@@ -1,0 +1,5 @@
+{
+  "_comment": "Map a Discord channel ID to the host daemon (hostId, matches the daemon's HOST_ID env) and the working directory that daemon should spawn/reuse a `gjc --mode=rpc` session for. Copy to channels.json and fill in real IDs.",
+  "111111111111111111": { "hostId": "prod-1", "workDir": "C:/projects/foo" },
+  "222222222222222222": { "hostId": "prod-2", "workDir": "/srv/apps/bar" }
+}

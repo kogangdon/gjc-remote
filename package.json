@@ -1,0 +1,11 @@
+{
+  "name": "gjc-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discord-controlled remote GJC sessions: bot (Discord + WS relay server) + daemon (per-host UDS<->WS bridge that spawns/reuses `gjc --mode=rpc` sessions on demand)",
+  "workspaces": [
+    "bot",
+    "daemon",
+    "shared"
+  ]
+}

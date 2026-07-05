@@ -1,0 +1,15 @@
+{
+  "name": "@gjc-remote/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/daemon.js",
+  "scripts": {
+    "start": "node src/daemon.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0",
+    "@gjc-remote/shared": "*"
+  }
+}

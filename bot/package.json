@@ -1,0 +1,17 @@
+{
+  "name": "@gjc-remote/bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/bot.js",
+  "scripts": {
+    "register": "node src/register-commands.js",
+    "start": "node src/bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0",
+    "@gjc-remote/shared": "*"
+  }
+}
