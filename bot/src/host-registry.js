@@ -13,7 +13,7 @@ export class HostRegistry {
     this.tokensByHostId = tokensByHostId;
     /** @type {Map<string, import("ws").WebSocket>} */
     this.connections = new Map();
-    /** @type {Map<string, { resolve: (v: any) => void, onEvent: (e: object) => void }>} */
+    /** @type {Map<string, { resolve: (v: any) => void, onEvent: (e: object) => void, text?: string }>} */
     this.pendingRequests = new Map();
 
     this.wss = new WebSocketServer({ port });
@@ -75,9 +75,13 @@ export class HostRegistry {
       this.pendingRequests.delete(msg.requestId);
       return;
     }
-    if (msg.event) pending.onEvent(msg.event);
+    if (msg.event) {
+      const text = extractAssistantText(msg.event);
+      if (text !== undefined) pending.text = text;
+      pending.onEvent(msg.event);
+    }
     if (msg.done) {
-      pending.resolve({ ok: true });
+      pending.resolve({ ok: true, text: pending.text });
       this.pendingRequests.delete(msg.requestId);
     }
   }
@@ -125,4 +129,17 @@ export class HostRegistry {
       );
     });
   }
+}
+
+function extractAssistantText(event) {
+  if (event?.message?.role !== "assistant" || !Array.isArray(event.message.content)) {
+    return undefined;
+  }
+
+  const text = event.message.content
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+
+  return text.length > 0 ? text : undefined;
 }

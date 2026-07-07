@@ -5,18 +5,19 @@ Discord-controlled remote GJC sessions.
 ## Architecture
 
 ```
-[host machine, per project]                         [always-on bot host, private network]
-  gjc --mode=rpc --listen <sock>   <--UDS-->    daemon/  --WS(outbound)-->   bot/
-  (spawned on demand per workDir,                                     (WS server +
-   reaped after 1h idle)                                               Discord client)
+[host machine, per project]                    [always-on bot host, private network]
+  gjc --mode=rpc (stdio)   <--stdin/stdout-->    daemon/  --WS(outbound)-->   bot/
+  (spawned on demand per                                              (WS server +
+   workDir, reaped after                                               Discord client)
+   1h idle)
 ```
 
 1. `daemon/` runs on each machine you want to control. It connects outbound to
    `bot/`'s WebSocket server and registers with a per-host pre-shared token.
 2. On the first Discord command routed to a given `workDir`, the daemon spawns
-   `gjc --mode=rpc --listen <socket>` for that directory and keeps it warm.
-   Subsequent commands for the same `workDir` reuse the live process. Idle
-   sessions (no requests for 1 hour) are killed automatically.
+   `gjc --mode=rpc` for that directory and talks to it over stdio. Subsequent
+   commands for the same `workDir` reuse the live process. Idle sessions (no
+   requests for 1 hour) are killed automatically.
 3. `bot/` exposes GJC's bundled skills (`deep-interview`, `ralplan`, `team`,
    `ultragoal`) plus `/gjc` (direct prompt), `/model` (runtime model switch),
    and `/hosts` (connection status) as Discord slash commands.

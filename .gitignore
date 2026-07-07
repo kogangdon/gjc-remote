@@ -6,4 +6,5 @@ package-lock.json
 channels.json
 .gjc-remote-session/
 .gjc-bot-sessions/
+.gjc/
 *.log
