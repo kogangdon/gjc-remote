@@ -67,7 +67,7 @@ export class RpcSession {
       // Streamed frames arrive wrapped: {type:"event", payload:{event_type, event}}.
       // Direct command replies arrive flat: {type:"response", command, success}.
       const innerType = evt.type === "event" ? evt.payload?.event_type : evt.type;
-      debugRpc("recv", summarizeFrame(evt, innerType, this.queue.length));
+      if (shouldDebugFrame(evt, innerType)) debugRpc("recv", summarizeFrame(evt, innerType, this.queue.length));
 
       waiter.onEvent(evt.type === "event" ? evt.payload.event : evt);
 
@@ -157,6 +157,12 @@ function summarizeFrame(evt, innerType, queueLength) {
     contentTypes: Array.isArray(event?.message?.content) ? event.message.content.map((part) => part?.type ?? typeof part) : undefined,
     queueLength,
   };
+}
+
+function shouldDebugFrame(evt, innerType) {
+  if (!DEBUG_RPC) return false;
+  if (innerType === "message_update") return false;
+  return true;
 }
 
 function isPromptLike(commandType) {

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Client, GatewayIntentBits, AttachmentBuilder } from "discord.js";
+import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
 
@@ -48,6 +48,8 @@ const allowedUsers = (GJC_BOT_ALLOWED_USERS || "")
 
 const skillNames = new Set(GJC_SKILLS.map((s) => s.name));
 const registry = new HostRegistry({ port: Number(HOST_WS_PORT || 7711), tokensByHostId });
+const toolLogStore = new Map();
+let toolLogSeq = 0;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -58,6 +60,11 @@ client.once("clientReady", () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
+  if (interaction.isButton()) {
+    await handleButtonInteraction(interaction);
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   if (allowedUsers.length > 0 && !allowedUsers.includes(interaction.user.id)) {
@@ -158,7 +165,9 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
 
   let lastEdit = 0;
   const startedAt = Date.now();
-  const progress = [];
+  const toolCalls = [];
+  const seenToolCalls = new Set();
+
   let preview = "";
   const editProgress = (force = false) => {
     const now = Date.now();
@@ -167,7 +176,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
 
     const elapsed = Math.max(1, Math.round((now - startedAt) / 1000));
     const details = [];
-    if (progress.length > 0) details.push(`tools: ${progress.slice(-8).join(", ")}`);
+    if (toolCalls.length > 0) details.push(`tools: ${summarizeToolCalls(toolCalls)}`);
     if (preview) details.push(`latest: ${truncate(preview, 500)}`);
 
     const suffix = details.length > 0 ? `\n${details.join("\n")}` : "";
@@ -181,19 +190,15 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   try {
     editProgress(true);
     result = await registry.invoke(route.hostId, route.workDir, command, (evt) => {
-      debugRemote("event", {
-        requestLabel,
-        type: evt?.type,
-        role: evt?.message?.role,
-        contentTypes: Array.isArray(evt?.message?.content) ? evt.message.content.map((part) => part?.type ?? typeof part) : undefined,
-        hasText: Boolean(extractAssistantText(evt)),
-        toolName: extractToolName(evt),
-      });
-      const toolName = extractToolName(evt);
-      if (toolName) progress.push(`\`${toolName}\``);
+
+      const toolCall = extractToolCall(evt);
+      if (toolCall && recordToolCall(toolCalls, seenToolCalls, toolCall)) {
+        debugRemote("tool-call", { requestLabel, name: toolCall.name, label: toolCall.label });
+      }
 
       const assistantText = extractAssistantText(evt);
       if (assistantText) preview = assistantText;
+      if (assistantText) debugRemote("assistant-text", { requestLabel, chars: assistantText.length });
 
       editProgress();
     });
@@ -201,6 +206,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
     clearInterval(heartbeat);
   }
 
+  if (result) result.toolCalls = toolCalls;
   debugRemote("result", { requestLabel, ok: result?.ok, hasText: Boolean(result?.text), error: result?.error });
 
   await deliver(result);
@@ -212,20 +218,21 @@ async function deliverInteraction(interaction, commandName, result) {
   const body = `${header}\n${text}`;
 
   const attachments = collectLocalAttachments(text, `${commandName}-attachment`);
+  const components = toolLogComponents(result.toolCalls);
   if (attachments.length > 0) {
     const content = `${header} (attached ${attachments.length} file${attachments.length === 1 ? "" : "s"})`;
-    await interaction.editReply({ content, files: attachments }).catch(() => {});
+    await interaction.editReply({ content, files: attachments, components }).catch(() => {});
     return;
   }
 
   if (body.length <= 1900) {
-    await interaction.editReply(body).catch(() => {});
+    await interaction.editReply({ content: body, components }).catch(() => {});
     return;
   }
 
   const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: `${commandName}-output.md` });
   await interaction
-    .editReply({ content: `${header} (output attached, ${text.length} chars)`, files: [file] })
+    .editReply({ content: `${header} (output attached, ${text.length} chars)`, files: [file], components })
     .catch(() => {});
 }
 
@@ -235,22 +242,104 @@ async function deliverMessage(message, result) {
   const body = `${header}\n${text}`;
 
   const attachments = collectLocalAttachments(text, "gjc-attachment");
+  const components = toolLogComponents(result.toolCalls);
   if (attachments.length > 0) {
     const content = `${header} (attached ${attachments.length} file${attachments.length === 1 ? "" : "s"})`;
-    await message.edit({ content, files: attachments }).catch(() => {});
+    await message.edit({ content, files: attachments, components }).catch(() => {});
     return;
   }
 
   if (body.length <= 1900) {
-    await message.edit(body).catch(() => {});
+    await message.edit({ content: body, components }).catch(() => {});
     return;
   }
 
   const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "gjc-output.md" });
-  await message.edit({ content: `${header} (output attached, ${text.length} chars)`, files: [file] }).catch(() => {});
+  await message.edit({ content: `${header} (output attached, ${text.length} chars)`, files: [file], components }).catch(() => {});
 }
 
 
+async function handleButtonInteraction(interaction) {
+  if (allowedUsers.length > 0 && !allowedUsers.includes(interaction.user.id)) {
+    await interaction.reply({ content: "You are not authorized to view GJC tool logs.", ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  if (!interaction.customId.startsWith("tool-log:")) return;
+  const id = interaction.customId.slice("tool-log:".length);
+  const entry = toolLogStore.get(id);
+  if (!entry) {
+    await interaction.reply({ content: "Tool log is no longer available.", ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const text = formatToolLog(entry.toolCalls);
+  if (text.length <= 1900) {
+    await interaction.reply({ content: text, ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "gjc-tool-log.md" });
+  await interaction.reply({ content: `Tool log (${entry.toolCalls.length} calls)`, files: [file], ephemeral: true }).catch(() => {});
+}
+
+function toolLogComponents(toolCalls) {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+  const id = String(++toolLogSeq);
+  toolLogStore.set(id, { toolCalls, createdAt: Date.now() });
+  pruneToolLogs();
+
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`tool-log:${id}`)
+        .setLabel(`View tool log (${toolCalls.length})`)
+        .setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+function formatToolLog(toolCalls) {
+  return toolCalls
+    .map((call, index) => {
+      const input = call.input === undefined ? "" : `\n\`\`\`json\n${JSON.stringify(call.input, null, 2)}\n\`\`\``;
+      return `**${index + 1}. ${call.name}**${call.label ? ` — ${call.label}` : ""}${input}`;
+    })
+    .join("\n\n");
+}
+
+function summarizeToolCalls(toolCalls) {
+  return toolCalls
+    .slice(-5)
+    .map((call, index, recent) => {
+      const number = toolCalls.length - recent.length + index + 1;
+      const label = call.label ? ` ${truncate(call.label, 60)}` : "";
+      return `#${number} \`${call.name}\`${label}`;
+    })
+    .join("; ");
+}
+
+function recordToolCall(toolCalls, seenToolCalls, toolCall) {
+  const signature = toolCallSignature(toolCall);
+  if (seenToolCalls.has(signature)) return false;
+
+  seenToolCalls.add(signature);
+  toolCalls.push({ ...toolCall, signature });
+  return true;
+}
+
+function toolCallSignature(toolCall) {
+  if (toolCall.id) return JSON.stringify(["id", toolCall.id]);
+  if (toolCall.label) return JSON.stringify(["label", toolCall.name, toolCall.label]);
+  return JSON.stringify(["input", toolCall.name, toolCall.input]);
+}
+
+function pruneToolLogs() {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [id, entry] of toolLogStore) {
+    if (entry.createdAt < cutoff || toolLogStore.size > 100) toolLogStore.delete(id);
+  }
+}
 
 function collectLocalAttachments(text, baseName) {
   const paths = extractLocalAttachmentPaths(text);
@@ -288,12 +377,28 @@ function attachmentName(filePath, baseName, index) {
 }
 
 
-function extractToolName(evt) {
-  if (evt?.type === "toolCall" && typeof evt.name === "string") return evt.name;
+function extractToolCall(evt) {
+  if (evt?.type === "toolCall" && typeof evt.name === "string") return normalizeToolCall(evt);
 
   const content = Array.isArray(evt?.message?.content) ? evt.message.content : [];
   const call = content.find((part) => part?.type === "toolCall" && typeof part.name === "string");
-  return call?.name;
+  return call ? normalizeToolCall(call) : undefined;
+}
+
+function normalizeToolCall(call) {
+  const input = call.input ?? call.arguments ?? call.args ?? call.parameters;
+  return {
+    id: call.id ?? call.toolCallId ?? call.callId,
+    name: call.name,
+    label: toolInputLabel(input),
+    input,
+  };
+}
+
+function toolInputLabel(input) {
+  if (!input || typeof input !== "object") return typeof input === "string" ? truncate(input, 80) : "";
+  const label = input._i ?? input.command ?? input.path ?? input.pattern ?? input.subject ?? input.name ?? input.action;
+  return typeof label === "string" ? label : "";
 }
 function extractAssistantText(evt) {
   const message = evt?.message ?? evt?.assistantMessageEvent?.message;
