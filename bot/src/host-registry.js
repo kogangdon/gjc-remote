@@ -141,15 +141,27 @@ export class HostRegistry {
   }
 }
 
-function extractAssistantText(event) {
-  if (event?.message?.role !== "assistant" || !Array.isArray(event.message.content)) {
-    return undefined;
-  }
+export function extractAssistantText(event) {
+  const message = event?.message ?? event?.assistantMessageEvent?.message;
+  if (message?.role !== "assistant") return undefined;
 
-  const text = event.message.content
-    .filter((part) => part?.type === "text" && typeof part.text === "string")
-    .map((part) => part.text)
-    .join("");
-
+  const text = extractTextFromContent(message.content);
   return text.length > 0 ? text : undefined;
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === "string") return content;
+
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.value === "string") return part.value;
+      if (typeof part.content === "string") return part.content;
+      return "";
+    })
+    .join("");
 }
