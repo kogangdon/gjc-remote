@@ -13,7 +13,7 @@ export class HostRegistry {
     this.tokensByHostId = tokensByHostId;
     /** @type {Map<string, import("ws").WebSocket>} */
     this.connections = new Map();
-    /** @type {Map<string, { resolve: (v: any) => void, onEvent: (e: object) => void, text?: string }>} */
+    /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string }>} */
     this.pendingRequests = new Map();
 
     this.wss = new WebSocketServer({ port });
@@ -51,6 +51,7 @@ export class HostRegistry {
       socket.on("message", (raw2) => this.#handleMessage(hostId, raw2));
       socket.on("close", () => {
         if (this.connections.get(hostId) === socket) this.connections.delete(hostId);
+        this.#failPendingForSocket(socket, `host '${hostId}' disconnected`);
         console.log(`HostRegistry: host '${hostId}' disconnected`);
       });
     });
@@ -86,6 +87,14 @@ export class HostRegistry {
     }
   }
 
+  #failPendingForSocket(socket, error) {
+    for (const [requestId, pending] of this.pendingRequests) {
+      if (pending.socket !== socket) continue;
+      pending.resolve({ ok: false, error });
+      this.pendingRequests.delete(requestId);
+    }
+  }
+
   isOnline(hostId) {
     return this.connections.has(hostId);
   }
@@ -117,6 +126,7 @@ export class HostRegistry {
       }, timeoutMs);
 
       this.pendingRequests.set(requestId, {
+        socket,
         resolve: (result) => {
           clearTimeout(timer);
           resolve(result);
