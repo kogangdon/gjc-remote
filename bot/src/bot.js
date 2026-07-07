@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Client, GatewayIntentBits, AttachmentBuilder } from "discord.js";
 import { GJC_SKILLS } from "./skills.js";
@@ -200,6 +200,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   } finally {
     clearInterval(heartbeat);
   }
+
   debugRemote("result", { requestLabel, ok: result?.ok, hasText: Boolean(result?.text), error: result?.error });
 
   await deliver(result);
@@ -209,6 +210,13 @@ async function deliverInteraction(interaction, commandName, result) {
   const header = result.ok ? `**/${commandName}** result:` : `**/${commandName}** failed:`;
   const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
   const body = `${header}\n${text}`;
+
+  const attachments = collectLocalAttachments(text, `${commandName}-attachment`);
+  if (attachments.length > 0) {
+    const content = `${header} (attached ${attachments.length} file${attachments.length === 1 ? "" : "s"})`;
+    await interaction.editReply({ content, files: attachments }).catch(() => {});
+    return;
+  }
 
   if (body.length <= 1900) {
     await interaction.editReply(body).catch(() => {});
@@ -226,6 +234,13 @@ async function deliverMessage(message, result) {
   const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
   const body = `${header}\n${text}`;
 
+  const attachments = collectLocalAttachments(text, "gjc-attachment");
+  if (attachments.length > 0) {
+    const content = `${header} (attached ${attachments.length} file${attachments.length === 1 ? "" : "s"})`;
+    await message.edit({ content, files: attachments }).catch(() => {});
+    return;
+  }
+
   if (body.length <= 1900) {
     await message.edit(body).catch(() => {});
     return;
@@ -235,6 +250,44 @@ async function deliverMessage(message, result) {
   await message.edit({ content: `${header} (output attached, ${text.length} chars)`, files: [file] }).catch(() => {});
 }
 
+
+
+function collectLocalAttachments(text, baseName) {
+  const paths = extractLocalAttachmentPaths(text);
+  return paths.map((filePath, index) => new AttachmentBuilder(filePath, { name: attachmentName(filePath, baseName, index) }));
+}
+
+function extractLocalAttachmentPaths(text) {
+  const candidates = new Set();
+  const patterns = [
+    /[A-Za-z]:\\[^\r\n"'<>|?*]+?\.(?:png|jpe?g|webp|gif|txt|md|json|csv|log|pdf|zip)/gi,
+    /\/[^\s"'<>]+?\.(?:png|jpe?g|webp|gif|txt|md|json|csv|log|pdf|zip)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      candidates.add(match[0].replace(/[),.;:]+$/g, ""));
+    }
+  }
+
+  return [...candidates].filter((filePath) => {
+    try {
+      if (!existsSync(filePath)) return false;
+      const stat = statSync(filePath);
+      return stat.isFile() && stat.size > 0 && stat.size <= 25 * 1024 * 1024;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function attachmentName(filePath, baseName, index) {
+  const normalized = filePath.replaceAll("\\", "/");
+  const original = normalized.slice(normalized.lastIndexOf("/") + 1);
+  return original || `${baseName}-${index + 1}`;
+}
+
+
 function extractToolName(evt) {
   if (evt?.type === "toolCall" && typeof evt.name === "string") return evt.name;
 
@@ -242,7 +295,6 @@ function extractToolName(evt) {
   const call = content.find((part) => part?.type === "toolCall" && typeof part.name === "string");
   return call?.name;
 }
-
 function extractAssistantText(evt) {
   const message = evt?.message ?? evt?.assistantMessageEvent?.message;
   if (message?.role !== "assistant") return "";
