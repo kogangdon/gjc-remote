@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+const DEBUG_RPC = process.env.GJC_REMOTE_DEBUG === "1";
 
 /**
  * Wraps a `gjc --mode=rpc` child process's stdin/stdout as a command/event
@@ -27,6 +28,7 @@ export class RpcSession {
     this.queue = [];
     this.closed = false;
     this.draining = false;
+
 
     child.stdout.on("data", (chunk) => this.#onData(chunk));
     const onDeath = (err) => {
@@ -57,11 +59,15 @@ export class RpcSession {
       if (evt.type === "ready") continue;
 
       const waiter = this.current;
-      if (!waiter) continue; // stray/late frame with nothing awaiting it (e.g. a trailing agent_end echo) — safe to drop
+      if (!waiter) {
+        debugRpc("drop", summarizeFrame(evt, "none", this.queue.length));
+        continue; // stray/late frame with nothing awaiting it (e.g. a trailing agent_end echo) — safe to drop
+      }
 
       // Streamed frames arrive wrapped: {type:"event", payload:{event_type, event}}.
       // Direct command replies arrive flat: {type:"response", command, success}.
       const innerType = evt.type === "event" ? evt.payload?.event_type : evt.type;
+      debugRpc("recv", summarizeFrame(evt, innerType, this.queue.length));
 
       waiter.onEvent(evt.type === "event" ? evt.payload.event : evt);
 
@@ -86,9 +92,11 @@ export class RpcSession {
     clearTimeout(this.current.timer);
     this.current = undefined;
     this.draining = true;
+    debugRpc("settle", { drainDelayMs, queueLength: this.queue.length });
     fn();
     setTimeout(() => {
       this.draining = false;
+      debugRpc("drain-ready", { queueLength: this.queue.length });
       this.#drainQueue();
     }, drainDelayMs);
   }
@@ -109,6 +117,7 @@ export class RpcSession {
     const dispatch = () =>
       new Promise((resolve, reject) => {
         const id = command.id || randomUUID();
+        debugRpc("dispatch", { id, command: command.type, queueLength: this.queue.length });
         const payload = { ...command, id };
 
         const timer = setTimeout(() => {
@@ -125,7 +134,27 @@ export class RpcSession {
     if (!this.current && !this.draining) return dispatch();
 
     return new Promise((resolve, reject) => {
+      debugRpc("queue", { command: command.type, queueLength: this.queue.length + 1, draining: this.draining });
       this.queue.push(() => dispatch().then(resolve, reject));
     });
   }
+}
+
+function debugRpc(label, data) {
+  if (!DEBUG_RPC) return;
+  console.error(`[rpc-client] ${label}`, JSON.stringify(data));
+}
+
+function summarizeFrame(evt, innerType, queueLength) {
+  const event = evt.type === "event" ? evt.payload?.event : evt;
+  return {
+    outerType: evt.type,
+    innerType,
+    eventType: event?.type,
+    command: evt.command,
+    success: evt.success,
+    role: event?.message?.role,
+    contentTypes: Array.isArray(event?.message?.content) ? event.message.content.map((part) => part?.type ?? typeof part) : undefined,
+    queueLength,
+  };
 }

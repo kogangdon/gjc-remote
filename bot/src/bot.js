@@ -12,6 +12,7 @@ const {
   HOST_WS_PORT,
   HOST_TOKENS,
 } = process.env;
+const DEBUG_REMOTE = process.env.GJC_REMOTE_DEBUG === "1";
 
 if (!DISCORD_TOKEN) {
   console.error("Missing DISCORD_TOKEN in environment (.env).");
@@ -89,6 +90,8 @@ client.on("interactionCreate", async (interaction) => {
   const isDirect = commandName === "gjc";
   if (!isSkill && !isModel && !isDirect) return;
 
+  const requestLabel = `${commandName}:${interaction.id}`;
+
   await interaction.deferReply();
 
   let command;
@@ -100,6 +103,14 @@ client.on("interactionCreate", async (interaction) => {
     const message = isSkill ? `/skill:${commandName} ${promptArg}` : promptArg;
     command = { kind: "prompt", message };
   }
+  debugRemote("interaction", {
+    requestLabel,
+    userId: interaction.user.id,
+    channelId: interaction.channelId,
+    hostId: route.hostId,
+    workDir: route.workDir,
+    kind: command.kind,
+  });
 
   let lastEdit = 0;
   const startedAt = Date.now();
@@ -126,6 +137,14 @@ client.on("interactionCreate", async (interaction) => {
   try {
     editProgress(true);
     result = await registry.invoke(route.hostId, route.workDir, command, (evt) => {
+      debugRemote("event", {
+        requestLabel,
+        type: evt?.type,
+        role: evt?.message?.role,
+        contentTypes: Array.isArray(evt?.message?.content) ? evt.message.content.map((part) => part?.type ?? typeof part) : undefined,
+        hasText: Boolean(extractAssistantText(evt)),
+        toolName: extractToolName(evt),
+      });
       const toolName = extractToolName(evt);
       if (toolName) progress.push(`\`${toolName}\``);
 
@@ -137,6 +156,7 @@ client.on("interactionCreate", async (interaction) => {
   } finally {
     clearInterval(heartbeat);
   }
+  debugRemote("result", { requestLabel, ok: result?.ok, hasText: Boolean(result?.text), error: result?.error });
 
   await deliver(interaction, commandName, result);
 });
@@ -190,6 +210,11 @@ function extractTextFromContent(content) {
 
 function truncate(text, maxLength) {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
+}
+
+function debugRemote(label, data) {
+  if (!DEBUG_REMOTE) return;
+  console.error(`[bot] ${label}`, JSON.stringify(data));
 }
 
 client.login(DISCORD_TOKEN);
