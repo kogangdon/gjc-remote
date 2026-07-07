@@ -22,7 +22,7 @@ const daemon = spawn(process.execPath, ["daemon/src/daemon.js"], {
     HOST_ID: hostId,
     HOST_TOKEN: token,
     HOST_LABEL: "local smoke test",
-    BOT_WS_URL: `ws://127.0.0.1:${port}`,
+    BOT_WS_URL: `ws://localhost:${port}`,
   },
   stdio: ["ignore", "pipe", "pipe"],
 });

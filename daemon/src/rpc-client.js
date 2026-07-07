@@ -22,7 +22,7 @@ export class RpcSession {
   constructor(child) {
     this.child = child;
     this.buf = "";
-    /** @type {{ onEvent: (e: object) => void, resolve: () => void, reject: (e: Error) => void, timer: NodeJS.Timeout } | undefined} */
+    /** @type {{ commandType: string, onEvent: (e: object) => void, resolve: () => void, reject: (e: Error) => void, timer: NodeJS.Timeout } | undefined} */
     this.current = undefined;
     /** @type {Array<() => void>} */
     this.queue = [];
@@ -71,12 +71,12 @@ export class RpcSession {
 
       waiter.onEvent(evt.type === "event" ? evt.payload.event : evt);
 
-      // `turn_end` is the authoritative completion signal for a single RPC
-      // turn. GJC also emits a trailing `agent_end` echo shortly afterwards
-      // (meant for one-shot `-p` runs). Keep the wire drained briefly before
-      // dispatching the next queued command so late terminal echoes cannot
-      // race with the next prompt and trigger GJC's "already processing" guard.
-      if (innerType === "turn_end") {
+      // `turn_end` is a per-turn boundary, not the end of a full agent run.
+      // Tool use can produce several turns before the final assistant text.
+      // Resolve prompt-like commands only at `agent_end`; otherwise the relay
+      // drops later tool-result/final-answer frames and Discord sees
+      // "(no text output)" while the agent is still running.
+      if (innerType === "agent_end" && isPromptLike(waiter.commandType)) {
         this.#settle(() => waiter.resolve(), 1000);
       } else if (evt.type === "response") {
         if (evt.success === false) {
@@ -127,7 +127,7 @@ export class RpcSession {
           this.#drainQueue();
         }, timeoutMs);
 
-        this.current = { onEvent, resolve, reject, timer };
+        this.current = { commandType: command.type, onEvent, resolve, reject, timer };
         this.child.stdin.write(`${JSON.stringify(payload)}\n`);
       });
 
@@ -157,4 +157,8 @@ function summarizeFrame(evt, innerType, queueLength) {
     contentTypes: Array.isArray(event?.message?.content) ? event.message.content.map((part) => part?.type ?? typeof part) : undefined,
     queueLength,
   };
+}
+
+function isPromptLike(commandType) {
+  return commandType === "prompt" || commandType === "steer" || commandType === "follow_up";
 }
