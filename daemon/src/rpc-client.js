@@ -26,6 +26,7 @@ export class RpcSession {
     /** @type {Array<() => void>} */
     this.queue = [];
     this.closed = false;
+    this.draining = false;
 
     child.stdout.on("data", (chunk) => this.#onData(chunk));
     const onDeath = (err) => {
@@ -66,12 +67,11 @@ export class RpcSession {
 
       // `turn_end` is the authoritative completion signal for a single RPC
       // turn. GJC also emits a trailing `agent_end` echo shortly afterwards
-      // (meant for one-shot `-p` runs) — deliberately ignored here (it falls
-      // through with `waiter` still cleared, so it's dropped by the `!waiter`
-      // guard above once the next command has dispatched) so it can never be
-      // misrouted onto whatever request is queued next.
+      // (meant for one-shot `-p` runs). Keep the wire drained briefly before
+      // dispatching the next queued command so late terminal echoes cannot
+      // race with the next prompt and trigger GJC's "already processing" guard.
       if (innerType === "turn_end") {
-        this.#settle(() => waiter.resolve());
+        this.#settle(() => waiter.resolve(), 1000);
       } else if (evt.type === "response") {
         if (evt.success === false) {
           this.#settle(() => waiter.reject(new Error(typeof evt.error === "string" ? evt.error : JSON.stringify(evt.error))));
@@ -82,11 +82,15 @@ export class RpcSession {
     }
   }
 
-  #settle(fn) {
+  #settle(fn, drainDelayMs = 0) {
     clearTimeout(this.current.timer);
     this.current = undefined;
+    this.draining = true;
     fn();
-    this.#drainQueue();
+    setTimeout(() => {
+      this.draining = false;
+      this.#drainQueue();
+    }, drainDelayMs);
   }
 
   #drainQueue() {
@@ -109,6 +113,7 @@ export class RpcSession {
 
         const timer = setTimeout(() => {
           this.current = undefined;
+          this.draining = false;
           reject(new Error("RPC command timed out"));
           this.#drainQueue();
         }, timeoutMs);
@@ -117,7 +122,7 @@ export class RpcSession {
         this.child.stdin.write(`${JSON.stringify(payload)}\n`);
       });
 
-    if (!this.current) return dispatch();
+    if (!this.current && !this.draining) return dispatch();
 
     return new Promise((resolve, reject) => {
       this.queue.push(() => dispatch().then(resolve, reject));

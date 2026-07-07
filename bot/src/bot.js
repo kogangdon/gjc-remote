@@ -102,18 +102,41 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   let lastEdit = 0;
+  const startedAt = Date.now();
   const progress = [];
-  const result = await registry.invoke(route.hostId, route.workDir, command, (evt) => {
-    if (evt.type === "toolCall" || (evt.message?.content || []).some((c) => c.type === "toolCall")) {
-      const call = evt.message?.content?.find((c) => c.type === "toolCall");
-      if (call?.name) progress.push(`\`${call.name}\``);
-    }
+  let preview = "";
+  const editProgress = (force = false) => {
     const now = Date.now();
-    if (now - lastEdit > 4000 && progress.length > 0) {
-      lastEdit = now;
-      interaction.editReply(`Running \`${commandName}\`... (${progress.slice(-8).join(", ")})`).catch(() => {});
-    }
-  });
+    if (!force && now - lastEdit < 4000) return;
+    lastEdit = now;
+
+    const elapsed = Math.max(1, Math.round((now - startedAt) / 1000));
+    const details = [];
+    if (progress.length > 0) details.push(`tools: ${progress.slice(-8).join(", ")}`);
+    if (preview) details.push(`latest: ${truncate(preview, 500)}`);
+
+    const suffix = details.length > 0 ? `\n${details.join("\n")}` : "";
+    interaction.editReply(`Running \`/${commandName}\`... (${elapsed}s elapsed)${suffix}`).catch(() => {});
+  };
+
+  const heartbeat = setInterval(() => editProgress(), 4000);
+  heartbeat.unref?.();
+
+  let result;
+  try {
+    editProgress(true);
+    result = await registry.invoke(route.hostId, route.workDir, command, (evt) => {
+      const toolName = extractToolName(evt);
+      if (toolName) progress.push(`\`${toolName}\``);
+
+      const assistantText = extractAssistantText(evt);
+      if (assistantText) preview = assistantText;
+
+      editProgress();
+    });
+  } finally {
+    clearInterval(heartbeat);
+  }
 
   await deliver(interaction, commandName, result);
 });
@@ -132,6 +155,41 @@ async function deliver(interaction, commandName, result) {
   await interaction
     .editReply({ content: `${header} (output attached, ${text.length} chars)`, files: [file] })
     .catch(() => {});
+}
+
+function extractToolName(evt) {
+  if (evt?.type === "toolCall" && typeof evt.name === "string") return evt.name;
+
+  const content = Array.isArray(evt?.message?.content) ? evt.message.content : [];
+  const call = content.find((part) => part?.type === "toolCall" && typeof part.name === "string");
+  return call?.name;
+}
+
+function extractAssistantText(evt) {
+  const message = evt?.message ?? evt?.assistantMessageEvent?.message;
+  if (message?.role !== "assistant") return "";
+
+  return extractTextFromContent(message.content).trim();
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.value === "string") return part.value;
+      if (typeof part.content === "string") return part.content;
+      return "";
+    })
+    .join("");
+}
+
+function truncate(text, maxLength) {
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
 
 client.login(DISCORD_TOKEN);
