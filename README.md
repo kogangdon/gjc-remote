@@ -18,9 +18,9 @@ Discord-controlled remote GJC sessions.
    `gjc --mode=rpc` for that directory and talks to it over stdio. Subsequent
    commands for the same `workDir` reuse the live process. Idle sessions (no
    requests for 1 hour) are killed automatically.
-3. `bot/` exposes GJC's bundled skills (`deep-interview`, `ralplan`, `team`,
-   `ultragoal`) plus `/gjc` (direct prompt), `/model` (runtime model switch),
-   and `/hosts` (connection status) as Discord slash commands.
+3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
+   bundled skills (`deep-interview`, `ralplan`, `team`, `ultragoal`), `/gjc`,
+   `/model`, and `/hosts` as Discord slash commands.
 4. Each Discord channel maps to one `(hostId, workDir)` pair via
    `bot/channels.json`. A host only accepts commands while its daemon is
    connected — turning the daemon off makes that channel's commands fail
@@ -35,6 +35,7 @@ npm install   # installs both workspaces (bot, daemon, shared)
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
 npm run register --workspace=bot    # publish slash commands to Discord
+# Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
 npm run start --workspace=bot
 
 # On each machine you want to control:

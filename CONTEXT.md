@@ -35,6 +35,8 @@ runtime model switching as `/slash` commands.
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
    each Discord channel to one `{hostId, workDir}` pair via
    `bot/channels.json` (gitignored — copy from `channels.example.json`).
+   In mapped channels, ordinary non-bot messages from allowed users are treated
+   as direct GJC prompts; slash commands remain available for skills/model/hosts.
 
 ## Why NOT the alternatives (rejected paths, don't re-litigate these)
 

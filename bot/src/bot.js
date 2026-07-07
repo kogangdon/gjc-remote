@@ -49,7 +49,9 @@ const allowedUsers = (GJC_BOT_ALLOWED_USERS || "")
 const skillNames = new Set(GJC_SKILLS.map((s) => s.name));
 const registry = new HostRegistry({ port: Number(HOST_WS_PORT || 7711), tokensByHostId });
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+});
 
 client.once("clientReady", () => {
   console.log(`Logged in as ${client.user.tag}. Channels mapped: ${Object.keys(channelMap).length}`);
@@ -90,10 +92,6 @@ client.on("interactionCreate", async (interaction) => {
   const isDirect = commandName === "gjc";
   if (!isSkill && !isModel && !isDirect) return;
 
-  const requestLabel = `${commandName}:${interaction.id}`;
-
-  await interaction.deferReply();
-
   let command;
   if (isModel) {
     const name = interaction.options.getString("name", true);
@@ -103,10 +101,56 @@ client.on("interactionCreate", async (interaction) => {
     const message = isSkill ? `/skill:${commandName} ${promptArg}` : promptArg;
     command = { kind: "prompt", message };
   }
-  debugRemote("interaction", {
-    requestLabel,
+
+  await interaction.deferReply();
+  await runAndDeliver({
+    commandName,
+    command,
+    route,
+    requestLabel: `${commandName}:${interaction.id}`,
     userId: interaction.user.id,
     channelId: interaction.channelId,
+    edit: (content) => interaction.editReply(content),
+    deliver: (result) => deliverInteraction(interaction, commandName, result),
+  });
+});
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot || !message.guildId) return;
+
+  const prompt = message.content.trim();
+  if (!prompt) return;
+
+  if (allowedUsers.length > 0 && !allowedUsers.includes(message.author.id)) return;
+
+  const route = channelMap[message.channelId];
+  if (!route) return;
+
+  if (!registry.isOnline(route.hostId)) {
+    await message.reply(`Host '${route.hostId}' is not connected right now.`).catch(() => {});
+    return;
+  }
+
+  const progressMessage = await message.reply("Queued `gjc` prompt...").catch(() => undefined);
+  if (!progressMessage) return;
+
+  await runAndDeliver({
+    commandName: "chat",
+    command: { kind: "prompt", message: prompt },
+    route,
+    requestLabel: `chat:${message.id}`,
+    userId: message.author.id,
+    channelId: message.channelId,
+    edit: (content) => progressMessage.edit(content),
+    deliver: (result) => deliverMessage(progressMessage, result),
+  });
+});
+
+async function runAndDeliver({ commandName, command, route, requestLabel, userId, channelId, edit, deliver }) {
+  debugRemote("request", {
+    requestLabel,
+    userId,
+    channelId,
     hostId: route.hostId,
     workDir: route.workDir,
     kind: command.kind,
@@ -127,7 +171,7 @@ client.on("interactionCreate", async (interaction) => {
     if (preview) details.push(`latest: ${truncate(preview, 500)}`);
 
     const suffix = details.length > 0 ? `\n${details.join("\n")}` : "";
-    interaction.editReply(`Running \`/${commandName}\`... (${elapsed}s elapsed)${suffix}`).catch(() => {});
+    edit(`Running \`${commandName}\`... (${elapsed}s elapsed)${suffix}`).catch(() => {});
   };
 
   const heartbeat = setInterval(() => editProgress(), 4000);
@@ -158,10 +202,10 @@ client.on("interactionCreate", async (interaction) => {
   }
   debugRemote("result", { requestLabel, ok: result?.ok, hasText: Boolean(result?.text), error: result?.error });
 
-  await deliver(interaction, commandName, result);
-});
+  await deliver(result);
+}
 
-async function deliver(interaction, commandName, result) {
+async function deliverInteraction(interaction, commandName, result) {
   const header = result.ok ? `**/${commandName}** result:` : `**/${commandName}** failed:`;
   const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
   const body = `${header}\n${text}`;
@@ -175,6 +219,20 @@ async function deliver(interaction, commandName, result) {
   await interaction
     .editReply({ content: `${header} (output attached, ${text.length} chars)`, files: [file] })
     .catch(() => {});
+}
+
+async function deliverMessage(message, result) {
+  const header = result.ok ? "**GJC** result:" : "**GJC** failed:";
+  const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
+  const body = `${header}\n${text}`;
+
+  if (body.length <= 1900) {
+    await message.edit(body).catch(() => {});
+    return;
+  }
+
+  const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "gjc-output.md" });
+  await message.edit({ content: `${header} (output attached, ${text.length} chars)`, files: [file] }).catch(() => {});
 }
 
 function extractToolName(evt) {
