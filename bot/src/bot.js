@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Client, GatewayIntentBits, AttachmentBuilder } from "discord.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
@@ -18,7 +19,7 @@ if (!DISCORD_TOKEN) {
 }
 
 // channels.json: { "<discordChannelId>": { "hostId": "...", "workDir": "..." } }
-const channelsPath = CHANNELS_CONFIG || new URL("../channels.json", import.meta.url).pathname;
+const channelsPath = CHANNELS_CONFIG || fileURLToPath(new URL("../channels.json", import.meta.url));
 let channelMap;
 try {
   channelMap = JSON.parse(readFileSync(channelsPath, "utf8"));
