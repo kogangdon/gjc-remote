@@ -125,13 +125,12 @@ what `gjc` itself uses and was what full e2e verification ran under.
 
 ## What is NOT done yet (pick up here)
 
-1. **Real Discord wiring never run end-to-end.** Everything through
-   `HostRegistry.invoke()` was verified with a throwaway `e2e-test.js`
-   script (deleted after verifying — the pattern is reusable if you need to
-   re-verify: spawn `daemon/src/daemon.js` as a child pointed at a
-   locally-started `HostRegistry`, skip Discord entirely). Actually
-   registering slash commands and running `bot/src/bot.js` against a real
-   Discord application + real `DISCORD_TOKEN` has not happened.
+1. **Real Discord wiring never run end-to-end.** The non-Discord relay path is
+   now covered by `npm run smoke:local`, which starts a local `HostRegistry`,
+   spawns `daemon/src/daemon.js`, sends a prompt through a real `gjc --mode=rpc`
+   process, and asserts the assistant text returned through the bot relay.
+   Actually registering slash commands and running `bot/src/bot.js` against a
+   real Discord application + real `DISCORD_TOKEN` has not happened.
 2. **`channels.json` does not exist yet** (gitignored, copy from
    `channels.example.json`) — needs real Discord channel IDs once a server
    exists.
@@ -145,8 +144,7 @@ what `gjc` itself uses and was what full e2e verification ran under.
    `gjc --mode=rpc` approach *should* be OS-agnostic (no socket files, no
    tmux), but has not actually been run on Linux/macOS yet. If you're
    picking this up on such a host: this is the first thing worth smoke
-   testing (`bun daemon/src/daemon.js` against a throwaway `HostRegistry`,
-   same pattern as bullet 1).
+   testing (`npm run smoke:local`).
 5. **No process supervision configured** — `README.md` mentions pm2/systemd
    as options but nothing is set up. Bot and each daemon currently need to
    be started manually.
@@ -157,11 +155,11 @@ what `gjc` itself uses and was what full e2e verification ran under.
 
 ## Verification pattern to reuse
 
-Whenever you touch `daemon/src/*` or `bot/src/host-registry.js`, prefer
-re-running an ad hoc Bun one-liner (or a throwaway script, deleted after)
-against a **real** `gjc` binary rather than trusting the protocol docs —
-every bug above was only found by actually spawning `gjc --mode=rpc` and
-inspecting real stdout frames. Example pattern (adapt as needed):
+Whenever you touch `daemon/src/*` or `bot/src/host-registry.js`, run
+`npm run smoke:local` against a **real** `gjc` binary rather than trusting the
+protocol docs — every protocol bug so far was only found by actually spawning
+`gjc --mode=rpc` and inspecting real stdout frames. The smoke script is the
+preferred reusable verification path.
 
 ```js
 import { SessionPool } from "./daemon/src/session-pool.js";

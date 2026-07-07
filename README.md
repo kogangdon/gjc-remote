@@ -42,6 +42,16 @@ cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bo
 npm run start --workspace=daemon
 ```
 
+## Verification
+
+```bash
+npm run smoke:local
+```
+
+`smoke:local` starts a local `HostRegistry`, spawns a real daemon, routes one
+prompt through `gjc --mode=rpc`, and asserts that the assistant text comes back
+through the relay. It does not require Discord credentials.
+
 ## Security notes
 
 - `bot/`'s WS port only needs to be reachable from daemon hosts on your
