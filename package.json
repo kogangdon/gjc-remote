@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "description": "Discord-controlled remote GJC sessions: bot (Discord + WS relay server) + daemon (per-host stdio<->WS bridge that spawns/reuses `gjc --mode=rpc` sessions on demand)",
+  "type": "module",
+  "scripts": {
+    "smoke:local": "node scripts/local-smoke.js"
+  },
   "workspaces": [
     "bot",
     "daemon",

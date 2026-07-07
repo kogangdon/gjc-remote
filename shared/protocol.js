@@ -13,7 +13,7 @@
  *   type: "invoke",
  *   requestId: string,
  *   workDir: string,
- *   command: { kind: "prompt" | "steer" | "follow_up", message: string } | { kind: "set_model", provider: string, modelId: string },
+ *   command: { kind: "prompt" | "steer" | "follow_up", message: string } | { kind: "set_model", modelName: string },
  * }} InvokeMessage
  */
 
