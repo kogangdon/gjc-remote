@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, watch } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
 import { GJC_SKILLS } from "./skills.js";
@@ -22,12 +22,12 @@ if (!DISCORD_TOKEN) {
 // channels.json: { "<discordChannelId>": { "hostId": "...", "workDir": "..." } }
 const channelsPath = CHANNELS_CONFIG || fileURLToPath(new URL("../channels.json", import.meta.url));
 let channelMap;
-try {
-  channelMap = JSON.parse(readFileSync(channelsPath, "utf8"));
-} catch (err) {
-  console.error(`Missing/invalid channel map at ${channelsPath} (copy channels.example.json).`, err.message);
-  process.exit(1);
-}
+channelMap = loadChannelMap({ fatal: true });
+let channelWatchTimer;
+watch(channelsPath, { persistent: false }, () => {
+  clearTimeout(channelWatchTimer);
+  channelWatchTimer = setTimeout(() => loadChannelMap({ fatal: false }), 250);
+});
 
 // HOST_TOKENS: "hostId1:token1,hostId2:token2" — pre-shared keys daemons must present on register.
 const tokensByHostId = new Map(
@@ -423,6 +423,19 @@ function extractTextFromContent(content) {
     .join("");
 }
 
+function loadChannelMap({ fatal }) {
+  try {
+    const nextMap = JSON.parse(readFileSync(channelsPath, "utf8"));
+    const count = Object.keys(nextMap).length;
+    channelMap = nextMap;
+    console.log(`Loaded channel map from ${channelsPath}: ${count} channel${count === 1 ? "" : "s"}`);
+    return nextMap;
+  } catch (err) {
+    console.error(`Missing/invalid channel map at ${channelsPath} (copy channels.example.json).`, err.message);
+    if (fatal) process.exit(1);
+    return channelMap;
+  }
+}
 function truncate(text, maxLength) {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
