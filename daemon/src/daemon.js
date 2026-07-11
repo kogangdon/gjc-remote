@@ -11,6 +11,7 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
   process.exit(1);
 }
 
+
 const pool = new SessionPool();
 let socket;
 let reconnectDelay = 1000;

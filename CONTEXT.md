@@ -36,7 +36,8 @@ runtime model switching as `/slash` commands.
    each Discord channel to one `{hostId, workDir}` pair via
    `bot/channels.json` (gitignored — copy from `channels.example.json`).
    In mapped channels, ordinary non-bot messages from allowed users are treated
-   as direct GJC prompts; slash commands remain available for skills/model/hosts.
+   as direct GJC prompts; slash commands remain available for skills, `/model`,
+   and `/hosts`.
 
 ## Why NOT the alternatives (rejected paths, don't re-litigate these)
 
@@ -103,6 +104,17 @@ runtime model switching as `/slash` commands.
    spawning, and both `session-pool.js`'s `child.on("error", ...)` and
    `rpc-client.js`'s `RpcSession` route spawn errors into a clean rejection
    instead of leaving them unhandled.
+5. **`/login` was discarded.** An earlier iteration added a real `login`
+   command kind (throwaway `gjc --mode=rpc` process, OAuth-URL relaying to
+   Discord, copilot device-flow detection). It was removed: browser/device
+   OAuth flows can't be driven cleanly through the bridge (the loopback
+   callback only completes if the browser runs on the host, and copilot's
+   device flow is refused in RPC mode entirely). Provider auth is now expected
+   to be done once directly on the host terminal (`gjc` + `/login <provider>`);
+   the saved token in `~/.gjc` is reused by every later RPC session. All login
+   plumbing (bot `/login` command + `extractLoginRequest`/`formatLoginEvents`/
+   `finalizeLoginResult`, the daemon `login` kind, `SessionPool#runEphemeral`,
+   `LOGIN_TIMEOUT_MS`) has been deleted.
 
 ## Runtime: Bun vs Node
 
@@ -125,6 +137,22 @@ what `gjc` itself uses and was what full e2e verification ran under.
 - Multi-host management = **one bot process**, many daemons connecting to
   it (not one bot per host). Confirmed explicitly by the user.
 
+## Telegram forwarding / long-message rendering guideline
+
+When forwarding GJC session output into Telegram, do **not** assume Telegram will
+show one long message in full. Manual rendering checks showed long messages can
+be visually collapsed/truncated with a trailing `...`, especially around long
+code blocks, long single-line strings, and dense tabular/code-like content.
+
+Use these rules for Telegram delivery:
+- Split long chat-visible text into multiple messages at roughly 2,000-3,000
+  characters, with explicit `Part N/M` labels.
+- Prefer a short visible summary plus `.md`/`.txt`/`.log` attachment for long
+  code blocks, logs, tables, or content intended for exact copying.
+- Avoid very long single lines; wrap generated/plain text around 80-120
+  characters when possible.
+- Treat tables and aligned text as attachment-first content because mobile
+  widths break visual alignment easily.
 ## What is NOT done yet (pick up here)
 
 1. **Real Discord wiring never run end-to-end.** The non-Discord relay path is
@@ -150,10 +178,13 @@ what `gjc` itself uses and was what full e2e verification ran under.
 5. **No process supervision configured** — `README.md` mentions pm2/systemd
    as options but nothing is set up. Bot and each daemon currently need to
    be started manually.
-6. **`bot.js`'s `/hosts` and progress-streaming (tool-call preview during a
-   running command) are implemented but unverified against real Discord** —
-   only the underlying `HostRegistry`/`RpcSession` plumbing they depend on
-   has been tested.
+6. **`/hosts` and progress-streaming (tool-call preview during a running
+   command) are implemented but unverified against real Discord** — only the
+   underlying `HostRegistry`/`RpcSession` plumbing they depend on has been
+   tested. `/login` is now wired to the real `login` RPC command and its
+   copilot-refusal + anthropic-URL-relay paths were verified end-to-end through
+   a real `gjc --mode=rpc` (see bugs #5/#6), but the Discord-message rendering
+   of the surfaced URL has not been eyeballed in a real channel.
 
 ## Verification pattern to reuse
 

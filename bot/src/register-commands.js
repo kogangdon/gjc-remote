@@ -48,7 +48,6 @@ commands.push(
     )
     .toJSON()
 );
-
 // Host/session visibility.
 commands.push(
   new SlashCommandBuilder()

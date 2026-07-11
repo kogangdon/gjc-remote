@@ -5,6 +5,7 @@ import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
 
+
 const {
   DISCORD_TOKEN,
   GJC_BOT_ALLOWED_USERS,
@@ -212,50 +213,108 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   await deliver(result);
 }
 
+const CHUNK_LIMIT = 1900;
+const MAX_CHUNKS = 7;
+const CHUNK_DELAY_MS = 600;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function deliverInteraction(interaction, commandName, result) {
-  const header = result.ok ? `**/${commandName}** result:` : `**/${commandName}** failed:`;
-  const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
-  const body = `${header}\n${text}`;
-
-  const attachments = collectLocalAttachments(text, `${commandName}-attachment`);
-  const components = toolLogComponents(result.toolCalls);
-  if (attachments.length > 0) {
-    const content = `${header} (attached ${attachments.length} file${attachments.length === 1 ? "" : "s"})`;
-    await interaction.editReply({ content, files: attachments, components }).catch(() => {});
-    return;
-  }
-
-  if (body.length <= 1900) {
-    await interaction.editReply({ content: body, components }).catch(() => {});
-    return;
-  }
-
-  const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: `${commandName}-output.md` });
-  await interaction
-    .editReply({ content: `${header} (output attached, ${text.length} chars)`, files: [file], components })
-    .catch(() => {});
+  await deliverResult({
+    result,
+    header: result.ok ? `**/${commandName}** result:` : `**/${commandName}** failed:`,
+    baseName: `${commandName}-attachment`,
+    outputName: `${commandName}-output.md`,
+    sendFirst: (payload) => interaction.editReply(payload).catch(() => {}),
+    sendFollow: (payload) => interaction.followUp(payload).catch(() => {}),
+  });
 }
 
 async function deliverMessage(message, result) {
-  const header = result.ok ? "**GJC** result:" : "**GJC** failed:";
-  const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
-  const body = `${header}\n${text}`;
+  await deliverResult({
+    result,
+    header: result.ok ? "**GJC** result:" : "**GJC** failed:",
+    baseName: "gjc-attachment",
+    outputName: "gjc-output.md",
+    sendFirst: (payload) => message.edit(payload).catch(() => {}),
+    sendFollow: (payload) => message.channel.send(payload).catch(() => {}),
+  });
+}
 
-  const attachments = collectLocalAttachments(text, "gjc-attachment");
+/**
+ * Shared delivery: local-file attachments win; otherwise short output is sent
+ * inline. Long output is split into <=CHUNK_LIMIT `Part N/M` messages (paced to
+ * dodge Discord rate limits) as long as it fits within MAX_CHUNKS; beyond that
+ * it falls back to a single `.md` attachment.
+ */
+async function deliverResult({ result, header, baseName, outputName, sendFirst, sendFollow }) {
+  const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
   const components = toolLogComponents(result.toolCalls);
+
+  const attachments = collectLocalAttachments(text, baseName);
   if (attachments.length > 0) {
     const content = `${header} (attached ${attachments.length} file${attachments.length === 1 ? "" : "s"})`;
-    await message.edit({ content, files: attachments, components }).catch(() => {});
+    await sendFirst({ content, files: attachments, components });
     return;
   }
 
-  if (body.length <= 1900) {
-    await message.edit({ content: body, components }).catch(() => {});
+  const body = `${header}\n${text}`;
+  if (body.length <= CHUNK_LIMIT) {
+    await sendFirst({ content: body, components });
     return;
   }
 
-  const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "gjc-output.md" });
-  await message.edit({ content: `${header} (output attached, ${text.length} chars)`, files: [file], components }).catch(() => {});
+  const chunks = splitForDiscord(body, CHUNK_LIMIT);
+  if (chunks.length <= MAX_CHUNKS) {
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1;
+      const label = chunks.length > 1 ? `_(Part ${i + 1}/${chunks.length})_\n` : "";
+      const payload = { content: `${label}${chunks[i]}` };
+      if (isLast && components.length > 0) payload.components = components;
+      await (i === 0 ? sendFirst(payload) : sendFollow(payload));
+      if (!isLast) await sleep(CHUNK_DELAY_MS);
+    }
+    return;
+  }
+
+  const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: outputName });
+  await sendFirst({ content: `${header} (output attached, ${text.length} chars)`, files: [file], components });
+}
+
+/**
+ * Split text into <=limit pieces on line boundaries, hard-wrapping any single
+ * line longer than the budget, and closing/reopening ``` code fences so a split
+ * never leaves an unbalanced fence.
+ */
+function splitForDiscord(text, limit) {
+  const budget = limit - 8;
+  const lines = [];
+  for (const line of text.split("\n")) {
+    if (line.length <= budget) {
+      lines.push(line);
+      continue;
+    }
+    for (let i = 0; i < line.length; i += budget) lines.push(line.slice(i, i + budget));
+  }
+
+  const chunks = [];
+  let current = "";
+  let inFence = false;
+  const flush = () => {
+    if (!current) return;
+    chunks.push(inFence ? `${current}\n\`\`\`` : current);
+    current = inFence ? "```" : "";
+  };
+
+  for (const line of lines) {
+    const projected = current ? current.length + 1 + line.length : line.length;
+    const reserve = inFence ? 4 : 0;
+    if (current && projected + reserve > limit) flush();
+    current += current ? `\n${line}` : line;
+    if (/^\s*```/.test(line)) inFence = !inFence;
+  }
+  if (current) chunks.push(current);
+  return chunks;
 }
 
 
@@ -400,6 +459,7 @@ function toolInputLabel(input) {
   const label = input._i ?? input.command ?? input.path ?? input.pattern ?? input.subject ?? input.name ?? input.action;
   return typeof label === "string" ? label : "";
 }
+
 function extractAssistantText(evt) {
   const message = evt?.message ?? evt?.assistantMessageEvent?.message;
   if (message?.role !== "assistant") return "";
