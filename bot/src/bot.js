@@ -1,7 +1,10 @@
 import "dotenv/config";
-import { readFileSync, watch } from "node:fs";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
+import { parseAllowedUsers, parseChannelMap, parseHostTokens } from "./config.js";
+import { watchConfigFile } from "./config-watcher.js";
 import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
@@ -22,31 +25,26 @@ if (!DISCORD_TOKEN) {
 }
 
 // channels.json: { "<discordChannelId>": { "hostId": "...", "workDir": "..." } }
-const channelsPath = CHANNELS_CONFIG || fileURLToPath(new URL("../channels.json", import.meta.url));
+const channelsPath = resolve(CHANNELS_CONFIG || fileURLToPath(new URL("../channels.json", import.meta.url)));
 let channelMap;
 channelMap = loadChannelMap({ fatal: true });
-let channelWatchTimer;
-watch(channelsPath, { persistent: false }, () => {
-  clearTimeout(channelWatchTimer);
-  channelWatchTimer = setTimeout(() => loadChannelMap({ fatal: false }), 250);
-});
+watchConfigFile(channelsPath, () => loadChannelMap({ fatal: false }));
 
-// HOST_TOKENS: "hostId1:token1,hostId2:token2" — pre-shared keys daemons must present on register.
-const tokensByHostId = new Map(
-  (HOST_TOKENS || "")
-    .split(",")
-    .map((pair) => pair.trim())
-    .filter(Boolean)
-    .map((pair) => {
-      const [hostId, token] = pair.split(":");
-      return [hostId, token];
-    })
-);
+let tokensByHostId;
+let allowedUsers;
+try {
+  tokensByHostId = parseHostTokens(HOST_TOKENS || "");
+  allowedUsers = parseAllowedUsers(GJC_BOT_ALLOWED_USERS || "");
+} catch (error) {
+  console.error(`Invalid bot environment configuration: ${error.message}`);
+  process.exit(1);
+}
 
-const allowedUsers = (GJC_BOT_ALLOWED_USERS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+if (allowedUsers.length === 0) {
+  console.warn(
+    "SECURITY WARNING: GJC_BOT_ALLOWED_USERS is empty; every user in a mapped channel can run GJC commands."
+  );
+}
 
 const skillNames = new Set(GJC_SKILLS.map((s) => s.name));
 const registry = new HostRegistry({ port: Number(HOST_WS_PORT || 7711), tokensByHostId });
@@ -367,13 +365,20 @@ function extractTextFromContent(content) {
 
 function loadChannelMap({ fatal }) {
   try {
-    const nextMap = JSON.parse(readFileSync(channelsPath, "utf8"));
+    const nextMap = parseChannelMap(JSON.parse(readFileSync(channelsPath, "utf8")));
     const count = Object.keys(nextMap).length;
     channelMap = nextMap;
     console.log(`Loaded channel map from ${channelsPath}: ${count} channel${count === 1 ? "" : "s"}`);
     return nextMap;
-  } catch (err) {
-    console.error(`Missing/invalid channel map at ${channelsPath} (copy channels.example.json).`, err.message);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        event: fatal ? "channel_map_startup_failed" : "channel_map_reload_failed",
+        path: channelsPath,
+        error: error.message,
+      })
+    );
     if (fatal) process.exit(1);
     return channelMap;
   }
