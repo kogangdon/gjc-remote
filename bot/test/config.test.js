@@ -13,11 +13,13 @@ test("parseChannelMap normalizes POSIX and Windows routes and omits _comment", (
     _comment: "example routes",
     "123": { hostId: " posix-host ", workDir: " /srv/project " },
     "456": { hostId: " windows-host ", workDir: String.raw` C:\work\project ` },
+    "789": { hostId: "unc-host", workDir: String.raw` \\server\share\project ` },
   };
 
   assert.deepEqual(parseChannelMap(raw), {
     "123": { hostId: "posix-host", workDir: "/srv/project" },
     "456": { hostId: "windows-host", workDir: String.raw`C:\work\project` },
+    "789": { hostId: "unc-host", workDir: String.raw`\\server\share\project` },
   });
 });
 
@@ -81,8 +83,14 @@ test("parseChannelMap rejects empty route values and relative workDir", () => {
   );
   assert.throws(
     () => parseChannelMap({ "123": { hostId: "host", workDir: "relative/path" } }),
-    /CHANNEL_MAP route "123" workDir.*absolute/
+    /CHANNEL_MAP route "123" workDir.*fully qualified/
   );
+  for (const workDir of [String.raw`\project`, String.raw`\\server`]) {
+    assert.throws(
+      () => parseChannelMap({ "123": { hostId: "host", workDir } }),
+      /CHANNEL_MAP route "123" workDir.*fully qualified/
+    );
+  }
 });
 
 test("parseChannelMap rejects non-decimal channel keys", () => {
