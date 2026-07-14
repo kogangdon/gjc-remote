@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  loadChannelMapState,
   parseAllowedUsers,
   parseChannelMap,
   parseHostTokens,
+  validateChannelHosts,
 } from "../src/config.js";
 
 test("parseChannelMap normalizes POSIX and Windows routes and omits _comment", () => {
@@ -159,4 +161,63 @@ test("parseAllowedUsers rejects invalid and empty entries", () => {
     () => parseAllowedUsers("123,,456"),
     /ALLOWED_USERS entry 2.*empty/
   );
+});
+
+test("validateChannelHosts rejects unmapped credentials and allows unused tokens", () => {
+  const channelMap = {
+    "123": { hostId: "known", workDir: "/work" },
+  };
+  const tokens = new Map([
+    ["known", "token"],
+    ["unused", "other-token"],
+  ]);
+
+  assert.doesNotThrow(() => validateChannelHosts(channelMap, tokens));
+  assert.throws(
+    () => validateChannelHosts(channelMap, new Map([["other", "token"]])),
+    /route "123".*unknown hostId "known"/
+  );
+});
+
+test("loadChannelMapState swaps only fully valid replacements", () => {
+  const current = {
+    "123": { hostId: "known", workDir: "/old" },
+  };
+  const valid = loadChannelMapState({
+    current,
+    readText: () => JSON.stringify({ "456": { hostId: "known", workDir: "/new" } }),
+    validate: (next) => validateChannelHosts(next, new Map([["known", "token"]])),
+  });
+
+  assert.equal(valid.ok, true);
+  assert.deepEqual(valid.map, {
+    "456": { hostId: "known", workDir: "/new" },
+  });
+  assert.notEqual(valid.map, current);
+
+  for (const readText of [
+    () => "{",
+    () => JSON.stringify({ "456": { hostId: "missing", workDir: "/new" } }),
+  ]) {
+    const invalid = loadChannelMapState({
+      current: valid.map,
+      readText,
+      validate: (next) => validateChannelHosts(next, new Map([["known", "token"]])),
+    });
+
+    assert.equal(invalid.ok, false);
+    assert.equal(invalid.map, valid.map);
+    assert.ok(invalid.error instanceof Error);
+  }
+});
+
+test("loadChannelMapState reports startup failure without inventing a map", () => {
+  const result = loadChannelMapState({
+    current: undefined,
+    readText: () => "[]",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.map, undefined);
+  assert.match(result.error.message, /CHANNEL_MAP.*plain object/);
 });
