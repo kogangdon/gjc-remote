@@ -9,6 +9,12 @@ export class ToolLogStore {
   #maxEntries;
 
   constructor({ now = Date.now, ttlMs = TOOL_LOG_TTL_MS, maxEntries = TOOL_LOG_MAX_ENTRIES } = {}) {
+    if (typeof now !== "function") {
+      throw new TypeError("now must be a function");
+    }
+    if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+      throw new RangeError("ttlMs must be a non-negative finite number");
+    }
     if (!Number.isInteger(maxEntries) || maxEntries < 0) {
       throw new RangeError("maxEntries must be a non-negative integer");
     }
@@ -18,7 +24,7 @@ export class ToolLogStore {
   }
 
   add(toolCalls) {
-    const now = this.#now();
+    const now = this.#readNow();
     this.#pruneExpired(now);
 
     const id = String(++this.#nextId);
@@ -28,7 +34,7 @@ export class ToolLogStore {
   }
 
   get(id) {
-    this.#pruneExpired(this.#now());
+    this.#pruneExpired(this.#readNow());
     return this.#entries.get(id);
   }
 
@@ -36,6 +42,13 @@ export class ToolLogStore {
     return this.#entries.size;
   }
 
+  #readNow() {
+    const now = this.#now();
+    if (!Number.isFinite(now)) {
+      throw new RangeError("now must return a finite number");
+    }
+    return now;
+  }
   #pruneExpired(now) {
     for (const [id, entry] of this.#entries) {
       if (now - entry.createdAt >= this.#ttlMs) this.#entries.delete(id);
