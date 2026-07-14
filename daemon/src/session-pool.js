@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
 import { RpcSession } from "./rpc-client.js";
+import { validateNativeWorkDir } from "./work-dir.js";
 
 const GJC_BIN = process.env.GJC_BIN || "gjc";
 
@@ -34,6 +35,7 @@ export class SessionPool {
 
   /** @returns {RpcSession} */
   ensureSession(workDir) {
+    workDir = validateNativeWorkDir(workDir);
     const existing = this.sessions.get(workDir);
     if (existing && !existing.session.closed) {
       existing.lastUsed = Date.now();

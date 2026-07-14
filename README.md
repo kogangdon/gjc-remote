@@ -32,7 +32,7 @@ Discord-controlled remote GJC sessions.
 npm install   # installs both workspaces (bot, daemon, shared)
 
 # On the always-on bot host:
-cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS
+cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
 npm run register --workspace=bot    # publish slash commands to Discord
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
@@ -42,6 +42,12 @@ npm run start --workspace=bot
 cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bot's HOST_TOKENS), BOT_WS_URL
 npm run start --workspace=daemon
 ```
+
+Each `channels.json` route must contain exactly `hostId` and `workDir`.
+`hostId` must have a matching `HOST_TOKENS` entry, and `workDir` must be a
+fully-qualified path native to that daemon host (for example,
+`C:/projects/foo` on Windows or `/srv/apps/foo` on Linux/macOS). Relative paths
+and extra route fields are rejected.
 
 ## Verification
 
@@ -63,3 +69,6 @@ through the relay. It does not require Discord credentials.
   inviting the bot to any shared server — an unrestricted bot lets anyone in
   the channel run arbitrary GJC workflows (file writes, bash, etc.) on your
   hosts.
+- Invalid `channels.json`, `HOST_TOKENS`, or allowed-user entries fail before
+  routing starts. Every mapped `hostId` must have a configured token. A failed
+  `channels.json` reload keeps the last valid map.

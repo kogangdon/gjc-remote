@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/daemon.js",
   "scripts": {
-    "start": "node src/daemon.js"
+    "start": "node src/daemon.js",
+    "test": "node --test"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
