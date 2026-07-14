@@ -6,9 +6,9 @@ const DEBUG_RPC = process.env.GJC_REMOTE_DEBUG === "1";
  * channel. One instance == one live GJC RPC session for a given workDir.
  *
  * Protocol: write one JSON command per line to stdin; read newline-delimited
- * JSON events/responses from stdout. A `prompt`/`steer`/`follow_up` command's
- * lifecycle ends at `turn_end`/`agent_end`; other commands resolve on their
- * matching `{type:"response", command:<type>}` frame.
+ * JSON events/responses from stdout. A `prompt`/`steer`/`follow_up` command
+ * resolves at the full-run `agent_end` boundary; other commands resolve on
+ * their matching `{type:"response", command:<type>}` frame.
  *
  * GJC's streamed event frames do not echo the request `id`, so there is no
  * way to correlate a stray/late frame to a specific in-flight command when

@@ -79,15 +79,12 @@ runtime model switching as `/slash` commands.
    handing events to callers.
 2. **Concurrent-request correlation race.** GJC's streamed frames don't echo
    the request `id`, so there's no way to route a frame to a specific
-   in-flight command when more than one is outstanding. GJC also emits a
-   trailing `agent_end` echo *after* `turn_end` for the same turn. If a
-   second command had already dispatched by the time that echo arrived, it
-   used to get misrouted onto the new command (reproduced: asked for
-   "SECOND", got "FIRST" back). Fix: `RpcSession` in `rpc-client.js`
-   serializes all commands through a single-in-flight FIFO queue, and
-   **only `turn_end` is treated as a completion signal** — `agent_end` is
-   deliberately ignored (dropped by the `!waiter` guard once nothing is
-   listening for it anymore).
+   in-flight command when more than one is outstanding. GJC can emit
+   `turn_end` for intermediate tool-use turns before the full run reaches
+   `agent_end`. Fix: `RpcSession` in `rpc-client.js` serializes all commands
+   through a single-in-flight FIFO queue, resolves prompt-like commands only
+   at the full-run `agent_end` boundary, and holds the queue briefly so trailing
+   frames cannot be assigned to the next command.
 3. **`set_model` needs exact `{provider, modelId}`, not a free-text name.**
    Discord users type "haiku"/"opus"/etc; GJC's CLI does fuzzy matching
    internally for `--model` but the RPC protocol's `set_model` command does
@@ -127,6 +124,12 @@ runtime model switching as `/slash` commands.
    use but emits an explicit security warning. `SessionPool` independently
    rejects workDirs that are not fully-qualified paths under the daemon host's
    native path semantics before lookup or spawn.
+7. **RPC termination left unresolved work.** Child `exit`/`error` now rejects
+   the active command and every queued command exactly once. A command timeout
+   permanently closes and kills that RPC session instead of dispatching queued
+   work on a process whose late frames cannot be correlated safely. The next
+   request creates a replacement session, and a delayed exit from the poisoned
+   child cannot remove that replacement from `SessionPool`.
 
 ## Runtime: Bun vs Node
 
@@ -215,6 +218,6 @@ const pool = new SessionPool();
 const s = pool.ensureSession("<some existing dir>");
 const events = [];
 await s.send({ type: "prompt", message: "reply with exactly: X" }, e => events.push(e));
-console.log(events.find(e => e.type === "turn_end"));
+console.log(events.find(e => e.type === "agent_end"));
 pool.shutdown();
 ```
