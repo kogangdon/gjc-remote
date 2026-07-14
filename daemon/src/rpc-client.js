@@ -22,27 +22,22 @@ export class RpcSession {
   constructor(child) {
     this.child = child;
     this.buf = "";
-    /** @type {{ commandType: string, onEvent: (e: object) => void, resolve: () => void, reject: (e: Error) => void, timer: NodeJS.Timeout } | undefined} */
+    /** @type {{ command: object, onEvent: (e: object) => void, timeoutMs: number, resolve: () => void, reject: (e: Error) => void, timer?: NodeJS.Timeout, settled: boolean } | undefined} */
     this.current = undefined;
-    /** @type {Array<() => void>} */
+    /** @type {Array<{ command: object, onEvent: (e: object) => void, timeoutMs: number, resolve: () => void, reject: (e: Error) => void, timer?: NodeJS.Timeout, settled: boolean }>} */
     this.queue = [];
     this.closed = false;
     this.draining = false;
 
-
     child.stdout.on("data", (chunk) => this.#onData(chunk));
-    const onDeath = (err) => {
-      if (this.closed) return;
-      this.closed = true;
-      this.current?.reject(err instanceof Error ? err : new Error("gjc rpc process exited"));
-      this.current = undefined;
-      this.queue.length = 0;
-    };
-    child.on("exit", () => onDeath(new Error("gjc rpc process exited")));
-    child.on("error", onDeath);
+    child.on("exit", () => this.#terminate(new Error("gjc rpc process exited")));
+    child.on("error", (error) =>
+      this.#terminate(error instanceof Error ? error : new Error("gjc rpc process failed"))
+    );
   }
 
   #onData(chunk) {
+    if (this.closed) return;
     this.buf += chunk.toString();
     let idx;
     while ((idx = this.buf.indexOf("\n")) !== -1) {
@@ -76,34 +71,89 @@ export class RpcSession {
       // Resolve prompt-like commands only at `agent_end`; otherwise the relay
       // drops later tool-result/final-answer frames and Discord sees
       // "(no text output)" while the agent is still running.
-      if (innerType === "agent_end" && isPromptLike(waiter.commandType)) {
-        this.#settle(() => waiter.resolve(), 1000);
+      if (innerType === "agent_end" && isPromptLike(waiter.command.type)) {
+        this.#settle(waiter, undefined, 1000);
       } else if (evt.type === "response") {
         if (evt.success === false) {
-          this.#settle(() => waiter.reject(new Error(typeof evt.error === "string" ? evt.error : JSON.stringify(evt.error))));
+          this.#settle(waiter, new Error(typeof evt.error === "string" ? evt.error : JSON.stringify(evt.error)));
         } else if (evt.command !== "prompt" && evt.command !== "steer" && evt.command !== "follow_up") {
-          this.#settle(() => waiter.resolve());
+          this.#settle(waiter);
         }
       }
     }
   }
 
-  #settle(fn, drainDelayMs = 0) {
-    clearTimeout(this.current.timer);
+  #settle(request, error, drainDelayMs = 0) {
+    if (this.current !== request || request.settled) return;
+
+    clearTimeout(request.timer);
     this.current = undefined;
     this.draining = true;
+    request.settled = true;
     debugRpc("settle", { drainDelayMs, queueLength: this.queue.length });
-    fn();
+    if (error) request.reject(error);
+    else request.resolve();
+
     setTimeout(() => {
+      if (this.closed) return;
       this.draining = false;
       debugRpc("drain-ready", { queueLength: this.queue.length });
       this.#drainQueue();
     }, drainDelayMs);
   }
 
+  #terminate(error) {
+    if (this.closed) return false;
+
+    this.closed = true;
+    this.draining = false;
+
+    const pending = [];
+    if (this.current) pending.push(this.current);
+    pending.push(...this.queue);
+    this.current = undefined;
+    this.queue.length = 0;
+
+    for (const request of pending) {
+      clearTimeout(request.timer);
+      if (request.settled) continue;
+      request.settled = true;
+      request.reject(error);
+    }
+    return true;
+  }
+
   #drainQueue() {
+    if (this.closed || this.current || this.draining) return;
     const next = this.queue.shift();
-    if (next) next();
+    if (next) this.#dispatch(next);
+  }
+
+  #dispatch(request) {
+    if (this.closed || request.settled) return;
+
+    const id = request.command.id || randomUUID();
+    debugRpc("dispatch", { id, command: request.command.type, queueLength: this.queue.length });
+    const payload = { ...request.command, id };
+
+    request.timer = setTimeout(() => {
+      if (this.current !== request) return;
+      const terminated = this.#terminate(new Error("RPC command timed out"));
+      if (terminated) {
+        try {
+          this.child.kill();
+        } catch {
+          // The session is already poisoned and all requests are settled.
+        }
+      }
+    }, request.timeoutMs);
+
+    this.current = request;
+    try {
+      this.child.stdin.write(`${JSON.stringify(payload)}\n`);
+    } catch (error) {
+      this.#terminate(error instanceof Error ? error : new Error("gjc rpc process failed"));
+    }
   }
 
   /**
@@ -114,28 +164,24 @@ export class RpcSession {
   send(command, onEvent, timeoutMs = 10 * 60 * 1000) {
     if (this.closed) return Promise.reject(new Error("gjc rpc process is not running"));
 
-    const dispatch = () =>
-      new Promise((resolve, reject) => {
-        const id = command.id || randomUUID();
-        debugRpc("dispatch", { id, command: command.type, queueLength: this.queue.length });
-        const payload = { ...command, id };
-
-        const timer = setTimeout(() => {
-          this.current = undefined;
-          this.draining = false;
-          reject(new Error("RPC command timed out"));
-          this.#drainQueue();
-        }, timeoutMs);
-
-        this.current = { commandType: command.type, onEvent, resolve, reject, timer };
-        this.child.stdin.write(`${JSON.stringify(payload)}\n`);
-      });
-
-    if (!this.current && !this.draining) return dispatch();
-
     return new Promise((resolve, reject) => {
+      const request = {
+        command,
+        onEvent,
+        timeoutMs,
+        resolve,
+        reject,
+        timer: undefined,
+        settled: false,
+      };
+
+      if (!this.current && !this.draining) {
+        this.#dispatch(request);
+        return;
+      }
+
       debugRpc("queue", { command: command.type, queueLength: this.queue.length + 1, draining: this.draining });
-      this.queue.push(() => dispatch().then(resolve, reject));
+      this.queue.push(request);
     });
   }
 }

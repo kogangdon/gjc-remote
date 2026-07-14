@@ -15,9 +15,11 @@ const GJC_BIN = process.env.GJC_BIN || "gjc";
  * IDLE_TIMEOUT_MS (1 hour).
  */
 export class SessionPool {
-  constructor() {
+  constructor({ spawnFn = spawn, existsSyncFn = existsSync } = {}) {
     /** @type {Map<string, { session: RpcSession, lastUsed: number }>} */
     this.sessions = new Map();
+    this.spawnFn = spawnFn;
+    this.existsSyncFn = existsSyncFn;
     this.reapTimer = setInterval(() => this.#reapIdle(), 5 * 60 * 1000);
     this.reapTimer.unref?.();
   }
@@ -42,20 +44,23 @@ export class SessionPool {
       return existing.session;
     }
 
-    if (!existsSync(workDir)) {
+    if (!this.existsSyncFn(workDir)) {
       throw new Error(`workDir does not exist on this host: ${workDir}`);
     }
 
-    const child = spawn(
+    const child = this.spawnFn(
       GJC_BIN,
       ["--mode=rpc", "--session-dir", join(workDir, ".gjc-remote-session")],
       { cwd: workDir, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
     );
+    const session = new RpcSession(child);
 
     child.stderr.on("data", (d) => console.error(`[gjc:${workDir}]`, d.toString().trim()));
     child.on("exit", (code) => {
       console.log(`SessionPool: gjc rpc for ${workDir} exited (${code})`);
-      this.sessions.delete(workDir);
+      if (this.sessions.get(workDir)?.session === session) {
+        this.sessions.delete(workDir);
+      }
     });
     // Without this handler, a spawn failure (e.g. GJC_BIN missing/ENOENT)
     // surfaces as an uncaught 'error' event and crashes the whole daemon
@@ -63,10 +68,11 @@ export class SessionPool {
     // instead so in-flight/queued send() calls reject cleanly.
     child.on("error", (err) => {
       console.error(`SessionPool: gjc rpc spawn failed for ${workDir}:`, err.message);
-      this.sessions.delete(workDir);
+      if (this.sessions.get(workDir)?.session === session) {
+        this.sessions.delete(workDir);
+      }
     });
 
-    const session = new RpcSession(child);
     this.sessions.set(workDir, { session, lastUsed: Date.now() });
     return session;
   }
