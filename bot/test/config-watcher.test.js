@@ -8,6 +8,7 @@ function createHarness() {
     clearCalls: [],
     closeCalls: 0,
     timers: [],
+    watcherHandlers: new Map(),
   };
 
   harness.watchFn = (directory, options, callback) => {
@@ -15,6 +16,10 @@ function createHarness() {
     harness.watchOptions = options;
     harness.callback = callback;
     return {
+      on(event, handler) {
+        harness.watcherHandlers.set(event, handler);
+        return this;
+      },
       close() {
         harness.closeCalls++;
       },
@@ -98,6 +103,18 @@ test("restarts the debounce timer and invokes onChange once with no arguments", 
 
   secondTimer.callback();
   assert.deepEqual(calls, [[]]);
+});
+
+test("handles watcher errors through the configured callback", () => {
+  const filePath = join("config", "channels.json");
+  const harness = createHarness();
+  const errors = [];
+  const error = new Error("watch failed");
+
+  start(filePath, () => {}, harness, { onError: (value) => errors.push(value) });
+  harness.watcherHandlers.get("error")(error);
+
+  assert.deepEqual(errors, [error]);
 });
 
 test("close is idempotent, clears pending work, and blocks late callbacks", () => {

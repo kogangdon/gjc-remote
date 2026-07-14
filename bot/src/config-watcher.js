@@ -6,6 +6,11 @@ export function watchConfigFile(filePath, onChange, options = {}) {
   const setTimeoutFn = options.setTimeoutFn ?? setTimeout;
   const clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
   const delayMs = options.delayMs ?? 250;
+  const onError =
+    options.onError ??
+    ((error) => {
+      console.error(`Config watcher error for ${filePath}: ${error?.message ?? String(error)}`);
+    });
   const directory = dirname(filePath);
   const target = basename(filePath);
 
@@ -22,6 +27,10 @@ export function watchConfigFile(filePath, onChange, options = {}) {
       if (!closed) onChange();
     }, delayMs);
   });
+
+  if (typeof watcher.on === "function") {
+    watcher.on("error", onError);
+  }
 
   return {
     close() {
