@@ -1,14 +1,4 @@
-import path from "node:path";
-const WINDOWS_DRIVE_ROOT = /^[A-Za-z]:[\\/]/;
-const WINDOWS_UNC_PATH = /^[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/].*)?$/;
-
-function isFullyQualifiedRoutePath(workDir) {
-  return (
-    path.posix.isAbsolute(workDir) ||
-    WINDOWS_DRIVE_ROOT.test(workDir) ||
-    WINDOWS_UNC_PATH.test(workDir)
-  );
-}
+import { isFullyQualifiedRouteWorkDir } from "@gjc-remote/shared/work-dir.js";
 
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -73,7 +63,7 @@ export function parseChannelMap(raw) {
       route.workDir,
       `CHANNEL_MAP route "${channelId}" workDir`
     );
-    if (!isFullyQualifiedRoutePath(workDir)) {
+    if (!isFullyQualifiedRouteWorkDir(workDir)) {
       throw new Error(`CHANNEL_MAP route "${channelId}" workDir must be fully qualified`);
     }
 

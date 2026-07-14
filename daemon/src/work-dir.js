@@ -1,18 +1,7 @@
-import { posix } from "node:path";
-
-const WINDOWS_DRIVE_ROOT = /^[A-Za-z]:[\\/]/;
-const WINDOWS_UNC_PATH = /^[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/].*)?$/;
+import { isFullyQualifiedNativeWorkDir } from "@gjc-remote/shared/work-dir.js";
 
 export function isFullyQualifiedWorkDir(workDir, platform = process.platform) {
-  if (typeof workDir !== "string" || workDir.length === 0 || workDir.trim() !== workDir) {
-    return false;
-  }
-
-  if (platform === "win32") {
-    return WINDOWS_DRIVE_ROOT.test(workDir) || WINDOWS_UNC_PATH.test(workDir);
-  }
-
-  return posix.isAbsolute(workDir);
+  return isFullyQualifiedNativeWorkDir(workDir, platform);
 }
 
 export function validateNativeWorkDir(workDir, platform = process.platform) {
