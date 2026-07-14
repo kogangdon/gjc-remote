@@ -5,6 +5,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits
 import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
+import { ToolLogStore } from "./tool-log-store.js";
 
 const {
   DISCORD_TOKEN,
@@ -49,8 +50,7 @@ const allowedUsers = (GJC_BOT_ALLOWED_USERS || "")
 
 const skillNames = new Set(GJC_SKILLS.map((s) => s.name));
 const registry = new HostRegistry({ port: Number(HOST_WS_PORT || 7711), tokensByHostId });
-const toolLogStore = new Map();
-let toolLogSeq = 0;
+const toolLogStore = new ToolLogStore();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -271,9 +271,7 @@ async function handleButtonInteraction(interaction) {
 
 function toolLogComponents(toolCalls) {
   if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
-  const id = String(++toolLogSeq);
-  toolLogStore.set(id, { toolCalls, createdAt: Date.now() });
-  pruneToolLogs();
+  const id = toolLogStore.add(toolCalls);
 
   return [
     new ActionRowBuilder().addComponents(
@@ -318,13 +316,6 @@ function toolCallSignature(toolCall) {
   if (toolCall.id) return JSON.stringify(["id", toolCall.id]);
   if (toolCall.label) return JSON.stringify(["label", toolCall.name, toolCall.label]);
   return JSON.stringify(["input", toolCall.name, toolCall.input]);
-}
-
-function pruneToolLogs() {
-  const cutoff = Date.now() - 60 * 60 * 1000;
-  for (const [id, entry] of toolLogStore) {
-    if (entry.createdAt < cutoff || toolLogStore.size > 100) toolLogStore.delete(id);
-  }
 }
 
 function extractToolCall(evt) {
