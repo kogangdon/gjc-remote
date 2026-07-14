@@ -9,6 +9,9 @@ export class ToolLogStore {
   #maxEntries;
 
   constructor({ now = Date.now, ttlMs = TOOL_LOG_TTL_MS, maxEntries = TOOL_LOG_MAX_ENTRIES } = {}) {
+    if (!Number.isInteger(maxEntries) || maxEntries < 0) {
+      throw new RangeError("maxEntries must be a non-negative integer");
+    }
     this.#now = now;
     this.#ttlMs = ttlMs;
     this.#maxEntries = maxEntries;
