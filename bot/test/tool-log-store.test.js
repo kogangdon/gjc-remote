@@ -56,3 +56,25 @@ test("zero tool log capacity discards new entries", () => {
   assert.equal(store.get(id), undefined);
   assert.equal(store.size, 0);
 });
+
+test("tool log store rejects invalid clocks and TTL values", () => {
+  assert.throws(() => new ToolLogStore({ now: 0 }), /now must be a function/);
+
+  for (const ttlMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => new ToolLogStore({ ttlMs }), /ttlMs must be a non-negative finite number/);
+  }
+});
+
+test("tool log store rejects non-finite clock results", () => {
+  for (const now of [Number.NaN, Number.POSITIVE_INFINITY]) {
+    const store = new ToolLogStore({ now: () => now });
+    assert.throws(() => store.add([{ name: "read" }]), /now must return a finite number/);
+  }
+
+  let now = 0;
+  const store = new ToolLogStore({ now: () => now });
+  const id = store.add([{ name: "read" }]);
+
+  now = Number.NaN;
+  assert.throws(() => store.get(id), /now must return a finite number/);
+});
