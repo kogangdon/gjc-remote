@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
 import { RpcSession } from "./rpc-client.js";
@@ -15,11 +15,16 @@ const GJC_BIN = process.env.GJC_BIN || "gjc";
  * IDLE_TIMEOUT_MS (1 hour).
  */
 export class SessionPool {
-  constructor({ spawnFn = spawn, existsSyncFn = existsSync } = {}) {
+  constructor({
+    spawnFn = spawn,
+    existsSyncFn = existsSync,
+    realpathSyncFn = realpathSync.native,
+  } = {}) {
     /** @type {Map<string, { session: RpcSession, lastUsed: number }>} */
     this.sessions = new Map();
     this.spawnFn = spawnFn;
     this.existsSyncFn = existsSyncFn;
+    this.realpathSyncFn = realpathSyncFn;
     this.reapTimer = setInterval(() => this.#reapIdle(), 5 * 60 * 1000);
     this.reapTimer.unref?.();
   }
@@ -37,15 +42,23 @@ export class SessionPool {
 
   /** @returns {RpcSession} */
   ensureSession(workDir) {
-    workDir = validateNativeWorkDir(workDir);
+    const requestedWorkDir = validateNativeWorkDir(workDir);
+    if (!this.existsSyncFn(requestedWorkDir)) {
+      throw new Error(`workDir does not exist on this host: ${requestedWorkDir}`);
+    }
+
+    try {
+      workDir = validateNativeWorkDir(this.realpathSyncFn(requestedWorkDir));
+    } catch (error) {
+      throw new Error(`workDir cannot be resolved on this host: ${requestedWorkDir}`, {
+        cause: error,
+      });
+    }
+
     const existing = this.sessions.get(workDir);
     if (existing && !existing.session.closed) {
       existing.lastUsed = Date.now();
       return existing.session;
-    }
-
-    if (!this.existsSyncFn(workDir)) {
-      throw new Error(`workDir does not exist on this host: ${workDir}`);
     }
 
     const child = this.spawnFn(
