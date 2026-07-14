@@ -1,10 +1,10 @@
 import "dotenv/config";
-import { existsSync, readFileSync, statSync, watch } from "node:fs";
+import { readFileSync, watch } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
+import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
-
 
 const {
   DISCORD_TOKEN,
@@ -120,6 +120,11 @@ client.on("interactionCreate", async (interaction) => {
     channelId: interaction.channelId,
     edit: (content) => interaction.editReply(content),
     deliver: (result) => deliverInteraction(interaction, commandName, result),
+  }).catch(async (error) => {
+    console.error(`Failed to handle /${commandName} interaction:`, error);
+    await interaction.editReply("GJC request failed before a result could be delivered.").catch((editError) => {
+      console.error(`Failed to report /${commandName} interaction error:`, editError);
+    });
   });
 });
 
@@ -151,6 +156,11 @@ client.on("messageCreate", async (message) => {
     channelId: message.channelId,
     edit: (content) => progressMessage.edit(content),
     deliver: (result) => deliverMessage(progressMessage, result),
+  }).catch(async (error) => {
+    console.error("Failed to handle message delivery:", error);
+    await progressMessage.edit("GJC request failed before a result could be delivered.").catch((editError) => {
+      console.error("Failed to report message delivery error:", editError);
+    });
   });
 });
 
@@ -213,20 +223,14 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   await deliver(result);
 }
 
-const CHUNK_LIMIT = 1900;
-const MAX_CHUNKS = 7;
-const CHUNK_DELAY_MS = 600;
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 async function deliverInteraction(interaction, commandName, result) {
   await deliverResult({
     result,
     header: result.ok ? `**/${commandName}** result:` : `**/${commandName}** failed:`,
-    baseName: `${commandName}-attachment`,
     outputName: `${commandName}-output.md`,
-    sendFirst: (payload) => interaction.editReply(payload).catch(() => {}),
-    sendFollow: (payload) => interaction.followUp(payload).catch(() => {}),
+    components: toolLogComponents(result.toolCalls),
+    sendFirst: (payload) => interaction.editReply(payload),
+    sendFollow: (payload) => interaction.followUp(payload),
   });
 }
 
@@ -234,89 +238,12 @@ async function deliverMessage(message, result) {
   await deliverResult({
     result,
     header: result.ok ? "**GJC** result:" : "**GJC** failed:",
-    baseName: "gjc-attachment",
     outputName: "gjc-output.md",
-    sendFirst: (payload) => message.edit(payload).catch(() => {}),
-    sendFollow: (payload) => message.channel.send(payload).catch(() => {}),
+    components: toolLogComponents(result.toolCalls),
+    sendFirst: (payload) => message.edit(payload),
+    sendFollow: (payload) => message.channel.send(payload),
   });
 }
-
-/**
- * Shared delivery: local-file attachments win; otherwise short output is sent
- * inline. Long output is split into <=CHUNK_LIMIT `Part N/M` messages (paced to
- * dodge Discord rate limits) as long as it fits within MAX_CHUNKS; beyond that
- * it falls back to a single `.md` attachment.
- */
-async function deliverResult({ result, header, baseName, outputName, sendFirst, sendFollow }) {
-  const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
-  const components = toolLogComponents(result.toolCalls);
-
-  const attachments = collectLocalAttachments(text, baseName);
-  if (attachments.length > 0) {
-    const content = `${header} (attached ${attachments.length} file${attachments.length === 1 ? "" : "s"})`;
-    await sendFirst({ content, files: attachments, components });
-    return;
-  }
-
-  const body = `${header}\n${text}`;
-  if (body.length <= CHUNK_LIMIT) {
-    await sendFirst({ content: body, components });
-    return;
-  }
-
-  const chunks = splitForDiscord(body, CHUNK_LIMIT);
-  if (chunks.length <= MAX_CHUNKS) {
-    for (let i = 0; i < chunks.length; i++) {
-      const isLast = i === chunks.length - 1;
-      const label = chunks.length > 1 ? `_(Part ${i + 1}/${chunks.length})_\n` : "";
-      const payload = { content: `${label}${chunks[i]}` };
-      if (isLast && components.length > 0) payload.components = components;
-      await (i === 0 ? sendFirst(payload) : sendFollow(payload));
-      if (!isLast) await sleep(CHUNK_DELAY_MS);
-    }
-    return;
-  }
-
-  const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: outputName });
-  await sendFirst({ content: `${header} (output attached, ${text.length} chars)`, files: [file], components });
-}
-
-/**
- * Split text into <=limit pieces on line boundaries, hard-wrapping any single
- * line longer than the budget, and closing/reopening ``` code fences so a split
- * never leaves an unbalanced fence.
- */
-function splitForDiscord(text, limit) {
-  const budget = limit - 8;
-  const lines = [];
-  for (const line of text.split("\n")) {
-    if (line.length <= budget) {
-      lines.push(line);
-      continue;
-    }
-    for (let i = 0; i < line.length; i += budget) lines.push(line.slice(i, i + budget));
-  }
-
-  const chunks = [];
-  let current = "";
-  let inFence = false;
-  const flush = () => {
-    if (!current) return;
-    chunks.push(inFence ? `${current}\n\`\`\`` : current);
-    current = inFence ? "```" : "";
-  };
-
-  for (const line of lines) {
-    const projected = current ? current.length + 1 + line.length : line.length;
-    const reserve = inFence ? 4 : 0;
-    if (current && projected + reserve > limit) flush();
-    current += current ? `\n${line}` : line;
-    if (/^\s*```/.test(line)) inFence = !inFence;
-  }
-  if (current) chunks.push(current);
-  return chunks;
-}
-
 
 async function handleButtonInteraction(interaction) {
   if (allowedUsers.length > 0 && !allowedUsers.includes(interaction.user.id)) {
@@ -333,12 +260,12 @@ async function handleButtonInteraction(interaction) {
   }
 
   const text = formatToolLog(entry.toolCalls);
-  if (text.length <= 1900) {
+  if (text.length <= CHUNK_LIMIT) {
     await interaction.reply({ content: text, ephemeral: true }).catch(() => {});
     return;
   }
 
-  const file = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "gjc-tool-log.md" });
+  const file = createTextAttachment(text, "gjc-tool-log.md");
   await interaction.reply({ content: `Tool log (${entry.toolCalls.length} calls)`, files: [file], ephemeral: true }).catch(() => {});
 }
 
@@ -383,7 +310,7 @@ function recordToolCall(toolCalls, seenToolCalls, toolCall) {
   if (seenToolCalls.has(signature)) return false;
 
   seenToolCalls.add(signature);
-  toolCalls.push({ ...toolCall, signature });
+  toolCalls.push(toolCall);
   return true;
 }
 
@@ -399,42 +326,6 @@ function pruneToolLogs() {
     if (entry.createdAt < cutoff || toolLogStore.size > 100) toolLogStore.delete(id);
   }
 }
-
-function collectLocalAttachments(text, baseName) {
-  const paths = extractLocalAttachmentPaths(text);
-  return paths.map((filePath, index) => new AttachmentBuilder(filePath, { name: attachmentName(filePath, baseName, index) }));
-}
-
-function extractLocalAttachmentPaths(text) {
-  const candidates = new Set();
-  const patterns = [
-    /[A-Za-z]:\\[^\r\n"'<>|?*]+?\.(?:png|jpe?g|webp|gif|txt|md|json|csv|log|pdf|zip)/gi,
-    /\/[^\s"'<>]+?\.(?:png|jpe?g|webp|gif|txt|md|json|csv|log|pdf|zip)/gi,
-  ];
-
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      candidates.add(match[0].replace(/[),.;:]+$/g, ""));
-    }
-  }
-
-  return [...candidates].filter((filePath) => {
-    try {
-      if (!existsSync(filePath)) return false;
-      const stat = statSync(filePath);
-      return stat.isFile() && stat.size > 0 && stat.size <= 25 * 1024 * 1024;
-    } catch {
-      return false;
-    }
-  });
-}
-
-function attachmentName(filePath, baseName, index) {
-  const normalized = filePath.replaceAll("\\", "/");
-  const original = normalized.slice(normalized.lastIndexOf("/") + 1);
-  return original || `${baseName}-${index + 1}`;
-}
-
 
 function extractToolCall(evt) {
   if (evt?.type === "toolCall" && typeof evt.name === "string") return normalizeToolCall(evt);

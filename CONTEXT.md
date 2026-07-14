@@ -11,7 +11,7 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `team`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (confirmed, implemented, e2e-tested)
+## Architecture (implemented; local relay e2e-tested)
 
 ```
 [host machine, per project]                    [always-on bot host, private network]
@@ -181,10 +181,13 @@ Use these rules for Telegram delivery:
 6. **`/hosts` and progress-streaming (tool-call preview during a running
    command) are implemented but unverified against real Discord** — only the
    underlying `HostRegistry`/`RpcSession` plumbing they depend on has been
-   tested. `/login` is now wired to the real `login` RPC command and its
-   copilot-refusal + anthropic-URL-relay paths were verified end-to-end through
-   a real `gjc --mode=rpc` (see bugs #5/#6), but the Discord-message rendering
-   of the surfaced URL has not been eyeballed in a real channel.
+   tested.
+7. **Remote host files are not attached automatically.** Assistant output may
+   contain absolute paths from the daemon host, but the Discord bot treats those
+   paths as text. It never reads matching paths from the bot host. A future
+   daemon-to-bot file transfer requires an explicit allowlisted protocol; the
+   generated long-output and tool-log attachments remain supported because they
+   are created in memory by the bot.
 
 ## Verification pattern to reuse
 

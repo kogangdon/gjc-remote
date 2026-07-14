@@ -6,7 +6,8 @@
   "main": "src/bot.js",
   "scripts": {
     "register": "node src/register-commands.js",
-    "start": "node src/bot.js"
+    "start": "node src/bot.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
