@@ -119,11 +119,14 @@ runtime model switching as `/slash` commands.
    `LOGIN_TIMEOUT_MS`) has been deleted.
 6. **Bot routing/auth configuration was unvalidated.** `channels.json` routes,
    `HOST_TOKENS`, and `GJC_BOT_ALLOWED_USERS` are now parsed through pure
-   validators before use. Startup rejects malformed values; reload parses a
-   complete replacement before swapping and keeps the previous map on failure.
-   The watcher follows the parent directory so atomic replace/rename saves do
-   not detach it. An empty allowed-user list remains backward-compatible for
-   local use but emits an explicit security warning.
+   validators before use. Every route host must have a configured token.
+   Startup rejects malformed values; reload parses and cross-checks a complete
+   replacement before swapping and keeps the previous map on failure. The
+   watcher follows the parent directory so atomic replace/rename saves do not
+   detach it. An empty allowed-user list remains backward-compatible for local
+   use but emits an explicit security warning. `SessionPool` independently
+   rejects workDirs that are not fully-qualified paths under the daemon host's
+   native path semantics before lookup or spawn.
 
 ## Runtime: Bun vs Node
 

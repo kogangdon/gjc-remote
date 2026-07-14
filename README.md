@@ -43,6 +43,12 @@ cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bo
 npm run start --workspace=daemon
 ```
 
+Each `channels.json` route must contain exactly `hostId` and `workDir`.
+`hostId` must have a matching `HOST_TOKENS` entry, and `workDir` must be a
+fully-qualified path native to that daemon host (for example,
+`C:/projects/foo` on Windows or `/srv/apps/foo` on Linux/macOS). Relative paths
+and extra route fields are rejected.
+
 ## Verification
 
 ```bash
@@ -64,4 +70,5 @@ through the relay. It does not require Discord credentials.
   the channel run arbitrary GJC workflows (file writes, bash, etc.) on your
   hosts.
 - Invalid `channels.json`, `HOST_TOKENS`, or allowed-user entries fail before
-  routing starts. A failed `channels.json` reload keeps the last valid map.
+  routing starts. Every mapped `hostId` must have a configured token. A failed
+  `channels.json` reload keeps the last valid map.
