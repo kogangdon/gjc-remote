@@ -42,3 +42,17 @@ test("tool log capacity evicts the oldest entries", () => {
   assert.equal(store.get(thirdId)?.toolCalls[0].name, "third");
   assert.equal(store.size, 2);
 });
+
+test("tool log capacity rejects invalid limits", () => {
+  for (const maxEntries of [-1, 1.5, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => new ToolLogStore({ maxEntries }), /maxEntries must be a non-negative integer/);
+  }
+});
+
+test("zero tool log capacity discards new entries", () => {
+  const store = new ToolLogStore({ maxEntries: 0 });
+  const id = store.add([{ name: "discarded" }]);
+
+  assert.equal(store.get(id), undefined);
+  assert.equal(store.size, 0);
+});
