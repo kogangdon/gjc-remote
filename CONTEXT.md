@@ -33,8 +33,10 @@ runtime model switching as `/slash` commands.
    sessions (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are killed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
-   each Discord channel to one `{hostId, workDir}` pair via
-   `bot/channels.json` (gitignored — copy from `channels.example.json`).
+   each Discord channel to one validated `{hostId, workDir}` pair via
+   `bot/channels.json` (gitignored — copy from `channels.example.json`). The bot
+   watches the parent directory so editor replace/rename saves reload safely;
+   an invalid reload keeps the last valid map.
    In mapped channels, ordinary non-bot messages from allowed users are treated
    as direct GJC prompts; slash commands remain available for skills, `/model`,
    and `/hosts`.
@@ -115,6 +117,13 @@ runtime model switching as `/slash` commands.
    plumbing (bot `/login` command + `extractLoginRequest`/`formatLoginEvents`/
    `finalizeLoginResult`, the daemon `login` kind, `SessionPool#runEphemeral`,
    `LOGIN_TIMEOUT_MS`) has been deleted.
+6. **Bot routing/auth configuration was unvalidated.** `channels.json` routes,
+   `HOST_TOKENS`, and `GJC_BOT_ALLOWED_USERS` are now parsed through pure
+   validators before use. Startup rejects malformed values; reload parses a
+   complete replacement before swapping and keeps the previous map on failure.
+   The watcher follows the parent directory so atomic replace/rename saves do
+   not detach it. An empty allowed-user list remains backward-compatible for
+   local use but emits an explicit security warning.
 
 ## Runtime: Bun vs Node
 

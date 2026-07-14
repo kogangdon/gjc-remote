@@ -32,7 +32,7 @@ Discord-controlled remote GJC sessions.
 npm install   # installs both workspaces (bot, daemon, shared)
 
 # On the always-on bot host:
-cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS
+cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
 npm run register --workspace=bot    # publish slash commands to Discord
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
@@ -63,3 +63,5 @@ through the relay. It does not require Discord credentials.
   inviting the bot to any shared server — an unrestricted bot lets anyone in
   the channel run arbitrary GJC workflows (file writes, bash, etc.) on your
   hosts.
+- Invalid `channels.json`, `HOST_TOKENS`, or allowed-user entries fail before
+  routing starts. A failed `channels.json` reload keeps the last valid map.
