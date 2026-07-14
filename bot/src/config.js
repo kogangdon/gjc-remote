@@ -135,3 +135,25 @@ export function parseAllowedUsers(raw) {
 
   return allowedUsers;
 }
+
+export function validateChannelHosts(channelMap, hostTokens) {
+  if (!(hostTokens instanceof Map)) {
+    throw new TypeError("HOST_TOKENS must be parsed before validating CHANNEL_MAP");
+  }
+
+  for (const [channelId, route] of Object.entries(channelMap)) {
+    if (!hostTokens.has(route.hostId)) {
+      throw new Error(`CHANNEL_MAP route "${channelId}" references unknown hostId "${route.hostId}"`);
+    }
+  }
+}
+
+export function loadChannelMapState({ current, readText, validate = () => {} }) {
+  try {
+    const next = parseChannelMap(JSON.parse(readText()));
+    validate(next);
+    return { ok: true, map: next };
+  } catch (error) {
+    return { ok: false, map: current, error };
+  }
+}
