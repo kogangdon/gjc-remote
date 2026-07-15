@@ -9,6 +9,7 @@ import {
   parseHostTokens,
   validateChannelHosts,
 } from "./config.js";
+import { createAuthorizationPolicy, parseRequireAllowlist } from "./authorization.js";
 import { watchConfigFile } from "./config-watcher.js";
 import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
@@ -19,6 +20,7 @@ import { ToolLogStore } from "./tool-log-store.js";
 const {
   DISCORD_TOKEN,
   GJC_BOT_ALLOWED_USERS,
+  GJC_REMOTE_REQUIRE_ALLOWLIST,
   CHANNELS_CONFIG,
   HOST_WS_PORT,
   HOST_TOKENS,
@@ -31,16 +33,18 @@ if (!DISCORD_TOKEN) {
 }
 
 let tokensByHostId;
-let allowedUsers;
+let authorization;
 try {
   tokensByHostId = parseHostTokens(HOST_TOKENS || "");
-  allowedUsers = parseAllowedUsers(GJC_BOT_ALLOWED_USERS || "");
+  const allowedUsers = parseAllowedUsers(GJC_BOT_ALLOWED_USERS || "");
+  const requireAllowlist = parseRequireAllowlist(GJC_REMOTE_REQUIRE_ALLOWLIST);
+  authorization = createAuthorizationPolicy(allowedUsers, { required: requireAllowlist });
 } catch (error) {
   console.error(`Invalid bot environment configuration: ${error.message}`);
   process.exit(1);
 }
 
-if (allowedUsers.length === 0) {
+if (authorization.unrestricted) {
   console.warn(
     "SECURITY WARNING: GJC_BOT_ALLOWED_USERS is empty; every user in a mapped channel can run GJC commands."
   );
@@ -72,7 +76,7 @@ client.on("interactionCreate", async (interaction) => {
 
   if (!interaction.isChatInputCommand()) return;
 
-  if (allowedUsers.length > 0 && !allowedUsers.includes(interaction.user.id)) {
+  if (!authorization.isAuthorized(interaction.user.id)) {
     await interaction.reply({ content: "You are not authorized to run GJC commands.", ephemeral: true });
     return;
   }
@@ -138,7 +142,7 @@ client.on("messageCreate", async (message) => {
   const prompt = message.content.trim();
   if (!prompt) return;
 
-  if (allowedUsers.length > 0 && !allowedUsers.includes(message.author.id)) return;
+  if (!authorization.isAuthorized(message.author.id)) return;
 
   const route = channelMap[message.channelId];
   if (!route) return;
@@ -254,7 +258,7 @@ async function deliverMessage(message, result) {
 }
 
 async function handleButtonInteraction(interaction) {
-  if (allowedUsers.length > 0 && !allowedUsers.includes(interaction.user.id)) {
+  if (!authorization.isAuthorized(interaction.user.id)) {
     await interaction.reply({ content: "You are not authorized to view GJC tool logs.", ephemeral: true }).catch(() => {});
     return;
   }
