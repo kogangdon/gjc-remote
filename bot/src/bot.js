@@ -13,6 +13,7 @@ import { watchConfigFile } from "./config-watcher.js";
 import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
+import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
 import { ToolLogStore } from "./tool-log-store.js";
 
 const {
@@ -181,6 +182,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   const startedAt = Date.now();
   const toolCalls = [];
   const seenToolCalls = new Set();
+  let modelReceipt;
 
   let preview = "";
   const editProgress = (force = false) => {
@@ -204,6 +206,8 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   try {
     editProgress(true);
     result = await registry.invoke(route.hostId, route.workDir, command, (evt) => {
+      const receipt = validateModelResolvedEvent(evt);
+      if (receipt) modelReceipt = receipt;
 
       const toolCall = extractToolCall(evt);
       if (toolCall && recordToolCall(toolCalls, seenToolCalls, toolCall)) {
@@ -219,6 +223,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   } finally {
     clearInterval(heartbeat);
   }
+  result = transformModelResult(command, result, modelReceipt);
 
   if (result) result.toolCalls = toolCalls;
   debugRemote("result", { requestLabel, ok: result?.ok, hasText: Boolean(result?.text), error: result?.error });

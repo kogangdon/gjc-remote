@@ -13,8 +13,11 @@
  *   type: "invoke",
  *   requestId: string,
  *   workDir: string,
- *   command: { kind: "prompt" | "steer" | "follow_up", message: string } | { kind: "set_model", modelName: string },
+ *   command: { kind: "prompt" | "steer" | "follow_up", message: string }
+ *     | { kind: "set_model", modelName: string },
  * }} InvokeMessage
+ *
+ * `set_model.modelName` is a unique name/id query or exact `provider:modelId`.
  */
 
 /**

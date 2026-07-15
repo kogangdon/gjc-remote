@@ -43,7 +43,7 @@ commands.push(
     .addStringOption((opt) =>
       opt
         .setName("name")
-        .setDescription("Model name (fuzzy match: opus, sonnet, gpt-5.2, ...)")
+        .setDescription("Unique model name/ID or exact provider:modelId")
         .setRequired(true)
     )
     .toJSON()
