@@ -7,6 +7,7 @@ const hostId = process.env.SMOKE_HOST_ID || "local-smoke";
 const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
 const workDir = process.env.SMOKE_WORK_DIR || process.cwd();
 const expected = "SMOKE_OK";
+const modelQuery = process.env.SMOKE_MODEL_QUERY;
 
 const registry = new HostRegistry({
   port,
@@ -48,7 +49,24 @@ try {
     throw new Error(`unexpected text: ${JSON.stringify(result.text)} (expected ${expected})`);
   }
 
-  console.log(JSON.stringify({ ok: true, hostId, workDir, text: result.text }));
+  let model;
+  if (modelQuery) {
+    const modelEvents = [];
+    const modelResult = await registry.invoke(
+      hostId,
+      workDir,
+      { kind: "set_model", modelName: modelQuery },
+      (event) => modelEvents.push(event),
+      120_000
+    );
+    if (!modelResult.ok) {
+      throw new Error(`model invoke failed: ${modelResult.error ?? "unknown error"}`);
+    }
+
+    model = modelEvents.find((event) => event?.type === "model_resolved");
+    if (!model) throw new Error("model invoke returned no model_resolved receipt");
+  }
+  console.log(JSON.stringify({ ok: true, hostId, workDir, text: result.text, model }));
 } finally {
   daemon.kill();
   await closeRegistry(registry);

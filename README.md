@@ -51,15 +51,27 @@ fully-qualified path native to that daemon host (for example,
 `C:/projects/foo` on Windows or `/srv/apps/foo` on Linux/macOS). Relative paths
 and extra route fields are rejected.
 
+`/model` accepts an exact `provider:modelId` (for example,
+`openai-codex:gpt-5.6-sol`) or an unqualified model ID/display-name fragment.
+Unqualified input is accepted only when it has one uniquely best match;
+ambiguous requests fail with a bounded candidate list instead of selecting a
+provider implicitly. A successful switch reports the selected display name,
+provider, and model ID. It does not change the daemon's startup default.
+
 ## Verification
 
 ```bash
 npm run smoke:local
+# Also verify model resolution and its structured success receipt:
+SMOKE_MODEL_QUERY=sol npm run smoke:local   # POSIX shell
+# PowerShell: $env:SMOKE_MODEL_QUERY="sol"; npm run smoke:local
 ```
 
 `smoke:local` starts a local `HostRegistry`, spawns a real daemon, routes one
 prompt through `gjc --mode=rpc`, and asserts that the assistant text comes back
-through the relay. It does not require Discord credentials.
+through the relay. When `SMOKE_MODEL_QUERY` is set, it also performs a real
+model switch and requires a `model_resolved` receipt. It does not require
+Discord credentials.
 
 ## Security notes
 

@@ -87,14 +87,15 @@ runtime model switching as `/slash` commands.
    at the full-run `agent_end` boundary, and holds the queue briefly so trailing
    frames cannot be assigned to the next command.
 3. **`set_model` needs exact `{provider, modelId}`, not a free-text name.**
-   Discord users type "haiku"/"opus"/etc; GJC's CLI does fuzzy matching
-   internally for `--model` but the RPC protocol's `set_model` command does
-   not. Fix: `daemon/src/model-lookup.js#resolveModel` calls
-   `get_available_models` first and fuzzy-matches (exact id match wins;
-   otherwise substring match on id/name, preferring entries whose name
-   contains "(latest)", then shorter ids). Verified: "haiku" -> `Anthropic
-   Haiku 4.5 (latest)` / `claude-haiku-4-5`, applied and confirmed via a
-   follow-up prompt.
+   Discord users may provide exact `provider:modelId`, a unique model ID, or a
+   unique display-name/ID fragment. `daemon/src/model-lookup.js` validates the
+   `get_available_models` response and refuses cross-provider or equal-rank
+   ambiguity instead of selecting by list order. `model-command.js` sends the
+   resolved exact pair and emits a bounded `model_resolved` receipt only after
+   success; the bot formats that receipt so `/model` never succeeds with
+   `(no text output)`. Verified against real GJC: `sol` resolved to
+   `openai-codex:gpt-5.6-sol` (`GPT-5.6 Sol`). Startup model selection remains
+   unchanged.
 4. **Daemon-wide crash on spawn failure.** A `child_process.spawn` `ENOENT`
    (e.g. bad `workDir`, missing `GJC_BIN`) fires an async `'error'` event,
    not a throw — an unhandled one crashes the whole Node/Bun process, not
