@@ -53,11 +53,19 @@ test("an exiting poisoned child does not remove its replacement session", () => 
   }
 });
 
-test("canonical workDir aliases reuse one session and one spawn path", () => {
+test("canonical workDir aliases reuse one session without repeated filesystem work", () => {
   const spawnCalls = [];
+  let existsCalls = 0;
+  let realpathCalls = 0;
   const pool = new SessionPool({
-    existsSyncFn: () => true,
-    realpathSyncFn: () => WORK_DIR,
+    existsSyncFn: () => {
+      existsCalls += 1;
+      return true;
+    },
+    realpathSyncFn: () => {
+      realpathCalls += 1;
+      return WORK_DIR;
+    },
     spawnFn: (...args) => {
       spawnCalls.push(args);
       return new FakeChild();
@@ -69,11 +77,52 @@ test("canonical workDir aliases reuse one session and one spawn path", () => {
     const second = pool.ensureSession(WORK_DIR);
 
     assert.strictEqual(second, first);
+    assert.equal(existsCalls, 1);
+    assert.equal(realpathCalls, 1);
     assert.equal(spawnCalls.length, 1);
     assert.equal(spawnCalls[0][2].cwd, WORK_DIR);
     assert.equal(spawnCalls[0][1][2], join(WORK_DIR, ".gjc-remote-session"));
   } finally {
     pool.shutdown();
+  }
+});
+
+test("Windows native realpaths normalize extended prefixes and case aliases", () => {
+  const cases = [
+    {
+      first: String.raw`c:\work`,
+      second: String.raw`C:\WORK`,
+      resolved: String.raw`\\?\C:\Work`,
+      canonical: String.raw`C:\Work`,
+    },
+    {
+      first: String.raw`\\server\share\work`,
+      second: String.raw`\\SERVER\SHARE\WORK`,
+      resolved: String.raw`\\?\UNC\Server\Share\Work`,
+      canonical: String.raw`\\Server\Share\Work`,
+    },
+  ];
+
+  for (const { first, second, resolved, canonical } of cases) {
+    const spawnCalls = [];
+    const pool = new SessionPool({
+      platform: "win32",
+      existsSyncFn: () => true,
+      realpathSyncFn: () => resolved,
+      spawnFn: (...args) => {
+        spawnCalls.push(args);
+        return new FakeChild();
+      },
+    });
+
+    try {
+      const original = pool.ensureSession(first);
+      assert.strictEqual(pool.ensureSession(second), original);
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0][2].cwd, canonical);
+    } finally {
+      pool.shutdown();
+    }
   }
 });
 
