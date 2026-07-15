@@ -25,7 +25,7 @@ export class SessionPool {
   constructor({
     spawnFn = spawn,
     existsSyncFn = existsSync,
-    realpathSyncFn = realpathSync.native,
+    realpathSyncFn = realpathSync.native ?? realpathSync,
     platform = process.platform,
   } = {}) {
     /** @type {Map<string, { session: RpcSession, lastUsed: number }>} */
