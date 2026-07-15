@@ -2,7 +2,7 @@ import "dotenv/config";
 import WebSocket from "ws";
 import { MSG_TYPES } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
-import { resolveModel } from "./model-lookup.js";
+import { setSessionModel } from "./model-command.js";
 
 const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
 
@@ -61,7 +61,7 @@ async function handleMessage(raw) {
     const session = pool.ensureSession(workDir);
 
     if (command.kind === "set_model") {
-      await setModel(session, command, (event) => send(event));
+      await setSessionModel(session, command, (event) => send(event));
     } else {
       const rpcCommand = toRpcCommand(command);
       await session.send(rpcCommand, (event) => send(event));
@@ -73,25 +73,6 @@ async function handleMessage(raw) {
   }
 }
 
-/**
- * `set_model` needs the exact {provider, modelId} pair; Discord users type a
- * free-text name (e.g. "haiku"), so this resolves it against the session's
- * own `get_available_models` list before issuing the real `set_model` call.
- */
-async function setModel(session, command, onEvent) {
-  const listEvents = [];
-  await session.send({ type: "get_available_models" }, (e) => listEvents.push(e));
-  const listResponse = listEvents.find((e) => e.command === "get_available_models");
-  const models = listResponse?.data?.models ?? [];
-
-  const match = resolveModel(models, command.modelName);
-  if (!match) {
-    throw new Error(`No model matches "${command.modelName}". Try a more specific name.`);
-  }
-
-  await session.send({ type: "set_model", provider: match.provider, modelId: match.modelId }, onEvent);
-  onEvent({ type: "model_resolved", name: match.name, provider: match.provider, modelId: match.modelId });
-}
 
 function toRpcCommand(command) {
   switch (command.kind) {
