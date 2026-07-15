@@ -1,6 +1,12 @@
 export function parseRequireAllowlist(raw) {
-  if (raw === undefined || raw === "" || raw === "0") return false;
-  if (raw === "1") return true;
+  if (raw === undefined) return false;
+  if (typeof raw !== "string") {
+    throw new TypeError('GJC_REMOTE_REQUIRE_ALLOWLIST must be unset, empty, "0", or "1".');
+  }
+
+  const value = raw.trim();
+  if (value === "" || value === "0") return false;
+  if (value === "1") return true;
 
   throw new TypeError('GJC_REMOTE_REQUIRE_ALLOWLIST must be unset, empty, "0", or "1".');
 }

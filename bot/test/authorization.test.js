@@ -2,15 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createAuthorizationPolicy, parseRequireAllowlist } from "../src/authorization.js";
 
-test("parseRequireAllowlist accepts only disabled and enabled values", () => {
-  for (const raw of [undefined, "", "0"]) {
+test("parseRequireAllowlist accepts trimmed disabled and enabled values", () => {
+  for (const raw of [undefined, "", "  ", "0", " 0 "]) {
     assert.equal(parseRequireAllowlist(raw), false);
   }
-  assert.equal(parseRequireAllowlist("1"), true);
+  for (const raw of ["1", " 1 "]) {
+    assert.equal(parseRequireAllowlist(raw), true);
+  }
 });
 
 test("parseRequireAllowlist rejects every other value with a config error", () => {
-  for (const raw of [null, 0, 1, false, true, "  ", "00", "true", "false", "2"]) {
+  for (const raw of [null, 0, 1, false, true, "00", "true", "false", "2"]) {
     assert.throws(() => parseRequireAllowlist(raw), /GJC_REMOTE_REQUIRE_ALLOWLIST.*unset.*"0".*"1"/);
   }
 });
