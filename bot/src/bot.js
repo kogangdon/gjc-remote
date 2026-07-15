@@ -10,6 +10,10 @@ import {
   validateChannelHosts,
 } from "./config.js";
 import { createAuthorizationPolicy, parseRequireAllowlist } from "./authorization.js";
+import {
+  dispatchAuthorizedInteraction,
+  dispatchAuthorizedMessage,
+} from "./authorized-dispatch.js";
 import { watchConfigFile } from "./config-watcher.js";
 import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
@@ -69,18 +73,15 @@ client.once("clientReady", () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-  if (interaction.isButton()) {
-    await handleButtonInteraction(interaction);
-    return;
-  }
+  await dispatchAuthorizedInteraction({
+    interaction,
+    authorization,
+    onButton: handleButtonInteraction,
+    onChatInput: handleChatInputInteraction,
+  });
+});
 
-  if (!interaction.isChatInputCommand()) return;
-
-  if (!authorization.isAuthorized(interaction.user.id)) {
-    await interaction.reply({ content: "You are not authorized to run GJC commands.", ephemeral: true });
-    return;
-  }
-
+async function handleChatInputInteraction(interaction) {
   const { commandName } = interaction;
 
   if (commandName === "hosts") {
@@ -134,15 +135,19 @@ client.on("interactionCreate", async (interaction) => {
       console.error(`Failed to report /${commandName} interaction error:`, editError);
     });
   });
-});
+}
 
 client.on("messageCreate", async (message) => {
-  if (message.author.bot || !message.guildId) return;
+  await dispatchAuthorizedMessage({
+    message,
+    authorization,
+    onMessage: handleAuthorizedMessage,
+  });
+});
 
+async function handleAuthorizedMessage(message) {
   const prompt = message.content.trim();
   if (!prompt) return;
-
-  if (!authorization.isAuthorized(message.author.id)) return;
 
   const route = channelMap[message.channelId];
   if (!route) return;
@@ -170,7 +175,7 @@ client.on("messageCreate", async (message) => {
       console.error("Failed to report message delivery error:", editError);
     });
   });
-});
+}
 
 async function runAndDeliver({ commandName, command, route, requestLabel, userId, channelId, edit, deliver }) {
   debugRemote("request", {
@@ -258,10 +263,6 @@ async function deliverMessage(message, result) {
 }
 
 async function handleButtonInteraction(interaction) {
-  if (!authorization.isAuthorized(interaction.user.id)) {
-    await interaction.reply({ content: "You are not authorized to view GJC tool logs.", ephemeral: true }).catch(() => {});
-    return;
-  }
 
   if (!interaction.customId.startsWith("tool-log:")) return;
   const id = interaction.customId.slice("tool-log:".length);

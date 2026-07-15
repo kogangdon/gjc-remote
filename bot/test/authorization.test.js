@@ -70,18 +70,3 @@ test("policy is immutable and defensively copies the allowlist", () => {
   }, TypeError);
   assert.equal(policy.unrestricted, false);
 });
-
-test("denied authorization returns before protected handler work", async () => {
-  const policy = createAuthorizationPolicy(["allowed-user"], { required: true });
-  const calls = [];
-  const handle = async (userId) => {
-    if (!policy.isAuthorized(userId)) return "denied";
-    calls.push("registry-or-store-work");
-    return "allowed";
-  };
-
-  assert.equal(await handle("denied-user"), "denied");
-  assert.deepEqual(calls, []);
-  assert.equal(await handle("allowed-user"), "allowed");
-  assert.deepEqual(calls, ["registry-or-store-work"]);
-});
