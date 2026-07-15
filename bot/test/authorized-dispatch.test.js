@@ -88,6 +88,7 @@ test("unauthorized tool-log button is denied ephemerally before store work", asy
   const replies = [];
   const interaction = {
     user: { id: "denied-user" },
+    customId: "tool:missing",
     isButton: () => true,
     isChatInputCommand: () => false,
     reply(payload) {
