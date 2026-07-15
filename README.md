@@ -22,10 +22,11 @@ Discord-controlled remote GJC sessions.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `team`, `ultragoal`), `/gjc`,
    `/model`, and `/hosts` as Discord slash commands.
-4. Each Discord channel maps to one `(hostId, workDir)` pair via
-   `bot/channels.json`. A host only accepts commands while its daemon is
-   connected — turning the daemon off makes that channel's commands fail
-   fast instead of hanging.
+4. Each Discord channel configures one `{hostId, workDir}` input via
+   `bot/channels.json`. The daemon canonicalizes `workDir`, so the effective
+   session identity is `(hostId, canonical workDir)`. A host only accepts
+   commands while its daemon is connected — turning the daemon off makes that
+   channel's commands fail fast instead of hanging.
 
 ## Setup
 
