@@ -65,6 +65,24 @@ test("unauthorized slash command is denied ephemerally before registry work", as
   ]);
 });
 
+test("unauthorized slash command remains denied when the reply fails", async () => {
+  const interaction = {
+    user: { id: "denied-user" },
+    isButton: () => false,
+    isChatInputCommand: () => true,
+    reply: () => Promise.reject(new Error("interaction expired")),
+  };
+
+  const status = await dispatchAuthorizedInteraction({
+    interaction,
+    authorization,
+    onButton: () => assert.fail("button handler must not run"),
+    onChatInput: () => assert.fail("chat handler must not run"),
+  });
+
+  assert.equal(status, "denied");
+});
+
 test("unauthorized tool-log button is denied ephemerally before store work", async () => {
   const { calls, store } = protectedFakes();
   const replies = [];

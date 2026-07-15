@@ -21,10 +21,12 @@ export async function dispatchAuthorizedInteraction({
 
   if (!interaction.isChatInputCommand()) return "ignored";
   if (!authorization.isAuthorized(interaction.user.id)) {
-    await interaction.reply({
-      content: "You are not authorized to run GJC commands.",
-      ephemeral: true,
-    });
+    await interaction
+      .reply({
+        content: "You are not authorized to run GJC commands.",
+        ephemeral: true,
+      })
+      .catch(() => {});
     return "denied";
   }
 
