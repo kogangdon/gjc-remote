@@ -19,7 +19,14 @@ export async function setSessionModel(session, command, onEvent) {
   let listResponse;
   try {
     await session.send({ type: "get_available_models" }, (event) => {
-      if (event?.command === "get_available_models") listResponse = event;
+      if (
+        listResponse === undefined &&
+        event?.command === "get_available_models" &&
+        event.data &&
+        Object.prototype.hasOwnProperty.call(event.data, "models")
+      ) {
+        listResponse = event;
+      }
     });
   } catch {
     throw new Error(LIST_ERROR);

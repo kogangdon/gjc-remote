@@ -103,6 +103,7 @@ test("setSessionModel sends the exact set_model payload and receipt after succes
       commands.push(command);
       if (command.type === "get_available_models") {
         onEvent({ command: "get_available_models", data: { models: MODELS } });
+        onEvent({ type: "response", command: "get_available_models", success: true });
         return;
       }
       onEvent({ type: "response", command: "set_model", success: true });
