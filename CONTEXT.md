@@ -27,9 +27,10 @@ runtime model switching as `/slash` commands.
    NAT/firewall with no inbound port, and does not need to be always-on —
    when its daemon isn't connected, the bot treats that host's channels as
    offline and fails fast instead of hanging.
-2. On the first Discord command routed to a given `workDir`, the daemon
-   spawns `gjc --mode=rpc` (stdio, cwd=workDir) and keeps talking to it over
-   its stdin/stdout for subsequent commands on the same `workDir`. Idle
+2. On the first Discord command routed to a given `workDir`, the daemon resolves
+   it to the host filesystem's canonical real path, spawns `gjc --mode=rpc`
+   (stdio, cwd=canonical workDir), and keeps talking to it over stdin/stdout.
+   Different path spellings for the same directory share one session. Idle
    sessions (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are killed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
@@ -130,6 +131,11 @@ runtime model switching as `/slash` commands.
    work on a process whose late frames cannot be correlated safely. The next
    request creates a replacement session, and a delayed exit from the poisoned
    child cannot remove that replacement from `SessionPool`.
+8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
+   now resolves every existing native workDir through the host filesystem and
+   uses that canonical real path for the pool key, child cwd, and session-dir.
+   Separator, case, or symlink aliases that resolve to one directory therefore
+   reuse one live GJC process.
 
 ## Runtime: Bun vs Node
 
@@ -147,8 +153,9 @@ what `gjc` itself uses and was what full e2e verification ran under.
 - Host<->bot auth: pre-shared per-host tokens (`HOST_TOKENS` on bot,
   `HOST_TOKEN` on each daemon), explicitly deferred stronger auth
   (mTLS/keypairs) to "later, if it becomes a problem."
-- Session key / isolation unit = **(hostId, workDir)** pair, one Discord
-  channel maps to exactly one pair via `bot/channels.json`.
+- Session key / isolation unit = **(hostId, canonical workDir)** pair; one
+  Discord channel maps to a configured `{hostId, workDir}` and the daemon
+  canonicalizes that path before lookup or spawn.
 - Multi-host management = **one bot process**, many daemons connecting to
   it (not one bot per host). Confirmed explicitly by the user.
 
