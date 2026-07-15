@@ -5,11 +5,17 @@ import test from "node:test";
 
 const botDir = fileURLToPath(new URL("..", import.meta.url));
 
+function withoutDotenvConfig(env) {
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => !key.toUpperCase().startsWith("DOTENV_CONFIG_"))
+  );
+}
+
 test("strict mode rejects an empty allowlist before bot services start", () => {
   const result = spawnSync(process.execPath, ["src/bot.js"], {
     cwd: botDir,
     env: {
-      ...process.env,
+      ...withoutDotenvConfig(process.env),
       DISCORD_TOKEN: "startup-test-token",
       GJC_BOT_ALLOWED_USERS: "",
       GJC_REMOTE_REQUIRE_ALLOWLIST: "1",
