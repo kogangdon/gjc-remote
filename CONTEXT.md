@@ -158,6 +158,11 @@ what `gjc` itself uses and was what full e2e verification ran under.
 - Host<->bot auth: pre-shared per-host tokens (`HOST_TOKENS` on bot,
   `HOST_TOKEN` on each daemon), explicitly deferred stronger auth
   (mTLS/keypairs) to "later, if it becomes a problem."
+- Host<->bot WebSocket frames are text JSON with an **8 MiB inbound cap** on
+  both endpoints. Required v0 register/invoke/event fields are validated
+  fail-closed while unknown extra object fields remain available for additive
+  compatibility. Event `requestId` values are accepted only from the exact
+  daemon socket that owns the pending invocation.
 - Session key / isolation unit = **(hostId, canonical workDir)** pair; one
   Discord channel maps to a configured `{hostId, workDir}` and the daemon
   canonicalizes that path before lookup or spawn.
