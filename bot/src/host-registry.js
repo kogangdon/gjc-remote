@@ -1,6 +1,12 @@
 import { WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
-import { MSG_TYPES } from "@gjc-remote/shared";
+import {
+  MAX_WS_PAYLOAD_BYTES,
+  MSG_TYPES,
+  isEventMessage,
+  isPongMessage,
+  isRegisterMessage,
+} from "@gjc-remote/shared";
 
 /**
  * WS server that host daemons connect to (outbound from the daemon's side).
@@ -16,7 +22,7 @@ export class HostRegistry {
     /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string }>} */
     this.pendingRequests = new Map();
 
-    this.wss = new WebSocketServer({ port });
+    this.wss = new WebSocketServer({ port, maxPayload: MAX_WS_PAYLOAD_BYTES });
     this.wss.on("connection", (socket) => this.#handleConnection(socket));
     console.log(`HostRegistry: WS server listening on :${port}`);
   }
@@ -24,7 +30,7 @@ export class HostRegistry {
   #handleConnection(socket) {
     let hostId;
 
-    socket.once("message", (raw) => {
+    socket.once("message", (raw, isBinary) => {
       let msg;
       try {
         msg = JSON.parse(raw.toString());
@@ -32,8 +38,8 @@ export class HostRegistry {
         socket.close(1008, "invalid json");
         return;
       }
-      if (msg.type !== MSG_TYPES.REGISTER) {
-        socket.close(1008, "expected register");
+      if (isBinary || !isRegisterMessage(msg)) {
+        socket.close(1008, "invalid register");
         return;
       }
       const expectedToken = this.tokensByHostId.get(msg.hostId);
@@ -48,7 +54,9 @@ export class HostRegistry {
       socket.send(JSON.stringify({ type: MSG_TYPES.REGISTER_OK }));
       console.log(`HostRegistry: host '${hostId}' connected (${msg.label ?? "no label"})`);
 
-      socket.on("message", (raw2) => this.#handleMessage(hostId, raw2));
+      socket.on("message", (raw2, isBinary2) =>
+        this.#handleMessage(socket, raw2, isBinary2)
+      );
       socket.on("close", () => {
         if (this.connections.get(hostId) === socket) this.connections.delete(hostId);
         this.#failPendingForSocket(socket, `host '${hostId}' disconnected`);
@@ -59,24 +67,39 @@ export class HostRegistry {
     socket.on("error", (err) => console.error("HostRegistry socket error:", err.message));
   }
 
-  #handleMessage(hostId, raw) {
+  #handleMessage(socket, raw, isBinary) {
+    if (isBinary) {
+      socket.close(1008, "invalid frame");
+      return;
+    }
+
     let msg;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      socket.close(1008, "invalid json");
       return;
     }
-    if (msg.type !== MSG_TYPES.EVENT) return;
+
+    if (isPongMessage(msg)) return;
+    if (!isEventMessage(msg)) {
+      socket.close(1008, "invalid event");
+      return;
+    }
 
     const pending = this.pendingRequests.get(msg.requestId);
     if (!pending) return;
+    if (pending.socket !== socket) {
+      socket.close(1008, "request owner mismatch");
+      return;
+    }
 
-    if (msg.error) {
+    if (msg.error !== undefined) {
       pending.resolve({ ok: false, error: msg.error });
       this.pendingRequests.delete(msg.requestId);
       return;
     }
-    if (msg.event) {
+    if (msg.event !== undefined) {
       const text = extractAssistantText(msg.event);
       if (text !== undefined) pending.text = text;
       pending.onEvent(msg.event);
