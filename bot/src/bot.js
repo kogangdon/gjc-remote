@@ -9,6 +9,11 @@ import {
   parseHostTokens,
   validateChannelHosts,
 } from "./config.js";
+import { createAuthorizationPolicy, parseRequireAllowlist } from "./authorization.js";
+import {
+  dispatchAuthorizedInteraction,
+  dispatchAuthorizedMessage,
+} from "./authorized-dispatch.js";
 import { watchConfigFile } from "./config-watcher.js";
 import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
@@ -19,6 +24,7 @@ import { ToolLogStore } from "./tool-log-store.js";
 const {
   DISCORD_TOKEN,
   GJC_BOT_ALLOWED_USERS,
+  GJC_REMOTE_REQUIRE_ALLOWLIST,
   CHANNELS_CONFIG,
   HOST_WS_PORT,
   HOST_TOKENS,
@@ -31,16 +37,18 @@ if (!DISCORD_TOKEN) {
 }
 
 let tokensByHostId;
-let allowedUsers;
+let authorization;
 try {
   tokensByHostId = parseHostTokens(HOST_TOKENS || "");
-  allowedUsers = parseAllowedUsers(GJC_BOT_ALLOWED_USERS || "");
+  const allowedUsers = parseAllowedUsers(GJC_BOT_ALLOWED_USERS || "");
+  const requireAllowlist = parseRequireAllowlist(GJC_REMOTE_REQUIRE_ALLOWLIST);
+  authorization = createAuthorizationPolicy(allowedUsers, { required: requireAllowlist });
 } catch (error) {
   console.error(`Invalid bot environment configuration: ${error.message}`);
   process.exit(1);
 }
 
-if (allowedUsers.length === 0) {
+if (authorization.unrestricted) {
   console.warn(
     "SECURITY WARNING: GJC_BOT_ALLOWED_USERS is empty; every user in a mapped channel can run GJC commands."
   );
@@ -65,18 +73,15 @@ client.once("clientReady", () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-  if (interaction.isButton()) {
-    await handleButtonInteraction(interaction);
-    return;
-  }
+  await dispatchAuthorizedInteraction({
+    interaction,
+    authorization,
+    onButton: handleButtonInteraction,
+    onChatInput: handleChatInputInteraction,
+  });
+});
 
-  if (!interaction.isChatInputCommand()) return;
-
-  if (allowedUsers.length > 0 && !allowedUsers.includes(interaction.user.id)) {
-    await interaction.reply({ content: "You are not authorized to run GJC commands.", ephemeral: true });
-    return;
-  }
-
+async function handleChatInputInteraction(interaction) {
   const { commandName } = interaction;
 
   if (commandName === "hosts") {
@@ -130,15 +135,19 @@ client.on("interactionCreate", async (interaction) => {
       console.error(`Failed to report /${commandName} interaction error:`, editError);
     });
   });
-});
+}
 
 client.on("messageCreate", async (message) => {
-  if (message.author.bot || !message.guildId) return;
+  await dispatchAuthorizedMessage({
+    message,
+    authorization,
+    onMessage: handleAuthorizedMessage,
+  });
+});
 
+async function handleAuthorizedMessage(message) {
   const prompt = message.content.trim();
   if (!prompt) return;
-
-  if (allowedUsers.length > 0 && !allowedUsers.includes(message.author.id)) return;
 
   const route = channelMap[message.channelId];
   if (!route) return;
@@ -166,7 +175,7 @@ client.on("messageCreate", async (message) => {
       console.error("Failed to report message delivery error:", editError);
     });
   });
-});
+}
 
 async function runAndDeliver({ commandName, command, route, requestLabel, userId, channelId, edit, deliver }) {
   debugRemote("request", {
@@ -254,10 +263,6 @@ async function deliverMessage(message, result) {
 }
 
 async function handleButtonInteraction(interaction) {
-  if (allowedUsers.length > 0 && !allowedUsers.includes(interaction.user.id)) {
-    await interaction.reply({ content: "You are not authorized to view GJC tool logs.", ephemeral: true }).catch(() => {});
-    return;
-  }
 
   if (!interaction.customId.startsWith("tool-log:")) return;
   const id = interaction.customId.slice("tool-log:".length);

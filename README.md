@@ -36,6 +36,7 @@ npm install   # installs both workspaces (bot, daemon, shared)
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
+# For shared/production deployments, set GJC_REMOTE_REQUIRE_ALLOWLIST=1.
 npm run register --workspace=bot    # publish slash commands to Discord
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
 npm run start --workspace=bot
@@ -83,6 +84,9 @@ Discord credentials.
   inviting the bot to any shared server — an unrestricted bot lets anyone in
   the channel run arbitrary GJC workflows (file writes, bash, etc.) on your
   hosts.
-- Invalid `channels.json`, `HOST_TOKENS`, or allowed-user entries fail before
-  routing starts. Every mapped `hostId` must have a configured token. A failed
-  `channels.json` reload keeps the last valid map.
+  Set `GJC_REMOTE_REQUIRE_ALLOWLIST=1` for shared/production deployments so the
+  bot refuses to start with an empty allowlist. Both authorization settings are
+  startup-only and require a bot restart after changes.
+- Invalid `channels.json`, `HOST_TOKENS`, allowed-user entries, or strict
+  allowlist flags fail before routing starts. Every mapped `hostId` must have a
+  configured token. A failed `channels.json` reload keeps the last valid map.

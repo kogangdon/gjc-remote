@@ -123,7 +123,11 @@ runtime model switching as `/slash` commands.
    replacement before swapping and keeps the previous map on failure. The
    watcher follows the parent directory so atomic replace/rename saves do not
    detach it. An empty allowed-user list remains backward-compatible for local
-   use but emits an explicit security warning. `SessionPool` independently
+   use but emits an explicit security warning. Shared/production deployments
+   set `GJC_REMOTE_REQUIRE_ALLOWLIST=1`, which rejects an empty allowlist before
+   channel watching, WS startup, or Discord login. Slash commands, mapped
+   plain chat, and tool-log buttons use one startup authorization policy;
+   changes to either allowlist setting require a bot restart. `SessionPool`
    rejects workDirs that are not fully-qualified paths under the daemon host's
    native path semantics before lookup or spawn.
 7. **RPC termination left unresolved work.** Child `exit`/`error` now rejects
@@ -192,6 +196,9 @@ Use these rules for Telegram delivery:
    before inviting the bot anywhere shared (unrestricted = anyone in-channel
    can run arbitrary GJC workflows — file writes, bash, etc. — on every
    connected host).
+   Shared/production deployment must also set
+   `GJC_REMOTE_REQUIRE_ALLOWLIST=1`; local unrestricted mode remains available
+   only for backward-compatible development and emits a startup warning.
 4. **Linux/macOS daemon path unverified.** Everything was built and tested
    on native Windows (this repo's origin host). The stdio-based
    `gjc --mode=rpc` approach *should* be OS-agnostic (no socket files, no
