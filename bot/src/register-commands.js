@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { REST, Routes, SlashCommandBuilder } from "discord.js";
+import { V0_LIMITS } from "@gjc-remote/shared";
 import { GJC_SKILLS } from "./skills.js";
 
 const { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID } = process.env;
@@ -44,6 +45,7 @@ commands.push(
       opt
         .setName("name")
         .setDescription("Unique model name/ID or exact provider:modelId")
+        .setMaxLength(V0_LIMITS.MODEL_NAME)
         .setRequired(true)
     )
     .toJSON()

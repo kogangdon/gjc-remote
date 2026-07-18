@@ -80,6 +80,14 @@ Discord credentials.
   private network — never expose it to the public internet.
 - `HOST_TOKENS`/`HOST_TOKEN` are pre-shared keys; treat them like passwords.
   Rotate per host if one is compromised.
+- WebSocket frames are text JSON, capped at 8 MiB on both bot and daemon,
+  validated against the required v0 fields, and rejected before routing when
+  malformed. Invoke message text is capped at 1 MiB to leave room for JSON
+  escaping and metadata, and the bot preflights the serialized outbound frame.
+  Extra object fields remain allowed for additive compatibility.
+  Host tokens authenticate daemon identity but do not encrypt WebSocket
+  traffic; use private `wss://`, a VPN, or a tunnel outside a single trusted
+  network.
 - `GJC_BOT_ALLOWED_USERS` should be set to your own Discord user ID(s) before
   inviting the bot to any shared server — an unrestricted bot lets anyone in
   the channel run arbitrary GJC workflows (file writes, bash, etc.) on your

@@ -1,6 +1,15 @@
 import "dotenv/config";
 import WebSocket from "ws";
-import { MSG_TYPES } from "@gjc-remote/shared";
+import {
+  MAX_WS_PAYLOAD_BYTES,
+  MSG_TYPES,
+  PONG,
+  isInvokeMessage,
+  isPingMessage,
+  isRegisterDeniedMessage,
+  isRegisterOkMessage,
+  normalizeProtocolError,
+} from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
 import { setSessionModel } from "./model-command.js";
 
@@ -13,49 +22,71 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
 
 
 const pool = new SessionPool();
-let socket;
 let reconnectDelay = 1000;
 
 function connectToBot() {
-  socket = new WebSocket(BOT_WS_URL);
+  const connection = new WebSocket(BOT_WS_URL, {
+    maxPayload: MAX_WS_PAYLOAD_BYTES,
+  });
 
-  socket.on("open", () => {
+  connection.on("open", () => {
     reconnectDelay = 1000;
-    socket.send(JSON.stringify({ type: MSG_TYPES.REGISTER, hostId: HOST_ID, token: HOST_TOKEN, label: HOST_LABEL }));
+    connection.send(JSON.stringify({ type: MSG_TYPES.REGISTER, hostId: HOST_ID, token: HOST_TOKEN, label: HOST_LABEL }));
     console.log(`daemon: connected to bot at ${BOT_WS_URL}, registering as '${HOST_ID}'`);
   });
 
-  socket.on("message", (raw) => handleMessage(raw).catch((err) => console.error("daemon: handler error", err)));
+  connection.on("message", (raw, isBinary) =>
+    handleMessage(connection, raw, isBinary).catch((err) =>
+      console.error("daemon: handler error", err)
+    )
+  );
 
-  socket.on("close", () => {
+  connection.on("close", () => {
     console.log(`daemon: disconnected from bot, retrying in ${reconnectDelay}ms`);
     setTimeout(connectToBot, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
   });
 
-  socket.on("error", (err) => console.error("daemon: ws error", err.message));
+  connection.on("error", (err) => console.error("daemon: ws error", err.message));
 }
 
-async function handleMessage(raw) {
+async function handleMessage(connection, raw, isBinary) {
+  if (isBinary) {
+    connection.close(1008, "invalid frame");
+    return;
+  }
+
   let msg;
   try {
     msg = JSON.parse(raw.toString());
   } catch {
+    connection.close(1008, "invalid json");
     return;
   }
 
-  if (msg.type === MSG_TYPES.REGISTER_OK) {
+  if (isRegisterOkMessage(msg)) {
     console.log("daemon: registration accepted");
     return;
   }
-  if (msg.type === MSG_TYPES.REGISTER_DENIED) {
+  if (isRegisterDeniedMessage(msg)) {
     console.error("daemon: registration denied:", msg.reason);
+    pool.shutdown();
     process.exit(1);
   }
-  if (msg.type !== MSG_TYPES.INVOKE) return;
+  if (isPingMessage(msg)) {
+    connection.send(JSON.stringify(PONG));
+    return;
+  }
+  if (!isInvokeMessage(msg)) {
+    connection.close(1008, "invalid message");
+    return;
+  }
 
   const { requestId, workDir, command } = msg;
-  const send = (event, extra = {}) => socket.send(JSON.stringify({ type: MSG_TYPES.EVENT, requestId, event, ...extra }));
+  const send = (event, extra = {}) =>
+    connection.send(
+      JSON.stringify({ type: MSG_TYPES.EVENT, requestId, event, ...extra })
+    );
 
   try {
     const session = pool.ensureSession(workDir);
@@ -67,9 +98,12 @@ async function handleMessage(raw) {
       await session.send(rpcCommand, (event) => send(event));
     }
 
-    socket.send(JSON.stringify({ type: MSG_TYPES.EVENT, requestId, done: true }));
+    send(undefined, { done: true });
   } catch (err) {
-    socket.send(JSON.stringify({ type: MSG_TYPES.EVENT, requestId, error: err.message, done: true }));
+    send(undefined, {
+      error: normalizeProtocolError(err),
+      done: true,
+    });
   }
 }
 
