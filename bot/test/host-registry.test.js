@@ -7,6 +7,7 @@ import {
   V0_LIMITS,
   isEventMessage,
   isInvokeMessage,
+  isModelName,
   isRegisterMessage,
 } from "@gjc-remote/shared";
 import { HostRegistry } from "../src/host-registry.js";
@@ -76,6 +77,23 @@ test("v0 validators reject malformed required fields and preserve additive field
     }),
     true
   );
+  const maxPrompt = {
+    type: "invoke",
+    requestId: "request-1",
+    workDir: "/workspace",
+    command: { kind: "prompt", message: "\0".repeat(V0_LIMITS.MESSAGE) },
+  };
+  assert.equal(isInvokeMessage(maxPrompt), true);
+  assert.ok(Buffer.byteLength(JSON.stringify(maxPrompt)) < MAX_WS_PAYLOAD_BYTES);
+  assert.equal(
+    isInvokeMessage({
+      ...maxPrompt,
+      command: { kind: "prompt", message: "x".repeat(V0_LIMITS.MESSAGE + 1) },
+    }),
+    false
+  );
+  assert.equal(isModelName("x".repeat(V0_LIMITS.MODEL_NAME)), true);
+  assert.equal(isModelName("x".repeat(V0_LIMITS.MODEL_NAME + 1)), false);
   for (const message of [
     { type: "invoke", workDir: "/workspace", command: { kind: "prompt", message: "x" } },
     { type: "invoke", requestId: "", workDir: "/workspace", command: { kind: "prompt", message: "x" } },
@@ -98,6 +116,11 @@ test("v0 validators reject malformed required fields and preserve additive field
     }),
     true
   );
+  const inheritedEvent = Object.assign(Object.create({ done: true }), {
+    type: "event",
+    requestId: "request-1",
+  });
+  assert.equal(isEventMessage(inheritedEvent), false);
   for (const message of [
     { type: "event", done: true },
     { type: "event", requestId: "" },
@@ -183,6 +206,46 @@ test("valid invoke events relay callbacks and assistant text", async () => {
 
     assert.deepEqual(await resultPromise, { ok: true, text: "answer" });
     assert.deepEqual(events, [event]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("invalid or oversized outbound invokes fail locally without disconnecting the host", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    let received = false;
+    socket.once("message", () => {
+      received = true;
+    });
+
+    const invalid = await server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "set_model", modelName: "x".repeat(V0_LIMITS.MODEL_NAME + 1) },
+      () => {}
+    );
+    const oversized = await server.registry.invoke(
+      "host-a",
+      "/workspace",
+      {
+        kind: "prompt",
+        message: "hello",
+        futurePayload: "x".repeat(MAX_WS_PAYLOAD_BYTES),
+      },
+      () => {}
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.deepEqual(invalid, { ok: false, error: "invalid invoke request" });
+    assert.deepEqual(oversized, {
+      ok: false,
+      error: "invoke request exceeds WebSocket payload limit",
+    });
+    assert.equal(received, false);
+    assert.equal(socket.readyState, WebSocket.OPEN);
+    assert.equal(server.registry.pendingRequests.size, 0);
   } finally {
     await server.close();
   }

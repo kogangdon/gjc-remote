@@ -9,7 +9,8 @@ export const V0_LIMITS = Object.freeze({
   LABEL: 256,
   REQUEST_ID: 128,
   WORK_DIR: 4096,
-  MESSAGE: MAX_WS_PAYLOAD_BYTES,
+  // Leaves headroom for worst-case JSON escaping plus invoke metadata.
+  MESSAGE: 1024 * 1024,
   MODEL_NAME: 512,
   ERROR: 4096,
   DENIAL_REASON: 1024,
@@ -57,12 +58,20 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function isBoundedString(value, maxLength, allowEmpty = false) {
   return (
     typeof value === "string" &&
     value.length <= maxLength &&
     (allowEmpty || value.length > 0)
   );
+}
+
+export function isModelName(value) {
+  return isBoundedString(value, V0_LIMITS.MODEL_NAME);
 }
 
 export function isRegisterMessage(value) {
@@ -85,9 +94,9 @@ export function isEventMessage(value) {
     return false;
   }
 
-  const hasEvent = Object.hasOwn(value, "event");
-  const hasDone = Object.hasOwn(value, "done");
-  const hasError = Object.hasOwn(value, "error");
+  const hasEvent = hasOwn(value, "event");
+  const hasDone = hasOwn(value, "done");
+  const hasError = hasOwn(value, "error");
   if (!hasEvent && !hasDone && !hasError) return false;
 
   return (
@@ -122,7 +131,7 @@ export function isInvokeMessage(value) {
 
   const { command } = value;
   if (command.kind === "set_model") {
-    return isBoundedString(command.modelName, V0_LIMITS.MODEL_NAME);
+    return isModelName(command.modelName);
   }
   if (
     command.kind === "prompt" ||

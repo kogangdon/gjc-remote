@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
+import { V0_LIMITS, isModelName } from "@gjc-remote/shared";
 import {
   loadChannelMapState,
   parseAllowedUsers,
@@ -112,6 +113,13 @@ async function handleChatInputInteraction(interaction) {
   let command;
   if (isModel) {
     const name = interaction.options.getString("name", true);
+    if (!isModelName(name)) {
+      await interaction.reply({
+        content: `Model name must be between 1 and ${V0_LIMITS.MODEL_NAME} characters.`,
+        ephemeral: true,
+      });
+      return;
+    }
     command = { kind: "set_model", modelName: name };
   } else {
     const promptArg = interaction.options.getString("prompt", true);

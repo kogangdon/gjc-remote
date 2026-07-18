@@ -4,6 +4,7 @@ import {
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   isEventMessage,
+  isInvokeMessage,
   isPongMessage,
   isRegisterMessage,
 } from "@gjc-remote/shared";
@@ -142,6 +143,21 @@ export class HostRegistry {
     if (!socket) return Promise.resolve({ ok: false, error: `host '${hostId}' is not connected` });
 
     const requestId = randomUUID();
+    const invoke = { type: MSG_TYPES.INVOKE, requestId, workDir, command };
+    if (!isInvokeMessage(invoke)) {
+      return Promise.resolve({ ok: false, error: "invalid invoke request" });
+    }
+
+    let payload;
+    try {
+      payload = JSON.stringify(invoke);
+    } catch {
+      return Promise.resolve({ ok: false, error: "invoke request is not serializable" });
+    }
+    if (Buffer.byteLength(payload) > MAX_WS_PAYLOAD_BYTES) {
+      return Promise.resolve({ ok: false, error: "invoke request exceeds WebSocket payload limit" });
+    }
+
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
@@ -157,9 +173,7 @@ export class HostRegistry {
         onEvent,
       });
 
-      socket.send(
-        JSON.stringify({ type: MSG_TYPES.INVOKE, requestId, workDir, command })
-      );
+      socket.send(payload);
     });
   }
 }

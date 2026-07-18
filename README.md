@@ -82,7 +82,9 @@ Discord credentials.
   Rotate per host if one is compromised.
 - WebSocket frames are text JSON, capped at 8 MiB on both bot and daemon,
   validated against the required v0 fields, and rejected before routing when
-  malformed. Extra object fields remain allowed for additive compatibility.
+  malformed. Invoke message text is capped at 1 MiB to leave room for JSON
+  escaping and metadata, and the bot preflights the serialized outbound frame.
+  Extra object fields remain allowed for additive compatibility.
   Host tokens authenticate daemon identity but do not encrypt WebSocket
   traffic; use private `wss://`, a VPN, or a tunnel outside a single trusted
   network.
