@@ -1,11 +1,7 @@
-import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { join } from "node:path";
 import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
-import { RpcSession } from "./rpc-client.js";
+import { createSdkSession } from "./sdk-session.js";
 import { validateNativeWorkDir } from "./work-dir.js";
-
-const GJC_BIN = process.env.GJC_BIN || "gjc";
 
 function normalizeCanonicalWorkDir(workDir, platform) {
   if (platform !== "win32") return workDir;
@@ -14,103 +10,157 @@ function normalizeCanonicalWorkDir(workDir, platform) {
     .replace(/^\\\\\?\\/, "");
 }
 
-/**
- * Per-workDir pool of `gjc --mode=rpc` child processes talked to over
- * stdin/stdout (no unix-domain-socket, so this works identically on Windows,
- * Linux, and macOS). Spawns on first request for a workDir, reuses the live
- * process for subsequent requests, and reaps processes idle longer than
- * IDLE_TIMEOUT_MS (1 hour).
- */
+/** Per-workDir pool of embedded GJC SDK sessions. */
 export class SessionPool {
   constructor({
-    spawnFn = spawn,
+    sessionFactory = createSdkSession,
     existsSyncFn = existsSync,
     realpathSyncFn = realpathSync.native ?? realpathSync,
     platform = process.platform,
   } = {}) {
-    /** @type {Map<string, { session: RpcSession, lastUsed: number }>} */
+    /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
     this.sessions = new Map();
-    this.spawnFn = spawnFn;
+    this.aliases = new Map();
+    this.sessionFactory = sessionFactory;
     this.existsSyncFn = existsSyncFn;
     this.realpathSyncFn = realpathSyncFn;
     this.platform = platform;
-    this.reapTimer = setInterval(() => this.#reapIdle(), 5 * 60 * 1000);
+    this.closed = false;
+    this.reapTimer = setInterval(() => {
+      void this.#reapIdle().catch((error) =>
+        console.error("SessionPool: idle reap failed:", error)
+      );
+    }, 5 * 60 * 1000);
     this.reapTimer.unref?.();
   }
 
-  #reapIdle() {
+  #aliasKey(workDir) {
+    return this.platform === "win32" ? workDir.toLowerCase() : workDir;
+  }
+
+  #entryForRequestedWorkDir(workDir) {
+    const canonical = this.aliases.get(this.#aliasKey(workDir));
+    return canonical === undefined ? undefined : this.sessions.get(canonical);
+  }
+
+  async #reapIdle() {
     const now = Date.now();
+    const disposals = [];
     for (const [workDir, entry] of this.sessions) {
-      if (now - entry.lastUsed > IDLE_TIMEOUT_MS) {
+      if (entry.session && now - entry.lastUsed > IDLE_TIMEOUT_MS) {
         console.log(`SessionPool: reaping idle session for ${workDir}`);
-        entry.session.child.kill();
         this.sessions.delete(workDir);
+        this.#deleteAliasesFor(workDir);
+        disposals.push(
+          entry.session.dispose().catch((error) =>
+            console.error(`SessionPool: failed to dispose idle session for ${workDir}:`, error)
+          )
+        );
       }
+    }
+    await Promise.all(disposals);
+  }
+
+  #deleteAliasesFor(canonicalWorkDir) {
+    for (const [alias, canonical] of this.aliases) {
+      if (canonical === canonicalWorkDir) this.aliases.delete(alias);
     }
   }
 
-  /** @returns {RpcSession} */
-  ensureSession(workDir) {
+  async ensureSession(workDir) {
+    if (this.closed) throw new Error("SessionPool is shut down");
+
     const requestedWorkDir = validateNativeWorkDir(workDir, this.platform);
-    const exact = this.sessions.get(requestedWorkDir);
-    if (exact && !exact.session.closed) {
+    const exact = this.#entryForRequestedWorkDir(requestedWorkDir);
+    if (exact?.session && !exact.session.closed) {
       exact.lastUsed = Date.now();
       return exact.session;
     }
+    if (exact?.creation) {
+      exact.lastUsed = Date.now();
+      return await exact.creation;
+    }
+
     if (!this.existsSyncFn(requestedWorkDir)) {
       throw new Error(`workDir does not exist on this host: ${requestedWorkDir}`);
     }
 
+    let canonicalWorkDir;
     try {
-      workDir = normalizeCanonicalWorkDir(
+      canonicalWorkDir = normalizeCanonicalWorkDir(
         this.realpathSyncFn(requestedWorkDir),
         this.platform
       );
-      workDir = validateNativeWorkDir(workDir, this.platform);
+      canonicalWorkDir = validateNativeWorkDir(canonicalWorkDir, this.platform);
     } catch (error) {
       throw new Error(`workDir cannot be resolved on this host: ${requestedWorkDir}`, {
         cause: error,
       });
     }
 
-    const existing = this.sessions.get(workDir);
-    if (existing && !existing.session.closed) {
+    this.aliases.set(this.#aliasKey(requestedWorkDir), canonicalWorkDir);
+    this.aliases.set(this.#aliasKey(canonicalWorkDir), canonicalWorkDir);
+
+    const existing = this.sessions.get(canonicalWorkDir);
+    if (existing?.session && !existing.session.closed) {
       existing.lastUsed = Date.now();
       return existing.session;
     }
+    if (existing?.creation) {
+      existing.lastUsed = Date.now();
+      return await existing.creation;
+    }
 
-    const child = this.spawnFn(
-      GJC_BIN,
-      ["--mode=rpc", "--session-dir", join(workDir, ".gjc-remote-session")],
-      { cwd: workDir, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
-    );
-    const session = new RpcSession(child);
-
-    child.stderr.on("data", (d) => console.error(`[gjc:${workDir}]`, d.toString().trim()));
-    child.on("exit", (code) => {
-      console.log(`SessionPool: gjc rpc for ${workDir} exited (${code})`);
-      if (this.sessions.get(workDir)?.session === session) {
-        this.sessions.delete(workDir);
+    const entry = { lastUsed: Date.now(), session: undefined, creation: undefined };
+    const creation = (async () => {
+      if (existing?.session) {
+        try {
+          await existing.session.dispose();
+        } catch (error) {
+          console.error(`SessionPool: failed to dispose replaced session for ${canonicalWorkDir}:`, error);
+        }
       }
-    });
-    // Without this handler, a spawn failure (e.g. GJC_BIN missing/ENOENT)
-    // surfaces as an uncaught 'error' event and crashes the whole daemon
-    // process — not just this one request. Route it through RpcSession
-    // instead so in-flight/queued send() calls reject cleanly.
-    child.on("error", (err) => {
-      console.error(`SessionPool: gjc rpc spawn failed for ${workDir}:`, err.message);
-      if (this.sessions.get(workDir)?.session === session) {
-        this.sessions.delete(workDir);
-      }
-    });
 
-    this.sessions.set(workDir, { session, lastUsed: Date.now() });
-    return session;
+      const session = await this.sessionFactory(canonicalWorkDir);
+      if (this.closed) {
+        await session.dispose();
+        throw new Error("SessionPool was shut down during session creation");
+      }
+      entry.session = session;
+      entry.creation = undefined;
+      return session;
+    })();
+    entry.creation = creation;
+    this.sessions.set(canonicalWorkDir, entry);
+
+    try {
+      return await creation;
+    } catch (error) {
+      if (this.sessions.get(canonicalWorkDir) === entry) {
+        this.sessions.delete(canonicalWorkDir);
+        this.#deleteAliasesFor(canonicalWorkDir);
+      }
+      throw error;
+    }
   }
 
-  shutdown() {
+  async shutdown() {
+    if (this.closed) return;
+    this.closed = true;
     clearInterval(this.reapTimer);
-    for (const { session } of this.sessions.values()) session.child.kill();
+
+    const entries = [...this.sessions.values()];
     this.sessions.clear();
+    this.aliases.clear();
+    const results = await Promise.allSettled(
+      entries.map(async (entry) => {
+        const session = entry.session ?? (await entry.creation?.catch(() => undefined));
+        if (session) await session.dispose();
+      })
+    );
+    const errors = results
+      .filter((result) => result.status === "rejected")
+      .map((result) => result.reason);
+    if (errors.length > 0) throw new AggregateError(errors, "Failed to dispose GJC SDK sessions");
   }
 }

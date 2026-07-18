@@ -6,8 +6,8 @@ Discord-controlled remote GJC sessions.
 
 ```
 [host machine, per project]                    [always-on bot host, private network]
-  gjc --mode=rpc (stdio)   <--stdin/stdout-->    daemon/  --WS(outbound)-->   bot/
-  (spawned on demand per                                              (WS server +
+  GJC embedding SDK          <--in-process-->    daemon/  --WS(outbound)-->   bot/
+  (one AgentSession per                                               (WS server +
    workDir, reaped after                                               Discord client)
    1h idle)
 ```
@@ -15,10 +15,10 @@ Discord-controlled remote GJC sessions.
 1. `daemon/` runs on each machine you want to control. It connects outbound to
    `bot/`'s WebSocket server and registers with a per-host pre-shared token.
 2. On the first Discord command routed to a given `workDir`, the daemon resolves
-   it to the host filesystem's canonical real path and spawns `gjc --mode=rpc`
-   for that directory. Different path spellings for the same directory reuse
-   one live process. Idle sessions (no requests for 1 hour) are killed
-   automatically.
+   it to the host filesystem's canonical real path and creates an in-process GJC
+   SDK `AgentSession` for that directory. Different path spellings for the same
+   directory reuse one serialized session. Idle sessions (no requests for 1
+   hour) are disposed automatically.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `team`, `ultragoal`), `/gjc`,
    `/model`, and `/hosts` as Discord slash commands.
@@ -41,7 +41,7 @@ npm run register --workspace=bot    # publish slash commands to Discord
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
 npm run start --workspace=bot
 
-# On each machine you want to control:
+# On each machine you want to control (requires Bun 1.3.14 or newer):
 cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bot's HOST_TOKENS), BOT_WS_URL
 npm run start --workspace=daemon
 ```
@@ -68,10 +68,10 @@ SMOKE_MODEL_QUERY=sol npm run smoke:local   # POSIX shell
 # PowerShell: $env:SMOKE_MODEL_QUERY="sol"; npm run smoke:local
 ```
 
-`smoke:local` starts a local `HostRegistry`, spawns a real daemon, routes one
-prompt through `gjc --mode=rpc`, and asserts that the assistant text comes back
-through the relay. When `SMOKE_MODEL_QUERY` is set, it also performs a real
-model switch and requires a `model_resolved` receipt. It does not require
+`smoke:local` starts a local `HostRegistry`, starts a real Bun daemon, routes one
+prompt through an embedded GJC SDK session, and asserts that the assistant text
+comes back through the relay. When `SMOKE_MODEL_QUERY` is set, it also performs
+a real model switch and requires a `model_resolved` receipt. It does not require
 Discord credentials.
 
 ## Security notes

@@ -11,12 +11,12 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `team`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (implemented; local relay e2e-tested)
+## Architecture (GJC 0.11 SDK; implemented and real-smoke tested)
 
 ```
 [host machine, per project]                    [always-on bot host, private network]
-  gjc --mode=rpc (stdio)   <--stdin/stdout-->    daemon/  --WS(outbound)-->   bot/
-  (spawned on demand per                                              (WS server +
+  GJC embedding SDK          <--in-process-->    daemon/  --WS(outbound)-->   bot/
+  (one AgentSession per                                               (WS server +
    workDir, reaped after                                               Discord client)
    1h idle)
 ```
@@ -28,10 +28,11 @@ runtime model switching as `/slash` commands.
    when its daemon isn't connected, the bot treats that host's channels as
    offline and fails fast instead of hanging.
 2. On the first Discord command routed to a given `workDir`, the daemon resolves
-   it to the host filesystem's canonical real path, spawns `gjc --mode=rpc`
-   (stdio, cwd=canonical workDir), and keeps talking to it over stdin/stdout.
-   Different path spellings for the same directory share one session. Idle
-   sessions (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are killed.
+   it to the host filesystem's canonical real path and creates an in-process GJC
+   SDK `AgentSession` with file-backed history under
+   `<workDir>/.gjc-remote-session`. Different path spellings for the same
+   directory share one serialized session. Idle sessions (`IDLE_TIMEOUT_MS` =
+   1h, in `shared/protocol.js`) are disposed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
    each Discord channel to one validated `{hostId, workDir}` pair via
@@ -42,37 +43,34 @@ runtime model switching as `/slash` commands.
    as direct GJC prompts; slash commands remain available for skills, `/model`,
    and `/hosts`.
 
-## Why NOT the alternatives (rejected paths, don't re-litigate these)
+## Why NOT the alternatives
 
 - **SSH pull (bot SSHes into each host)** — rejected. Requires the target
   host to run an SSH server and be reachable inbound; breaks the "host isn't
   always online" requirement. The WS-push model (host dials out to the bot)
   was chosen specifically to invert this.
-- **`gjc --mode=rpc --listen <unix-socket>`** — rejected for cross-platform
-  use. Verified experimentally: GJC's `prepareRpcSocketPath` enforces POSIX
-  `0o700`-only directory permissions (`rpc-socket-security.ts`,
-  `assertPrivateMode`). Node's `fs.mkdir(..., {mode: 0o700})` is a no-op on
-  NTFS, so this **always** throws `RpcSocketSecurityError: ... has
-  group/other permissions` on Windows. No env var/flag bypasses it — it's a
-  hardcoded security gate. Likely fine on Linux/macOS but not verified there
-  yet. Decision: use `gjc --mode=rpc` over **stdio** instead (no socket file
-  at all), which works identically on every OS. If a real need for
-  reconnect-without-respawn resurfaces, revisit UDS on POSIX hosts only.
+- **Historical RPC stdio/socket transports** — removed upstream in GJC 0.11.
+  `--mode rpc` now fails with an explicit SDK migration error. The daemon embeds
+  `@gajae-code/coding-agent` instead, preserving per-workDir session reuse
+  without a subprocess or Unix socket.
 - **`gjc session` / `gjc team` (tmux-backed)** — separately confirmed
   Windows-incompatible: `tmux` binary isn't available/expected on native
   Windows and `gjc session list` hard-crashes with `Executable not found in
   $PATH: "tmux"`. Unrelated to the RPC socket issue above — two independent
-  Windows gaps. Not used by this project's architecture at all (we drive
-  skills via `/skill:<name>` prompt text over RPC, not via `gjc team`).
+  Windows gaps. Not used by this project's architecture at all (we drive skills
+  through SDK `AgentSession` prompt methods, not via `gjc team`).
 - **One `gjc -p "..."` subprocess per Discord command** — this was the
   *first* working prototype (now deleted, used to live at
   `C:/tmp/gjc-discord-bridge`). It worked (verified: parallel isolated
   sessions via `--session-dir` + `--continue`) but can't inject into an
   *already-running* session or stream live progress — each call is a fresh
-  process that exits. Superseded once `--mode=rpc` was discovered. Don't
-  resurrect this path; `daemon/` supersedes it entirely.
+  process that exits. The embedded SDK supersedes this path.
 
-## Bugs found and fixed during implementation (all via real `gjc` execution, not guessed)
+## Implementation findings
+
+Items 1, 2, 4, and 7 below describe the superseded RPC implementation and are
+retained only as regression history. GJC 0.11 removed that ingress; current
+session transport lives in `daemon/src/sdk-session.js`.
 
 1. **Event frame unwrapping.** GJC's RPC stdio protocol wraps streamed
    frames as `{type:"event", payload:{event_type, event}}`, not a flat
@@ -112,7 +110,7 @@ runtime model switching as `/slash` commands.
    callback only completes if the browser runs on the host, and copilot's
    device flow is refused in RPC mode entirely). Provider auth is now expected
    to be done once directly on the host terminal (`gjc` + `/login <provider>`);
-   the saved token in `~/.gjc` is reused by every later RPC session. All login
+   the saved token in `~/.gjc` is reused by every later SDK session. All login
    plumbing (bot `/login` command + `extractLoginRequest`/`formatLoginEvents`/
    `finalizeLoginResult`, the daemon `login` kind, `SessionPool#runEphemeral`,
    `LOGIN_TIMEOUT_MS`) has been deleted.
@@ -129,7 +127,7 @@ runtime model switching as `/slash` commands.
    plain chat, and tool-log buttons use one startup authorization policy;
    changes to either allowlist setting require a bot restart. `SessionPool`
    rejects workDirs that are not fully-qualified paths under the daemon host's
-   native path semantics before lookup or spawn.
+   native path semantics before lookup or SDK session creation.
 7. **RPC termination left unresolved work.** Child `exit`/`error` now rejects
    the active command and every queued command exactly once. A command timeout
    permanently closes and kills that RPC session instead of dispatching queued
@@ -137,23 +135,21 @@ runtime model switching as `/slash` commands.
    request creates a replacement session, and a delayed exit from the poisoned
    child cannot remove that replacement from `SessionPool`.
 8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
-   now resolves every existing native workDir through the host filesystem and
-   uses that canonical real path for the pool key, child cwd, and session-dir.
+   resolves every existing native workDir through the host filesystem and uses
+   that canonical real path for the pool key, SDK cwd, and session directory.
    Separator, case, or symlink aliases that resolve to one directory therefore
-   reuse one live GJC process.
+   reuse one live GJC SDK session.
 
 ## Runtime: Bun vs Node
 
-`gjc` itself is Bun-compiled (uses `Bun.spawnSync`, `Bun.listen`, etc. —
-visible in its own crash stack traces). `bot/` and `daemon/` are written in
-plain Node-compatible ESM (no Bun-only APIs) so either runtime works; **Bun
-is the intended/tested runtime** (`bun install`, `bun run`) since it matches
-what `gjc` itself uses and was what full e2e verification ran under.
-`package-lock.json` is gitignored; `bun.lock` is the committed lockfile.
+`@gajae-code/coding-agent` 0.11.1 requires Bun 1.3.14 or newer, so the daemon
+starts with Bun and embeds GJC in-process. The bot and Node built-in test runner
+remain Node-compatible. `bun.lock` is the committed dependency lockfile;
+`package-lock.json` is gitignored.
 
 ## Decided config values (don't re-ask the user these)
 
-- Idle GJC-RPC-process timeout: **1 hour** (`IDLE_TIMEOUT_MS` in
+- Idle GJC SDK session timeout: **1 hour** (`IDLE_TIMEOUT_MS` in
   `shared/protocol.js`).
 - Host<->bot auth: pre-shared per-host tokens (`HOST_TOKENS` on bot,
   `HOST_TOKEN` on each daemon), explicitly deferred stronger auth
@@ -167,7 +163,7 @@ what `gjc` itself uses and was what full e2e verification ran under.
   from the exact daemon socket that owns the pending invocation.
 - Session key / isolation unit = **(hostId, canonical workDir)** pair; one
   Discord channel maps to a configured `{hostId, workDir}` and the daemon
-  canonicalizes that path before lookup or spawn.
+  canonicalizes that path before SDK session lookup or creation.
 - Multi-host management = **one bot process**, many daemons connecting to
   it (not one bot per host). Confirmed explicitly by the user.
 
@@ -190,9 +186,9 @@ Use these rules for Telegram delivery:
 ## What is NOT done yet (pick up here)
 
 1. **Real Discord wiring never run end-to-end.** The non-Discord relay path is
-   now covered by `npm run smoke:local`, which starts a local `HostRegistry`,
-   spawns `daemon/src/daemon.js`, sends a prompt through a real `gjc --mode=rpc`
-   process, and asserts the assistant text returned through the bot relay.
+   covered by `npm run smoke:local`, which starts a local `HostRegistry`, starts
+   `daemon/src/daemon.js` under Bun, sends a prompt through a real embedded GJC
+   SDK session, and asserts the assistant text returned through the bot relay.
    Actually registering slash commands and running `bot/src/bot.js` against a
    real Discord application + real `DISCORD_TOKEN` has not happened.
 2. **`channels.json` does not exist yet** (gitignored, copy from
@@ -206,18 +202,16 @@ Use these rules for Telegram delivery:
    Shared/production deployment must also set
    `GJC_REMOTE_REQUIRE_ALLOWLIST=1`; local unrestricted mode remains available
    only for backward-compatible development and emits a startup warning.
-4. **Linux/macOS daemon path unverified.** Everything was built and tested
-   on native Windows (this repo's origin host). The stdio-based
-   `gjc --mode=rpc` approach *should* be OS-agnostic (no socket files, no
-   tmux), but has not actually been run on Linux/macOS yet. If you're
-   picking this up on such a host: this is the first thing worth smoke
-   testing (`npm run smoke:local`).
+4. **Linux/macOS daemon path unverified.** Everything was built and tested on
+   native Windows (this repo's origin host). The Bun embedding SDK path avoids
+   socket and tmux dependencies but has not actually been run on Linux/macOS
+   yet. Run the real local smoke first on each additional platform.
 5. **No process supervision configured** — `README.md` mentions pm2/systemd
    as options but nothing is set up. Bot and each daemon currently need to
    be started manually.
 6. **`/hosts` and progress-streaming (tool-call preview during a running
    command) are implemented but unverified against real Discord** — only the
-   underlying `HostRegistry`/`RpcSession` plumbing they depend on has been
+   underlying `HostRegistry`/SDK session plumbing they depend on has been
    tested.
 7. **Remote host files are not attached automatically.** Assistant output may
    contain absolute paths from the daemon host, but the Discord bot treats those
@@ -229,17 +223,16 @@ Use these rules for Telegram delivery:
 ## Verification pattern to reuse
 
 Whenever you touch `daemon/src/*` or `bot/src/host-registry.js`, run
-`npm run smoke:local` against a **real** `gjc` binary rather than trusting the
-protocol docs — every protocol bug so far was only found by actually spawning
-`gjc --mode=rpc` and inspecting real stdout frames. The smoke script is the
-preferred reusable verification path.
+`npm run smoke:local` against the installed `@gajae-code/coding-agent` SDK
+rather than trusting unit doubles. The smoke script is the preferred reusable
+verification path because it starts the real Bun daemon and embedded agent.
 
 ```js
 import { SessionPool } from "./daemon/src/session-pool.js";
 const pool = new SessionPool();
-const s = pool.ensureSession("<some existing dir>");
+const s = await pool.ensureSession("<some existing dir>");
 const events = [];
 await s.send({ type: "prompt", message: "reply with exactly: X" }, e => events.push(e));
 console.log(events.find(e => e.type === "agent_end"));
-pool.shutdown();
+await pool.shutdown();
 ```

@@ -23,6 +23,7 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
 
 const pool = new SessionPool();
 let reconnectDelay = 1000;
+let shuttingDown = false;
 
 function connectToBot() {
   const connection = new WebSocket(BOT_WS_URL, {
@@ -42,6 +43,7 @@ function connectToBot() {
   );
 
   connection.on("close", () => {
+    if (shuttingDown) return;
     console.log(`daemon: disconnected from bot, retrying in ${reconnectDelay}ms`);
     setTimeout(connectToBot, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
@@ -51,6 +53,10 @@ function connectToBot() {
 }
 
 async function handleMessage(connection, raw, isBinary) {
+  if ((raw.byteLength ?? raw.length ?? 0) > MAX_WS_PAYLOAD_BYTES) {
+    connection.close(1009, "message too big");
+    return;
+  }
   if (isBinary) {
     connection.close(1008, "invalid frame");
     return;
@@ -70,8 +76,8 @@ async function handleMessage(connection, raw, isBinary) {
   }
   if (isRegisterDeniedMessage(msg)) {
     console.error("daemon: registration denied:", msg.reason);
-    pool.shutdown();
-    process.exit(1);
+    await shutdownAndExit(1);
+    return;
   }
   if (isPingMessage(msg)) {
     connection.send(JSON.stringify(PONG));
@@ -89,7 +95,7 @@ async function handleMessage(connection, raw, isBinary) {
     );
 
   try {
-    const session = pool.ensureSession(workDir);
+    const session = await pool.ensureSession(workDir);
 
     if (command.kind === "set_model") {
       await setSessionModel(session, command, (event) => send(event));
@@ -123,11 +129,21 @@ function toRpcCommand(command) {
 
 connectToBot();
 
+async function shutdownAndExit(exitCode) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await pool.shutdown();
+  } catch (error) {
+    console.error("daemon: shutdown failed", error);
+    exitCode = 1;
+  }
+  process.exit(exitCode);
+}
+
 process.on("SIGINT", () => {
-  pool.shutdown();
-  process.exit(0);
+  void shutdownAndExit(0);
 });
 process.on("SIGTERM", () => {
-  pool.shutdown();
-  process.exit(0);
+  void shutdownAndExit(0);
 });
