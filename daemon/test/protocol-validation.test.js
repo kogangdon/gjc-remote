@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
@@ -13,12 +13,27 @@ import {
 import { WebSocketServer } from "ws";
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
+const CHILD_EXIT_TIMEOUT_MS = 2_000;
 
-async function stopChild(child) {
+async function stopChild(child, timeoutMs = CHILD_EXIT_TIMEOUT_MS) {
   if (child.exitCode !== null || child.signalCode !== null) return;
+
   const exited = once(child, "exit");
   child.kill("SIGTERM");
-  await exited;
+
+  let forceTimer;
+  await Promise.race([
+    exited,
+    new Promise((resolve) => {
+      forceTimer = setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+  clearTimeout(forceTimer);
+
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await exited;
+  }
 }
 
 async function startDaemon() {
@@ -83,6 +98,25 @@ test("invoke validation rejects an empty model name", () => {
   );
 });
 
+test("stopChild escalates to SIGKILL after the graceful timeout", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === "SIGKILL") {
+      child.signalCode = signal;
+      queueMicrotask(() => child.emit("exit", null, signal));
+    }
+    return true;
+  };
+
+  await stopChild(child, 1);
+
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
 test("protocol errors are non-empty and bounded for Error and non-Error throws", () => {
   assert.equal(normalizeProtocolError(new Error("")), "Unknown daemon error");
   assert.equal(normalizeProtocolError(""), "Unknown daemon error");
@@ -98,6 +132,13 @@ test("protocol errors are non-empty and bounded for Error and non-Error throws",
     }),
     "Unknown daemon error"
   );
+  const throwingMessage = new Error("ignored");
+  Object.defineProperty(throwingMessage, "message", {
+    get() {
+      throw new Error("cannot read message");
+    },
+  });
+  assert.equal(normalizeProtocolError(throwingMessage), "Unknown daemon error");
   assert.equal(
     normalizeProtocolError("x".repeat(V0_LIMITS.ERROR + 1)).length,
     V0_LIMITS.ERROR

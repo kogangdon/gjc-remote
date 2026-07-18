@@ -135,13 +135,11 @@ export function isInvokeMessage(value) {
 }
 
 export function normalizeProtocolError(value) {
-  let message;
-  if (value instanceof Error) {
-    message = value.message;
-  } else if (typeof value === "string") {
-    message = value;
-  } else {
-    message = value;
+  let message = value;
+  try {
+    if (value instanceof Error) message = value.message;
+  } catch {
+    message = "";
   }
 
   if (typeof message !== "string") {
