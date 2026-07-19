@@ -99,6 +99,8 @@ Discord credentials.
   Extra object fields remain allowed for additive compatibility.
   Each host is limited to 64 concurrent in-flight invokes; beyond that the bot
   fails new requests locally instead of growing its pending map.
+  The daemon and bot exchange an additive protocol version and capability list
+  during registration; legacy daemons that omit them are treated as v0.
   Host tokens authenticate daemon identity but do not encrypt WebSocket
   traffic; use private `wss://`, a VPN, or a tunnel outside a single trusted
   network.

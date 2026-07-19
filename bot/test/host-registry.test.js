@@ -3,13 +3,19 @@ import { once } from "node:events";
 import test from "node:test";
 import WebSocket from "ws";
 import {
+  CAPABILITIES,
   MAX_WS_PAYLOAD_BYTES,
   PONG,
+  PROTOCOL_VERSION,
   V0_LIMITS,
   isEventMessage,
   isInvokeMessage,
+  isCapabilityList,
   isModelName,
+  isProtocolVersion,
   isRegisterMessage,
+  isRegisterOkMessage,
+  negotiateCapabilities,
 } from "@gjc-remote/shared";
 import { HostRegistry } from "../src/host-registry.js";
 
@@ -84,13 +90,26 @@ async function startRegistry(
 
   return {
     registry,
-    async connect(hostId, token) {
+    async connect(hostId, token, register = {}) {
       const socket = new WebSocket(`ws://127.0.0.1:${port}`);
       await once(socket, "open");
       const response = once(socket, "message");
-      socket.send(JSON.stringify({ type: "register", hostId, token }));
+      socket.send(
+        JSON.stringify({
+          type: "register",
+          hostId,
+          token,
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: CAPABILITIES,
+          ...register,
+        })
+      );
       const [raw] = await response;
-      assert.deepEqual(JSON.parse(raw.toString()), { type: "register_ok" });
+      assert.deepEqual(JSON.parse(raw.toString()), {
+        type: "register_ok",
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: CAPABILITIES,
+      });
       return socket;
     },
     close() {
@@ -609,6 +628,121 @@ test("a host's pending cap does not block a different host", async () => {
     );
     await invokeFrameB;
     assert.equal(server.registry.pendingRequests.size, cap + 1);
+  } finally {
+    await server.close();
+  }
+});
+test("v1 negotiation validators bound version and capabilities additively", () => {
+  assert.equal(isProtocolVersion(0), true);
+  assert.equal(isProtocolVersion(1), true);
+  assert.equal(isProtocolVersion(V0_LIMITS.PROTOCOL_VERSION_MAX), true);
+  for (const bad of [-1, 1.5, "1", Number.NaN, V0_LIMITS.PROTOCOL_VERSION_MAX + 1]) {
+    assert.equal(isProtocolVersion(bad), false);
+  }
+
+  assert.equal(isCapabilityList([]), true);
+  assert.equal(isCapabilityList(["invoke", "set_model"]), true);
+  assert.equal(isCapabilityList(Array(V0_LIMITS.MAX_CAPABILITIES).fill("x")), true);
+  for (const bad of [
+    "invoke",
+    [1],
+    [""],
+    ["x".repeat(V0_LIMITS.CAPABILITY + 1)],
+    Array(V0_LIMITS.MAX_CAPABILITIES + 1).fill("x"),
+  ]) {
+    assert.equal(isCapabilityList(bad), false);
+  }
+
+  // Register/register_ok accept the v1 fields but still pass with them absent.
+  assert.equal(isRegisterMessage({ type: "register", hostId: "h", token: "t" }), true);
+  assert.equal(
+    isRegisterMessage({
+      type: "register",
+      hostId: "h",
+      token: "t",
+      protocolVersion: 1,
+      capabilities: ["invoke"],
+    }),
+    true
+  );
+  for (const bad of [
+    { type: "register", hostId: "h", token: "t", protocolVersion: -1 },
+    { type: "register", hostId: "h", token: "t", capabilities: "invoke" },
+  ]) {
+    assert.equal(isRegisterMessage(bad), false);
+  }
+  assert.equal(isRegisterOkMessage({ type: "register_ok" }), true);
+  assert.equal(
+    isRegisterOkMessage({ type: "register_ok", protocolVersion: 1, capabilities: ["invoke"] }),
+    true
+  );
+  assert.equal(isRegisterOkMessage({ type: "register_ok", capabilities: [1] }), false);
+
+  // Negotiation intersects local with the peer's advertised set.
+  assert.deepEqual(negotiateCapabilities(["invoke", "set_model"], ["set_model", "bogus"]), [
+    "set_model",
+  ]);
+  assert.deepEqual(negotiateCapabilities(["invoke"], undefined), []);
+  assert.deepEqual(negotiateCapabilities(["invoke"], "not-a-list"), []);
+});
+
+test("register handshake negotiates protocol version and shared capabilities", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a", {
+      capabilities: ["invoke", "bogus"],
+    });
+    assert.deepEqual(server.registry.getHostInfo("host-a"), {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: ["invoke"],
+    });
+
+    const closed = once(socket, "close");
+    socket.close();
+    await closed;
+    await waitFor(() => server.registry.getHostInfo("host-a") === undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a legacy v0 daemon registers with version 0 and no shared capabilities", async () => {
+  const server = await startRegistry();
+  const port = server.registry.wss.address().port;
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  try {
+    await once(socket, "open");
+    const response = once(socket, "message");
+    socket.send(JSON.stringify({ type: "register", hostId: "host-a", token: "token-a" }));
+    const [raw] = await response;
+    assert.deepEqual(JSON.parse(raw.toString()), {
+      type: "register_ok",
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: CAPABILITIES,
+    });
+    assert.deepEqual(server.registry.getHostInfo("host-a"), {
+      protocolVersion: 0,
+      capabilities: [],
+    });
+  } finally {
+    socket.terminate();
+    await server.close();
+  }
+});
+
+test("negotiated protocol version is clamped to this bot build and hostInfo is a copy", async () => {
+  const server = await startRegistry();
+  try {
+    // A newer daemon advertises a higher version than this bot understands.
+    await server.connect("host-a", "token-a", {
+      protocolVersion: PROTOCOL_VERSION + 5,
+    });
+    const info = server.registry.getHostInfo("host-a");
+    assert.equal(info.protocolVersion, PROTOCOL_VERSION);
+
+    // getHostInfo returns a defensive copy; mutating it must not leak inward.
+    info.capabilities.push("tampered");
+    assert.deepEqual(server.registry.getHostInfo("host-a").capabilities, [...CAPABILITIES]);
   } finally {
     await server.close();
   }

@@ -181,6 +181,14 @@ remain Node-compatible. `bun.lock` is the committed dependency lockfile;
   **10 seconds**. A missed deadline removes only the socket that owns that
   heartbeat and fails its pending invocations exactly once; a replacement
   connection for the same host is not affected by stale heartbeat state.
+  The register handshake carries an **additive protocol version and capability
+  list** (`PROTOCOL_VERSION`, `CAPABILITIES` in `shared/protocol.js`): the daemon
+  advertises its version/capabilities on `register` and the bot echoes its own on
+  `register_ok`, storing the negotiated `{protocolVersion, capabilities}`
+  (capabilities intersected via `negotiateCapabilities`) per host, queryable with
+  `HostRegistry.getHostInfo(hostId)`. Both fields are optional and bounded; a
+  legacy v0 daemon that omits them is treated as `protocolVersion: 0` with no
+  shared capabilities, so the handshake stays backward compatible.
 - Session key / isolation unit = **(hostId, canonical workDir)** pair; one
   Discord channel maps to a configured `{hostId, workDir}` and the daemon
   canonicalizes that path before SDK session lookup or creation.
