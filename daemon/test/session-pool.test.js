@@ -51,7 +51,7 @@ test("a closed SDK session is disposed and replaced", async () => {
   }
 });
 
-test("canonical workDir aliases reuse one SDK session without repeated filesystem work", async () => {
+test("canonical workDir aliases reuse one SDK session after filesystem revalidation", async () => {
   const factoryCalls = [];
   let existsCalls = 0;
   let realpathCalls = 0;
@@ -75,9 +75,34 @@ test("canonical workDir aliases reuse one SDK session without repeated filesyste
     const second = await pool.ensureSession(WORK_DIR);
 
     assert.strictEqual(second, first);
-    assert.equal(existsCalls, 1);
-    assert.equal(realpathCalls, 1);
+    assert.equal(existsCalls, 2);
+    assert.equal(realpathCalls, 2);
     assert.deepEqual(factoryCalls, [WORK_DIR]);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("a retargeted workDir alias routes to the new canonical directory", async () => {
+  const firstTarget = process.platform === "win32" ? String.raw`C:\first` : "/first";
+  const secondTarget = process.platform === "win32" ? String.raw`C:\second` : "/second";
+  let resolvedTarget = firstTarget;
+  const factoryCalls = [];
+  const pool = createPool({
+    realpathSyncFn: () => resolvedTarget,
+    sessionFactory: async (workDir) => {
+      factoryCalls.push(workDir);
+      return new FakeSession();
+    },
+  });
+
+  try {
+    const first = await pool.ensureSession(ALIAS_WORK_DIR);
+    resolvedTarget = secondTarget;
+    const second = await pool.ensureSession(ALIAS_WORK_DIR);
+
+    assert.notStrictEqual(second, first);
+    assert.deepEqual(factoryCalls, [firstTarget, secondTarget]);
   } finally {
     await pool.shutdown();
   }
