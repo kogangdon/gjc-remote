@@ -8,7 +8,7 @@ const DISPLAY_ID_LENGTH = 96;
 const DISPLAY_NAME_LENGTH = 96;
 
 /**
- * Resolve and set a session model using serialized RPC commands.
+ * Resolve and set a session model using serialized SDK commands.
  *
  * @param {{send: (command: object, onEvent: (event: object) => void) => Promise<void>}} session
  * @param {{modelName?: unknown}} command

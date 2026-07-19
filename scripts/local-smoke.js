@@ -16,7 +16,7 @@ const registry = new HostRegistry({
 
 await once(registry.wss, "listening");
 
-const daemon = spawn(process.execPath, ["daemon/src/daemon.js"], {
+const daemon = spawn(process.env.BUN_BIN || "bun", ["daemon/src/daemon.js"], {
   cwd: process.cwd(),
   env: {
     ...process.env,

@@ -1,63 +1,90 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
-import { join } from "node:path";
 import test from "node:test";
 
 import { SessionPool } from "../src/session-pool.js";
 
-class FakeChild extends EventEmitter {
+class FakeSession {
   constructor() {
-    super();
-    this.stdout = new EventEmitter();
-    this.stderr = new EventEmitter();
-    this.stdin = { write: () => true };
-    this.killCount = 0;
+    this.closed = false;
+    this.disposeCalls = 0;
   }
 
-  kill() {
-    this.killCount += 1;
-    return true;
+  async dispose() {
+    this.disposeCalls += 1;
+    this.closed = true;
   }
 }
 
 const WORK_DIR = process.platform === "win32" ? String.raw`C:\work` : "/work";
 const ALIAS_WORK_DIR = process.platform === "win32" ? "C:/work/." : "/work/.";
 
-test("an exiting poisoned child does not remove its replacement session", () => {
-  const children = [];
-  const pool = new SessionPool({
+function createPool(overrides = {}) {
+  return new SessionPool({
     existsSyncFn: () => true,
     realpathSyncFn: () => WORK_DIR,
-    spawnFn: () => {
-      const child = new FakeChild();
-      children.push(child);
-      return child;
+    ...overrides,
+  });
+}
+
+test("a closed SDK session is disposed and replaced", async () => {
+  const created = [];
+  const pool = createPool({
+    sessionFactory: async () => {
+      const session = new FakeSession();
+      created.push(session);
+      return session;
     },
   });
 
   try {
-    const poisoned = pool.ensureSession(WORK_DIR);
-    poisoned.closed = true;
-    poisoned.child.kill();
+    const closed = await pool.ensureSession(WORK_DIR);
+    closed.closed = true;
 
-    const replacement = pool.ensureSession(WORK_DIR);
-    assert.notStrictEqual(replacement, poisoned);
-    assert.equal(children.length, 2);
+    const replacement = await pool.ensureSession(WORK_DIR);
 
-    children[0].emit("exit", 1, null);
-
-    assert.strictEqual(pool.ensureSession(WORK_DIR), replacement);
-    assert.equal(children.length, 2);
+    assert.notStrictEqual(replacement, closed);
+    assert.equal(closed.disposeCalls, 1);
+    assert.equal(created.length, 2);
+    assert.strictEqual(await pool.ensureSession(WORK_DIR), replacement);
   } finally {
-    pool.shutdown();
+    await pool.shutdown();
   }
 });
 
-test("canonical workDir aliases reuse one session without repeated filesystem work", () => {
-  const spawnCalls = [];
+test("replacement creation proceeds when closed-session disposal stalls", async () => {
+  const created = [];
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => {
+      const session = new FakeSession();
+      created.push(session);
+      return session;
+    },
+  });
+
+  try {
+    const stuck = await pool.ensureSession(WORK_DIR);
+    stuck.closed = true;
+    stuck.dispose = () => {
+      stuck.disposeCalls += 1;
+      return new Promise(() => {});
+    };
+
+    const replacement = await pool.ensureSession(WORK_DIR);
+
+    assert.notStrictEqual(replacement, stuck);
+    assert.equal(stuck.disposeCalls, 1);
+    assert.equal(created.length, 2);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("canonical workDir aliases reuse one SDK session after filesystem revalidation", async () => {
+  const factoryCalls = [];
   let existsCalls = 0;
   let realpathCalls = 0;
-  const pool = new SessionPool({
+  const pool = createPool({
     existsSyncFn: () => {
       existsCalls += 1;
       return true;
@@ -66,28 +93,79 @@ test("canonical workDir aliases reuse one session without repeated filesystem wo
       realpathCalls += 1;
       return WORK_DIR;
     },
-    spawnFn: (...args) => {
-      spawnCalls.push(args);
-      return new FakeChild();
+    sessionFactory: async (workDir) => {
+      factoryCalls.push(workDir);
+      return new FakeSession();
+    },
+  });
+
+  try {
+    const first = await pool.ensureSession(ALIAS_WORK_DIR);
+    const second = await pool.ensureSession(WORK_DIR);
+
+    assert.strictEqual(second, first);
+    assert.equal(existsCalls, 2);
+    assert.equal(realpathCalls, 2);
+    assert.deepEqual(factoryCalls, [WORK_DIR]);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("a retargeted workDir alias routes to the new canonical directory", async () => {
+  const firstTarget = process.platform === "win32" ? String.raw`C:\first` : "/first";
+  const secondTarget = process.platform === "win32" ? String.raw`C:\second` : "/second";
+  let resolvedTarget = firstTarget;
+  const factoryCalls = [];
+  const pool = createPool({
+    realpathSyncFn: () => resolvedTarget,
+    sessionFactory: async (workDir) => {
+      factoryCalls.push(workDir);
+      return new FakeSession();
+    },
+  });
+
+  try {
+    const first = await pool.ensureSession(ALIAS_WORK_DIR);
+    resolvedTarget = secondTarget;
+    const second = await pool.ensureSession(ALIAS_WORK_DIR);
+
+    assert.notStrictEqual(second, first);
+    assert.deepEqual(factoryCalls, [firstTarget, secondTarget]);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("concurrent first requests share one in-flight SDK session creation", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let factoryCalls = 0;
+  const session = new FakeSession();
+  const pool = createPool({
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      await gate;
+      return session;
     },
   });
 
   try {
     const first = pool.ensureSession(ALIAS_WORK_DIR);
     const second = pool.ensureSession(WORK_DIR);
+    release();
 
-    assert.strictEqual(second, first);
-    assert.equal(existsCalls, 1);
-    assert.equal(realpathCalls, 1);
-    assert.equal(spawnCalls.length, 1);
-    assert.equal(spawnCalls[0][2].cwd, WORK_DIR);
-    assert.equal(spawnCalls[0][1][2], join(WORK_DIR, ".gjc-remote-session"));
+    assert.strictEqual(await first, session);
+    assert.strictEqual(await second, session);
+    assert.equal(factoryCalls, 1);
   } finally {
-    pool.shutdown();
+    await pool.shutdown();
   }
 });
 
-test("Windows native realpaths normalize extended prefixes and case aliases", () => {
+test("Windows native realpaths normalize extended prefixes and case aliases", async () => {
   const cases = [
     {
       first: String.raw`c:\work`,
@@ -104,51 +182,160 @@ test("Windows native realpaths normalize extended prefixes and case aliases", ()
   ];
 
   for (const { first, second, resolved, canonical } of cases) {
-    const spawnCalls = [];
-    const pool = new SessionPool({
+    const factoryCalls = [];
+    const pool = createPool({
       platform: "win32",
-      existsSyncFn: () => true,
       realpathSyncFn: () => resolved,
-      spawnFn: (...args) => {
-        spawnCalls.push(args);
-        return new FakeChild();
+      sessionFactory: async (workDir) => {
+        factoryCalls.push(workDir);
+        return new FakeSession();
       },
     });
 
     try {
-      const original = pool.ensureSession(first);
-      assert.strictEqual(pool.ensureSession(second), original);
-      assert.equal(spawnCalls.length, 1);
-      assert.equal(spawnCalls[0][2].cwd, canonical);
+      const original = await pool.ensureSession(first);
+      assert.strictEqual(await pool.ensureSession(second), original);
+      assert.deepEqual(factoryCalls, [canonical]);
     } finally {
-      pool.shutdown();
+      await pool.shutdown();
     }
   }
 });
 
-test("an unresolvable workDir fails before spawning a child", () => {
-  let spawnCalls = 0;
+test("an unresolvable workDir fails before SDK session creation", async () => {
+  let factoryCalls = 0;
   const failure = new Error("realpath failed");
-  const pool = new SessionPool({
-    existsSyncFn: () => true,
+  const pool = createPool({
     realpathSyncFn: () => {
       throw failure;
     },
-    spawnFn: () => {
-      spawnCalls += 1;
-      return new FakeChild();
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return new FakeSession();
     },
   });
 
   try {
-    assert.throws(
-      () => pool.ensureSession(WORK_DIR),
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
       (error) =>
         error.message === `workDir cannot be resolved on this host: ${WORK_DIR}` &&
         error.cause === failure
     );
-    assert.equal(spawnCalls, 0);
+    assert.equal(factoryCalls, 0);
   } finally {
-    pool.shutdown();
+    await pool.shutdown();
+  }
+});
+
+test("shutdown completes when session disposal stalls", async () => {
+  const session = new FakeSession();
+  session.dispose = () => {
+    session.disposeCalls += 1;
+    return new Promise(() => {});
+  };
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => session,
+  });
+
+  await pool.ensureSession(WORK_DIR);
+  await pool.shutdown();
+
+  assert.equal(session.disposeCalls, 1);
+});
+
+test("shutdown during SDK creation disposes the late session", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const session = new FakeSession();
+  const pool = createPool({
+    sessionFactory: async () => {
+      await gate;
+      return session;
+    },
+  });
+
+  const creation = pool.ensureSession(WORK_DIR);
+  const shutdown = pool.shutdown();
+  release();
+
+  await assert.rejects(creation, /shut down during session creation/);
+  await shutdown;
+  assert.equal(session.disposeCalls, 1);
+});
+
+test("shutdown completes when late-created session disposal stalls", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const session = new FakeSession();
+  session.dispose = () => {
+    session.disposeCalls += 1;
+    return new Promise(() => {});
+  };
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => {
+      await gate;
+      return session;
+    },
+  });
+
+  const creation = pool.ensureSession(WORK_DIR);
+  const shutdown = pool.shutdown();
+  release();
+
+  await assert.rejects(creation, /shut down during session creation/);
+  await shutdown;
+  assert.equal(session.disposeCalls, 1);
+});
+
+test("shutdown completes when SDK session creation stalls", async () => {
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: () => new Promise(() => {}),
+  });
+
+  const creation = pool.ensureSession(WORK_DIR);
+  const creationRejection = assert.rejects(creation, /session creation timed out/);
+  await pool.shutdown();
+  await creationRejection;
+});
+
+test("timed-out session creation is evicted and late sessions are disposed", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const late = new FakeSession();
+  const replacement = new FakeSession();
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      if (factoryCalls === 1) {
+        await gate;
+        return late;
+      }
+      return replacement;
+    },
+  });
+
+  try {
+    await assert.rejects(pool.ensureSession(WORK_DIR), /session creation timed out/);
+    assert.strictEqual(await pool.ensureSession(WORK_DIR), replacement);
+
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(factoryCalls, 2);
+    assert.equal(late.disposeCalls, 1);
+  } finally {
+    await pool.shutdown();
   }
 });

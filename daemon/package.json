@@ -4,11 +4,15 @@
   "private": true,
   "type": "module",
   "main": "src/daemon.js",
+  "engines": {
+    "bun": ">=1.3.14"
+  },
   "scripts": {
-    "start": "node src/daemon.js",
+    "start": "bun src/daemon.js",
     "test": "node --test"
   },
   "dependencies": {
+    "@gajae-code/coding-agent": "0.11.1",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0",
     "@gjc-remote/shared": "*"
