@@ -1,13 +1,16 @@
 import "dotenv/config";
 import WebSocket from "ws";
 import {
+  CAPABILITIES,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PONG,
+  PROTOCOL_VERSION,
   isInvokeMessage,
   isPingMessage,
   isRegisterDeniedMessage,
   isRegisterOkMessage,
+  negotiateCapabilities,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
@@ -36,7 +39,16 @@ function connectToBot() {
 
   connection.on("open", () => {
     reconnectDelay = 1000;
-    connection.send(JSON.stringify({ type: MSG_TYPES.REGISTER, hostId: HOST_ID, token: HOST_TOKEN, label: HOST_LABEL }));
+    connection.send(
+      JSON.stringify({
+        type: MSG_TYPES.REGISTER,
+        hostId: HOST_ID,
+        token: HOST_TOKEN,
+        label: HOST_LABEL,
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: CAPABILITIES,
+      })
+    );
     console.log(`daemon: connected to bot at ${BOT_WS_URL}, registering as '${HOST_ID}'`);
   });
 
@@ -82,7 +94,12 @@ async function handleMessage(connection, raw, isBinary) {
   }
 
   if (isRegisterOkMessage(msg)) {
-    console.log("daemon: registration accepted");
+    const botVersion = msg.protocolVersion ?? 0;
+    const shared = negotiateCapabilities(CAPABILITIES, msg.capabilities);
+    console.log(
+      `daemon: registration accepted (bot protocol v${botVersion}, ` +
+        `shared capabilities: ${shared.join(", ") || "none"})`
+    );
     return;
   }
   if (isRegisterDeniedMessage(msg)) {

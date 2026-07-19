@@ -4,10 +4,13 @@ import { EventEmitter, once } from "node:events";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
+  CAPABILITIES,
   MAX_WS_PAYLOAD_BYTES,
+  PROTOCOL_VERSION,
   V0_LIMITS,
   isEventMessage,
   isInvokeMessage,
+  isRegisterMessage,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { WebSocketServer } from "ws";
@@ -74,6 +77,7 @@ async function startDaemon() {
   return {
     child,
     peer,
+    register,
     stderr: () => stderr,
     async close() {
       peer?.terminate();
@@ -95,6 +99,19 @@ test("invoke validation rejects an empty model name", () => {
     }),
     false
   );
+});
+
+test("daemon advertises protocol version and capabilities in its register frame", async () => {
+  const daemon = await startDaemon();
+  try {
+    // startDaemon() captures the first register frame from the child daemon.
+    assert.equal(daemon.register.protocolVersion, PROTOCOL_VERSION);
+    assert.deepEqual(daemon.register.capabilities, [...CAPABILITIES]);
+    assert.equal(isRegisterMessage(daemon.register), true);
+    daemon.peer.send(JSON.stringify({ type: "register_ok" }));
+  } finally {
+    await daemon.close();
+  }
 });
 
 test("stopChild escalates to SIGKILL after the graceful timeout", async () => {

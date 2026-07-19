@@ -1,14 +1,17 @@
 import { WebSocket, WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
 import {
+  CAPABILITIES,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PING,
+  PROTOCOL_VERSION,
   V0_LIMITS,
   isEventMessage,
   isInvokeMessage,
   isPongMessage,
   isRegisterMessage,
+  negotiateCapabilities,
 } from "@gjc-remote/shared";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -65,6 +68,8 @@ export class HostRegistry {
     this.pendingRequests = new Map();
     /** @type {Map<import("ws").WebSocket, number>} */
     this.pendingCountBySocket = new Map();
+    /** @type {Map<string, { protocolVersion: number, capabilities: string[] }>} */
+    this.hostInfo = new Map();
     this.closed = false;
     this.closePromise = undefined;
 
@@ -109,8 +114,20 @@ export class HostRegistry {
 
       this.connections.set(hostId, socket);
       this.heartbeatStates.set(socket, { hostId });
-      socket.send(JSON.stringify({ type: MSG_TYPES.REGISTER_OK }));
-      console.log(`HostRegistry: host '${hostId}' connected (${msg.label ?? "no label"})`);
+      const protocolVersion = msg.protocolVersion ?? 0;
+      const capabilities = negotiateCapabilities(CAPABILITIES, msg.capabilities);
+      this.hostInfo.set(hostId, { protocolVersion, capabilities });
+      socket.send(
+        JSON.stringify({
+          type: MSG_TYPES.REGISTER_OK,
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: CAPABILITIES,
+        })
+      );
+      console.log(
+        `HostRegistry: host '${hostId}' connected (${msg.label ?? "no label"}, ` +
+          `protocol v${protocolVersion}, capabilities: ${capabilities.join(", ") || "none"})`
+      );
 
       socket.on("message", (raw2, isBinary2) =>
         this.#handleMessage(socket, raw2, isBinary2)
@@ -215,7 +232,10 @@ export class HostRegistry {
 
   #dropConnection(hostId, socket, error) {
     const wasCurrent = this.connections.get(hostId) === socket;
-    if (wasCurrent) this.connections.delete(hostId);
+    if (wasCurrent) {
+      this.connections.delete(hostId);
+      this.hostInfo.delete(hostId);
+    }
     this.#clearHeartbeat(socket);
     this.#failPendingForSocket(socket, error);
     return wasCurrent;
@@ -278,6 +298,7 @@ export class HostRegistry {
       socket.terminate();
     }
     this.connections.clear();
+    this.hostInfo.clear();
 
     this.closePromise = new Promise((resolve, reject) => {
       this.wss.close((error) => (error ? reject(error) : resolve()));
@@ -291,6 +312,17 @@ export class HostRegistry {
 
   listOnline() {
     return [...this.connections.keys()];
+  }
+
+  /**
+   * Returns the negotiated protocol version and shared capabilities for a
+   * connected host, or `undefined` if the host is not currently registered.
+   * A legacy (v0) daemon reports `{ protocolVersion: 0, capabilities: [] }`.
+   *
+   * @param {string} hostId
+   */
+  getHostInfo(hostId) {
+    return this.hostInfo.get(hostId);
   }
 
   /**

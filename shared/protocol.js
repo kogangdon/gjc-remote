@@ -18,7 +18,21 @@ export const V0_LIMITS = Object.freeze({
   // grow the bot's pending-request map without limit. Excess invokes are
   // rejected locally (fail-closed) rather than queued or dropped silently.
   MAX_PENDING_PER_HOST: 64,
+  // Bounds on the additive v1 protocol negotiation fields (see PROTOCOL_VERSION).
+  CAPABILITY: 64,
+  MAX_CAPABILITIES: 32,
+  PROTOCOL_VERSION_MAX: 1_000_000,
 });
+
+/**
+ * Wire protocol version this build speaks. v0 (legacy) daemons omit
+ * `protocolVersion`/`capabilities` entirely; both sides MUST keep treating a
+ * missing version as 0 so the handshake stays backward compatible.
+ */
+export const PROTOCOL_VERSION = 1;
+
+/** Capabilities this build advertises during the register handshake. */
+export const CAPABILITIES = Object.freeze(["invoke", "set_model", "heartbeat"]);
 
 /**
  * host -> bot, sent immediately after the daemon opens its WS connection.
@@ -78,6 +92,33 @@ export function isModelName(value) {
   return isBoundedString(value, V0_LIMITS.MODEL_NAME);
 }
 
+/**
+ * Additive v1 negotiation field: a non-negative, bounded integer version.
+ * Absence is treated as v0 by callers, so this only validates present values.
+ */
+export function isProtocolVersion(value) {
+  return (
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= V0_LIMITS.PROTOCOL_VERSION_MAX
+  );
+}
+
+/** Additive v1 negotiation field: a bounded array of bounded capability tags. */
+export function isCapabilityList(value) {
+  return (
+    Array.isArray(value) &&
+    value.length <= V0_LIMITS.MAX_CAPABILITIES &&
+    value.every((cap) => isBoundedString(cap, V0_LIMITS.CAPABILITY))
+  );
+}
+
+/** Intersects a local capability list with a remote peer's advertised set. */
+export function negotiateCapabilities(local, remote) {
+  const advertised = new Set(isCapabilityList(remote) ? remote : []);
+  return local.filter((cap) => advertised.has(cap));
+}
+
 export function isRegisterMessage(value) {
   return (
     isObject(value) &&
@@ -85,7 +126,10 @@ export function isRegisterMessage(value) {
     isBoundedString(value.hostId, V0_LIMITS.HOST_ID) &&
     isBoundedString(value.token, V0_LIMITS.TOKEN) &&
     (value.label === undefined ||
-      isBoundedString(value.label, V0_LIMITS.LABEL, true))
+      isBoundedString(value.label, V0_LIMITS.LABEL, true)) &&
+    (value.protocolVersion === undefined ||
+      isProtocolVersion(value.protocolVersion)) &&
+    (value.capabilities === undefined || isCapabilityList(value.capabilities))
   );
 }
 
@@ -111,7 +155,13 @@ export function isEventMessage(value) {
 }
 
 export function isRegisterOkMessage(value) {
-  return isObject(value) && value.type === MSG_TYPES.REGISTER_OK;
+  return (
+    isObject(value) &&
+    value.type === MSG_TYPES.REGISTER_OK &&
+    (value.protocolVersion === undefined ||
+      isProtocolVersion(value.protocolVersion)) &&
+    (value.capabilities === undefined || isCapabilityList(value.capabilities))
+  );
 }
 
 export function isRegisterDeniedMessage(value) {
