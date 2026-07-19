@@ -286,6 +286,53 @@ test("live controls dispatch during a prompt and keep their event streams open",
   await session.dispose();
 });
 
+test("controls retain SDK semantics during an active follow-up run", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  agent.steer = async (message) => {
+    agent.calls.push(["steer", message]);
+  };
+  agent.followUp = async (message) => {
+    agent.calls.push(["follow_up", message]);
+  };
+  const session = new SdkSession(agent);
+  let secondSettled = false;
+
+  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
+  const first = session.send({ type: "follow_up", message: "first" }, () => {}, 100);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  agent.emit({ type: "agent_end" });
+  await prompt;
+
+  const steer = session.send({ type: "steer", message: "adjust" }, () => {}, 100);
+  const second = session
+    .send({ type: "follow_up", message: "second" }, () => {}, 100)
+    .finally(() => {
+      secondSettled = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(agent.calls, [
+    ["prompt", "initial"],
+    ["follow_up", "first"],
+    ["steer", "adjust"],
+    ["follow_up", "second"],
+  ]);
+
+  agent.emit({ type: "agent_end" });
+  await Promise.all([first, steer]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondSettled, false);
+
+  agent.emit({ type: "agent_end" });
+  await second;
+  assert.equal(secondSettled, true);
+  await session.dispose();
+});
+
 test("queued commands wait for an active follow-up run to complete", async () => {
   const agent = new FakeAgentSession();
   agent.prompt = async (message) => {

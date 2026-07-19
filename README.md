@@ -20,10 +20,11 @@ Discord-controlled remote GJC sessions.
    directory reuse one in-process GJC SDK `AgentSession`. Prompt and model
    operations are serialized per session. Idle `steer`/`follow_up` requests join
    that FIFO and start a prompt-equivalent run instead of waiting on an inactive
-   control queue. Before an active prompt emits `agent_end`, controls dispatch
-   without waiting behind it. A `steer` request remains open through the current
-   run's `agent_end`; each successfully queued `follow_up` remains open through
-   its own run's `agent_end` and blocks queued prompt/model operations until that
+   control queue. While a prompt or accepted follow-up pipeline is active,
+   controls retain their SDK `steer`/`follow_up` semantics instead of waiting
+   behind it. A `steer` request remains open through the current run's
+   `agent_end`; each successfully queued `follow_up` remains open through its
+   own run's `agent_end` and blocks queued prompt/model operations until that
    boundary. Rejected follow-up admissions consume no completion boundary. Each
    request receives its event stream, and later controls rejoin the FIFO. Idle
    sessions (no requests for 1 hour) are disposed automatically.

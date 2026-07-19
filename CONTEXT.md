@@ -34,13 +34,14 @@ runtime model switching as `/slash` commands.
    under `<workDir>/.gjc-remote-session`. Prompt and model operations are
    serialized per session. Idle `steer`/`follow_up` requests join that FIFO and
    start a prompt-equivalent run instead of waiting on an inactive control queue.
-   Before an active prompt emits `agent_end`, controls dispatch without waiting
-   behind it. A `steer` request remains open through the current run's
-   `agent_end`; each successfully queued `follow_up` remains open through its own
-   run's `agent_end` and blocks queued prompt/model operations until that
-   boundary. Rejected follow-up admissions consume no completion boundary. Each
-   request receives its event stream, and later controls rejoin the FIFO. Idle
-   sessions (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
+   While a prompt or accepted follow-up pipeline is active, controls retain
+   their SDK `steer`/`follow_up` semantics instead of waiting behind it. A
+   `steer` request remains open through the current run's `agent_end`; each
+   successfully queued `follow_up` remains open through its own run's
+   `agent_end` and blocks queued prompt/model operations until that boundary.
+   Rejected follow-up admissions consume no completion boundary. Each request
+   receives its event stream, and later controls rejoin the FIFO. Idle sessions
+   (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
    each Discord channel to one validated `{hostId, workDir}` pair via
@@ -139,8 +140,9 @@ current transport lives in `daemon/src/sdk-session.js`.
    permanently poisoned timed-out RPC sessions so late frames could not be
    assigned to replacement sessions. The current SDK adapter preserves the
    relevant invariant by timing out and poisoning a stuck `AgentSession`.
-   `SessionPool` bounds idle, replacement, and shutdown disposal waits plus
-   shutdown waits for in-flight session creation, so stalled SDK work cannot
+   `SessionPool` bounds session creation, idle/replacement/shutdown disposal,
+   and shutdown waits for in-flight creation. Timed-out creations are evicted,
+   and any session they produce later is disposed, so stalled SDK work cannot
    block a workDir or daemon shutdown indefinitely.
 8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses

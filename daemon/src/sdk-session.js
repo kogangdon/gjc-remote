@@ -25,7 +25,7 @@ export class SdkSession {
     this.activePromptRuns = 0;
     this.pendingLiveFollowUps = 0;
     this.liveFollowUpAcceptance = Promise.resolve();
-    this.nextLiveFollowUpAgentEnds = 2;
+    this.outstandingAcceptedFollowUps = 0;
     this.liveFollowUpBarrier = undefined;
     this.disposePromise = undefined;
   }
@@ -38,7 +38,7 @@ export class SdkSession {
 
     const result = Promise.resolve().then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
-      if (this.activePromptRuns <= 0) {
+      if (this.activePromptRuns <= 0 && !this.liveFollowUpBarrier) {
         return this.#enqueue(command, onEvent, timeoutMs);
       }
       if (command.type !== "follow_up") {
@@ -47,19 +47,26 @@ export class SdkSession {
 
       if (this.pendingLiveFollowUps === 0) {
         this.liveFollowUpAcceptance = Promise.resolve();
-        this.nextLiveFollowUpAgentEnds = 2;
       }
       this.pendingLiveFollowUps += 1;
       const previousAcceptance = this.liveFollowUpAcceptance;
       let releaseAcceptance;
+      let accepted = false;
       this.liveFollowUpAcceptance = new Promise((resolve) => {
         releaseAcceptance = resolve;
       });
-      const settleAcceptance = async (queued) => {
+      const settleAcceptance = async (queued, observedAgentEnds) => {
         await previousAcceptance;
-        const agentEndsToWait = queued
-          ? this.nextLiveFollowUpAgentEnds++
-          : undefined;
+        let agentEndsToWait;
+        if (queued) {
+          agentEndsToWait =
+            observedAgentEnds +
+            this.outstandingAcceptedFollowUps +
+            (this.activePromptRuns > 0 ? 1 : 0) +
+            1;
+          this.outstandingAcceptedFollowUps += 1;
+          accepted = true;
+        }
         releaseAcceptance();
         return agentEndsToWait;
       };
@@ -82,9 +89,11 @@ export class SdkSession {
       control.then(
         () => {
           this.pendingLiveFollowUps -= 1;
+          if (accepted) this.outstandingAcceptedFollowUps -= 1;
         },
         () => {
           this.pendingLiveFollowUps -= 1;
+          if (accepted) this.outstandingAcceptedFollowUps -= 1;
         }
       );
       return control;
@@ -221,7 +230,7 @@ export class SdkSession {
             throw error;
           }
           if (settleFollowUpAcceptance) {
-            requiredAgentEnds = await settleFollowUpAcceptance(true);
+            requiredAgentEnds = await settleFollowUpAcceptance(true, observedAgentEnds);
             resolveIfComplete();
           }
         }

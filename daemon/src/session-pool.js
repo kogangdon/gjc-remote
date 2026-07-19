@@ -83,6 +83,19 @@ export class SessionPool {
     }
   }
 
+  async #createSessionBounded(workDir) {
+    const pending = Promise.resolve().then(() => this.sessionFactory(workDir));
+    const result = await this.#settleBounded(pending);
+    if (result.status === "fulfilled") return result.value;
+    if (result.status === "rejected") throw result.reason;
+
+    void pending.then(
+      (session) => this.#disposeIgnoringFailure(session, workDir, "late-created"),
+      () => {}
+    );
+    throw new Error(`GJC SDK session creation timed out for ${workDir}`);
+  }
+
   async ensureSession(workDir) {
     if (this.closed) throw new Error("SessionPool is shut down");
 
@@ -121,7 +134,7 @@ export class SessionPool {
         await this.#disposeIgnoringFailure(existing.session, canonicalWorkDir, "replacement");
       }
 
-      const session = await this.sessionFactory(canonicalWorkDir);
+      const session = await this.#createSessionBounded(canonicalWorkDir);
       if (this.closed) {
         await this.#disposeIgnoringFailure(session, canonicalWorkDir, "late-created");
         throw new Error("SessionPool was shut down during session creation");
