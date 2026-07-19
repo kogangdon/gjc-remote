@@ -110,6 +110,28 @@ test("SDK adapter forwards prompt events and preserves model command receipts", 
   await session.dispose();
 });
 
+test("prompt completion waits for the final agent_end event", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  const session = new SdkSession(agent);
+  let settled = false;
+
+  const result = session
+    .send({ type: "prompt", message: "hello" }, () => {}, 100)
+    .then(() => {
+      settled = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+
+  agent.emit({ type: "agent_end" });
+  await result;
+  assert.equal(settled, true);
+  await session.dispose();
+});
+
 test("SDK adapter serializes commands per session", async () => {
   const agent = new FakeAgentSession();
   let releaseFirst;
@@ -153,4 +175,40 @@ test("SDK adapter poisons and disposes a timed-out session", async () => {
     session.send({ type: "prompt", message: "later" }, () => {}),
     /not running/
   );
+});
+
+test("model switches use the same timeout and poison lifecycle", async () => {
+  const agent = new FakeAgentSession();
+  agent.setModel = () => new Promise(() => {});
+  const session = new SdkSession(agent);
+
+  await assert.rejects(
+    session.send(
+      { type: "set_model", provider: "provider-a", modelId: "model-a" },
+      () => {},
+      1
+    ),
+    /SDK command timed out/
+  );
+  assert.equal(session.closed, true);
+  await session.dispose();
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("timeout-triggered disposal rejections are handled immediately", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = () => new Promise(() => {});
+  agent.dispose = async () => {
+    agent.disposeCalls += 1;
+    throw new Error("dispose failed");
+  };
+  const session = new SdkSession(agent);
+
+  await assert.rejects(
+    session.send({ type: "prompt", message: "never" }, () => {}, 1),
+    /SDK command timed out/
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(agent.disposeCalls, 1);
+  await assert.rejects(session.dispose(), /dispose failed/);
 });

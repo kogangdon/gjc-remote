@@ -12,6 +12,7 @@ import {
 } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
 import { setSessionModel } from "./model-command.js";
+import { webSocketPayloadByteLength } from "./ws-payload.js";
 
 const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
 
@@ -53,7 +54,14 @@ function connectToBot() {
 }
 
 async function handleMessage(connection, raw, isBinary) {
-  if ((raw.byteLength ?? raw.length ?? 0) > MAX_WS_PAYLOAD_BYTES) {
+  let payloadBytes;
+  try {
+    payloadBytes = webSocketPayloadByteLength(raw);
+  } catch {
+    connection.close(1008, "invalid frame");
+    return;
+  }
+  if (payloadBytes > MAX_WS_PAYLOAD_BYTES) {
     connection.close(1009, "message too big");
     return;
   }

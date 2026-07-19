@@ -67,7 +67,7 @@ export class SdkSession {
         if (!model) {
           throw new Error(`Model is not available: ${command.provider}/${command.modelId}`);
         }
-        await this.session.setModel(model);
+        await this.#withTimeout(() => this.session.setModel(model), timeoutMs);
         onEvent({
           type: "response",
           command: command.type,
@@ -96,31 +96,39 @@ export class SdkSession {
       if (event.type === "agent_end") resolveAgentEnd();
     });
 
+    try {
+      await this.#withTimeout(async () => {
+        if (command.type === "prompt") {
+          await this.session.prompt(command.message);
+        } else if (command.type === "steer") {
+          await this.session.steer(command.message);
+        } else {
+          await this.session.followUp(command.message);
+        }
+        await agentEnd;
+      }, timeoutMs);
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  async #withTimeout(operation, timeoutMs) {
+    const timeoutError = new Error("SDK command timed out");
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("SDK command timed out")), timeoutMs);
+      timer = setTimeout(() => reject(timeoutError), timeoutMs);
     });
 
     try {
-      const operation = (async () => {
-        if (command.type === "prompt") {
-          await this.session.prompt(command.message);
-          return;
-        }
-        if (command.type === "steer") await this.session.steer(command.message);
-        else await this.session.followUp(command.message);
-        await agentEnd;
-      })();
-      await Promise.race([operation, timeout]);
+      return await Promise.race([Promise.resolve().then(operation), timeout]);
     } catch (error) {
-      if (error instanceof Error && error.message === "SDK command timed out") {
+      if (error === timeoutError) {
         this.closed = true;
-        void this.#disposeUnderlying();
+        void this.#disposeUnderlying().catch(() => {});
       }
       throw error;
     } finally {
       clearTimeout(timer);
-      unsubscribe();
     }
   }
 
