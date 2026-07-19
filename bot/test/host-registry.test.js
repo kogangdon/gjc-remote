@@ -4,6 +4,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import {
   MAX_WS_PAYLOAD_BYTES,
+  PONG,
   V0_LIMITS,
   isEventMessage,
   isInvokeMessage,
@@ -12,17 +13,79 @@ import {
 } from "@gjc-remote/shared";
 import { HostRegistry } from "../src/host-registry.js";
 
-async function startRegistry(tokens = new Map([["host-a", "token-a"]])) {
-  const registry = new HostRegistry({ port: 0, tokensByHostId: tokens });
+function createManualTimers() {
+  const intervals = new Map();
+  const timeouts = new Map();
+  const clearedTimeouts = [];
+
+  const add = (store, callback, delay) => {
+    const timer = { unref() {} };
+    store.set(timer, { callback, delay });
+    return timer;
+  };
+
+  return {
+    api: {
+      setInterval: (callback, delay) => add(intervals, callback, delay),
+      clearInterval: (timer) => intervals.delete(timer),
+      setTimeout: (callback, delay) => add(timeouts, callback, delay),
+      clearTimeout: (timer) => {
+        const entry = timeouts.get(timer);
+        if (entry) clearedTimeouts.push(entry.callback);
+        return timeouts.delete(timer);
+      },
+    },
+    runIntervals() {
+      for (const { callback } of [...intervals.values()]) callback();
+    },
+    runTimeouts() {
+      const entries = [...timeouts.values()];
+      timeouts.clear();
+      for (const { callback } of entries) callback();
+    },
+    runClearedTimeouts() {
+      const callbacks = clearedTimeouts.splice(0);
+      for (const callback of callbacks) callback();
+    },
+    get intervalCount() {
+      return intervals.size;
+    },
+    get intervalDelays() {
+      return [...intervals.values()].map(({ delay }) => delay);
+    },
+    get timeoutCount() {
+      return timeouts.size;
+    },
+    get timeoutDelays() {
+      return [...timeouts.values()].map(({ delay }) => delay);
+    },
+  };
+}
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("condition was not met");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function startRegistry(
+  tokens = new Map([["host-a", "token-a"]]),
+  options = {}
+) {
+  const registry = new HostRegistry({
+    port: 0,
+    tokensByHostId: tokens,
+    ...options,
+  });
   if (!registry.wss.address()) await once(registry.wss, "listening");
   const { port } = registry.wss.address();
-  const clients = [];
 
   return {
     registry,
     async connect(hostId, token) {
       const socket = new WebSocket(`ws://127.0.0.1:${port}`);
-      clients.push(socket);
       await once(socket, "open");
       const response = once(socket, "message");
       socket.send(JSON.stringify({ type: "register", hostId, token }));
@@ -30,11 +93,8 @@ async function startRegistry(tokens = new Map([["host-a", "token-a"]])) {
       assert.deepEqual(JSON.parse(raw.toString()), { type: "register_ok" });
       return socket;
     },
-    async close() {
-      for (const client of clients) client.terminate();
-      await new Promise((resolve, reject) => {
-        registry.wss.close((error) => (error ? reject(error) : resolve()));
-      });
+    close() {
+      return registry.close();
     },
   };
 }
@@ -45,6 +105,23 @@ async function expectPolicyClose(socket, payload) {
   const [code] = await closed;
   assert.equal(code, 1008);
 }
+
+test("heartbeat durations must be positive finite values", () => {
+  const tokensByHostId = new Map([["host-a", "token-a"]]);
+
+  for (const heartbeatIntervalMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new HostRegistry({ port: 0, tokensByHostId, heartbeatIntervalMs }),
+      /heartbeatIntervalMs must be a positive duration/
+    );
+  }
+  for (const heartbeatTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new HostRegistry({ port: 0, tokensByHostId, heartbeatTimeoutMs }),
+      /heartbeatTimeoutMs must be a positive duration/
+    );
+  }
+});
 
 test("v0 validators reject malformed required fields and preserve additive fields", () => {
   assert.equal(
@@ -292,4 +369,151 @@ test("a different registered socket cannot spoof a pending requestId", async () 
   } finally {
     await server.close();
   }
+});
+
+test("heartbeat pong keeps a registered host online", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, { timers: timers.api });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    assert.deepEqual(timers.intervalDelays, [30_000]);
+    const ping = once(socket, "message");
+
+    timers.runIntervals();
+    const [raw] = await ping;
+    assert.deepEqual(JSON.parse(raw.toString()), { type: "ping" });
+    assert.equal(timers.timeoutCount, 1);
+    assert.deepEqual(timers.timeoutDelays, [10_000]);
+
+    socket.send(JSON.stringify(PONG));
+    await waitFor(() => timers.timeoutCount === 0);
+
+    assert.equal(timers.timeoutCount, 0);
+    timers.runClearedTimeouts();
+    assert.equal(server.registry.isOnline("host-a"), true);
+    assert.equal(socket.readyState, WebSocket.OPEN);
+  } finally {
+    await server.close();
+  }
+});
+
+test("heartbeat timeout disconnects a host and fails its pending invoke", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, { timers: timers.api });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const registeredSocket = server.registry.connections.get("host-a");
+    assert.ok(registeredSocket);
+    const invokeFrame = once(socket, "message");
+    const result = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      1000
+    );
+    await invokeFrame;
+
+    const ping = once(socket, "message");
+    const closed = once(socket, "close");
+    timers.runIntervals();
+    await ping;
+    assert.deepEqual(timers.timeoutDelays, [10_000]);
+    timers.runTimeouts();
+    await closed;
+
+    assert.deepEqual(await result, {
+      ok: false,
+      error: "host 'host-a' heartbeat timed out",
+    });
+    assert.equal(server.registry.isOnline("host-a"), false);
+    assert.equal(server.registry.pendingRequests.size, 0);
+    registeredSocket.emit("message", Buffer.from(JSON.stringify(PONG)), false);
+    assert.equal(server.registry.isOnline("host-a"), false);
+    assert.equal(server.registry.heartbeatStates.has(registeredSocket), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("replacement sockets are not removed by stale heartbeat state", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, { timers: timers.api });
+  try {
+    const original = await server.connect("host-a", "token-a");
+    const invokeFrame = once(original, "message");
+    const originalResult = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      1000
+    );
+    await invokeFrame;
+
+    const originalPing = once(original, "message");
+    timers.runIntervals();
+    await originalPing;
+    assert.equal(timers.timeoutCount, 1);
+
+    const originalClosed = once(original, "close");
+    const replacement = await server.connect("host-a", "token-a");
+    await originalClosed;
+
+    assert.deepEqual(await originalResult, {
+      ok: false,
+      error: "host 'host-a' connection replaced",
+    });
+    assert.equal(timers.timeoutCount, 0);
+    timers.runClearedTimeouts();
+    assert.equal(server.registry.isOnline("host-a"), true);
+    assert.equal(replacement.readyState, WebSocket.OPEN);
+
+    const replacementPing = once(replacement, "message");
+    timers.runIntervals();
+    const [raw] = await replacementPing;
+    assert.deepEqual(JSON.parse(raw.toString()), { type: "ping" });
+    replacement.send(JSON.stringify(PONG));
+    await waitFor(() => timers.timeoutCount === 0);
+    assert.equal(timers.timeoutCount, 0);
+    timers.runClearedTimeouts();
+    assert.equal(server.registry.isOnline("host-a"), true);
+    assert.equal(replacement.readyState, WebSocket.OPEN);
+  } finally {
+    await server.close();
+  }
+});
+
+test("registry shutdown clears heartbeat state and settles pending invokes", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, { timers: timers.api });
+  const socket = await server.connect("host-a", "token-a");
+  const invokeFrame = once(socket, "message");
+  const result = server.registry.invoke(
+    "host-a",
+    "/workspace",
+    { kind: "prompt", message: "hello" },
+    () => {},
+    1000
+  );
+  await invokeFrame;
+
+  const ping = once(socket, "message");
+  timers.runIntervals();
+  await ping;
+  assert.equal(timers.intervalCount, 1);
+  assert.equal(timers.timeoutCount, 1);
+
+  const closing = server.registry.close();
+  assert.strictEqual(server.registry.close(), closing);
+  await closing;
+
+  assert.deepEqual(await result, {
+    ok: false,
+    error: "HostRegistry shut down",
+  });
+  assert.equal(timers.intervalCount, 0);
+  assert.equal(timers.timeoutCount, 0);
+  assert.equal(server.registry.connections.size, 0);
+  assert.equal(server.registry.pendingRequests.size, 0);
 });

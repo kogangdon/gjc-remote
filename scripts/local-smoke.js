@@ -8,10 +8,14 @@ const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
 const workDir = process.env.SMOKE_WORK_DIR || process.cwd();
 const expected = "SMOKE_OK";
 const modelQuery = process.env.SMOKE_MODEL_QUERY;
+const heartbeatIntervalMs = 100;
+const heartbeatTimeoutMs = 5000;
 
 const registry = new HostRegistry({
   port,
   tokensByHostId: new Map([[hostId, token]]),
+  heartbeatIntervalMs,
+  heartbeatTimeoutMs,
 });
 
 await once(registry.wss, "listening");
@@ -33,6 +37,12 @@ daemon.stderr.on("data", (chunk) => process.stderr.write(chunk));
 
 try {
   await waitForHost(registry, hostId, 10_000);
+  await new Promise((resolve) =>
+    setTimeout(resolve, heartbeatIntervalMs + heartbeatTimeoutMs + 100)
+  );
+  if (!registry.isOnline(hostId)) {
+    throw new Error("host failed the application-level heartbeat");
+  }
 
   const result = await registry.invoke(
     hostId,
@@ -83,7 +93,5 @@ async function waitForHost(registry, id, timeoutMs) {
 }
 
 async function closeRegistry(registry) {
-  for (const socket of registry.connections.values()) socket.close();
-  registry.wss.close();
-  await once(registry.wss, "close").catch(() => {});
+  await registry.close();
 }
