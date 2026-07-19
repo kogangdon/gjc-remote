@@ -14,11 +14,13 @@ Discord-controlled remote GJC sessions.
 
 1. `daemon/` runs on each machine you want to control. It connects outbound to
    `bot/`'s WebSocket server and registers with a per-host pre-shared token.
-2. On the first Discord command routed to a given `workDir`, the daemon resolves
-   it to the host filesystem's canonical real path and creates an in-process GJC
-   SDK `AgentSession` for that directory. Different path spellings for the same
-   directory reuse one serialized session. Idle sessions (no requests for 1
-   hour) are disposed automatically.
+2. On each Discord command, the daemon resolves its configured `workDir` to the
+   host filesystem's current canonical real path, so retargeted symlinks or
+   junctions cannot reuse a stale target. Different path spellings for the same
+   directory reuse one in-process GJC SDK `AgentSession`. Prompt and model
+   operations are serialized per session, while `steer` and `follow_up` are
+   injected into an active run without waiting behind it. Idle sessions (no
+   requests for 1 hour) are disposed automatically.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `team`, `ultragoal`), `/gjc`,
    `/model`, and `/hosts` as Discord slash commands.

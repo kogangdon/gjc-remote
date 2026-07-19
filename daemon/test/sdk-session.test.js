@@ -159,6 +159,60 @@ test("SDK adapter serializes commands per session", async () => {
   await session.dispose();
 });
 
+test("steer and follow-up dispatch while a prompt is still active", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  agent.steer = async (message) => {
+    agent.calls.push(["steer", message]);
+  };
+  agent.followUp = async (message) => {
+    agent.calls.push(["follow_up", message]);
+  };
+  const session = new SdkSession(agent);
+  let promptSettled = false;
+
+  const prompt = session
+    .send({ type: "prompt", message: "first" }, () => {}, 100)
+    .finally(() => {
+      promptSettled = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await Promise.all([
+    session.send({ type: "steer", message: "adjust" }, () => {}, 100),
+    session.send({ type: "follow_up", message: "then continue" }, () => {}, 100),
+  ]);
+
+  assert.equal(promptSettled, false);
+  assert.deepEqual(agent.calls, [
+    ["prompt", "first"],
+    ["steer", "adjust"],
+    ["follow_up", "then continue"],
+  ]);
+
+  agent.emit({ type: "agent_end" });
+  await prompt;
+  await session.dispose();
+});
+
+test("idle follow-up keeps its own event stream through agent_end", async () => {
+  const agent = new FakeAgentSession();
+  const session = new SdkSession(agent);
+  const events = [];
+
+  await session.send(
+    { type: "follow_up", message: "continue" },
+    (event) => events.push(event),
+    100
+  );
+
+  assert.deepEqual(agent.calls, [["follow_up", "continue"]]);
+  assert.deepEqual(events, [{ type: "agent_end" }]);
+  await session.dispose();
+});
+
 test("SDK adapter poisons and disposes a timed-out session", async () => {
   const agent = new FakeAgentSession();
   agent.prompt = () => new Promise(() => {});

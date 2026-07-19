@@ -27,12 +27,14 @@ runtime model switching as `/slash` commands.
    NAT/firewall with no inbound port, and does not need to be always-on —
    when its daemon isn't connected, the bot treats that host's channels as
    offline and fails fast instead of hanging.
-2. On the first Discord command routed to a given `workDir`, the daemon resolves
-   it to the host filesystem's canonical real path and creates an in-process GJC
-   SDK `AgentSession` with file-backed history under
-   `<workDir>/.gjc-remote-session`. Different path spellings for the same
-   directory share one serialized session. Idle sessions (`IDLE_TIMEOUT_MS` =
-   1h, in `shared/protocol.js`) are disposed.
+2. On each Discord command, the daemon resolves its configured `workDir` to the
+   host filesystem's current canonical real path, so retargeted symlinks or
+   junctions cannot reuse a stale target. Different path spellings for the same
+   directory share one in-process GJC SDK `AgentSession` with file-backed history
+   under `<workDir>/.gjc-remote-session`. Prompt and model operations are
+   serialized per session, while `steer` and `follow_up` are injected into an
+   active run without waiting behind it. Idle sessions (`IDLE_TIMEOUT_MS` = 1h,
+   in `shared/protocol.js`) are disposed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
    each Discord channel to one validated `{hostId, workDir}` pair via

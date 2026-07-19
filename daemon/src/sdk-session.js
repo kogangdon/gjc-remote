@@ -21,17 +21,23 @@ export class SdkSession {
     this.session = session;
     this.closed = false;
     this.queue = Promise.resolve();
+    this.controlQueue = Promise.resolve();
+    this.activeRun = false;
     this.disposePromise = undefined;
   }
 
   send(command, onEvent, timeoutMs = COMMAND_TIMEOUT_MS) {
     if (this.closed) return Promise.reject(new Error("GJC SDK session is not running"));
 
-    const result = this.queue.then(() => {
+    const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
+    const queueName = isLiveControl ? "controlQueue" : "queue";
+    const result = this[queueName].then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
-      return this.#dispatch(command, onEvent, timeoutMs);
+      return isLiveControl
+        ? this.#dispatchLiveControl(command, onEvent, timeoutMs)
+        : this.#dispatch(command, onEvent, timeoutMs);
     });
-    this.queue = result.catch(() => {});
+    this[queueName] = result.catch(() => {});
     return result;
   }
 
@@ -77,8 +83,6 @@ export class SdkSession {
         return;
       }
       case "prompt":
-      case "steer":
-      case "follow_up":
         await this.#runPromptCommand(command, onEvent, timeoutMs);
         return;
       default:
@@ -86,11 +90,27 @@ export class SdkSession {
     }
   }
 
+  async #dispatchLiveControl(command, onEvent, timeoutMs) {
+    const operation =
+      command.type === "steer"
+        ? () => this.session.steer(command.message)
+        : () => this.session.followUp(command.message);
+
+    if (!this.activeRun) await this.queue;
+    if (this.activeRun) {
+      await this.#withTimeout(operation, timeoutMs);
+      return;
+    }
+
+    await this.#runPromptCommand(command, onEvent, timeoutMs);
+  }
+
   async #runPromptCommand(command, onEvent, timeoutMs) {
     let resolveAgentEnd;
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
     });
+    this.activeRun = true;
     const unsubscribe = this.session.subscribe((event) => {
       onEvent(event);
       if (event.type === "agent_end") resolveAgentEnd();
@@ -108,6 +128,7 @@ export class SdkSession {
         await agentEnd;
       }, timeoutMs);
     } finally {
+      this.activeRun = false;
       unsubscribe();
     }
   }
@@ -142,6 +163,6 @@ export class SdkSession {
   async dispose() {
     this.closed = true;
     const disposal = this.#disposeUnderlying();
-    await Promise.all([this.queue, disposal]);
+    await Promise.all([this.queue, this.controlQueue, disposal]);
   }
 }
