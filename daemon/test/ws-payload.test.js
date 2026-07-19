@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { webSocketPayloadByteLength } from "../src/ws-payload.js";
+import {
+  webSocketPayloadByteLength,
+  webSocketPayloadToUtf8,
+} from "../src/ws-payload.js";
 
 test("payload byte length uses UTF-8 bytes for strings", () => {
   assert.equal(webSocketPayloadByteLength("ascii"), 5);
@@ -21,6 +24,29 @@ test("payload byte length sums fragmented ws RawData chunks", () => {
   );
 });
 
-test("payload byte length rejects unsupported values", () => {
+test("payload UTF-8 decoding supports every RawData shape", () => {
+  const json = JSON.stringify({ message: "한글" });
+  const encoded = Buffer.from(json);
+  const split = encoded.indexOf(0xed) + 1;
+
+  assert.equal(webSocketPayloadToUtf8(json), json);
+  assert.equal(webSocketPayloadToUtf8(encoded), json);
+  assert.equal(
+    webSocketPayloadToUtf8([
+      encoded.subarray(0, split),
+      new Uint8Array(encoded.subarray(split)),
+    ]),
+    json
+  );
+  assert.equal(
+    webSocketPayloadToUtf8(
+      encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength)
+    ),
+    json
+  );
+});
+
+test("payload helpers reject unsupported values", () => {
   assert.throws(() => webSocketPayloadByteLength({ length: 1 }), /Unsupported/);
+  assert.throws(() => webSocketPayloadToUtf8({ length: 1 }), /Unsupported/);
 });

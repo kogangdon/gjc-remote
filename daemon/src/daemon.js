@@ -12,7 +12,10 @@ import {
 } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
 import { setSessionModel } from "./model-command.js";
-import { webSocketPayloadByteLength } from "./ws-payload.js";
+import {
+  webSocketPayloadByteLength,
+  webSocketPayloadToUtf8,
+} from "./ws-payload.js";
 
 const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
 
@@ -72,7 +75,7 @@ async function handleMessage(connection, raw, isBinary) {
 
   let msg;
   try {
-    msg = JSON.parse(raw.toString());
+    msg = JSON.parse(webSocketPayloadToUtf8(raw));
   } catch {
     connection.close(1008, "invalid json");
     return;
