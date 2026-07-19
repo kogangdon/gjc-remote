@@ -36,7 +36,10 @@ export const CAPABILITIES = Object.freeze(["invoke", "set_model", "heartbeat"]);
 
 /**
  * host -> bot, sent immediately after the daemon opens its WS connection.
- * @typedef {{ type: "register", hostId: string, token: string, label?: string }} RegisterMessage
+ * `protocolVersion` and `capabilities` are additive v1 fields; legacy v0
+ * daemons omit them.
+ * @typedef {{ type: "register", hostId: string, token: string, label?: string,
+ *   protocolVersion?: number, capabilities?: string[] }} RegisterMessage
  */
 
 /**

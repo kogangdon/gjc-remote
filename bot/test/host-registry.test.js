@@ -729,3 +729,21 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
     await server.close();
   }
 });
+
+test("negotiated protocol version is clamped to this bot build and hostInfo is a copy", async () => {
+  const server = await startRegistry();
+  try {
+    // A newer daemon advertises a higher version than this bot understands.
+    await server.connect("host-a", "token-a", {
+      protocolVersion: PROTOCOL_VERSION + 5,
+    });
+    const info = server.registry.getHostInfo("host-a");
+    assert.equal(info.protocolVersion, PROTOCOL_VERSION);
+
+    // getHostInfo returns a defensive copy; mutating it must not leak inward.
+    info.capabilities.push("tampered");
+    assert.deepEqual(server.registry.getHostInfo("host-a").capabilities, [...CAPABILITIES]);
+  } finally {
+    await server.close();
+  }
+});

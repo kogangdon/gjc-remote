@@ -114,7 +114,7 @@ export class HostRegistry {
 
       this.connections.set(hostId, socket);
       this.heartbeatStates.set(socket, { hostId });
-      const protocolVersion = msg.protocolVersion ?? 0;
+      const protocolVersion = Math.min(PROTOCOL_VERSION, msg.protocolVersion ?? 0);
       const capabilities = negotiateCapabilities(CAPABILITIES, msg.capabilities);
       this.hostInfo.set(hostId, { protocolVersion, capabilities });
       socket.send(
@@ -322,7 +322,12 @@ export class HostRegistry {
    * @param {string} hostId
    */
   getHostInfo(hostId) {
-    return this.hostInfo.get(hostId);
+    const info = this.hostInfo.get(hostId);
+    if (!info) return undefined;
+    return {
+      protocolVersion: info.protocolVersion,
+      capabilities: [...info.capabilities],
+    };
   }
 
   /**

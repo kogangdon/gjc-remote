@@ -94,10 +94,13 @@ async function handleMessage(connection, raw, isBinary) {
   }
 
   if (isRegisterOkMessage(msg)) {
-    const botVersion = msg.protocolVersion ?? 0;
+    const negotiatedVersion = Math.min(
+      PROTOCOL_VERSION,
+      msg.protocolVersion ?? 0
+    );
     const shared = negotiateCapabilities(CAPABILITIES, msg.capabilities);
     console.log(
-      `daemon: registration accepted (bot protocol v${botVersion}, ` +
+      `daemon: registration accepted (negotiated protocol v${negotiatedVersion}, ` +
         `shared capabilities: ${shared.join(", ") || "none"})`
     );
     return;
