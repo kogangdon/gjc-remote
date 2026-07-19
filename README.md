@@ -18,8 +18,9 @@ Discord-controlled remote GJC sessions.
    host filesystem's current canonical real path, so retargeted symlinks or
    junctions cannot reuse a stale target. Different path spellings for the same
    directory reuse one in-process GJC SDK `AgentSession`. Prompt and model
-   operations are serialized per session, and idle `steer`/`follow_up` requests
-   join that FIFO. During an active run, controls dispatch without waiting behind
+   operations are serialized per session. Idle `steer`/`follow_up` requests join
+   that FIFO and start a prompt-equivalent run instead of waiting on an inactive
+   control queue. During an active run, controls dispatch without waiting behind
    its prompt, while each request remains open through the resulting `agent_end`
    and receives its event stream. Idle sessions (no requests for 1 hour) are
    disposed automatically.

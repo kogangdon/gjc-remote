@@ -22,7 +22,7 @@ export class SdkSession {
     this.closed = false;
     this.queue = Promise.resolve();
     this.inFlightControls = new Set();
-    this.activeRuns = 0;
+    this.activePromptRuns = 0;
     this.disposePromise = undefined;
   }
 
@@ -34,7 +34,7 @@ export class SdkSession {
 
     const result = Promise.resolve().then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
-      if (this.activeRuns > 0) {
+      if (this.activePromptRuns > 0) {
         return this.#runPromptCommand(command, onEvent, timeoutMs);
       }
       return this.#enqueue(command, onEvent, timeoutMs);
@@ -98,9 +98,15 @@ export class SdkSession {
         return;
       }
       case "prompt":
+        await this.#runPromptCommand(command, onEvent, timeoutMs);
+        return;
       case "steer":
       case "follow_up":
-        await this.#runPromptCommand(command, onEvent, timeoutMs);
+        await this.#runPromptCommand(
+          { type: "prompt", message: command.message },
+          onEvent,
+          timeoutMs
+        );
         return;
       default:
         throw new Error(`Unknown SDK session command: ${command.type}`);
@@ -112,7 +118,8 @@ export class SdkSession {
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
     });
-    this.activeRuns += 1;
+    const startsPrompt = command.type === "prompt";
+    if (startsPrompt) this.activePromptRuns += 1;
     const unsubscribe = this.session.subscribe((event) => {
       onEvent(event);
       if (event.type === "agent_end") resolveAgentEnd();
@@ -130,7 +137,7 @@ export class SdkSession {
         await agentEnd;
       }, timeoutMs);
     } finally {
-      this.activeRuns -= 1;
+      if (startsPrompt) this.activePromptRuns -= 1;
       unsubscribe();
     }
   }

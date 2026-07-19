@@ -32,7 +32,8 @@ runtime model switching as `/slash` commands.
    junctions cannot reuse a stale target. Different path spellings for the same
    directory share one in-process GJC SDK `AgentSession` with file-backed history
    under `<workDir>/.gjc-remote-session`. Prompt and model operations are
-   serialized per session, and idle `steer`/`follow_up` requests join that FIFO.
+   serialized per session. Idle `steer`/`follow_up` requests join that FIFO and
+   start a prompt-equivalent run instead of waiting on an inactive control queue.
    During an active run, controls dispatch without waiting behind its prompt,
    while each request remains open through the resulting `agent_end` and receives
    its event stream. Idle sessions (`IDLE_TIMEOUT_MS` = 1h, in

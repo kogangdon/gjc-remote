@@ -220,7 +220,7 @@ test("live controls dispatch during a prompt and keep their event streams open",
   await session.dispose();
 });
 
-test("idle follow-up keeps its own event stream through agent_end", async () => {
+test("idle follow-up starts a prompt run and keeps its event stream", async () => {
   const agent = new FakeAgentSession();
   const session = new SdkSession(agent);
   const events = [];
@@ -231,10 +231,14 @@ test("idle follow-up keeps its own event stream through agent_end", async () => 
     100
   );
 
-  assert.deepEqual(agent.calls, [["follow_up", "continue"]]);
-  assert.deepEqual(events, [{ type: "agent_end" }]);
+  assert.deepEqual(agent.calls, [["prompt", "continue"]]);
+  assert.deepEqual(events, [
+    { type: "message_update", value: "continue" },
+    { type: "agent_end" },
+  ]);
   await session.dispose();
 });
+
 test("idle controls serialize behind an in-flight model switch", async () => {
   const agent = new FakeAgentSession();
   let releaseModel;
@@ -264,7 +268,34 @@ test("idle controls serialize behind an in-flight model switch", async () => {
   await Promise.all([modelSwitch, followUp]);
   assert.deepEqual(agent.calls, [
     ["set_model", agent.models[0]],
-    ["follow_up", "after model"],
+    ["prompt", "after model"],
+  ]);
+  await session.dispose();
+});
+
+test("multiple idle controls remain FIFO prompt runs", async () => {
+  const agent = new FakeAgentSession();
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    if (message === "first") await firstGate;
+    agent.emit({ type: "agent_end" });
+  };
+  const session = new SdkSession(agent);
+
+  const first = session.send({ type: "follow_up", message: "first" }, () => {}, 100);
+  const second = session.send({ type: "steer", message: "second" }, () => {}, 100);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(agent.calls, [["prompt", "first"]]);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(agent.calls, [
+    ["prompt", "first"],
+    ["prompt", "second"],
   ]);
   await session.dispose();
 });
