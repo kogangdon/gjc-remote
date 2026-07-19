@@ -1,13 +1,28 @@
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
 import {
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
+  PING,
   isEventMessage,
   isInvokeMessage,
   isPongMessage,
   isRegisterMessage,
 } from "@gjc-remote/shared";
+
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_TIMEOUT_MS = 10_000;
+const PING_PAYLOAD = JSON.stringify(PING);
+const SYSTEM_TIMERS = {
+  setInterval: (callback, delay) => setInterval(callback, delay),
+  clearInterval: (timer) => clearInterval(timer),
+  setTimeout: (callback, delay) => setTimeout(callback, delay),
+  clearTimeout: (timer) => clearTimeout(timer),
+};
+
+function isPositiveDuration(value) {
+  return Number.isFinite(value) && value > 0;
+}
 
 /**
  * WS server that host daemons connect to (outbound from the daemon's side).
@@ -15,16 +30,48 @@ import {
  * the Discord layer and whichever daemon owns the target host.
  */
 export class HostRegistry {
-  /** @param {{ port: number, tokensByHostId: Map<string, string> }} opts */
-  constructor({ port, tokensByHostId }) {
+  /**
+   * @param {{
+   *   port: number,
+   *   tokensByHostId: Map<string, string>,
+   *   heartbeatIntervalMs?: number,
+   *   heartbeatTimeoutMs?: number,
+   *   timers?: typeof SYSTEM_TIMERS,
+   * }} opts
+   */
+  constructor({
+    port,
+    tokensByHostId,
+    heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
+    heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
+    timers = SYSTEM_TIMERS,
+  }) {
+    if (!isPositiveDuration(heartbeatIntervalMs)) {
+      throw new Error("heartbeatIntervalMs must be a positive duration");
+    }
+    if (!isPositiveDuration(heartbeatTimeoutMs)) {
+      throw new Error("heartbeatTimeoutMs must be a positive duration");
+    }
+
     this.tokensByHostId = tokensByHostId;
+    this.heartbeatTimeoutMs = heartbeatTimeoutMs;
+    this.timers = timers;
     /** @type {Map<string, import("ws").WebSocket>} */
     this.connections = new Map();
+    /** @type {Map<import("ws").WebSocket, { hostId: string, timeout?: object }>} */
+    this.heartbeatStates = new Map();
     /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string }>} */
     this.pendingRequests = new Map();
+    this.closed = false;
+    this.closePromise = undefined;
 
     this.wss = new WebSocketServer({ port, maxPayload: MAX_WS_PAYLOAD_BYTES });
     this.wss.on("connection", (socket) => this.#handleConnection(socket));
+    this.heartbeatTimer = this.timers.setInterval(
+      () => this.#sendHeartbeats(),
+      heartbeatIntervalMs
+    );
+    this.heartbeatTimer.unref?.();
     console.log(`HostRegistry: WS server listening on :${port}`);
   }
 
@@ -51,7 +98,14 @@ export class HostRegistry {
       }
 
       hostId = msg.hostId;
+      const previous = this.connections.get(hostId);
+      if (previous && previous !== socket) {
+        this.#dropConnection(hostId, previous, `host '${hostId}' connection replaced`);
+        previous.terminate();
+      }
+
       this.connections.set(hostId, socket);
+      this.heartbeatStates.set(socket, { hostId });
       socket.send(JSON.stringify({ type: MSG_TYPES.REGISTER_OK }));
       console.log(`HostRegistry: host '${hostId}' connected (${msg.label ?? "no label"})`);
 
@@ -59,9 +113,12 @@ export class HostRegistry {
         this.#handleMessage(socket, raw2, isBinary2)
       );
       socket.on("close", () => {
-        if (this.connections.get(hostId) === socket) this.connections.delete(hostId);
-        this.#failPendingForSocket(socket, `host '${hostId}' disconnected`);
-        console.log(`HostRegistry: host '${hostId}' disconnected`);
+        const wasCurrent = this.#dropConnection(
+          hostId,
+          socket,
+          `host '${hostId}' disconnected`
+        );
+        if (wasCurrent) console.log(`HostRegistry: host '${hostId}' disconnected`);
       });
     });
 
@@ -82,7 +139,10 @@ export class HostRegistry {
       return;
     }
 
-    if (isPongMessage(msg)) return;
+    if (isPongMessage(msg)) {
+      this.#acceptPong(socket);
+      return;
+    }
     if (!isEventMessage(msg)) {
       socket.close(1008, "invalid event");
       return;
@@ -117,6 +177,92 @@ export class HostRegistry {
       pending.resolve({ ok: false, error });
       this.pendingRequests.delete(requestId);
     }
+  }
+
+  #acceptPong(socket) {
+    const state = this.heartbeatStates.get(socket);
+    if (!state?.timeout) return;
+
+    this.timers.clearTimeout(state.timeout);
+    state.timeout = undefined;
+  }
+
+  #clearHeartbeat(socket) {
+    const state = this.heartbeatStates.get(socket);
+    if (state?.timeout) this.timers.clearTimeout(state.timeout);
+    this.heartbeatStates.delete(socket);
+  }
+
+  #dropConnection(hostId, socket, error) {
+    const wasCurrent = this.connections.get(hostId) === socket;
+    if (wasCurrent) this.connections.delete(hostId);
+    this.#clearHeartbeat(socket);
+    this.#failPendingForSocket(socket, error);
+    return wasCurrent;
+  }
+
+  #expireHeartbeat(hostId, socket, timeout) {
+    const state = this.heartbeatStates.get(socket);
+    if (state?.timeout !== timeout) return;
+
+    this.#dropConnection(hostId, socket, `host '${hostId}' heartbeat timed out`);
+    socket.terminate();
+  }
+
+  #sendHeartbeats() {
+    if (this.closed) return;
+
+    for (const [hostId, socket] of this.connections) {
+      const state = this.heartbeatStates.get(socket);
+      if (!state || state.timeout) continue;
+      if (socket.readyState !== WebSocket.OPEN) {
+        this.#dropConnection(hostId, socket, `host '${hostId}' disconnected`);
+        continue;
+      }
+
+      let timeout;
+      timeout = this.timers.setTimeout(
+        () => this.#expireHeartbeat(hostId, socket, timeout),
+        this.heartbeatTimeoutMs
+      );
+      timeout.unref?.();
+      state.timeout = timeout;
+
+      try {
+        socket.send(PING_PAYLOAD, (error) => {
+          if (!error) return;
+          this.#dropConnection(hostId, socket, `host '${hostId}' heartbeat failed`);
+          socket.terminate();
+        });
+      } catch {
+        this.#dropConnection(hostId, socket, `host '${hostId}' heartbeat failed`);
+        socket.terminate();
+      }
+    }
+  }
+
+  close() {
+    if (this.closePromise) return this.closePromise;
+
+    this.closed = true;
+    this.timers.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+
+    for (const socket of this.wss.clients) {
+      const state = this.heartbeatStates.get(socket);
+      if (state) {
+        this.#dropConnection(state.hostId, socket, "HostRegistry shut down");
+      } else {
+        this.#clearHeartbeat(socket);
+      }
+      socket.terminate();
+    }
+    this.connections.clear();
+
+    this.closePromise = new Promise((resolve, reject) => {
+      this.wss.close((error) => (error ? reject(error) : resolve()));
+    });
+    return this.closePromise;
   }
 
   isOnline(hostId) {

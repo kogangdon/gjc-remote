@@ -8,10 +8,16 @@ const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
 const workDir = process.env.SMOKE_WORK_DIR || process.cwd();
 const expected = "SMOKE_OK";
 const modelQuery = process.env.SMOKE_MODEL_QUERY;
+const heartbeatIntervalMs = 100;
+const heartbeatTimeoutMs = 5000;
+const heartbeatTimers = createObservedHeartbeatTimers();
 
 const registry = new HostRegistry({
   port,
   tokensByHostId: new Map([[hostId, token]]),
+  heartbeatIntervalMs,
+  heartbeatTimeoutMs,
+  timers: heartbeatTimers.api,
 });
 
 await once(registry.wss, "listening");
@@ -33,6 +39,18 @@ daemon.stderr.on("data", (chunk) => process.stderr.write(chunk));
 
 try {
   await waitForHost(registry, hostId, 10_000);
+  await new Promise((resolve) =>
+    setTimeout(resolve, heartbeatIntervalMs + heartbeatTimeoutMs + 100)
+  );
+  if (!registry.isOnline(hostId)) {
+    throw new Error("host failed the application-level heartbeat");
+  }
+  if (
+    heartbeatTimers.scheduledTimeouts === 0 ||
+    heartbeatTimers.clearedTimeouts === 0
+  ) {
+    throw new Error("application-level ping/pong exchange was not observed");
+  }
 
   const result = await registry.invoke(
     hostId,
@@ -71,6 +89,38 @@ try {
   daemon.kill();
   await closeRegistry(registry);
 }
+function createObservedHeartbeatTimers() {
+  const activeTimeouts = new Set();
+  let scheduledTimeouts = 0;
+  let clearedTimeouts = 0;
+
+  return {
+    api: {
+      setInterval: (callback, delay) => setInterval(callback, delay),
+      clearInterval: (timer) => clearInterval(timer),
+      setTimeout(callback, delay) {
+        let timer;
+        timer = setTimeout(() => {
+          activeTimeouts.delete(timer);
+          callback();
+        }, delay);
+        activeTimeouts.add(timer);
+        scheduledTimeouts += 1;
+        return timer;
+      },
+      clearTimeout(timer) {
+        if (activeTimeouts.delete(timer)) clearedTimeouts += 1;
+        clearTimeout(timer);
+      },
+    },
+    get scheduledTimeouts() {
+      return scheduledTimeouts;
+    },
+    get clearedTimeouts() {
+      return clearedTimeouts;
+    },
+  };
+}
 
 async function waitForHost(registry, id, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -83,7 +133,5 @@ async function waitForHost(registry, id, timeoutMs) {
 }
 
 async function closeRegistry(registry) {
-  for (const socket of registry.connections.values()) socket.close();
-  registry.wss.close();
-  await once(registry.wss, "close").catch(() => {});
+  await registry.close();
 }
