@@ -63,6 +63,8 @@ export class HostRegistry {
     this.heartbeatStates = new Map();
     /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string }>} */
     this.pendingRequests = new Map();
+    /** @type {Map<import("ws").WebSocket, number>} */
+    this.pendingCountBySocket = new Map();
     this.closed = false;
     this.closePromise = undefined;
 
@@ -158,7 +160,7 @@ export class HostRegistry {
 
     if (msg.error !== undefined) {
       pending.resolve({ ok: false, error: msg.error });
-      this.pendingRequests.delete(msg.requestId);
+      this.#deletePending(msg.requestId);
       return;
     }
     if (msg.event !== undefined) {
@@ -168,15 +170,32 @@ export class HostRegistry {
     }
     if (msg.done) {
       pending.resolve({ ok: true, text: pending.text });
-      this.pendingRequests.delete(msg.requestId);
+      this.#deletePending(msg.requestId);
     }
+  }
+
+  #addPending(requestId, entry) {
+    this.pendingRequests.set(requestId, entry);
+    this.pendingCountBySocket.set(
+      entry.socket,
+      (this.pendingCountBySocket.get(entry.socket) ?? 0) + 1
+    );
+  }
+
+  #deletePending(requestId) {
+    const entry = this.pendingRequests.get(requestId);
+    if (!entry) return;
+    this.pendingRequests.delete(requestId);
+    const next = (this.pendingCountBySocket.get(entry.socket) ?? 0) - 1;
+    if (next > 0) this.pendingCountBySocket.set(entry.socket, next);
+    else this.pendingCountBySocket.delete(entry.socket);
   }
 
   #failPendingForSocket(socket, error) {
     for (const [requestId, pending] of this.pendingRequests) {
       if (pending.socket !== socket) continue;
       pending.resolve({ ok: false, error });
-      this.pendingRequests.delete(requestId);
+      this.#deletePending(requestId);
     }
   }
 
@@ -289,10 +308,7 @@ export class HostRegistry {
     const socket = this.connections.get(hostId);
     if (!socket) return Promise.resolve({ ok: false, error: `host '${hostId}' is not connected` });
 
-    let pendingForSocket = 0;
-    for (const pending of this.pendingRequests.values()) {
-      if (pending.socket === socket) pendingForSocket += 1;
-    }
+    const pendingForSocket = this.pendingCountBySocket.get(socket) ?? 0;
     if (pendingForSocket >= V0_LIMITS.MAX_PENDING_PER_HOST) {
       return Promise.resolve({
         ok: false,
@@ -318,11 +334,11 @@ export class HostRegistry {
 
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.pendingRequests.delete(requestId);
+        this.#deletePending(requestId);
         resolve({ ok: false, error: "timed out waiting for host response" });
       }, timeoutMs);
 
-      this.pendingRequests.set(requestId, {
+      this.#addPending(requestId, {
         socket,
         resolve: (result) => {
           clearTimeout(timer);
