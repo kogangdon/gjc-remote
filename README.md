@@ -97,6 +97,8 @@ Discord credentials.
   malformed. Invoke message text is capped at 1 MiB to leave room for JSON
   escaping and metadata, and the bot preflights the serialized outbound frame.
   Extra object fields remain allowed for additive compatibility.
+  Each host is limited to 64 concurrent in-flight invokes; beyond that the bot
+  fails new requests locally instead of growing its pending map.
   Host tokens authenticate daemon identity but do not encrypt WebSocket
   traffic; use private `wss://`, a VPN, or a tunnel outside a single trusted
   network.
