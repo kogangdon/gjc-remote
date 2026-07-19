@@ -17,9 +17,12 @@ function nextReconnect(
   base,
   { max = RECONNECT_MAX_MS, random = Math.random } = {}
 ) {
-  const half = base / 2;
+  // Clamp the incoming base to the ceiling first, so the drawn delay itself is
+  // always bounded by `max` (not just the base carried into the next attempt).
+  const capped = Math.min(base, max);
+  const half = capped / 2;
   const delay = Math.round(half + random() * half);
-  const nextBase = Math.min(base * 2, max);
+  const nextBase = Math.min(capped * 2, max);
   return { delay, nextBase };
 }
 
