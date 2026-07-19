@@ -132,6 +132,58 @@ test("prompt completion waits for the final agent_end event", async () => {
   await session.dispose();
 });
 
+test("agent_end marks a prompt inactive before prompt() settles", async () => {
+  const agent = new FakeAgentSession();
+  let releasePrompt;
+  const promptGate = new Promise((resolve) => {
+    releasePrompt = resolve;
+  });
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    agent.emit({ type: "agent_end" });
+    if (message === "first") await promptGate;
+  };
+  const session = new SdkSession(agent);
+
+  const first = session.send({ type: "prompt", message: "first" }, () => {}, 100);
+  await new Promise((resolve) => setImmediate(resolve));
+  const followUp = session.send(
+    { type: "follow_up", message: "after end" },
+    () => {},
+    100
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(agent.calls, [["prompt", "first"]]);
+  releasePrompt();
+  await Promise.all([first, followUp]);
+  assert.deepEqual(agent.calls, [
+    ["prompt", "first"],
+    ["prompt", "after end"],
+  ]);
+  await session.dispose();
+});
+
+test("event consumer failures do not block agent_end lifecycle", async () => {
+  const agent = new FakeAgentSession();
+  const session = new SdkSession(agent);
+
+  await assert.rejects(
+    session.send(
+      { type: "prompt", message: "first" },
+      () => {
+        throw new Error("consumer failed");
+      },
+      100
+    ),
+    /consumer failed/
+  );
+
+  assert.equal(session.closed, false);
+  await session.send({ type: "prompt", message: "second" }, () => {}, 100);
+  await session.dispose();
+});
+
 test("SDK adapter serializes commands per session", async () => {
   const agent = new FakeAgentSession();
   let releaseFirst;

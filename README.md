@@ -20,9 +20,10 @@ Discord-controlled remote GJC sessions.
    directory reuse one in-process GJC SDK `AgentSession`. Prompt and model
    operations are serialized per session. Idle `steer`/`follow_up` requests join
    that FIFO and start a prompt-equivalent run instead of waiting on an inactive
-   control queue. During an active run, controls dispatch without waiting behind
-   its prompt, while each request remains open through the resulting `agent_end`
-   and receives its event stream. Idle sessions (no requests for 1 hour) are
+   control queue. Before an active prompt emits `agent_end`, controls dispatch
+   without waiting behind it, while each request remains open through that
+   `agent_end` and receives its event stream. Later controls rejoin the FIFO.
+   Idle sessions (no requests for 1 hour) are
    disposed automatically.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `team`, `ultragoal`), `/gjc`,

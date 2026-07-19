@@ -119,10 +119,28 @@ export class SdkSession {
       resolveAgentEnd = resolve;
     });
     const startsPrompt = command.type === "prompt";
+    let promptActive = startsPrompt;
+    let eventConsumerError;
     if (startsPrompt) this.activePromptRuns += 1;
+
+    const markPromptInactive = () => {
+      if (!promptActive) return;
+      promptActive = false;
+      this.activePromptRuns -= 1;
+    };
     const unsubscribe = this.session.subscribe((event) => {
-      onEvent(event);
-      if (event.type === "agent_end") resolveAgentEnd();
+      if (event.type === "agent_end") {
+        markPromptInactive();
+        resolveAgentEnd();
+      }
+      try {
+        onEvent(event);
+      } catch (error) {
+        eventConsumerError ??=
+          error instanceof Error
+            ? error
+            : new Error("SDK event consumer failed", { cause: error });
+      }
     });
 
     try {
@@ -136,8 +154,9 @@ export class SdkSession {
         }
         await agentEnd;
       }, timeoutMs);
+      if (eventConsumerError) throw eventConsumerError;
     } finally {
-      if (startsPrompt) this.activePromptRuns -= 1;
+      markPromptInactive();
       unsubscribe();
     }
   }

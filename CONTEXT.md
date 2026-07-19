@@ -34,9 +34,10 @@ runtime model switching as `/slash` commands.
    under `<workDir>/.gjc-remote-session`. Prompt and model operations are
    serialized per session. Idle `steer`/`follow_up` requests join that FIFO and
    start a prompt-equivalent run instead of waiting on an inactive control queue.
-   During an active run, controls dispatch without waiting behind its prompt,
-   while each request remains open through the resulting `agent_end` and receives
-   its event stream. Idle sessions (`IDLE_TIMEOUT_MS` = 1h, in
+   Before an active prompt emits `agent_end`, controls dispatch without waiting
+   behind it, while each request remains open through that `agent_end` and
+   receives its event stream. Later controls rejoin the FIFO. Idle sessions
+   (`IDLE_TIMEOUT_MS` = 1h, in
    `shared/protocol.js`) are disposed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
