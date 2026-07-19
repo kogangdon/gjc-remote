@@ -148,7 +148,7 @@ test("protocol errors are non-empty and bounded for Error and non-Error throws",
   );
 });
 
-test("malformed invoke closes before SessionPool SDK creation", async () => {
+test("malformed invoke closes with a policy violation", async () => {
   const daemon = await startDaemon();
   try {
     daemon.peer.send(JSON.stringify({ type: "register_ok" }));
@@ -164,9 +164,7 @@ test("malformed invoke closes before SessionPool SDK creation", async () => {
     const [code] = await closed;
     assert.equal(code, 1008);
 
-    // The policy close is emitted only after the synchronous validation branch
-    // returns. Ending the daemon here also proves the invalid invoke never
-    // entered a long-running SDK turn.
+    // Stop the child after the peer observes the policy close.
     await stopChild(daemon.child);
   } finally {
     await daemon.close();

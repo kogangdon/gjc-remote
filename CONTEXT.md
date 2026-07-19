@@ -136,8 +136,9 @@ current transport lives in `daemon/src/sdk-session.js`.
    rejected its active and queued commands when the child exited or errored, and
    permanently poisoned timed-out RPC sessions so late frames could not be
    assigned to replacement sessions. The current SDK adapter preserves the
-   relevant invariant by timing out, poisoning, and disposing a stuck
-   `AgentSession`; the next request creates a replacement.
+   relevant invariant by timing out and poisoning a stuck `AgentSession`.
+   `SessionPool` bounds the old session's disposal wait before creating its
+   replacement, so stalled cleanup cannot block the workDir indefinitely.
 8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.

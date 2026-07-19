@@ -3,6 +3,8 @@ import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
 import { createSdkSession } from "./sdk-session.js";
 import { validateNativeWorkDir } from "./work-dir.js";
 
+const REPLACEMENT_DISPOSE_TIMEOUT_MS = 5_000;
+
 function normalizeCanonicalWorkDir(workDir, platform) {
   if (platform !== "win32") return workDir;
   return workDir
@@ -17,6 +19,7 @@ export class SessionPool {
     existsSyncFn = existsSync,
     realpathSyncFn = realpathSync.native ?? realpathSync,
     platform = process.platform,
+    replacementDisposeTimeoutMs = REPLACEMENT_DISPOSE_TIMEOUT_MS,
   } = {}) {
     /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
     this.sessions = new Map();
@@ -24,6 +27,7 @@ export class SessionPool {
     this.existsSyncFn = existsSyncFn;
     this.realpathSyncFn = realpathSyncFn;
     this.platform = platform;
+    this.replacementDisposeTimeoutMs = replacementDisposeTimeoutMs;
     this.closed = false;
     this.reapTimer = setInterval(() => {
       void this.#reapIdle().catch((error) =>
@@ -48,6 +52,27 @@ export class SessionPool {
       }
     }
     await Promise.all(disposals);
+  }
+  async #disposeForReplacement(session, workDir) {
+    let timer;
+    const disposal = Promise.resolve()
+      .then(() => session.dispose())
+      .then(
+        () => true,
+        (error) => {
+          console.error(`SessionPool: failed to dispose replaced session for ${workDir}:`, error);
+          return true;
+        }
+      );
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), this.replacementDisposeTimeoutMs);
+    });
+
+    const completed = await Promise.race([disposal, timeout]);
+    clearTimeout(timer);
+    if (!completed) {
+      console.error(`SessionPool: replacement disposal timed out for ${workDir}`);
+    }
   }
 
   async ensureSession(workDir) {
@@ -85,11 +110,7 @@ export class SessionPool {
     const entry = { lastUsed: Date.now(), session: undefined, creation: undefined };
     const creation = (async () => {
       if (existing?.session) {
-        try {
-          await existing.session.dispose();
-        } catch (error) {
-          console.error(`SessionPool: failed to dispose replaced session for ${canonicalWorkDir}:`, error);
-        }
+        await this.#disposeForReplacement(existing.session, canonicalWorkDir);
       }
 
       const session = await this.sessionFactory(canonicalWorkDir);

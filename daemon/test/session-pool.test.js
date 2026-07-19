@@ -51,6 +51,35 @@ test("a closed SDK session is disposed and replaced", async () => {
   }
 });
 
+test("replacement creation proceeds when closed-session disposal stalls", async () => {
+  const created = [];
+  const pool = createPool({
+    replacementDisposeTimeoutMs: 1,
+    sessionFactory: async () => {
+      const session = new FakeSession();
+      created.push(session);
+      return session;
+    },
+  });
+
+  try {
+    const stuck = await pool.ensureSession(WORK_DIR);
+    stuck.closed = true;
+    stuck.dispose = () => {
+      stuck.disposeCalls += 1;
+      return new Promise(() => {});
+    };
+
+    const replacement = await pool.ensureSession(WORK_DIR);
+
+    assert.notStrictEqual(replacement, stuck);
+    assert.equal(stuck.disposeCalls, 1);
+    assert.equal(created.length, 2);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
 test("canonical workDir aliases reuse one SDK session after filesystem revalidation", async () => {
   const factoryCalls = [];
   let existsCalls = 0;
