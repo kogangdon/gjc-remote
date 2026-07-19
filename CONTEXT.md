@@ -74,22 +74,22 @@ runtime model switching as `/slash` commands.
 
 ## Implementation findings
 
-Items 1, 2, 4, and 7 below describe the superseded RPC implementation and are
-retained only as regression history. GJC 0.11 removed that ingress; current
-session transport lives in `daemon/src/sdk-session.js`.
+Items 1, 2, 4, and 7 below document the deleted RPC adapter as regression
+history. `daemon/src/rpc-client.js`, `RpcSession`, and the child-process handlers
+named in those entries no longer exist after GJC 0.11 removed RPC ingress. The
+current transport lives in `daemon/src/sdk-session.js`.
 
-1. **Event frame unwrapping.** GJC's RPC stdio protocol wraps streamed
-   frames as `{type:"event", payload:{event_type, event}}`, not a flat
-   `{type: event_type}`. `daemon/src/rpc-client.js` unwraps this before
-   handing events to callers.
-2. **Concurrent-request correlation race.** GJC's streamed frames don't echo
-   the request `id`, so there's no way to route a frame to a specific
-   in-flight command when more than one is outstanding. GJC can emit
-   `turn_end` for intermediate tool-use turns before the full run reaches
-   `agent_end`. Fix: `RpcSession` in `rpc-client.js` serializes all commands
-   through a single-in-flight FIFO queue, resolves prompt-like commands only
-   at the full-run `agent_end` boundary, and holds the queue briefly so trailing
-   frames cannot be assigned to the next command.
+1. **Historical event frame unwrapping.** GJC's RPC stdio protocol wrapped
+   streamed frames as `{type:"event", payload:{event_type, event}}`, not a flat
+   `{type: event_type}`. The deleted `daemon/src/rpc-client.js` unwrapped those
+   frames before handing events to callers.
+2. **Historical concurrent-request correlation race.** GJC's streamed frames did
+   not echo the request `id`, so the removed adapter could not route multiple
+   in-flight commands. It also emitted `turn_end` for intermediate tool-use turns
+   before the full run reached `agent_end`. The deleted `RpcSession` serialized
+   commands through a single-in-flight FIFO and resolved prompt-like commands at
+   the full-run `agent_end` boundary. The SDK adapter retains only the relevant
+   completion and serialization invariants without RPC frame correlation.
 3. **`set_model` needs exact `{provider, modelId}`, not a free-text name.**
    Discord users may provide exact `provider:modelId`, a unique model ID, or a
    unique display-name/ID fragment. `daemon/src/model-lookup.js` validates the
@@ -100,15 +100,13 @@ session transport lives in `daemon/src/sdk-session.js`.
    `(no text output)`. Verified against real GJC: `sol` resolved to
    `openai-codex:gpt-5.6-sol` (`GPT-5.6 Sol`). Startup model selection remains
    unchanged.
-4. **Daemon-wide crash on spawn failure.** A `child_process.spawn` `ENOENT`
-   (e.g. bad `workDir`, missing `GJC_BIN`) fires an async `'error'` event,
-   not a throw — an unhandled one crashes the whole Node/Bun process, not
-   just the failing request (reproduced: one bad `workDir` invoke killed the
-   entire daemon, dropping every other host session on that machine). Fixed
-   in two places: `session-pool.js` checks `existsSync(workDir)` before
-   spawning, and both `session-pool.js`'s `child.on("error", ...)` and
-   `rpc-client.js`'s `RpcSession` route spawn errors into a clean rejection
-   instead of leaving them unhandled.
+4. **Historical daemon-wide crash on spawn failure.** In the removed subprocess
+   transport, a `child_process.spawn` `ENOENT` fired an async `'error'` event
+   rather than throwing; an unhandled event crashed the whole daemon. The old
+   pool and `RpcSession` converted those events into request rejections. Those
+   child-process handlers were deleted with the RPC adapter. The current
+   `SessionPool` still validates that `workDir` exists before SDK session
+   creation, and SDK creation failures reject the affected request.
 5. **`/login` was discarded.** An earlier iteration added a real `login`
    command kind (throwaway `gjc --mode=rpc` process, OAuth-URL relaying to
    Discord, copilot device-flow detection). It was removed: browser/device
@@ -134,12 +132,12 @@ session transport lives in `daemon/src/sdk-session.js`.
    changes to either allowlist setting require a bot restart. `SessionPool`
    rejects workDirs that are not fully-qualified paths under the daemon host's
    native path semantics before lookup or SDK session creation.
-7. **RPC termination left unresolved work.** Child `exit`/`error` now rejects
-   the active command and every queued command exactly once. A command timeout
-   permanently closes and kills that RPC session instead of dispatching queued
-   work on a process whose late frames cannot be correlated safely. The next
-   request creates a replacement session, and a delayed exit from the poisoned
-   child cannot remove that replacement from `SessionPool`.
+7. **Historical RPC termination with unresolved work.** The deleted adapter
+   rejected its active and queued commands when the child exited or errored, and
+   permanently poisoned timed-out RPC sessions so late frames could not be
+   assigned to replacement sessions. The current SDK adapter preserves the
+   relevant invariant by timing out, poisoning, and disposing a stuck
+   `AgentSession`; the next request creates a replacement.
 8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.
