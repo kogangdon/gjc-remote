@@ -22,6 +22,8 @@ import { HostRegistry } from "./host-registry.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
 import { ToolLogStore } from "./tool-log-store.js";
 
+import { createShutdown } from "./shutdown.js";
+
 const {
   DISCORD_TOKEN,
   GJC_BOT_ALLOWED_USERS,
@@ -422,3 +424,7 @@ function debugRemote(label, data) {
 }
 
 client.login(DISCORD_TOKEN);
+
+const shutdown = createShutdown({ registry, client });
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

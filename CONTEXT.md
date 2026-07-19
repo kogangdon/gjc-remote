@@ -189,6 +189,14 @@ remain Node-compatible. `bun.lock` is the committed dependency lockfile;
   `HostRegistry.getHostInfo(hostId)`. Both fields are optional and bounded; a
   legacy v0 daemon that omits them is treated as `protocolVersion: 0` with no
   shared capabilities, so the handshake stays backward compatible.
+  When the bot process receives `SIGINT`/`SIGTERM` it shuts down gracefully:
+  `HostRegistry.close()` first, so in-flight invokes settle and daemons observe
+  a clean socket close, then the Discord client is destroyed; the handler is
+  idempotent and always reaches `exit(0)` even if a teardown step throws
+  (`bot/src/shutdown.js`). A disconnected daemon reconnects with **equal-jitter
+  exponential backoff** (`daemon/src/reconnect.js`): the base doubles from 1s up
+  to a 30s ceiling, and each actual wait is drawn from `[base/2, base]` so a
+  shared bot restart does not trigger a synchronized reconnect thundering herd.
 - Session key / isolation unit = **(hostId, canonical workDir)** pair; one
   Discord channel maps to a configured `{hostId, workDir}` and the daemon
   canonicalizes that path before SDK session lookup or creation.
