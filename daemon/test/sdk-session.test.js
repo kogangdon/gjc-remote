@@ -159,7 +159,7 @@ test("SDK adapter serializes commands per session", async () => {
   await session.dispose();
 });
 
-test("steer and follow-up dispatch while a prompt is still active", async () => {
+test("live controls dispatch during a prompt and keep their event streams open", async () => {
   const agent = new FakeAgentSession();
   agent.prompt = async (message) => {
     agent.calls.push(["prompt", message]);
@@ -171,29 +171,52 @@ test("steer and follow-up dispatch while a prompt is still active", async () => 
     agent.calls.push(["follow_up", message]);
   };
   const session = new SdkSession(agent);
+  const promptEvents = [];
+  const steerEvents = [];
+  const followUpEvents = [];
   let promptSettled = false;
+  let steerSettled = false;
+  let followUpSettled = false;
 
   const prompt = session
-    .send({ type: "prompt", message: "first" }, () => {}, 100)
+    .send({ type: "prompt", message: "first" }, (event) => promptEvents.push(event), 100)
     .finally(() => {
       promptSettled = true;
     });
+  const steer = session
+    .send({ type: "steer", message: "adjust" }, (event) => steerEvents.push(event), 100)
+    .finally(() => {
+      steerSettled = true;
+    });
+  const followUp = session
+    .send(
+      { type: "follow_up", message: "then continue" },
+      (event) => followUpEvents.push(event),
+      100
+    )
+    .finally(() => {
+      followUpSettled = true;
+    });
   await new Promise((resolve) => setImmediate(resolve));
 
-  await Promise.all([
-    session.send({ type: "steer", message: "adjust" }, () => {}, 100),
-    session.send({ type: "follow_up", message: "then continue" }, () => {}, 100),
-  ]);
-
   assert.equal(promptSettled, false);
+  assert.equal(steerSettled, false);
+  assert.equal(followUpSettled, false);
   assert.deepEqual(agent.calls, [
     ["prompt", "first"],
     ["steer", "adjust"],
     ["follow_up", "then continue"],
   ]);
 
-  agent.emit({ type: "agent_end" });
-  await prompt;
+  const update = { type: "message_update", value: "controlled" };
+  const end = { type: "agent_end" };
+  agent.emit(update);
+  agent.emit(end);
+  await Promise.all([prompt, steer, followUp]);
+
+  assert.deepEqual(promptEvents, [update, end]);
+  assert.deepEqual(steerEvents, [update, end]);
+  assert.deepEqual(followUpEvents, [update, end]);
   await session.dispose();
 });
 

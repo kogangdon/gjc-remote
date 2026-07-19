@@ -18,9 +18,10 @@ Discord-controlled remote GJC sessions.
    host filesystem's current canonical real path, so retargeted symlinks or
    junctions cannot reuse a stale target. Different path spellings for the same
    directory reuse one in-process GJC SDK `AgentSession`. Prompt and model
-   operations are serialized per session, while `steer` and `follow_up` are
-   injected into an active run without waiting behind it. Idle sessions (no
-   requests for 1 hour) are disposed automatically.
+   operations are serialized per session. `steer` and `follow_up` dispatch into
+   an active run without waiting behind its prompt, while each control request
+   remains open through the resulting `agent_end` and receives its event stream.
+   Idle sessions (no requests for 1 hour) are disposed automatically.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `team`, `ultragoal`), `/gjc`,
    `/model`, and `/hosts` as Discord slash commands.

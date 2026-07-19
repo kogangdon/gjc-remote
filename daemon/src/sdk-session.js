@@ -21,8 +21,7 @@ export class SdkSession {
     this.session = session;
     this.closed = false;
     this.queue = Promise.resolve();
-    this.controlQueue = Promise.resolve();
-    this.activeRun = false;
+    this.inFlightControls = new Set();
     this.disposePromise = undefined;
   }
 
@@ -30,14 +29,24 @@ export class SdkSession {
     if (this.closed) return Promise.reject(new Error("GJC SDK session is not running"));
 
     const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
-    const queueName = isLiveControl ? "controlQueue" : "queue";
-    const result = this[queueName].then(() => {
+    if (isLiveControl) {
+      const result = Promise.resolve().then(() => {
+        if (this.closed) throw new Error("GJC SDK session is not running");
+        return this.#runPromptCommand(command, onEvent, timeoutMs);
+      });
+      this.inFlightControls.add(result);
+      result.then(
+        () => this.inFlightControls.delete(result),
+        () => this.inFlightControls.delete(result)
+      );
+      return result;
+    }
+
+    const result = this.queue.then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
-      return isLiveControl
-        ? this.#dispatchLiveControl(command, onEvent, timeoutMs)
-        : this.#dispatch(command, onEvent, timeoutMs);
+      return this.#dispatch(command, onEvent, timeoutMs);
     });
-    this[queueName] = result.catch(() => {});
+    this.queue = result.catch(() => {});
     return result;
   }
 
@@ -90,27 +99,11 @@ export class SdkSession {
     }
   }
 
-  async #dispatchLiveControl(command, onEvent, timeoutMs) {
-    const operation =
-      command.type === "steer"
-        ? () => this.session.steer(command.message)
-        : () => this.session.followUp(command.message);
-
-    if (!this.activeRun) await this.queue;
-    if (this.activeRun) {
-      await this.#withTimeout(operation, timeoutMs);
-      return;
-    }
-
-    await this.#runPromptCommand(command, onEvent, timeoutMs);
-  }
-
   async #runPromptCommand(command, onEvent, timeoutMs) {
     let resolveAgentEnd;
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
     });
-    this.activeRun = true;
     const unsubscribe = this.session.subscribe((event) => {
       onEvent(event);
       if (event.type === "agent_end") resolveAgentEnd();
@@ -128,7 +121,6 @@ export class SdkSession {
         await agentEnd;
       }, timeoutMs);
     } finally {
-      this.activeRun = false;
       unsubscribe();
     }
   }
@@ -163,6 +155,6 @@ export class SdkSession {
   async dispose() {
     this.closed = true;
     const disposal = this.#disposeUnderlying();
-    await Promise.all([this.queue, this.controlQueue, disposal]);
+    await Promise.all([this.queue, ...this.inFlightControls, disposal]);
   }
 }
