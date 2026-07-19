@@ -3,7 +3,7 @@ import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
 import { createSdkSession } from "./sdk-session.js";
 import { validateNativeWorkDir } from "./work-dir.js";
 
-const REPLACEMENT_DISPOSE_TIMEOUT_MS = 5_000;
+const SESSION_DISPOSE_TIMEOUT_MS = 5_000;
 
 function normalizeCanonicalWorkDir(workDir, platform) {
   if (platform !== "win32") return workDir;
@@ -19,7 +19,7 @@ export class SessionPool {
     existsSyncFn = existsSync,
     realpathSyncFn = realpathSync.native ?? realpathSync,
     platform = process.platform,
-    replacementDisposeTimeoutMs = REPLACEMENT_DISPOSE_TIMEOUT_MS,
+    sessionDisposeTimeoutMs = SESSION_DISPOSE_TIMEOUT_MS,
   } = {}) {
     /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
     this.sessions = new Map();
@@ -27,7 +27,7 @@ export class SessionPool {
     this.existsSyncFn = existsSyncFn;
     this.realpathSyncFn = realpathSyncFn;
     this.platform = platform;
-    this.replacementDisposeTimeoutMs = replacementDisposeTimeoutMs;
+    this.sessionDisposeTimeoutMs = sessionDisposeTimeoutMs;
     this.closed = false;
     this.reapTimer = setInterval(() => {
       void this.#reapIdle().catch((error) =>
@@ -44,34 +44,40 @@ export class SessionPool {
       if (entry.session && now - entry.lastUsed > IDLE_TIMEOUT_MS) {
         console.log(`SessionPool: reaping idle session for ${workDir}`);
         this.sessions.delete(workDir);
-        disposals.push(
-          entry.session.dispose().catch((error) =>
-            console.error(`SessionPool: failed to dispose idle session for ${workDir}:`, error)
-          )
-        );
+        disposals.push(this.#disposeIgnoringFailure(entry.session, workDir, "idle"));
       }
     }
     await Promise.all(disposals);
   }
-  async #disposeForReplacement(session, workDir) {
+  async #disposeBounded(session) {
     let timer;
     const disposal = Promise.resolve()
       .then(() => session.dispose())
       .then(
-        () => true,
-        (error) => {
-          console.error(`SessionPool: failed to dispose replaced session for ${workDir}:`, error);
-          return true;
-        }
+        () => ({ status: "fulfilled" }),
+        (reason) => ({ status: "rejected", reason })
       );
     const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve(false), this.replacementDisposeTimeoutMs);
+      timer = setTimeout(
+        () => resolve({ status: "timed_out" }),
+        this.sessionDisposeTimeoutMs
+      );
     });
 
-    const completed = await Promise.race([disposal, timeout]);
+    const result = await Promise.race([disposal, timeout]);
     clearTimeout(timer);
-    if (!completed) {
-      console.error(`SessionPool: replacement disposal timed out for ${workDir}`);
+    return result;
+  }
+
+  async #disposeIgnoringFailure(session, workDir, context) {
+    const result = await this.#disposeBounded(session);
+    if (result.status === "rejected") {
+      console.error(
+        `SessionPool: failed to dispose ${context} session for ${workDir}:`,
+        result.reason
+      );
+    } else if (result.status === "timed_out") {
+      console.error(`SessionPool: ${context} session disposal timed out for ${workDir}`);
     }
   }
 
@@ -110,12 +116,12 @@ export class SessionPool {
     const entry = { lastUsed: Date.now(), session: undefined, creation: undefined };
     const creation = (async () => {
       if (existing?.session) {
-        await this.#disposeForReplacement(existing.session, canonicalWorkDir);
+        await this.#disposeIgnoringFailure(existing.session, canonicalWorkDir, "replacement");
       }
 
       const session = await this.sessionFactory(canonicalWorkDir);
       if (this.closed) {
-        await session.dispose();
+        await this.#disposeIgnoringFailure(session, canonicalWorkDir, "late-created");
         throw new Error("SessionPool was shut down during session creation");
       }
       entry.session = session;
@@ -140,12 +146,18 @@ export class SessionPool {
     this.closed = true;
     clearInterval(this.reapTimer);
 
-    const entries = [...this.sessions.values()];
+    const entries = [...this.sessions.entries()];
     this.sessions.clear();
     const results = await Promise.allSettled(
-      entries.map(async (entry) => {
+      entries.map(async ([workDir, entry]) => {
         const session = entry.session ?? (await entry.creation?.catch(() => undefined));
-        if (session) await session.dispose();
+        if (!session) return;
+
+        const result = await this.#disposeBounded(session);
+        if (result.status === "rejected") throw result.reason;
+        if (result.status === "timed_out") {
+          console.error(`SessionPool: shutdown session disposal timed out for ${workDir}`);
+        }
       })
     );
     const errors = results

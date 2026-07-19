@@ -260,15 +260,29 @@ test("live controls dispatch during a prompt and keep their event streams open",
     ["follow_up", "then continue"],
   ]);
 
-  const update = { type: "message_update", value: "controlled" };
-  const end = { type: "agent_end" };
-  agent.emit(update);
-  agent.emit(end);
-  await Promise.all([prompt, steer, followUp]);
+  const currentUpdate = { type: "message_update", value: "controlled" };
+  const currentEnd = { type: "agent_end" };
+  agent.emit(currentUpdate);
+  agent.emit(currentEnd);
+  await Promise.all([prompt, steer]);
+  await new Promise((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(promptEvents, [update, end]);
-  assert.deepEqual(steerEvents, [update, end]);
-  assert.deepEqual(followUpEvents, [update, end]);
+  assert.equal(followUpSettled, false);
+
+  const followUpUpdate = { type: "message_update", value: "follow-up" };
+  const followUpEnd = { type: "agent_end" };
+  agent.emit(followUpUpdate);
+  agent.emit(followUpEnd);
+  await followUp;
+
+  assert.deepEqual(promptEvents, [currentUpdate, currentEnd]);
+  assert.deepEqual(steerEvents, [currentUpdate, currentEnd]);
+  assert.deepEqual(followUpEvents, [
+    currentUpdate,
+    currentEnd,
+    followUpUpdate,
+    followUpEnd,
+  ]);
   await session.dispose();
 });
 

@@ -35,7 +35,8 @@ export class SdkSession {
     const result = Promise.resolve().then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
       if (this.activePromptRuns > 0) {
-        return this.#runPromptCommand(command, onEvent, timeoutMs);
+        const agentEndsToWait = command.type === "follow_up" ? 2 : 1;
+        return this.#runPromptCommand(command, onEvent, timeoutMs, agentEndsToWait);
       }
       return this.#enqueue(command, onEvent, timeoutMs);
     });
@@ -113,7 +114,7 @@ export class SdkSession {
     }
   }
 
-  async #runPromptCommand(command, onEvent, timeoutMs) {
+  async #runPromptCommand(command, onEvent, timeoutMs, agentEndsToWait = 1) {
     let resolveAgentEnd;
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
@@ -121,6 +122,7 @@ export class SdkSession {
     const startsPrompt = command.type === "prompt";
     let promptActive = startsPrompt;
     let eventConsumerError;
+    let remainingAgentEnds = agentEndsToWait;
     if (startsPrompt) this.activePromptRuns += 1;
 
     const markPromptInactive = () => {
@@ -131,7 +133,8 @@ export class SdkSession {
     const unsubscribe = this.session.subscribe((event) => {
       if (event.type === "agent_end") {
         markPromptInactive();
-        resolveAgentEnd();
+        remainingAgentEnds -= 1;
+        if (remainingAgentEnds === 0) resolveAgentEnd();
       }
       try {
         onEvent(event);

@@ -54,7 +54,7 @@ test("a closed SDK session is disposed and replaced", async () => {
 test("replacement creation proceeds when closed-session disposal stalls", async () => {
   const created = [];
   const pool = createPool({
-    replacementDisposeTimeoutMs: 1,
+    sessionDisposeTimeoutMs: 1,
     sessionFactory: async () => {
       const session = new FakeSession();
       created.push(session);
@@ -228,6 +228,23 @@ test("an unresolvable workDir fails before SDK session creation", async () => {
   }
 });
 
+test("shutdown completes when session disposal stalls", async () => {
+  const session = new FakeSession();
+  session.dispose = () => {
+    session.disposeCalls += 1;
+    return new Promise(() => {});
+  };
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => session,
+  });
+
+  await pool.ensureSession(WORK_DIR);
+  await pool.shutdown();
+
+  assert.equal(session.disposeCalls, 1);
+});
+
 test("shutdown during SDK creation disposes the late session", async () => {
   let release;
   const gate = new Promise((resolve) => {
@@ -235,6 +252,33 @@ test("shutdown during SDK creation disposes the late session", async () => {
   });
   const session = new FakeSession();
   const pool = createPool({
+    sessionFactory: async () => {
+      await gate;
+      return session;
+    },
+  });
+
+  const creation = pool.ensureSession(WORK_DIR);
+  const shutdown = pool.shutdown();
+  release();
+
+  await assert.rejects(creation, /shut down during session creation/);
+  await shutdown;
+  assert.equal(session.disposeCalls, 1);
+});
+
+test("shutdown completes when late-created session disposal stalls", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const session = new FakeSession();
+  session.dispose = () => {
+    session.disposeCalls += 1;
+    return new Promise(() => {});
+  };
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
     sessionFactory: async () => {
       await gate;
       return session;
