@@ -22,6 +22,8 @@ import { HostRegistry } from "./host-registry.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
 import { ToolLogStore } from "./tool-log-store.js";
 
+import { createShutdown } from "./shutdown.js";
+
 const {
   DISCORD_TOKEN,
   GJC_BOT_ALLOWED_USERS,
@@ -420,5 +422,11 @@ function debugRemote(label, data) {
   if (!DEBUG_REMOTE) return;
   console.error(`[bot] ${label}`, JSON.stringify(data));
 }
+
+const shutdown = createShutdown({ registry, client });
+// Register signal handlers before login so a signal received mid-login still
+// triggers a graceful shutdown instead of the default abrupt termination.
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 client.login(DISCORD_TOKEN);

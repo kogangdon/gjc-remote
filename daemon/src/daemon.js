@@ -20,6 +20,11 @@ import {
   webSocketPayloadToUtf8,
 } from "./ws-payload.js";
 
+import {
+  RECONNECT_BASE_MS,
+  nextReconnect,
+} from "./reconnect.js";
+
 const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
 
 if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
@@ -29,7 +34,7 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
 
 
 const pool = new SessionPool();
-let reconnectDelay = 1000;
+let reconnectDelay = RECONNECT_BASE_MS;
 let shuttingDown = false;
 
 function connectToBot() {
@@ -38,7 +43,7 @@ function connectToBot() {
   });
 
   connection.on("open", () => {
-    reconnectDelay = 1000;
+    reconnectDelay = RECONNECT_BASE_MS;
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.REGISTER,
@@ -60,9 +65,10 @@ function connectToBot() {
 
   connection.on("close", () => {
     if (shuttingDown) return;
-    console.log(`daemon: disconnected from bot, retrying in ${reconnectDelay}ms`);
-    setTimeout(connectToBot, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+    const { delay, nextBase } = nextReconnect(reconnectDelay);
+    console.log(`daemon: disconnected from bot, retrying in ${delay}ms`);
+    setTimeout(connectToBot, delay);
+    reconnectDelay = nextBase;
   });
 
   connection.on("error", (err) => console.error("daemon: ws error", err.message));
