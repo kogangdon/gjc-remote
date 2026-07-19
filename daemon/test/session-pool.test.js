@@ -293,3 +293,19 @@ test("shutdown completes when late-created session disposal stalls", async () =>
   await shutdown;
   assert.equal(session.disposeCalls, 1);
 });
+
+test("shutdown completes when SDK session creation stalls", async () => {
+  let creationSettled = false;
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: () => new Promise(() => {}),
+  });
+
+  const creation = pool.ensureSession(WORK_DIR).finally(() => {
+    creationSettled = true;
+  });
+  await pool.shutdown();
+
+  assert.equal(creationSettled, false);
+  void creation;
+});

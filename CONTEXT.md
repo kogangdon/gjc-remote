@@ -36,7 +36,8 @@ runtime model switching as `/slash` commands.
    start a prompt-equivalent run instead of waiting on an inactive control queue.
    Before an active prompt emits `agent_end`, controls dispatch without waiting
    behind it. A `steer` request remains open through the current run's
-   `agent_end`; `follow_up` remains open through its queued run's own `agent_end`.
+   `agent_end`; each `follow_up` remains open through its own queued run's
+   `agent_end` and blocks queued prompt/model operations until that boundary.
    Each receives its event stream, and later controls rejoin the FIFO. Idle
    sessions (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
@@ -137,8 +138,9 @@ current transport lives in `daemon/src/sdk-session.js`.
    permanently poisoned timed-out RPC sessions so late frames could not be
    assigned to replacement sessions. The current SDK adapter preserves the
    relevant invariant by timing out and poisoning a stuck `AgentSession`.
-   `SessionPool` bounds idle, replacement, and shutdown disposal waits, so
-   stalled cleanup cannot block a workDir or daemon shutdown indefinitely.
+   `SessionPool` bounds idle, replacement, and shutdown disposal waits plus
+   shutdown waits for in-flight session creation, so stalled SDK work cannot
+   block a workDir or daemon shutdown indefinitely.
 8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.

@@ -49,14 +49,12 @@ export class SessionPool {
     }
     await Promise.all(disposals);
   }
-  async #disposeBounded(session) {
+  async #settleBounded(operation) {
     let timer;
-    const disposal = Promise.resolve()
-      .then(() => session.dispose())
-      .then(
-        () => ({ status: "fulfilled" }),
-        (reason) => ({ status: "rejected", reason })
-      );
+    const settlement = Promise.resolve(operation).then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason })
+    );
     const timeout = new Promise((resolve) => {
       timer = setTimeout(
         () => resolve({ status: "timed_out" }),
@@ -64,9 +62,13 @@ export class SessionPool {
       );
     });
 
-    const result = await Promise.race([disposal, timeout]);
+    const result = await Promise.race([settlement, timeout]);
     clearTimeout(timer);
     return result;
+  }
+
+  #disposeBounded(session) {
+    return this.#settleBounded(Promise.resolve().then(() => session.dispose()));
   }
 
   async #disposeIgnoringFailure(session, workDir, context) {
@@ -150,7 +152,14 @@ export class SessionPool {
     this.sessions.clear();
     const results = await Promise.allSettled(
       entries.map(async ([workDir, entry]) => {
-        const session = entry.session ?? (await entry.creation?.catch(() => undefined));
+        const session = entry.session;
+        if (!session && entry.creation) {
+          const creationResult = await this.#settleBounded(entry.creation);
+          if (creationResult.status === "timed_out") {
+            console.error(`SessionPool: session creation wait timed out for ${workDir}`);
+          }
+          return;
+        }
         if (!session) return;
 
         const result = await this.#disposeBounded(session);

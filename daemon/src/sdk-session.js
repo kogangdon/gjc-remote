@@ -23,6 +23,8 @@ export class SdkSession {
     this.queue = Promise.resolve();
     this.inFlightControls = new Set();
     this.activePromptRuns = 0;
+    this.pendingLiveFollowUps = 0;
+    this.liveFollowUpBarrier = undefined;
     this.disposePromise = undefined;
   }
 
@@ -34,11 +36,39 @@ export class SdkSession {
 
     const result = Promise.resolve().then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
-      if (this.activePromptRuns > 0) {
-        const agentEndsToWait = command.type === "follow_up" ? 2 : 1;
-        return this.#runPromptCommand(command, onEvent, timeoutMs, agentEndsToWait);
+      if (this.activePromptRuns <= 0) {
+        return this.#enqueue(command, onEvent, timeoutMs);
       }
-      return this.#enqueue(command, onEvent, timeoutMs);
+      if (command.type !== "follow_up") {
+        return this.#runPromptCommand(command, onEvent, timeoutMs);
+      }
+
+      this.pendingLiveFollowUps += 1;
+      const control = this.#runPromptCommand(
+        command,
+        onEvent,
+        timeoutMs,
+        this.pendingLiveFollowUps + 1
+      );
+      const priorBarrier = this.liveFollowUpBarrier;
+      const barrier = Promise.allSettled(
+        priorBarrier ? [priorBarrier, control] : [control]
+      ).then(() => {});
+      this.liveFollowUpBarrier = barrier;
+      barrier.then(() => {
+        if (this.liveFollowUpBarrier === barrier) {
+          this.liveFollowUpBarrier = undefined;
+        }
+      });
+      control.then(
+        () => {
+          this.pendingLiveFollowUps -= 1;
+        },
+        () => {
+          this.pendingLiveFollowUps -= 1;
+        }
+      );
+      return control;
     });
     this.inFlightControls.add(result);
     result.then(
@@ -49,7 +79,10 @@ export class SdkSession {
   }
 
   #enqueue(command, onEvent, timeoutMs) {
-    const result = this.queue.then(() => {
+    const result = this.queue.then(async () => {
+      if (this.closed) throw new Error("GJC SDK session is not running");
+      const barrier = this.liveFollowUpBarrier;
+      if (barrier) await barrier;
       if (this.closed) throw new Error("GJC SDK session is not running");
       return this.#dispatch(command, onEvent, timeoutMs);
     });

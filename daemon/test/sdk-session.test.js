@@ -286,6 +286,124 @@ test("live controls dispatch during a prompt and keep their event streams open",
   await session.dispose();
 });
 
+test("queued commands wait for an active follow-up run to complete", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  agent.followUp = async (message) => {
+    agent.calls.push(["follow_up", message]);
+  };
+  const session = new SdkSession(agent);
+
+  const prompt = session.send({ type: "prompt", message: "first" }, () => {}, 100);
+  const followUp = session.send(
+    { type: "follow_up", message: "continue" },
+    () => {},
+    100
+  );
+  const modelSwitch = session.send(
+    { type: "set_model", provider: "provider-a", modelId: "model-a" },
+    () => {},
+    100
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(agent.calls, [
+    ["prompt", "first"],
+    ["follow_up", "continue"],
+  ]);
+
+  agent.emit({ type: "agent_end" });
+  await prompt;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(agent.calls, [
+    ["prompt", "first"],
+    ["follow_up", "continue"],
+  ]);
+
+  agent.emit({ type: "agent_end" });
+  await Promise.all([followUp, modelSwitch]);
+  assert.deepEqual(agent.calls, [
+    ["prompt", "first"],
+    ["follow_up", "continue"],
+    ["set_model", agent.models[0]],
+  ]);
+  await session.dispose();
+});
+
+test("multiple active follow-ups wait for their own queued run boundaries", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  agent.followUp = async (message) => {
+    agent.calls.push(["follow_up", message]);
+  };
+  const session = new SdkSession(agent);
+  let firstSettled = false;
+  let secondSettled = false;
+
+  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
+  const first = session
+    .send({ type: "follow_up", message: "first" }, () => {}, 100)
+    .finally(() => {
+      firstSettled = true;
+    });
+  const second = session
+    .send({ type: "follow_up", message: "second" }, () => {}, 100)
+    .finally(() => {
+      secondSettled = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  agent.emit({ type: "agent_end" });
+  await prompt;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstSettled, false);
+  assert.equal(secondSettled, false);
+
+  agent.emit({ type: "agent_end" });
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstSettled, true);
+  assert.equal(secondSettled, false);
+
+  agent.emit({ type: "agent_end" });
+  await second;
+  assert.equal(secondSettled, true);
+  await session.dispose();
+});
+
+test("active follow-up subscribes before a queued agent_end callback", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  agent.followUp = async (message) => {
+    agent.calls.push(["follow_up", message]);
+  };
+  const session = new SdkSession(agent);
+  let followUpSettled = false;
+
+  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
+  const followUp = session
+    .send({ type: "follow_up", message: "continue" }, () => {}, 100)
+    .finally(() => {
+      followUpSettled = true;
+    });
+  queueMicrotask(() => agent.emit({ type: "agent_end" }));
+
+  await prompt;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(followUpSettled, false);
+
+  agent.emit({ type: "agent_end" });
+  await followUp;
+  assert.equal(followUpSettled, true);
+  await session.dispose();
+});
+
 test("idle follow-up starts a prompt run and keeps its event stream", async () => {
   const agent = new FakeAgentSession();
   const session = new SdkSession(agent);
