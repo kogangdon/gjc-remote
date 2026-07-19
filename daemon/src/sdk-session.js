@@ -24,6 +24,8 @@ export class SdkSession {
     this.inFlightControls = new Set();
     this.activePromptRuns = 0;
     this.pendingLiveFollowUps = 0;
+    this.liveFollowUpAcceptance = Promise.resolve();
+    this.nextLiveFollowUpAgentEnds = 2;
     this.liveFollowUpBarrier = undefined;
     this.disposePromise = undefined;
   }
@@ -43,12 +45,29 @@ export class SdkSession {
         return this.#runPromptCommand(command, onEvent, timeoutMs);
       }
 
+      if (this.pendingLiveFollowUps === 0) {
+        this.liveFollowUpAcceptance = Promise.resolve();
+        this.nextLiveFollowUpAgentEnds = 2;
+      }
       this.pendingLiveFollowUps += 1;
+      const previousAcceptance = this.liveFollowUpAcceptance;
+      let releaseAcceptance;
+      this.liveFollowUpAcceptance = new Promise((resolve) => {
+        releaseAcceptance = resolve;
+      });
+      const settleAcceptance = async (queued) => {
+        await previousAcceptance;
+        const agentEndsToWait = queued
+          ? this.nextLiveFollowUpAgentEnds++
+          : undefined;
+        releaseAcceptance();
+        return agentEndsToWait;
+      };
       const control = this.#runPromptCommand(
         command,
         onEvent,
         timeoutMs,
-        this.pendingLiveFollowUps + 1
+        settleAcceptance
       );
       const priorBarrier = this.liveFollowUpBarrier;
       const barrier = Promise.allSettled(
@@ -147,7 +166,7 @@ export class SdkSession {
     }
   }
 
-  async #runPromptCommand(command, onEvent, timeoutMs, agentEndsToWait = 1) {
+  async #runPromptCommand(command, onEvent, timeoutMs, settleFollowUpAcceptance) {
     let resolveAgentEnd;
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
@@ -155,9 +174,18 @@ export class SdkSession {
     const startsPrompt = command.type === "prompt";
     let promptActive = startsPrompt;
     let eventConsumerError;
-    let remainingAgentEnds = agentEndsToWait;
+    let observedAgentEnds = 0;
+    let requiredAgentEnds = settleFollowUpAcceptance ? undefined : 1;
     if (startsPrompt) this.activePromptRuns += 1;
 
+    const resolveIfComplete = () => {
+      if (
+        requiredAgentEnds !== undefined &&
+        observedAgentEnds >= requiredAgentEnds
+      ) {
+        resolveAgentEnd();
+      }
+    };
     const markPromptInactive = () => {
       if (!promptActive) return;
       promptActive = false;
@@ -166,8 +194,8 @@ export class SdkSession {
     const unsubscribe = this.session.subscribe((event) => {
       if (event.type === "agent_end") {
         markPromptInactive();
-        remainingAgentEnds -= 1;
-        if (remainingAgentEnds === 0) resolveAgentEnd();
+        observedAgentEnds += 1;
+        resolveIfComplete();
       }
       try {
         onEvent(event);
@@ -186,7 +214,16 @@ export class SdkSession {
         } else if (command.type === "steer") {
           await this.session.steer(command.message);
         } else {
-          await this.session.followUp(command.message);
+          try {
+            await this.session.followUp(command.message);
+          } catch (error) {
+            await settleFollowUpAcceptance?.(false);
+            throw error;
+          }
+          if (settleFollowUpAcceptance) {
+            requiredAgentEnds = await settleFollowUpAcceptance(true);
+            resolveIfComplete();
+          }
         }
         await agentEnd;
       }, timeoutMs);

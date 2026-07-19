@@ -375,6 +375,41 @@ test("multiple active follow-ups wait for their own queued run boundaries", asyn
   await session.dispose();
 });
 
+test("rejected live follow-ups do not reserve completion boundaries", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  let followUpCalls = 0;
+  agent.followUp = async (message) => {
+    agent.calls.push(["follow_up", message]);
+    followUpCalls += 1;
+    if (followUpCalls === 1) throw new Error("queue rejected");
+  };
+  const session = new SdkSession(agent);
+  let secondSettled = false;
+
+  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
+  const first = session.send({ type: "follow_up", message: "rejected" }, () => {}, 100);
+  const firstRejection = assert.rejects(first, /queue rejected/);
+  const second = session
+    .send({ type: "follow_up", message: "accepted" }, () => {}, 100)
+    .finally(() => {
+      secondSettled = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  agent.emit({ type: "agent_end" });
+  await Promise.all([prompt, firstRejection]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondSettled, false);
+
+  agent.emit({ type: "agent_end" });
+  await second;
+  assert.equal(secondSettled, true);
+  await session.dispose();
+});
+
 test("active follow-up subscribes before a queued agent_end callback", async () => {
   const agent = new FakeAgentSession();
   agent.prompt = async (message) => {

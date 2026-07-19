@@ -36,9 +36,10 @@ runtime model switching as `/slash` commands.
    start a prompt-equivalent run instead of waiting on an inactive control queue.
    Before an active prompt emits `agent_end`, controls dispatch without waiting
    behind it. A `steer` request remains open through the current run's
-   `agent_end`; each `follow_up` remains open through its own queued run's
-   `agent_end` and blocks queued prompt/model operations until that boundary.
-   Each receives its event stream, and later controls rejoin the FIFO. Idle
+   `agent_end`; each successfully queued `follow_up` remains open through its own
+   run's `agent_end` and blocks queued prompt/model operations until that
+   boundary. Rejected follow-up admissions consume no completion boundary. Each
+   request receives its event stream, and later controls rejoin the FIFO. Idle
    sessions (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
