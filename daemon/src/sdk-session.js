@@ -22,6 +22,7 @@ export class SdkSession {
     this.closed = false;
     this.queue = Promise.resolve();
     this.inFlightControls = new Set();
+    this.activeRuns = 0;
     this.disposePromise = undefined;
   }
 
@@ -29,19 +30,24 @@ export class SdkSession {
     if (this.closed) return Promise.reject(new Error("GJC SDK session is not running"));
 
     const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
-    if (isLiveControl) {
-      const result = Promise.resolve().then(() => {
-        if (this.closed) throw new Error("GJC SDK session is not running");
-        return this.#runPromptCommand(command, onEvent, timeoutMs);
-      });
-      this.inFlightControls.add(result);
-      result.then(
-        () => this.inFlightControls.delete(result),
-        () => this.inFlightControls.delete(result)
-      );
-      return result;
-    }
+    if (!isLiveControl) return this.#enqueue(command, onEvent, timeoutMs);
 
+    const result = Promise.resolve().then(() => {
+      if (this.closed) throw new Error("GJC SDK session is not running");
+      if (this.activeRuns > 0) {
+        return this.#runPromptCommand(command, onEvent, timeoutMs);
+      }
+      return this.#enqueue(command, onEvent, timeoutMs);
+    });
+    this.inFlightControls.add(result);
+    result.then(
+      () => this.inFlightControls.delete(result),
+      () => this.inFlightControls.delete(result)
+    );
+    return result;
+  }
+
+  #enqueue(command, onEvent, timeoutMs) {
     const result = this.queue.then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
       return this.#dispatch(command, onEvent, timeoutMs);
@@ -92,6 +98,8 @@ export class SdkSession {
         return;
       }
       case "prompt":
+      case "steer":
+      case "follow_up":
         await this.#runPromptCommand(command, onEvent, timeoutMs);
         return;
       default:
@@ -104,6 +112,7 @@ export class SdkSession {
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
     });
+    this.activeRuns += 1;
     const unsubscribe = this.session.subscribe((event) => {
       onEvent(event);
       if (event.type === "agent_end") resolveAgentEnd();
@@ -121,6 +130,7 @@ export class SdkSession {
         await agentEnd;
       }, timeoutMs);
     } finally {
+      this.activeRuns -= 1;
       unsubscribe();
     }
   }
@@ -155,6 +165,8 @@ export class SdkSession {
   async dispose() {
     this.closed = true;
     const disposal = this.#disposeUnderlying();
-    await Promise.all([this.queue, ...this.inFlightControls, disposal]);
+    const commands = Promise.allSettled([this.queue, ...this.inFlightControls]);
+    await disposal;
+    await commands;
   }
 }

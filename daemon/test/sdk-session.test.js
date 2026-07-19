@@ -235,6 +235,39 @@ test("idle follow-up keeps its own event stream through agent_end", async () => 
   assert.deepEqual(events, [{ type: "agent_end" }]);
   await session.dispose();
 });
+test("idle controls serialize behind an in-flight model switch", async () => {
+  const agent = new FakeAgentSession();
+  let releaseModel;
+  const modelGate = new Promise((resolve) => {
+    releaseModel = resolve;
+  });
+  agent.setModel = async (model) => {
+    agent.calls.push(["set_model", model]);
+    await modelGate;
+  };
+  const session = new SdkSession(agent);
+
+  const modelSwitch = session.send(
+    { type: "set_model", provider: "provider-a", modelId: "model-a" },
+    () => {},
+    100
+  );
+  const followUp = session.send(
+    { type: "follow_up", message: "after model" },
+    () => {},
+    100
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(agent.calls, [["set_model", agent.models[0]]]);
+  releaseModel();
+  await Promise.all([modelSwitch, followUp]);
+  assert.deepEqual(agent.calls, [
+    ["set_model", agent.models[0]],
+    ["follow_up", "after model"],
+  ]);
+  await session.dispose();
+});
 
 test("SDK adapter poisons and disposes a timed-out session", async () => {
   const agent = new FakeAgentSession();
@@ -269,6 +302,36 @@ test("model switches use the same timeout and poison lifecycle", async () => {
   );
   assert.equal(session.closed, true);
   await session.dispose();
+  assert.equal(agent.disposeCalls, 1);
+});
+test("dispose ignores prior control failures after underlying cleanup succeeds", async () => {
+  const agent = new FakeAgentSession();
+  let rejectSteer;
+  const steerGate = new Promise((_, reject) => {
+    rejectSteer = reject;
+  });
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+  };
+  agent.steer = async (message) => {
+    agent.calls.push(["steer", message]);
+    await steerGate;
+  };
+  agent.dispose = async () => {
+    agent.disposeCalls += 1;
+    rejectSteer(new Error("control failed"));
+    agent.emit({ type: "agent_end" });
+  };
+  const session = new SdkSession(agent);
+
+  const prompt = session.send({ type: "prompt", message: "active" }, () => {}, 100);
+  await new Promise((resolve) => setImmediate(resolve));
+  const steer = session.send({ type: "steer", message: "adjust" }, () => {}, 100);
+  const steerFailure = assert.rejects(steer, /control failed/);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await session.dispose();
+  await Promise.all([prompt, steerFailure]);
   assert.equal(agent.disposeCalls, 1);
 });
 

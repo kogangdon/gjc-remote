@@ -32,10 +32,11 @@ runtime model switching as `/slash` commands.
    junctions cannot reuse a stale target. Different path spellings for the same
    directory share one in-process GJC SDK `AgentSession` with file-backed history
    under `<workDir>/.gjc-remote-session`. Prompt and model operations are
-   serialized per session. `steer` and `follow_up` dispatch into an active run
-   without waiting behind its prompt, while each control request remains open
-   through the resulting `agent_end` and receives its event stream. Idle sessions
-   (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
+   serialized per session, and idle `steer`/`follow_up` requests join that FIFO.
+   During an active run, controls dispatch without waiting behind its prompt,
+   while each request remains open through the resulting `agent_end` and receives
+   its event stream. Idle sessions (`IDLE_TIMEOUT_MS` = 1h, in
+   `shared/protocol.js`) are disposed.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
    each Discord channel to one validated `{hostId, workDir}` pair via
