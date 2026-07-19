@@ -192,7 +192,8 @@ remain Node-compatible. `bun.lock` is the committed dependency lockfile;
   When the bot process receives `SIGINT`/`SIGTERM` it shuts down gracefully:
   `HostRegistry.close()` first, so in-flight invokes settle and daemons observe
   a clean socket close, then the Discord client is destroyed; the handler is
-  idempotent and always reaches `exit(0)` even if a teardown step throws
+  idempotent and always reaches `exit(0)` — each step is bounded by a timeout so
+  a step that throws *or* hangs cannot wedge the process
   (`bot/src/shutdown.js`). A disconnected daemon reconnects with **equal-jitter
   exponential backoff** (`daemon/src/reconnect.js`): the base doubles from 1s up
   to a 30s ceiling, and each actual wait is drawn from `[base/2, base]` so a

@@ -82,3 +82,21 @@ test("the received signal name is logged", async () => {
 
   assert.ok(logs.some((line) => line.includes("SIGTERM")));
 });
+
+test("a hanging teardown step is abandoned after the timeout and still exits 0", async () => {
+  const errors = [];
+  const { calls, deps } = makeDeps({
+    registry: {
+      // Never settles: simulates a wedged wss.close().
+      close: () => new Promise(() => {}),
+    },
+    logError: (message) => errors.push(message),
+    timeoutMs: 20,
+  });
+  const shutdown = createShutdown(deps);
+
+  await shutdown("SIGTERM");
+
+  assert.deepEqual(calls, ["client.destroy", "exit:0"]);
+  assert.ok(errors.some((line) => /host registry shutdown timed out/.test(line)));
+});

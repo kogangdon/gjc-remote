@@ -423,8 +423,10 @@ function debugRemote(label, data) {
   console.error(`[bot] ${label}`, JSON.stringify(data));
 }
 
-client.login(DISCORD_TOKEN);
-
 const shutdown = createShutdown({ registry, client });
+// Register signal handlers before login so a signal received mid-login still
+// triggers a graceful shutdown instead of the default abrupt termination.
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+client.login(DISCORD_TOKEN);

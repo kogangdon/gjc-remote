@@ -26,6 +26,11 @@ test("nextBase is clamped to the maximum and never overflows", () => {
 
   const atMax = nextReconnect(RECONNECT_MAX_MS);
   assert.equal(atMax.nextBase, RECONNECT_MAX_MS);
+  // Even an absurdly large base (e.g. a corrupted carry-over) stays clamped and
+  // never doubles past the ceiling.
+  const huge = nextReconnect(Number.MAX_SAFE_INTEGER);
+  assert.equal(huge.nextBase, RECONNECT_MAX_MS);
+  assert.ok(huge.nextBase <= RECONNECT_MAX_MS);
 });
 
 test("random draws across the unit interval keep delay in [base/2, base]", () => {

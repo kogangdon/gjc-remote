@@ -43,7 +43,7 @@ function connectToBot() {
   });
 
   connection.on("open", () => {
-    reconnectDelay = 1000;
+    reconnectDelay = RECONNECT_BASE_MS;
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.REGISTER,
