@@ -171,10 +171,10 @@ remain Node-compatible. `bun.lock` is the committed dependency lockfile;
   worst-case JSON escaping headroom, and the bot rejects invalid or oversized
   serialized invokes before sending. Event `requestId` values are accepted only
   from the exact daemon socket that owns the pending invocation.
-   The bot sends protocol `ping` every **30 seconds** and requires `pong` within
-   **10 seconds**. A missed deadline removes only the socket that owns that
-   heartbeat and fails its pending invocations exactly once; a replacement
-   connection for the same host is not affected by stale heartbeat state.
+  The bot sends protocol `ping` every **30 seconds** and requires `pong` within
+  **10 seconds**. A missed deadline removes only the socket that owns that
+  heartbeat and fails its pending invocations exactly once; a replacement
+  connection for the same host is not affected by stale heartbeat state.
 - Session key / isolation unit = **(hostId, canonical workDir)** pair; one
   Discord channel maps to a configured `{hostId, workDir}` and the daemon
   canonicalizes that path before SDK session lookup or creation.
