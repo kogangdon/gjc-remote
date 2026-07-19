@@ -517,3 +517,99 @@ test("registry shutdown clears heartbeat state and settles pending invokes", asy
   assert.equal(server.registry.connections.size, 0);
   assert.equal(server.registry.pendingRequests.size, 0);
 });
+
+test("per-host in-flight invokes are capped and freed on completion", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const cap = V0_LIMITS.MAX_PENDING_PER_HOST;
+
+    for (let i = 0; i < cap; i += 1) {
+      server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: "hello" },
+        () => {},
+        10_000
+      );
+    }
+    assert.equal(server.registry.pendingRequests.size, cap);
+
+    const overflow = await server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      10_000
+    );
+    assert.deepEqual(overflow, {
+      ok: false,
+      error: "host 'host-a' has too many in-flight requests",
+    });
+    assert.equal(server.registry.pendingRequests.size, cap);
+
+    const [freedRequestId] = [...server.registry.pendingRequests.keys()];
+    socket.send(
+      JSON.stringify({ type: "event", requestId: freedRequestId, done: true })
+    );
+    await waitFor(() => server.registry.pendingRequests.size === cap - 1);
+
+    const invokeFrame = once(socket, "message");
+    server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      10_000
+    );
+    await invokeFrame;
+    assert.equal(server.registry.pendingRequests.size, cap);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a host's pending cap does not block a different host", async () => {
+  const server = await startRegistry(
+    new Map([
+      ["host-a", "token-a"],
+      ["host-b", "token-b"],
+    ])
+  );
+  try {
+    await server.connect("host-a", "token-a");
+    const socketB = await server.connect("host-b", "token-b");
+    const cap = V0_LIMITS.MAX_PENDING_PER_HOST;
+
+    for (let i = 0; i < cap; i += 1) {
+      server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: "hello" },
+        () => {},
+        10_000
+      );
+    }
+    const overflowA = await server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      10_000
+    );
+    assert.equal(overflowA.ok, false);
+
+    const invokeFrameB = once(socketB, "message");
+    server.registry.invoke(
+      "host-b",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      10_000
+    );
+    await invokeFrameB;
+    assert.equal(server.registry.pendingRequests.size, cap + 1);
+  } finally {
+    await server.close();
+  }
+});

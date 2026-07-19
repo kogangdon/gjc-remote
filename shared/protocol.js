@@ -14,6 +14,10 @@ export const V0_LIMITS = Object.freeze({
   MODEL_NAME: 512,
   ERROR: 4096,
   DENIAL_REASON: 1024,
+  // Bounds concurrent in-flight invokes per host so a single daemon cannot
+  // grow the bot's pending-request map without limit. Excess invokes are
+  // rejected locally (fail-closed) rather than queued or dropped silently.
+  MAX_PENDING_PER_HOST: 64,
 });
 
 /**

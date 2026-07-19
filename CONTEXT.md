@@ -171,6 +171,12 @@ remain Node-compatible. `bun.lock` is the committed dependency lockfile;
   worst-case JSON escaping headroom, and the bot rejects invalid or oversized
   serialized invokes before sending. Event `requestId` values are accepted only
   from the exact daemon socket that owns the pending invocation.
+  Each host is capped at **64 concurrent in-flight invokes**
+  (`V0_LIMITS.MAX_PENDING_PER_HOST`); excess invokes fail closed locally with
+  `too many in-flight requests` rather than growing the pending-request map,
+  and completing or failing a request frees the slot. Streamed event volume is
+  bounded by the per-frame 8 MiB cap, the invoke timeout, and dropping events
+  whose `requestId` has no live pending owner.
   The bot sends protocol `ping` every **30 seconds** and requires `pong` within
   **10 seconds**. A missed deadline removes only the socket that owns that
   heartbeat and fails its pending invocations exactly once; a replacement

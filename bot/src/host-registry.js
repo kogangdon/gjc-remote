@@ -4,6 +4,7 @@ import {
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PING,
+  V0_LIMITS,
   isEventMessage,
   isInvokeMessage,
   isPongMessage,
@@ -287,6 +288,17 @@ export class HostRegistry {
   invoke(hostId, workDir, command, onEvent, timeoutMs = 10 * 60 * 1000) {
     const socket = this.connections.get(hostId);
     if (!socket) return Promise.resolve({ ok: false, error: `host '${hostId}' is not connected` });
+
+    let pendingForSocket = 0;
+    for (const pending of this.pendingRequests.values()) {
+      if (pending.socket === socket) pendingForSocket += 1;
+    }
+    if (pendingForSocket >= V0_LIMITS.MAX_PENDING_PER_HOST) {
+      return Promise.resolve({
+        ok: false,
+        error: `host '${hostId}' has too many in-flight requests`,
+      });
+    }
 
     const requestId = randomUUID();
     const invoke = { type: MSG_TYPES.INVOKE, requestId, workDir, command };
