@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import test from "node:test";
 
-import { SdkSession, createSdkSession } from "../src/sdk-session.js";
+import {
+  SdkSession,
+  applyConfiguredModelProfile,
+  createSdkSession,
+} from "../src/sdk-session.js";
 
 class FakeAgentSession {
   constructor() {
@@ -12,6 +16,7 @@ class FakeAgentSession {
     ];
     this.calls = [];
     this.disposeCalls = 0;
+    this.modelRegistry = { id: "fake-model-registry" };
   }
 
   subscribe(listener) {
@@ -56,6 +61,7 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   const calls = [];
   const agent = new FakeAgentSession();
   let manager;
+  const activateCalls = [];
   const sdk = {
     SessionManager: {
       create(workDir, sessionDir) {
@@ -67,6 +73,14 @@ test("createSdkSession uses the canonical workDir and dedicated session director
     async createAgentSession(options) {
       calls.push(["session", options]);
       return { session: agent };
+    },
+    Settings: {
+      async init() {
+        return { get: (key) => (key === "modelProfile.default" ? "copilot-claude" : undefined) };
+      },
+    },
+    async activateModelProfile(options, applyOptions) {
+      activateCalls.push([options, applyOptions]);
     },
   };
 
@@ -81,6 +95,12 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(calls[1][0], "session");
   assert.equal(calls[1][1].cwd, "/workspace");
   assert.strictEqual(calls[1][1].sessionManager, manager);
+  assert.equal(activateCalls.length, 1);
+  const [activateOptions, activateApplyOptions] = activateCalls[0];
+  assert.equal(activateOptions.profileName, "copilot-claude");
+  assert.strictEqual(activateOptions.session, agent);
+  assert.strictEqual(activateOptions.modelRegistry, agent.modelRegistry);
+  assert.deepEqual(activateApplyOptions, { persistDefault: false });
   await session.dispose();
 });
 
@@ -648,4 +668,90 @@ test("timeout-triggered disposal rejections are handled immediately", async () =
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(agent.disposeCalls, 1);
   await assert.rejects(session.dispose(), /dispose failed/);
+});
+function activationHarness() {
+  const activateCalls = [];
+  const session = { modelRegistry: { id: "registry" } };
+  const settings = { get: () => undefined };
+  return {
+    activateCalls,
+    session,
+    settings,
+    sdk: {
+      Settings: { async init() { return settings; } },
+      async activateModelProfile(options, applyOptions) {
+        activateCalls.push([options, applyOptions]);
+      },
+    },
+  };
+}
+
+test("applyConfiguredModelProfile activates the host-configured profile in-memory", async () => {
+  const h = activationHarness();
+  h.settings.get = (key) =>
+    key === "modelProfile.default" ? "copilot-claude" : undefined;
+
+  await applyConfiguredModelProfile(h.session, h.sdk);
+
+  assert.equal(h.activateCalls.length, 1);
+  const [options, applyOptions] = h.activateCalls[0];
+  assert.equal(options.profileName, "copilot-claude");
+  assert.strictEqual(options.session, h.session);
+  assert.strictEqual(options.modelRegistry, h.session.modelRegistry);
+  assert.strictEqual(options.settings, h.settings);
+  assert.deepEqual(applyOptions, { persistDefault: false });
+});
+
+test("applyConfiguredModelProfile lets GJC_MODEL_PROFILE override the configured profile", async () => {
+  const h = activationHarness();
+  h.settings.get = () => "copilot-claude";
+  const previous = process.env.GJC_MODEL_PROFILE;
+  process.env.GJC_MODEL_PROFILE = "  custom-profile  ";
+  try {
+    await applyConfiguredModelProfile(h.session, h.sdk);
+  } finally {
+    if (previous === undefined) delete process.env.GJC_MODEL_PROFILE;
+    else process.env.GJC_MODEL_PROFILE = previous;
+  }
+
+  assert.equal(h.activateCalls.length, 1);
+  assert.equal(h.activateCalls[0][0].profileName, "custom-profile");
+});
+
+test("applyConfiguredModelProfile skips activation and warns when no profile is configured", async () => {
+  const h = activationHarness();
+  h.settings.get = () => undefined;
+  const previous = process.env.GJC_MODEL_PROFILE;
+  delete process.env.GJC_MODEL_PROFILE;
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    await applyConfiguredModelProfile(h.session, h.sdk);
+  } finally {
+    console.warn = originalWarn;
+    if (previous !== undefined) process.env.GJC_MODEL_PROFILE = previous;
+  }
+
+  assert.equal(h.activateCalls.length, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /no model profile configured/);
+});
+
+test("applyConfiguredModelProfile surfaces activation failures loudly", async () => {
+  const h = activationHarness();
+  h.settings.get = () => "copilot-claude";
+  h.sdk.activateModelProfile = async () => {
+    throw new Error("missing credentials for provider github-copilot");
+  };
+
+  await assert.rejects(
+    applyConfiguredModelProfile(h.session, h.sdk),
+    (error) => {
+      assert.match(error.message, /failed to activate model profile "copilot-claude"/);
+      assert.match(error.message, /missing credentials for provider github-copilot/);
+      assert.equal(error.cause instanceof Error, true);
+      return true;
+    }
+  );
 });

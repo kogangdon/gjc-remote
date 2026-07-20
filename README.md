@@ -71,6 +71,14 @@ ambiguous requests fail with a bounded candidate list instead of selecting a
 provider implicitly. A successful switch reports the selected display name,
 provider, and model ID. It does not change the daemon's startup default.
 
+Each new session activates the host's configured model profile
+(`~/.gjc/agent/config.yml` `modelProfile.default`) through GJC's own resolver, so
+the daemon starts on the same model your interactive GJC uses instead of the
+SDK's first-available fallback. Set `GJC_MODEL_PROFILE` to override the profile
+name. A profile that cannot be activated (for example, missing provider
+credentials) fails session creation loudly rather than silently returning empty
+responses.
+
 ## Verification
 
 ```bash
