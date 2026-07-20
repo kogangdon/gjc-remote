@@ -6,20 +6,18 @@ const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
  * Load only the canonical SDK surfaces this daemon needs, rather than the
  * package-root barrel (`@gajae-code/coding-agent`) which pulls the entire
  * runtime graph — TUI/modes and browser/puppeteer tools — into the daemon
- * process. `@gajae-code/coding-agent/sdk` and `.../session/session-manager`
- * are the exports-map-blessed subpaths for these symbols.
+ * process. `@gajae-code/coding-agent/sdk` exports `createAgentSession` and
+ * re-exports `Settings`; `.../session/session-manager` provides `SessionManager`.
  *
  * `config/model-profile-activation` is the config-layer surface used to honour
  * the host's model profile (see `applyConfiguredModelProfile`). It is
  * lower-level than `/sdk`, so it is more version-coupled — the trade accepted
  * so config discovery stays GJC's own concern (robust to config-path/schema
- * changes) instead of hand-parsed. Settings themselves come from the created
- * session (`session.settings`), already scoped to the session's cwd, so no
- * separate settings loader is imported.
+ * changes) instead of hand-parsed.
  */
 async function loadCanonicalSdk() {
   const [
-    { createAgentSession },
+    { createAgentSession, Settings },
     { SessionManager },
     { activateModelProfile },
   ] = await Promise.all([
@@ -27,17 +25,32 @@ async function loadCanonicalSdk() {
     import("@gajae-code/coding-agent/session/session-manager"),
     import("@gajae-code/coding-agent/config/model-profile-activation"),
   ]);
-  return { createAgentSession, SessionManager, activateModelProfile };
+  return { createAgentSession, Settings, SessionManager, activateModelProfile };
 }
 
 export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
-  const { createAgentSession, SessionManager, activateModelProfile } =
+  const { createAgentSession, Settings, SessionManager, activateModelProfile } =
     await loadSdk();
   const sessionManager = SessionManager.create(
     workDir,
     join(workDir, ".gjc-remote-session")
   );
-  const { session } = await createAgentSession({ cwd: workDir, sessionManager });
+  // `Settings.init()` returns a process-global singleton whose cwd is frozen at
+  // first call, so it cannot scope per pooled session. Clone it per workDir so
+  // each session reads that directory's merged config AND so profile activation
+  // (which mutates modelRoles/agentModelOverrides via settings.override) stays
+  // isolated to this session instead of clobbering every other live session.
+  // Caveat: the clone isolates settings-derived state (model roles, profile
+  // activation), but the SDK's capability/discovery layer keeps a module-global
+  // bound to the most recently created session's settings, so disabledProviders
+  // /capability resolution is still last-writer-wins across pooled sessions —
+  // an upstream SDK limitation the clone cannot fix, no worse than before.
+  const settings = await (await Settings.init()).cloneForCwd(workDir);
+  const { session } = await createAgentSession({
+    cwd: workDir,
+    sessionManager,
+    settings,
+  });
   try {
     await applyConfiguredModelProfile(session, { activateModelProfile });
   } catch (error) {
@@ -46,7 +59,12 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
     // activation before propagating the failure.
     await Promise.resolve()
       .then(() => session.dispose())
-      .catch(() => {});
+      .catch((disposeError) => {
+        console.error(
+          `gjc-remote daemon: failed to dispose session after activation failure for ${workDir}:`,
+          disposeError
+        );
+      });
     throw error;
   }
   return new SdkSession(session);
@@ -63,13 +81,14 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
  * hidden `stopReason: "error"` (the "ok:true, hasText:false" silent failure).
  *
  * Resolution is delegated to GJC's own `activateModelProfile`, reading the
- * profile from `session.settings` — the session's own settings, already scoped
- * to its cwd, so a project-level `modelProfile.default` override is honoured the
- * same way the interactive GJC would in that directory. `persistDefault` is
- * false: activation is in-memory for this session only and never mutates the
- * host's `config.yml`. A misconfigured/uncredentialed profile throws here
- * (e.g. `ModelProfileCredentialError`), which fails session creation loudly
- * instead of silently serving a broken session.
+ * profile from `session.settings` — the per-workDir clone `createSdkSession`
+ * built, so a project-level `modelProfile.default` override is honoured the same
+ * way interactive GJC would in that directory, and the activation's in-memory
+ * mutations never leak to other sessions. `persistDefault` is false: activation
+ * is in-memory for this session only and never mutates the host's `config.yml`.
+ * A misconfigured/uncredentialed profile throws here (e.g.
+ * `ModelProfileCredentialError`), which fails session creation loudly instead
+ * of silently serving a broken session.
  *
  * `GJC_MODEL_PROFILE` overrides the configured profile name when set.
  */
@@ -77,15 +96,25 @@ export async function applyConfiguredModelProfile(session, { activateModelProfil
   const settings = session.settings;
   const configured = settings.get("modelProfile.default");
   const envOverride = (process.env.GJC_MODEL_PROFILE ?? "").trim();
-  const profileName =
-    envOverride || (typeof configured === "string" ? configured.trim() : "");
+  const configuredName = typeof configured === "string" ? configured.trim() : "";
+  const profileName = envOverride || configuredName;
 
   if (!profileName) {
-    console.warn(
-      "gjc-remote daemon: no model profile configured " +
-        "(modelProfile.default / GJC_MODEL_PROFILE); the SDK default model may " +
-        "be unauthenticated and return empty responses."
-    );
+    if (configured !== undefined && configuredName === "") {
+      // A present-but-unusable modelProfile.default (non-string or blank) is a
+      // misconfiguration, not an unconfigured host — do not mask it as "none".
+      console.warn(
+        "gjc-remote daemon: modelProfile.default is set but not a usable " +
+          `profile name (${JSON.stringify(configured)}); ignoring it. The SDK ` +
+          "default model may be unauthenticated and return empty responses."
+      );
+    } else {
+      console.warn(
+        "gjc-remote daemon: no model profile configured " +
+          "(modelProfile.default / GJC_MODEL_PROFILE); the SDK default model may " +
+          "be unauthenticated and return empty responses."
+      );
+    }
     return;
   }
 

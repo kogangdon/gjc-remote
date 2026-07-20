@@ -289,6 +289,26 @@ Whenever you touch `daemon/src/*` or `bot/src/host-registry.js`, run
 rather than trusting unit doubles. The smoke script is the preferred reusable
 verification path because it starts the real Bun daemon and embedded agent.
 
+## SDK Settings is a process-global singleton (per-session isolation gotcha)
+
+`Settings.init({ cwd })` (and the `settings` a bare `createAgentSession`
+auto-builds) returns a **process-global cached singleton** whose cwd is frozen
+at first call — it does NOT re-scope per pooled session. Probe:
+`bun -e "const {Settings}=await import('@gajae-code/coding-agent/config/settings'); const a=await Settings.init({cwd:'D:/tmp/a'}); const b=await Settings.init({cwd:'D:/tmp/b'}); console.log(a===b, b.getCwd())"`
+→ `true D:\tmp\a`. Because `activateModelProfile` mutates that settings object
+via `settings.override('modelRoles' | 'task.agentModelOverrides')` even with
+`persistDefault:false`, sharing one Settings across the SessionPool lets each
+new session's activation clobber every other live session's roles. Fix (PR
+after #24): `const scoped = await (await Settings.init()).cloneForCwd(workDir)`
+and pass `settings: scoped` to `createAgentSession` — `cloneForCwd` returns an
+independent instance (`ca===cb` false, override on one does not leak to
+another). Regenerate this reasoning with a probe before trusting SDK scoping
+assumptions on a version bump.
+
+**Process note:** PR #24 was merged after only ad-hoc self-review; the missed
+singleton hazard was caught by a post-merge independent `architect` review.
+Run the review-pr-loop (independent reviewer pass) BEFORE merging, not after.
+
 ```js
 import { SessionPool } from "./daemon/src/session-pool.js";
 const pool = new SessionPool();

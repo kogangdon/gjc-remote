@@ -65,7 +65,21 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   const agent = new FakeAgentSession();
   let manager;
   const activateCalls = [];
+  let cloneForCwdArg;
+  const scopedSettings = {
+    get: (key) => (key === "modelProfile.default" ? "copilot-claude" : undefined),
+  };
   const sdk = {
+    Settings: {
+      async init() {
+        return {
+          async cloneForCwd(cwd) {
+            cloneForCwdArg = cwd;
+            return scopedSettings;
+          },
+        };
+      },
+    },
     SessionManager: {
       create(workDir, sessionDir) {
         calls.push(["manager", workDir, sessionDir]);
@@ -75,6 +89,8 @@ test("createSdkSession uses the canonical workDir and dedicated session director
     },
     async createAgentSession(options) {
       calls.push(["session", options]);
+      // Model reality: the session reads the settings passed in (the clone).
+      agent.settings = options.settings;
       return { session: agent };
     },
     async activateModelProfile(options, applyOptions) {
@@ -93,6 +109,8 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(calls[1][0], "session");
   assert.equal(calls[1][1].cwd, "/workspace");
   assert.strictEqual(calls[1][1].sessionManager, manager);
+  assert.strictEqual(calls[1][1].settings, scopedSettings);
+  assert.equal(cloneForCwdArg, "/workspace");
   assert.equal(activateCalls.length, 1);
   const [activateOptions, activateApplyOptions] = activateCalls[0];
   assert.equal(activateOptions.profileName, "copilot-claude");
@@ -736,6 +754,44 @@ test("applyConfiguredModelProfile skips activation and warns when no profile is 
   assert.match(warnings[0], /no model profile configured/);
 });
 
+test("applyConfiguredModelProfile warns distinctly when modelProfile.default is set but unusable", async () => {
+  const h = activationHarness();
+  h.settings.get = (key) => (key === "modelProfile.default" ? 42 : undefined);
+  const previous = process.env.GJC_MODEL_PROFILE;
+  delete process.env.GJC_MODEL_PROFILE;
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    await applyConfiguredModelProfile(h.session, h.sdk);
+  } finally {
+    console.warn = originalWarn;
+    if (previous !== undefined) process.env.GJC_MODEL_PROFILE = previous;
+  }
+
+  assert.equal(h.activateCalls.length, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /modelProfile\.default is set but not a usable/);
+  assert.match(warnings[0], /42/);
+});
+
+test("applyConfiguredModelProfile ignores a whitespace-only GJC_MODEL_PROFILE and uses the configured profile", async () => {
+  const h = activationHarness();
+  h.settings.get = (key) =>
+    key === "modelProfile.default" ? "copilot-claude" : undefined;
+  const previous = process.env.GJC_MODEL_PROFILE;
+  process.env.GJC_MODEL_PROFILE = "   ";
+  try {
+    await applyConfiguredModelProfile(h.session, h.sdk);
+  } finally {
+    if (previous === undefined) delete process.env.GJC_MODEL_PROFILE;
+    else process.env.GJC_MODEL_PROFILE = previous;
+  }
+
+  assert.equal(h.activateCalls.length, 1);
+  assert.equal(h.activateCalls[0][0].profileName, "copilot-claude");
+});
+
 test("applyConfiguredModelProfile surfaces activation failures loudly", async () => {
   const h = activationHarness();
   h.settings.get = () => "copilot-claude";
@@ -756,8 +812,14 @@ test("applyConfiguredModelProfile surfaces activation failures loudly", async ()
 test("createSdkSession disposes the raw session when profile activation fails", async () => {
   const agent = new FakeAgentSession();
   const sdk = {
+    Settings: {
+      async init() {
+        return { async cloneForCwd() { return agent.settings; } };
+      },
+    },
     SessionManager: { create: (workDir, sessionDir) => ({ workDir, sessionDir }) },
-    async createAgentSession() {
+    async createAgentSession(options) {
+      agent.settings = options.settings ?? agent.settings;
       return { session: agent };
     },
     async activateModelProfile() {
