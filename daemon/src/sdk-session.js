@@ -2,7 +2,22 @@ import { join } from "node:path";
 
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 
-export async function createSdkSession(workDir, loadSdk = () => import("@gajae-code/coding-agent")) {
+/**
+ * Load only the canonical SDK surfaces this daemon needs, rather than the
+ * package-root barrel (`@gajae-code/coding-agent`) which pulls the entire
+ * runtime graph — TUI/modes and browser/puppeteer tools — into the daemon
+ * process. `@gajae-code/coding-agent/sdk` and `.../session/session-manager`
+ * are the exports-map-blessed subpaths for these symbols.
+ */
+async function loadCanonicalSdk() {
+  const [{ createAgentSession }, { SessionManager }] = await Promise.all([
+    import("@gajae-code/coding-agent/sdk"),
+    import("@gajae-code/coding-agent/session/session-manager"),
+  ]);
+  return { createAgentSession, SessionManager };
+}
+
+export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
   const { createAgentSession, SessionManager } = await loadSdk();
   const sessionManager = SessionManager.create(
     workDir,

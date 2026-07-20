@@ -157,6 +157,18 @@ starts with Bun and embeds GJC in-process. The bot and Node built-in test runner
 remain Node-compatible. `bun.lock` is the committed dependency lockfile;
 `package-lock.json` is gitignored.
 
+The daemon imports GJC through the **canonical exports-map subpaths**
+(`@gajae-code/coding-agent/sdk` for `createAgentSession`,
+`@gajae-code/coding-agent/session/session-manager` for `SessionManager`) in
+`daemon/src/sdk-session.js`, not the package-root barrel. The barrel re-exports
+both symbols but drags the whole runtime graph (TUI/modes, browser/puppeteer
+tools) into the daemon process; the subpaths are the surfaces GJC's `exports`
+map + `verify:sdk-canonicalization` gate actually bless, so this both shrinks the
+daemon's loaded graph and rides the supported SDK surface rather than an
+incidental barrel re-export. The `createSdkSession(workDir, loadSdk)` seam is
+unchanged — tests still inject a fake `{ createAgentSession, SessionManager }`;
+only the default production loader was narrowed.
+
 ## Decided config values (don't re-ask the user these)
 
 - Idle GJC SDK session timeout: **1 hour** (`IDLE_TIMEOUT_MS` in
