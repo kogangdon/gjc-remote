@@ -297,6 +297,7 @@ test("shutdown completes when late-created session disposal stalls", async () =>
 test("shutdown completes when SDK session creation stalls", async () => {
   const pool = createPool({
     sessionDisposeTimeoutMs: 1,
+    sessionCreateTimeoutMs: 1,
     sessionFactory: () => new Promise(() => {}),
   });
 
@@ -316,6 +317,7 @@ test("timed-out session creation is evicted and late sessions are disposed", asy
   let factoryCalls = 0;
   const pool = createPool({
     sessionDisposeTimeoutMs: 1,
+    sessionCreateTimeoutMs: 1,
     sessionFactory: async () => {
       factoryCalls += 1;
       if (factoryCalls === 1) {
@@ -335,6 +337,35 @@ test("timed-out session creation is evicted and late sessions are disposed", asy
 
     assert.equal(factoryCalls, 2);
     assert.equal(late.disposeCalls, 1);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("session creation is bounded by the create timeout, not the dispose timeout", async () => {
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 10_000,
+    sessionCreateTimeoutMs: 1,
+    sessionFactory: () => new Promise(() => {}),
+  });
+
+  const creation = pool.ensureSession(WORK_DIR);
+  const creationRejection = assert.rejects(creation, /session creation timed out/);
+  await pool.shutdown();
+  await creationRejection;
+});
+
+test("a creation slower than the dispose timeout still succeeds under a generous create timeout", async () => {
+  const session = new FakeSession();
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionCreateTimeoutMs: 1_000,
+    sessionFactory: () =>
+      new Promise((resolve) => setTimeout(() => resolve(session), 20)),
+  });
+
+  try {
+    assert.strictEqual(await pool.ensureSession(WORK_DIR), session);
   } finally {
     await pool.shutdown();
   }
