@@ -269,6 +269,19 @@ Use these rules for Telegram delivery:
    generated long-output and tool-log attachments remain supported because they
    are created in memory by the bot.
 
+## Merge / PR workflow
+
+When a review-pr-loop converges and the PR is merged **directly in the same
+session**, merge with a **merge commit** (GitHub "Create a merge commit"), not
+squash or rebase. Rationale: PRs #13/#15/#17/#19 landed as two-parent merge
+commits, but #20/#21/#22 were squash-merged, which produced single linear
+commits on `main` whose source branches then dangled beside the graph as
+non-ancestors (same changes, different commit identity) — visually "broken"
+history even though nothing was actually wrong. Staying on merge commits keeps
+the branch topology legible and the merged branch reachable as an ancestor
+(so `git branch -d` can verify-delete it later). Delete the source branch after
+merging. Reserve squash for cases the user explicitly asks for.
+
 ## Verification pattern to reuse
 
 Whenever you touch `daemon/src/*` or `bot/src/host-registry.js`, run
