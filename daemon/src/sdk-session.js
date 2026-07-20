@@ -40,6 +40,11 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
   // each session reads that directory's merged config AND so profile activation
   // (which mutates modelRoles/agentModelOverrides via settings.override) stays
   // isolated to this session instead of clobbering every other live session.
+  // Caveat: the clone isolates settings-derived state (model roles, profile
+  // activation), but the SDK's capability/discovery layer keeps a module-global
+  // bound to the most recently created session's settings, so disabledProviders
+  // /capability resolution is still last-writer-wins across pooled sessions —
+  // an upstream SDK limitation the clone cannot fix, no worse than before.
   const settings = await (await Settings.init()).cloneForCwd(workDir);
   const { session } = await createAgentSession({
     cwd: workDir,
