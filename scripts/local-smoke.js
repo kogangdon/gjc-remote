@@ -1,17 +1,27 @@
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { once } from "node:events";
 import { HostRegistry } from "../bot/src/host-registry.js";
 
 const port = Number(process.env.SMOKE_HOST_WS_PORT || 7788);
 const hostId = process.env.SMOKE_HOST_ID || "local-smoke";
 const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
-// A second, distinct canonical workDir so the smoke exercises two concurrent
-// pooled sessions. Each session clones Settings for its own cwd, so activating
-// one host profile must not clobber the other session (regression guard for the
-// per-workDir Settings isolation fix). Defaults to the repo's daemon/ subdir.
+// A second, distinct canonical workDir so the smoke drives two concurrent
+// pooled sessions (each session clones Settings for its own cwd). This guards
+// against gross cross-session breakage: session A must keep working after
+// session B is created and activates the host profile. NOTE: when both workDirs
+// resolve the SAME effective modelProfile.default (the default case), this does
+// NOT exercise the specific per-role clobber that #25 fixed — to make it a true
+// isolation regression guard, point SMOKE_WORK_DIR_2 at a directory whose
+// project-level config sets a DIFFERENT modelProfile.default. Assumes the smoke
+// runs from the repo root; defaults to the repo's daemon/ subdir.
 const workDir = process.env.SMOKE_WORK_DIR || process.cwd();
 const workDir2 = process.env.SMOKE_WORK_DIR_2 || join(process.cwd(), "daemon");
+if (resolve(workDir) === resolve(workDir2)) {
+  throw new Error(
+    `SMOKE_WORK_DIR and SMOKE_WORK_DIR_2 must differ; both resolved to ${resolve(workDir)}`
+  );
+}
 const expected = "SMOKE_OK";
 const modelQuery = process.env.SMOKE_MODEL_QUERY;
 const heartbeatIntervalMs = 100;
@@ -77,10 +87,10 @@ try {
 
   const result = { text: await promptExact(workDir) };
 
-  // Two-workDir isolation: create a second pooled session (its own Settings
-  // clone + profile activation), then re-prompt the first. If the second
-  // session's activation clobbered shared model state, the first session would
-  // now break — a passing re-prompt proves per-session isolation end to end.
+  // Create a second pooled session (its own Settings clone + profile
+  // activation), then re-prompt the first. A passing re-prompt proves session A
+  // survives session B's creation/activation end to end — a guard against gross
+  // cross-session breakage (see the workDir2 note above for its limits).
   await promptExact(workDir2);
   await promptExact(workDir);
 
