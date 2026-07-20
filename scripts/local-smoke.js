@@ -1,11 +1,27 @@
 import { spawn } from "node:child_process";
+import { join, resolve } from "node:path";
 import { once } from "node:events";
 import { HostRegistry } from "../bot/src/host-registry.js";
 
 const port = Number(process.env.SMOKE_HOST_WS_PORT || 7788);
 const hostId = process.env.SMOKE_HOST_ID || "local-smoke";
 const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
+// A second, distinct canonical workDir so the smoke drives two concurrent
+// pooled sessions (each session clones Settings for its own cwd). This guards
+// against gross cross-session breakage: session A must keep working after
+// session B is created and activates the host profile. NOTE: when both workDirs
+// resolve the SAME effective modelProfile.default (the default case), this does
+// NOT exercise the specific per-role clobber that #25 fixed — to make it a true
+// isolation regression guard, point SMOKE_WORK_DIR_2 at a directory whose
+// project-level config sets a DIFFERENT modelProfile.default. Assumes the smoke
+// runs from the repo root; defaults to the repo's daemon/ subdir.
 const workDir = process.env.SMOKE_WORK_DIR || process.cwd();
+const workDir2 = process.env.SMOKE_WORK_DIR_2 || join(process.cwd(), "daemon");
+if (resolve(workDir) === resolve(workDir2)) {
+  throw new Error(
+    `SMOKE_WORK_DIR and SMOKE_WORK_DIR_2 must differ; both resolved to ${resolve(workDir)}`
+  );
+}
 const expected = "SMOKE_OK";
 const modelQuery = process.env.SMOKE_MODEL_QUERY;
 const heartbeatIntervalMs = 100;
@@ -52,20 +68,31 @@ try {
     throw new Error("application-level ping/pong exchange was not observed");
   }
 
-  const result = await registry.invoke(
-    hostId,
-    workDir,
-    { kind: "prompt", message: `reply with exactly: ${expected}` },
-    () => {},
-    120_000
-  );
+  const promptExact = async (dir) => {
+    const r = await registry.invoke(
+      hostId,
+      dir,
+      { kind: "prompt", message: `reply with exactly: ${expected}` },
+      () => {},
+      120_000
+    );
+    if (!r.ok) throw new Error(`invoke failed for ${dir}: ${r.error ?? "unknown error"}`);
+    if (r.text !== expected) {
+      throw new Error(
+        `unexpected text for ${dir}: ${JSON.stringify(r.text)} (expected ${expected})`
+      );
+    }
+    return r.text;
+  };
 
-  if (!result.ok) {
-    throw new Error(`invoke failed: ${result.error ?? "unknown error"}`);
-  }
-  if (result.text !== expected) {
-    throw new Error(`unexpected text: ${JSON.stringify(result.text)} (expected ${expected})`);
-  }
+  const result = { text: await promptExact(workDir) };
+
+  // Create a second pooled session (its own Settings clone + profile
+  // activation), then re-prompt the first. A passing re-prompt proves session A
+  // survives session B's creation/activation end to end — a guard against gross
+  // cross-session breakage (see the workDir2 note above for its limits).
+  await promptExact(workDir2);
+  await promptExact(workDir);
 
   let model;
   if (modelQuery) {
@@ -84,7 +111,9 @@ try {
     model = modelEvents.find((event) => event?.type === "model_resolved");
     if (!model) throw new Error("model invoke returned no model_resolved receipt");
   }
-  console.log(JSON.stringify({ ok: true, hostId, workDir, text: result.text, model }));
+  console.log(
+    JSON.stringify({ ok: true, hostId, workDir, workDir2, text: result.text, model })
+  );
 } finally {
   daemon.kill();
   await closeRegistry(registry);
