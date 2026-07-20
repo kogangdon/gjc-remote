@@ -1,11 +1,17 @@
 import { spawn } from "node:child_process";
+import { join } from "node:path";
 import { once } from "node:events";
 import { HostRegistry } from "../bot/src/host-registry.js";
 
 const port = Number(process.env.SMOKE_HOST_WS_PORT || 7788);
 const hostId = process.env.SMOKE_HOST_ID || "local-smoke";
 const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
+// A second, distinct canonical workDir so the smoke exercises two concurrent
+// pooled sessions. Each session clones Settings for its own cwd, so activating
+// one host profile must not clobber the other session (regression guard for the
+// per-workDir Settings isolation fix). Defaults to the repo's daemon/ subdir.
 const workDir = process.env.SMOKE_WORK_DIR || process.cwd();
+const workDir2 = process.env.SMOKE_WORK_DIR_2 || join(process.cwd(), "daemon");
 const expected = "SMOKE_OK";
 const modelQuery = process.env.SMOKE_MODEL_QUERY;
 const heartbeatIntervalMs = 100;
@@ -52,20 +58,31 @@ try {
     throw new Error("application-level ping/pong exchange was not observed");
   }
 
-  const result = await registry.invoke(
-    hostId,
-    workDir,
-    { kind: "prompt", message: `reply with exactly: ${expected}` },
-    () => {},
-    120_000
-  );
+  const promptExact = async (dir) => {
+    const r = await registry.invoke(
+      hostId,
+      dir,
+      { kind: "prompt", message: `reply with exactly: ${expected}` },
+      () => {},
+      120_000
+    );
+    if (!r.ok) throw new Error(`invoke failed for ${dir}: ${r.error ?? "unknown error"}`);
+    if (r.text !== expected) {
+      throw new Error(
+        `unexpected text for ${dir}: ${JSON.stringify(r.text)} (expected ${expected})`
+      );
+    }
+    return r.text;
+  };
 
-  if (!result.ok) {
-    throw new Error(`invoke failed: ${result.error ?? "unknown error"}`);
-  }
-  if (result.text !== expected) {
-    throw new Error(`unexpected text: ${JSON.stringify(result.text)} (expected ${expected})`);
-  }
+  const result = { text: await promptExact(workDir) };
+
+  // Two-workDir isolation: create a second pooled session (its own Settings
+  // clone + profile activation), then re-prompt the first. If the second
+  // session's activation clobbered shared model state, the first session would
+  // now break — a passing re-prompt proves per-session isolation end to end.
+  await promptExact(workDir2);
+  await promptExact(workDir);
 
   let model;
   if (modelQuery) {
@@ -84,7 +101,9 @@ try {
     model = modelEvents.find((event) => event?.type === "model_resolved");
     if (!model) throw new Error("model invoke returned no model_resolved receipt");
   }
-  console.log(JSON.stringify({ ok: true, hostId, workDir, text: result.text, model }));
+  console.log(
+    JSON.stringify({ ok: true, hostId, workDir, workDir2, text: result.text, model })
+  );
 } finally {
   daemon.kill();
   await closeRegistry(registry);
