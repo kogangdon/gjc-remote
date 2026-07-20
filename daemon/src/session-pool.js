@@ -57,6 +57,9 @@ export class SessionPool {
     await Promise.all(disposals);
   }
   async #settleBounded(operation, timeoutMs) {
+    if (typeof timeoutMs !== "number") {
+      throw new TypeError("#settleBounded requires a numeric timeoutMs");
+    }
     let timer;
     const settlement = Promise.resolve(operation).then(
       (value) => ({ status: "fulfilled", value }),
