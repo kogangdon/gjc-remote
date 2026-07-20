@@ -50,8 +50,15 @@ const daemon = spawn(process.env.BUN_BIN || "bun", ["daemon/src/daemon.js"], {
   stdio: ["ignore", "pipe", "pipe"],
 });
 
-daemon.stdout.on("data", (chunk) => process.stderr.write(chunk));
-daemon.stderr.on("data", (chunk) => process.stderr.write(chunk));
+// Capture daemon output so the smoke can assert profile activation actually ran
+// (see the profile-activation check below), while still forwarding it live.
+let daemonOutput = "";
+const captureDaemon = (chunk) => {
+  daemonOutput += chunk.toString();
+  process.stderr.write(chunk);
+};
+daemon.stdout.on("data", captureDaemon);
+daemon.stderr.on("data", captureDaemon);
 
 try {
   await waitForHost(registry, hostId, 10_000);
@@ -93,6 +100,23 @@ try {
   // cross-session breakage (see the workDir2 note above for its limits).
   await promptExact(workDir2);
   await promptExact(workDir);
+  // Prove profile activation ran against the real SDK rather than silently
+  // falling back to the SDK default model. applyConfiguredModelProfile warns
+  // and skips when it finds no usable profile; if that warning appears, the
+  // session never routed through activateModelProfile (the exact surface this
+  // smoke exists to regression-guard on an SDK bump), so fail loudly.
+  const skipWarnings = [
+    "gjc-remote daemon: no model profile configured",
+    "gjc-remote daemon: modelProfile.default is set but not a usable",
+  ].filter((needle) => daemonOutput.includes(needle));
+  if (skipWarnings.length > 0) {
+    throw new Error(
+      "daemon skipped model-profile activation (SDK default fallback); this " +
+        `host needs a usable modelProfile.default / GJC_MODEL_PROFILE. Saw: ${skipWarnings.join(
+          "; "
+        )}`
+    );
+  }
 
   let model;
   if (modelQuery) {
