@@ -17,6 +17,9 @@ class FakeAgentSession {
     this.calls = [];
     this.disposeCalls = 0;
     this.modelRegistry = { id: "fake-model-registry" };
+    this.settings = {
+      get: (key) => (key === "modelProfile.default" ? "copilot-claude" : undefined),
+    };
   }
 
   subscribe(listener) {
@@ -74,11 +77,6 @@ test("createSdkSession uses the canonical workDir and dedicated session director
       calls.push(["session", options]);
       return { session: agent };
     },
-    Settings: {
-      async init() {
-        return { get: (key) => (key === "modelProfile.default" ? "copilot-claude" : undefined) };
-      },
-    },
     async activateModelProfile(options, applyOptions) {
       activateCalls.push([options, applyOptions]);
     },
@@ -100,6 +98,7 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(activateOptions.profileName, "copilot-claude");
   assert.strictEqual(activateOptions.session, agent);
   assert.strictEqual(activateOptions.modelRegistry, agent.modelRegistry);
+  assert.strictEqual(activateOptions.settings, agent.settings);
   assert.deepEqual(activateApplyOptions, { persistDefault: false });
   await session.dispose();
 });
@@ -671,14 +670,13 @@ test("timeout-triggered disposal rejections are handled immediately", async () =
 });
 function activationHarness() {
   const activateCalls = [];
-  const session = { modelRegistry: { id: "registry" } };
   const settings = { get: () => undefined };
+  const session = { modelRegistry: { id: "registry" }, settings };
   return {
     activateCalls,
     session,
     settings,
     sdk: {
-      Settings: { async init() { return settings; } },
       async activateModelProfile(options, applyOptions) {
         activateCalls.push([options, applyOptions]);
       },
@@ -754,4 +752,22 @@ test("applyConfiguredModelProfile surfaces activation failures loudly", async ()
       return true;
     }
   );
+});
+test("createSdkSession disposes the raw session when profile activation fails", async () => {
+  const agent = new FakeAgentSession();
+  const sdk = {
+    SessionManager: { create: (workDir, sessionDir) => ({ workDir, sessionDir }) },
+    async createAgentSession() {
+      return { session: agent };
+    },
+    async activateModelProfile() {
+      throw new Error("missing credentials for provider github-copilot");
+    },
+  };
+
+  await assert.rejects(
+    createSdkSession("/workspace", async () => sdk),
+    /failed to activate model profile "copilot-claude"/
+  );
+  assert.equal(agent.disposeCalls, 1);
 });

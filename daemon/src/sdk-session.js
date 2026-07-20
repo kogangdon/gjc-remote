@@ -9,36 +9,46 @@ const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
  * process. `@gajae-code/coding-agent/sdk` and `.../session/session-manager`
  * are the exports-map-blessed subpaths for these symbols.
  *
- * `config/settings` and `config/model-profile-activation` are the config-layer
- * surfaces used to honour the host's global model profile (see
- * `applyConfiguredModelProfile`). They are lower-level than `/sdk`, so they are
- * more version-coupled — the trade accepted so config discovery stays GJC's
- * own concern (robust to config-path/schema changes) instead of hand-parsed.
+ * `config/model-profile-activation` is the config-layer surface used to honour
+ * the host's model profile (see `applyConfiguredModelProfile`). It is
+ * lower-level than `/sdk`, so it is more version-coupled — the trade accepted
+ * so config discovery stays GJC's own concern (robust to config-path/schema
+ * changes) instead of hand-parsed. Settings themselves come from the created
+ * session (`session.settings`), already scoped to the session's cwd, so no
+ * separate settings loader is imported.
  */
 async function loadCanonicalSdk() {
   const [
     { createAgentSession },
     { SessionManager },
-    { Settings },
     { activateModelProfile },
   ] = await Promise.all([
     import("@gajae-code/coding-agent/sdk"),
     import("@gajae-code/coding-agent/session/session-manager"),
-    import("@gajae-code/coding-agent/config/settings"),
     import("@gajae-code/coding-agent/config/model-profile-activation"),
   ]);
-  return { createAgentSession, SessionManager, Settings, activateModelProfile };
+  return { createAgentSession, SessionManager, activateModelProfile };
 }
 
 export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
-  const { createAgentSession, SessionManager, Settings, activateModelProfile } =
+  const { createAgentSession, SessionManager, activateModelProfile } =
     await loadSdk();
   const sessionManager = SessionManager.create(
     workDir,
     join(workDir, ".gjc-remote-session")
   );
   const { session } = await createAgentSession({ cwd: workDir, sessionManager });
-  await applyConfiguredModelProfile(session, { Settings, activateModelProfile });
+  try {
+    await applyConfiguredModelProfile(session, { activateModelProfile });
+  } catch (error) {
+    // The raw AgentSession is not yet owned by an SdkSession/SessionPool, so
+    // dispose it here to avoid leaking the underlying runtime on a failed
+    // activation before propagating the failure.
+    await Promise.resolve()
+      .then(() => session.dispose())
+      .catch(() => {});
+    throw error;
+  }
   return new SdkSession(session);
 }
 
@@ -52,20 +62,19 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
  * commonly an unauthenticated model — so prompts return empty text under a
  * hidden `stopReason: "error"` (the "ok:true, hasText:false" silent failure).
  *
- * We delegate resolution to GJC's own `Settings` + `activateModelProfile` so
- * the daemon honours the exact global profile the host runs. `persistDefault`
- * is false: activation is in-memory for this session only and never mutates the
+ * Resolution is delegated to GJC's own `activateModelProfile`, reading the
+ * profile from `session.settings` — the session's own settings, already scoped
+ * to its cwd, so a project-level `modelProfile.default` override is honoured the
+ * same way the interactive GJC would in that directory. `persistDefault` is
+ * false: activation is in-memory for this session only and never mutates the
  * host's `config.yml`. A misconfigured/uncredentialed profile throws here
  * (e.g. `ModelProfileCredentialError`), which fails session creation loudly
  * instead of silently serving a broken session.
  *
  * `GJC_MODEL_PROFILE` overrides the configured profile name when set.
  */
-export async function applyConfiguredModelProfile(
-  session,
-  { Settings, activateModelProfile }
-) {
-  const settings = await Settings.init();
+export async function applyConfiguredModelProfile(session, { activateModelProfile }) {
+  const settings = session.settings;
   const configured = settings.get("modelProfile.default");
   const envOverride = (process.env.GJC_MODEL_PROFILE ?? "").trim();
   const profileName =
