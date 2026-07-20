@@ -106,8 +106,8 @@ try {
   // session never routed through activateModelProfile (the exact surface this
   // smoke exists to regression-guard on an SDK bump), so fail loudly.
   const skipWarnings = [
-    "no model profile configured",
-    "not a usable",
+    "gjc-remote daemon: no model profile configured",
+    "gjc-remote daemon: modelProfile.default is set but not a usable",
   ].filter((needle) => daemonOutput.includes(needle));
   if (skipWarnings.length > 0) {
     throw new Error(
