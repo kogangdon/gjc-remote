@@ -157,6 +157,18 @@ starts with Bun and embeds GJC in-process. The bot and Node built-in test runner
 remain Node-compatible. `bun.lock` is the committed dependency lockfile;
 `package-lock.json` is gitignored.
 
+The daemon imports GJC through the **canonical exports-map subpaths**
+(`@gajae-code/coding-agent/sdk` for `createAgentSession`,
+`@gajae-code/coding-agent/session/session-manager` for `SessionManager`) in
+`daemon/src/sdk-session.js`, not the package-root barrel. The barrel re-exports
+both symbols but drags the whole runtime graph (TUI/modes, browser/puppeteer
+tools) into the daemon process; the subpaths are the surfaces GJC's `exports`
+map + `verify:sdk-canonicalization` gate actually bless, so this both shrinks the
+daemon's loaded graph and rides the supported SDK surface rather than an
+incidental barrel re-export. The `createSdkSession(workDir, loadSdk)` seam is
+unchanged — tests still inject a fake `{ createAgentSession, SessionManager }`;
+only the default production loader was narrowed.
+
 ## Decided config values (don't re-ask the user these)
 
 - Idle GJC SDK session timeout: **1 hour** (`IDLE_TIMEOUT_MS` in
@@ -256,6 +268,19 @@ Use these rules for Telegram delivery:
    daemon-to-bot file transfer requires an explicit allowlisted protocol; the
    generated long-output and tool-log attachments remain supported because they
    are created in memory by the bot.
+
+## Merge / PR workflow
+
+When a review-pr-loop converges and the PR is merged **directly in the same
+session**, merge with a **merge commit** (GitHub "Create a merge commit"), not
+squash or rebase. Rationale: PRs #13/#15/#17/#19 landed as two-parent merge
+commits, but #20/#21/#22 were squash-merged, which produced single linear
+commits on `main` whose source branches then dangled beside the graph as
+non-ancestors (same changes, different commit identity) — visually "broken"
+history even though nothing was actually wrong. Staying on merge commits keeps
+the branch topology legible and the merged branch reachable as an ancestor
+(so `git branch -d` can verify-delete it later). Delete the source branch after
+merging. Reserve squash for cases the user explicitly asks for.
 
 ## Verification pattern to reuse
 
