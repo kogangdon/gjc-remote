@@ -4,6 +4,11 @@ import { createSdkSession } from "./sdk-session.js";
 import { validateNativeWorkDir } from "./work-dir.js";
 
 const SESSION_DISPOSE_TIMEOUT_MS = 5_000;
+// Session creation activates the host's model profile, which can touch the
+// credential store and model registry (potentially a network token exchange),
+// so it needs a far larger bound than teardown. Sharing the 5s dispose bound
+// made cold-host creations spuriously "time out" and churn create/dispose.
+const SESSION_CREATE_TIMEOUT_MS = 60_000;
 
 function normalizeCanonicalWorkDir(workDir, platform) {
   if (platform !== "win32") return workDir;
@@ -20,6 +25,7 @@ export class SessionPool {
     realpathSyncFn = realpathSync.native ?? realpathSync,
     platform = process.platform,
     sessionDisposeTimeoutMs = SESSION_DISPOSE_TIMEOUT_MS,
+    sessionCreateTimeoutMs = SESSION_CREATE_TIMEOUT_MS,
   } = {}) {
     /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
     this.sessions = new Map();
@@ -27,6 +33,7 @@ export class SessionPool {
     this.existsSyncFn = existsSyncFn;
     this.realpathSyncFn = realpathSyncFn;
     this.platform = platform;
+    this.sessionCreateTimeoutMs = sessionCreateTimeoutMs;
     this.sessionDisposeTimeoutMs = sessionDisposeTimeoutMs;
     this.closed = false;
     this.reapTimer = setInterval(() => {
@@ -49,17 +56,17 @@ export class SessionPool {
     }
     await Promise.all(disposals);
   }
-  async #settleBounded(operation) {
+  async #settleBounded(operation, timeoutMs) {
+    if (typeof timeoutMs !== "number") {
+      throw new TypeError("#settleBounded requires a numeric timeoutMs");
+    }
     let timer;
     const settlement = Promise.resolve(operation).then(
       (value) => ({ status: "fulfilled", value }),
       (reason) => ({ status: "rejected", reason })
     );
     const timeout = new Promise((resolve) => {
-      timer = setTimeout(
-        () => resolve({ status: "timed_out" }),
-        this.sessionDisposeTimeoutMs
-      );
+      timer = setTimeout(() => resolve({ status: "timed_out" }), timeoutMs);
     });
 
     const result = await Promise.race([settlement, timeout]);
@@ -68,7 +75,10 @@ export class SessionPool {
   }
 
   #disposeBounded(session) {
-    return this.#settleBounded(Promise.resolve().then(() => session.dispose()));
+    return this.#settleBounded(
+      Promise.resolve().then(() => session.dispose()),
+      this.sessionDisposeTimeoutMs
+    );
   }
 
   async #disposeIgnoringFailure(session, workDir, context) {
@@ -85,7 +95,7 @@ export class SessionPool {
 
   async #createSessionBounded(workDir) {
     const pending = Promise.resolve().then(() => this.sessionFactory(workDir));
-    const result = await this.#settleBounded(pending);
+    const result = await this.#settleBounded(pending, this.sessionCreateTimeoutMs);
     if (result.status === "fulfilled") return result.value;
     if (result.status === "rejected") throw result.reason;
 
@@ -167,7 +177,10 @@ export class SessionPool {
       entries.map(async ([workDir, entry]) => {
         const session = entry.session;
         if (!session && entry.creation) {
-          const creationResult = await this.#settleBounded(entry.creation);
+          const creationResult = await this.#settleBounded(
+            entry.creation,
+            this.sessionDisposeTimeoutMs
+          );
           if (creationResult.status === "timed_out") {
             console.error(`SessionPool: session creation wait timed out for ${workDir}`);
           }
