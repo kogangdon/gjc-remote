@@ -8,23 +8,100 @@ const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
  * runtime graph — TUI/modes and browser/puppeteer tools — into the daemon
  * process. `@gajae-code/coding-agent/sdk` and `.../session/session-manager`
  * are the exports-map-blessed subpaths for these symbols.
+ *
+ * `config/model-profile-activation` is the config-layer surface used to honour
+ * the host's model profile (see `applyConfiguredModelProfile`). It is
+ * lower-level than `/sdk`, so it is more version-coupled — the trade accepted
+ * so config discovery stays GJC's own concern (robust to config-path/schema
+ * changes) instead of hand-parsed. Settings themselves come from the created
+ * session (`session.settings`), already scoped to the session's cwd, so no
+ * separate settings loader is imported.
  */
 async function loadCanonicalSdk() {
-  const [{ createAgentSession }, { SessionManager }] = await Promise.all([
+  const [
+    { createAgentSession },
+    { SessionManager },
+    { activateModelProfile },
+  ] = await Promise.all([
     import("@gajae-code/coding-agent/sdk"),
     import("@gajae-code/coding-agent/session/session-manager"),
+    import("@gajae-code/coding-agent/config/model-profile-activation"),
   ]);
-  return { createAgentSession, SessionManager };
+  return { createAgentSession, SessionManager, activateModelProfile };
 }
 
 export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
-  const { createAgentSession, SessionManager } = await loadSdk();
+  const { createAgentSession, SessionManager, activateModelProfile } =
+    await loadSdk();
   const sessionManager = SessionManager.create(
     workDir,
     join(workDir, ".gjc-remote-session")
   );
   const { session } = await createAgentSession({ cwd: workDir, sessionManager });
+  try {
+    await applyConfiguredModelProfile(session, { activateModelProfile });
+  } catch (error) {
+    // The raw AgentSession is not yet owned by an SdkSession/SessionPool, so
+    // dispose it here to avoid leaking the underlying runtime on a failed
+    // activation before propagating the failure.
+    await Promise.resolve()
+      .then(() => session.dispose())
+      .catch(() => {});
+    throw error;
+  }
   return new SdkSession(session);
+}
+
+/**
+ * Replicate the model-profile activation the interactive CLI runs at startup.
+ *
+ * Bare `createAgentSession` only reads an already-resolved `settings.model`; it
+ * does NOT expand `modelProfile.default` (a profile reference) into concrete
+ * role→model assignments. A host configured with a profile (and empty
+ * `modelRoles`) therefore falls through to the SDK's "first available" model —
+ * commonly an unauthenticated model — so prompts return empty text under a
+ * hidden `stopReason: "error"` (the "ok:true, hasText:false" silent failure).
+ *
+ * Resolution is delegated to GJC's own `activateModelProfile`, reading the
+ * profile from `session.settings` — the session's own settings, already scoped
+ * to its cwd, so a project-level `modelProfile.default` override is honoured the
+ * same way the interactive GJC would in that directory. `persistDefault` is
+ * false: activation is in-memory for this session only and never mutates the
+ * host's `config.yml`. A misconfigured/uncredentialed profile throws here
+ * (e.g. `ModelProfileCredentialError`), which fails session creation loudly
+ * instead of silently serving a broken session.
+ *
+ * `GJC_MODEL_PROFILE` overrides the configured profile name when set.
+ */
+export async function applyConfiguredModelProfile(session, { activateModelProfile }) {
+  const settings = session.settings;
+  const configured = settings.get("modelProfile.default");
+  const envOverride = (process.env.GJC_MODEL_PROFILE ?? "").trim();
+  const profileName =
+    envOverride || (typeof configured === "string" ? configured.trim() : "");
+
+  if (!profileName) {
+    console.warn(
+      "gjc-remote daemon: no model profile configured " +
+        "(modelProfile.default / GJC_MODEL_PROFILE); the SDK default model may " +
+        "be unauthenticated and return empty responses."
+    );
+    return;
+  }
+
+  try {
+    await activateModelProfile(
+      { session, modelRegistry: session.modelRegistry, settings, profileName },
+      { persistDefault: false }
+    );
+  } catch (error) {
+    throw new Error(
+      `gjc-remote daemon: failed to activate model profile "${profileName}": ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error }
+    );
+  }
 }
 
 /**
