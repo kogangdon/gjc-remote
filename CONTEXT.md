@@ -318,3 +318,27 @@ await s.send({ type: "prompt", message: "reply with exactly: X" }, e => events.p
 console.log(events.find(e => e.type === "agent_end"));
 await pool.shutdown();
 ```
+
+## Capability layer is a process-global NOT isolated by the per-session Settings clone (upstream)
+
+The per-workDir `Settings` clone (above) isolates model roles, but the SDK's
+`capability/index.ts` keeps `disabledProviders` (module-global `Set`, src line
+40) and its `settings` ref (line 43) as **process-global** state. Every
+`createAgentSession` runs `initializeWithSettings(settings)`
+(`sdk/session.ts:1060-1062`) which `disabledProviders.clear()` + repopulates
+from that session's settings — **last-created session wins process-wide**.
+`filterProviders` (line 210-211) reads this global to filter which
+skills/rules/tools/MCP/hooks/context-files load, so an earlier live session can
+resolve capabilities under a later session's disable-set. Probe confirmed
+(0.11.4): create A(`disabledProviders:["prov-A-only"]`) then
+B(`["prov-B-only"]`) → `getDisabledProviders()` returns B's set and
+`isProviderEnabled("prov-A-only")===true` (A's intent lost), while
+`a.settings.get("disabledProviders")` stays correct — only the capability
+module-global diverges. **Cannot be fixed by `cloneForCwd`** (clone isolates
+Settings, not the SDK's separate capability global). Impact is LOW for typical
+gjc-remote hosts where `disabledProviders` is global-only (every writer writes
+the same value); it only bites with divergent per-workDir project overrides +
+concurrent sessions. Decision: no local mitigation (any per-prompt
+re-`initializeWithSettings` would be racy and reach below `/sdk`); tracked
+upstream at **Yeachan-Heo/gajae-code#2774** with repro + suggested fix (thread
+active `Settings` through capability load instead of a module global).
