@@ -251,10 +251,15 @@ Use these rules for Telegram delivery:
    Shared/production deployment must also set
    `GJC_REMOTE_REQUIRE_ALLOWLIST=1`; local unrestricted mode remains available
    only for backward-compatible development and emits a startup warning.
-4. **Linux/macOS daemon path unverified.** Everything was built and tested on
-   native Windows (this repo's origin host). The Bun embedding SDK path avoids
-   socket and tmux dependencies but has not actually been run on Linux/macOS
-   yet. Run the real local smoke first on each additional platform.
+4. **Linux verified; macOS daemon path still unverified.** Built on native
+   Windows (this repo's origin host). 2026-07-25: real local smoke passed on
+   WSL2 Ubuntu 24.04 (Bun 1.3.14, repo cloned to native ext4 `~/gjc-remote`,
+   Windows `~/.gjc/agent` config + auth DBs copied to WSL `~/.gjc/agent`) —
+   `SMOKE_OK`, protocol v1, profile activation against real Copilot creds.
+   Two useful fail-fast modes observed en route: no config → "No model
+   selected"; profile without credentials → "requires credentials for:
+   github-copilot". macOS remains unverified; run `npm run smoke:local` there
+   before relying on it.
 5. **No process supervision configured** — `README.md` mentions pm2/systemd
    as options but nothing is set up. Bot and each daemon currently need to
    be started manually.
