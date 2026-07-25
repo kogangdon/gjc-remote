@@ -58,6 +58,22 @@ cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bo
 npm run start --workspace=daemon
 ```
 
+## Provider authentication (e.g. GitHub Copilot)
+
+Browser/device OAuth flows cannot be driven through the Discord bridge, so
+provider auth is done once directly on each daemon host:
+
+```bash
+# On each daemon host, run interactive GJC and log in:
+gjc
+# then inside the session:
+/login github-copilot
+```
+
+The saved token in `~/.gjc` is reused by every SDK session the daemon creates.
+Once authenticated, that provider's models appear in `/model` resolution and can
+be selected via exact `provider:modelId` or a unique name/ID fragment.
+
 Each `channels.json` route must contain exactly `hostId` and `workDir`.
 `hostId` must have a matching `HOST_TOKENS` entry, and `workDir` must be a
 fully-qualified path native to that daemon host (for example,
