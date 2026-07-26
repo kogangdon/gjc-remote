@@ -110,6 +110,59 @@ comes back through the relay. When `SMOKE_MODEL_QUERY` is set, it also performs
 a real model switch and requires a `model_resolved` receipt. It does not require
 Discord credentials.
 
+## Operations
+
+### Process supervision
+
+Neither component daemonizes itself; run each under a supervisor that restarts
+on exit. Both handle `SIGINT`/`SIGTERM` gracefully, so plain signal-based stop
+commands are safe:
+
+- **bot** closes the host WS registry first (in-flight invokes settle, daemons
+  observe a clean socket close), then destroys the Discord client. Each step is
+  bounded by a 10s timeout, so a hung dependency cannot wedge the stop.
+- **daemon** disposes its GJC SDK session pool (`pool.shutdown()`) before
+  exiting; stalled sessions are bounded by the pool's own timeouts.
+
+Examples:
+
+```bash
+# pm2 (bot host and/or daemon hosts)
+pm2 start npm --name gjc-remote-bot -- run start --workspace=bot
+pm2 start npm --name gjc-remote-daemon -- run start --workspace=daemon
+pm2 save
+
+# systemd (per-unit sketch; set WorkingDirectory to the repo root)
+# [Service]
+# WorkingDirectory=/srv/gjc-remote
+# ExecStart=/usr/bin/npm run start --workspace=daemon
+# Restart=on-failure
+# KillSignal=SIGTERM
+# TimeoutStopSec=30
+```
+
+On native Windows daemon hosts, use a service wrapper (e.g. NSSM or a
+Scheduled Task with restart-on-failure) around the same npm command. A daemon
+that dies reconnects on start with equal-jitter exponential backoff, so mass
+restarts do not thundering-herd the bot.
+
+### Rotation, retention, rollback
+
+- **Host tokens**: rotate by updating the daemon's `HOST_TOKEN` and the bot's
+  matching `HOST_TOKENS` entry, then restarting both; tokens are read at
+  startup only. Rotate per host if one is compromised.
+- **Discord authorization** (`GJC_BOT_ALLOWED_USERS`,
+  `GJC_REMOTE_REQUIRE_ALLOWLIST`): startup-only; restart the bot after changes.
+- **`channels.json`**: hot-reloaded on save. An invalid reload keeps the last
+  valid map (rollback is automatic); fix the file and save again.
+- **Tool logs**: kept in bot memory only — at most 100 entries, each expiring
+  1 hour after creation. Nothing is written to disk; no cleanup needed.
+- **Session history**: each daemon workDir persists GJC session history under
+  `<workDir>/.gjc-remote-session`; idle in-process sessions are disposed after
+  1 hour. Delete that directory to reset a project's remote history.
+- **Process logs**: both components log to stdout/stderr; retention is the
+  supervisor's job (`pm2 install pm2-logrotate`, or journald's defaults).
+
 ## Security notes
 
 - `bot/`'s WS port only needs to be reachable from daemon hosts on your
