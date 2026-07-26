@@ -12,9 +12,9 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@gajae-code/coding-agent": "0.11.4",
+    "@gajae-code/coding-agent": "0.11.10",
+    "@gjc-remote/shared": "*",
     "dotenv": "^16.4.5",
-    "ws": "^8.18.0",
-    "@gjc-remote/shared": "*"
+    "ws": "^8.18.0"
   }
 }
