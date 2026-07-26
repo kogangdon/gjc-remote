@@ -152,7 +152,7 @@ current transport lives in `daemon/src/sdk-session.js`.
 
 ## Runtime: Bun vs Node
 
-`@gajae-code/coding-agent` 0.11.4 requires Bun 1.3.14 or newer, so the daemon
+`@gajae-code/coding-agent` 0.11.10 requires Bun 1.3.14 or newer, so the daemon
 starts with Bun and embeds GJC in-process. The bot and Node built-in test runner
 remain Node-compatible. `bun.lock` is the committed dependency lockfile;
 `package-lock.json` is gitignored.
@@ -335,8 +335,8 @@ from that session's settings — **last-created session wins process-wide**.
 `filterProviders` (line 210-211) reads this global to filter which
 skills/rules/tools/MCP/hooks/context-files load, so an earlier live session can
 resolve capabilities under a later session's disable-set. Probe confirmed
-(0.11.4): create A(`disabledProviders:["prov-A-only"]`) then
-B(`["prov-B-only"]`) → `getDisabledProviders()` returns B's set and
+(0.11.4, re-confirmed 0.11.10): create A(`disabledProviders:["prov-A-only"]`)
+then B(`["prov-B-only"]`) → `getDisabledProviders()` returns B's set and
 `isProviderEnabled("prov-A-only")===true` (A's intent lost), while
 `a.settings.get("disabledProviders")` stays correct — only the capability
 module-global diverges. **Cannot be fixed by `cloneForCwd`** (clone isolates
@@ -347,3 +347,25 @@ concurrent sessions. Decision: no local mitigation (any per-prompt
 re-`initializeWithSettings` would be racy and reach below `/sdk`); tracked
 upstream at **Yeachan-Heo/gajae-code#2774** with repro + suggested fix (thread
 active `Settings` through capability load instead of a module global).
+Upstream status: closed 2026-07-22 via their PR #2865 merged into `dev`
+(`c2ca200`), but the fix is NOT in the 0.11.10 npm release — the probe above
+still reproduces on 0.11.10. Re-probe on the next version bump.
+
+## Windows owner-only session storage constraint (found during 0.11.10 bump)
+
+The SDK's managed session storage applies fail-closed "owner-only" security
+(`@gajae-code/natives` `applyOwnerOnlyPathSecurity`) to `<workDir>/
+.gjc-remote-session`. On this Windows host it fails with `owner_mismatch` for
+workDirs under `E:/` and `C:/tmp` even though `dir /q` shows the same user as
+owner, while workDirs under `C:/Users/<user>/` succeed (`~/.gjc/agent/sessions`
+verifies ok). Reproduced identically on SDK 0.11.4 and 0.11.10 — an
+environment/native-check trait, not a bump regression (earlier E:-drive smoke
+passes predate wiping `.gjc-remote-session`; a fresh apply on those volumes
+fails). Practical rule: **on Windows hosts, configure channel workDirs under
+the daemon user's profile directory**, or investigate the native ownership
+check before mapping other volumes. `SMOKE_WORK_DIR`/`SMOKE_WORK_DIR_2` must
+also point inside the profile on this machine.
+
+Also note: `SMOKE_MODEL_QUERY=sol` is now ambiguous (Copilot also ships
+`gpt-5.6-sol`); the resolver fail-closes with both candidates as designed. Use
+the exact `openai-codex:gpt-5.6-sol`.
