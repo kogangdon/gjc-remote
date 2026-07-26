@@ -354,8 +354,9 @@ still reproduces on 0.11.10. Re-probe on the next version bump.
 ## Windows owner-only session storage constraint (found during 0.11.10 bump)
 
 The SDK's managed session storage applies fail-closed "owner-only" security
-(`@gajae-code/natives` `applyOwnerOnlyPathSecurity`) to `<workDir>/
-.gjc-remote-session`. On this Windows host it fails with `owner_mismatch` for
+(`@gajae-code/natives` `applyOwnerOnlyPathSecurity`) to
+`<workDir>/.gjc-remote-session`. On this Windows host it fails with
+`owner_mismatch` for
 workDirs under `E:/` and `C:/tmp` even though `dir /q` shows the same user as
 owner, while workDirs under `C:/Users/<user>/` succeed (`~/.gjc/agent/sessions`
 verifies ok). Reproduced identically on SDK 0.11.4 and 0.11.10 — an
