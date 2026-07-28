@@ -2,6 +2,14 @@
 
 Discord-controlled remote GJC sessions.
 
+> **⚠️ Security: this grants remote code execution.** A mapped Discord channel
+> runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
+> Keep `bot/`'s WebSocket port on a private network, treat host tokens like
+> passwords, and set `GJC_BOT_ALLOWED_USERS` to your own Discord user ID(s). The
+> bot ships fail-closed (`GJC_REMOTE_REQUIRE_ALLOWLIST=1`) and refuses to start
+> with an empty allowlist. See [SECURITY.md](SECURITY.md) before exposing it to
+> anyone else.
+
 ## Architecture
 
 ```
@@ -55,7 +63,9 @@ bun install   # installs all workspaces (bot, daemon, shared) from bun.lock
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
-# For shared/production deployments, set GJC_REMOTE_REQUIRE_ALLOWLIST=1.
+# Fill GJC_BOT_ALLOWED_USERS with your Discord user ID(s): the bot ships
+# fail-closed (GJC_REMOTE_REQUIRE_ALLOWLIST=1) and refuses to start otherwise.
+# Set GJC_REMOTE_REQUIRE_ALLOWLIST=0 ONLY for isolated local testing.
 bun run --filter '@gjc-remote/bot' register    # publish slash commands to Discord
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
 bun run --filter '@gjc-remote/bot' start
@@ -230,9 +240,11 @@ restarts do not thundering-herd the bot.
   inviting the bot to any shared server — an unrestricted bot lets anyone in
   the channel run arbitrary GJC workflows (file writes, bash, etc.) on your
   hosts.
-  Set `GJC_REMOTE_REQUIRE_ALLOWLIST=1` for shared/production deployments so the
-  bot refuses to start with an empty allowlist. Both authorization settings are
-  startup-only and require a bot restart after changes.
+  `GJC_REMOTE_REQUIRE_ALLOWLIST` ships as `1` (fail-closed): the bot refuses to
+  start with an empty allowlist. Override to `0` only for isolated local
+  testing, which lets anyone in a mapped channel run arbitrary GJC workflows.
+  Both authorization settings are startup-only and require a bot restart after
+  changes.
 - Invalid `channels.json`, `HOST_TOKENS`, allowed-user entries, or strict
   allowlist flags fail before routing starts. Every mapped `hostId` must have a
   configured token. A failed `channels.json` reload keeps the last valid map.
