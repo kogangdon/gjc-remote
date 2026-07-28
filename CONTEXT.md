@@ -234,20 +234,49 @@ Use these rules for Telegram delivery:
   widths break visual alignment easily.
 ## What is NOT done yet (pick up here)
 
-1. **Real Discord wiring never run end-to-end.** The non-Discord relay path is
-   covered by `npm run smoke:local`, which starts a local `HostRegistry`, starts
-   `daemon/src/daemon.js` under Bun, sends a prompt through a real embedded GJC
-   SDK session, and asserts the assistant text returned through the bot relay.
-   Actually registering slash commands and running `bot/src/bot.js` against a
-   real Discord application + real `DISCORD_TOKEN` has not happened.
-2. **`channels.json` does not exist yet** (gitignored, copy from
-   `channels.example.json`) — needs real Discord channel IDs once a server
-   exists.
-3. **`GJC_BOT_ALLOWED_USERS` allowlisting** — implemented in `bot.js` but
-   never actually exercised against a real Discord guild. Must be set
-   before inviting the bot anywhere shared (unrestricted = anyone in-channel
-   can run arbitrary GJC workflows — file writes, bash, etc. — on every
-   connected host).
+1. **Real Discord E2E: first manual canary passed 2026-07-28; formal evidence
+   table still pending.** The non-Discord relay path stays covered by
+   `npm run smoke:local` (local `HostRegistry` + `daemon/src/daemon.js` under Bun
+   + real embedded GJC SDK session, asserting relayed assistant text). On
+   2026-07-28 the bot was additionally run for real: `bot/src/bot.js` with
+   registered slash commands against a real Discord application/`DISCORD_TOKEN`
+   and a private test guild, driving a live Windows daemon. Manually exercised
+   and observed (operator-driven, screenshot evidence — NOT an automated or
+   repeatable test):
+   - **Authorization** allow + deny across all three entry paths: slash command
+     (ephemeral `You are not authorized to run GJC commands.`), mapped plain chat
+     (silent deny), tool-log button (ephemeral deny). Strict
+     `GJC_REMOTE_REQUIRE_ALLOWLIST=1` boots with a non-empty allowlist and denies
+     everyone else.
+   - **Routing/failure matrix**: `/hosts` online (`Online: test`) / offline
+     (`No hosts connected.`); unmapped channel (slash = mapping-missing
+     ephemeral, chat = silent); offline daemon (`Host 'test' is not connected
+     right now.`); nonexistent workDir (`workDir does not exist on this host: …`
+     surfaced from the daemon `existsSync` check); mid-flight daemon kill
+     (`host 'test' disconnected`, partial tool-log preserved); daemon reconnect
+     restoring `Online: test`. `channels.json` hot-reload (no bot restart) also
+     confirmed via the E-test re-map.
+   - **Rendering**: live progress edit + tool-call preview, tool-log button,
+     message chunking (`Part N/M`), large-output attachment (`gjc-output.md`),
+     and button expiry after a bot restart (`Tool log is no longer available.`,
+     the store is bot-process memory so a restart clears it).
+   Caveats / still open: this was **manual** (no reproducible harness); it ran
+   against the **live repo as workDir** (`D:/dev/gjc-remote`), NOT a disposable
+   workDir — a relayed prompt wrote `rep_gen.py`/`rep_out.txt` into the repo,
+   demonstrating that an authorized user gets the daemon OS account's write/exec
+   authority (artifacts cleaned up afterward). `timeout` and too-many-in-flight
+   were not manually triggered (unit-covered only), and the formal pass/fail
+   table issue #2 asks for (versions, timestamps, command-registration receipt,
+   sanitized logs, rollback procedure) has NOT been produced.
+2. **`channels.json` exists on this host** (still gitignored; copy from
+   `channels.example.json` elsewhere) — configured with the test guild's real
+   channel IDs mapped to `{hostId: "test", workDir}` for the 2026-07-28 canary.
+   A fresh deployment still needs its own real channel IDs.
+3. **`GJC_BOT_ALLOWED_USERS` allowlisting — manually verified 2026-07-28** against
+   the real test guild (allow + deny across all three entry paths, plus
+   strict-mode boot with a non-empty allowlist). Still must be set before
+   inviting the bot anywhere shared (unrestricted = anyone in-channel can run
+   arbitrary GJC workflows — file writes, bash, etc. — on every connected host).
    Shared/production deployment must also set
    `GJC_REMOTE_REQUIRE_ALLOWLIST=1`; local unrestricted mode remains available
    only for backward-compatible development and emits a startup warning.
@@ -264,9 +293,10 @@ Use these rules for Telegram delivery:
    as options but nothing is set up. Bot and each daemon currently need to
    be started manually.
 6. **`/hosts` and progress-streaming (tool-call preview during a running
-   command) are implemented but unverified against real Discord** — only the
-   underlying `HostRegistry`/SDK session plumbing they depend on has been
-   tested.
+   command) — manually verified 2026-07-28** against the real test guild (see
+   item 1: `/hosts` online/offline, live progress edit + tool-call preview
+   during a running prompt). Underlying `HostRegistry`/SDK session plumbing
+   remains unit-tested.
 7. **Remote host files are not attached automatically.** Assistant output may
    contain absolute paths from the daemon host, but the Discord bot treats those
    paths as text. It never reads matching paths from the bot host. A future
