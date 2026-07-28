@@ -169,6 +169,72 @@ incidental barrel re-export. The `createSdkSession(workDir, loadSdk)` seam is
 unchanged — tests still inject a fake `{ createAgentSession, SessionManager }`;
 only the default production loader was narrowed.
 
+## Concurrency model: single event loop, and the subprocess alternative (feasibility-confirmed, not implemented)
+
+**Current model — cooperative concurrency, NOT parallelism.** Every pooled
+`AgentSession` runs *in-process* inside the one daemon Bun process (see
+`session-pool.js` / `sdk-session.js`; `daemon/src` has no `spawn`/`child_process`/
+`--mode`). Multiple channels mapped to the same host therefore share **one JS
+event loop**. Two concurrent remote prompts (e.g. `gjc-remote` + `nk-jenkins`
+channels) do interleave and both make progress — live-observed: both workDirs'
+`.gjc-remote-session/*.jsonl` update within seconds of each other, and both
+resident-cache dirs carry the **same daemon PID** suffix (`…-<daemonPid>-1`,
+`…-<daemonPid>-2`), proving distinct SDK sessions coexisting in one process.
+
+Constraint that follows:
+- **No true CPU parallelism.** Sessions advance only while one is `await`-ing
+  I/O (LLM calls, tool child-processes). A long *synchronous* CPU stretch on the
+  main thread stalls every other session until it yields. Fine while work is
+  I/O-bound; degrades under CPU-bound load.
+- **Per-session FIFO** serialization is intentional (prompt/model ops; see
+  Architecture §2). Cross-session there is no scheduling lock — independent.
+- **Cross-session state bleed** is the two documented process-globals, not the
+  scheduler: Settings singleton (mitigated by `cloneForCwd`, see that section)
+  and the capability module-global (NOT mitigated; last-created wins;
+  upstream #2774 / gajae-code#2865, still reproduces on 0.11.10).
+
+**Subprocess alternative — feasible, and the SDK already ships the transport.**
+Confirmed against installed `@gajae-code/coding-agent` (asked 2026-07-28):
+- `gjc` is a spawnable bin. The CLI exposes `--mode=acp` (`src/cli.ts`:
+  `mode: Flags.string({ options: ["text","json","acp"] })`) plus a dedicated
+  `gjc acp` subcommand.
+- `src/modes/acp/acp-mode.ts` `runAcpMode()` drives an `AgentSideConnection`
+  over **ndjson on stdin/stdout** via `@agentclientprotocol/sdk`
+  (`ndJsonStream(process.stdout, process.stdin)`). ACP (Agent Client Protocol)
+  is the editor-standard "drive an agent session as a subprocess over stdio" —
+  exactly this use case, no new protocol needed.
+- Precedent: the daemon *used to* run subprocess RPC (see Implementation
+  findings — deleted `rpc-client.js`/`RpcSession`, "formerly provided by the RPC
+  transport"). The `SdkSession` adapter is already shaped as a swappable
+  command/event transport, so a subprocess route replaces only the in-process
+  `createAgentSession` seam.
+
+Two routes if pursued:
+- **A — `gjc --mode=acp` per session** (standard). Reuses ACP; must map our
+  invoke/set_model/steer/follow_up onto ACP session/prompt + its permission
+  model (`modes/acp/permission-mode.ts`, `terminal-auth.ts`).
+- **B — `Bun.spawn` custom worker per session** (Bun↔Bun `ipc`). Worker imports
+  the SDK and runs one session; relays today's `SdkSession` invoke/event
+  interface unchanged. No ACP mapping; you own the harness.
+
+Both buy **true parallelism** (N OS processes, N event loops) and **full state
+isolation** (dissolves the capability-global caveat). Costs — this re-pays what
+the in-process migration deliberately removed:
+- **Memory**: one full gjc runtime per session (interactive `gjc` observed ~465
+  MB) vs. one shared runtime today → ≈ N×hundreds-MB.
+- **Cold start**: spawn + ACP handshake + model-profile activation per session
+  (profile activation is why `SESSION_CREATE_TIMEOUT_MS` is 60s).
+- **Lifecycle**: idle reap becomes process-kill not object-dispose; child
+  crash/zombie reaping; re-apply payload cap + backpressure at the stdio edge.
+- **Version drift**: a `GJC_BIN`-spawned child uses the on-PATH gjc, which can
+  differ from the daemon's imported SDK (note the existing pin-0.11.10 vs
+  installed-0.11.4 gap) — independent upgrades (pro) but two versions to track
+  (con).
+
+**Status: feasibility only.** No route chosen, nothing implemented. The real
+question is not "can we" (yes) but "is parallelism + full isolation worth
+re-paying the memory/complexity the team dropped by going in-process?"
+
 ## Decided config values (don't re-ask the user these)
 
 - Idle GJC SDK session timeout: **1 hour** (`IDLE_TIMEOUT_MS` in

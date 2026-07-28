@@ -40,23 +40,47 @@ Discord-controlled remote GJC sessions.
    commands while its daemon is connected — turning the daemon off makes that
    channel's commands fail fast instead of hanging.
 
+**Concurrency limits.** All sessions on a host share one daemon process and one
+JS event loop: concurrent prompts on different workDirs interleave cooperatively
+but do not run in true parallel, and a long synchronous stretch in one session
+can briefly stall the others. See `CONTEXT.md` → "Concurrency model: single event
+loop, and the subprocess alternative" for the full model and the subprocess
+option (tracked in #33).
+
 ## Setup
 
 ```bash
-npm install   # installs both workspaces (bot, daemon, shared)
+bun install   # installs all workspaces (bot, daemon, shared) from bun.lock
 
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
 # For shared/production deployments, set GJC_REMOTE_REQUIRE_ALLOWLIST=1.
-npm run register --workspace=bot    # publish slash commands to Discord
+bun run --filter '@gjc-remote/bot' register    # publish slash commands to Discord
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
-npm run start --workspace=bot
+bun run --filter '@gjc-remote/bot' start
 
 # On each machine you want to control (requires Bun 1.3.14 or newer):
 cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bot's HOST_TOKENS), BOT_WS_URL
-npm run start --workspace=daemon
+bun run --filter '@gjc-remote/daemon' start
 ```
+
+Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
+daemon runs on Bun (>=1.3.14) and embeds `@gajae-code/coding-agent` **0.11.10**
+(pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
+exactly that version, and the interactive `gjc` used for provider login (below)
+should match it. The bot, `register`, and the smoke harness run on Node via their
+package scripts, so keep Node available on the bot host — or add `--bun` to
+`bun run` to execute those Node scripts under Bun instead.
+
+**Optional environment variables** — beyond the required keys above:
+
+- **bot** — `DISCORD_GUILD_ID` registers slash commands to a single guild for
+  instant propagation (global registration can take up to ~1h to appear);
+  `GJC_REMOTE_DEBUG=1` logs Discord interaction lifecycle and relayed GJC event
+  summaries; `CHANNELS_CONFIG` overrides the `channels.json` path.
+- **daemon** — `HOST_LABEL` sets a human-readable name shown in the bot's connect
+  logs; `GJC_MODEL_PROFILE` overrides the activated model profile.
 
 ## Provider authentication (e.g. GitHub Copilot)
 
@@ -80,6 +104,14 @@ fully-qualified path native to that daemon host (for example,
 `C:/projects/foo` on Windows or `/srv/apps/foo` on Linux/macOS). Relative paths
 and extra route fields are rejected.
 
+**Windows hosts:** the SDK applies fail-closed owner-only security to each
+session's `<workDir>/.gjc-remote-session` storage. On Windows this can fail with
+`owner_mismatch` for workDirs outside the daemon user's profile directory
+(observed on `E:/` and `C:/tmp`), which aborts session creation. Configure
+Windows channel workDirs under the daemon user's profile (for example
+`C:/Users/<user>/projects/foo`), or verify the native ownership check before
+mapping other volumes.
+
 `/model` accepts an exact `provider:modelId` (for example,
 `openai-codex:gpt-5.6-sol`) or an unqualified model ID/display-name fragment.
 Unqualified input is accepted only when it has one uniquely best match;
@@ -95,13 +127,26 @@ name. A profile that cannot be activated (for example, missing provider
 credentials) fails session creation loudly rather than silently returning empty
 responses.
 
+## Output & tool logs
+
+GJC output reaches the channel as follows (`bot/src/delivery.js`):
+
+- Responses up to ~1900 characters post as a single message.
+- Longer output is split into sequential messages labelled `(Part i/N)`, up to
+  7 parts (~600ms apart, with code fences kept intact across the split).
+- Output that would exceed 7 parts posts as a short notice plus the full text as
+  an in-memory `.md` file attachment — nothing is written to the bot's disk.
+- Results that carry tool activity attach a button that expands the tool-call
+  log on demand. Tool logs live in bot memory only: at most 100 entries, each
+  expiring 1 hour after creation (`bot/src/tool-log-store.js`).
+
 ## Verification
 
 ```bash
-npm run smoke:local
+bun run smoke:local
 # Also verify model resolution and its structured success receipt:
-SMOKE_MODEL_QUERY=sol npm run smoke:local   # POSIX shell
-# PowerShell: $env:SMOKE_MODEL_QUERY="sol"; npm run smoke:local
+SMOKE_MODEL_QUERY=sol bun run smoke:local   # POSIX shell
+# PowerShell: $env:SMOKE_MODEL_QUERY="sol"; bun run smoke:local
 ```
 
 `smoke:local` starts a local `HostRegistry`, starts a real Bun daemon, routes one
@@ -128,21 +173,21 @@ Examples:
 
 ```bash
 # pm2 (bot host and/or daemon hosts)
-pm2 start npm --name gjc-remote-bot -- run start --workspace=bot
-pm2 start npm --name gjc-remote-daemon -- run start --workspace=daemon
+pm2 start bun --name gjc-remote-bot -- run --filter '@gjc-remote/bot' start
+pm2 start bun --name gjc-remote-daemon -- run --filter '@gjc-remote/daemon' start
 pm2 save
 
 # systemd (per-unit sketch; set WorkingDirectory to the repo root)
 # [Service]
 # WorkingDirectory=/srv/gjc-remote
-# ExecStart=/usr/bin/npm run start --workspace=daemon
+# ExecStart=/usr/bin/env bun run --filter '@gjc-remote/daemon' start
 # Restart=on-failure
 # KillSignal=SIGTERM
 # TimeoutStopSec=30
 ```
 
 On native Windows daemon hosts, use a service wrapper (e.g. NSSM or a
-Scheduled Task with restart-on-failure) around the same npm command. A daemon
+Scheduled Task with restart-on-failure) around the same bun command. A daemon
 that dies reconnects on start with equal-jitter exponential backoff, so mass
 restarts do not thundering-herd the bot.
 
