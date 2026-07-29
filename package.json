@@ -5,7 +5,8 @@
   "description": "Discord-controlled remote GJC sessions: bot (Discord + WS relay server) + daemon (per-host WebSocket bridge with pooled GJC SDK sessions)",
   "type": "module",
   "scripts": {
-    "smoke:local": "node scripts/local-smoke.js"
+    "smoke:local": "node scripts/local-smoke.js",
+    "test": "npm run test --workspaces --if-present"
   },
   "workspaces": [
     "bot",
