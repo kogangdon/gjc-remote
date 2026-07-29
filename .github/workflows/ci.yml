@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # daemon/test/protocol-validation.test.js spawns a real `bun` child,
+      # so bun must be on PATH even though the test files run under node --test.
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # bun.lock is the committed lockfile (package-lock.json is gitignored),
+      # so install with bun rather than `npm ci`.
+      - run: bun install --frozen-lockfile
+
+      - run: npm test
