@@ -21,6 +21,13 @@ import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
 import { ToolLogStore } from "./tool-log-store.js";
+import {
+  extractToolCall,
+  formatToolLog,
+  recordToolCall,
+  summarizeToolCalls,
+  truncate,
+} from "./tool-calls.js";
 
 import { createShutdown } from "./shutdown.js";
 
@@ -200,7 +207,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   let lastEdit = 0;
   const startedAt = Date.now();
   const toolCalls = [];
-  const seenToolCalls = new Set();
+  const toolCallIndex = new Map();
   let modelReceipt;
 
   let preview = "";
@@ -229,7 +236,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
       if (receipt) modelReceipt = receipt;
 
       const toolCall = extractToolCall(evt);
-      if (toolCall && recordToolCall(toolCalls, seenToolCalls, toolCall)) {
+      if (toolCall && recordToolCall(toolCalls, toolCallIndex, toolCall)) {
         debugRemote("tool-call", { requestLabel, name: toolCall.name, label: toolCall.label });
       }
 
@@ -306,65 +313,6 @@ function toolLogComponents(toolCalls) {
   ];
 }
 
-function formatToolLog(toolCalls) {
-  return toolCalls
-    .map((call, index) => {
-      const input = call.input === undefined ? "" : `\n\`\`\`json\n${JSON.stringify(call.input, null, 2)}\n\`\`\``;
-      return `**${index + 1}. ${call.name}**${call.label ? ` — ${call.label}` : ""}${input}`;
-    })
-    .join("\n\n");
-}
-
-function summarizeToolCalls(toolCalls) {
-  return toolCalls
-    .slice(-5)
-    .map((call, index, recent) => {
-      const number = toolCalls.length - recent.length + index + 1;
-      const label = call.label ? ` ${truncate(call.label, 60)}` : "";
-      return `#${number} \`${call.name}\`${label}`;
-    })
-    .join("; ");
-}
-
-function recordToolCall(toolCalls, seenToolCalls, toolCall) {
-  const signature = toolCallSignature(toolCall);
-  if (seenToolCalls.has(signature)) return false;
-
-  seenToolCalls.add(signature);
-  toolCalls.push(toolCall);
-  return true;
-}
-
-function toolCallSignature(toolCall) {
-  if (toolCall.id) return JSON.stringify(["id", toolCall.id]);
-  if (toolCall.label) return JSON.stringify(["label", toolCall.name, toolCall.label]);
-  return JSON.stringify(["input", toolCall.name, toolCall.input]);
-}
-
-function extractToolCall(evt) {
-  if (evt?.type === "toolCall" && typeof evt.name === "string") return normalizeToolCall(evt);
-
-  const content = Array.isArray(evt?.message?.content) ? evt.message.content : [];
-  const call = content.find((part) => part?.type === "toolCall" && typeof part.name === "string");
-  return call ? normalizeToolCall(call) : undefined;
-}
-
-function normalizeToolCall(call) {
-  const input = call.input ?? call.arguments ?? call.args ?? call.parameters;
-  return {
-    id: call.id ?? call.toolCallId ?? call.callId,
-    name: call.name,
-    label: toolInputLabel(input),
-    input,
-  };
-}
-
-function toolInputLabel(input) {
-  if (!input || typeof input !== "object") return typeof input === "string" ? truncate(input, 80) : "";
-  const label = input._i ?? input.command ?? input.path ?? input.pattern ?? input.subject ?? input.name ?? input.action;
-  return typeof label === "string" ? label : "";
-}
-
 function extractAssistantText(evt) {
   const message = evt?.message ?? evt?.assistantMessageEvent?.message;
   if (message?.role !== "assistant") return "";
@@ -413,9 +361,6 @@ function loadChannelMap({ fatal }) {
   );
   if (fatal) process.exit(1);
   return result.map;
-}
-function truncate(text, maxLength) {
-  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
 
 function debugRemote(label, data) {
