@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<!--
+  Editable source for docs/architecture.en.png (rendered from this file).
+  Regenerate after edits (Chrome/Chromium headless, 1600x900 @ 1.25x DPR):
+    chrome --headless --hide-scrollbars --force-device-scale-factor=1.25 \
+      --window-size=1600,900 --screenshot=architecture.en.png architecture.en.html
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root{
+    --bg1:#0b1020; --bg2:#131a30;
+    --slate:#1b2340; --slate2:#222c52;
+    --line:#334066;
+    --indigo:#7c8cff; --teal:#35d0c0; --amber:#f2b45c; --violet:#c08cff;
+    --txt:#eaf0ff; --sub:#9fb0d6; --dim:#6f7fa8;
+  }
+  html,body{ background:var(--bg1); }
+  body{
+    width:1600px; height:900px;
+    font-family:'Segoe UI','Malgun Gothic',system-ui,sans-serif;
+    color:var(--txt); position:relative; overflow:hidden;
+    background:
+      radial-gradient(1200px 600px at 20% -10%, #182247 0%, transparent 60%),
+      radial-gradient(1000px 700px at 100% 120%, #10233a 0%, transparent 55%),
+      linear-gradient(160deg, var(--bg1), var(--bg2));
+  }
+  .grid{
+    position:absolute; inset:0;
+    background-image:
+      radial-gradient(rgba(120,140,255,.08) 1.2px, transparent 1.2px);
+    background-size:34px 34px; opacity:.5;
+  }
+  header{ padding:52px 70px 0; position:relative; z-index:2; }
+  .brand{ display:flex; align-items:center; gap:16px; }
+  .logo{
+    width:52px; height:52px; border-radius:14px;
+    background:linear-gradient(135deg,var(--indigo),var(--teal));
+    display:flex; align-items:center; justify-content:center;
+    font-weight:800; font-size:26px; color:#0b1020;
+    box-shadow:0 8px 30px rgba(124,140,255,.4);
+  }
+  h1{ font-size:44px; letter-spacing:-1px; font-weight:800; }
+  h1 span{ color:var(--teal); }
+  .tag{ margin-top:10px; color:var(--sub); font-size:20px; font-weight:500; }
+
+  .zones{ position:absolute; top:200px; left:70px; right:70px; display:flex; gap:26px; z-index:1; }
+  .zone{
+    flex:1; border:1px dashed var(--line); border-radius:22px;
+    padding:44px 30px 30px; position:relative; min-height:520px;
+    background:linear-gradient(180deg, rgba(30,40,74,.35), rgba(20,26,48,.15));
+  }
+  .zone.two{ flex:1.05; }
+  .zlabel{
+    position:absolute; top:-15px; left:26px;
+    background:var(--bg1); padding:2px 14px; border-radius:20px;
+    font-size:15px; color:var(--dim); border:1px solid var(--line);
+    letter-spacing:.5px; text-transform:uppercase; font-weight:600;
+  }
+
+  .flow{ display:flex; gap:0; align-items:stretch; position:relative; z-index:3; }
+  .node{
+    flex:1; border-radius:20px; padding:28px 24px;
+    background:linear-gradient(180deg,var(--slate2),var(--slate));
+    border:1px solid var(--line);
+    box-shadow:0 18px 40px rgba(0,0,0,.35);
+    position:relative;
+  }
+  .node .ico{
+    width:56px; height:56px; border-radius:14px; margin-bottom:18px;
+    display:flex; align-items:center; justify-content:center; font-size:30px;
+    background:rgba(255,255,255,.05); border:1px solid var(--line);
+  }
+  .n1 .ico{ box-shadow:inset 0 0 0 2px rgba(124,140,255,.5); }
+  .n2 .ico{ box-shadow:inset 0 0 0 2px rgba(53,208,192,.5); }
+  .n3 .ico{ box-shadow:inset 0 0 0 2px rgba(242,180,92,.5); }
+  .n4 .ico{ box-shadow:inset 0 0 0 2px rgba(192,140,255,.5); }
+  .node h3{ font-size:26px; font-weight:800; margin-bottom:4px; }
+  .node .path{ font-family:'Consolas',monospace; font-size:15px; color:var(--teal); margin-bottom:14px; }
+  .node p{ font-size:16px; color:var(--sub); line-height:1.5; }
+  .node .chips{ margin-top:16px; display:flex; flex-wrap:wrap; gap:7px; }
+  .chip{
+    font-size:12.5px; font-family:'Consolas',monospace;
+    background:rgba(124,140,255,.12); color:#b9c4ff;
+    border:1px solid rgba(124,140,255,.3); padding:3px 9px; border-radius:8px;
+  }
+  .chip.t{ background:rgba(53,208,192,.12); color:#8ef0e6; border-color:rgba(53,208,192,.3); }
+  .chip.a{ background:rgba(242,180,92,.12); color:#ffd9a0; border-color:rgba(242,180,92,.3); }
+
+  /* arrows between nodes */
+  .arrow{ width:118px; position:relative; display:flex; flex-direction:column; justify-content:center; align-items:center; }
+  .arrow .lbl{ font-size:13.5px; color:var(--sub); text-align:center; margin-bottom:8px; line-height:1.35; font-weight:600; }
+  .arrow .bar{
+    width:100%; height:3px; border-radius:3px; position:relative;
+    background:linear-gradient(90deg,var(--indigo),var(--teal));
+  }
+  .arrow .bar::after{
+    content:''; position:absolute; right:-2px; top:50%; transform:translateY(-50%);
+    border-left:12px solid var(--teal);
+    border-top:8px solid transparent; border-bottom:8px solid transparent;
+  }
+  .arrow .sub{ font-size:12px; color:var(--dim); margin-top:8px; font-family:'Consolas',monospace; }
+  .arrow.a2 .bar{ background:linear-gradient(90deg,var(--teal),var(--amber)); }
+  .arrow.a2 .bar::after{ border-left-color:var(--amber); }
+  .arrow.a3 .bar{ background:linear-gradient(90deg,var(--amber),var(--violet)); }
+  .arrow.a3 .bar::after{ border-left-color:var(--violet); }
+
+  footer{
+    position:absolute; bottom:34px; left:70px; right:70px; z-index:3;
+    display:flex; justify-content:space-between; align-items:center;
+    color:var(--dim); font-size:15px;
+  }
+  .foot-tags{ display:flex; gap:22px; }
+  .foot-tags b{ color:var(--sub); font-weight:600; }
+</style>
+</head>
+<body>
+  <div class="grid"></div>
+
+  <header>
+    <div class="brand">
+      <div class="logo">g</div>
+      <div>
+        <h1>gjc-<span>remote</span></h1>
+      </div>
+    </div>
+    <div class="tag">A bridge to control remote GJC sessions from Discord — one channel = one <code>{hostId, workDir}</code></div>
+  </header>
+
+  <div class="zones">
+    <div class="zone" style="flex:2.1"><span class="zlabel">always-on bot host · private network</span></div>
+    <div class="zone two" style="flex:2.15"><span class="zlabel">per-project machine (host)</span></div>
+  </div>
+
+  <div class="flow" style="position:absolute; top:270px; left:96px; right:96px;">
+    <div class="node n1">
+      <div class="ico">💬</div>
+      <h3>Discord</h3>
+      <div class="path">mapped channel</div>
+      <p>Plain chat in a mapped channel = a GJC prompt. Slash commands run skills.</p>
+      <div class="chips">
+        <span class="chip">/gjc</span><span class="chip">/model</span><span class="chip">/hosts</span>
+        <span class="chip">deep-interview</span><span class="chip">ralplan</span><span class="chip">team</span><span class="chip">ultragoal</span>
+      </div>
+    </div>
+
+    <div class="arrow a1">
+      <div class="lbl">prompt /<br>slash command</div>
+      <div class="bar"></div>
+      <div class="sub">allowlist auth</div>
+    </div>
+
+    <div class="node n2">
+      <div class="ico">🛡️</div>
+      <h3>bot/</h3>
+      <div class="path">WS server + Discord client</div>
+      <p>Registers &amp; routes slash commands, maps channel→{hostId, workDir}, keeps tool logs.</p>
+      <div class="chips">
+        <span class="chip t">host WS registry</span>
+        <span class="chip t">channels.json hot-reload</span>
+        <span class="chip t">64 in-flight invokes / host</span>
+      </div>
+    </div>
+
+    <div class="arrow a2">
+      <div class="lbl">authenticated<br>WebSocket (outbound)</div>
+      <div class="bar"></div>
+      <div class="sub">ping/pong 30s · 8MiB cap</div>
+    </div>
+
+    <div class="node n3">
+      <div class="ico">⚙️</div>
+      <h3>daemon/</h3>
+      <div class="path">per-host, outbound WS</div>
+      <p>Outbound connection to bot with a pre-shared token. Normalizes workDir to its real canonical path.</p>
+      <div class="chips">
+        <span class="chip a">HOST_TOKEN</span>
+        <span class="chip a">canonical workDir</span>
+        <span class="chip a">backoff reconnect</span>
+      </div>
+    </div>
+
+    <div class="arrow a3">
+      <div class="lbl">in-process<br>serialized per session</div>
+      <div class="bar"></div>
+      <div class="sub">steer · follow_up FIFO</div>
+    </div>
+
+    <div class="node n4">
+      <div class="ico">🧠</div>
+      <h3>GJC SDK</h3>
+      <div class="path">AgentSession per workDir</div>
+      <p>One session per (hostId, canonical workDir). Prompt/model ops serialized, auto-reaped after 1h idle.</p>
+      <div class="chips">
+        <span class="chip">modelProfile.default</span>
+        <span class="chip">idle 1h reap</span>
+        <span class="chip">persistent history</span>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <div>Result text streams back to Discord in reverse</div>
+    <div class="foot-tags">
+      <span><b>Install:</b> bun install</span>
+      <span><b>Run:</b> daemon = bun · bot = node</span>
+      <span><b>Verify:</b> npm run smoke:local</span>
+    </div>
+  </footer>
+</body>
+</html>

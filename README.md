@@ -12,6 +12,10 @@ Discord-controlled remote GJC sessions.
 
 ## Architecture
 
+[![gjc-remote architecture](docs/architecture.en.png)](docs/architecture.en.png)
+
+_Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.ko.png) — editable sources: [`docs/architecture.en.html`](docs/architecture.en.html), [`docs/architecture.ko.html`](docs/architecture.ko.html)._
+
 ```
 [host machine, per project]                    [always-on bot host, private network]
   GJC embedding SDK          <--in-process-->    daemon/  --WS(outbound)-->   bot/
