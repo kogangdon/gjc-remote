@@ -20,7 +20,7 @@ const ALIAS_WORK_DIR = process.platform === "win32" ? "C:/work/." : "/work/.";
 
 function createPool(overrides = {}) {
   return new SessionPool({
-    existsSyncFn: () => true,
+    statSyncFn: () => ({ isDirectory: () => true }),
     realpathSyncFn: () => WORK_DIR,
     ...overrides,
   });
@@ -80,14 +80,60 @@ test("replacement creation proceeds when closed-session disposal stalls", async 
   }
 });
 
+test("a workDir that resolves to a file is rejected before SDK session creation", async () => {
+  let factoryCalls = 0;
+  const pool = createPool({
+    statSyncFn: () => ({ isDirectory: () => false }),
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return new FakeSession();
+    },
+  });
+
+  try {
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error.message === `workDir is not a directory on this host: ${WORK_DIR}`
+    );
+    assert.equal(factoryCalls, 0);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("a nonexistent workDir is rejected before SDK session creation", async () => {
+  let factoryCalls = 0;
+  const pool = createPool({
+    statSyncFn: () => {
+      const error = new Error("ENOENT: no such file or directory");
+      error.code = "ENOENT";
+      throw error;
+    },
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return new FakeSession();
+    },
+  });
+
+  try {
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error.message === `workDir does not exist on this host: ${WORK_DIR}`
+    );
+    assert.equal(factoryCalls, 0);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
 test("canonical workDir aliases reuse one SDK session after filesystem revalidation", async () => {
   const factoryCalls = [];
-  let existsCalls = 0;
+  let statCalls = 0;
   let realpathCalls = 0;
   const pool = createPool({
-    existsSyncFn: () => {
-      existsCalls += 1;
-      return true;
+    statSyncFn: () => {
+      statCalls += 1;
+      return { isDirectory: () => true };
     },
     realpathSyncFn: () => {
       realpathCalls += 1;
@@ -104,7 +150,7 @@ test("canonical workDir aliases reuse one SDK session after filesystem revalidat
     const second = await pool.ensureSession(WORK_DIR);
 
     assert.strictEqual(second, first);
-    assert.equal(existsCalls, 2);
+    assert.equal(statCalls, 2);
     assert.equal(realpathCalls, 2);
     assert.deepEqual(factoryCalls, [WORK_DIR]);
   } finally {

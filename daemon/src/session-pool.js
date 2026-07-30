@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
 import { createSdkSession } from "./sdk-session.js";
 import { validateNativeWorkDir } from "./work-dir.js";
@@ -21,7 +21,7 @@ function normalizeCanonicalWorkDir(workDir, platform) {
 export class SessionPool {
   constructor({
     sessionFactory = createSdkSession,
-    existsSyncFn = existsSync,
+    statSyncFn = statSync,
     realpathSyncFn = realpathSync.native ?? realpathSync,
     platform = process.platform,
     sessionDisposeTimeoutMs = SESSION_DISPOSE_TIMEOUT_MS,
@@ -30,7 +30,7 @@ export class SessionPool {
     /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
     this.sessions = new Map();
     this.sessionFactory = sessionFactory;
-    this.existsSyncFn = existsSyncFn;
+    this.statSyncFn = statSyncFn;
     this.realpathSyncFn = realpathSyncFn;
     this.platform = platform;
     this.sessionCreateTimeoutMs = sessionCreateTimeoutMs;
@@ -111,8 +111,14 @@ export class SessionPool {
 
     const requestedWorkDir = validateNativeWorkDir(workDir, this.platform);
 
-    if (!this.existsSyncFn(requestedWorkDir)) {
+    let stat;
+    try {
+      stat = this.statSyncFn(requestedWorkDir);
+    } catch {
       throw new Error(`workDir does not exist on this host: ${requestedWorkDir}`);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`workDir is not a directory on this host: ${requestedWorkDir}`);
     }
 
     let canonicalWorkDir;
