@@ -1,0 +1,48 @@
+name: release
+
+# Cut a GitHub Release when a vX.Y.Z tag is pushed. The tag is produced locally
+# by `node scripts/release.js <version>` (bumps workspace versions in lockstep).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # daemon/test/protocol-validation.test.js spawns a real `bun` child, and
+      # the daemon loads the SDK from bun-executed TS source, so bun must be on
+      # PATH even though the *.test.js files run under node --test.
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - run: bun install --frozen-lockfile
+
+      # Fail closed if the pushed tag does not match the committed root version.
+      - name: Verify tag matches package version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      - run: npm test
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+
+      # npm publish is intentionally deferred: it will be added as a step here,
+      # gated on a repository NPM_TOKEN secret and an owned @gjc-remote npm org,
+      # publishing shared -> bot -> daemon once those are provisioned.
