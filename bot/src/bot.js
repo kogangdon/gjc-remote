@@ -207,12 +207,14 @@ async function handleAuthorizedMessage(message) {
     );
     if (result.ok) {
       await message.react("✅").catch(() => {});
-    } else {
-      await message
-        .reply(`Could not deliver your answer: ${result.error}`)
-        .catch(() => {});
+      return;
     }
-    return;
+    // #35: the gate is stale (e.g. the run already resumed without our answer, or
+    // the host dropped). Rather than swallow the user's message, fall through and
+    // treat it as an ordinary prompt.
+    console.warn(
+      `gjc-remote bot: stale gate answer for channel ${message.channelId}: ${result.error}; treating as a new prompt.`
+    );
   }
 
   if (!registry.isOnline(route.hostId)) {
@@ -276,6 +278,16 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   heartbeat.unref?.();
 
   let result;
+  // #35: the requestId of a gate this invoke raises, so the leaked-marker guard
+  // in `finally` only clears a marker THIS invoke owns (a concurrent invoke on
+  // the same channel must not have its live marker cross-deleted).
+  let ownedGateRequestId;
+  const trackedOnGate = onGate
+    ? (gate) => {
+        ownedGateRequestId = gate.requestId;
+        return onGate(gate);
+      }
+    : undefined;
   try {
     editProgress(true);
     result = await registry.invoke(
@@ -298,14 +310,19 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
         editProgress();
       },
       undefined,
-      onGate
+      trackedOnGate
     );
   } finally {
     clearInterval(heartbeat);
     // #35: an invoke never settles with a gate still pending, but guard against a
     // leaked marker (timeout/hard-cap mid-gate) so a later message is not
-    // misrouted as a stale answer.
-    if (channelId !== undefined) pendingGateByChannel.delete(channelId);
+    // misrouted as a stale answer. Only clear a marker this invoke owns.
+    if (channelId !== undefined && ownedGateRequestId !== undefined) {
+      const marker = pendingGateByChannel.get(channelId);
+      if (marker && marker.requestId === ownedGateRequestId) {
+        pendingGateByChannel.delete(channelId);
+      }
+    }
   }
   result = transformModelResult(command, result, modelReceipt);
 

@@ -7,6 +7,7 @@ import {
   applyConfiguredModelProfile,
   createSdkSession,
 } from "../src/sdk-session.js";
+import { V0_LIMITS, isGateRequestEvent } from "@gjc-remote/shared";
 
 class FakeAgentSession {
   constructor() {
@@ -1473,5 +1474,100 @@ test("adversarial: mapAnswerToGate — an empty-string answer passes through rat
   await session.answerGate("g-empty", "");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-empty", answer: "" }]);
+  await session.dispose();
+});
+test("#35 concurrency: the workflow-gate listener is registered once per session, not per run", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-one",
+    kind: "question",
+    context: { prompt: "Q" },
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 5_000,
+  });
+  const run = session.send({ type: "prompt", message: "a" }, () => {});
+  await gateDelay(0);
+
+  // Exactly ONE session-level listener — the old per-run design added a listener
+  // per #runPromptCommand, so a second concurrent run's listener fired on the same
+  // emit and self-rejected the pending gate with answer:null.
+  assert.equal(agent.gateEmitter.listeners.size, 1);
+  assert.equal(session.pendingGates.size, 1);
+  assert.deepEqual(agent.gateEmitter.resolveCalls, []);
+
+  const answered = await session.answerGate("g-one", "ok");
+  assert.equal(answered.ok, true);
+  await run;
+
+  // The subscription is session-scoped: it survives run completion and is only
+  // torn down on dispose (not per run).
+  assert.equal(agent.gateEmitter.listeners.size, 1);
+  await session.dispose();
+  assert.equal(agent.gateEmitter.listeners.size, 0);
+});
+
+test("#35 concurrency: answerGate resumes the OWNING run's idle controller", async () => {
+  // With a single shared controller slot a concurrent run could null/clobber it,
+  // so answering could not re-arm the parked run's idle timer. The per-entry
+  // controller must still resume the owning run.
+  const agent = new GatingAgentSession({
+    gate_id: "g-owner",
+    kind: "question",
+    context: { prompt: "Park here" },
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 5_000,
+  });
+  const parked = session.send({ type: "prompt", message: "a" }, () => {});
+  await gateDelay(0);
+  const entry = session.pendingGates.get("g-owner");
+  assert.ok(entry, "the parked run registered its gate");
+  assert.ok(entry.controller, "the entry captured the parked run's controller");
+
+  const resumeCalls = [];
+  const realResume = entry.controller.resumeAfterGate;
+  entry.controller.resumeAfterGate = (...args) => {
+    resumeCalls.push(args);
+    return realResume.apply(entry.controller, args);
+  };
+
+  const answered = await session.answerGate("g-owner", "ok");
+  assert.equal(answered.ok, true);
+  assert.equal(resumeCalls.length, 1, "the owning run's controller was resumed exactly once");
+  await parked;
+  await session.dispose();
+});
+
+test("#35 an oversized / unknown-kind gate is clamped so the bot's isGateRequestEvent still accepts it", async () => {
+  const hugePrompt = "P".repeat(V0_LIMITS.GATE_PROMPT + 500);
+  const hugeLabel = "L".repeat(V0_LIMITS.CHOICE_LABEL + 200);
+  const agent = new GatingAgentSession({
+    gate_id: "g-clamp",
+    kind: "totally-unknown-kind",
+    context: { prompt: hugePrompt },
+    options: [{ value: "a", label: hugeLabel }],
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 5_000,
+  });
+  const events = [];
+  const done = session.send({ type: "prompt", message: "hi" }, (evt) => events.push(evt));
+  await gateDelay(0);
+
+  const gateEvent = events.find((evt) => evt.type === "gate_request");
+  assert.ok(gateEvent, "a gate_request event was emitted");
+  assert.equal(gateEvent.kind, "question", "unknown kind is coerced to a valid kind");
+  assert.equal(gateEvent.prompt.length, V0_LIMITS.GATE_PROMPT, "prompt clamped to the limit");
+  assert.equal(gateEvent.choices[0].label.length, V0_LIMITS.CHOICE_LABEL, "label clamped to the limit");
+  assert.equal(isGateRequestEvent(gateEvent), true, "the clamped event passes the bot's validator");
+
+  await session.answerGate("g-clamp", "a");
+  await done;
   await session.dispose();
 });
