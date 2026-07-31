@@ -67,5 +67,5 @@ disclosure. There is no bug-bounty program; this is a community project.
 ## Supported versions
 
 This project tracks a specific embedded `@gajae-code/coding-agent` release
-(currently `0.12.6`, pinned in `daemon/package.json` and `bun.lock`). Security
+(currently `0.12.5`, pinned in `daemon/package.json` and `bun.lock`). Security
 fixes land on `main`; there are no long-term support branches.
