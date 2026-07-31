@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "smoke:local": "node scripts/local-smoke.js",
+    "release": "node scripts/release.js",
     "test": "npm run test --workspaces --if-present"
   },
   "workspaces": [
