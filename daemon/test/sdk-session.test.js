@@ -60,6 +60,63 @@ class FakeAgentSession {
   }
 }
 
+// #35: a fake BrokerWorkflowGateEmitter. emitGate() fires the registered
+// listeners (as the real emitter does when the `ask` tool opens a gate) and
+// returns a promise that resolves only when resolveGate() is called with the
+// matching gate_id — mirroring how emitGate suspends the agent loop until an
+// answer arrives.
+class FakeGateEmitter {
+  constructor() {
+    this.listeners = new Set();
+    this.resolveCalls = [];
+    this.resolvers = new Map();
+  }
+  onGateEmitted(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  emitGate(gate) {
+    for (const listener of this.listeners) listener(gate);
+    return new Promise((resolve) => this.resolvers.set(gate.gate_id, resolve));
+  }
+  async resolveGate(response) {
+    this.resolveCalls.push(response);
+    const resolve = this.resolvers.get(response.gate_id);
+    if (resolve) {
+      this.resolvers.delete(response.gate_id);
+      resolve({ gate_id: response.gate_id, status: "accepted", answer: response.answer });
+    }
+    return { gate_id: response.gate_id, status: "accepted", answer_hash: "hash" };
+  }
+  listPendingGates() {
+    return [...this.resolvers.keys()].map((gate_id) => ({ gate_id }));
+  }
+}
+
+// #35: a session whose prompt() opens one or more gates and blocks on each until
+// answered, then emits agent_end.
+class GatingAgentSession extends FakeAgentSession {
+  constructor(gates) {
+    super();
+    this.gateEmitter = new FakeGateEmitter();
+    this.gates = Array.isArray(gates) ? gates : [gates];
+    this.answers = [];
+  }
+  getWorkflowGateEmitter() {
+    return this.gateEmitter;
+  }
+  async prompt(message) {
+    this.calls.push(["prompt", message]);
+    this.emit({ type: "message_update", value: message });
+    for (const gate of this.gates) {
+      this.answers.push(await this.gateEmitter.emitGate(gate));
+    }
+    this.emit({ type: "agent_end" });
+  }
+}
+
+const gateDelay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 test("createSdkSession uses the canonical workDir and dedicated session directory", async () => {
   const calls = [];
   const agent = new FakeAgentSession();
@@ -990,4 +1047,173 @@ test("createSdkSession disposes the raw session when profile activation fails", 
     /failed to activate model profile "copilot-claude"/
   );
   assert.equal(agent.disposeCalls, 1);
+});
+// ---------------------------------------------------------------------------
+// #35: workflow gate answer channel
+// ---------------------------------------------------------------------------
+
+test("gate emission produces a gate_request event and resolves on a label answer", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g1",
+    kind: "question",
+    context: { prompt: "Pick a fruit" },
+    options: [
+      { value: "a", label: "Apple" },
+      { value: "b", label: "Banana" },
+    ],
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 40,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 5_000,
+  });
+
+  const events = [];
+  const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
+
+  await gateDelay(0);
+  const gateReq = events.find((e) => e && e.type === "gate_request");
+  assert.ok(gateReq, "a gate_request event is emitted");
+  assert.equal(gateReq.gateId, "g1");
+  assert.equal(gateReq.kind, "question");
+  assert.equal(gateReq.prompt, "Pick a fruit");
+  assert.deepEqual(gateReq.choices, [
+    { value: "a", label: "Apple" },
+    { value: "b", label: "Banana" },
+  ]);
+  assert.equal(session.pendingGates.size, 1);
+
+  // Idle is suspended while the gate is pending: waiting well past idleTimeoutMs
+  // must NOT reap the session.
+  await gateDelay(120);
+  assert.equal(session.closed, false);
+
+  const result = await session.answerGate("g1", "Banana");
+  assert.equal(result.ok, true);
+  await done;
+
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g1", answer: "b" }]);
+  assert.equal(session.pendingGates.size, 0);
+  await session.dispose();
+});
+
+test("gate answer maps a 1-based index to the option value", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g2",
+    kind: "question",
+    context: { title: "Choose" },
+    options: [
+      { value: "x", label: "First" },
+      { value: "y", label: "Second" },
+    ],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const events = [];
+  const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
+
+  await gateDelay(0);
+  const gateReq = events.find((e) => e && e.type === "gate_request");
+  assert.equal(gateReq.prompt, "Choose"); // falls back to context.title
+
+  await session.answerGate("g2", "2");
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g2", answer: "y" }]);
+  await session.dispose();
+});
+
+test("free-text gate (no options) passes the answer through verbatim", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g3",
+    kind: "question",
+    context: { prompt: "Describe it" },
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const events = [];
+  const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
+
+  await gateDelay(0);
+  const gateReq = events.find((e) => e && e.type === "gate_request");
+  assert.equal(gateReq.choices, undefined);
+
+  await session.answerGate("g3", "a long free-form answer");
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    { gate_id: "g3", answer: "a long free-form answer" },
+  ]);
+  await session.dispose();
+});
+
+test("gate-answer window expiry disposes the session with a distinct error", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g4",
+    kind: "question",
+    context: { prompt: "Answer me" },
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 20,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 60,
+  });
+
+  await assert.rejects(
+    session.send({ type: "prompt", message: "hi" }, () => {}),
+    /gate answer window expired/
+  );
+  assert.equal(session.closed, true);
+  await session.dispose();
+  assert.equal(agent.disposeCalls >= 1, true);
+});
+
+test("answerGate on an unknown/stale gate id is a safe no-op", async () => {
+  const agent = new FakeAgentSession();
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const result = await session.answerGate("nope", "x");
+  assert.equal(result.ok, false);
+  await session.dispose();
+});
+
+test("a concurrent second gate is rejected without overwriting the first resolver", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g5",
+    kind: "question",
+    context: { prompt: "First" },
+    options: [{ value: "a", label: "A" }],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const events = [];
+  const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
+  await gateDelay(0);
+  assert.equal(session.pendingGates.size, 1);
+
+  // Simulate a second gate arriving on the same session while the first is pending.
+  const emitter = agent.getWorkflowGateEmitter();
+  for (const listener of emitter.listeners) {
+    listener({ gate_id: "g5b", kind: "question", context: { prompt: "Second" } });
+  }
+  // The first gate is untouched; only one gate is tracked.
+  assert.equal(session.pendingGates.size, 1);
+  assert.ok(session.pendingGates.has("g5"));
+  // The newcomer was best-effort rejected (answer: null).
+  assert.ok(emitter.resolveCalls.some((r) => r.gate_id === "g5b" && r.answer === null));
+
+  await session.answerGate("g5", "A");
+  await done;
+  assert.ok(emitter.resolveCalls.some((r) => r.gate_id === "g5" && r.answer === "a"));
+  await session.dispose();
+});
+
+test("gate-answer window is clamped to the hard-cap with a warning", async () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const session = new SdkSession(new FakeAgentSession(), {
+      hardCapMs: 1_000,
+      gateAnswerWindowMs: 5_000,
+    });
+    assert.equal(session.gateAnswerWindowMs, 1_000);
+    assert.ok(warnings.some((w) => /clamping to the hard-cap/.test(w)));
+  } finally {
+    console.warn = originalWarn;
+  }
 });
