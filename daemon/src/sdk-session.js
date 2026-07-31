@@ -1,7 +1,17 @@
 import { join } from "node:path";
+import { V0_LIMITS, isGateRequestEvent } from "@gjc-remote/shared";
+
+const GATE_KINDS = new Set(["question", "approval", "execution"]);
 
 const SDK_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SDK_HARD_CAP_MS = 30 * 60 * 1000;
+// #35: while a workflow gate is pending the agent loop is blocked awaiting the
+// answer, so NO events stream and the idle timer would otherwise reap a healthy
+// session. The idle timer is suspended for the gate's lifetime and replaced by
+// this dedicated window; on expiry the run fails (and the session disposes) with
+// a distinct error, converting the ask.timeout default-0 infinite hang into a
+// bounded failure. Clamped to <= hardCapMs (the absolute backstop still wins).
+const SDK_GATE_ANSWER_WINDOW_MS = 10 * 60 * 1000;
 
 function resolveDuration(optionValue, envValue, fallback, envName) {
   const candidates = [optionValue, Number(envValue), fallback];
@@ -17,6 +27,63 @@ function resolveDuration(optionValue, envValue, fallback, envName) {
     );
   }
   return fallback;
+}
+
+// #35: resolve the gate-answer window, then clamp it to hardCapMs so the
+// absolute backstop always remains the outer bound. A configured window that
+// exceeds hardCapMs is honoured up to the cap with a one-time warning.
+function resolveGateWindow(optionValue, envValue, fallback, hardCapMs, envName) {
+  const resolved = resolveDuration(optionValue, envValue, fallback, envName);
+  if (resolved > hardCapMs) {
+    // Only warn when an operator explicitly configured an oversized window; a
+    // default that merely exceeds a (small) hard-cap is clamped silently.
+    const envNumber = Number(envValue);
+    const explicit =
+      (typeof optionValue === "number" &&
+        Number.isFinite(optionValue) &&
+        optionValue > 0) ||
+      (Number.isFinite(envNumber) && envNumber > 0);
+    if (explicit) {
+      console.warn(
+        `gjc-remote daemon: gate-answer window ${resolved}ms exceeds the hard-cap ` +
+          `${hardCapMs}ms; clamping to the hard-cap.`
+      );
+    }
+    return hardCapMs;
+  }
+  return resolved;
+}
+
+// #35: derive a human-facing prompt for a gate_request event from a WorkflowGate.
+function gatePrompt(gate) {
+  const context = gate?.context ?? {};
+  for (const candidate of [context.prompt, context.title, context.summary]) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate;
+    }
+  }
+  return "The workflow is waiting for your answer.";
+}
+
+// #35: map a user's free-text answer onto a WorkflowGateResponse `answer`. For a
+// choice gate, resolve the text to the matching option's `value` (by exact label,
+// case-insensitive, then by 1-based index). Otherwise pass the text through and
+// let the SDK's schema validation decide.
+function mapAnswerToGate(gate, answer) {
+  const options = Array.isArray(gate?.options) ? gate.options : [];
+  if (options.length === 0) return answer;
+  const text = typeof answer === "string" ? answer.trim() : answer;
+  const byLabel = options.find(
+    (option) =>
+      typeof option.label === "string" &&
+      option.label.toLowerCase() === String(text).toLowerCase()
+  );
+  if (byLabel) return byLabel.value;
+  const index = Number(text);
+  if (Number.isInteger(index) && index >= 1 && index <= options.length) {
+    return options[index - 1].value;
+  }
+  return answer;
 }
 
 /**
@@ -188,6 +255,30 @@ export class SdkSession {
       SDK_HARD_CAP_MS,
       "GJC_SDK_HARD_CAP_MS"
     );
+    this.gateAnswerWindowMs = resolveGateWindow(
+      options.gateAnswerWindowMs,
+      process.env.GJC_GATE_ANSWER_WINDOW_MS,
+      SDK_GATE_ANSWER_WINDOW_MS,
+      this.hardCapMs,
+      "GJC_GATE_ANSWER_WINDOW_MS"
+    );
+    // #35: gateId -> { gate, emitter, controller }. At most one gate is
+    // registered at a time; a concurrent gate is rejected (see #handleGateEmitted)
+    // so the first resolver is never overwritten. Each entry stores the OWNING
+    // run's idle controller so answerGate resumes exactly that run (multiple
+    // prompt runs can share this session when channels map to one workDir).
+    this.pendingGates = new Map();
+    // #35: active prompt runs, most-recent last ({ onEvent, controller }). A gate
+    // emitted on the shared session-level emitter is attributed to the most
+    // recently started run.
+    this.activeGateRuns = [];
+    // #35: the session-level workflow-gate subscription is registered ONCE
+    // (lazily, on the first prompt run) rather than per-run, so a single emitted
+    // gate is not delivered to — and self-rejected by — every concurrent run's
+    // listener.
+    this.gateSubscribed = false;
+    this.gateEmitter = undefined;
+    this.gateUnsubscribe = undefined;
   }
 
   send(command, onEvent, timeoutMs = this.idleTimeoutMs) {
@@ -346,6 +437,13 @@ export class SdkSession {
     let observedAgentEnds = 0;
     let requiredAgentEnds = settleFollowUpAcceptance ? undefined : 1;
     let resetIdle = () => {};
+    // #35: register the session-level workflow-gate subscription once and track
+    // this run so a gate emitted mid-run is attributed to it. The gate's onEvent
+    // stream and idle controller both come from the owning run context, so a
+    // second concurrent run on this session cannot clobber either.
+    this.#ensureGateSubscription();
+    const gateRun = { onEvent, controller: undefined };
+    this.activeGateRuns.push(gateRun);
     if (startsPrompt) this.activePromptRuns += 1;
 
     const resolveIfComplete = () => {
@@ -401,14 +499,138 @@ export class SdkSession {
         },
         timeoutMs,
         this.hardCapMs,
-        (arm) => {
-          resetIdle = arm;
+        this.gateAnswerWindowMs,
+        (controller) => {
+          resetIdle = controller.arm;
+          gateRun.controller = controller;
         }
       );
       if (eventConsumerError) throw eventConsumerError;
     } finally {
       markPromptInactive();
       unsubscribe();
+      const runIndex = this.activeGateRuns.indexOf(gateRun);
+      if (runIndex >= 0) this.activeGateRuns.splice(runIndex, 1);
+    }
+  }
+
+  // #35: register the workflow-gate subscription once for the whole session.
+  // Legacy sessions without an emitter are marked subscribed so we never retry.
+  #ensureGateSubscription() {
+    if (this.gateSubscribed) return;
+    this.gateSubscribed = true;
+    const emitter = this.session.getWorkflowGateEmitter?.();
+    if (typeof emitter?.onGateEmitted !== "function") return;
+    this.gateEmitter = emitter;
+    this.gateUnsubscribe = emitter.onGateEmitted((gate) =>
+      this.#handleGateEmitted(gate, emitter)
+    );
+  }
+
+  // #35: a workflow gate opened during an active run. Register it, suspend the
+  // owning run's idle timer, and synthesize a clamped gate_request event onto
+  // that run's stream so the bot can render it and collect an answer.
+  #handleGateEmitted(gate, gateEmitter) {
+    const gateId = gate?.gate_id;
+    if (typeof gateId !== "string" || gateId.length === 0) return;
+    // The single session-level listener can be invoked more than once for the
+    // same gate on some SDK builds; treat a re-delivery as an idempotent no-op.
+    if (this.pendingGates.has(gateId)) return;
+    if (this.pendingGates.size > 0) {
+      // Concurrent-gate guard: never overwrite the first resolver. Best-effort
+      // reject the newcomer so it does not hang; the first gate stays pending.
+      console.warn(
+        `gjc-remote daemon: rejecting concurrent workflow gate ${gateId}; a gate is already pending.`
+      );
+      void this.#rejectGate(gateEmitter, gateId);
+      return;
+    }
+    // Attribute the gate to the most recently started run (gates emit while that
+    // run's prompt() is executing). With no active run there is nothing to
+    // suspend or stream to, so reject rather than leak a pending gate.
+    const gateRun = this.activeGateRuns[this.activeGateRuns.length - 1];
+    if (!gateRun) {
+      void this.#rejectGate(gateEmitter, gateId);
+      return;
+    }
+    const event = this.#buildGateRequestEvent(gate, gateId);
+    if (!event) {
+      // A malformed/oversized gate the bot could not render; do not hang the run.
+      console.error(
+        `gjc-remote daemon: dropping unrenderable workflow gate ${gateId}.`
+      );
+      void this.#rejectGate(gateEmitter, gateId);
+      return;
+    }
+    this.pendingGates.set(gateId, {
+      gate,
+      emitter: gateEmitter,
+      controller: gateRun.controller,
+    });
+    gateRun.controller?.suspendForGate();
+    try {
+      gateRun.onEvent(event);
+    } catch (error) {
+      console.error("gjc-remote daemon: failed to emit gate_request event:", error);
+    }
+  }
+
+  // #35: build a protocol-conforming gate_request event, clamping the prompt,
+  // kind, and choices to V0_LIMITS so the bot's isGateRequestEvent never silently
+  // drops a valid-but-oversized SDK gate. Returns undefined if it cannot be made
+  // to validate.
+  #buildGateRequestEvent(gate, gateId) {
+    const kind = GATE_KINDS.has(gate?.kind) ? gate.kind : "question";
+    const prompt = gatePrompt(gate).slice(0, V0_LIMITS.GATE_PROMPT);
+    const options = Array.isArray(gate?.options) ? gate.options : [];
+    const choices =
+      options.length > 0
+        ? options.slice(0, V0_LIMITS.MAX_CHOICES).map((option) => ({
+            value: option.value,
+            label:
+              typeof option.label === "string"
+                ? option.label.slice(0, V0_LIMITS.CHOICE_LABEL)
+                : String(option.label ?? "").slice(0, V0_LIMITS.CHOICE_LABEL),
+          }))
+        : undefined;
+    const event = {
+      type: "gate_request",
+      gateId,
+      prompt,
+      kind,
+      ...(choices ? { choices } : {}),
+    };
+    return isGateRequestEvent(event) ? event : undefined;
+  }
+
+  // #35: resolve a pending gate with a user's answer (called from daemon message
+  // routing when an ANSWER frame arrives). Runs concurrently with the blocked
+  // prompt run that is awaiting the gate. A stale/unknown gateId is a safe no-op.
+  async answerGate(gateId, answer) {
+    if (this.closed) return { ok: false, error: "session is closed" };
+    const entry = this.pendingGates.get(gateId);
+    if (!entry) return { ok: false, error: "no pending gate for id" };
+    this.pendingGates.delete(gateId);
+    entry.controller?.resumeAfterGate();
+    try {
+      const resolution = await entry.emitter.resolveGate({
+        gate_id: gateId,
+        answer: mapAnswerToGate(entry.gate, answer),
+      });
+      return { ok: true, resolution };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async #rejectGate(gateEmitter, gateId) {
+    try {
+      await gateEmitter?.resolveGate?.({ gate_id: gateId, answer: null });
+    } catch {
+      // Best-effort: the concurrent run's own idle/hard-cap still bounds it.
     }
   }
 
@@ -431,31 +653,53 @@ export class SdkSession {
       clearTimeout(timer);
     }
   }
-  async #withStreamingTimeout(operation, idleMs, hardCapMs, onArm) {
+  async #withStreamingTimeout(operation, idleMs, hardCapMs, gateWindowMs, onArm) {
     const idleError = new Error("SDK command timed out");
     const hardCapError = new Error("SDK command exceeded absolute hard-cap");
+    const gateError = new Error("SDK gate answer window expired");
     let idleTimer;
     let hardCapTimer;
+    let gateTimer;
     let rejectTimeout;
     const timeout = new Promise((_, reject) => {
       rejectTimeout = reject;
     });
     let settled = false;
+    let gateSuspended = false;
     const armIdle = () => {
-      if (settled) return;
+      if (settled || gateSuspended) return;
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => rejectTimeout(idleError), idleMs);
+    };
+    // #35: while a workflow gate is pending, stop the idle timer and bound the
+    // wait by the dedicated gate-answer window instead. Idempotent: repeated
+    // suspend/resume calls are safe no-ops.
+    const suspendForGate = () => {
+      if (settled || gateSuspended) return;
+      gateSuspended = true;
+      clearTimeout(idleTimer);
+      gateTimer = setTimeout(() => rejectTimeout(gateError), gateWindowMs);
+    };
+    const resumeAfterGate = () => {
+      if (settled || !gateSuspended) return;
+      gateSuspended = false;
+      clearTimeout(gateTimer);
+      armIdle();
     };
     armIdle();
     hardCapTimer = setTimeout(() => rejectTimeout(hardCapError), hardCapMs);
 
-    onArm?.(armIdle);
+    onArm?.({ arm: armIdle, suspendForGate, resumeAfterGate });
 
     try {
       return await Promise.race([Promise.resolve().then(operation), timeout]);
     } catch (error) {
-      if (error === idleError || error === hardCapError) {
+      if (error === idleError || error === hardCapError || error === gateError) {
         this.closed = true;
+        // #35: a timeout/hard-cap/gate-window expiry tears down the session via
+        // #disposeUnderlying (not the public dispose()), so drop any pending gate
+        // here too — otherwise a late answerGate() would resolve an orphaned gate.
+        this.pendingGates.clear();
         void this.#disposeUnderlying().catch(() => {});
       }
       throw error;
@@ -463,6 +707,7 @@ export class SdkSession {
       settled = true;
       clearTimeout(idleTimer);
       clearTimeout(hardCapTimer);
+      clearTimeout(gateTimer);
     }
   }
 
@@ -475,6 +720,17 @@ export class SdkSession {
 
   async dispose() {
     this.closed = true;
+    // #35: drop any pending gate so a later answer is a no-op, unsubscribe the
+    // session-level gate listener, and forget active runs; the awaiting run is
+    // already being torn down by the disposal below.
+    this.pendingGates.clear();
+    this.activeGateRuns.length = 0;
+    try {
+      this.gateUnsubscribe?.();
+    } catch {
+      // Best-effort: the underlying session is being disposed anyway.
+    }
+    this.gateUnsubscribe = undefined;
     const disposal = this.#disposeUnderlying();
     const commands = Promise.allSettled([this.queue, ...this.inFlightControls]);
     await disposal;

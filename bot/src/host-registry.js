@@ -7,7 +7,9 @@ import {
   PING,
   PROTOCOL_VERSION,
   V0_LIMITS,
+  isAnswerMessage,
   isEventMessage,
+  isGateRequestEvent,
   isInvokeMessage,
   isPongMessage,
   isRegisterMessage,
@@ -195,9 +197,32 @@ export class HostRegistry {
       return;
     }
     if (msg.event !== undefined) {
-      const text = extractAssistantText(msg.event);
+      const event = msg.event;
+      // #35: a gate_request means the daemon's agent loop is now blocked awaiting
+      // a user answer. Suspend the invoke idle timer (the user may take minutes);
+      // the absolute hard-cap remains the backstop. onEvent renders the prompt to
+      // the Discord channel; the answer is collected out of band via answerGate().
+      if (isGateRequestEvent(event)) {
+        pending.gatePending = true;
+        pending.gateId = event.gateId;
+        clearTimeout(pending.idleTimer);
+        // Route to the dedicated gate callback (carries requestId, needed to send
+        // the answer back). Not forwarded to onEvent — gates are not stream text.
+        pending.onGate?.({
+          gateId: event.gateId,
+          requestId: msg.requestId,
+          prompt: event.prompt,
+          kind: event.kind,
+          choices: event.choices,
+        });
+        return;
+      }
+      const text = extractAssistantText(event);
       if (text !== undefined) pending.text = text;
-      pending.onEvent(msg.event);
+      // Any non-gate event means the agent resumed, so the gate (if any) resolved.
+      pending.gatePending = false;
+      pending.gateId = undefined;
+      pending.onEvent(event);
       this.#armIdleTimer(pending);
     }
     if (msg.done) {
@@ -214,6 +239,9 @@ export class HostRegistry {
     );
   }
   #armIdleTimer(pending) {
+    // #35: while a gate is pending the invoke is deliberately not idle-bounded
+    // (it is waiting on a human); never re-arm until the gate is answered.
+    if (pending.gatePending) return;
     clearTimeout(pending.idleTimer);
     pending.idleTimer = setTimeout(() => {
       this.#deletePending(pending.requestId);
@@ -364,8 +392,11 @@ export class HostRegistry {
    * @param {object} command
    * @param {(event: object) => void} onEvent
    * @param {number} timeoutMs Idle timeout: resets on each streamed event.
+   * @param {(gate: { gateId: string, requestId: string, prompt: string, kind: string, choices?: {value: unknown, label: string}[] }) => void} [onGate]
+   *   #35: invoked when the daemon opens a workflow gate; carries the requestId
+   *   needed to route the answer back via answerGate().
    */
-  invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs) {
+  invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, onGate) {
     const socket = this.connections.get(hostId);
     if (!socket) return Promise.resolve({ ok: false, error: `host '${hostId}' is not connected` });
 
@@ -399,9 +430,12 @@ export class HostRegistry {
         requestId,
         socket,
         onEvent,
+        onGate,
         idleMs: timeoutMs,
         idleTimer: undefined,
         hardCapTimer: undefined,
+        gatePending: false,
+        gateId: undefined,
         settle: (result) => {
           if (settled) return;
           settled = true;
@@ -421,6 +455,54 @@ export class HostRegistry {
 
       socket.send(payload);
     });
+  }
+
+  /**
+   * #35: deliver a user's answer to a pending workflow gate on an in-flight
+   * invoke. Sends an `answer` frame to the owning daemon and re-arms the invoke
+   * idle timer (so the daemon's continuation is bounded again). Returns a
+   * synchronous result; a stale gateId or resolved/missing request is rejected
+   * without side effects.
+   *
+   * @param {string} hostId
+   * @param {string} requestId
+   * @param {string} gateId
+   * @param {string} answer
+   */
+  answerGate(hostId, requestId, gateId, answer) {
+    const pending = this.pendingRequests.get(requestId);
+    if (!pending) {
+      return { ok: false, error: "no in-flight request for that answer" };
+    }
+    const socket = this.connections.get(hostId);
+    if (!socket || socket !== pending.socket) {
+      return { ok: false, error: `host '${hostId}' is not connected` };
+    }
+    if (!pending.gatePending || pending.gateId !== gateId) {
+      return { ok: false, error: "no matching pending gate for that answer" };
+    }
+
+    const message = { type: MSG_TYPES.ANSWER, requestId, gateId, answer };
+    if (!isAnswerMessage(message)) {
+      return { ok: false, error: "invalid gate answer" };
+    }
+    let payload;
+    try {
+      payload = JSON.stringify(message);
+    } catch {
+      return { ok: false, error: "gate answer is not serializable" };
+    }
+    if (Buffer.byteLength(payload) > MAX_WS_PAYLOAD_BYTES) {
+      return { ok: false, error: "gate answer exceeds WebSocket payload limit" };
+    }
+
+    // The gate is answered: stop suppressing the idle timer and re-arm it so the
+    // daemon's post-answer continuation is bounded like any other streamed work.
+    pending.gatePending = false;
+    pending.gateId = undefined;
+    this.#armIdleTimer(pending);
+    socket.send(payload);
+    return { ok: true };
   }
 }
 

@@ -1000,3 +1000,312 @@ test("negotiated protocol version is clamped to this bot build and hostInfo is a
     await server.close();
   }
 });
+// ---------------------------------------------------------------------------
+// #35: workflow gate answer channel
+// ---------------------------------------------------------------------------
+
+test("#35 a gate_request fires onGate, suspends the invoke idle timer, and answerGate sends an answer frame", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 40,
+    invokeHardCapMs: 5000,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const gates = [];
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      (gate) => gates.push(gate)
+    );
+    let settled = false;
+    resultPromise.then(() => {
+      settled = true;
+    });
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    const gateEvent = {
+      type: "gate_request",
+      gateId: "g1",
+      prompt: "Pick a fruit",
+      kind: "question",
+      choices: [{ value: "a", label: "Apple" }],
+    };
+    socket.send(JSON.stringify({ type: "event", requestId, event: gateEvent }));
+
+    await waitFor(() => gates.length === 1);
+    assert.equal(gates[0].gateId, "g1");
+    assert.equal(gates[0].requestId, requestId);
+    assert.equal(gates[0].prompt, "Pick a fruit");
+    assert.equal(gates[0].kind, "question");
+    assert.deepEqual(gates[0].choices, [{ value: "a", label: "Apple" }]);
+
+    // The idle window (40ms) must NOT reap the invoke while the gate is pending.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(settled, false);
+
+    const answerFrame = once(socket, "message");
+    const answerResult = server.registry.answerGate("host-a", requestId, "g1", "Apple");
+    assert.deepEqual(answerResult, { ok: true });
+    const [rawAnswer] = await answerFrame;
+    assert.deepEqual(JSON.parse(rawAnswer.toString()), {
+      type: "answer",
+      requestId,
+      gateId: "g1",
+      answer: "Apple",
+    });
+
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId,
+        event: { message: { role: "assistant", content: "done" } },
+      })
+    );
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: "done" });
+  } finally {
+    await server.close();
+  }
+});
+
+test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and wrong hosts", async () => {
+  const server = await startRegistry(new Map([["host-a", "token-a"], ["host-b", "token-b"]]));
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    assert.deepEqual(server.registry.answerGate("host-a", "nope", "g1", "x"), {
+      ok: false,
+      error: "no in-flight request for that answer",
+    });
+    assert.deepEqual(server.registry.answerGate("host-a", requestId, "g1", "x"), {
+      ok: false,
+      error: "no matching pending gate for that answer",
+    });
+
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId,
+        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+      })
+    );
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gatePending === true
+    );
+
+    assert.deepEqual(server.registry.answerGate("host-a", requestId, "WRONG", "x"), {
+      ok: false,
+      error: "no matching pending gate for that answer",
+    });
+    assert.equal(server.registry.answerGate("host-b", requestId, "g1", "x").ok, false);
+
+    const answerFrame = once(socket, "message");
+    assert.deepEqual(server.registry.answerGate("host-a", requestId, "g1", "yes"), { ok: true });
+    await answerFrame;
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    await resultPromise;
+  } finally {
+    await server.close();
+  }
+});
+
+test("#35 answering a gate re-arms the idle timer so a silent daemon still times out", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 40,
+    invokeHardCapMs: 5000,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId,
+        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+      })
+    );
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gatePending === true
+    );
+
+    const answerFrame = once(socket, "message");
+    server.registry.answerGate("host-a", requestId, "g1", "yes");
+    await answerFrame;
+
+    // Daemon stays silent after the answer: the re-armed idle timer must fire.
+    assert.deepEqual(await resultPromise, {
+      ok: false,
+      error: "timed out waiting for host response",
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+
+test("adversarial: a late answer after the invoke has already settled (done) is rejected without throwing", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId,
+        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+      })
+    );
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gatePending === true
+    );
+
+    server.registry.answerGate("host-a", requestId, "g1", "yes");
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    await resultPromise;
+
+    // The request is gone: a late answer for the same (now-stale) requestId/gateId
+    // must be rejected, not throw.
+    assert.deepEqual(server.registry.answerGate("host-a", requestId, "g1", "late"), {
+      ok: false,
+      error: "no in-flight request for that answer",
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: a second answer for the same requestId/gateId after the gate was already answered is rejected", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId,
+        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+      })
+    );
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gatePending === true
+    );
+
+    const firstAnswer = server.registry.answerGate("host-a", requestId, "g1", "yes");
+    assert.deepEqual(firstAnswer, { ok: true });
+
+    // Same requestId, same gateId, submitted again before `done`: gatePending is
+    // already false, so this must be rejected rather than sending a duplicate
+    // answer frame to the daemon.
+    const secondAnswer = server.registry.answerGate("host-a", requestId, "g1", "yes-again");
+    assert.deepEqual(secondAnswer, {
+      ok: false,
+      error: "no matching pending gate for that answer",
+    });
+
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    await resultPromise;
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: a gate pending across multiple idle windows never times out, only silence after answering does", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 30,
+    invokeHardCapMs: 5000,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    let settled = false;
+    resultPromise.then(() => {
+      settled = true;
+    });
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId,
+        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+      })
+    );
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gatePending === true
+    );
+
+    // Wait across several multiples of the idle window while the gate is
+    // pending: the invoke must survive every one of them.
+    await new Promise((resolve) => setTimeout(resolve, 30 * 6));
+    assert.equal(settled, false);
+
+    server.registry.answerGate("host-a", requestId, "g1", "yes");
+
+    // The daemon goes silent after the answer: the re-armed idle timer must
+    // now fire.
+    assert.deepEqual(await resultPromise, {
+      ok: false,
+      error: "timed out waiting for host response",
+    });
+  } finally {
+    await server.close();
+  }
+});

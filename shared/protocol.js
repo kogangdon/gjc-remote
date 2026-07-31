@@ -21,6 +21,13 @@ export const V0_LIMITS = Object.freeze({
   // Bounds on the additive v1 protocol negotiation fields (see PROTOCOL_VERSION).
   CAPABILITY: 64,
   MAX_CAPABILITIES: 32,
+  // Bounds on the additive #35 ask/gate answer channel. gateId mirrors a UUID;
+  // prompt/choice labels are rendered to a Discord channel; answer reuses the
+  // MESSAGE bound since it is user chat text routed back as a gate answer.
+  GATE_ID: 128,
+  GATE_PROMPT: 16 * 1024,
+  CHOICE_LABEL: 1024,
+  MAX_CHOICES: 64,
   PROTOCOL_VERSION_MAX: 1_000_000,
 });
 
@@ -74,6 +81,12 @@ export const MSG_TYPES = Object.freeze({
   EVENT: "event",
   PING: "ping",
   PONG: "pong",
+  // #35: additive ask/gate answer channel. ANSWER is a top-level bot->host
+  // message; GATE_REQUEST is an event *subtype* that rides an EventMessage's
+  // `event` payload (daemon->bot). v0 peers that don't know these simply never
+  // emit ANSWER and treat an unrecognized event subtype as an ignorable event.
+  ANSWER: "answer",
+  GATE_REQUEST: "gate_request",
 });
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -198,6 +211,62 @@ export function isInvokeMessage(value) {
     return isBoundedString(command.message, V0_LIMITS.MESSAGE, true);
   }
   return false;
+}
+
+/**
+ * bot -> host, a user's answer to a pending workflow gate (#35). Additive: v0
+ * hosts never receive one because they never emit a `gate_request`.
+ * @typedef {{ type: "answer", requestId: string, gateId: string, answer: string }} AnswerMessage
+ */
+export function isAnswerMessage(value) {
+  return (
+    isObject(value) &&
+    value.type === MSG_TYPES.ANSWER &&
+    isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.gateId, V0_LIMITS.GATE_ID) &&
+    isBoundedString(value.answer, V0_LIMITS.MESSAGE, true)
+  );
+}
+
+/**
+ * A `gate_request` event subtype (#35). This validates the inner `event`
+ * payload carried by an EventMessage (daemon -> bot), NOT a top-level WS frame:
+ * a pending workflow gate the bot must render and collect an answer for.
+ * `choices` is present only for choice-style gates; `kind` mirrors the SDK
+ * WorkflowGateKind. Unknown/legacy event payloads fail this check and are
+ * treated as ordinary (ignorable) events by v0-aware peers.
+ * @typedef {{ type: "gate_request", requestId?: string, gateId: string, prompt: string, kind: string, choices?: Array<{ value: unknown, label: string }> }} GateRequestEvent
+ */
+export function isGateRequestEvent(value) {
+  if (
+    !isObject(value) ||
+    value.type !== MSG_TYPES.GATE_REQUEST ||
+    !isBoundedString(value.gateId, V0_LIMITS.GATE_ID) ||
+    !isBoundedString(value.prompt, V0_LIMITS.GATE_PROMPT) ||
+    (value.kind !== "question" &&
+      value.kind !== "approval" &&
+      value.kind !== "execution")
+  ) {
+    return false;
+  }
+  if (hasOwn(value, "requestId") && !isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID)) {
+    return false;
+  }
+  if (hasOwn(value, "choices")) {
+    if (!Array.isArray(value.choices) || value.choices.length > V0_LIMITS.MAX_CHOICES) {
+      return false;
+    }
+    for (const choice of value.choices) {
+      if (
+        !isObject(choice) ||
+        !hasOwn(choice, "value") ||
+        !isBoundedString(choice.label, V0_LIMITS.CHOICE_LABEL)
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 export function normalizeProtocolError(value) {

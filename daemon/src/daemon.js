@@ -6,6 +6,7 @@ import {
   MSG_TYPES,
   PONG,
   PROTOCOL_VERSION,
+  isAnswerMessage,
   isInvokeMessage,
   isPingMessage,
   isRegisterDeniedMessage,
@@ -34,6 +35,10 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
 
 
 const pool = new SessionPool();
+// #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
+// (which arrives as a separate message while the invoke is blocked on a gate)
+// can be routed to the session that owns the pending gate.
+const inFlightByRequestId = new Map();
 let reconnectDelay = RECONNECT_BASE_MS;
 let shuttingDown = false;
 
@@ -120,6 +125,20 @@ async function handleMessage(connection, raw, isBinary) {
     connection.send(JSON.stringify(PONG));
     return;
   }
+  if (isAnswerMessage(msg)) {
+    // #35: route a gate answer to the in-flight session that owns the gate.
+    // Stale/unknown requestIds are silently ignored (the gate may have already
+    // resolved, timed out, or the session disposed).
+    const session = inFlightByRequestId.get(msg.requestId);
+    if (session) {
+      try {
+        await session.answerGate(msg.gateId, msg.answer);
+      } catch (err) {
+        console.error("daemon: failed to answer gate:", err);
+      }
+    }
+    return;
+  }
   if (!isInvokeMessage(msg)) {
     connection.close(1008, "invalid message");
     return;
@@ -133,6 +152,7 @@ async function handleMessage(connection, raw, isBinary) {
 
   try {
     const session = await pool.ensureSession(workDir);
+    inFlightByRequestId.set(requestId, session);
 
     if (command.kind === "set_model") {
       await setSessionModel(session, command, (event) => send(event));
@@ -147,6 +167,8 @@ async function handleMessage(connection, raw, isBinary) {
       error: normalizeProtocolError(err),
       done: true,
     });
+  } finally {
+    inFlightByRequestId.delete(requestId);
   }
 }
 

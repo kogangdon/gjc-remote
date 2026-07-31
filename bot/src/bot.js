@@ -93,6 +93,11 @@ const registry = new HostRegistry({
   ...invokeTimeoutOptions,
 });
 const toolLogStore = new ToolLogStore();
+// #35: channelId -> { hostId, requestId, gateId } for a workflow gate currently
+// awaiting a user's answer in that channel. While an entry exists, the next
+// message in the channel is routed to the daemon as the gate answer rather than
+// starting a new prompt. Cleared when answered or when the invoke settles.
+const pendingGateByChannel = new Map();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -189,6 +194,29 @@ async function handleAuthorizedMessage(message) {
   const route = channelMap[message.channelId];
   if (!route) return;
 
+  // #35: if a workflow gate is awaiting an answer in this channel, route this
+  // message to the daemon as the gate answer instead of starting a new prompt.
+  const pendingGate = pendingGateByChannel.get(message.channelId);
+  if (pendingGate) {
+    pendingGateByChannel.delete(message.channelId);
+    const result = registry.answerGate(
+      pendingGate.hostId,
+      pendingGate.requestId,
+      pendingGate.gateId,
+      prompt
+    );
+    if (result.ok) {
+      await message.react("✅").catch(() => {});
+      return;
+    }
+    // #35: the gate is stale (e.g. the run already resumed without our answer, or
+    // the host dropped). Rather than swallow the user's message, fall through and
+    // treat it as an ordinary prompt.
+    console.warn(
+      `gjc-remote bot: stale gate answer for channel ${message.channelId}: ${result.error}; treating as a new prompt.`
+    );
+  }
+
   if (!registry.isOnline(route.hostId)) {
     await message.reply(`Host '${route.hostId}' is not connected right now.`).catch(() => {});
     return;
@@ -206,6 +234,7 @@ async function handleAuthorizedMessage(message) {
     channelId: message.channelId,
     edit: (content) => progressMessage.edit(content),
     deliver: (result) => deliverMessage(progressMessage, result),
+    onGate: (gate) => renderGateToChannel(message.channel, message.channelId, route.hostId, gate),
   }).catch(async (error) => {
     console.error("Failed to handle message delivery:", error);
     await progressMessage.edit("GJC request failed before a result could be delivered.").catch((editError) => {
@@ -214,7 +243,7 @@ async function handleAuthorizedMessage(message) {
   });
 }
 
-async function runAndDeliver({ commandName, command, route, requestLabel, userId, channelId, edit, deliver }) {
+async function runAndDeliver({ commandName, command, route, requestLabel, userId, channelId, edit, deliver, onGate }) {
   debugRemote("request", {
     requestLabel,
     userId,
@@ -249,25 +278,51 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   heartbeat.unref?.();
 
   let result;
+  // #35: the requestId of a gate this invoke raises, so the leaked-marker guard
+  // in `finally` only clears a marker THIS invoke owns (a concurrent invoke on
+  // the same channel must not have its live marker cross-deleted).
+  let ownedGateRequestId;
+  const trackedOnGate = onGate
+    ? (gate) => {
+        ownedGateRequestId = gate.requestId;
+        return onGate(gate);
+      }
+    : undefined;
   try {
     editProgress(true);
-    result = await registry.invoke(route.hostId, route.workDir, command, (evt) => {
-      const receipt = validateModelResolvedEvent(evt);
-      if (receipt) modelReceipt = receipt;
+    result = await registry.invoke(
+      route.hostId,
+      route.workDir,
+      command,
+      (evt) => {
+        const receipt = validateModelResolvedEvent(evt);
+        if (receipt) modelReceipt = receipt;
 
-      const toolCall = extractToolCall(evt);
-      if (toolCall && recordToolCall(toolCalls, toolCallIndex, toolCall)) {
-        debugRemote("tool-call", { requestLabel, name: toolCall.name, label: toolCall.label });
-      }
+        const toolCall = extractToolCall(evt);
+        if (toolCall && recordToolCall(toolCalls, toolCallIndex, toolCall)) {
+          debugRemote("tool-call", { requestLabel, name: toolCall.name, label: toolCall.label });
+        }
 
-      const assistantText = extractAssistantText(evt);
-      if (assistantText) preview = assistantText;
-      if (assistantText) debugRemote("assistant-text", { requestLabel, chars: assistantText.length });
+        const assistantText = extractAssistantText(evt);
+        if (assistantText) preview = assistantText;
+        if (assistantText) debugRemote("assistant-text", { requestLabel, chars: assistantText.length });
 
-      editProgress();
-    });
+        editProgress();
+      },
+      undefined,
+      trackedOnGate
+    );
   } finally {
     clearInterval(heartbeat);
+    // #35: an invoke never settles with a gate still pending, but guard against a
+    // leaked marker (timeout/hard-cap mid-gate) so a later message is not
+    // misrouted as a stale answer. Only clear a marker this invoke owns.
+    if (channelId !== undefined && ownedGateRequestId !== undefined) {
+      const marker = pendingGateByChannel.get(channelId);
+      if (marker && marker.requestId === ownedGateRequestId) {
+        pendingGateByChannel.delete(channelId);
+      }
+    }
   }
   result = transformModelResult(command, result, modelReceipt);
 
@@ -275,6 +330,29 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   debugRemote("result", { requestLabel, ok: result?.ok, hasText: Boolean(result?.text), error: result?.error });
 
   await deliver(result);
+}
+
+// #35: render a workflow gate to its Discord channel and register the pending
+// state so the next message in the channel is routed back as the answer. The
+// marker is registered before the (async) send so an immediate reply is not lost.
+function renderGateToChannel(channel, channelId, hostId, gate) {
+  pendingGateByChannel.set(channelId, {
+    hostId,
+    requestId: gate.requestId,
+    gateId: gate.gateId,
+  });
+  const lines = [`**GJC needs your input** (${gate.kind}):`, gate.prompt];
+  if (Array.isArray(gate.choices) && gate.choices.length > 0) {
+    gate.choices.forEach((choice, index) => {
+      lines.push(`**${index + 1}.** ${choice.label}`);
+    });
+    lines.push("_Reply with the option number or its exact text._");
+  } else {
+    lines.push("_Reply in this channel with your answer._");
+  }
+  return channel.send(lines.join("\n")).catch((error) => {
+    console.error("Failed to render workflow gate:", error);
+  });
 }
 
 async function deliverInteraction(interaction, commandName, result) {
