@@ -6,9 +6,12 @@ import test from "node:test";
 import {
   CAPABILITIES,
   MAX_WS_PAYLOAD_BYTES,
+  MSG_TYPES,
   PROTOCOL_VERSION,
   V0_LIMITS,
+  isAnswerMessage,
   isEventMessage,
+  isGateRequestEvent,
   isInvokeMessage,
   isRegisterMessage,
   normalizeProtocolError,
@@ -225,4 +228,200 @@ test("daemon rejects an oversized inbound WebSocket payload", async () => {
   } finally {
     await daemon.close();
   }
+});
+test("isAnswerMessage accepts a well-formed answer and rejects malformed ones (#35)", () => {
+  assert.equal(
+    isAnswerMessage({
+      type: "answer",
+      requestId: "request-1",
+      gateId: "gate-1",
+      answer: "yes",
+    }),
+    true
+  );
+  // Empty answer is allowed (a user may send an empty selection the daemon maps/rejects).
+  assert.equal(
+    isAnswerMessage({ type: "answer", requestId: "r", gateId: "g", answer: "" }),
+    true
+  );
+  assert.equal(isAnswerMessage(null), false);
+  assert.equal(isAnswerMessage({ type: "answer" }), false);
+  assert.equal(
+    isAnswerMessage({ type: "answer", requestId: "r", gateId: "g" }),
+    false,
+    "missing answer"
+  );
+  assert.equal(
+    isAnswerMessage({ type: "answer", requestId: "", gateId: "g", answer: "x" }),
+    false,
+    "empty requestId"
+  );
+  assert.equal(
+    isAnswerMessage({ type: "answer", requestId: "r", gateId: "", answer: "x" }),
+    false,
+    "empty gateId"
+  );
+  assert.equal(
+    isAnswerMessage({
+      type: "answer",
+      requestId: "r",
+      gateId: "x".repeat(V0_LIMITS.GATE_ID + 1),
+      answer: "x",
+    }),
+    false,
+    "oversized gateId"
+  );
+  assert.equal(
+    isAnswerMessage({
+      type: "answer",
+      requestId: "r",
+      gateId: "g",
+      answer: "x".repeat(V0_LIMITS.MESSAGE + 1),
+    }),
+    false,
+    "oversized answer"
+  );
+  assert.equal(
+    isAnswerMessage({ type: "invoke", requestId: "r", gateId: "g", answer: "x" }),
+    false,
+    "wrong type"
+  );
+});
+
+test("isGateRequestEvent validates the gate_request event subtype incl. bounds and choices (#35)", () => {
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      requestId: "request-1",
+      gateId: "gate-1",
+      prompt: "Pick one",
+      kind: "question",
+      choices: [
+        { value: 0, label: "First" },
+        { value: "b", label: "Second" },
+      ],
+    }),
+    true
+  );
+  // requestId and choices are optional.
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      gateId: "g",
+      prompt: "Approve?",
+      kind: "approval",
+    }),
+    true
+  );
+  assert.equal(isGateRequestEvent({ type: "gate_request", gateId: "g", prompt: "p", kind: "execution" }), true);
+  assert.equal(isGateRequestEvent(null), false);
+  assert.equal(
+    isGateRequestEvent({ type: "gate_request", gateId: "g", prompt: "p", kind: "bogus" }),
+    false,
+    "unknown kind"
+  );
+  assert.equal(
+    isGateRequestEvent({ type: "gate_request", gateId: "", prompt: "p", kind: "question" }),
+    false,
+    "empty gateId"
+  );
+  assert.equal(
+    isGateRequestEvent({ type: "gate_request", gateId: "g", prompt: "", kind: "question" }),
+    false,
+    "empty prompt"
+  );
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      gateId: "g",
+      prompt: "x".repeat(V0_LIMITS.GATE_PROMPT + 1),
+      kind: "question",
+    }),
+    false,
+    "oversized prompt"
+  );
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      gateId: "g",
+      prompt: "p",
+      kind: "question",
+      requestId: "",
+    }),
+    false,
+    "present but empty requestId"
+  );
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      gateId: "g",
+      prompt: "p",
+      kind: "question",
+      choices: "not-an-array",
+    }),
+    false,
+    "choices must be an array"
+  );
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      gateId: "g",
+      prompt: "p",
+      kind: "question",
+      choices: Array.from({ length: V0_LIMITS.MAX_CHOICES + 1 }, (_, i) => ({
+        value: i,
+        label: `c${i}`,
+      })),
+    }),
+    false,
+    "too many choices"
+  );
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      gateId: "g",
+      prompt: "p",
+      kind: "question",
+      choices: [{ label: "missing value" }],
+    }),
+    false,
+    "choice missing value"
+  );
+  assert.equal(
+    isGateRequestEvent({
+      type: "gate_request",
+      gateId: "g",
+      prompt: "p",
+      kind: "question",
+      choices: [{ value: 1, label: 123 }],
+    }),
+    false,
+    "choice label must be a string"
+  );
+});
+
+test("adding #35 message types does not break backward-compat validators", () => {
+  // MSG_TYPES additions are present and additive.
+  assert.equal(MSG_TYPES.ANSWER, "answer");
+  assert.equal(MSG_TYPES.GATE_REQUEST, "gate_request");
+
+  // A gate_request rides inside an EventMessage's `event` payload; isEventMessage
+  // still accepts it as a normal event (it only requires event to be an object).
+  const gateRequest = {
+    type: "gate_request",
+    gateId: "g",
+    prompt: "p",
+    kind: "question",
+  };
+  assert.equal(
+    isEventMessage({ type: "event", requestId: "r", event: gateRequest }),
+    true
+  );
+
+  // An unrecognized/new top-level type must not crash or be misclassified by the
+  // legacy validators — a v0 peer safely ignores it.
+  assert.equal(isEventMessage({ type: "answer", requestId: "r", gateId: "g", answer: "y" }), false);
+  assert.equal(isInvokeMessage({ type: "answer", requestId: "r", gateId: "g", answer: "y" }), false);
+  assert.equal(isAnswerMessage({ type: "event", requestId: "r", event: {} }), false);
+  assert.equal(isGateRequestEvent({ type: "event", requestId: "r" }), false);
 });
