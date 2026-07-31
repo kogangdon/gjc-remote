@@ -542,6 +542,7 @@ export class SdkSession {
   // routing when an ANSWER frame arrives). Runs concurrently with the blocked
   // prompt run that is awaiting the gate. A stale/unknown gateId is a safe no-op.
   async answerGate(gateId, answer) {
+    if (this.closed) return { ok: false, error: "session is closed" };
     const entry = this.pendingGates.get(gateId);
     if (!entry) return { ok: false, error: "no pending gate for id" };
     this.pendingGates.delete(gateId);
@@ -630,6 +631,10 @@ export class SdkSession {
     } catch (error) {
       if (error === idleError || error === hardCapError || error === gateError) {
         this.closed = true;
+        // #35: a timeout/hard-cap/gate-window expiry tears down the session via
+        // #disposeUnderlying (not the public dispose()), so drop any pending gate
+        // here too — otherwise a late answerGate() would resolve an orphaned gate.
+        this.pendingGates.clear();
         void this.#disposeUnderlying().catch(() => {});
       }
       throw error;

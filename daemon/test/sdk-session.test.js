@@ -1217,3 +1217,261 @@ test("gate-answer window is clamped to the hard-cap with a warning", async () =>
     console.warn = originalWarn;
   }
 });
+
+
+test("adversarial: the absolute hard-cap still fires while a gate is suspended, even after the gate is answered and the run goes silent again", async () => {
+  // Regression guard for #1: suspendForGate/resumeAfterGate must never touch
+  // hardCapTimer. The hard-cap is the outer backstop and must bound the whole
+  // run (gate wait + post-answer silence) regardless of gate suspension.
+  class SlowResumeAgentSession extends GatingAgentSession {
+    async prompt(message) {
+      this.calls.push(["prompt", message]);
+      this.emit({ type: "message_update", value: message });
+      for (const gate of this.gates) {
+        this.answers.push(await this.gateEmitter.emitGate(gate));
+      }
+      // Silent stretch after the gate resolves, long enough to blow the hard-cap
+      // even though the idle timer was freshly re-armed by resumeAfterGate.
+      await gateDelay(200);
+      this.emit({ type: "agent_end" });
+    }
+  }
+  const agent = new SlowResumeAgentSession({
+    gate_id: "g-hardcap",
+    kind: "question",
+    context: { prompt: "Answer fast" },
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 150,
+    gateAnswerWindowMs: 100,
+  });
+
+  const events = [];
+  const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
+  await gateDelay(0);
+  const answerResult = await session.answerGate("g-hardcap", "anything");
+  assert.equal(answerResult.ok, true);
+
+  await assert.rejects(done, /exceeded absolute hard-cap/);
+  assert.equal(session.closed, true);
+  await session.dispose();
+});
+
+test("adversarial: answering the same gate twice is a safe no-op the second time (no double resolveGate)", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-double",
+    kind: "question",
+    context: { prompt: "Pick one" },
+    options: [{ value: "a", label: "A" }],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await gateDelay(0);
+
+  const first = await session.answerGate("g-double", "A");
+  assert.equal(first.ok, true);
+  const second = await session.answerGate("g-double", "A");
+  assert.deepEqual(second, { ok: false, error: "no pending gate for id" });
+
+  await done;
+  // Only one resolveGate call reached the emitter for this gate id.
+  assert.equal(
+    agent.gateEmitter.resolveCalls.filter((r) => r.gate_id === "g-double").length,
+    1
+  );
+  assert.equal(session.pendingGates.size, 0);
+  await session.dispose();
+});
+
+test("adversarial: an answer submitted after the gate-answer window already expired must be a safe no-op", async () => {
+  // #35 spec requires a post-expiry/disposal answer to be a safe no-op. The
+  // private disposal path (idle/hard-cap/gate-window rejection inside
+  // #withStreamingTimeout) only disposes the underlying session; it does NOT
+  // clear `pendingGates` (only the public dispose() does that). So a late
+  // answerGate() call after a gate-window expiry still finds the stale entry
+  // and "succeeds" against an abandoned gate emitter instead of no-op'ing.
+  const agent = new GatingAgentSession({
+    gate_id: "g-late",
+    kind: "question",
+    context: { prompt: "Answer me" },
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 30,
+  });
+
+  await assert.rejects(
+    session.send({ type: "prompt", message: "hi" }, () => {}),
+    /gate answer window expired/
+  );
+  assert.equal(session.closed, true);
+
+  // The run already errored out on the gate-answer window; a late answer for
+  // that same gate must be rejected, not honored.
+  const lateAnswer = await session.answerGate("g-late", "too late");
+  assert.deepEqual(lateAnswer, { ok: false, error: "session is closed" });
+
+  await session.dispose();
+});
+
+test("adversarial: a gate answered normally, followed by silence, still idle-times-out (resumeAfterGate re-arms correctly)", async () => {
+  class SilentAfterGateAgentSession extends GatingAgentSession {
+    async prompt(message) {
+      this.calls.push(["prompt", message]);
+      this.emit({ type: "message_update", value: message });
+      for (const gate of this.gates) {
+        this.answers.push(await this.gateEmitter.emitGate(gate));
+      }
+      // Never emits agent_end and never streams again: the idle timer (re-armed
+      // by resumeAfterGate) must be the one to bound this, not a stray timer.
+      await new Promise(() => {});
+    }
+  }
+  const agent = new SilentAfterGateAgentSession({
+    gate_id: "g-silent",
+    kind: "question",
+    context: { prompt: "Answer" },
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 30,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 5_000,
+  });
+
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await gateDelay(0);
+  const answerResult = await session.answerGate("g-silent", "ok");
+  assert.equal(answerResult.ok, true);
+
+  await assert.rejects(done, /SDK command timed out/);
+  assert.equal(session.closed, true);
+  await session.dispose();
+});
+
+test("adversarial: a concurrent gate rejection leaves pendingGates empty once the first gate is answered", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g6",
+    kind: "question",
+    context: { prompt: "First" },
+    options: [{ value: "a", label: "A" }],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await gateDelay(0);
+
+  const emitter = agent.getWorkflowGateEmitter();
+  for (const listener of emitter.listeners) {
+    listener({ gate_id: "g6b", kind: "question", context: { prompt: "Second" } });
+  }
+  assert.equal(session.pendingGates.size, 1);
+
+  await session.answerGate("g6", "A");
+  await done;
+  assert.equal(session.pendingGates.size, 0);
+  await session.dispose();
+});
+
+test("adversarial: mapAnswerToGate — a numeric-looking label wins over positional index parsing", async () => {
+  // options[0].label is "2"; an index-based reading of answer "2" would pick
+  // options[1] instead. Label matching must run first and win.
+  const agent = new GatingAgentSession({
+    gate_id: "g-numlabel",
+    kind: "question",
+    context: { prompt: "Pick" },
+    options: [
+      { value: "label-two", label: "2" },
+      { value: "only", label: "Only" },
+    ],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await gateDelay(0);
+
+  await session.answerGate("g-numlabel", "2");
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    { gate_id: "g-numlabel", answer: "label-two" },
+  ]);
+  await session.dispose();
+});
+
+test("adversarial: mapAnswerToGate — duplicate labels resolve to the first matching option", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-dup",
+    kind: "question",
+    context: { prompt: "Pick" },
+    options: [
+      { value: "first", label: "Yes" },
+      { value: "second", label: "Yes" },
+    ],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await gateDelay(0);
+
+  await session.answerGate("g-dup", "yes");
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-dup", answer: "first" }]);
+  await session.dispose();
+});
+
+test("adversarial: mapAnswerToGate — whitespace/case variance still matches by label", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-ws",
+    kind: "question",
+    context: { prompt: "Pick" },
+    options: [{ value: "a", label: "Apple" }],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await gateDelay(0);
+
+  await session.answerGate("g-ws", "  APPLE  ");
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-ws", answer: "a" }]);
+  await session.dispose();
+});
+
+test("adversarial: mapAnswerToGate — out-of-range index (0, negative, overflow) passes the raw answer through", async () => {
+  for (const bad of ["0", "-1", "5"]) {
+    const agent = new GatingAgentSession({
+      gate_id: "g-range",
+      kind: "question",
+      context: { prompt: "Pick" },
+      options: [
+        { value: "a", label: "A" },
+        { value: "b", label: "B" },
+      ],
+    });
+    const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+    const done = session.send({ type: "prompt", message: "hi" }, () => {});
+    await gateDelay(0);
+
+    await session.answerGate("g-range", bad);
+    await done;
+    assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-range", answer: bad }]);
+    await session.dispose();
+  }
+});
+
+test("adversarial: mapAnswerToGate — an empty-string answer passes through rather than matching any option", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-empty",
+    kind: "question",
+    context: { prompt: "Pick" },
+    options: [
+      { value: "a", label: "A" },
+      { value: "b", label: "B" },
+    ],
+  });
+  const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await gateDelay(0);
+
+  await session.answerGate("g-empty", "");
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-empty", answer: "" }]);
+  await session.dispose();
+});
