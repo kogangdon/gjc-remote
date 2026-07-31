@@ -88,6 +88,11 @@ should match it. The bot, `register`, and the smoke harness run on Node via thei
 package scripts, so keep Node available on the bot host — or add `--bun` to
 `bun run` to execute those Node scripts under Bun instead.
 
+> **Temporary SDK caution (v0.2.1):** This release pins
+> `@gajae-code/coding-agent` **0.12.6**. Hold production rollout until the
+> upstream hotfix is confirmed. SDK **0.12.5** is currently the known-good
+> fallback; use v0.2.0 if you need to stay on that version.
+
 **Optional environment variables** — beyond the required keys above:
 
 - **bot** — `DISCORD_GUILD_ID` registers slash commands to a single guild for
