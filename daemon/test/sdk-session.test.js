@@ -638,6 +638,164 @@ test("model switches use the same timeout and poison lifecycle", async () => {
   await session.dispose();
   assert.equal(agent.disposeCalls, 1);
 });
+
+test("prompt idle timer resets on streamed activity and completes past the idle window", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await delay(25);
+    agent.emit({ type: "message_update", value: "a" });
+    await delay(25);
+    agent.emit({ type: "message_update", value: "b" });
+    await delay(25);
+    agent.emit({ type: "message_update", value: "c" });
+    await delay(25);
+    agent.emit({ type: "agent_end" });
+  };
+  const session = new SdkSession(agent, { idleTimeoutMs: 60, hardCapMs: 5000 });
+
+  await session.send({ type: "prompt", message: "hi" }, () => {});
+
+  assert.equal(session.closed, false);
+  await session.dispose();
+});
+
+test("prompt hard cap fires and disposes despite continuous activity", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = () => {
+    agent.calls.push(["prompt", "x"]);
+    const interval = setInterval(() => {
+      agent.emit({ type: "message_update", value: "tick" });
+    }, 10);
+    interval.unref?.();
+    agent._activityInterval = interval;
+    return new Promise(() => {});
+  };
+  const session = new SdkSession(agent, { idleTimeoutMs: 1000, hardCapMs: 40 });
+
+  try {
+    await assert.rejects(
+      session.send({ type: "prompt", message: "x" }, () => {}),
+      /exceeded absolute hard-cap/
+    );
+  } finally {
+    clearInterval(agent._activityInterval);
+  }
+
+  assert.equal(session.closed, true);
+  await session.dispose();
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("per-instance idle/hard-cap config is honored independently", async () => {
+  const agentFast = new FakeAgentSession();
+  agentFast.prompt = () => new Promise(() => {});
+  const sessionFast = new SdkSession(agentFast, { idleTimeoutMs: 10, hardCapMs: 5000 });
+
+  const agentSlow = new FakeAgentSession();
+  agentSlow.prompt = () => new Promise(() => {});
+  const sessionSlow = new SdkSession(agentSlow, { idleTimeoutMs: 40, hardCapMs: 5000 });
+
+  let fastSettledAt;
+  let slowSettledAt;
+  const fast = sessionFast
+    .send({ type: "prompt", message: "fast" }, () => {})
+    .catch((error) => {
+      fastSettledAt = Date.now();
+      throw error;
+    });
+  const slow = sessionSlow
+    .send({ type: "prompt", message: "slow" }, () => {})
+    .catch((error) => {
+      slowSettledAt = Date.now();
+      throw error;
+    });
+
+  await assert.rejects(fast, /SDK command timed out/);
+  await assert.rejects(slow, /SDK command timed out/);
+
+  assert.ok(fastSettledAt <= slowSettledAt);
+  assert.equal(sessionFast.closed, true);
+  assert.equal(sessionSlow.closed, true);
+  await sessionFast.dispose();
+  await sessionSlow.dispose();
+});
+test("adversarial: non-positive/NaN/undefined idle and hard-cap config fall back to defaults (resolveDuration)", async () => {
+  const DEFAULT_IDLE_MS = 5 * 60 * 1000;
+  const DEFAULT_HARD_CAP_MS = 30 * 60 * 1000;
+  const previousIdleEnv = process.env.GJC_SDK_IDLE_TIMEOUT_MS;
+  const previousHardCapEnv = process.env.GJC_SDK_HARD_CAP_MS;
+  delete process.env.GJC_SDK_IDLE_TIMEOUT_MS;
+  delete process.env.GJC_SDK_HARD_CAP_MS;
+
+  try {
+    // Invalid explicit options with no env override fall back to defaults.
+    const noOptions = new SdkSession(new FakeAgentSession());
+    assert.equal(noOptions.idleTimeoutMs, DEFAULT_IDLE_MS);
+    assert.equal(noOptions.hardCapMs, DEFAULT_HARD_CAP_MS);
+
+    for (const bad of [0, -1, Number.NaN, undefined]) {
+      const session = new SdkSession(new FakeAgentSession(), {
+        idleTimeoutMs: bad,
+        hardCapMs: bad,
+      });
+      assert.equal(session.idleTimeoutMs, DEFAULT_IDLE_MS);
+      assert.equal(session.hardCapMs, DEFAULT_HARD_CAP_MS);
+    }
+
+    // A non-numeric/non-positive env value is likewise ignored, falling back
+    // to the default rather than throwing or coercing to NaN/negative delays.
+    process.env.GJC_SDK_IDLE_TIMEOUT_MS = "not-a-number";
+    process.env.GJC_SDK_HARD_CAP_MS = "-5";
+    const envInvalid = new SdkSession(new FakeAgentSession());
+    assert.equal(envInvalid.idleTimeoutMs, DEFAULT_IDLE_MS);
+    assert.equal(envInvalid.hardCapMs, DEFAULT_HARD_CAP_MS);
+
+    // A valid env override is honored when no explicit option is given.
+    process.env.GJC_SDK_IDLE_TIMEOUT_MS = "1234";
+    process.env.GJC_SDK_HARD_CAP_MS = "5678";
+    const envValid = new SdkSession(new FakeAgentSession());
+    assert.equal(envValid.idleTimeoutMs, 1234);
+    assert.equal(envValid.hardCapMs, 5678);
+
+    // An explicit positive option still wins over a valid env override.
+    process.env.GJC_SDK_IDLE_TIMEOUT_MS = "9999";
+    const optionWins = new SdkSession(new FakeAgentSession(), { idleTimeoutMs: 42 });
+    assert.equal(optionWins.idleTimeoutMs, 42);
+  } finally {
+    if (previousIdleEnv === undefined) delete process.env.GJC_SDK_IDLE_TIMEOUT_MS;
+    else process.env.GJC_SDK_IDLE_TIMEOUT_MS = previousIdleEnv;
+    if (previousHardCapEnv === undefined) delete process.env.GJC_SDK_HARD_CAP_MS;
+    else process.env.GJC_SDK_HARD_CAP_MS = previousHardCapEnv;
+  }
+});
+
+test("concurrent live-control sibling settles boundedly when the other hard-caps and disposes", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = () => new Promise(() => {});
+  agent.steer = () => new Promise(() => {});
+  const session = new SdkSession(agent, { idleTimeoutMs: 5000, hardCapMs: 30 });
+
+  const prompt = session.send({ type: "prompt", message: "hard-cap me" }, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  const steer = session.send({ type: "steer", message: "sibling" }, () => {}, 10);
+
+  const guard = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("test guard: settlement hung")), 2000).unref?.();
+  });
+
+  const results = await Promise.race([
+    Promise.allSettled([prompt, steer]),
+    guard,
+  ]);
+
+  assert.equal(results[0].status, "rejected");
+  assert.match(results[0].reason.message, /exceeded absolute hard-cap/);
+  assert.equal(results[1].status, "rejected");
+  assert.equal(session.closed, true);
+  await session.dispose();
+});
 test("dispose ignores prior control failures after underlying cleanup succeeds", async () => {
   const agent = new FakeAgentSession();
   let rejectSteer;

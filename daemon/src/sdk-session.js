@@ -1,6 +1,23 @@
 import { join } from "node:path";
 
-const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+const SDK_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const SDK_HARD_CAP_MS = 30 * 60 * 1000;
+
+function resolveDuration(optionValue, envValue, fallback, envName) {
+  const candidates = [optionValue, Number(envValue), fallback];
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
+      return candidate;
+    }
+  }
+  if (envName && envValue !== undefined && `${envValue}`.trim() !== "") {
+    console.warn(
+      `gjc-remote daemon: ${envName}=${JSON.stringify(envValue)} is not a positive ` +
+        `duration; falling back to ${fallback}ms.`
+    );
+  }
+  return fallback;
+}
 
 /**
  * Load only the canonical SDK surfaces this daemon needs, rather than the
@@ -138,7 +155,7 @@ export async function applyConfiguredModelProfile(session, { activateModelProfil
  * provided by the RPC transport.
  */
 export class SdkSession {
-  constructor(session) {
+  constructor(session, options = {}) {
     this.session = session;
     this.closed = false;
     this.queue = Promise.resolve();
@@ -149,9 +166,31 @@ export class SdkSession {
     this.outstandingAcceptedFollowUps = 0;
     this.liveFollowUpBarrier = undefined;
     this.disposePromise = undefined;
+    // idleTimeoutMs bounds silence between streamed events; hardCapMs is the
+    // absolute per-run backstop that fires even under continuous activity and
+    // always disposes the underlying session. Both default to the same values
+    // as the bot's invoke idle/hard-cap (5min / 30min). There is deliberately
+    // NO cross-process comparison here: the bot and daemon run in separate
+    // processes with independent env, so the daemon cannot see the bot's cap.
+    // Guaranteeing daemon hardCapMs >= bot invokeHardCapMs (so a bot that gives
+    // up first never orphans a still-running daemon session) requires the bot
+    // to advertise its cap over the wire plus a daemon-side warning / cancel
+    // frame — tracked as the #35 (R10) follow-up, out of scope for #36.
+    this.idleTimeoutMs = resolveDuration(
+      options.idleTimeoutMs,
+      process.env.GJC_SDK_IDLE_TIMEOUT_MS,
+      SDK_IDLE_TIMEOUT_MS,
+      "GJC_SDK_IDLE_TIMEOUT_MS"
+    );
+    this.hardCapMs = resolveDuration(
+      options.hardCapMs,
+      process.env.GJC_SDK_HARD_CAP_MS,
+      SDK_HARD_CAP_MS,
+      "GJC_SDK_HARD_CAP_MS"
+    );
   }
 
-  send(command, onEvent, timeoutMs = COMMAND_TIMEOUT_MS) {
+  send(command, onEvent, timeoutMs = this.idleTimeoutMs) {
     if (this.closed) return Promise.reject(new Error("GJC SDK session is not running"));
 
     const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
@@ -306,6 +345,7 @@ export class SdkSession {
     let eventConsumerError;
     let observedAgentEnds = 0;
     let requiredAgentEnds = settleFollowUpAcceptance ? undefined : 1;
+    let resetIdle = () => {};
     if (startsPrompt) this.activePromptRuns += 1;
 
     const resolveIfComplete = () => {
@@ -322,6 +362,7 @@ export class SdkSession {
       this.activePromptRuns -= 1;
     };
     const unsubscribe = this.session.subscribe((event) => {
+      resetIdle();
       if (event.type === "agent_end") {
         markPromptInactive();
         observedAgentEnds += 1;
@@ -338,25 +379,32 @@ export class SdkSession {
     });
 
     try {
-      await this.#withTimeout(async () => {
-        if (command.type === "prompt") {
-          await this.session.prompt(command.message);
-        } else if (command.type === "steer") {
-          await this.session.steer(command.message);
-        } else {
-          try {
-            await this.session.followUp(command.message);
-          } catch (error) {
-            await settleFollowUpAcceptance?.(false);
-            throw error;
+      await this.#withStreamingTimeout(
+        async () => {
+          if (command.type === "prompt") {
+            await this.session.prompt(command.message);
+          } else if (command.type === "steer") {
+            await this.session.steer(command.message);
+          } else {
+            try {
+              await this.session.followUp(command.message);
+            } catch (error) {
+              await settleFollowUpAcceptance?.(false);
+              throw error;
+            }
+            if (settleFollowUpAcceptance) {
+              requiredAgentEnds = await settleFollowUpAcceptance(true, observedAgentEnds);
+              resolveIfComplete();
+            }
           }
-          if (settleFollowUpAcceptance) {
-            requiredAgentEnds = await settleFollowUpAcceptance(true, observedAgentEnds);
-            resolveIfComplete();
-          }
+          await agentEnd;
+        },
+        timeoutMs,
+        this.hardCapMs,
+        (arm) => {
+          resetIdle = arm;
         }
-        await agentEnd;
-      }, timeoutMs);
+      );
       if (eventConsumerError) throw eventConsumerError;
     } finally {
       markPromptInactive();
@@ -381,6 +429,40 @@ export class SdkSession {
       throw error;
     } finally {
       clearTimeout(timer);
+    }
+  }
+  async #withStreamingTimeout(operation, idleMs, hardCapMs, onArm) {
+    const idleError = new Error("SDK command timed out");
+    const hardCapError = new Error("SDK command exceeded absolute hard-cap");
+    let idleTimer;
+    let hardCapTimer;
+    let rejectTimeout;
+    const timeout = new Promise((_, reject) => {
+      rejectTimeout = reject;
+    });
+    let settled = false;
+    const armIdle = () => {
+      if (settled) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => rejectTimeout(idleError), idleMs);
+    };
+    armIdle();
+    hardCapTimer = setTimeout(() => rejectTimeout(hardCapError), hardCapMs);
+
+    onArm?.(armIdle);
+
+    try {
+      return await Promise.race([Promise.resolve().then(operation), timeout]);
+    } catch (error) {
+      if (error === idleError || error === hardCapError) {
+        this.closed = true;
+        void this.#disposeUnderlying().catch(() => {});
+      }
+      throw error;
+    } finally {
+      settled = true;
+      clearTimeout(idleTimer);
+      clearTimeout(hardCapTimer);
     }
   }
 
