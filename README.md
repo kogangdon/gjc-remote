@@ -80,7 +80,8 @@ bun run --filter '@gjc-remote/daemon' start
 ```
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
-daemon runs on Bun (>=1.3.14) and embeds `@gajae-code/coding-agent` **0.11.10**
+daemon runs on Bun (>=1.3.14) and embeds the
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.6**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, and the smoke harness run on Node via their
