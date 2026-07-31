@@ -38,6 +38,8 @@ const {
   CHANNELS_CONFIG,
   HOST_WS_PORT,
   HOST_TOKENS,
+  GJC_INVOKE_IDLE_TIMEOUT_MS,
+  GJC_INVOKE_HARD_CAP_MS,
 } = process.env;
 const DEBUG_REMOTE = process.env.GJC_REMOTE_DEBUG === "1";
 
@@ -71,7 +73,25 @@ channelMap = loadChannelMap({ fatal: true });
 watchConfigFile(channelsPath, () => loadChannelMap({ fatal: false }));
 
 const skillNames = new Set(GJC_SKILLS.map((s) => s.name));
-const registry = new HostRegistry({ port: Number(HOST_WS_PORT || 7711), tokensByHostId });
+const invokeTimeoutOptions = {};
+function readInvokeTimeoutEnv(raw, key, envName) {
+  if (raw === undefined || `${raw}`.trim() === "") return;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    invokeTimeoutOptions[key] = parsed;
+    return;
+  }
+  console.warn(
+    `Ignoring ${envName}=${JSON.stringify(raw)}: not a positive duration; using the default.`
+  );
+}
+readInvokeTimeoutEnv(GJC_INVOKE_IDLE_TIMEOUT_MS, "invokeIdleTimeoutMs", "GJC_INVOKE_IDLE_TIMEOUT_MS");
+readInvokeTimeoutEnv(GJC_INVOKE_HARD_CAP_MS, "invokeHardCapMs", "GJC_INVOKE_HARD_CAP_MS");
+const registry = new HostRegistry({
+  port: Number(HOST_WS_PORT || 7711),
+  tokensByHostId,
+  ...invokeTimeoutOptions,
+});
 const toolLogStore = new ToolLogStore();
 
 const client = new Client({

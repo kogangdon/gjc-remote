@@ -142,6 +142,23 @@ test("heartbeat durations must be positive finite values", () => {
   }
 });
 
+test("adversarial: invoke idle/hard-cap durations must be positive finite values", () => {
+  const tokensByHostId = new Map([["host-a", "token-a"]]);
+
+  for (const invokeIdleTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new HostRegistry({ port: 0, tokensByHostId, invokeIdleTimeoutMs }),
+      /invokeIdleTimeoutMs must be a positive duration/
+    );
+  }
+  for (const invokeHardCapMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new HostRegistry({ port: 0, tokensByHostId, invokeHardCapMs }),
+      /invokeHardCapMs must be a positive duration/
+    );
+  }
+});
+
 test("v0 validators reject malformed required fields and preserve additive fields", () => {
   assert.equal(
     isRegisterMessage({
@@ -302,6 +319,242 @@ test("valid invoke events relay callbacks and assistant text", async () => {
 
     assert.deepEqual(await resultPromise, { ok: true, text: "answer" });
     assert.deepEqual(events, [event]);
+  } finally {
+    await server.close();
+  }
+});
+test("invoke idle timer resets on each streamed event", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 60,
+    invokeHardCapMs: 5000,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {}
+    );
+    let settled = false;
+    resultPromise.then(() => {
+      settled = true;
+    });
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    const event = { message: { role: "assistant", content: "still working" } };
+    for (let i = 0; i < 4; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      socket.send(JSON.stringify({ type: "event", requestId, event }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(settled, false);
+
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: "still working" });
+  } finally {
+    await server.close();
+  }
+});
+
+test("invoke idle expiry fires with zero events", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 20,
+    invokeHardCapMs: 5000,
+  });
+  try {
+    await server.connect("host-a", "token-a");
+    const result = await server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {}
+    );
+    assert.deepEqual(result, {
+      ok: false,
+      error: "timed out waiting for host response",
+    });
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("invoke hard cap fires despite continuous activity", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 1000,
+    invokeHardCapMs: 40,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+
+    let settled = false;
+    resultPromise.then(() => {
+      settled = true;
+    });
+    const event = { message: { role: "assistant", content: "still working" } };
+    const interval = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "event", requestId, event }));
+      }
+    }, 10);
+    try {
+      await waitFor(() => settled, 2000);
+    } finally {
+      clearInterval(interval);
+    }
+
+    assert.deepEqual(await resultPromise, {
+      ok: false,
+      error: "invoke exceeded absolute hard-cap",
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("invoke timers are cleared on normal resolve", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 30,
+    invokeHardCapMs: 200,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+
+    const result = await resultPromise;
+    assert.deepEqual(result, { ok: true, text: undefined });
+    assert.equal(server.registry.pendingRequests.size, 0);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+test("adversarial: a stale settle call after normal resolution is a safe no-op (double-resolve safety)", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 5000,
+    invokeHardCapMs: 5000,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    const pendingEntry = server.registry.pendingRequests.get(requestId);
+    assert.ok(pendingEntry);
+
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    const result = await resultPromise;
+    assert.deepEqual(result, { ok: true, text: undefined });
+    assert.equal(server.registry.pendingRequests.size, 0);
+
+    // Simulate a stale idle/hard-cap timer firing after the real done already
+    // settled this request: calling settle again must be a safe no-op that
+    // neither changes the resolved value nor corrupts registry state.
+    assert.doesNotThrow(() => {
+      pendingEntry.settle({ ok: false, error: "invoke exceeded absolute hard-cap" });
+    });
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: N sequential invokes leave no pending requests or armed timers (timer-leak safety)", async () => {
+  const server = await startRegistry(undefined, {
+    invokeIdleTimeoutMs: 50,
+    invokeHardCapMs: 5000,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const N = 5;
+    for (let i = 0; i < N; i += 1) {
+      const invokeFrame = once(socket, "message");
+      const resultPromise = server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: `hi-${i}` },
+        () => {}
+      );
+      const [raw] = await invokeFrame;
+      const { requestId } = JSON.parse(raw.toString());
+      socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+      const result = await resultPromise;
+      assert.deepEqual(result, { ok: true, text: undefined });
+      assert.equal(server.registry.pendingRequests.size, 0);
+      assert.equal(server.registry.pendingCountBySocket.size, 0);
+    }
+    // Wait past the idle window: if a timer had leaked or been left armed on
+    // a prior iteration it would fire (and corrupt state) by now.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: an event frame arriving after done is ignored and does not resurrect the pending entry (boundary)", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const events = [];
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      (event) => events.push(event)
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    assert.equal(server.registry.pendingRequests.size, 0);
+
+    // A late event frame for the same (now-settled) requestId must not crash,
+    // must not resurrect the pending entry, and must not re-arm a timer.
+    assert.doesNotThrow(() => {
+      socket.send(
+        JSON.stringify({
+          type: "event",
+          requestId,
+          event: { message: { role: "assistant", content: "late" } },
+        })
+      );
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(server.registry.pendingRequests.size, 0);
+    assert.equal(events.length, 0);
+    assert.equal(socket.readyState, WebSocket.OPEN);
   } finally {
     await server.close();
   }

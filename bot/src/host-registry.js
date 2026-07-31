@@ -16,6 +16,8 @@ import {
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
+const INVOKE_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
 const PING_PAYLOAD = JSON.stringify(PING);
 const SYSTEM_TIMERS = {
   setInterval: (callback, delay) => setInterval(callback, delay),
@@ -40,6 +42,8 @@ export class HostRegistry {
    *   tokensByHostId: Map<string, string>,
    *   heartbeatIntervalMs?: number,
    *   heartbeatTimeoutMs?: number,
+   *   invokeIdleTimeoutMs?: number,
+   *   invokeHardCapMs?: number,
    *   timers?: typeof SYSTEM_TIMERS,
    * }} opts
    */
@@ -48,6 +52,8 @@ export class HostRegistry {
     tokensByHostId,
     heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
+    invokeIdleTimeoutMs = INVOKE_IDLE_TIMEOUT_MS,
+    invokeHardCapMs = INVOKE_HARD_CAP_MS,
     timers = SYSTEM_TIMERS,
   }) {
     if (!isPositiveDuration(heartbeatIntervalMs)) {
@@ -56,9 +62,17 @@ export class HostRegistry {
     if (!isPositiveDuration(heartbeatTimeoutMs)) {
       throw new Error("heartbeatTimeoutMs must be a positive duration");
     }
+    if (!isPositiveDuration(invokeIdleTimeoutMs)) {
+      throw new Error("invokeIdleTimeoutMs must be a positive duration");
+    }
+    if (!isPositiveDuration(invokeHardCapMs)) {
+      throw new Error("invokeHardCapMs must be a positive duration");
+    }
 
     this.tokensByHostId = tokensByHostId;
     this.heartbeatTimeoutMs = heartbeatTimeoutMs;
+    this.invokeIdleTimeoutMs = invokeIdleTimeoutMs;
+    this.invokeHardCapMs = invokeHardCapMs;
     this.timers = timers;
     /** @type {Map<string, import("ws").WebSocket>} */
     this.connections = new Map();
@@ -184,6 +198,7 @@ export class HostRegistry {
       const text = extractAssistantText(msg.event);
       if (text !== undefined) pending.text = text;
       pending.onEvent(msg.event);
+      this.#armIdleTimer(pending);
     }
     if (msg.done) {
       pending.resolve({ ok: true, text: pending.text });
@@ -198,10 +213,19 @@ export class HostRegistry {
       (this.pendingCountBySocket.get(entry.socket) ?? 0) + 1
     );
   }
+  #armIdleTimer(pending) {
+    clearTimeout(pending.idleTimer);
+    pending.idleTimer = setTimeout(() => {
+      this.#deletePending(pending.requestId);
+      pending.settle({ ok: false, error: "timed out waiting for host response" });
+    }, pending.idleMs);
+  }
 
   #deletePending(requestId) {
     const entry = this.pendingRequests.get(requestId);
     if (!entry) return;
+    clearTimeout(entry.idleTimer);
+    clearTimeout(entry.hardCapTimer);
     this.pendingRequests.delete(requestId);
     const next = (this.pendingCountBySocket.get(entry.socket) ?? 0) - 1;
     if (next > 0) this.pendingCountBySocket.set(entry.socket, next);
@@ -339,9 +363,9 @@ export class HostRegistry {
    * @param {string} workDir
    * @param {object} command
    * @param {(event: object) => void} onEvent
-   * @param {number} timeoutMs
+   * @param {number} timeoutMs Idle timeout: resets on each streamed event.
    */
-  invoke(hostId, workDir, command, onEvent, timeoutMs = 10 * 60 * 1000) {
+  invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs) {
     const socket = this.connections.get(hostId);
     if (!socket) return Promise.resolve({ ok: false, error: `host '${hostId}' is not connected` });
 
@@ -370,19 +394,30 @@ export class HostRegistry {
     }
 
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.#deletePending(requestId);
-        resolve({ ok: false, error: "timed out waiting for host response" });
-      }, timeoutMs);
-
-      this.#addPending(requestId, {
+      let settled = false;
+      const pending = {
+        requestId,
         socket,
-        resolve: (result) => {
-          clearTimeout(timer);
+        onEvent,
+        idleMs: timeoutMs,
+        idleTimer: undefined,
+        hardCapTimer: undefined,
+        settle: (result) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(pending.idleTimer);
+          clearTimeout(pending.hardCapTimer);
           resolve(result);
         },
-        onEvent,
-      });
+        resolve: (result) => pending.settle(result),
+      };
+      pending.hardCapTimer = setTimeout(() => {
+        this.#deletePending(requestId);
+        pending.settle({ ok: false, error: "invoke exceeded absolute hard-cap" });
+      }, this.invokeHardCapMs);
+
+      this.#addPending(requestId, pending);
+      this.#armIdleTimer(pending);
 
       socket.send(payload);
     });
