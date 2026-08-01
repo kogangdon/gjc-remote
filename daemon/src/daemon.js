@@ -23,12 +23,13 @@ import {
 
 import {
   parseRegisterDeniedRetryMs,
+  parseShutdownTimeoutMs,
   REGISTER_DENIED_RETRY_MS,
+  SHUTDOWN_TIMEOUT_DEFAULT_MS,
   sanitizeErrorMessage,
   createReconnectScheduler,
 } from "./reconnect.js";
 
-const DAEMON_SHUTDOWN_TIMEOUT_MS = 15_000;
 const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
 
 if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
@@ -66,6 +67,18 @@ try {
 } catch (error) {
   console.error(
     `daemon: invalid GJC_REGISTER_DENIED_RETRY_MS: ${sanitizeDaemonError(error)}`
+  );
+  process.exit(1);
+}
+
+let DAEMON_SHUTDOWN_TIMEOUT_MS = SHUTDOWN_TIMEOUT_DEFAULT_MS;
+try {
+  DAEMON_SHUTDOWN_TIMEOUT_MS = parseShutdownTimeoutMs(
+    process.env.GJC_SHUTDOWN_TIMEOUT_MS
+  );
+} catch (error) {
+  console.error(
+    `daemon: invalid GJC_SHUTDOWN_TIMEOUT_MS: ${sanitizeDaemonError(error)}`
   );
   process.exit(1);
 }

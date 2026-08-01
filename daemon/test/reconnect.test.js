@@ -7,9 +7,12 @@ import {
   REGISTER_DENIED_RETRY_MS,
   REGISTER_DENIED_RETRY_DEFAULT_MS,
   REGISTER_DENIED_RETRY_MIN_MS,
+  SHUTDOWN_TIMEOUT_DEFAULT_MS,
+  SHUTDOWN_TIMEOUT_MIN_MS,
   TIMER_MAX_MS,
   nextReconnect,
   parseRegisterDeniedRetryMs,
+  parseShutdownTimeoutMs,
   createReconnectScheduler,
   sanitizeErrorMessage,
 } from "../src/reconnect.js";
@@ -104,6 +107,42 @@ test("registration-denied retry accepts the safe timer bounds", () => {
     REGISTER_DENIED_RETRY_MIN_MS
   );
   assert.equal(parseRegisterDeniedRetryMs(String(TIMER_MAX_MS)), TIMER_MAX_MS);
+});
+
+test("shutdown timeout defaults to fifteen seconds within the timer bounds", () => {
+  const timeoutMs = parseShutdownTimeoutMs(undefined);
+  assert.equal(timeoutMs, SHUTDOWN_TIMEOUT_DEFAULT_MS);
+  assert.equal(timeoutMs, 15_000);
+  assert.ok(timeoutMs >= SHUTDOWN_TIMEOUT_MIN_MS);
+  assert.ok(timeoutMs <= TIMER_MAX_MS);
+});
+
+test("shutdown timeout rejects hot-loop and unsafe configuration", () => {
+  for (const value of [
+    "",
+    "not-a-number",
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    "-1",
+    "0",
+    SHUTDOWN_TIMEOUT_MIN_MS - 1,
+    1.5,
+    Number.MAX_SAFE_INTEGER,
+    TIMER_MAX_MS + 1,
+  ]) {
+    assert.throws(() => parseShutdownTimeoutMs(value), {
+      name: "RangeError",
+    });
+  }
+});
+
+test("shutdown timeout accepts the safe timer bounds", () => {
+  assert.equal(
+    parseShutdownTimeoutMs(String(SHUTDOWN_TIMEOUT_MIN_MS)),
+    SHUTDOWN_TIMEOUT_MIN_MS
+  );
+  assert.equal(parseShutdownTimeoutMs(String(TIMER_MAX_MS)), TIMER_MAX_MS);
 });
 test("denied retry scheduling is isolated and accepted registration restores normal reconnects", () => {
   const timers = [];

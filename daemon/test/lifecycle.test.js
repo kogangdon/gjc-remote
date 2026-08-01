@@ -4,7 +4,10 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { WebSocketServer } from "ws";
-const fixturesDir = new URL("./fixtures/", import.meta.url);
+// Fixtures live OUTSIDE test/: bare `node --test` (the CI invocation)
+// discovers every .mjs under a directory named `test` and would run the
+// fixtures as test files.
+const fixturesDir = new URL("../test-fixtures/", import.meta.url);
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const TEST_TIMEOUT_MS = 8_000;
@@ -135,16 +138,21 @@ test("denied registration uses one fixed retry and accepted recovery restores no
     await new Promise((resolve) => wss.close(() => resolve()));
   }
 });
-test("SIGTERM with a failing session disposal still exits 0", async () => {
+// Spawn a test-fixtures/ entry under bun and wait for the process to finish.
+// Fixtures deliver "signals" by invoking the daemon's captured handlers, so
+// these tests behave identically on POSIX and Windows.
+async function runFixture(name, envOverrides = {}) {
   const child = spawn(
     process.env.BUN_BIN || "bun",
-    [fileURLToPath(new URL("shutdown-dispose-failure.mjs", fixturesDir))],
+    [fileURLToPath(new URL(name, fixturesDir))],
     {
       env: {
         ...process.env,
         HOST_ID: "lifecycle-test-host",
         HOST_TOKEN: "lifecycle-test-secret",
         BOT_WS_URL: "ws://127.0.0.1:9",
+        GJC_LIFECYCLE_FIXTURE: "1",
+        ...envOverrides,
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -159,27 +167,80 @@ test("SIGTERM with a failing session disposal still exits 0", async () => {
     output += chunk.toString();
   });
 
-  let exitResult;
   try {
-    exitResult = await new Promise((resolve, reject) => {
+    // "close" (not "exit") so both stdio pipes have flushed before the
+    // caller asserts on output.
+    const result = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
-        reject(new Error(`daemon did not exit; output: ${output}`));
+        reject(new Error(`fixture ${name} did not exit; output: ${output}`));
       }, TEST_TIMEOUT_MS);
-      child.once("exit", (code, signal) => {
+      child.once("close", (code, signal) => {
         clearTimeout(timer);
         resolve({ code, signal });
       });
     });
+    return { ...result, output };
   } finally {
     await stopChild(child);
   }
+}
+
+test("SIGTERM with a failing session disposal still exits 0", async () => {
+  const { code, signal, output } = await runFixture("shutdown-dispose-failure.mjs");
 
   assert.equal(
-    exitResult.code,
+    code,
     0,
-    `expected exit 0, got ${exitResult.code}; signal: ${exitResult.signal}; output: ${output}`
+    `expected exit 0, got ${code}; signal: ${signal}; output: ${output}`
   );
   assert.match(output, /daemon: shutdown failed: .*injected dispose failure/);
   assert.doesNotMatch(output, /\n\s+at /);
+});
+
+test("the shutdown deadline unblocks a hanging disposal and keeps exit 0", async () => {
+  // 1000ms is the validated minimum for GJC_SHUTDOWN_TIMEOUT_MS.
+  const { code, signal, output } = await runFixture("shutdown-hang.mjs", {
+    GJC_SHUTDOWN_TIMEOUT_MS: "1000",
+  });
+
+  assert.equal(
+    code,
+    0,
+    `expected exit 0, got ${code}; signal: ${signal}; output: ${output}`
+  );
+  assert.match(
+    output,
+    /daemon: shutdown timed out after 1000ms; session disposals were abandoned; pending operations: none/
+  );
+});
+
+test("a fatal during signal-initiated shutdown neither re-enters nor changes exit 0", async () => {
+  const { code, signal, output } = await runFixture(
+    "reentrancy-signal-then-fatal.mjs"
+  );
+
+  assert.equal(
+    code,
+    0,
+    `expected exit 0, got ${code}; signal: ${signal}; output: ${output}`
+  );
+  // The shutdown latch must hold: pool shutdown starts exactly once.
+  assert.equal((output.match(/POOL_SHUTDOWN_CALLED/g) ?? []).length, 1, output);
+  // The late fatal is recorded, not swallowed — it just cannot change the code.
+  assert.match(output, /daemon: uncaught exception: .*late fatal/);
+});
+
+test("a signal during fatal-initiated shutdown neither re-enters nor changes exit 1", async () => {
+  const { code, signal, output } = await runFixture(
+    "reentrancy-fatal-then-signal.mjs"
+  );
+
+  assert.equal(
+    code,
+    1,
+    `expected exit 1, got ${code}; signal: ${signal}; output: ${output}`
+  );
+  assert.equal((output.match(/POOL_SHUTDOWN_CALLED/g) ?? []).length, 1, output);
+  assert.match(output, /daemon: uncaught exception: .*early fatal/);
 });

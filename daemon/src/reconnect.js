@@ -3,6 +3,8 @@ const RECONNECT_MAX_MS = 30_000;
 const REGISTER_DENIED_RETRY_MS = 300_000;
 const REGISTER_DENIED_RETRY_DEFAULT_MS = REGISTER_DENIED_RETRY_MS;
 const REGISTER_DENIED_RETRY_MIN_MS = 1000;
+const SHUTDOWN_TIMEOUT_DEFAULT_MS = 15_000;
+const SHUTDOWN_TIMEOUT_MIN_MS = 1000;
 // setTimeout clamps larger values to a one millisecond timeout. Keep the
 // configured retry below that boundary so an invalid large value cannot turn
 // into a hot reconnect loop.
@@ -45,39 +47,67 @@ function sanitizeErrorMessage(value, sensitiveValues = []) {
 }
 
 /**
- * Parse and validate the fixed retry used after registration denial.
+ * Parse and validate a millisecond duration supplied via environment variable.
  *
- * Undefined means that the documented five-minute default should be used.
- * Every configured value must be an integer in the range accepted by
- * setTimeout and at least one second, so malformed test configuration cannot
- * create a hot loop.
+ * Undefined means the documented default should be used. Every configured
+ * value must be an integer in the range accepted by setTimeout and at least
+ * `minMs`, so malformed configuration can neither create a hot loop
+ * (setTimeout clamps out-of-range values to ~1ms) nor an unbounded wait.
+ *
+ * @param {unknown} value
+ * @param {{ envName: string, defaultMs: number, minMs: number }} bounds
+ * @returns {number}
+ */
+function parseBoundedTimeoutMs(value, { envName, defaultMs, minMs }) {
+  if (value === undefined) return defaultMs;
+
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "") {
+    throw new RangeError(`${envName} must be at least ${minMs}ms`);
+  }
+
+  const ms = typeof text === "number" ? text : Number(text);
+  if (
+    !Number.isFinite(ms) ||
+    !Number.isSafeInteger(ms) ||
+    ms < minMs ||
+    ms > TIMER_MAX_MS
+  ) {
+    throw new RangeError(
+      `${envName} must be a safe integer between ${minMs}ms and ${TIMER_MAX_MS}ms`
+    );
+  }
+  return ms;
+}
+
+/**
+ * Parse and validate the fixed retry used after registration denial.
  *
  * @param {unknown} value
  * @returns {number}
  */
 function parseRegisterDeniedRetryMs(value) {
-  if (value === undefined) return REGISTER_DENIED_RETRY_DEFAULT_MS;
+  return parseBoundedTimeoutMs(value, {
+    envName: "GJC_REGISTER_DENIED_RETRY_MS",
+    defaultMs: REGISTER_DENIED_RETRY_DEFAULT_MS,
+    minMs: REGISTER_DENIED_RETRY_MIN_MS,
+  });
+}
 
-  const text = typeof value === "string" ? value.trim() : value;
-  if (text === "") {
-    throw new RangeError(
-      `GJC_REGISTER_DENIED_RETRY_MS must be at least ${REGISTER_DENIED_RETRY_MIN_MS}ms`
-    );
-  }
-
-  const retryMs = typeof text === "number" ? text : Number(text);
-  if (
-    !Number.isFinite(retryMs) ||
-    !Number.isSafeInteger(retryMs) ||
-    retryMs < REGISTER_DENIED_RETRY_MIN_MS ||
-    retryMs > TIMER_MAX_MS
-  ) {
-    throw new RangeError(
-      `GJC_REGISTER_DENIED_RETRY_MS must be a safe integer between ` +
-        `${REGISTER_DENIED_RETRY_MIN_MS}ms and ${TIMER_MAX_MS}ms`
-    );
-  }
-  return retryMs;
+/**
+ * Parse and validate the daemon's overall shutdown deadline. The deadline
+ * must stay below any supervisor stop timeout so the daemon's clean exit
+ * never races the supervisor's kill.
+ *
+ * @param {unknown} value
+ * @returns {number}
+ */
+function parseShutdownTimeoutMs(value) {
+  return parseBoundedTimeoutMs(value, {
+    envName: "GJC_SHUTDOWN_TIMEOUT_MS",
+    defaultMs: SHUTDOWN_TIMEOUT_DEFAULT_MS,
+    minMs: SHUTDOWN_TIMEOUT_MIN_MS,
+  });
 }
 
 /**
@@ -186,8 +216,11 @@ export {
   REGISTER_DENIED_RETRY_MS,
   REGISTER_DENIED_RETRY_DEFAULT_MS,
   REGISTER_DENIED_RETRY_MIN_MS,
+  SHUTDOWN_TIMEOUT_DEFAULT_MS,
+  SHUTDOWN_TIMEOUT_MIN_MS,
   TIMER_MAX_MS,
   parseRegisterDeniedRetryMs,
+  parseShutdownTimeoutMs,
   nextReconnect,
   createReconnectScheduler,
   sanitizeErrorMessage,
