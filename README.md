@@ -81,16 +81,18 @@ bun run --filter '@gjc-remote/daemon' start
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
 daemon runs on Bun (>=1.3.14) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.5**
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.7**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, and the smoke harness run on Node via their
 package scripts, so keep Node available on the bot host — or add `--bun` to
 `bun run` to execute those Node scripts under Bun instead.
 
-> **SDK rollback (v0.2.2):** v0.2.1's `@gajae-code/coding-agent` 0.12.6
-> rollout is held due to the LunaMaxxing issue. v0.2.2 returns to the known-good
-> SDK **0.12.5** pending upstream 0.12.7/hotfix confirmation.
+> **SDK update:** `@gajae-code/coding-agent` is pinned to **0.12.7**.
+> The 0.12.6 hold is closed for this repository after the 0.12.7 package
+> availability check and local regression evidence: daemon regression (44 tests),
+> workspace suite (118 tests), and local smoke (`SMOKE_OK`) passed. Provider/model
+> switch coverage remains environment-dependent.
 
 **Optional environment variables** — beyond the required keys above:
 
@@ -99,7 +101,10 @@ package scripts, so keep Node available on the bot host — or add `--bun` to
   `GJC_REMOTE_DEBUG=1` logs Discord interaction lifecycle and relayed GJC event
   summaries; `CHANNELS_CONFIG` overrides the `channels.json` path.
 - **daemon** — `HOST_LABEL` sets a human-readable name shown in the bot's connect
-  logs; `GJC_MODEL_PROFILE` overrides the activated model profile.
+  logs; `GJC_MODEL_PROFILE` overrides the activated model profile;
+  `GJC_SHUTDOWN_TIMEOUT_MS` overrides the daemon shutdown deadline (default
+  15000ms, validated from 1000ms through the runtime timer maximum). Keep it
+  below the external supervisor's daemon stop timeout.
 
 ## Provider authentication (e.g. GitHub Copilot)
 
@@ -178,37 +183,51 @@ Discord credentials.
 
 ### Process supervision
 
-Neither component daemonizes itself; run each under a supervisor that restarts
-on exit. Both handle `SIGINT`/`SIGTERM` gracefully, so plain signal-based stop
-commands are safe:
+Neither component daemonizes itself. The approved operations boundary is
+documented in [`docs/process-supervision.md`](docs/process-supervision.md), with
+the decision in [`docs/adr/0001-process-supervision.md`](docs/adr/0001-process-supervision.md)
+and failure scenarios in
+[`docs/pre-mortem-process-supervision.md`](docs/pre-mortem-process-supervision.md).
 
-- **bot** closes the host WS registry first (in-flight invokes settle, daemons
-  observe a clean socket close), then destroys the Discord client. Each step is
-  bounded by a 10s timeout, so a hung dependency cannot wedge the stop.
-- **daemon** disposes its GJC SDK session pool (`pool.shutdown()`) before
-  exiting; stalled sessions are bounded by the pool's own timeouts.
+The current Windows evaluation path is Shawl: one `GJCRemoteBot` service and one
+`GJCRemoteDaemon-<instance-key>` per exact valid `HOST_ID`. Shawl v1.9.0 has
+passed local Windows checks for daemon and bot child replacement, daemon
+reconnect/registration after bot recovery, and graceful stop without an
+unwanted restart. Shawl is not yet the production primary because its
+distributed binary is unsigned; hash pinning, artifact provenance,
+service-account configuration, and production Windows evidence remain required.
 
-Examples:
+The production-primary design remains a future first-party signed Windows
+service wrapper registered through the Windows SCM. Directly registering Bun or
+Node with `sc.exe` is unsupported because those processes do not implement the
+Windows Service Control API. NSSM remains a legacy fallback candidate only; its
+current installer contract is not the recommended Windows path. Linux uses a bot
+unit plus a true `gjc-remote-daemon@.service` template. The documents define
+account/profile/env/ACL boundaries, current-run readiness, restart/rotation,
+rollback, transaction proofs, and honest best-effort stop/manual-cleanup
+semantics. Host-policy journald is consumed by default; global changes need
+separate approval.
 
-```bash
-# pm2 (bot host and/or daemon hosts)
-pm2 start bun --name gjc-remote-bot -- run --filter '@gjc-remote/bot' start
-pm2 start bun --name gjc-remote-daemon -- run --filter '@gjc-remote/daemon' start
-pm2 save
+**Platform evidence is pending.** These links describe the current contract and
+evaluation results; they do not claim that a signed Windows primary wrapper,
+production Windows account/ACL behavior, Linux boot/readiness, relay behavior,
+or transaction fault-injection has been verified. Existing foreground commands
+remain the universal rollback:
 
-# systemd (per-unit sketch; set WorkingDirectory to the repo root)
-# [Service]
-# WorkingDirectory=/srv/gjc-remote
-# ExecStart=/usr/bin/env bun run --filter '@gjc-remote/daemon' start
-# Restart=on-failure
-# KillSignal=SIGTERM
-# TimeoutStopSec=30
+```text
+# from the repository root
+cd bot    && node src/bot.js
+cd daemon && bun src/daemon.js   # Bun >= 1.3.14
 ```
 
-On native Windows daemon hosts, use a service wrapper (e.g. NSSM or a
-Scheduled Task with restart-on-failure) around the same bun command. A daemon
-that dies reconnects on start with equal-jitter exponential backoff, so mass
-restarts do not thundering-herd the bot.
+The daemon reconnects with equal-jitter exponential backoff after a
+disconnect; this is application behavior and is separate from supervisor
+restart policy.
+Registration denial is intentionally separate from transport reconnects: the daemon
+waits 5 minutes (`GJC_REGISTER_DENIED_RETRY_MS`, validated to a safe timer range)
+before retrying and emits a sanitized warning. A successful registration clears that
+state. Shutdown is bounded at 15 seconds; signal shutdown exits 0 even when disposal
+fails, while fatal shutdown exits non-zero.
 
 ### Rotation, retention, rollback
 
@@ -224,8 +243,11 @@ restarts do not thundering-herd the bot.
 - **Session history**: each daemon workDir persists GJC session history under
   `<workDir>/.gjc-remote-session`; idle in-process sessions are disposed after
   1 hour. Delete that directory to reset a project's remote history.
-- **Process logs**: both components log to stdout/stderr; retention is the
-  supervisor's job (`pm2 install pm2-logrotate`, or journald's defaults).
+- **Process logs**: both components log to stdout/stderr. Retention is
+  supervisor-specific: Shawl's retention/rotation must be explicitly configured
+  and verified; Linux uses host-policy journald defaults. NSSM's bounded
+  current/`.old` policy applies only to its legacy fallback. See
+  [`docs/process-supervision.md`](docs/process-supervision.md).
 
 ## Security notes
 

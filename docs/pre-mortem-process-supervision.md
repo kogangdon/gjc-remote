@@ -1,0 +1,34 @@
+# Pre-mortem: process supervision
+
+This review covers the Linux systemd path and the Windows Shawl evaluation path,
+with NSSM retained only as a legacy fallback. **Production Windows provenance
+and platform evidence remain pending.** A scenario is not closed by documentation
+or a green service status; the named evidence must exist.
+
+| # | Failure scenario and signal | Owner | Mitigation and escalation | Required evidence |
+|---:|---|---|---|---|
+| 1 | A Windows supervisor signals the wrapper but an active child remains; tree poll reaches 35,000 ms or force appears. | Windows adapter maintainer | Classify `force-required`; suppress restart, revalidate PID/start time, use only verified process-tree termination, or fall back to foreground/manual. A repeatable unsafe child blocks unattended production use. | No-child and active-child fixtures, tree snapshots, measured signal latency, force/manual record. |
+| 2 | A stale Windows log marker declares a failed restart ready. | Readiness owner | Require pre-start offsets, current boot, current PID/start time, and post-boundary marker plus relay evidence; stale output or PID reuse fails. | Seeded stale logs, offsets, PID/start-time lineage, bot/daemon current-run evidence within 60 s. |
+| 3 | A stale Linux journal declares a new invocation ready. | Linux/systemd owner | Match `InvocationID`, boot ID, unit/cgroup, PID, and start timestamp; require exact current host registration. `active (running)` is insufficient. | JSON journal records for old/new invocations, cgroup/PID filtering, registration evidence. |
+| 4 | A global journald change harms unrelated services or retention. | Linux administrator | Default install only consumes host policy. Any global drop-in needs written approval, baseline/diff, owned rollback, and separate evidence. Stop if an installer edits it silently. | Before/after global config and disk policy, approval, rollback proof, unit-scoped queries. |
+| 5 | PowerShell and Linux compute different ownership fingerprints for Unicode, paths, or newlines. | Operations contract owner | Use the published canonical byte algorithm, exact UTF-8 `HOST_ID` bytes, path-rule version, and shared fixture. Hash/byte mismatch stops release. | Cross-platform fixture bytes, no BOM/trailing byte, identical lower-case SHA-256. |
+| 6 | First install strands a service, or an interrupted update removes data. | Transaction owner | Journal and staged manifest precede mutation; old/new proofs are retained; recovery is idempotent and proof-bound. Never delete env, provider stores, logs, or `.gjc-remote-session`. | Fault injection at every install/update boundary, before/after envelopes, recovery state, preservation sentinels. |
+| 7 | A stale journal meets same-name service recreation and recovery takes it over. | Recovery owner | Require exact three-way journal/manifest/resource match for owner, role, operation, fingerprint, nonce, and proof. Any new/missing/malformed marker becomes durable `manual-cleanup`; leave resource untouched and block the key. | Recreated-service race fixture (same owner/fingerprint), unchanged resource/data, manual-cleanup record and operator action. |
+| 8 | NSSM provenance is accepted from a copied or tampered receipt. | Release/provenance owner | Require exact pinned URL/version and exact 64/40-hex shape/value. Hash actual operator ZIP and extracted `win64\\nssm.exe` with an authoritative tool; no auto-download/bundling. Mismatch stops release. | Sanitized `Get-FileHash -Algorithm SHA256` outputs, source/path/tool metadata, archive and executable byte comparisons. |
+| 9 | Two hosts collide, or controls/newlines spoof a service or log correlation. | Identity owner | Validate exact protocol `HOST_ID`, derive slug plus full exact-UTF-8 hash, reject controls/surrogates, and escape correlation output. Never normalize or name by slug alone. | Boundary IDs (128 code units, astral, collisions), exact-ID mismatch refusal, sanitized names/logs. |
+| 10 | A service runs with the wrong cwd, env, account, HOME, or provider profile. | Account/environment owner | Use absolute paths and component-local env loading; dedicated account/profile, protected `.gjc`, mode/ACL checks, provider login as service identity, URL credential rejection, debug off. | Startup environment/path/account evidence, path-with-spaces case, profile/provider readiness, ACL and secret scan. |
+| 11 | Token rotation causes a restart storm or leaves an opaque offline bot. | Release operator | Stop daemon first, update/restart bot and prove readiness, update/restart daemon and registration, use protected backup and reverse rollback within 120 s. Keep supervisor restart and daemon reconnect evidence separate. | Old-token rejection, two 60-s readiness windows, registration/host-connected evidence, numeric restart/start-limit records, no token output. |
+| 12 | Planned restart loses pending work and is misreported as a drain. | Operations owner | Document that pending invokes/gates may fail and force cleanup is loss/failure evidence. Preserve durable session data; make no migration or drain claim. | Pending-request failures, teardown timeout/force records, preserved `.gjc-remote-session`, separate app/supervisor timelines. |
+| 13 | A Linux unit verifies but cannot boot. | Linux owner | Render concrete units and `%i` instances with absolute paths/users; validate env quoting, mode-0600 env, per-instance HOME, network ordering, control-group stop, and limits. | `systemd-analyze verify`, boot/start logs, account/path permissions, template and at least two instances. |
+| 14 | Secrets leak through metadata, journals, output, or evidence. | Security reviewer | Keep service descriptions/proofs/journals/tombstones secret-free; reject credential-bearing URLs; protect ACLs/modes; scan commands, env, Event Log/journal, stdout/stderr, and artifacts. Any sentinel hit stops release. | Sentinel scan across all surfaces, redacted artifacts, ACL/mode evidence, no raw token/prompt/credential path. |
+
+## Release gate
+
+Close a row only with the required artifact and an owner sign-off. Missing Windows, Linux, relay, transaction, provenance, readiness, rotation, or secret-scan evidence is an escalation—not a waiver. If any row fails, use the foreground commands documented in [the runbook](process-supervision.md) and obtain a new ADR before changing the selected boundary.
+
+## References
+
+- [ADR 0001: Process supervision](adr/0001-process-supervision.md)
+- [NSSM usage](https://nssm.cc/usage) and [commands](https://nssm.cc/commands)
+- [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html), [systemd.unit](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html), and [journald.conf](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)
+- [Node signal events](https://nodejs.org/api/process.html#signal-events)
