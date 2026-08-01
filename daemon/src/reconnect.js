@@ -7,6 +7,42 @@ const REGISTER_DENIED_RETRY_MIN_MS = 1000;
 // configured retry below that boundary so an invalid large value cannot turn
 // into a hot reconnect loop.
 const TIMER_MAX_MS = 2_147_483_647;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+const URL_CREDENTIALS = /:\/\/[^/\s@]+@/g;
+const MAX_SANITIZED_ERROR_LENGTH = 500;
+
+function stringifyErrorMessage(value) {
+  try {
+    if (value instanceof Error) return String(value.message);
+    return String(value);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Convert an arbitrary thrown value into a bounded, single-line diagnostic.
+ * Only the message is used for Error instances; stack traces and raw objects
+ * never reach logs.
+ *
+ * @param {unknown} value
+ * @param {Iterable<unknown>} [sensitiveValues]
+ * @returns {string}
+ */
+function sanitizeErrorMessage(value, sensitiveValues = []) {
+  let message = stringifyErrorMessage(value);
+  for (const secret of sensitiveValues) {
+    if (typeof secret !== "string" || secret.length === 0) continue;
+    message = message.split(secret).join("[redacted]");
+  }
+  message = message
+    .replace(URL_CREDENTIALS, "://[redacted]@")
+    .replace(CONTROL_CHARACTERS, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (message.length === 0) message = "unknown error";
+  return message.slice(0, MAX_SANITIZED_ERROR_LENGTH);
+}
 
 /**
  * Parse and validate the fixed retry used after registration denial.
@@ -75,6 +111,74 @@ function nextReconnect(
   const nextBase = Math.min(capped * 2, max);
   return { delay, nextBase };
 }
+function createReconnectScheduler({
+  deniedRetryMs = REGISTER_DENIED_RETRY_DEFAULT_MS,
+  onReconnect = () => {},
+  logger = console.log,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+  random = Math.random,
+} = {}) {
+  let reconnectDelay = RECONNECT_BASE_MS;
+  let timer = null;
+  let registrationDenied = false;
+
+  function clear() {
+    if (timer !== null) {
+      clearTimeoutFn(timer);
+      timer = null;
+    }
+  }
+
+  function scheduleNormal() {
+    if (timer !== null) return;
+    const { delay, nextBase } = nextReconnect(reconnectDelay, { random });
+    reconnectDelay = nextBase;
+    logger(`daemon: disconnected from bot, retrying in ${delay}ms`);
+    timer = setTimeoutFn(() => {
+      timer = null;
+      onReconnect();
+    }, delay);
+  }
+
+  function scheduleDenied() {
+    if (timer !== null) return;
+    logger(`daemon: registration denied, retrying in ${deniedRetryMs}ms`);
+    timer = setTimeoutFn(() => {
+      timer = null;
+      onReconnect();
+    }, deniedRetryMs);
+  }
+
+  return {
+    clear,
+    resetBackoff() {
+      reconnectDelay = RECONNECT_BASE_MS;
+    },
+    markDenied() {
+      registrationDenied = true;
+    },
+    markAccepted() {
+      registrationDenied = false;
+      clear();
+    },
+    scheduleNormal,
+    scheduleDenied,
+    onClose({ deniedForConnection = false } = {}) {
+      if (registrationDenied) {
+        if (!deniedForConnection) scheduleDenied();
+        return;
+      }
+      scheduleNormal();
+    },
+    isDenied() {
+      return registrationDenied;
+    },
+    hasTimer() {
+      return timer !== null;
+    },
+  };
+}
 
 export {
   RECONNECT_BASE_MS,
@@ -85,4 +189,6 @@ export {
   TIMER_MAX_MS,
   parseRegisterDeniedRetryMs,
   nextReconnect,
+  createReconnectScheduler,
+  sanitizeErrorMessage,
 };

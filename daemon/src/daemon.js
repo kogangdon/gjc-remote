@@ -22,10 +22,10 @@ import {
 } from "./ws-payload.js";
 
 import {
-  RECONNECT_BASE_MS,
-  nextReconnect,
   parseRegisterDeniedRetryMs,
   REGISTER_DENIED_RETRY_MS,
+  sanitizeErrorMessage,
+  createReconnectScheduler,
 } from "./reconnect.js";
 
 const DAEMON_SHUTDOWN_TIMEOUT_MS = 15_000;
@@ -35,6 +35,28 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
   console.error("Missing HOST_ID, HOST_TOKEN, or BOT_WS_URL in environment (.env).");
   process.exit(1);
 }
+function readBotWsUrlCredentials(value) {
+  try {
+    const url = new URL(value);
+    return [
+      url.username,
+      url.password,
+      ...url.searchParams.values(),
+      url.hash.slice(1),
+    ].filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+const daemonSensitiveValues = [
+  HOST_TOKEN,
+  ...readBotWsUrlCredentials(BOT_WS_URL),
+].filter((value) => typeof value === "string" && value.length > 0);
+
+function sanitizeDaemonError(error) {
+  return sanitizeErrorMessage(error, daemonSensitiveValues);
+}
 
 let registerDeniedRetryMs = REGISTER_DENIED_RETRY_MS;
 try {
@@ -42,49 +64,36 @@ try {
     process.env.GJC_REGISTER_DENIED_RETRY_MS
   );
 } catch (error) {
-  console.error(`daemon: invalid GJC_REGISTER_DENIED_RETRY_MS: ${error.message}`);
+  console.error(
+    `daemon: invalid GJC_REGISTER_DENIED_RETRY_MS: ${sanitizeDaemonError(error)}`
+  );
   process.exit(1);
 }
 
-const pool = new SessionPool();
+const pool = new SessionPool({ sensitiveValues: daemonSensitiveValues });
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
 const inFlightByRequestId = new Map();
 const connections = new Set();
-let reconnectDelay = RECONNECT_BASE_MS;
-let reconnectTimer = null;
-let registrationDenied = false;
 let shuttingDown = false;
 let shutdownPromise = null;
 let shutdownExitCode = null;
+const retryScheduler = createReconnectScheduler({
+  deniedRetryMs: registerDeniedRetryMs,
+  onReconnect: () => {
+    if (!shuttingDown) connectToBot();
+  },
+});
 
 function clearReconnectTimer() {
-  if (reconnectTimer !== null) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
+  retryScheduler.clear();
 }
 
-function scheduleReconnect() {
-  if (shuttingDown || reconnectTimer !== null) return;
-  const { delay, nextBase } = nextReconnect(reconnectDelay);
-  reconnectDelay = nextBase;
-  console.log(`daemon: disconnected from bot, retrying in ${delay}ms`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectToBot();
-  }, delay);
-}
 
 function scheduleDeniedRetry() {
-  if (shuttingDown || reconnectTimer !== null) return;
-  const delay = registerDeniedRetryMs;
-  console.log(`daemon: registration denied, retrying in ${delay}ms`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectToBot();
-  }, delay);
+  if (shuttingDown) return;
+  retryScheduler.scheduleDenied();
 }
 
 function sanitizeRegistrationReason(reason) {
@@ -105,7 +114,7 @@ function connectToBot() {
   connections.add(connection);
 
   connection.on("open", () => {
-    reconnectDelay = RECONNECT_BASE_MS;
+    retryScheduler.resetBackoff();
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.REGISTER,
@@ -116,7 +125,10 @@ function connectToBot() {
         capabilities: CAPABILITIES,
       })
     );
-    console.log(`daemon: connected to bot at ${BOT_WS_URL}, registering as '${HOST_ID}'`);
+    console.log(
+      `daemon: connected to bot at ${sanitizeDaemonError(BOT_WS_URL)}, ` +
+        `registering as '${sanitizeDaemonError(HOST_ID)}'`
+    );
   });
 
   connection.on("message", (raw, isBinary) =>
@@ -124,21 +136,22 @@ function connectToBot() {
       wasDenied: () => deniedForConnection,
       markDenied: () => {
         deniedForConnection = true;
+        retryScheduler.markDenied();
       },
-    }).catch((err) => console.error("daemon: handler error", err))
+    }).catch((err) =>
+      console.error(`daemon: handler error: ${sanitizeDaemonError(err)}`)
+    )
   );
 
   connection.on("close", () => {
     connections.delete(connection);
     if (shuttingDown) return;
-    if (registrationDenied) {
-      if (!deniedForConnection) scheduleDeniedRetry();
-      return;
-    }
-    scheduleReconnect();
+    retryScheduler.onClose({ deniedForConnection });
   });
 
-  connection.on("error", (err) => console.error("daemon: ws error", err.message));
+  connection.on("error", (err) =>
+    console.error(`daemon: ws error: ${sanitizeDaemonError(err)}`)
+  );
 }
 
 async function handleMessage(
@@ -174,8 +187,7 @@ async function handleMessage(
   if (isRegisterOkMessage(msg)) {
     // A denied registration remains denied across transport failures. Only a
     // successful registration clears the fixed-denial retry state.
-    registrationDenied = false;
-    clearReconnectTimer();
+    retryScheduler.markAccepted();
     const negotiatedVersion = Math.min(
       PROTOCOL_VERSION,
       msg.protocolVersion ?? 0
@@ -190,7 +202,6 @@ async function handleMessage(
   if (isRegisterDeniedMessage(msg)) {
     if (!wasDenied()) {
       markDenied();
-      registrationDenied = true;
       const hasSafeReason =
         sanitizeRegistrationReason(msg.reason) !== "unspecified";
       console.warn(
@@ -201,7 +212,9 @@ async function handleMessage(
     try {
       connection.close(1008, "registration denied");
     } catch (error) {
-      console.error("daemon: failed to close denied websocket", error);
+      console.error(
+        `daemon: failed to close denied websocket: ${sanitizeDaemonError(error)}`
+      );
     } finally {
       scheduleDeniedRetry();
     }
@@ -220,7 +233,9 @@ async function handleMessage(
       try {
         await session.answerGate(msg.gateId, msg.answer);
       } catch (err) {
-        console.error("daemon: failed to answer gate:", err);
+        console.error(
+          `daemon: failed to answer gate: ${sanitizeDaemonError(err)}`
+        );
       }
     }
     return;
@@ -250,7 +265,7 @@ async function handleMessage(
     send(undefined, { done: true });
   } catch (err) {
     send(undefined, {
-      error: normalizeProtocolError(err),
+      error: sanitizeDaemonError(normalizeProtocolError(err)),
       done: true,
     });
   } finally {
@@ -277,9 +292,29 @@ function closeConnections() {
     try {
       connection.close(1000, "daemon shutting down");
     } catch (error) {
-      console.error("daemon: failed to close websocket during shutdown", error);
+      console.error(
+        `daemon: failed to close websocket during shutdown: ${sanitizeDaemonError(
+          error
+        )}`
+      );
     }
   }
+}
+function formatPendingShutdownOperations() {
+  let pending;
+  try {
+    pending = pool.getPendingShutdownOperations?.() ?? [];
+  } catch (error) {
+    return `unavailable (${sanitizeDaemonError(error)})`;
+  }
+  if (!Array.isArray(pending) || pending.length === 0) return "none";
+  return pending
+    .map(({ workDir, operation }) => {
+      const label = sanitizeDaemonError(operation || "operation");
+      const path = sanitizeDaemonError(workDir || "unknown workDir");
+      return `${label} for ${path}`;
+    })
+    .join(", ");
 }
 
 async function shutdownAndExit(exitCode) {
@@ -295,7 +330,8 @@ async function shutdownAndExit(exitCode) {
       timer = setTimeout(() => {
         console.error(
           `daemon: shutdown timed out after ${DAEMON_SHUTDOWN_TIMEOUT_MS}ms; ` +
-            "session disposals were abandoned"
+            `session disposals were abandoned; ` +
+            `pending operations: ${formatPendingShutdownOperations()}`
         );
         resolve();
       }, DAEMON_SHUTDOWN_TIMEOUT_MS);
@@ -306,7 +342,7 @@ async function shutdownAndExit(exitCode) {
     } catch (error) {
       // Signal shutdown remains successful even if disposal fails. Fatal
       // shutdown keeps the first caller's non-zero exit code.
-      console.error("daemon: shutdown failed", error);
+      console.error(`daemon: shutdown failed: ${sanitizeDaemonError(error)}`);
     } finally {
       clearTimeout(timer);
       process.exit(shutdownExitCode);
@@ -322,11 +358,11 @@ process.on("SIGTERM", () => {
   void shutdownAndExit(0);
 });
 process.on("unhandledRejection", (reason) => {
-  console.error("daemon: unhandled rejection", reason);
+  console.error(`daemon: unhandled rejection: ${sanitizeDaemonError(reason)}`);
   void shutdownAndExit(1);
 });
 process.on("uncaughtException", (error) => {
-  console.error("daemon: uncaught exception", error);
+  console.error(`daemon: uncaught exception: ${sanitizeDaemonError(error)}`);
   void shutdownAndExit(1);
 });
 
@@ -334,7 +370,7 @@ connectToBot();
 
 export {
   DAEMON_SHUTDOWN_TIMEOUT_MS,
-  parseRegisterDeniedRetryMs,
   sanitizeRegistrationReason,
   shutdownAndExit,
+  sanitizeDaemonError,
 };

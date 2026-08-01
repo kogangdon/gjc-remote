@@ -156,6 +156,19 @@ test("WebSocket server errors are surfaced through the registry callback", async
     await new Promise((resolve) => blocker.close(resolve));
   }
 });
+test("non-function onError values do not throw from WS server errors", async () => {
+  const registry = new HostRegistry({
+    port: 0,
+    tokensByHostId: new Map([["host-a", "token-a"]]),
+    onError: "not a callback",
+  });
+
+  try {
+    assert.doesNotThrow(() => registry.wss.emit("error", new Error("synthetic WS error")));
+  } finally {
+    await registry.close().catch(() => {});
+  }
+});
 test("heartbeat durations must be positive finite values", () => {
   const tokensByHostId = new Map([["host-a", "token-a"]]);
 

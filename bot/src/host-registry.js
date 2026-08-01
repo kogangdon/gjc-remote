@@ -95,7 +95,7 @@ export class HostRegistry {
     this.wss.on("connection", (socket) => this.#handleConnection(socket));
     this.onError = onError;
     this.wss.on("error", (error) => {
-      if (this.onError) this.onError(error);
+      if (typeof this.onError === "function") this.onError(error);
       else console.error(`HostRegistry: WS server error: ${error?.message ?? String(error)}`);
     });
     this.heartbeatTimer = this.timers.setInterval(

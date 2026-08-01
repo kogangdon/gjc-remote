@@ -10,6 +10,8 @@ import {
   TIMER_MAX_MS,
   nextReconnect,
   parseRegisterDeniedRetryMs,
+  createReconnectScheduler,
+  sanitizeErrorMessage,
 } from "../src/reconnect.js";
 
 test("delay stays within the equal-jitter window and base doubles", () => {
@@ -102,4 +104,59 @@ test("registration-denied retry accepts the safe timer bounds", () => {
     REGISTER_DENIED_RETRY_MIN_MS
   );
   assert.equal(parseRegisterDeniedRetryMs(String(TIMER_MAX_MS)), TIMER_MAX_MS);
+});
+test("denied retry scheduling is isolated and accepted registration restores normal reconnects", () => {
+  const timers = [];
+  const cleared = [];
+  const logs = [];
+  const reconnects = [];
+  const scheduler = createReconnectScheduler({
+    deniedRetryMs: REGISTER_DENIED_RETRY_MIN_MS,
+    onReconnect: () => reconnects.push("connect"),
+    logger: (line) => logs.push(line),
+    random: () => 0,
+    setTimeoutFn: (callback, delay) => {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: (timer) => cleared.push(timer),
+  });
+
+  scheduler.markDenied();
+  scheduler.scheduleDenied();
+  scheduler.onClose({ deniedForConnection: true });
+  scheduler.onClose({ deniedForConnection: false });
+
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, REGISTER_DENIED_RETRY_MIN_MS);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /registration denied/);
+  assert.equal(scheduler.isDenied(), true);
+
+  scheduler.markAccepted();
+  assert.deepEqual(cleared, [timers[0]]);
+  assert.equal(scheduler.isDenied(), false);
+
+  scheduler.onClose();
+  assert.equal(timers.length, 2);
+  assert.equal(timers[1].delay, RECONNECT_BASE_MS / 2);
+  assert.match(logs[1], /disconnected from bot/);
+
+  timers[1].callback();
+  assert.deepEqual(reconnects, ["connect"]);
+});
+test("error diagnostics redact secrets, controls, and stacks", () => {
+  const token = "host-token";
+  const error = new Error(
+    `failed ${token} ws://user:password@example.test/path\nstack line`
+  );
+  const message = sanitizeErrorMessage(error, [token]);
+
+  assert.equal(
+    message,
+    "failed [redacted] ws://[redacted]@example.test/path stack line"
+  );
+  assert.equal(message.includes(error.stack), false);
+  assert.equal(sanitizeErrorMessage({ stack: "private" }, [token]), "[object Object]");
 });
