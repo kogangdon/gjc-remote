@@ -46,7 +46,7 @@ Shawl is the current Windows evaluation adapter. Stage the operator-supplied
 binary at `C:\ProgramData\gjc-remote\shawl\shawl.exe`, protect the directory
 from inherited user access, and record the actual executable SHA-256 before
 registration. The binary tested locally was v1.9.0, SHA-256
-`0985555B71E7F943B8F3FC639952A9890AA62E66617942A2D0996985FE8E7C6D`, and had
+`0985555b71e7f943b8f3fc639952a9890aa62e66617942a2d0996985fe8e7c6d`, and had
 no Authenticode signature. Do not treat the hash as provenance without recording
 the source release and independently verifying the bytes.
 The tested binary was unsigned; production use is blocked until the source
@@ -55,11 +55,20 @@ recorded and reviewed.
 
 Use absolute Bun/Node paths; a service account cannot be expected to resolve a
 user-scoped runtime from `PATH`. Keep credentials in the component-local `.env`
-and do not pass secrets in Shawl arguments or service metadata. Configure
-`--kill-process-tree`, a bounded `--stop-timeout`, explicit restart conditions,
-delay, and a protected log directory. Run Shawl under a least-privilege service
-account in production; the local test used the default account only as functional
-evidence.
+and do not pass secrets in Shawl arguments or service metadata. Use the tested
+restart contract (restart on non-zero exit only; do not pass `--restart`) and
+configure these stop bounds:
+
+- daemon: `--stop-timeout 20000`; this exceeds the daemon's default
+  `GJC_SHUTDOWN_TIMEOUT_MS=15000`;
+- bot: `--stop-timeout 30000`; this exceeds the bot's two sequential 10-second
+  teardown steps.
+
+Also configure `--kill-process-tree`, `--restart-if-not 0`, a restart delay, and
+a protected log directory. `GJC_SHUTDOWN_TIMEOUT_MS` is validated from 1000 ms
+through the runtime timer maximum; values above the supervisor stop timeout are
+unsafe. Run Shawl under a least-privilege service account in production; the
+local test used the default account only as functional evidence.
 
 The local Windows checks passed:
 
@@ -75,7 +84,7 @@ back to the foreground commands below.
 
 ### Legacy NSSM fallback (not primary)
 
-### Provenance gate
+#### Provenance gate
 
 Obtain NSSM yourself from the approved URL; do not download it from an installer, bundle it, or commit the binary:
 
@@ -98,7 +107,7 @@ win64\nssm.exe SHA-256  eee9c44c29c2be011f1f1e43bb8c3fca888cb81053022ec5a0060035
 
 A receipt string without matching authoritative byte observations fails the release gate. The archive and executable hashes are exactly 64 lower-case hex characters; the build hash is exactly 40.
 
-### Service contract
+#### Service contract
 
 Install exactly `GJCRemoteBot` or one `GJCRemoteDaemon-<instance-key>` under the component directory with absolute Node/Bun and application paths, delayed automatic start, own-process type, and an explicit service account. Configure the existing component-local `.env`; `AppEnvironmentExtra` is limited to non-secret profile paths and `GJC_REMOTE_DEBUG=0`. Query settings with `nssm get` after writing them:
 
@@ -109,7 +118,7 @@ Install exactly `GJCRemoteBot` or one `GJCRemoteDaemon-<instance-key>` under the
 
 NSSM appends stdout/stderr to protected files, keeping current plus one `.old` file at 10 MiB per stream (20 MiB per stream pair). This is a size bound, not an age-retention promise. The service description contains only secret-free owner/role/operation/fingerprint/nonce/proof metadata.
 
-### Stop and readiness
+#### Stop and readiness
 
 `sc.exe stop <owned-service>` requests a signal. It does not promise a graceful service-wide wall or a drain. Observe existing bot signal/registry-close/Discord-destroy evidence; for the daemon use supervisor, process-tree, exit-code, and pool evidence—do not invent a daemon marker.
 The existing child behavior remains unchanged: the bot closes the host WebSocket

@@ -89,9 +89,10 @@ package scripts, so keep Node available on the bot host — or add `--bun` to
 `bun run` to execute those Node scripts under Bun instead.
 
 > **SDK update:** `@gajae-code/coding-agent` is pinned to **0.12.7**.
-> The daemon regression suite (44 tests), workspace suite (118 tests), and
-> local smoke (`SMOKE_OK`) passed on this branch; provider/model-switch
-> coverage remains environment-dependent.
+> The 0.12.6 hold is closed for this repository after the 0.12.7 package
+> availability check and local regression evidence: daemon regression (44 tests),
+> workspace suite (118 tests), and local smoke (`SMOKE_OK`) passed. Provider/model
+> switch coverage remains environment-dependent.
 
 **Optional environment variables** — beyond the required keys above:
 
@@ -100,7 +101,10 @@ package scripts, so keep Node available on the bot host — or add `--bun` to
   `GJC_REMOTE_DEBUG=1` logs Discord interaction lifecycle and relayed GJC event
   summaries; `CHANNELS_CONFIG` overrides the `channels.json` path.
 - **daemon** — `HOST_LABEL` sets a human-readable name shown in the bot's connect
-  logs; `GJC_MODEL_PROFILE` overrides the activated model profile.
+  logs; `GJC_MODEL_PROFILE` overrides the activated model profile;
+  `GJC_SHUTDOWN_TIMEOUT_MS` overrides the daemon shutdown deadline (default
+  15000ms, validated from 1000ms through the runtime timer maximum). Keep it
+  below the external supervisor's daemon stop timeout.
 
 ## Provider authentication (e.g. GitHub Copilot)
 
