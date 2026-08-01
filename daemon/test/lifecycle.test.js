@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { WebSocketServer } from "ws";
+const fixturesDir = new URL("./fixtures/", import.meta.url);
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const TEST_TIMEOUT_MS = 8_000;
@@ -133,4 +134,52 @@ test("denied registration uses one fixed retry and accepted recovery restores no
     for (const socket of sockets) socket.terminate();
     await new Promise((resolve) => wss.close(() => resolve()));
   }
+});
+test("SIGTERM with a failing session disposal still exits 0", async () => {
+  const child = spawn(
+    process.env.BUN_BIN || "bun",
+    [fileURLToPath(new URL("shutdown-dispose-failure.mjs", fixturesDir))],
+    {
+      env: {
+        ...process.env,
+        HOST_ID: "lifecycle-test-host",
+        HOST_TOKEN: "lifecycle-test-secret",
+        BOT_WS_URL: "ws://127.0.0.1:9",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    }
+  );
+
+  let output = "";
+  child.stdout.on("data", (chunk) => {
+    output += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    output += chunk.toString();
+  });
+
+  let exitResult;
+  try {
+    exitResult = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`daemon did not exit; output: ${output}`));
+      }, TEST_TIMEOUT_MS);
+      child.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        resolve({ code, signal });
+      });
+    });
+  } finally {
+    await stopChild(child);
+  }
+
+  assert.equal(
+    exitResult.code,
+    0,
+    `expected exit 0, got ${exitResult.code}; signal: ${exitResult.signal}; output: ${output}`
+  );
+  assert.match(output, /daemon: shutdown failed: .*injected dispose failure/);
+  assert.doesNotMatch(output, /\n\s+at /);
 });
