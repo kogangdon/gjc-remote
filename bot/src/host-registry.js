@@ -47,6 +47,7 @@ export class HostRegistry {
    *   invokeIdleTimeoutMs?: number,
    *   invokeHardCapMs?: number,
    *   timers?: typeof SYSTEM_TIMERS,
+   *   onError?: (error: unknown) => void,
    * }} opts
    */
   constructor({
@@ -57,6 +58,7 @@ export class HostRegistry {
     invokeIdleTimeoutMs = INVOKE_IDLE_TIMEOUT_MS,
     invokeHardCapMs = INVOKE_HARD_CAP_MS,
     timers = SYSTEM_TIMERS,
+    onError,
   }) {
     if (!isPositiveDuration(heartbeatIntervalMs)) {
       throw new Error("heartbeatIntervalMs must be a positive duration");
@@ -91,12 +93,19 @@ export class HostRegistry {
 
     this.wss = new WebSocketServer({ port, maxPayload: MAX_WS_PAYLOAD_BYTES });
     this.wss.on("connection", (socket) => this.#handleConnection(socket));
+    this.onError = onError;
+    this.wss.on("error", (error) => {
+      if (typeof this.onError === "function") this.onError(error);
+      else console.error(`HostRegistry: WS server error: ${error?.message ?? String(error)}`);
+    });
     this.heartbeatTimer = this.timers.setInterval(
       () => this.#sendHeartbeats(),
       heartbeatIntervalMs
     );
     this.heartbeatTimer.unref?.();
-    console.log(`HostRegistry: WS server listening on :${port}`);
+    this.wss.on("listening", () => {
+      console.log(`HostRegistry: WS server listening on :${port}`);
+    });
   }
 
   #handleConnection(socket) {

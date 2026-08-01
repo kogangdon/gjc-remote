@@ -290,6 +290,22 @@ test("shutdown completes when session disposal stalls", async () => {
 
   assert.equal(session.disposeCalls, 1);
 });
+test("shutdown exposes pending work directories while disposal is in flight", async () => {
+  const session = new FakeSession();
+  session.dispose = () => new Promise(() => {});
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 20,
+    sessionFactory: async () => session,
+  });
+
+  await pool.ensureSession(WORK_DIR);
+  const shutdown = pool.shutdown();
+  assert.deepEqual(pool.getPendingShutdownOperations(), [
+    { workDir: WORK_DIR, operation: "shutdown session disposal" },
+  ]);
+  await shutdown;
+  assert.deepEqual(pool.getPendingShutdownOperations(), []);
+});
 
 test("shutdown during SDK creation disposes the late session", async () => {
   let release;

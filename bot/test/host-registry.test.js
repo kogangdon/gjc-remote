@@ -1,3 +1,4 @@
+import { createServer } from "node:net";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import test from "node:test";
@@ -125,6 +126,49 @@ async function expectPolicyClose(socket, payload) {
   assert.equal(code, 1008);
 }
 
+test("WebSocket server errors are surfaced through the registry callback", async () => {
+  const blocker = createServer();
+  await new Promise((resolve, reject) => {
+    blocker.once("error", reject);
+    blocker.listen(0, resolve);
+  });
+  const { port } = blocker.address();
+  const errors = [];
+  let reported;
+  const registry = new HostRegistry({
+    port,
+    tokensByHostId: new Map([["host-a", "token-a"]]),
+    onError: (error) => {
+      errors.push(error);
+      reported?.();
+    },
+  });
+
+  try {
+    await new Promise((resolve) => {
+      reported = resolve;
+      if (errors.length > 0) resolve();
+    });
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0]?.code, "EADDRINUSE");
+  } finally {
+    await registry.close().catch(() => {});
+    await new Promise((resolve) => blocker.close(resolve));
+  }
+});
+test("non-function onError values do not throw from WS server errors", async () => {
+  const registry = new HostRegistry({
+    port: 0,
+    tokensByHostId: new Map([["host-a", "token-a"]]),
+    onError: "not a callback",
+  });
+
+  try {
+    assert.doesNotThrow(() => registry.wss.emit("error", new Error("synthetic WS error")));
+  } finally {
+    await registry.close().catch(() => {});
+  }
+});
 test("heartbeat durations must be positive finite values", () => {
   const tokensByHostId = new Map([["host-a", "token-a"]]);
 
