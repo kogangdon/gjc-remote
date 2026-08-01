@@ -4,7 +4,12 @@ import assert from "node:assert/strict";
 import {
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
+  REGISTER_DENIED_RETRY_MS,
+  REGISTER_DENIED_RETRY_DEFAULT_MS,
+  REGISTER_DENIED_RETRY_MIN_MS,
+  TIMER_MAX_MS,
   nextReconnect,
+  parseRegisterDeniedRetryMs,
 } from "../src/reconnect.js";
 
 test("delay stays within the equal-jitter window and base doubles", () => {
@@ -57,4 +62,44 @@ test("jitter actually spreads consecutive draws (no synchronized herd)", () => {
     values.add(delay);
   }
   assert.ok(values.size > 1, "expected distinct jittered delays");
+});
+
+test("registration-denied retry defaults to a bounded fixed delay", () => {
+  const retryMs = parseRegisterDeniedRetryMs(undefined);
+  assert.equal(retryMs, REGISTER_DENIED_RETRY_MS);
+  assert.equal(retryMs, REGISTER_DENIED_RETRY_DEFAULT_MS);
+  assert.ok(retryMs > RECONNECT_MAX_MS);
+  assert.ok(retryMs >= REGISTER_DENIED_RETRY_MIN_MS);
+  assert.ok(retryMs <= TIMER_MAX_MS);
+  // Unlike normal reconnects, a denied registration does not carry an
+  // exponential base or jitter into the next attempt.
+  assert.equal(parseRegisterDeniedRetryMs(retryMs), retryMs);
+});
+
+test("registration-denied retry rejects hot-loop and unsafe configuration", () => {
+  for (const value of [
+    "",
+    "not-a-number",
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    "-1",
+    "0",
+    REGISTER_DENIED_RETRY_MIN_MS - 1,
+    1.5,
+    Number.MAX_SAFE_INTEGER,
+    TIMER_MAX_MS + 1,
+  ]) {
+    assert.throws(() => parseRegisterDeniedRetryMs(value), {
+      name: "RangeError",
+    });
+  }
+});
+
+test("registration-denied retry accepts the safe timer bounds", () => {
+  assert.equal(
+    parseRegisterDeniedRetryMs(String(REGISTER_DENIED_RETRY_MIN_MS)),
+    REGISTER_DENIED_RETRY_MIN_MS
+  );
+  assert.equal(parseRegisterDeniedRetryMs(String(TIMER_MAX_MS)), TIMER_MAX_MS);
 });

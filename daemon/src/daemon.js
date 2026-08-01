@@ -24,8 +24,11 @@ import {
 import {
   RECONNECT_BASE_MS,
   nextReconnect,
+  parseRegisterDeniedRetryMs,
+  REGISTER_DENIED_RETRY_MS,
 } from "./reconnect.js";
 
+const DAEMON_SHUTDOWN_TIMEOUT_MS = 15_000;
 const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
 
 if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
@@ -33,19 +36,73 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
   process.exit(1);
 }
 
+let registerDeniedRetryMs = REGISTER_DENIED_RETRY_MS;
+try {
+  registerDeniedRetryMs = parseRegisterDeniedRetryMs(
+    process.env.GJC_REGISTER_DENIED_RETRY_MS
+  );
+} catch (error) {
+  console.error(`daemon: invalid GJC_REGISTER_DENIED_RETRY_MS: ${error.message}`);
+  process.exit(1);
+}
 
 const pool = new SessionPool();
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
 const inFlightByRequestId = new Map();
+const connections = new Set();
 let reconnectDelay = RECONNECT_BASE_MS;
+let reconnectTimer = null;
+let registrationDenied = false;
 let shuttingDown = false;
+let shutdownPromise = null;
+let shutdownExitCode = null;
+
+function clearReconnectTimer() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function scheduleReconnect() {
+  if (shuttingDown || reconnectTimer !== null) return;
+  const { delay, nextBase } = nextReconnect(reconnectDelay);
+  reconnectDelay = nextBase;
+  console.log(`daemon: disconnected from bot, retrying in ${delay}ms`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToBot();
+  }, delay);
+}
+
+function scheduleDeniedRetry() {
+  if (shuttingDown || reconnectTimer !== null) return;
+  const delay = registerDeniedRetryMs;
+  console.log(`daemon: registration denied, retrying in ${delay}ms`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToBot();
+  }, delay);
+}
+
+function sanitizeRegistrationReason(reason) {
+  if (typeof reason !== "string") return "unspecified";
+  const sanitized = reason
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .trim()
+    .slice(0, 200);
+  return sanitized || "unspecified";
+}
 
 function connectToBot() {
+  if (shuttingDown) return;
   const connection = new WebSocket(BOT_WS_URL, {
     maxPayload: MAX_WS_PAYLOAD_BYTES,
   });
+  let deniedForConnection = false;
+  connections.add(connection);
 
   connection.on("open", () => {
     reconnectDelay = RECONNECT_BASE_MS;
@@ -63,23 +120,33 @@ function connectToBot() {
   });
 
   connection.on("message", (raw, isBinary) =>
-    handleMessage(connection, raw, isBinary).catch((err) =>
-      console.error("daemon: handler error", err)
-    )
+    handleMessage(connection, raw, isBinary, {
+      wasDenied: () => deniedForConnection,
+      markDenied: () => {
+        deniedForConnection = true;
+      },
+    }).catch((err) => console.error("daemon: handler error", err))
   );
 
   connection.on("close", () => {
+    connections.delete(connection);
     if (shuttingDown) return;
-    const { delay, nextBase } = nextReconnect(reconnectDelay);
-    console.log(`daemon: disconnected from bot, retrying in ${delay}ms`);
-    setTimeout(connectToBot, delay);
-    reconnectDelay = nextBase;
+    if (registrationDenied) {
+      if (!deniedForConnection) scheduleDeniedRetry();
+      return;
+    }
+    scheduleReconnect();
   });
 
   connection.on("error", (err) => console.error("daemon: ws error", err.message));
 }
 
-async function handleMessage(connection, raw, isBinary) {
+async function handleMessage(
+  connection,
+  raw,
+  isBinary,
+  { wasDenied = () => false, markDenied = () => {} } = {}
+) {
   let payloadBytes;
   try {
     payloadBytes = webSocketPayloadByteLength(raw);
@@ -105,6 +172,10 @@ async function handleMessage(connection, raw, isBinary) {
   }
 
   if (isRegisterOkMessage(msg)) {
+    // A denied registration remains denied across transport failures. Only a
+    // successful registration clears the fixed-denial retry state.
+    registrationDenied = false;
+    clearReconnectTimer();
     const negotiatedVersion = Math.min(
       PROTOCOL_VERSION,
       msg.protocolVersion ?? 0
@@ -117,8 +188,23 @@ async function handleMessage(connection, raw, isBinary) {
     return;
   }
   if (isRegisterDeniedMessage(msg)) {
-    console.error("daemon: registration denied:", msg.reason);
-    await shutdownAndExit(1);
+    if (!wasDenied()) {
+      markDenied();
+      registrationDenied = true;
+      const hasSafeReason =
+        sanitizeRegistrationReason(msg.reason) !== "unspecified";
+      console.warn(
+        `daemon: registration denied${hasSafeReason ? " (details redacted)" : ""}; ` +
+          `retrying in ${registerDeniedRetryMs}ms`
+      );
+    }
+    try {
+      connection.close(1008, "registration denied");
+    } catch (error) {
+      console.error("daemon: failed to close denied websocket", error);
+    } finally {
+      scheduleDeniedRetry();
+    }
     return;
   }
   if (isPingMessage(msg)) {
@@ -186,18 +272,47 @@ function toRpcCommand(command) {
   }
 }
 
-connectToBot();
+function closeConnections() {
+  for (const connection of connections) {
+    try {
+      connection.close(1000, "daemon shutting down");
+    } catch (error) {
+      console.error("daemon: failed to close websocket during shutdown", error);
+    }
+  }
+}
 
 async function shutdownAndExit(exitCode) {
-  if (shuttingDown) return;
+  if (shutdownPromise) return shutdownPromise;
+  // The first signal or fatal event owns the eventual exit code. A later
+  // signal must not turn a fatal exit into success (or vice versa).
+  shutdownExitCode = exitCode;
   shuttingDown = true;
-  try {
-    await pool.shutdown();
-  } catch (error) {
-    console.error("daemon: shutdown failed", error);
-    exitCode = 1;
-  }
-  process.exit(exitCode);
+  clearReconnectTimer();
+  shutdownPromise = (async () => {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        console.error(
+          `daemon: shutdown timed out after ${DAEMON_SHUTDOWN_TIMEOUT_MS}ms; ` +
+            "session disposals were abandoned"
+        );
+        resolve();
+      }, DAEMON_SHUTDOWN_TIMEOUT_MS);
+    });
+    try {
+      closeConnections();
+      await Promise.race([Promise.resolve().then(() => pool.shutdown()), timeout]);
+    } catch (error) {
+      // Signal shutdown remains successful even if disposal fails. Fatal
+      // shutdown keeps the first caller's non-zero exit code.
+      console.error("daemon: shutdown failed", error);
+    } finally {
+      clearTimeout(timer);
+      process.exit(shutdownExitCode);
+    }
+  })();
+  return shutdownPromise;
 }
 
 process.on("SIGINT", () => {
@@ -206,3 +321,20 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   void shutdownAndExit(0);
 });
+process.on("unhandledRejection", (reason) => {
+  console.error("daemon: unhandled rejection", reason);
+  void shutdownAndExit(1);
+});
+process.on("uncaughtException", (error) => {
+  console.error("daemon: uncaught exception", error);
+  void shutdownAndExit(1);
+});
+
+connectToBot();
+
+export {
+  DAEMON_SHUTDOWN_TIMEOUT_MS,
+  parseRegisterDeniedRetryMs,
+  sanitizeRegistrationReason,
+  shutdownAndExit,
+};

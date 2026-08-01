@@ -87,10 +87,53 @@ function readInvokeTimeoutEnv(raw, key, envName) {
 }
 readInvokeTimeoutEnv(GJC_INVOKE_IDLE_TIMEOUT_MS, "invokeIdleTimeoutMs", "GJC_INVOKE_IDLE_TIMEOUT_MS");
 readInvokeTimeoutEnv(GJC_INVOKE_HARD_CAP_MS, "invokeHardCapMs", "GJC_INVOKE_HARD_CAP_MS");
+const sensitiveFatalValues = [DISCORD_TOKEN, ...tokensByHostId.values()]
+  .filter((value) => typeof value === "string" && value.length > 0);
+let shutdown;
+let fatalExitCode;
+let fatalReported = false;
+let fatalExitTimer;
+
+function sanitizeFatalError(error) {
+  let message = error instanceof Error ? String(error.message) : String(error);
+  for (const secret of sensitiveFatalValues) {
+    message = message.split(secret).join("[redacted]");
+  }
+  message = message
+    .replace(/:\/\/[^/\s@]+@/g, "://[redacted]@")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (message.length === 0) message = "unknown error";
+  return message.slice(0, 500);
+}
+function exitBot(code) {
+  const exitCode = fatalExitCode ?? code;
+  if (fatalExitCode === undefined) {
+    process.exit(exitCode);
+    return;
+  }
+  process.exitCode = exitCode;
+  if (fatalExitTimer) return;
+  fatalExitTimer = setTimeout(() => process.exit(exitCode), 100);
+}
+
+function handleFatal(event, error) {
+  if (fatalReported) return;
+  fatalReported = true;
+  fatalExitCode = 1;
+  console.error(JSON.stringify({
+    level: "error",
+    event,
+    error: sanitizeFatalError(error),
+  }));
+  void shutdown?.(event);
+}
 const registry = new HostRegistry({
   port: Number(HOST_WS_PORT || 7711),
   tokensByHostId,
   ...invokeTimeoutOptions,
+  onError: (error) => handleFatal("host_ws_listen_failed", error),
 });
 const toolLogStore = new ToolLogStore();
 // #35: channelId -> { hostId, requestId, gateId } for a workflow gate currently
@@ -466,10 +509,22 @@ function debugRemote(label, data) {
   console.error(`[bot] ${label}`, JSON.stringify(data));
 }
 
-const shutdown = createShutdown({ registry, client });
+shutdown = createShutdown({
+  registry,
+  client,
+  exit: exitBot,
+});
 // Register signal handlers before login so a signal received mid-login still
 // triggers a graceful shutdown instead of the default abrupt termination.
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("unhandledRejection", (reason) => handleFatal("unhandled_rejection", reason));
+process.on("uncaughtException", (error) => handleFatal("uncaught_exception", error));
 
-client.login(DISCORD_TOKEN);
+try {
+  Promise.resolve(client.login(DISCORD_TOKEN)).catch((error) => {
+    handleFatal("discord_login_failed", error);
+  });
+} catch (error) {
+  handleFatal("discord_login_failed", error);
+}
