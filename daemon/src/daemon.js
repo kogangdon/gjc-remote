@@ -96,13 +96,14 @@ function scheduleDeniedRetry() {
   retryScheduler.scheduleDenied();
 }
 
-function sanitizeRegistrationReason(reason) {
-  if (typeof reason !== "string") return "unspecified";
-  const sanitized = reason
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
-    .trim()
-    .slice(0, 200);
-  return sanitized || "unspecified";
+function hasRegistrationReason(reason) {
+  if (typeof reason !== "string") return false;
+  return (
+    reason
+      .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+      .trim()
+      .slice(0, 200).length > 0
+  );
 }
 
 function connectToBot() {
@@ -202,8 +203,7 @@ async function handleMessage(
   if (isRegisterDeniedMessage(msg)) {
     if (!wasDenied()) {
       markDenied();
-      const hasSafeReason =
-        sanitizeRegistrationReason(msg.reason) !== "unspecified";
+      const hasSafeReason = hasRegistrationReason(msg.reason);
       console.warn(
         `daemon: registration denied${hasSafeReason ? " (details redacted)" : ""}; ` +
           `retrying in ${registerDeniedRetryMs}ms`
@@ -370,7 +370,6 @@ connectToBot();
 
 export {
   DAEMON_SHUTDOWN_TIMEOUT_MS,
-  sanitizeRegistrationReason,
   shutdownAndExit,
   sanitizeDaemonError,
 };
