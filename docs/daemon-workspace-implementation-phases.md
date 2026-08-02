@@ -23,8 +23,8 @@ readiness-consumer fixtures are required before Docker fixture approval or relea
 
 ## Required preconditions
 
-Before contract/test scaffolding, #44 ownership and the field-level handshake, plus #33 ownership
-of the admission numbers, must be recorded.
+Before contract/test scaffolding, #44 ownership and the field-level handshake, plus #43 ownership
+of host-wide admission and #33 ownership of subprocess budgets, must be recorded.
 Before native serving, the complete authenticated envelope and all native-applicable persistence,
 migration, authentication, audit, idempotency, concurrency, cgroup, containment, readiness, Git,
 provider, and resource gates below must close. Docker, platform, and readiness-consumer fixtures
@@ -35,10 +35,12 @@ remain required at their later Docker or release boundary.
    native/container roots, volume/share identity, case policy, persistence, migration timing,
    authentication, audit, idempotency, and concurrency ownership are defined. #44 alone mutates
    the mapping registry.
-2. **#33 admission numbers:** initial limits are 8 active workspaces, 8 in-process SDK sessions,
-   64 in-flight invokes host-wide, and 4 subprocess workers only when subprocess mode is enabled.
-   Bounds, cgroup headroom, and per-host accounting are fixed; these values remain provisional until
-   their owner gate closes and never authorize an unbounded queue.
+2. **#43 host-wide admission:** initial limits are 8 active workspaces, 8 in-process SDK sessions,
+   and 64 in-flight invokes per host. #43 owns their bounds, cgroup headroom, accounting, overflow
+   behavior, and boundary fixtures; values remain provisional until that owner gate closes.
+3. **#33 subprocess budgets:** #33 owns the optional subprocess worker cap of 4, nested budgets,
+   transport, and worker evidence. The cap applies only when subprocess mode is enabled. No owner
+   may authorize an unbounded queue.
 
 #42 owns deployment/grace/rollback/platform evidence and #45 owns bot image/runtime/network and
 readiness-consumer guidance. #44 owns route/control-plane schema/auth/audit/idempotency/concurrency.
