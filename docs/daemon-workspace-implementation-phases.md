@@ -24,9 +24,11 @@ readiness-consumer fixtures are required before Docker fixture approval or relea
 ## Required preconditions
 
 Before contract/test scaffolding, #44 ownership and the field-level handshake, plus #33 ownership
-of the admission numbers, must be recorded. Before any serving runtime, the complete authenticated
-envelope and all persistence, migration, authentication, audit, idempotency, concurrency, cgroup,
-and fixture gates below must close.
+of the admission numbers, must be recorded.
+Before native serving, the complete authenticated envelope and all native-applicable persistence,
+migration, authentication, audit, idempotency, concurrency, cgroup, containment, readiness, Git,
+provider, and resource gates below must close. Docker, platform, and readiness-consumer fixtures
+remain required at their later Docker or release boundary.
 1. **#44 mapping envelope:** the serving-runtime contract is the exact authenticated/versioned route
    envelope, not merely a field sketch. It includes `hostId`, `mappingId`, `mappingGeneration`,
    `mappingVersion`, `sourcePlatform`, and either legacy `workDir` or `workspaceId`; canonical
