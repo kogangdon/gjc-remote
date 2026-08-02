@@ -189,6 +189,12 @@ the decision in [`docs/adr/0001-process-supervision.md`](docs/adr/0001-process-s
 and failure scenarios in
 [`docs/pre-mortem-process-supervision.md`](docs/pre-mortem-process-supervision.md).
 
+### Workspace implementation contract
+
+The phased implementation gates, readiness decisions, interim development boundaries, and release
+evidence checklist are documented in
+[`docs/daemon-workspace-implementation-phases.md`](docs/daemon-workspace-implementation-phases.md).
+
 The current Windows evaluation path is Shawl: one `GJCRemoteBot` service and one
 `GJCRemoteDaemon-<instance-key>` per exact valid `HOST_ID`. Shawl v1.9.0 has
 passed local Windows checks for daemon and bot child replacement, daemon
