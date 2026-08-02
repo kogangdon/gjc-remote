@@ -2,7 +2,8 @@
 
 This document supplements ADR 0002 and issue #43. It freezes sequencing and MVP boundaries
 without weakening the final workspace-container contract. ADR 0002 and the verification matrix
-remain authoritative when this document is more specific or more permissive.
+remain authoritative for safety and permissiveness; this document supplies sequencing and
+concretization only and never authorizes a more permissive behavior.
 
 ## Phase entry and release gates
 
@@ -22,13 +23,16 @@ required before serving runtime implementation.
 
 ## Required preconditions
 
-These decisions must be recorded before contract/test scaffolding begins:
-
-1. **#44 mapping envelope:** the exact authenticated/versioned route envelope is frozen, not merely
-   a field sketch. It includes `hostId`, `mappingId`, `mappingGeneration`, `mappingVersion`,
-   `sourcePlatform`, and either legacy `workDir` or `workspaceId`; canonical native/container roots,
-   volume/share identity, case policy, persistence, migration timing, authentication, audit,
-   idempotency, and concurrency ownership are defined. #44 alone mutates the mapping registry.
+Before contract/test scaffolding, #44 ownership and the field-level handshake, plus #33 ownership
+of the admission numbers, must be recorded. Before any serving runtime, the complete authenticated
+envelope and all persistence, migration, authentication, audit, idempotency, concurrency, cgroup,
+and fixture gates below must close.
+1. **#44 mapping envelope:** the serving-runtime contract is the exact authenticated/versioned route
+   envelope, not merely a field sketch. It includes `hostId`, `mappingId`, `mappingGeneration`,
+   `mappingVersion`, `sourcePlatform`, and either legacy `workDir` or `workspaceId`; canonical
+   native/container roots, volume/share identity, case policy, persistence, migration timing,
+   authentication, audit, idempotency, and concurrency ownership are defined. #44 alone mutates
+   the mapping registry.
 2. **#33 admission numbers:** initial limits are 8 active workspaces, 8 in-process SDK sessions,
    64 in-flight invokes host-wide, and 4 subprocess workers only when subprocess mode is enabled.
    Bounds, cgroup headroom, and per-host accounting are fixed; these values remain provisional until
