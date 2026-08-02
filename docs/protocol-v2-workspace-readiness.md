@@ -32,11 +32,11 @@ stat is allowed. v0/v1 Docker fallback is permitted only when exactly one immuta
 exists, the #44 route mapping equals that host's immutable default, and that default identity and
 generation remain unchanged while the peer is connected. Multiple, missing, foreign, unknown-
 platform, or changed mappings return `MAPPING_ID_REQUIRED` or `WORKSPACE_MAPPING_CHANGED`; old
+peers never receive v2 frames.
 A legacy socket records the authenticated route mapping fingerprint and generation at registration.
 If #44 changes that mapping, mapping version, default identity, or generation, the socket is
 invalidated and must re-register; it is never silently remapped. A v2 mappingVersion change must
 bump generation or be rejected as stale.
-peers never receive v2 frames.
 
 ## Readiness frame and freshness
 

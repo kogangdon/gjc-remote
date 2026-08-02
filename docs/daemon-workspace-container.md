@@ -128,11 +128,11 @@ these enums, oversized fields, or malformed frames are rejected before state mut
 The negotiated `workspace_readiness_v2` capability gates workspaceId, mapping identity, and
 readiness frames atomically on ingress and egress. HostRegistry records local `receivedAt` and a
 monotonic receipt time, clamps a validated TTL to the maximum, rejects future/skewed/replayed
-observations and stale socket generations/revisions, and marks expired state unknown. Sender
-Readiness expiry is computed from a monotonic receipt deadline derived at reception; wall-clock
-`receivedAt` is diagnostic/projection data and clock changes cannot extend stale state.
-expiry is diagnostic only. `/hosts` exposes opaque IDs, aggregate/per-dimension state, local
-error time, revision, and generation without paths or secrets.
+observations and stale socket generations/revisions, and marks expired state unknown. Sender expiry
+and remote timestamps are diagnostic only; receiver-local monotonic expiry is authoritative.
+`receivedAt` is diagnostic/projection data and clock changes cannot extend stale state. `/hosts`
+exposes opaque IDs, aggregate/per-dimension state, local error time, revision, and generation
+without paths or secrets.
 Workspace IDs are bounded opaque safe-alphabet tokens and are looked up in authenticated state
 before any interpolation into a path; route and frame size limits are implementation gates.
 

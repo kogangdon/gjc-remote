@@ -41,7 +41,6 @@ key version, and restart count. Release evidence includes path/secret/control se
   durable `manual-cleanup`.
 - Host-wide mounted authority is not tenant isolation; separate daemon hosts are required.
 ## Assumptions and closure ledger
-+
 | Assumption | Owner | Closure gate | Fail-closed behavior |
 | --- | --- | --- | --- |
 | #44 route envelope, mapping persistence, and migration timing | #44 | Versioned schema and authenticated mapping fixture | Reject unknown/missing mapping identity; no parallel registry |
