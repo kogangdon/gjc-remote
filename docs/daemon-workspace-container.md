@@ -127,7 +127,8 @@ these enums, oversized fields, or malformed frames are rejected before state mut
 
 The negotiated `workspace_readiness_v2` capability gates workspaceId, mapping identity, and
 readiness frames atomically on ingress and egress. HostRegistry records local `receivedAt` and a
-monotonic receipt time, clamps a validated TTL to the maximum, rejects future/skewed/replayed
+monotonic receipt time, clamps a validated TTL to the maximum, accepts diagnostic `observedAt`
+values only within the bounded receiver-time skew window, rejects out-of-window/malformed/replayed
 observations and stale socket generations/revisions, and marks expired state unknown. Sender expiry
 and remote timestamps are diagnostic only; receiver-local monotonic expiry is authoritative.
 `receivedAt` is diagnostic/projection data and clock changes cannot extend stale state. `/hosts`

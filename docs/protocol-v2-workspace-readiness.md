@@ -62,8 +62,12 @@ HostRegistry is the freshness authority:
   `min(ttlMs, READINESS_MAX_TTL_MS)`;
 - use a bounded default when TTL is absent (initial design value: 60 seconds);
 - treat sender `expiresAt` and remote `observedAt` as diagnostics, never as expiry authority;
-- reject invalid/out-of-range TTL, future or old-beyond-skew observations, duplicate/lower
-  revisions, old socket generations, and replayed/backward timestamps;
+- reject invalid/out-of-range TTL, observations outside the bounded receiver-time skew window,
+  malformed timestamps, duplicate/lower revisions, old socket generations, and replayed/backward
+  timestamps;
+- accept `observedAt` only as diagnostic data within the bounded receiver-time window; it never
+  changes the receiver's monotonic expiry deadline. A future value inside the window is accepted
+  for diagnostics, while a value outside the window is rejected as `READINESS_TIMESTAMP_INVALID`.
 - expire per-workspace state using a timer or lazy check; expired/unknown is never ready;
 - clear readiness on socket replacement.
 

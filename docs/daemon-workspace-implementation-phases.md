@@ -12,14 +12,14 @@ There are four distinct boundaries. A later boundary MUST NOT be inferred from a
 | Boundary | May begin after | May claim |
 | --- | --- | --- |
 | Contract/test scaffolding | #44 exact envelope decision and #33 admission numbers are recorded | Validators, deterministic fakes, fixtures, and non-serving contract tests only |
-| Native serving runtime | Every ADR 0002 implementation-stop gate and all #42/#43/#44/#45/#33 ownership/fixture agreements are directly evidenced | Native development behavior under the final contract; never Docker or production release by itself |
+| Native serving runtime | Every ADR 0002 gate applicable to native serving, plus #42/#43/#44/#45/#33 ownership agreements, is directly evidenced | Native development behavior under the final contract; never Docker or production release by itself |
 | Docker test fixture | Native contracts and Phase 2 gates pass; Docker engine/security/egress fixture is approved | Disposable Compose evidence only; never production deployment or tenant isolation |
 | Production/release promotion | Every ADR 0002 and verification-matrix gate has direct evidence | No waiver, copied receipt, interim feature flag, or missing platform evidence |
 
 Before the native-serving boundary, no daemon or bot process may serve workspace invokes. A failed
 or missing gate preserves the native rollback and stops promotion. #42 and #45 are consumers of the
-contract, but their ownership agreements and relevant deployment/readiness-consumer fixtures remain
-required before serving runtime implementation.
+contract: their ownership agreements are required before native serving, while deployment and
+readiness-consumer fixtures are required before Docker fixture approval or release promotion.
 
 ## Required preconditions
 
@@ -61,13 +61,12 @@ cannot refresh a workspace's expiry. A replacement socket clears all inherited w
 
 ### Clock skew handling
 
-Let `receivedAt` be the receiver wall-clock timestamp and `SKEW_MAX_MS = 300000`. Any future
-`observedAt`, even within the skew window, is rejected with `READINESS_TIMESTAMP_INVALID`. A past
-timestamp within `[receivedAt - SKEW_MAX_MS, receivedAt]` is accepted as diagnostic metadata; a
-past value outside the window, malformed value, or replay is rejected with
+Let `receivedAt` be the receiver wall-clock timestamp and `SKEW_MAX_MS = 300000`. An
+`observedAt` within `[receivedAt - SKEW_MAX_MS, receivedAt + SKEW_MAX_MS]` is accepted only as
+diagnostic metadata; it never changes the receiver's monotonic expiry deadline. Values outside the
+window, malformed values, or replayed/backward timestamps are rejected with
 `READINESS_TIMESTAMP_INVALID` or `READINESS_REPLAYED`. These provisional bounds become closed only
-after the TTL/skew validator owner gate; remote timestamps never extend the receiver's monotonic
-deadline.
+after the TTL/skew validator owner gate.
 
 ## Phase 1 — readiness end-to-end
 

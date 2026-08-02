@@ -81,8 +81,10 @@ the bot and management plane never receive credentials or credential paths.
 
 HostRegistry owns freshness: it records local `receivedAt` and monotonic receipt time, clamps a
 validated TTL to a maximum (initial design value 60 seconds), and never uses sender expiry or
-remote wall-clock time as authority. It rejects future/skewed/replayed timestamps, stale socket
-generations, duplicate revisions, and invalid TTLs. Expired or unknown state never renders ready.
+remote wall-clock time as authority. It accepts diagnostic `observedAt` values only inside the
+bounded receiver-time skew window; out-of-window, malformed, or replayed timestamps, stale socket
+generations, duplicate revisions, and invalid TTLs are rejected. Expired or unknown state never
+renders ready.
 The receiver computes and compares a monotonic expiry deadline at receipt using a bounded TTL;
 wall-clock receivedAt is diagnostic only and clock changes cannot extend stale readiness. Aggregate
 status degrades only for a previously-ready workspace expiry or readiness error; initial unknown
@@ -112,9 +114,21 @@ required for tenant isolation.
 
 ## Release gates
 
-Implementation must stop until #42/#43/#44/#45/#33 ownership and fixtures agree; mapping identity,
-receiver-local readiness, no-follow containment, lease/fence recovery, resource budgets, full Git
-verification, provider/image provenance, hard Docker security/egress checks, and strict
-`stop_grace_period > GJC_SHUTDOWN_TIMEOUT_MS` are proven. Docker uses `restart: on-failure` only.
+Implementation must stop before native serving until #42/#43/#44/#45/#33 ownership and the
+native-applicable gates agree. Mapping identity, receiver-local readiness, no-follow containment,
+lease/fence recovery, resource budgets, full Git verification, and provider provenance gate native
+serving; image, Docker security/egress, platform, and consumer evidence gate Docker or release
+promotion. Docker uses `restart: on-failure` only.
+Implementation and release promotion use separate evidence boundaries:
+
+| Boundary | Required evidence |
+| --- | --- |
+| Contract/test scaffolding | #44 field handshake and #33 ownership; validators and non-serving fixtures only |
+| Native serving | Native-applicable mapping, readiness, containment, lease/fence, resource, Git, and provider gates; #42/#45 ownership |
+| Docker fixture | Native gates plus image, engine, security, egress, persistence, and Compose evidence |
+| Release promotion | Every ADR and verification-matrix gate, including #42/#45 platform/consumer evidence and strict `stop_grace_period > GJC_SHUTDOWN_TIMEOUT_MS` |
+
+No boundary authorizes a later one. Missing evidence stops serving or promotion, and Docker uses
+`restart: on-failure` only.
 No cloud VM provisioning, public management endpoint, OAuth implementation, executable packaging,
 Docker image, Compose file, or runtime code is part of this ADR change.
