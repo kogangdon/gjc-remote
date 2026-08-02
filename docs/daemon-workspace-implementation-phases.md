@@ -132,7 +132,7 @@ Git (`GIT_GRAPH_INCOMPLETE`, `GIT_AUTH_FAILED`, `GIT_NETWORK_FAILED`); readiness
 (`RESOURCE_EXHAUSTED`, `SESSION_LIMIT`, `SESSION_CREATE_TIMEOUT`, `SHUTDOWN_TIMEOUT`); and fatal
 (`DAEMON_FATAL`, `UNHANDLED_REJECTION`, `UNCAUGHT_EXCEPTION`).
 
-A connected-not-ready, degraded, expired, incompatible, unknown, workspace-not-found, stale-
+A connected-not-ready, degraded, expired, incompatible, unknown, workspace-not-found, stale
 generation, or stale-mapping invoke is rejected before SDK/session work. Remediation is structured as
 `{ code, retryable, action }`, where `action` is one of `login`, `repair_profile`, `retry_later`,
 `refresh_workspace`, or `contact_admin`. Docker session migration disabled maps to
@@ -164,7 +164,7 @@ Phase 2 implements mapping/containment, lifecycle, persistence, Git, backup, and
 
 A single-writer durable lock may be used only in a development-only native mode guarded by the
 exact feature flag `GJC_DEV_NATIVE_SINGLE_WRITER_LOCK=1`, default off. It records owner identity
-and rejects a second writer. It never authorizes stale-owner takeover or resumed writes: process-
+and rejects a second writer. It never authorizes stale-owner takeover or resumed writes: process
 absence evidence permits only inspection/cleanup, while ambiguity enters `manual-cleanup`. A negative
 fixture must prove Docker and production paths cannot select this mode. A named removal gate is the
 Phase 2 acceptance `FINAL_LEASE_FENCE_TESTS_PASS`; Phase 4 is blocked while the flag exists.
