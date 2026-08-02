@@ -92,11 +92,11 @@ remains connected-not-ready.
 
 ## Ownership and rollback
 
-- **#43:** daemon workspace and protocol invariants, this ADR, and linked fixtures.
+- **#43:** daemon workspace/protocol invariants, host-wide admission (`8/8/64`), this ADR, and linked fixtures.
 - **#42:** platform/component deployment documentation, rendered units, rollout/rollback, and platform evidence.
 - **#44:** versioned route envelope, mapping registry, management auth, audit, idempotency, concurrency, and token rotation.
 - **#45:** bot image/runtime/network guidance.
-- **#33:** optional subprocess transport and worker/resource policy.
+- **#33:** optional subprocess transport, worker cap (`4`), nested budgets, and worker evidence.
 
 Keep the current native daemon and v0/v1 workDir route as universal rollback. Roll back only to an
 exact prior signed image and matching volume/owner/fingerprint/generation manifest. Missing
