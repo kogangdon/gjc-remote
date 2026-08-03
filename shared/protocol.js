@@ -30,6 +30,386 @@ export const V0_LIMITS = Object.freeze({
   MAX_CHOICES: 64,
   PROTOCOL_VERSION_MAX: 1_000_000,
 });
+export const WORKSPACE_READINESS_CAPABILITY = "workspace_readiness_v2";
+export const WORKSPACE_READINESS_V2_CAPABILITY = WORKSPACE_READINESS_CAPABILITY;
+export const PROTOCOL_VERSION_V2 = 2;
+export const WORKSPACE_READINESS_V2 = WORKSPACE_READINESS_CAPABILITY;
+
+/**
+ * Bounded v2 workspace/readiness fields. These limits are intentionally
+ * independent from the legacy v0 limits so adding v2 fields cannot change
+ * validation of existing frames.
+ */
+export const V2_LIMITS = Object.freeze({
+  WORKSPACE_ID: 128,
+  MAPPING_ID: 128,
+  SOCKET_GENERATION: Number.MAX_SAFE_INTEGER,
+  WORKSPACE_GENERATION: Number.MAX_SAFE_INTEGER,
+  MAPPING_GENERATION: Number.MAX_SAFE_INTEGER,
+  MAPPING_VERSION: Number.MAX_SAFE_INTEGER,
+  READINESS_REVISION: Number.MAX_SAFE_INTEGER,
+  READINESS_ERROR_CODE: 64,
+  READINESS_REMEDIATION_CODE: 64,
+  READINESS_REMEDIATION_ACTION: 32,
+});
+
+/** Readiness TTL is receiver-clamped; sender values outside this range fail closed. */
+export const READINESS_MIN_TTL_MS = 1_000;
+export const READINESS_MAX_TTL_MS = 60_000;
+export const READINESS_DEFAULT_TTL_MS = READINESS_MAX_TTL_MS;
+export const READINESS_MAX_SKEW_MS = 5 * 60 * 1_000;
+
+/**
+ * The opaque workspace identifier is deliberately narrower than a path or
+ * URL. It is safe to log and to use as a lookup key, but is never a path.
+ */
+export const WORKSPACE_ID_MAX_LENGTH = V2_LIMITS.WORKSPACE_ID;
+export const WORKSPACE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** Stable readiness dimensions and their complete wire-level value sets. */
+export const READINESS_DIMENSIONS = Object.freeze([
+  "connection",
+  "runtime",
+  "providerAuth",
+  "modelProfile",
+  "workspace",
+]);
+export const READINESS_STATUS_VALUES = Object.freeze({
+  connection: Object.freeze(["online", "offline"]),
+  runtime: Object.freeze(["ready", "incompatible", "error"]),
+  providerAuth: Object.freeze(["configured", "missing", "invalid", "unknown"]),
+  modelProfile: Object.freeze(["ready", "missing", "invalid", "unknown"]),
+  workspace: Object.freeze(["ready", "unavailable", "unknown"]),
+});
+export const READINESS_DIMENSION_VALUES = READINESS_STATUS_VALUES;
+export const READINESS_STATUSES = READINESS_STATUS_VALUES;
+export const READINESS_AGGREGATE_STATUSES = Object.freeze([
+  "offline",
+  "incompatible",
+  "degraded",
+  "connected-not-ready",
+  "ready",
+]);
+export const READINESS_CONNECTION_STATUS = Object.freeze({
+  ONLINE: "online",
+  OFFLINE: "offline",
+});
+export const READINESS_RUNTIME_STATUS = Object.freeze({
+  READY: "ready",
+  INCOMPATIBLE: "incompatible",
+  ERROR: "error",
+});
+export const READINESS_PROVIDER_AUTH_STATUS = Object.freeze({
+  CONFIGURED: "configured",
+  MISSING: "missing",
+  INVALID: "invalid",
+  UNKNOWN: "unknown",
+});
+export const READINESS_MODEL_PROFILE_STATUS = Object.freeze({
+  READY: "ready",
+  MISSING: "missing",
+  INVALID: "invalid",
+  UNKNOWN: "unknown",
+});
+export const READINESS_WORKSPACE_STATUS = Object.freeze({
+  READY: "ready",
+  UNAVAILABLE: "unavailable",
+  UNKNOWN: "unknown",
+});
+
+/** Stable remediation actions exposed to readiness consumers. */
+export const READINESS_REMEDIATION_ACTIONS = Object.freeze([
+  "login",
+  "repair_profile",
+  "retry_later",
+  "refresh_workspace",
+  "contact_admin",
+]);
+
+/**
+ * Stable public error taxonomy. Keep values wire-compatible and path-free.
+ * Category-specific views below make it possible for consumers to avoid
+ * duplicating string literals while retaining one canonical taxonomy.
+ */
+export const PROTOCOL_ERROR_CODES = Object.freeze({
+  AUTH_REJECTED: "AUTH_REJECTED",
+  PROTOCOL_INCOMPATIBLE: "PROTOCOL_INCOMPATIBLE",
+  CONNECTION_LOST: "CONNECTION_LOST",
+  HEARTBEAT_TIMEOUT: "HEARTBEAT_TIMEOUT",
+  PROVIDER_MISSING: "PROVIDER_MISSING",
+  PROVIDER_INVALID: "PROVIDER_INVALID",
+  PROVIDER_EXPIRED: "PROVIDER_EXPIRED",
+  PROVIDER_UNAVAILABLE: "PROVIDER_UNAVAILABLE",
+  MODEL_PROFILE_MISSING: "MODEL_PROFILE_MISSING",
+  MODEL_PROFILE_INVALID: "MODEL_PROFILE_INVALID",
+  RUNTIME_INCOMPATIBLE: "RUNTIME_INCOMPATIBLE",
+  CONFIG_INVALID: "CONFIG_INVALID",
+  UNKNOWN_RUNTIME: "UNKNOWN_RUNTIME",
+  WORKSPACE_NOT_FOUND: "WORKSPACE_NOT_FOUND",
+  WORKSPACE_ROOT_ESCAPE: "WORKSPACE_ROOT_ESCAPE",
+  CONTAINMENT_UNSUPPORTED: "CONTAINMENT_UNSUPPORTED",
+  MAPPING_ID_REQUIRED: "MAPPING_ID_REQUIRED",
+  WORKSPACE_MAPPING_CHANGED: "WORKSPACE_MAPPING_CHANGED",
+  MAPPING_GENERATION_STALE: "MAPPING_GENERATION_STALE",
+  WORKSPACE_BUSY: "WORKSPACE_BUSY",
+  WORKSPACE_GENERATION_STALE: "WORKSPACE_GENERATION_STALE",
+  LEASE_CONFLICT: "LEASE_CONFLICT",
+  GIT_GRAPH_INCOMPLETE: "GIT_GRAPH_INCOMPLETE",
+  GIT_AUTH_FAILED: "GIT_AUTH_FAILED",
+  GIT_NETWORK_FAILED: "GIT_NETWORK_FAILED",
+  READINESS_TIMESTAMP_INVALID: "READINESS_TIMESTAMP_INVALID",
+  READINESS_REPLAYED: "READINESS_REPLAYED",
+  READINESS_EXPIRED: "READINESS_EXPIRED",
+  RESOURCE_EXHAUSTED: "RESOURCE_EXHAUSTED",
+  SESSION_LIMIT: "SESSION_LIMIT",
+  SESSION_CREATE_TIMEOUT: "SESSION_CREATE_TIMEOUT",
+  SHUTDOWN_TIMEOUT: "SHUTDOWN_TIMEOUT",
+  DAEMON_FATAL: "DAEMON_FATAL",
+  UNHANDLED_REJECTION: "UNHANDLED_REJECTION",
+  UNCAUGHT_EXCEPTION: "UNCAUGHT_EXCEPTION",
+});
+export const READINESS_ERROR_CODES = PROTOCOL_ERROR_CODES;
+export const READINESS_ERROR_TAXONOMY = Object.freeze({
+  transport: Object.freeze([
+    PROTOCOL_ERROR_CODES.AUTH_REJECTED,
+    PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+    PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+    PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT,
+  ]),
+  providerProfile: Object.freeze([
+    PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+    PROTOCOL_ERROR_CODES.PROVIDER_INVALID,
+    PROTOCOL_ERROR_CODES.PROVIDER_EXPIRED,
+    PROTOCOL_ERROR_CODES.PROVIDER_UNAVAILABLE,
+    PROTOCOL_ERROR_CODES.MODEL_PROFILE_MISSING,
+    PROTOCOL_ERROR_CODES.MODEL_PROFILE_INVALID,
+  ]),
+  runtimeConfig: Object.freeze([
+    PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+    PROTOCOL_ERROR_CODES.CONFIG_INVALID,
+    PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+  ]),
+  workspaceMappingLease: Object.freeze([
+    PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
+    PROTOCOL_ERROR_CODES.WORKSPACE_ROOT_ESCAPE,
+    PROTOCOL_ERROR_CODES.CONTAINMENT_UNSUPPORTED,
+    PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED,
+    PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+    PROTOCOL_ERROR_CODES.MAPPING_GENERATION_STALE,
+    PROTOCOL_ERROR_CODES.WORKSPACE_BUSY,
+    PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE,
+    PROTOCOL_ERROR_CODES.LEASE_CONFLICT,
+  ]),
+  git: Object.freeze([
+    PROTOCOL_ERROR_CODES.GIT_GRAPH_INCOMPLETE,
+    PROTOCOL_ERROR_CODES.GIT_AUTH_FAILED,
+    PROTOCOL_ERROR_CODES.GIT_NETWORK_FAILED,
+  ]),
+  readiness: Object.freeze([
+    PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID,
+    PROTOCOL_ERROR_CODES.READINESS_REPLAYED,
+    PROTOCOL_ERROR_CODES.READINESS_EXPIRED,
+  ]),
+  resourceSession: Object.freeze([
+    PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED,
+    PROTOCOL_ERROR_CODES.SESSION_LIMIT,
+    PROTOCOL_ERROR_CODES.SESSION_CREATE_TIMEOUT,
+    PROTOCOL_ERROR_CODES.SHUTDOWN_TIMEOUT,
+  ]),
+  fatal: Object.freeze([
+    PROTOCOL_ERROR_CODES.DAEMON_FATAL,
+    PROTOCOL_ERROR_CODES.UNHANDLED_REJECTION,
+    PROTOCOL_ERROR_CODES.UNCAUGHT_EXCEPTION,
+  ]),
+});
+export const ERROR_CODES = PROTOCOL_ERROR_CODES;
+/**
+ * Canonical remediation tuples for all public protocol/readiness errors.
+ * Consumers MUST copy a tuple before adding local diagnostic fields.
+ */
+const remediationTuple = (code, retryable, action) =>
+  Object.freeze({ code, retryable, action });
+
+export const READINESS_REMEDIATIONS = Object.freeze({
+  [PROTOCOL_ERROR_CODES.AUTH_REJECTED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.AUTH_REJECTED,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.CONNECTION_LOST]: remediationTuple(
+    PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT]: remediationTuple(
+    PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.PROVIDER_MISSING]: remediationTuple(
+    PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+    true,
+    "login"
+  ),
+  [PROTOCOL_ERROR_CODES.PROVIDER_INVALID]: remediationTuple(
+    PROTOCOL_ERROR_CODES.PROVIDER_INVALID,
+    false,
+    "repair_profile"
+  ),
+  [PROTOCOL_ERROR_CODES.PROVIDER_EXPIRED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.PROVIDER_EXPIRED,
+    true,
+    "login"
+  ),
+  [PROTOCOL_ERROR_CODES.PROVIDER_UNAVAILABLE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.PROVIDER_UNAVAILABLE,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.MODEL_PROFILE_MISSING]: remediationTuple(
+    PROTOCOL_ERROR_CODES.MODEL_PROFILE_MISSING,
+    false,
+    "repair_profile"
+  ),
+  [PROTOCOL_ERROR_CODES.MODEL_PROFILE_INVALID]: remediationTuple(
+    PROTOCOL_ERROR_CODES.MODEL_PROFILE_INVALID,
+    false,
+    "repair_profile"
+  ),
+  [PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.CONFIG_INVALID]: remediationTuple(
+    PROTOCOL_ERROR_CODES.CONFIG_INVALID,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME]: remediationTuple(
+    PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND]: remediationTuple(
+    PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
+    false,
+    "refresh_workspace"
+  ),
+  [PROTOCOL_ERROR_CODES.WORKSPACE_ROOT_ESCAPE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.WORKSPACE_ROOT_ESCAPE,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.CONTAINMENT_UNSUPPORTED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.CONTAINMENT_UNSUPPORTED,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+    false,
+    "refresh_workspace"
+  ),
+  [PROTOCOL_ERROR_CODES.MAPPING_GENERATION_STALE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.MAPPING_GENERATION_STALE,
+    false,
+    "refresh_workspace"
+  ),
+  [PROTOCOL_ERROR_CODES.WORKSPACE_BUSY]: remediationTuple(
+    PROTOCOL_ERROR_CODES.WORKSPACE_BUSY,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE,
+    false,
+    "refresh_workspace"
+  ),
+  [PROTOCOL_ERROR_CODES.LEASE_CONFLICT]: remediationTuple(
+    PROTOCOL_ERROR_CODES.LEASE_CONFLICT,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.GIT_GRAPH_INCOMPLETE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.GIT_GRAPH_INCOMPLETE,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.GIT_AUTH_FAILED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.GIT_AUTH_FAILED,
+    false,
+    "login"
+  ),
+  [PROTOCOL_ERROR_CODES.GIT_NETWORK_FAILED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.GIT_NETWORK_FAILED,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID]: remediationTuple(
+    PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.READINESS_REPLAYED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.READINESS_REPLAYED,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.READINESS_EXPIRED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.READINESS_EXPIRED,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.SESSION_LIMIT]: remediationTuple(
+    PROTOCOL_ERROR_CODES.SESSION_LIMIT,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.SESSION_CREATE_TIMEOUT]: remediationTuple(
+    PROTOCOL_ERROR_CODES.SESSION_CREATE_TIMEOUT,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.SHUTDOWN_TIMEOUT]: remediationTuple(
+    PROTOCOL_ERROR_CODES.SHUTDOWN_TIMEOUT,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.DAEMON_FATAL]: remediationTuple(
+    PROTOCOL_ERROR_CODES.DAEMON_FATAL,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.UNHANDLED_REJECTION]: remediationTuple(
+    PROTOCOL_ERROR_CODES.UNHANDLED_REJECTION,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.UNCAUGHT_EXCEPTION]: remediationTuple(
+    PROTOCOL_ERROR_CODES.UNCAUGHT_EXCEPTION,
+    false,
+    "contact_admin"
+  ),
+});
+/** Aliases retain one canonical mapping for consumers using map terminology. */
+export const READINESS_REMEDIATION_MAP = READINESS_REMEDIATIONS;
+export const READINESS_REMEDIATION_BY_CODE = READINESS_REMEDIATIONS;
 
 /**
  * Wire protocol version this build speaks. v0 (legacy) daemons omit
@@ -87,6 +467,7 @@ export const MSG_TYPES = Object.freeze({
   // emit ANSWER and treat an unrecognized event subtype as an ignorable event.
   ANSWER: "answer",
   GATE_REQUEST: "gate_request",
+  READINESS: "readiness",
 });
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -116,7 +497,7 @@ export function isProtocolVersion(value) {
   return (
     Number.isInteger(value) &&
     value >= 0 &&
-    value <= V0_LIMITS.PROTOCOL_VERSION_MAX
+    value <= PROTOCOL_VERSION_V2
   );
 }
 
@@ -126,6 +507,262 @@ export function isCapabilityList(value) {
     Array.isArray(value) &&
     value.length <= V0_LIMITS.MAX_CAPABILITIES &&
     value.every((cap) => isBoundedString(cap, V0_LIMITS.CAPABILITY))
+  );
+}
+/**
+ * Validate the opaque workspace lookup key used by v2 frames. Path separators,
+ * whitespace, control characters, and URL punctuation are intentionally not
+ * part of the safe alphabet.
+ */
+export function isWorkspaceId(value) {
+  return (
+    isBoundedString(value, WORKSPACE_ID_MAX_LENGTH) &&
+    WORKSPACE_ID_PATTERN.test(value)
+  );
+}
+export function isMappingId(value) {
+  return (
+    isBoundedString(value, V2_LIMITS.MAPPING_ID) &&
+    WORKSPACE_ID_PATTERN.test(value)
+  );
+}
+
+export function isMappingGeneration(value) {
+  return isBoundedSafeInteger(value, 1, V2_LIMITS.MAPPING_GENERATION);
+}
+
+export function isMappingVersion(value) {
+  return isBoundedSafeInteger(value, 1, V2_LIMITS.MAPPING_VERSION);
+}
+
+function isBoundedSafeInteger(value, minimum, maximum = Number.MAX_SAFE_INTEGER) {
+  return Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+}
+
+export function isReadinessRevision(value) {
+  return isBoundedSafeInteger(value, 1, V2_LIMITS.READINESS_REVISION);
+}
+
+export function isReadinessSocketGeneration(value) {
+  return isBoundedSafeInteger(value, 1, V2_LIMITS.SOCKET_GENERATION);
+}
+
+export function isReadinessWorkspaceGeneration(value) {
+  return isBoundedSafeInteger(value, 1, V2_LIMITS.WORKSPACE_GENERATION);
+}
+
+export function isReadinessTtl(value) {
+  return (
+    Number.isSafeInteger(value) &&
+    value >= READINESS_MIN_TTL_MS &&
+    value <= READINESS_MAX_TTL_MS
+  );
+}
+
+export function normalizeReadinessTtl(value) {
+  return value === undefined ? READINESS_DEFAULT_TTL_MS : value;
+}
+
+function isReadinessTimestamp(value) {
+  return isBoundedSafeInteger(value, 0);
+}
+
+function isKnownErrorCode(value) {
+  return (
+    isBoundedString(value, V2_LIMITS.READINESS_ERROR_CODE) &&
+    Object.values(PROTOCOL_ERROR_CODES).includes(value)
+  );
+}
+
+function isReadinessRemediation(value) {
+  if (!isObject(value)) return false;
+  if (
+    !hasOwn(value, "code") ||
+    !hasOwn(value, "retryable") ||
+    !hasOwn(value, "action") ||
+    !isKnownErrorCode(value.code) ||
+    typeof value.retryable !== "boolean" ||
+    !READINESS_REMEDIATION_ACTIONS.includes(value.action)
+  ) {
+    return false;
+  }
+  return Object.keys(value).every(
+    (key) => key === "code" || key === "retryable" || key === "action"
+  );
+}
+
+export function isReadinessError(value) {
+  if (
+    !isObject(value) ||
+    !hasOwn(value, "code") ||
+    !hasOwn(value, "at") ||
+    !hasOwn(value, "remediation") ||
+    !isKnownErrorCode(value.code) ||
+    !isReadinessTimestamp(value.at) ||
+    !isReadinessRemediation(value.remediation)
+  ) {
+    return false;
+  }
+  const expectedRemediation = READINESS_REMEDIATIONS[value.code];
+  if (
+    !expectedRemediation ||
+    value.remediation.code !== expectedRemediation.code ||
+    value.remediation.retryable !== expectedRemediation.retryable ||
+    value.remediation.action !== expectedRemediation.action
+  ) {
+    return false;
+  }
+  return Object.keys(value).every(
+    (key) => key === "code" || key === "at" || key === "remediation"
+  );
+}
+
+export function isReadinessStatus(value) {
+  if (!isObject(value) || Object.keys(value).length !== READINESS_DIMENSIONS.length) {
+    return false;
+  }
+  return READINESS_DIMENSIONS.every(
+    (dimension) =>
+      hasOwn(value, dimension) &&
+      typeof value[dimension] === "string" &&
+      READINESS_STATUS_VALUES[dimension].includes(value[dimension])
+  );
+}
+
+function isReadinessFrameShape(value) {
+  if (
+    !isObject(value) ||
+    value.type !== MSG_TYPES.READINESS ||
+    !isReadinessSocketGeneration(value.socketGeneration) ||
+    !isReadinessRevision(value.revision) ||
+    !isReadinessTimestamp(value.observedAt) ||
+    !isReadinessStatus(value.status)
+  ) {
+    return false;
+  }
+
+  const allowedFields = new Set([
+    "type",
+    "socketGeneration",
+    "revision",
+    "observedAt",
+    "ttlMs",
+    "workspaceId",
+    "workspaceGeneration",
+    "status",
+    "lastError",
+    "expiresAt",
+  ]);
+  if (!Object.keys(value).every((key) => allowedFields.has(key))) return false;
+
+  if (hasOwn(value, "ttlMs") && !isReadinessTtl(value.ttlMs)) return false;
+  if (hasOwn(value, "expiresAt") && !isReadinessTimestamp(value.expiresAt)) return false;
+  if (hasOwn(value, "lastError") && !isReadinessError(value.lastError)) return false;
+
+  const hasWorkspaceId = hasOwn(value, "workspaceId");
+  const hasWorkspaceGeneration = hasOwn(value, "workspaceGeneration");
+  if (hasWorkspaceId !== hasWorkspaceGeneration) return false;
+  if (hasWorkspaceId) {
+    return (
+      isWorkspaceId(value.workspaceId) &&
+      isReadinessWorkspaceGeneration(value.workspaceGeneration)
+    );
+  }
+  return true;
+}
+
+/**
+ * Validate a v2 readiness frame. The optional `context` argument lets a
+ * receiver apply its current socket/revision fence without moving that state
+ * into this dependency-free shared module.
+ */
+export function isReadinessMessage(value, context = undefined) {
+  if (!isReadinessFrameShape(value)) return false;
+  if (!isObject(context)) return true;
+
+  const currentSocketGeneration =
+    context.currentSocketGeneration ?? context.socketGeneration;
+  if (
+    currentSocketGeneration !== undefined &&
+    value.socketGeneration !== currentSocketGeneration
+  ) {
+    return false;
+  }
+
+  const previous =
+    context.previous ??
+    context.previousFrame ??
+    (context.type === MSG_TYPES.READINESS ? context : undefined);
+  if (isObject(previous)) {
+    if (
+      previous.socketGeneration === value.socketGeneration &&
+      isReadinessRevision(previous.revision) &&
+      value.revision <= previous.revision
+    ) {
+      return false;
+    }
+    if (
+      isReadinessTimestamp(previous.observedAt) &&
+      value.observedAt < previous.observedAt
+    ) {
+      return false;
+    }
+  }
+
+  const receivedAt = context.receivedAt;
+  if (receivedAt !== undefined && isReadinessTimestamp(receivedAt)) {
+    if (Math.abs(value.observedAt - receivedAt) > READINESS_MAX_SKEW_MS) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export const isWorkspaceReadinessMessage = isReadinessMessage;
+
+/**
+ * Atomically enable the v2 workspace/readiness extension only when both
+ * sides advertised and accepted protocol v2 and the capability. Missing
+ * negotiation fields are therefore treated as legacy, not as an implicit
+ * opt-in.
+ */
+export function isReadinessCapabilityGate(register, registerOk) {
+  if (
+    arguments.length === 1 &&
+    isObject(register) &&
+    isObject(register.register) &&
+    (isObject(register.registerOk) || isObject(register.response))
+  ) {
+    registerOk = register.registerOk ?? register.response;
+    register = register.register;
+  }
+  if (
+    arguments.length === 1 &&
+    isObject(register) &&
+    Number.isSafeInteger(register.negotiatedVersion)
+  ) {
+    return (
+      register.negotiatedVersion === PROTOCOL_VERSION_V2 &&
+      isCapabilityList(register.localCapabilities) &&
+      isCapabilityList(register.remoteCapabilities) &&
+      register.localCapabilities.includes(WORKSPACE_READINESS_CAPABILITY) &&
+      register.remoteCapabilities.includes(WORKSPACE_READINESS_CAPABILITY)
+    );
+  }
+  if (!isRegisterMessage(register) || !isRegisterOkMessage(registerOk)) return false;
+  if (
+    !hasOwn(register, "protocolVersion") ||
+    !hasOwn(register, "capabilities") ||
+    !hasOwn(registerOk, "protocolVersion") ||
+    !hasOwn(registerOk, "capabilities")
+  ) {
+    return false;
+  }
+  return (
+    register.protocolVersion === PROTOCOL_VERSION_V2 &&
+    registerOk.protocolVersion === PROTOCOL_VERSION_V2 &&
+    register.capabilities.includes(WORKSPACE_READINESS_CAPABILITY) &&
+    registerOk.capabilities.includes(WORKSPACE_READINESS_CAPABILITY)
   );
 }
 
@@ -188,14 +825,49 @@ export function isRegisterDeniedMessage(value) {
   );
 }
 
-export function isInvokeMessage(value) {
+export function isInvokeMessage(value, context = undefined) {
   if (
     !isObject(value) ||
     value.type !== MSG_TYPES.INVOKE ||
     !isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) ||
-    !isBoundedString(value.workDir, V0_LIMITS.WORK_DIR) ||
     !isObject(value.command)
   ) {
+    return false;
+  }
+
+  const isV2 = isObject(context) && context.v2 === true;
+  const v2Fields = ["mappingId", "mappingGeneration", "mappingVersion", "workspaceId"];
+  const hasV2Field = v2Fields.some((field) => hasOwn(value, field));
+  // A legacy socket must never carry v2 identity, even if the fields happen
+  // to have valid values. This keeps the capability gate atomic.
+  if (!isV2 && hasV2Field) return false;
+
+  if (isV2) {
+    const allowedFields = new Set([
+      "type",
+      "requestId",
+      "mappingId",
+      "mappingGeneration",
+      "mappingVersion",
+      "workspaceId",
+      "workDir",
+      "command",
+    ]);
+    if (!Object.keys(value).every((key) => allowedFields.has(key))) return false;
+    if (
+      !isMappingId(value.mappingId) ||
+      !isMappingGeneration(value.mappingGeneration) ||
+      !isMappingVersion(value.mappingVersion)
+    ) {
+      return false;
+    }
+    if (hasOwn(value, "workspaceId") && !isWorkspaceId(value.workspaceId)) {
+      return false;
+    }
+    if (hasOwn(value, "workDir") && !isBoundedString(value.workDir, V0_LIMITS.WORK_DIR)) {
+      return false;
+    }
+  } else if (!isBoundedString(value.workDir, V0_LIMITS.WORK_DIR)) {
     return false;
   }
 

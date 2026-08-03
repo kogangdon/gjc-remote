@@ -17,6 +17,8 @@ import {
   isRegisterMessage,
   isRegisterOkMessage,
   negotiateCapabilities,
+  PROTOCOL_ERROR_CODES,
+  WORKSPACE_READINESS_CAPABILITY,
 } from "@gjc-remote/shared";
 import { HostRegistry } from "../src/host-registry.js";
 
@@ -117,6 +119,49 @@ async function startRegistry(
       return registry.close();
     },
   };
+}
+async function connectV2(server, hostId = "host-a", token = "token-a", register = {}) {
+  const port = server.registry.wss.address().port;
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  await once(socket, "open");
+  const response = once(socket, "message");
+  socket.send(
+    JSON.stringify({
+      type: "register",
+      hostId,
+      token,
+      protocolVersion: 2,
+      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+      ...register,
+    })
+  );
+  const [raw] = await response;
+  return { socket, response: JSON.parse(raw.toString()) };
+}
+
+function readinessFrame(overrides = {}) {
+  return {
+    type: "readiness",
+    socketGeneration: 1,
+    revision: 1,
+    observedAt: Date.now(),
+    ttlMs: 1_000,
+    status: {
+      connection: "online",
+      runtime: "ready",
+      providerAuth: "configured",
+      modelProfile: "ready",
+      workspace: "ready",
+    },
+    workspaceId: "workspace-1",
+    workspaceGeneration: 1,
+    ...overrides,
+  };
+}
+
+async function sendReadiness(socket, frame) {
+  socket.send(JSON.stringify(frame));
+  await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
 async function expectPolicyClose(socket, payload) {
@@ -929,11 +974,11 @@ test("a host's pending cap does not block a different host", async () => {
     await server.close();
   }
 });
-test("v1 negotiation validators bound version and capabilities additively", () => {
+test("protocol version validators accept only supported versions", () => {
   assert.equal(isProtocolVersion(0), true);
   assert.equal(isProtocolVersion(1), true);
-  assert.equal(isProtocolVersion(V0_LIMITS.PROTOCOL_VERSION_MAX), true);
-  for (const bad of [-1, 1.5, "1", Number.NaN, V0_LIMITS.PROTOCOL_VERSION_MAX + 1]) {
+  assert.equal(isProtocolVersion(2), true);
+  for (const bad of [-1, 3, 1.5, "1", Number.NaN, V0_LIMITS.PROTOCOL_VERSION_MAX]) {
     assert.equal(isProtocolVersion(bad), false);
   }
 
@@ -1027,20 +1072,26 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
   }
 });
 
-test("negotiated protocol version is clamped to this bot build and hostInfo is a copy", async () => {
+test("future protocol versions fail closed", async () => {
   const server = await startRegistry();
+  let socket;
   try {
-    // A newer daemon advertises a higher version than this bot understands.
-    await server.connect("host-a", "token-a", {
-      protocolVersion: PROTOCOL_VERSION + 5,
-    });
-    const info = server.registry.getHostInfo("host-a");
-    assert.equal(info.protocolVersion, PROTOCOL_VERSION);
-
-    // getHostInfo returns a defensive copy; mutating it must not leak inward.
-    info.capabilities.push("tampered");
-    assert.deepEqual(server.registry.getHostInfo("host-a").capabilities, [...CAPABILITIES]);
+    socket = new WebSocket(`ws://127.0.0.1:${server.registry.wss.address().port}`);
+    await once(socket, "open");
+    const closed = once(socket, "close");
+    socket.send(
+      JSON.stringify({
+        type: "register",
+        hostId: "host-a",
+        token: "token-a",
+        protocolVersion: PROTOCOL_VERSION + 5,
+        capabilities: CAPABILITIES,
+      })
+    );
+    await closed;
+    assert.equal(server.registry.getHostInfo("host-a"), undefined);
   } finally {
+    socket?.terminate();
     await server.close();
   }
 });
@@ -1349,6 +1400,308 @@ test("adversarial: a gate pending across multiple idle windows never times out, 
       ok: false,
       error: "timed out waiting for host response",
     });
+  } finally {
+    await server.close();
+  }
+});
+test("phase 1 gates readiness capability advertisement atomically", async () => {
+  const server = await startRegistry();
+  try {
+    const suppressed = await connectV2(server, "host-a", "token-a", {
+      capabilities: CAPABILITIES,
+    });
+    assert.deepEqual(suppressed.response, {
+      type: "register_ok",
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: CAPABILITIES,
+    });
+    suppressed.socket.terminate();
+    await waitFor(() => server.registry.getHostInfo("host-a") === undefined);
+
+    const committed = await connectV2(server);
+    assert.deepEqual(committed.response, {
+      type: "register_ok",
+      protocolVersion: 2,
+      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+    });
+    assert.deepEqual(server.registry.getHostInfo("host-a"), {
+      protocolVersion: 2,
+      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("phase 1 accepts bounded readiness, keeps ping/pong from refreshing TTL, and resets on replacement", async () => {
+  let wall = 1_700_000_000_000;
+  let monotonic = 0;
+  const server = await startRegistry(undefined, {
+    now: () => wall,
+    monotonicNow: () => monotonic,
+  });
+  try {
+    const first = await connectV2(server);
+    await sendReadiness(first.socket, readinessFrame({ observedAt: wall }));
+    assert.equal(server.registry.getHostReadiness("host-a").aggregate, "ready");
+    const expiry = server.registry.getHostReadiness("host-a").expiresAt;
+
+    first.socket.send(JSON.stringify({ type: "pong" }));
+    monotonic = 1_000;
+    const expired = server.registry.getHostReadiness("host-a");
+    assert.equal(expired.aggregate, "degraded");
+    assert.equal(expired.expiresAt, expiry);
+
+    first.socket.terminate();
+    await waitFor(() => server.registry.getHostReadiness("host-a") === undefined);
+    const replacement = await connectV2(server);
+    assert.deepEqual(server.registry.getHostReadiness("host-a"), {
+      hostId: "host-a",
+      aggregate: "connected-not-ready",
+      dimensions: {
+        connection: "online",
+        runtime: "error",
+        providerAuth: "unknown",
+        modelProfile: "unknown",
+        workspace: "unknown",
+      },
+      lastErrorAt: null,
+      revision: 0,
+      socketGeneration: null,
+    });
+    replacement.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+test("phase 1 preserves readiness fences across replacement and records replay state", async () => {
+  const server = await startRegistry();
+  try {
+    const first = await connectV2(server);
+    await sendReadiness(first.socket, readinessFrame({ socketGeneration: 7, observedAt: Date.now() }));
+    first.socket.terminate();
+    await waitFor(() => server.registry.getHostReadiness("host-a") === undefined);
+
+    const replacement = await connectV2(server);
+    const closed = once(replacement.socket, "close");
+    replacement.socket.send(
+      JSON.stringify(
+        readinessFrame({
+          socketGeneration: 7,
+          revision: 2,
+          observedAt: Date.now(),
+        })
+      )
+    );
+    await closed;
+    assert.equal(
+      server.registry.readinessStates.get("host-a")?.lastError?.code,
+      PROTOCOL_ERROR_CODES.READINESS_REPLAYED
+    );
+
+    const current = await connectV2(server);
+    await sendReadiness(
+      current.socket,
+      readinessFrame({ socketGeneration: 8, revision: 1, observedAt: Date.now() })
+    );
+    assert.equal(server.registry.getHostReadiness("host-a").socketGeneration, 8);
+    current.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("phase 1 records invalid freshness and recovers degraded readiness on a fresh frame", async () => {
+  let wall = 1_700_000_000_000;
+  let monotonic = 0;
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    now: () => wall,
+    monotonicNow: () => monotonic,
+  });
+  try {
+    const { socket } = await connectV2(server);
+    const invalid = readinessFrame({ observedAt: wall + 10 * 60 * 1000 });
+    socket.send(JSON.stringify(invalid));
+    await waitFor(
+      () =>
+        server.registry.readinessStates.get("host-a")?.lastError?.code ===
+        PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID
+    );
+    assert.deepEqual(
+      server.registry.readinessStates.get("host-a")?.lastError?.remediation,
+      {
+        code: PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID,
+        retryable: false,
+        action: "contact_admin",
+      }
+    );
+    socket.terminate();
+    await waitFor(() => server.registry.getHostReadiness("host-a") === undefined);
+  } finally {
+    await server.close();
+  }
+
+  const recovery = await startRegistry(undefined, {
+    timers: createManualTimers().api,
+    now: () => wall,
+    monotonicNow: () => monotonic,
+  });
+  try {
+    const { socket } = await connectV2(recovery);
+    await sendReadiness(socket, readinessFrame({ observedAt: wall }));
+    assert.equal(recovery.registry.getHostReadiness("host-a").aggregate, "ready");
+    monotonic = 2_000;
+    assert.equal(recovery.registry.getHostReadiness("host-a").aggregate, "degraded");
+    await sendReadiness(socket, readinessFrame({ revision: 2, observedAt: wall }));
+    assert.equal(recovery.registry.getHostReadiness("host-a").aggregate, "ready");
+    socket.terminate();
+  } finally {
+    await recovery.close();
+  }
+});
+
+test("phase 1 fences revisions and workspace generations before state mutation", async () => {
+  const server = await startRegistry();
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({ observedAt: Date.now(), workspaceGeneration: 2 }));
+    assert.equal(server.registry.getHostReadiness("host-a").workspaceGeneration, 2);
+
+    await sendReadiness(
+      socket,
+      readinessFrame({
+        revision: 2,
+        observedAt: Date.now(),
+        workspaceGeneration: 3,
+      })
+    );
+    assert.equal(server.registry.getHostReadiness("host-a").workspaceGeneration, 3);
+
+    const closed = once(socket, "close");
+    socket.send(
+      JSON.stringify(
+        readinessFrame({
+          revision: 3,
+          observedAt: Date.now(),
+          workspaceGeneration: 2,
+        })
+      )
+    );
+    await closed;
+    assert.equal(server.registry.getHostReadiness("host-a"), undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("phase 1 aggregate precedence and not-ready invoke remediation allocate no requests", async () => {
+  const tokens = new Map([
+    ["offline", "offline-token"],
+    ["incompatible", "incompatible-token"],
+    ["degraded", "degraded-token"],
+    ["missing", "missing-token"],
+    ["ready", "ready-token"],
+  ]);
+  const server = await startRegistry(tokens);
+  const sockets = [];
+  try {
+    const offline = await connectV2(server, "offline", "offline-token");
+    const incompatible = await connectV2(server, "incompatible", "incompatible-token");
+    const degraded = await connectV2(server, "degraded", "degraded-token");
+    const missing = await connectV2(server, "missing", "missing-token");
+    const ready = await connectV2(server, "ready", "ready-token");
+    sockets.push(offline.socket, incompatible.socket, degraded.socket, missing.socket, ready.socket);
+
+    await sendReadiness(
+      offline.socket,
+      readinessFrame({
+        observedAt: Date.now(),
+        status: { ...readinessFrame().status, connection: "offline" },
+      })
+    );
+    await sendReadiness(
+      incompatible.socket,
+      readinessFrame({
+        observedAt: Date.now(),
+        status: { ...readinessFrame().status, runtime: "incompatible" },
+      })
+    );
+    await sendReadiness(degraded.socket, readinessFrame({ observedAt: Date.now() }));
+    await sendReadiness(
+      degraded.socket,
+      readinessFrame({
+        revision: 2,
+        observedAt: Date.now(),
+        lastError: {
+          code: "PROVIDER_UNAVAILABLE",
+          at: Date.now(),
+          remediation: { code: "PROVIDER_UNAVAILABLE", retryable: true, action: "retry_later" },
+        },
+      })
+    );
+    await sendReadiness(
+      missing.socket,
+      readinessFrame({
+        observedAt: Date.now(),
+        status: { ...readinessFrame().status, providerAuth: "missing" },
+      })
+    );
+    await sendReadiness(ready.socket, readinessFrame({ observedAt: Date.now() }));
+
+    assert.equal(server.registry.getHostReadiness("offline").aggregate, "offline");
+    assert.equal(server.registry.getHostReadiness("incompatible").aggregate, "incompatible");
+    assert.equal(server.registry.getHostReadiness("degraded").aggregate, "degraded");
+    assert.equal(server.registry.getHostReadiness("missing").aggregate, "connected-not-ready");
+    assert.equal(server.registry.getHostReadiness("ready").aggregate, "ready");
+
+    const outcomes = await Promise.all([
+      server.registry.invoke("offline", "/x", { kind: "prompt", message: "x" }, () => {}),
+      server.registry.invoke("incompatible", "/x", { kind: "prompt", message: "x" }, () => {}),
+      server.registry.invoke("degraded", "/x", { kind: "prompt", message: "x" }, () => {}),
+      server.registry.invoke("missing", "/x", { kind: "prompt", message: "x" }, () => {}),
+    ]);
+    assert.deepEqual(
+      outcomes.map((result) => result.error),
+      [
+        { code: "CONNECTION_LOST", retryable: true, action: "retry_later" },
+        { code: "RUNTIME_INCOMPATIBLE", retryable: false, action: "contact_admin" },
+        { code: "PROVIDER_UNAVAILABLE", retryable: true, action: "retry_later" },
+        { code: "PROVIDER_MISSING", retryable: true, action: "login" },
+      ]
+    );
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await server.close();
+  }
+});
+
+test("phase 1 host projections redact hostile identity and readiness diagnostics", async () => {
+  const hostId = "host\nsecret";
+  const token = "secret-token";
+  const server = await startRegistry(new Map([[hostId, token]]));
+  try {
+    const { socket } = await connectV2(server, hostId, token);
+    await sendReadiness(
+      socket,
+      readinessFrame({
+        observedAt: Date.now(),
+        lastError: {
+          code: "PROVIDER_MISSING",
+          at: Date.now(),
+          remediation: { code: "PROVIDER_MISSING", retryable: true, action: "login" },
+        },
+      })
+    );
+    const projection = server.registry.getHostReadiness(hostId);
+    assert.equal(projection.hostId, "[redacted-host]");
+    assert.equal(projection.lastErrorAt > 0, true);
+    assert.equal(JSON.stringify(projection).includes(token), false);
+    assert.equal(JSON.stringify(projection).includes("/var/lib"), false);
+    assert.equal(/[\u0000-\u001f]/.test(JSON.stringify(projection)), false);
+    socket.terminate();
   } finally {
     await server.close();
   }
