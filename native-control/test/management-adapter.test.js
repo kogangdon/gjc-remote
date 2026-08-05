@@ -395,6 +395,37 @@ test('prospective GP refuses an actual config parent owned by a principal other 
   }), /actual config parent owner is not the configured management principal/);
   assert.deepEqual(calls, []);
 });
+test('terminal close is create-once, idempotent on exact replay, and rejects replacement before writes', async () => {
+  const { files, roles, lowLevel, calls } = fake();
+  const native = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles });
+  const request = records().request;
+  await native.probeProspectiveCleanup({
+    txId: request.genesisTxId,
+    targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid },
+    botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64),
+    botProvisioningFingerprint: 'c'.repeat(64),
+    recoveryProvisioningFingerprint: 'd'.repeat(64),
+  });
+  const first = await native.terminalCloseOrManualCleanup({ reason: 'first' });
+  const terminal = [...files.keys()].find((path) => normalize(path).endsWith('/terminal-close.json'));
+  const before = Buffer.from(files.get(terminal));
+  const writes = calls.length;
+  const replay = await native.terminalCloseOrManualCleanup({ reason: 'first' });
+  assert.deepEqual(replay, first);
+  assert.deepEqual(files.get(terminal), before);
+  assert.equal(calls.length, writes);
+  const stored = JSON.parse(before);
+  assert.equal(stored.manualCleanupFingerprint, recordHash(stored, 'manualCleanupFingerprint'));
+  await assert.rejects(
+    native.terminalCloseOrManualCleanup({ reason: 'second' }),
+    /terminal-close replay conflicts/,
+  );
+  assert.deepEqual(files.get(terminal), before);
+  assert.equal(calls.length, writes);
+});
 
 test('fails closed before replacement when a retained authority ACL drifts', async () => {
   const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
@@ -409,12 +440,12 @@ test('fails closed before replacement when a retained authority ACL drifts', asy
   const terminal = [...files.keys()].find((path) => normalize(path).endsWith('/terminal-close.json'));
   const before = Buffer.from(files.get(terminal));
   let reads = 0;
-  lowLevel.read_acl = async (path) => normalize(path) === normalize(terminal) && ++reads === 2 ? 'drifted' : 'protected:M,B,R,SYSTEM';
-  await assert.rejects(native.terminalCloseOrManualCleanup({ reason: 'second' }), /ACL changed/);
+  lowLevel.read_acl = async (path) => normalize(path) === normalize(terminal) && ++reads === 1 ? '' : 'protected:M,B,R,SYSTEM';
+  await assert.rejects(native.terminalCloseOrManualCleanup({ reason: 'first' }), /ACL changed/);
   assert.deepEqual(files.get(terminal), before);
 });
-test('rejects a post-replace identity or byte mismatch', async () => {
-  const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
+test('rejects a mismatched terminal-close replacement before writes', async () => {
+  const { files, roles, lowLevel, calls } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   await native.probeProspectiveCleanup({
     txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' },
@@ -423,8 +454,13 @@ test('rejects a post-replace identity or byte mismatch', async () => {
     managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64),
   });
   await native.terminalCloseOrManualCleanup({ reason: 'first' });
-  lowLevel.replace_existing_atomic = async (_from, to) => { files.set(to, Buffer.from('corrupt')); };
-  await assert.rejects(native.terminalCloseOrManualCleanup({ reason: 'second' }), /object bytes or identity changed/);
+  const terminal = [...files.keys()].find((path) => normalize(path).endsWith('/terminal-close.json'));
+  const before = Buffer.from(files.get(terminal));
+  const writes = calls.length;
+  lowLevel.replace_existing_atomic = async () => { throw new Error('replacement must not run'); };
+  await assert.rejects(native.terminalCloseOrManualCleanup({ reason: 'second' }), /terminal-close replay conflicts/);
+  assert.deepEqual(files.get(terminal), before);
+  assert.equal(calls.length, writes);
 });
 test('fails closed when a retained authority identity drifts', async () => {
   const { roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
@@ -980,6 +1016,77 @@ test('MST cleans retained artifacts after temp create, verification, flush, and 
     lowLevel.read_identity = originalIdentity;
     lowLevel.flush_file = originalFlush;
     lowLevel.replace_existing_atomic = originalReplace;
+  }
+});
+test('generic writes clean verified replacement temps or refuse ambiguous cleanup', async () => {
+  const phases = ['temp-verify', 'temp-flush', 'replace'];
+  for (const phase of phases) {
+    const { files, lowLevel, roles } = fake();
+    const configPath = 'C:/state/channels.json';
+    const targetBytes = Buffer.from('{"legacy":true}');
+    files.set(configPath, targetBytes);
+    const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+    const genesis = records();
+    await native.probeProspectiveCleanup({
+      txId: genesis.request.genesisTxId,
+      targetPrincipal: { kind: 'sid', value: 'target' },
+      managementPrincipal: { kind: 'sid', value: roles.managementSid },
+      botPrincipal: { kind: 'sid', value: roles.botSid },
+      recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+      managementProvisioningFingerprint: 'b'.repeat(64),
+      botProvisioningFingerprint: 'c'.repeat(64),
+      recoveryProvisioningFingerprint: 'd'.repeat(64),
+    });
+    await writeAuthorityRequest(native, configPath, genesis.request, roles, targetBytes);
+    const ownerPrincipal = { kind: 'sid', value: roles.managementSid };
+    const ownerPrincipalKey = canonicalJsonHash(ownerPrincipal);
+    const auth = {
+      version: 1,
+      ownerPrincipal,
+      ownerPrincipalKey,
+      credentials: {
+        [ownerPrincipalKey]: {
+          version: 1,
+          principal: ownerPrincipal,
+          kdf: { name: 'scrypt', N: 16384, r: 8, p: 1, keyLength: 32, saltBytes: 16 },
+          salt: 'a'.repeat(32),
+          hash: 'b'.repeat(64),
+          epoch: 1,
+          revoked: false,
+        },
+      },
+    };
+    const authPath = 'C:\\state\\.gjc-remote-control\\management-auth.json';
+    files.set(authPath, Buffer.from(canonicalJson(auth)));
+    const replacement = structuredClone(auth);
+    replacement.credentials[ownerPrincipalKey].revoked = true;
+    const originalIdentity = lowLevel.read_identity;
+    const originalFlush = lowLevel.flush_file;
+    const originalReplace = lowLevel.replace_existing_atomic;
+    if (phase === 'temp-verify') {
+      lowLevel.read_identity = async (path) =>
+        path.includes('channels.json.tmp') ? null : originalIdentity(path);
+    } else if (phase === 'temp-flush') {
+      lowLevel.flush_file = async (path) => {
+        if (path.includes('channels.json.tmp')) throw new Error('injected temp flush failure');
+        return originalFlush(path);
+      };
+    } else {
+      lowLevel.replace_existing_atomic = async () => { throw new Error('injected replace failure'); };
+    }
+    try {
+      const expectedFingerprint = canonicalJsonHash(auth);
+      await assert.rejects(
+        native.compareAndSwapManagementAuth(expectedFingerprint, replacement),
+        phase === 'temp-verify' ? /temporary artifact cleanup is ambiguous/ : /injected/,
+      );
+      const temporary = [...files.keys()].filter((path) => path.includes('channels.json.tmp'));
+      assert.equal(temporary.length, phase === 'temp-verify' ? 1 : 0, phase);
+    } finally {
+      lowLevel.read_identity = originalIdentity;
+      lowLevel.flush_file = originalFlush;
+      lowLevel.replace_existing_atomic = originalReplace;
+    }
   }
 });
 

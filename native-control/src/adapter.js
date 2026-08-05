@@ -318,6 +318,23 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (profile !== null && !await lowLevel.verify_exact_role_acl(name, ...roleArguments(profile))) refused('verify_management_object', 'object exact role ACL changed or is unreadable');
     return { identity, acl };
   };
+  const cleanupGenericWriteTemp = async (name, bytes, parentIdentity, profile, expectedIdentity) => {
+    try {
+      if (await lowLevel.read_verified_bytes(name) === null) {
+        return !(await lowLevel.path_exists_no_follow(name));
+      }
+      if (!expectedIdentity) return false;
+      const verified = await assertObject(name, bytes, parentIdentity, undefined, profile);
+      if (!sameIdentity(verified.identity, expectedIdentity)) return false;
+      await lowLevel.remove_verified_file(name, bytes);
+      await lowLevel.flush_directory_or_volume(dirname(name));
+      await assertParent(name, parentIdentity);
+      return await lowLevel.read_verified_bytes(name) === null &&
+        !await lowLevel.path_exists_no_follow(name);
+    } catch {
+      return false;
+    }
+  };
   const ensure = async () => { const parentIdentity = await verifiedParent(root); await lowLevel.ensure_control_directory(root, ...roleArguments('authority')); await lowLevel.open_no_follow(root); if (!await lowLevel.read_acl(root) || !await lowLevel.verify_exact_role_acl(root, ...roleArguments('authority'))) refused('ensure_control_directory', 'control-root exact role ACL is unreadable'); await assertParent(root, parentIdentity); };
   const ensureBotRoot = async () => { await ensure(); const parentIdentity = await verifiedParent(botRoot); await lowLevel.ensure_control_directory(botRoot, ...roleArguments('bot-state')); await lowLevel.open_no_follow(botRoot); if (!await lowLevel.read_acl(botRoot) || !await lowLevel.verify_exact_role_acl(botRoot, ...roleArguments('bot-state'))) refused('ensure_bot_directory', 'bot-state exact role ACL is unreadable'); await assertParent(botRoot, parentIdentity); };
   const hasPublishedAuthority = async () => (await lowLevel.read_verified_bytes(path('control-root'))) !== null;
@@ -355,6 +372,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   };
   const read = async (name) => rawRead(name);
   const write = async (name, value, profile = 'authority', requireRequest = true) => {
+    const cleanupOperation = profile === 'bot-state' ? 'write_bot_state' : 'write_management_state';
     if (profile === 'bot-state') await requireBotPrincipal('write_bot_state');
     else await requireManagementPrincipal('write_management_state');
     if (requireRequest) await requireAuthorityRequest('write_management_state');
@@ -366,18 +384,26 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     } else {
       const before = await assertObject(name, Buffer.from(old), parentIdentity);
       const temp = await lowLevel.create_exclusive_temp(dirname(name), tempPrefix, bytes, ...roleArgs);
-      const scratch = await assertObject(temp, bytes, parentIdentity);
-      await lowLevel.flush_file(temp);
-      await assertObject(name, Buffer.from(old), parentIdentity, before.acl);
-      await lowLevel.replace_existing_atomic(temp, name, ...roleArgs);
-      await assertObject(name, bytes, parentIdentity, scratch.acl);
+      let scratch = null;
+      try {
+        scratch = await assertObject(temp, bytes, parentIdentity, undefined, profile);
+        await lowLevel.flush_file(temp);
+        await assertObject(name, Buffer.from(old), parentIdentity, before.acl);
+        await lowLevel.replace_existing_atomic(temp, name, ...roleArgs);
+        await assertObject(name, bytes, parentIdentity, scratch.acl);
+      } catch (error) {
+        if (!await cleanupGenericWriteTemp(temp, bytes, parentIdentity, profile, scratch?.identity)) {
+          refused(cleanupOperation, 'generic write temporary artifact cleanup is ambiguous; manual cleanup is required');
+        }
+        throw error;
+      }
     }
     await lowLevel.flush_file(name); await lowLevel.flush_directory_or_volume(dirname(name)); await assertParent(name, parentIdentity);
   };
   const writeAuthority = async (name, value, requireRequest = true) => { await requireManagementPrincipal('write_management_state'); await requireGenesisProof(); await ensure(); await write(path(name), value, 'authority', requireRequest); };
   const writeImmutableAuthority = async (name, value, authorityRequest = false) => { await requireManagementPrincipal('write_immutable_authority'); await requireGenesisProof(); await ensure(); if (!authorityRequest) await requireAuthorityRequest('write_immutable_authority'); const destination = path(name); const bytes = encode(value); const parentIdentity = await verifiedParent(destination); if (await lowLevel.read_verified_bytes(destination) !== null) refused('write_immutable_authority', 'immutable authority record already exists'); await lowLevel.create_absent_exclusive(destination, bytes, ...roleArguments('authority')); await assertObject(destination, bytes, parentIdentity); await lowLevel.flush_file(destination); await lowLevel.flush_directory_or_volume(dirname(destination)); await assertParent(destination, parentIdentity); };
-  const writeCreateOnceAuthority = async (name, value) => {
-    await requireManagementPrincipal('write_create_once_authority'); await requireGenesisProof(); await ensure(); await requireAuthorityRequest('write_create_once_authority');
+  const writeCreateOnceAuthority = async (name, value, requireRequest = true) => {
+    await requireManagementPrincipal('write_create_once_authority'); await requireGenesisProof(); await ensure(); if (requireRequest) await requireAuthorityRequest('write_create_once_authority');
     const destination = path(name); const bytes = encode(value); const parentIdentity = await verifiedParent(destination);
     const existing = await lowLevel.read_verified_bytes(destination);
     if (existing !== null) {
@@ -3148,7 +3174,18 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       }
       await writeAuthority('token-sidecar', record);
     },
-    async terminalCloseOrManualCleanup(value) { const record = await manualCleanupRecord(value); await writeAuthority('terminal-close', record, false); return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: record.manualCleanupFingerprint }; },
+    async terminalCloseOrManualCleanup(value) {
+      const existing = await read(path('terminal-close'));
+      if (existing !== null) {
+        try { validateManualCleanup(existing); } catch { refused('terminal_close', 'durable terminal-close record is torn or invalid'); }
+        const record = await manualCleanupRecord(value);
+        if (canonical(existing) !== canonical(record)) refused('terminal_close', 'terminal-close replay conflicts with the durable cleanup record');
+        return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: existing.manualCleanupFingerprint };
+      }
+      const record = await manualCleanupRecord(value);
+      await writeCreateOnceAuthority('terminal-close', record, false);
+      return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: record.manualCleanupFingerprint };
+    },
     async recoverManagementState(recovery) {
       const existing = await read(path('terminal-close'));
       if (existing) {
