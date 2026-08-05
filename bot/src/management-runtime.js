@@ -7,7 +7,7 @@ import { addCredential, authenticate, bootstrapOwner, revokeCredential, rotateCr
 import { buildAdmissionGrant, buildAdmissionRequest, validateAdmissionAck, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
 import { validateGenesisSuffixRecovery } from "@gjc-remote/shared/recovery-envelope";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationState, buildPublicationTransaction, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationY, validatePublicationZp } from "@gjc-remote/shared/publication-envelope";
-import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorRequest } from "@gjc-remote/shared/successor-envelope";
+import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest } from "@gjc-remote/shared/successor-envelope";
 
 export const EXIT = Object.freeze({ OK: 0, USAGE: 2, AUTH: 3, CONFLICT: 4, NATIVE: 5, INVALID: 6, RECOVERY: 7, INTERNAL: 70 });
 const LOCK_ORDER = ["genesis", "mapping", "admission"];
@@ -290,6 +290,27 @@ export class ManagementRuntime {
     const state = await this.native.readManagementState();
     return state ?? emptyState();
   }
+  async #readAuthorityEpochFloor() {
+    if (typeof this.native.readAuthorityEpochFloor !== "function") return null;
+    return this.native.readAuthorityEpochFloor();
+  }
+  async #nextAuthorityEpoch(state) {
+    const floor = await this.#readAuthorityEpochFloor();
+    const highest = Number.isSafeInteger(floor?.highestReservedAuthorityEpoch)
+      ? floor.highestReservedAuthorityEpoch
+      : state.authorityEpoch;
+    if (!Number.isSafeInteger(highest) || highest < 0 || highest >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("AUTHORITY_EPOCH_FLOOR_INVALID");
+    }
+    return highest + 1;
+  }
+  async #committedAuthorityEpoch(state) {
+    if (typeof this.native.readAuthorityEpoch === "function") {
+      const epoch = await this.native.readAuthorityEpoch();
+      if (Number.isSafeInteger(epoch?.epoch) && epoch.epoch > 0) return epoch.epoch;
+    }
+    return state.authorityEpoch;
+  }
   async #readAuth() {
     const auth = await this.native.readManagementAuth();
     if (!auth) throw new Error("MANAGEMENT_AUTH_REQUIRED");
@@ -351,8 +372,7 @@ export class ManagementRuntime {
       };
       current.admission = { phase: "closed", finalityFingerprint: null };
       const revision = current.revision;
-      current.revision = revision + 1;
-      current.authorityEpoch += 1;
+      current.authorityEpoch = (await this.#readAuthorityEpochFloor())?.highestReservedAuthorityEpoch ?? current.authorityEpoch;
       if (!await this.native.compareAndSwapManagementState(revision, current)) throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
     }
     throw new Error("MANUAL_CLEANUP_REQUIRED");
@@ -515,7 +535,7 @@ export class ManagementRuntime {
         };
         try { await this.#commitGenesisHistory(anchorFingerprint); } catch { await this.#manualCleanup(state, "MANAGED_HISTORY_MARKER_REQUIRED"); }
         state.revision = before + 1;
-        state.authorityEpoch += 1;
+        state.authorityEpoch = await this.#committedAuthorityEpoch(state);
         if (!await this.native.compareAndSwapManagementState(before, state)) {
           throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
         }
@@ -572,7 +592,7 @@ export class ManagementRuntime {
         try { await this.#commitGenesisHistory(anchorFingerprint); } catch { await this.#manualCleanup(state, "MANAGED_HISTORY_MARKER_REQUIRED"); }
         const before = state.revision;
         state.revision += 1;
-        state.authorityEpoch += 1;
+        state.authorityEpoch = await this.#committedAuthorityEpoch(state);
         if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
         return { idempotent: true, recovered: true, genesisTxId: state.recovery.txId, routeDisposition: "no-route" };
       }
@@ -607,8 +627,9 @@ export class ManagementRuntime {
       request.requestFingerprint = recordHash(request, "requestFingerprint");
       validateGenesisRequest(request);
       let authorityRequest;
+      const authorityEpochCandidate = await this.#nextAuthorityEpoch(state);
       const authorityReservation = {
-        version: 1, kind: "authority-reservation", anchorFingerprint, txId, epoch: state.authorityEpoch + 1,
+        version: 1, kind: "authority-reservation", anchorFingerprint, txId, epoch: authorityEpochCandidate,
         generation, candidateFingerprint: request.requestFingerprint, previousAuthorityCommitSnapshotFingerprint: null, reservationFingerprint: null,
       };
       authorityReservation.reservationFingerprint = recordHash(authorityReservation, "reservationFingerprint");
@@ -695,7 +716,7 @@ export class ManagementRuntime {
         state.recovery = { txId, phase: "prepared", replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, generation, hostSetFingerprint, requestFingerprint: request.requestFingerprint, reservationFingerprint: reservedFloor.floorFingerprint, attestationFingerprint: attestation.attestationFingerprint, finalityFingerprint: null };
         const preparedRevision = state.revision;
         state.revision = preparedRevision + 1;
-        state.authorityEpoch += 1;
+        state.authorityEpoch = authorityReservation.epoch;
         if (!await this.native.compareAndSwapManagementState(preparedRevision, state)) throw new Error("MANUAL_CLEANUP_REQUIRED");
         await this.native.writeGenesisRequest(request);
         nativeMutation = true;
@@ -705,6 +726,9 @@ export class ManagementRuntime {
         if (genesisProbe?.targetInputState === "legacy-unmigrated") {
           baseline = { ...baseline, targetState: "legacy-unmigrated", baselineFingerprint: null };
         }
+        await this.native.reserveAuthorityEpoch(authorityEpoch);
+        await this.native.writeAuthorityReservation(authorityReservation);
+        await this.native.writeAuthorityCommitSnapshot(authorityCommit);
         let publicationEvidence = await this.native.publishMapping({
           request,
           attestation,
@@ -713,9 +737,6 @@ export class ManagementRuntime {
           expectedLegacyTarget,
           readerVersionFloor: null,
         });
-        await this.native.reserveAuthorityEpoch(authorityEpoch);
-        await this.native.writeAuthorityReservation(authorityReservation);
-        await this.native.writeAuthorityCommitSnapshot(authorityCommit);
         let readerVersionFloor = null;
         if (request.requestedReaderMode === "handshake") {
           readerVersionFloor = await this.native.casReaderVersionFloor({
@@ -909,7 +930,7 @@ export class ManagementRuntime {
             state.admission = { phase: "closed", finalityFingerprint: null };
             const before = state.revision;
             state.revision = before + 1;
-            state.authorityEpoch += 1;
+            state.authorityEpoch = authorityReservation.epoch;
             if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("MANUAL_CLEANUP_REQUIRED");
             return { genesisTxId: txId, pending: true, reopened: false, routeDisposition: "no-route" };
           }
@@ -979,7 +1000,7 @@ export class ManagementRuntime {
           ? { phase: "open", finalityFingerprint: finalityProof.finalityProofFingerprint }
           : { phase: "closed", finalityFingerprint: null };
         state.tokenConfigGeneration = generation;
-        state.authorityEpoch += 1;
+        state.authorityEpoch = committedAuthorityEpoch.epoch;
         state.revision += 1;
         if (!await this.native.compareAndSwapManagementState(state.revision - 1, state)) throw new Error("MANUAL_CLEANUP_REQUIRED");
         try {
@@ -1078,6 +1099,95 @@ export class ManagementRuntime {
     await this.native.writeAuthoritySuccessorHead(terminal);
     return { pending: false, idempotent: true, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
   }
+  async #completeNoReaderSuccessor(state, txId, bundle = null) {
+    if (typeof this.native.readSuccessorBundle !== "function" ||
+        typeof this.native.readSuccessorRecovery !== "function" ||
+        typeof this.native.writeAuthoritySuccessorReceipt !== "function") {
+      throw new Error("MANAGED_NATIVE_UNAVAILABLE");
+    }
+    const successor = bundle ?? await this.native.readSuccessorBundle();
+    if (!successor || successor.head.txId !== txId || successor.head.phase !== "reader-pending") return null;
+    validateAuthoritySuccessorBundle(successor);
+    validateReaderVersionFloor(successor.readerFloor);
+    if (!successor.baseline || successor.readerFloor.readerVersionFloor !== null || successor.request.readerMode !== "no-reader" ||
+        successor.fence !== null || successor.lease !== null || successor.projection !== null || successor.ack !== null) {
+      throw new Error("READER_FLOOR_PROOF_MISMATCH");
+    }
+    const { request, finality, baseline, head } = successor;
+    const recovery = await this.native.readSuccessorRecovery({
+      predecessorReceiptFingerprint: request.previousReceiptFingerprint,
+    });
+    if (!recovery ||
+        recovery.predecessorReceiptFingerprint !== request.previousReceiptFingerprint ||
+        recovery.predecessorTargetFingerprint !== request.previousTargetFingerprint ||
+        recovery.predecessorWrapperFingerprint !== request.previousWrapperFingerprint ||
+        recovery.predecessorSnapshotFingerprint !== request.previousSnapshotFingerprint ||
+        recovery.candidateTargetFingerprint !== request.candidateTargetFingerprint ||
+        recovery.candidateConfigFingerprint !== request.candidateSnapshotFingerprint ||
+        recovery.sequence !== request.sequence ||
+        recovery.phase !== "reader-pending" ||
+        recovery.headFingerprint !== head.headFingerprint ||
+        recovery.phaseRecordFingerprint !== finality.finalityFingerprint ||
+        !recovery.candidateState ||
+        canonicalJsonHash(recovery.candidateState) !== recovery.candidateStateFingerprint) {
+      throw new Error("SUCCESSOR_RECOVERY_EVIDENCE_INVALID");
+    }
+    validateManagedChannelsV2(recovery.candidateState);
+    if (recovery.candidateState.revision !== finality.revision ||
+        recovery.candidateState.authorityEpoch !== finality.authorityEpoch ||
+        recovery.candidateState.mappingGeneration !== finality.mappingGeneration ||
+        recovery.candidateState.configFingerprint !== recovery.candidateConfigFingerprint) {
+      throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
+    }
+    const receipt = buildAuthoritySuccessorRecord({
+      version: 1, kind: "authority-successor-receipt", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId,
+      operation: request.operation, requestFingerprint: request.requestFingerprint, previousReceiptFingerprint: request.previousReceiptFingerprint,
+      finalityFingerprint: finality.finalityFingerprint, readerMode: "no-reader",
+      leaseBindingFingerprint: null, readerProjectionFingerprint: null, ackFingerprint: null,
+      snapshotFingerprint: finality.snapshotFingerprint, revision: finality.revision, authorityEpoch: finality.authorityEpoch,
+      tokenConfigGeneration: finality.tokenConfigGeneration, mappingGeneration: finality.mappingGeneration,
+      phase: "terminal", routeDisposition: "no-route", receiptFingerprint: null,
+    }, "receiptFingerprint");
+    validateAuthoritySuccessorReceipt(receipt, request, finality);
+    await this.native.writeAuthoritySuccessorReceipt(receipt);
+    const previousMarker = await this.native.readManagedHistoryMarker();
+    validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
+    const marker = {
+      version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, sequence: request.sequence,
+      previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null,
+    };
+    marker.markerFingerprint = recordHash(marker, "markerFingerprint");
+    const committedMarker = await this.native.commitManagedHistoryMarker(marker);
+    if (!committedMarker ||
+        canonicalJsonHash(committedMarker) !== canonicalJsonHash(marker) ||
+        canonicalJsonHash(await this.native.readManagedHistoryMarker()) !== canonicalJsonHash(marker)) {
+      throw new Error("MANAGED_HISTORY_MARKER_REQUIRED");
+    }
+    validateManagedHistoryMarker(committedMarker, request.anchorFingerprint, request.sequence);
+    const terminal = buildAuthoritySuccessorRecord({
+      ...head, phase: "terminal", receiptFingerprint: receipt.receiptFingerprint,
+      historyMarkerFingerprint: marker.markerFingerprint, previousHeadFingerprint: head.headFingerprint, headFingerprint: null,
+    }, "headFingerprint");
+    validateAuthoritySuccessorHeadTransition(head, terminal, request);
+    const before = state.revision;
+    state.revision = finality.revision;
+    state.authorityEpoch = finality.authorityEpoch;
+    state.tokenConfigGeneration = finality.tokenConfigGeneration;
+    state.mappingGeneration = finality.mappingGeneration;
+    state.mappings = structuredClone(recovery.candidateState.mappings);
+    state.routes = structuredClone(recovery.candidateState.routes);
+    state.tokenAttestation = {
+      fingerprint: baseline.tokenConfigHostSetFingerprint,
+      generation: finality.tokenConfigGeneration,
+      attestationFingerprint: finality.attestationFingerprint,
+      finalityFingerprint: finality.tokenFloorFingerprint,
+    };
+    state.admission = { phase: "closed", finalityFingerprint: null };
+    state.recovery = { phase: "terminal", txId, finalityFingerprint: finality.finalityFingerprint };
+    if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
+    await this.native.writeAuthoritySuccessorHead(terminal);
+    return { pending: false, idempotent: true, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
+  }
   async #recoverSuccessorHead({ state, input, actorPrincipal, operation, txId, intent, head }) {
     if (head.txId !== txId) await this.#manualCleanup(state, "RECOVERY_INPUT_MISMATCH");
     let bundle;
@@ -1090,16 +1200,20 @@ export class ManagementRuntime {
           bundle.request.idempotencyKey !== input.idempotencyKey ||
           bundle.request.operation !== operation ||
           bundle.request.previousRevision !== intent.expectedRevision) {
-        throw new Error("RECOVERY_INPUT_MISMATCH");
+        throw new Error("RECOVERY_INPUT_MISMATCH_HEAD");
       }
       if (operation === "tokens-attest") {
         if (bundle.baseline?.tokenConfigHostSetFingerprint !== intent.hostSetFingerprint) {
-          throw new Error("RECOVERY_INPUT_MISMATCH");
+          throw new Error("RECOVERY_INPUT_MISMATCH_TOKENS");
         }
       } else {
-        const prepared = await this.#prepareMappingMutation(operation, structuredClone(state), input);
-        if (prepared.snapshot.configFingerprint !== bundle.request.candidateSnapshotFingerprint ||
-            canonicalJsonHash({ operation, mappingId: input.mappingId ?? null, snapshotFingerprint: prepared.snapshot.configFingerprint }) !== bundle.request.mappingRecoveryTxFingerprint) {
+        const recoveryState = structuredClone(state);
+        recoveryState.authorityEpoch = bundle.request.candidateAuthorityEpoch - 1;
+        const prepared = await this.#prepareMappingMutation(operation, recoveryState, input);
+        if (prepared.snapshot.configFingerprint !== bundle.request.candidateSnapshotFingerprint) {
+          throw new Error("RECOVERY_INPUT_MISMATCH");
+        }
+        if (canonicalJsonHash({ operation, mappingId: input.mappingId ?? null, snapshotFingerprint: prepared.snapshot.configFingerprint }) !== bundle.request.mappingRecoveryTxFingerprint) {
           throw new Error("RECOVERY_INPUT_MISMATCH");
         }
       }
@@ -1107,6 +1221,11 @@ export class ManagementRuntime {
       await this.#manualCleanup(state, "RECOVERY_INPUT_MISMATCH");
     }
     if (head.phase === "reader-pending") {
+      if (bundle.request.readerMode === "no-reader") {
+        return (await this.#completeNoReaderSuccessor(state, txId, bundle)) ?? {
+          pending: true, idempotent: true, txId, phase: head.phase, routeDisposition: "no-route",
+        };
+      }
       return (await this.#completeBoundSuccessor(state, txId)) ?? {
         pending: true, idempotent: true, txId, phase: head.phase, routeDisposition: "no-route",
       };
@@ -1197,14 +1316,16 @@ export class ManagementRuntime {
         !Buffer.isBuffer(predecessor.targetBytes)) {
       throw new Error("RETAINED_TARGET_PROOF_REQUIRED");
     }
+    const candidateAuthorityEpoch = await this.#nextAuthorityEpoch(state);
     const preparedState = operation === "tokens-attest" ? null : structuredClone(state);
+    if (preparedState) preparedState.authorityEpoch = candidateAuthorityEpoch - 1;
     const prepared = preparedState ? await this.#prepareMappingMutation(operation, preparedState, input) : null;
     let candidateSnapshot = prepared?.snapshot ?? null;
     if (operation === "tokens-attest" && predecessor.sourceKind === "managed-v1") {
       candidateSnapshot = {
         ...structuredClone(predecessor.snapshot),
         revision: state.revision + 1,
-        authorityEpoch: state.authorityEpoch + 1,
+        authorityEpoch: candidateAuthorityEpoch,
         mappingGeneration: state.mappingGeneration,
         targetState: predecessor.snapshot.targetState === "genesis-empty" ? "managed-empty" : predecessor.snapshot.targetState,
         tokenConfigGeneration: state.tokenConfigGeneration + 1,
@@ -1261,7 +1382,7 @@ export class ManagementRuntime {
       previousReceiptFingerprint: predecessorReceiptFingerprint,
       previousTargetFingerprint: predecessor.targetFingerprint, previousWrapperFingerprint: predecessor.wrapperFingerprint,
       previousRevision: state.revision, candidateRevision: state.revision + 1,
-      previousAuthorityEpoch: state.authorityEpoch, candidateAuthorityEpoch: state.authorityEpoch + 1,
+      previousAuthorityEpoch: state.authorityEpoch, candidateAuthorityEpoch,
       previousTokenConfigGeneration: state.tokenConfigGeneration,
       candidateTokenConfigGeneration: state.tokenConfigGeneration + (operation === "tokens-attest" ? 1 : 0),
       previousAttestationFingerprint: state.tokenAttestation?.attestationFingerprint ?? previousFingerprint,
@@ -1614,7 +1735,9 @@ export class ManagementRuntime {
     if (head.phase === "reader-pending") {
       let completed;
       try {
-        completed = await this.#completeBoundSuccessor(state, head.txId);
+        completed = bundle.request.readerMode === "no-reader"
+          ? await this.#completeNoReaderSuccessor(state, head.txId, bundle)
+          : await this.#completeBoundSuccessor(state, head.txId);
       } catch {
         await this.#manualCleanup(state, "SUCCESSOR_RECOVERY_EVIDENCE_INVALID", recovery);
       }

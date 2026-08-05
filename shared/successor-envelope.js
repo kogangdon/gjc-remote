@@ -133,7 +133,7 @@ export function validateAuthoritySuccessorBundle(bundle) {
         !publicationY || publicationY["publication-yFingerprint"] !== head.publicationYFingerprint) fail("AH replaced proof");
   }
   if (head.phase === "replaced" && (finality !== null || lease !== null || projection !== null || ack !== null || receipt !== null)) fail("AH replaced bundle");
-  if (head.phase === "reader-pending" && (finality === null || receipt !== null || request.readerMode !== "bound-reader" || fence === null)) fail("AH pending bundle");
+  if (head.phase === "reader-pending" && (finality === null || receipt !== null || !["bound-reader", "no-reader"].includes(request.readerMode) || (request.readerMode === "bound-reader" && fence === null))) fail("AH pending bundle");
   if (head.phase === "terminal" && (finality === null || receipt === null || !historyMarker || historyMarker.markerFingerprint !== head.historyMarkerFingerprint || historyMarker.sequence !== head.sequence || (request.readerMode === "bound-reader" && [fence, lease, projection, ack].some((value) => value === null)))) fail("AH terminal bundle");
   return bundle;
 }

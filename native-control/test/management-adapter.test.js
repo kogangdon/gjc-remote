@@ -816,3 +816,37 @@ test('MST treats a non-exact no-replace collision as ambiguous', async () => {
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   await assert.rejects(native.runStartupSelfTest(), /management native primitive self-test failed/);
 });
+test('rejects persisted management auth when principal objects and credential keys are not hash-bound', async () => {
+  const { files, roles, lowLevel } = fake();
+  const configPath = 'C:/state/channels.json';
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  const ownerPrincipal = { kind: 'sid', value: roles.managementSid };
+  const ownerKey = canonicalJsonHash(ownerPrincipal);
+  const credential = {
+    version: 1,
+    principal: structuredClone(ownerPrincipal),
+    kdf: { name: 'scrypt', N: 16384, r: 8, p: 1, keyLength: 32, saltBytes: 16 },
+    salt: '0'.repeat(32),
+    hash: '0'.repeat(64),
+    epoch: 1,
+    revoked: false,
+  };
+  const authPath = 'C:\\state\\.gjc-remote-control\\management-auth.json';
+  const auth = {
+    version: 1,
+    ownerPrincipal: structuredClone(ownerPrincipal),
+    ownerPrincipalKey: ownerKey,
+    credentials: { [ownerKey]: credential },
+  };
+  files.set(authPath, Buffer.from(canonicalJson(auth)));
+  assert.deepEqual(await native.readManagementAuth(), auth);
+
+  const ownerKeyMismatch = { ...auth, ownerPrincipalKey: canonicalJsonHash({ kind: 'sid', value: roles.botSid }) };
+  files.set(authPath, Buffer.from(canonicalJson(ownerKeyMismatch)));
+  await assert.rejects(native.readManagementAuth, /management auth record is invalid/);
+
+  const credentialPrincipalMismatch = structuredClone(auth);
+  credentialPrincipalMismatch.credentials[ownerKey].principal = { kind: 'sid', value: roles.botSid };
+  files.set(authPath, Buffer.from(canonicalJson(credentialPrincipalMismatch)));
+  await assert.rejects(native.readManagementAuth, /management auth record is invalid/);
+});

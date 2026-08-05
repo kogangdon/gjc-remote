@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { isPrincipal } from '@gjc-remote/shared/identity';
 import { basename as pathBasename, dirname as pathDirname, join as pathJoin, sep as pathSep, win32 as win32Path } from 'node:path';
 import { advanceReaderVersionFloor, buildAttestedTokenFloorProof, commitTokenFloor, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from '@gjc-remote/shared/genesis-envelope';
 import { createGenesisEmptyChannels, isManagedV1Wrapper, validateManagedMappingRecord, validateManagedRouteRecord, validateManagedChannelsV2, validateManagementEnvelope } from '@gjc-remote/shared/mapping-envelope';
@@ -38,25 +39,30 @@ const hex = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 const recordFingerprint = (record, field) => fingerprint(encode(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field))));
 const same = (left, right) => canonical(left) === canonical(right);
 const validManagementAuth = (auth) => {
-  if (!auth || Object.getPrototypeOf(auth) !== Object.prototype ||
-      auth.version !== 1 || !hex(auth.ownerPrincipalKey) ||
-      !auth.ownerPrincipal || Object.getPrototypeOf(auth.ownerPrincipal) !== Object.prototype ||
-      !auth.credentials || Object.getPrototypeOf(auth.credentials) !== Object.prototype ||
-      !Object.hasOwn(auth.credentials, auth.ownerPrincipalKey)) return false;
-  const entries = Object.entries(auth.credentials);
-  if (entries.length === 0 || entries.length > 256) return false;
-  for (const [key, credential] of entries) {
-    if (!hex(key) || !credential || Object.getPrototypeOf(credential) !== Object.prototype ||
-        credential.version !== 1 || !credential.principal ||
-        credential.kdf?.name !== 'scrypt' || credential.kdf.N !== 16384 ||
-        credential.kdf.r !== 8 || credential.kdf.p !== 1 ||
-        credential.kdf.keyLength !== 32 || credential.kdf.saltBytes !== 16 ||
-        !/^[a-f0-9]{32}$/.test(credential.salt) ||
-        !hex(credential.hash) || !Number.isSafeInteger(credential.epoch) ||
-        credential.epoch < 1 || typeof credential.revoked !== 'boolean') return false;
+  try {
+    if (!auth || Object.getPrototypeOf(auth) !== Object.prototype ||
+        auth.version !== 1 || !isPrincipal(auth.ownerPrincipal) ||
+        !hex(auth.ownerPrincipalKey) || auth.ownerPrincipalKey !== canonicalJsonHash(auth.ownerPrincipal) ||
+        !auth.credentials || Object.getPrototypeOf(auth.credentials) !== Object.prototype ||
+        !Object.hasOwn(auth.credentials, auth.ownerPrincipalKey)) return false;
+    const entries = Object.entries(auth.credentials);
+    if (entries.length === 0 || entries.length > 256) return false;
+    for (const [key, credential] of entries) {
+      if (!hex(key) || !credential || Object.getPrototypeOf(credential) !== Object.prototype ||
+          credential.version !== 1 || !isPrincipal(credential.principal) ||
+          canonicalJsonHash(credential.principal) !== key ||
+          credential.kdf?.name !== 'scrypt' || credential.kdf.N !== 16384 ||
+          credential.kdf.r !== 8 || credential.kdf.p !== 1 ||
+          credential.kdf.keyLength !== 32 || credential.kdf.saltBytes !== 16 ||
+          !/^[a-f0-9]{32}$/.test(credential.salt) ||
+          !hex(credential.hash) || !Number.isSafeInteger(credential.epoch) ||
+          credential.epoch < 1 || typeof credential.revoked !== 'boolean') return false;
+    }
+    canonicalJson(auth);
+    return true;
+  } catch {
+    return false;
   }
-  try { canonicalJson(auth); } catch { return false; }
-  return true;
 };
 const validateManagementSnapshot = (snapshot) => {
   validateManagedChannelsV2(snapshot);
@@ -65,6 +71,49 @@ const validateManagementSnapshot = (snapshot) => {
     throw new TypeError('management mappings must be workspace-only');
   }
   return snapshot;
+};
+const authorityEpochFloorKeys = [
+  'version', 'kind', 'anchorFingerprint', 'genesisAuthorityEpoch',
+  'highestReservedAuthorityEpoch', 'highestCommittedAuthorityEpoch',
+  'lastReservationTxId', 'lastCommittedTxId', 'floorFingerprint',
+];
+const isOpaque = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256;
+const validateAuthorityEpochFloor = (floor) => {
+  if (!floor || Object.getPrototypeOf(floor) !== Object.prototype ||
+      Object.keys(floor).length !== authorityEpochFloorKeys.length ||
+      !authorityEpochFloorKeys.every((key) => Object.hasOwn(floor, key)) ||
+      floor.version !== 1 || floor.kind !== 'authority-epoch-floor' ||
+      !hex(floor.anchorFingerprint) || floor.genesisAuthorityEpoch !== 1 ||
+      !Number.isSafeInteger(floor.highestReservedAuthorityEpoch) ||
+      !Number.isSafeInteger(floor.highestCommittedAuthorityEpoch) ||
+      floor.highestReservedAuthorityEpoch < floor.genesisAuthorityEpoch - 1 ||
+      floor.highestCommittedAuthorityEpoch < floor.genesisAuthorityEpoch - 1 ||
+      floor.highestCommittedAuthorityEpoch > floor.highestReservedAuthorityEpoch ||
+      ![floor.lastReservationTxId, floor.lastCommittedTxId].every((value) => value === null || isOpaque(value)) ||
+      !hex(floor.floorFingerprint) ||
+      floor.floorFingerprint !== recordFingerprint(floor, 'floorFingerprint')) {
+    throw new TypeError('authority epoch floor schema');
+  }
+  if ((floor.highestReservedAuthorityEpoch < floor.genesisAuthorityEpoch) !== (floor.lastReservationTxId === null) ||
+      (floor.highestCommittedAuthorityEpoch < floor.genesisAuthorityEpoch) !== (floor.lastCommittedTxId === null)) {
+    throw new TypeError('authority epoch floor relation');
+  }
+  return floor;
+};
+const buildAuthorityEpochFloor = (anchorFingerprint, previous = null) => {
+  const floor = previous ?? {
+    version: 1,
+    kind: 'authority-epoch-floor',
+    anchorFingerprint,
+    genesisAuthorityEpoch: 1,
+    highestReservedAuthorityEpoch: 0,
+    highestCommittedAuthorityEpoch: 0,
+    lastReservationTxId: null,
+    lastCommittedTxId: null,
+    floorFingerprint: null,
+  };
+  floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint');
+  return validateAuthorityEpochFloor(floor);
 };
 
 export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, roles, platform = process.platform, identityNormalizer = normalizeNativeIdentity }) {
@@ -249,6 +298,57 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       (await lowLevel.principal_access_check(targetPath, roleKind, principal, mode)) === expected));
     if (!access.every(Boolean)) refused('read_managed_mapping_snapshot', managed ? 'managed target M/B/R access proof failed' : 'retained target M/B read equality proof failed');
     return { bytes: Buffer.from(bytes), targetIdentity: identityFingerprint(target.identity), targetAclFingerprint: fingerprint(Buffer.from(String(target.acl))) };
+  };
+  const assertManagementStateCounters = async (state) => {
+    const phase = state?.recovery?.phase;
+    if (!state || !Number.isSafeInteger(state.revision) || state.revision < 0 ||
+        !Number.isSafeInteger(state.authorityEpoch) || state.authorityEpoch < 0 ||
+        !Number.isSafeInteger(state.tokenConfigGeneration) || state.tokenConfigGeneration < 0 ||
+        !Number.isSafeInteger(state.mappingGeneration) || state.mappingGeneration < 0) {
+      refused('write_management_state', 'management state counters are invalid');
+    }
+    if (phase === 'terminal') {
+      const txId = state.recovery?.txId;
+      const successorFinality = txId && await read(path(`authority-successor-finality-${encodeURIComponent(txId)}`));
+      if (successorFinality !== null) {
+        const fields = ['revision', 'authorityEpoch', 'tokenConfigGeneration', 'mappingGeneration'];
+        if (fields.some((field) => state[field] !== successorFinality[field])) {
+          refused('write_management_state', 'management state counters are not bound to successor finality');
+        }
+      } else {
+        const request = await read(path('genesis-request'));
+        if (request?.genesisTxId === txId) {
+          const epoch = await read(path('authority-epoch'));
+          if (!epoch || state.authorityEpoch !== epoch.epoch ||
+              state.tokenConfigGeneration !== request.generation || state.mappingGeneration !== 0) {
+            refused('write_management_state', 'management state counters are not bound to Genesis finality');
+          }
+        }
+      }
+      const control = await read(path('control-root'));
+      if (control?.sourceKind === 'managed-v1') {
+        let snapshot;
+        try {
+          const target = await targetProof({ sourceKind: 'managed-v1' });
+          snapshot = validateManagementSnapshot(parseCanonicalJsonBytes(target.bytes));
+        } catch {
+          refused('write_management_state', 'managed target counter proof is invalid');
+        }
+        if (state.tokenConfigGeneration !== snapshot.tokenConfigGeneration ||
+            state.mappingGeneration !== snapshot.mappingGeneration ||
+            (snapshot.revision !== null &&
+             (state.revision !== snapshot.revision || state.authorityEpoch !== snapshot.authorityEpoch))) {
+          refused('write_management_state', 'management state counters are not bound to the live target');
+        }
+      }
+    } else if (phase === 'handshake-pending' && state.recovery?.txId) {
+      const request = await read(path('genesis-request'));
+      const epoch = await read(path('authority-epoch'));
+      if (!request || request.genesisTxId !== state.recovery.txId || !epoch ||
+          state.authorityEpoch !== epoch.epoch) {
+        refused('write_management_state', 'pending management counters are not bound to Genesis authority');
+      }
+    }
   };
   const authorityObjectProof = async (name) => {
     const record = await verifiedBytes(name);
@@ -891,11 +991,34 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return Object.freeze({ role: 'bot', mst: false, bst: true, writes: 0 });
     },
     async configureManagementRoles(candidate) { const normalized = normalizeRoles(candidate); if (configuredRoles && canonical(configuredRoles) !== canonical(normalized)) refused('management_role_configuration', 'role configuration is immutable'); configuredRoles = normalized; return configuredRoles; },
+    async readAuthorityEpochFloor() {
+      await requireManagementPrincipal('read_authority_epoch_floor');
+      const floor = await read(path('authority-epoch-floor'));
+      if (floor === null) return null;
+      try { return validateAuthorityEpochFloor(floor); } catch { refused('read_authority_epoch_floor', 'durable authority epoch floor is invalid'); }
+    },
+    async readAuthorityEpoch() {
+      await requireManagementPrincipal('read_authority_epoch');
+      const epoch = await read(path('authority-epoch'));
+      if (epoch === null) return null;
+      try { return validateAuthorityEpoch(epoch); } catch { refused('read_authority_epoch', 'durable authority epoch is invalid'); }
+    },
     async readManagementState() { await requirePostGpAuthority('read_management_state'); return read(path('management-state')); },
     async compareAndSwapManagementState(expected, state) {
       await requireManagementPrincipal('write_management_state');
       await requireGenesisProof();
       await ensure();
+      const floor = await read(path('authority-epoch-floor'));
+      if (floor !== null) {
+        try { validateAuthorityEpochFloor(floor); } catch { refused('write_management_state', 'durable authority epoch floor is invalid'); }
+        const expectedAuthorityEpoch = state?.recovery?.phase === 'terminal'
+          ? floor.highestCommittedAuthorityEpoch
+          : floor.highestReservedAuthorityEpoch;
+        if (!Number.isSafeInteger(state?.authorityEpoch) || state.authorityEpoch !== expectedAuthorityEpoch) {
+          refused('write_management_state', 'management state authority epoch is not bound to the durable authority floor');
+        }
+      }
+      await assertManagementStateCounters(state);
       const current = await read(path('management-state'));
       if ((current?.revision ?? 0) !== expected) return false;
       const manualCleanup = state?.recovery?.phase === 'manual_cleanup' &&
@@ -1041,6 +1164,31 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       if (!state || state.authorityEpoch !== record.epoch) {
         refused('reserve_authority_epoch', 'authority epoch does not match the durable management reservation');
       }
+      let floor = await read(path('authority-epoch-floor'));
+      try {
+        floor = floor === null
+          ? buildAuthorityEpochFloor(record.anchorFingerprint)
+          : validateAuthorityEpochFloor(floor);
+      } catch {
+        refused('reserve_authority_epoch', 'durable authority epoch floor is invalid');
+      }
+      if (floor.anchorFingerprint !== record.anchorFingerprint) {
+        refused('reserve_authority_epoch', 'authority epoch floor anchor is invalid');
+      }
+      const replay = floor.lastReservationTxId === record.reservationTxId &&
+        floor.highestReservedAuthorityEpoch === record.epoch;
+      if (!replay && record.epoch !== floor.highestReservedAuthorityEpoch + 1) {
+        refused('reserve_authority_epoch', 'authority epoch reservation is not a durable monotonic successor');
+      }
+      if (!replay) {
+        floor = buildAuthorityEpochFloor(record.anchorFingerprint, {
+          ...floor,
+          highestReservedAuthorityEpoch: record.epoch,
+          lastReservationTxId: record.reservationTxId,
+          floorFingerprint: null,
+        });
+        await writeAuthority('authority-epoch-floor', floor);
+      }
       await writeImmutableAuthority(`authority-epoch-${record.epoch}-reserved`, record);
       await writeAuthority('authority-epoch', record);
       return record;
@@ -1088,6 +1236,20 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       await writeAuthority('genesis-precommit-proof', precommit);
       await writeImmutableAuthority(`authority-epoch-${record.epoch}-committed`, record);
       await writeAuthority('authority-epoch', record);
+      let floor = await read(path('authority-epoch-floor'));
+      try { floor = validateAuthorityEpochFloor(floor); } catch { refused('commit_authority_epoch', 'durable authority epoch floor is invalid'); }
+      if (floor.anchorFingerprint !== record.anchorFingerprint ||
+          floor.highestReservedAuthorityEpoch !== record.epoch ||
+          floor.highestCommittedAuthorityEpoch !== record.epoch - 1) {
+        refused('commit_authority_epoch', 'authority epoch commit is not bound to the reserved floor');
+      }
+      floor = buildAuthorityEpochFloor(record.anchorFingerprint, {
+        ...floor,
+        highestCommittedAuthorityEpoch: record.epoch,
+        lastCommittedTxId: record.commitTxId,
+        floorFingerprint: null,
+      });
+      await writeAuthority('authority-epoch-floor', floor);
       const reopened = await read(path('authority-epoch'));
       const reopenedPrecommit = await read(path('genesis-precommit-proof'));
       if (!reopened || canonical(reopened) !== canonical(record) ||
@@ -3000,8 +3162,31 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       await requireManagementPrincipal('commit_authority_successor_epoch');
       try { validateAuthorityEpoch(record); } catch { refused('commit_authority_successor_epoch', 'exact committed successor epoch is required'); }
       if (record.commitTxId !== record.reservationTxId) refused('commit_authority_successor_epoch', 'successor epoch commit transaction is invalid');
+      let floor = await read(path('authority-epoch-floor'));
+      try { floor = validateAuthorityEpochFloor(floor); } catch { refused('commit_authority_successor_epoch', 'durable authority epoch floor is invalid'); }
+      if (floor.anchorFingerprint !== record.anchorFingerprint ||
+          floor.highestReservedAuthorityEpoch !== record.epoch ||
+          floor.lastReservationTxId !== record.reservationTxId) {
+        refused('commit_authority_successor_epoch', 'successor epoch commit is not bound to the reserved floor');
+      }
+      if (floor.highestCommittedAuthorityEpoch === record.epoch &&
+          floor.lastCommittedTxId === record.commitTxId) {
+        const existing = await read(path(`authority-epoch-${record.epoch}-committed`));
+        if (existing && canonical(existing) === canonical(record)) return record;
+        refused('commit_authority_successor_epoch', 'successor epoch commit replay is invalid');
+      }
+      if (floor.highestCommittedAuthorityEpoch > record.epoch) {
+        refused('commit_authority_successor_epoch', 'successor epoch commit rewinds the durable floor');
+      }
       await writeCreateOnceAuthority(`authority-epoch-${record.epoch}-committed`, record);
       await writeAuthority('authority-epoch', record);
+      floor = buildAuthorityEpochFloor(record.anchorFingerprint, {
+        ...floor,
+        highestCommittedAuthorityEpoch: record.epoch,
+        lastCommittedTxId: record.commitTxId,
+        floorFingerprint: null,
+      });
+      await writeAuthority('authority-epoch-floor', floor);
       return record;
     },
     async writeAuthoritySuccessorHead(value) {
@@ -3228,6 +3413,24 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async writeAuthoritySuccessorReservation(value) {
       await requireManagementPrincipal('write_authority_successor_reservation');
       try { validateAuthorityReservation(value); } catch { refused('write_authority_successor_reservation', 'exact successor authority reservation is required'); }
+      let floor = await read(path('authority-epoch-floor'));
+      try { floor = validateAuthorityEpochFloor(floor); } catch { refused('write_authority_successor_reservation', 'durable authority epoch floor is invalid'); }
+      if (floor.anchorFingerprint !== value.anchorFingerprint) {
+        refused('write_authority_successor_reservation', 'successor authority reservation anchor is invalid');
+      }
+      const replay = floor.highestReservedAuthorityEpoch === value.epoch && floor.lastReservationTxId === value.txId;
+      if (!replay && (value.epoch !== floor.highestReservedAuthorityEpoch + 1 || value.epoch <= floor.highestCommittedAuthorityEpoch)) {
+        refused('write_authority_successor_reservation', 'successor authority reservation is not a durable monotonic successor');
+      }
+      if (!replay) {
+        floor = buildAuthorityEpochFloor(value.anchorFingerprint, {
+          ...floor,
+          highestReservedAuthorityEpoch: value.epoch,
+          lastReservationTxId: value.txId,
+          floorFingerprint: null,
+        });
+        await writeAuthority('authority-epoch-floor', floor);
+      }
       await writeCreateOnceAuthority(`authority-reservation-${encodeURIComponent(value.txId)}`, value);
       return value;
     },

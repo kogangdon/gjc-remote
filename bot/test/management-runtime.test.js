@@ -233,10 +233,10 @@ test('real management adapter receives canonical secret-free genesis records in 
   const publicationGraphWrite = writes.findIndex((p) => p.includes('publication-u-'));
   assert.ok(genesisRequestWrite < tokenReservationWrite);
   assert.ok(tokenReservationWrite < attestationWrite);
-  assert.ok(attestationWrite < targetPublicationWrite);
-  assert.ok(targetPublicationWrite < authorityReservationWrite);
+  assert.ok(attestationWrite < authorityReservationWrite);
   assert.ok(authorityReservationWrite < authorityCommitWrite);
-  assert.ok(authorityCommitWrite < authorityBaselineWrite);
+  assert.ok(authorityCommitWrite < targetPublicationWrite);
+  assert.ok(targetPublicationWrite < authorityBaselineWrite);
   assert.ok(authorityBaselineWrite < publicationGraphWrite);
   assert.ok(targetPublicationWrite < writes.findLastIndex((p) => p.endsWith('token-floor.json')));
   assert.equal([...files.values()].some((bytes) => bytes.includes(Buffer.from('secret-a')) || bytes.includes(Buffer.from('secret-b'))), false);
@@ -484,6 +484,40 @@ test('no-reader mapping successors reach the terminal graph with exact lineage a
   assert.equal(replay.ok, true, JSON.stringify(replay));
   assert.equal(replay.idempotent, true);
   assert.equal(replay.phase, 'terminal');
+});
+test('durable authority floors and terminal state counters stay bound across a successor', async () => {
+  const { native, files } = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native });
+  const genesis = await runtime.execute('genesis', genesisInput('host=old'));
+  assert.equal(genesis.ok, true, JSON.stringify(genesis));
+  const genesisState = await native.readManagementState();
+  const genesisFloor = await native.readAuthorityEpochFloor();
+  assert.equal(genesisFloor.highestReservedAuthorityEpoch, 1);
+  assert.equal(genesisFloor.highestCommittedAuthorityEpoch, 1);
+  assert.equal(genesisState.authorityEpoch, genesisFloor.highestCommittedAuthorityEpoch);
+
+  const candidate = mappingInput('durable-epoch-map');
+  const result = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'durable-epoch-successor',
+    mappingId: candidate.mapping.mappingId, ...candidate,
+    expectedRevision: genesisState.revision, expectedFingerprint: null,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const request = JSON.parse(fileEnding(files, `/authority-successor-request-${result.txId}.json`));
+  const finality = JSON.parse(fileEnding(files, `/authority-successor-finality-${result.txId}.json`));
+  const successorFloor = await native.readAuthorityEpochFloor();
+  const terminalState = await native.readManagementState();
+  assert.equal(request.candidateAuthorityEpoch, 2);
+  assert.equal(successorFloor.highestReservedAuthorityEpoch, request.candidateAuthorityEpoch);
+  assert.equal(successorFloor.highestCommittedAuthorityEpoch, finality.authorityEpoch);
+  assert.deepEqual(
+    [terminalState.revision, terminalState.authorityEpoch, terminalState.tokenConfigGeneration, terminalState.mappingGeneration],
+    [finality.revision, finality.authorityEpoch, finality.tokenConfigGeneration, finality.mappingGeneration],
+  );
+  await assert.rejects(
+    native.compareAndSwapManagementState(terminalState.revision, { ...terminalState, authorityEpoch: terminalState.authorityEpoch - 1 }),
+    /authority epoch is not bound/,
+  );
 });
 test('a post-publication audit failure persists manual cleanup and blocks later management commands', async () => {
   const { native } = adapter({ failAudit: true });
@@ -778,10 +812,24 @@ async function terminalSuccessorFixture() {
   assert.equal(successor.ok, true, JSON.stringify(successor));
   return { ...harness, genesisMarker, successor };
 }
+async function terminalMappingSuccessorFixture() {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=secret'))).ok, true);
+  const genesisMarker = await harness.native.readManagedHistoryMarker();
+  const state = await harness.native.readManagementState();
+  const candidate = mappingInput('recoverable-mapping-key');
+  const successor = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'recoverable-mapping-key',
+    mappingId: candidate.mapping.mappingId, ...candidate, expectedRevision: state.revision, expectedFingerprint: null,
+  });
+  assert.equal(successor.ok, true, JSON.stringify(successor));
+  return { ...harness, genesisMarker, successor };
+}
 
 function setSuccessorHeadPhase(fixture, phase) {
   const headPath = [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/authority-head.json'));
-  const markerPath = [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/managed-history-marker.json'));
+  const markerPath = [...fixture.files.keys()].find((path) => typeof path === 'string' && path.replaceAll('\\', '/').endsWith('.managed-history.json'));
   const terminal = JSON.parse(fixture.files.get(headPath));
   const keep = {
     reserved: [],
@@ -799,6 +847,11 @@ function setSuccessorHeadPhase(fixture, phase) {
   }, 'headFingerprint');
   fixture.files.set(headPath, Buffer.from(canonicalJson(head)));
   fixture.files.set(markerPath, Buffer.from(canonicalJson(fixture.genesisMarker)));
+  for (const path of [...fixture.files.keys()]) {
+    if (typeof path === 'string' && [`/authority-head-${terminal.sequence}-${phase}.json`, `/authority-head-${terminal.sequence}-terminal.json`].some((suffix) => path.replaceAll('\\', '/').endsWith(suffix))) {
+      fixture.files.delete(path);
+    }
+  }
   const deleted = {
     reserved: ['authority-close-proof-', 'authority-successor-baseline-', 'authority-commit-', 'publication-k-', 'publication-y-', 'authority-successor-finality-', 'authority-successor-receipt-'],
     closed: ['authority-successor-baseline-', 'authority-commit-', 'publication-k-', 'publication-y-', 'authority-successor-finality-', 'authority-successor-receipt-'],
@@ -860,6 +913,25 @@ test('public recover exactly replays terminal and reader-pending successor heads
   assert.equal(resumed.pending, true);
   assert.equal(resumed.phase, 'reader-pending');
   assert.equal(JSON.parse(fileEnding(pending.files, '/authority-head.json')).phase, 'reader-pending');
+});
+test('public recover completes an interrupted no-reader successor without reader proof', async () => {
+  const fixture = await terminalMappingSuccessorFixture();
+  setSuccessorHeadPhase(fixture, 'reader-pending');
+  const recovered = await new ManagementRuntime({ native: fixture.native }).execute('recover', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'recoverable-mapping-key',
+  });
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.pending, false);
+  assert.equal(recovered.idempotent, true);
+  assert.equal(recovered.routeDisposition, 'no-route');
+  const head = JSON.parse(fileEnding(fixture.files, '/authority-head.json'));
+  const receipt = JSON.parse(fileEnding(fixture.files, `/authority-successor-receipt-${fixture.successor.txId}.json`));
+  const marker = await fixture.native.readManagedHistoryMarker();
+  assert.equal(head.phase, 'terminal');
+  assert.equal(head.receiptFingerprint, receipt.receiptFingerprint);
+  assert.equal(head.historyMarkerFingerprint, marker.markerFingerprint);
+  assert.equal(marker.sequence, head.sequence);
+  assert.equal((await fixture.native.readManagementState()).recovery.phase, 'terminal');
 });
 
 test('public recover rejects a conflicting key with transaction-bound no-route cleanup', async () => {

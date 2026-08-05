@@ -14,6 +14,32 @@ const KDF = Object.freeze({
 const requiredPrincipal = (value, name) => { if (!isPrincipal(value)) throw new TypeError(`${name.toUpperCase()}_INVALID`); return value; };
 const requiredSecret = (value) => { if (typeof value !== "string" || value.length < 16 || Buffer.byteLength(value, "utf8") > 4096) throw new TypeError("AUTH_SECRET_INVALID"); return value; };
 const principalKey = (value, name = "principal") => canonicalJsonHash(requiredPrincipal(value, name));
+const isPlainObject = (value) => value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
+const isHex = (value, length) => typeof value === "string" && new RegExp(`^[0-9a-f]{${length}}$`).test(value);
+const validStoredAuth = (auth) => {
+  try {
+    if (!isPlainObject(auth) || auth.version !== 1 || !isPrincipal(auth.ownerPrincipal) ||
+        !isHex(auth.ownerPrincipalKey, 64) || principalKey(auth.ownerPrincipal) !== auth.ownerPrincipalKey ||
+        !isPlainObject(auth.credentials)) return false;
+    const entries = Object.entries(auth.credentials);
+    if (entries.length === 0 || entries.length > 256 || !Object.hasOwn(auth.credentials, auth.ownerPrincipalKey)) return false;
+    for (const [key, credential] of entries) {
+      if (!isHex(key, 64) || !isPlainObject(credential) || credential.version !== 1 ||
+          !isPrincipal(credential.principal) || principalKey(credential.principal) !== key ||
+          !isPlainObject(credential.kdf) || credential.kdf.name !== KDF.name ||
+          credential.kdf.N !== KDF.N || credential.kdf.r !== KDF.r ||
+          credential.kdf.p !== KDF.p || credential.kdf.keyLength !== KDF.keyLength ||
+          credential.kdf.saltBytes !== KDF.saltBytes ||
+          !isHex(credential.salt, 32) || !isHex(credential.hash, 64) ||
+          !Number.isSafeInteger(credential.epoch) || credential.epoch < 1 ||
+          typeof credential.revoked !== "boolean") return false;
+    }
+    canonicalJsonHash(auth);
+    return true;
+  } catch {
+    return false;
+  }
+};
 const deriveSecretHash = (secret, salt, kdf = KDF) => {
   requiredSecret(secret);
   if (
@@ -74,17 +100,22 @@ export const MANAGEMENT_AUTH_KDF = KDF;
 export function authenticate(state, actorPrincipal, secret) {
   const key = principalKey(actorPrincipal, "actor principal");
   requiredSecret(secret);
-  const credential = state.auth?.credentials?.[key];
+  const auth = state?.auth;
+  if (auth === null || auth === undefined) throw new Error("AUTH_DENIED");
+  if (!validStoredAuth(auth)) throw new Error("AUTH_CREDENTIAL_INVALID");
+  const credential = auth.credentials[key];
   if (!credential || credential.revoked) throw new Error("AUTH_DENIED");
-  if (credential.version !== 1) throw new Error("AUTH_CREDENTIAL_INVALID");
-  const actual = Buffer.from(deriveSecretHash(secret, credential.salt, credential.kdf), "hex");
-  const expected = typeof credential.hash === "string" && /^[0-9a-f]{64}$/.test(credential.hash)
-    ? Buffer.from(credential.hash, "hex")
-    : Buffer.alloc(0);
+  let actual;
+  try {
+    actual = Buffer.from(deriveSecretHash(secret, credential.salt, credential.kdf), "hex");
+  } catch {
+    throw new Error("AUTH_CREDENTIAL_INVALID");
+  }
+  const expected = Buffer.from(credential.hash, "hex");
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error("AUTH_DENIED");
   return {
     actorPrincipal: structuredClone(actorPrincipal),
-    owner: state.auth.ownerPrincipalKey === key,
+    owner: auth.ownerPrincipalKey === key,
     epoch: credential.epoch,
   };
 }

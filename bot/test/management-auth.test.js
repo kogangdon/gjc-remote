@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ManagementRuntime, EXIT } from "../src/management-runtime.js";
+import { authenticate, bootstrapOwner } from "../src/management-auth.js";
 import { canonicalJsonHash } from "../../shared/strict-json.js";
 import { validateGenesisRequest, validateTokenConfigAttestation, validateTokenFloorReservation } from "../../shared/genesis-envelope.js";
 import { fingerprintManagedMappingRecord } from "../../shared/mapping-envelope.js";
@@ -303,4 +304,32 @@ test("issue #44 management rejects serving-shaped workDir mappings", async () =>
     actorPrincipal: owner, actorSecret: ownerSecret, mapping,
   });
   assert.equal(result.error, "MAPPING_INVALID");
+});
+test("authentication rejects persisted principal and credential key mismatches", () => {
+  const state = {};
+  bootstrapOwner(state, { actorPrincipal: owner, osPrincipal: owner, secret: ownerSecret });
+  assert.equal(authenticate(state, owner, ownerSecret).owner, true);
+
+  const ownerKey = canonicalJsonHash(owner);
+  const ownerCredential = state.auth.credentials[ownerKey];
+
+  const ownerKeyMismatch = structuredClone(state);
+  ownerKeyMismatch.auth.ownerPrincipalKey = canonicalJsonHash(member);
+  assert.throws(() => authenticate(ownerKeyMismatch, owner, ownerSecret), /AUTH_CREDENTIAL_INVALID/);
+
+  const ownerPrincipalMismatch = structuredClone(state);
+  ownerPrincipalMismatch.auth.ownerPrincipal = structuredClone(member);
+  assert.throws(() => authenticate(ownerPrincipalMismatch, owner, ownerSecret), /AUTH_CREDENTIAL_INVALID/);
+
+  const credentialPrincipalMismatch = structuredClone(state);
+  credentialPrincipalMismatch.auth.credentials[ownerKey].principal = structuredClone(member);
+  assert.throws(() => authenticate(credentialPrincipalMismatch, owner, ownerSecret), /AUTH_CREDENTIAL_INVALID/);
+
+  const credentialKeyMismatch = {
+    auth: {
+      ...structuredClone(state.auth),
+      credentials: { [canonicalJsonHash(member)]: ownerCredential },
+    },
+  };
+  assert.throws(() => authenticate(credentialKeyMismatch, owner, ownerSecret), /AUTH_CREDENTIAL_INVALID/);
 });
