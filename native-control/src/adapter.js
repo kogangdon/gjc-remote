@@ -372,6 +372,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         !Number.isSafeInteger(state.mappingGeneration) || state.mappingGeneration < 0) {
       refused('write_management_state', 'management state counters are invalid');
     }
+    if (phase === 'terminal' && state.tokenAttestation && state.tokenFloor === undefined) {
+      refused('write_management_state', 'terminal management state token floor is required');
+    }
     if (state.tokenFloor !== undefined) {
       const durableFloor = await read(path('token-floor'));
       const durableAttestation = await read(path('attestation'));
@@ -2591,6 +2594,15 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         validatePublicationK(k);
         validatePublicationY(y, k['publication-kFingerprint']);
       } catch { fail(); }
+      if (precommit.requestFingerprint !== request.requestFingerprint ||
+          precommit.reservationFingerprint !== reservation.floorFingerprint ||
+          precommit.attestedProofFingerprint !== attestedProof.attestedProofFingerprint ||
+          precommit.authorityReservationFingerprint !== authorityReservation.reservationFingerprint ||
+          precommit.authorityCommitSnapshotFingerprint !== authorityCommit.authorityCommitSnapshotFingerprint ||
+          precommit.authorityEpochFingerprint !== epoch.authorityEpochFingerprint ||
+          precommit.publicationKFingerprint !== k['publication-kFingerprint'] ||
+          precommit.publicationYFingerprint !== y['publication-yFingerprint'] ||
+          epoch.commitTxId !== request.genesisTxId) fail();
       const committedEpoch = await read(path(`authority-epoch-${epoch.epoch}-committed`));
       let authorityEpochFloor = await read(path('authority-epoch-floor'));
       try {
@@ -2625,15 +2637,6 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           authorityEpochFloor = expectedAuthorityEpochFloor;
         }
       } catch { fail(); }
-      if (precommit.requestFingerprint !== request.requestFingerprint ||
-          precommit.reservationFingerprint !== reservation.floorFingerprint ||
-          precommit.attestedProofFingerprint !== attestedProof.attestedProofFingerprint ||
-          precommit.authorityReservationFingerprint !== authorityReservation.reservationFingerprint ||
-          precommit.authorityCommitSnapshotFingerprint !== authorityCommit.authorityCommitSnapshotFingerprint ||
-          precommit.authorityEpochFingerprint !== epoch.authorityEpochFingerprint ||
-          precommit.publicationKFingerprint !== k['publication-kFingerprint'] ||
-          precommit.publicationYFingerprint !== y['publication-yFingerprint'] ||
-          epoch.commitTxId !== request.genesisTxId) fail();
       if (!await exactPrecommitBoundary(request, precommit)) fail();
       if (committed.floorPhase === 'attested') {
         const expected = commitTokenFloor(committed, {
