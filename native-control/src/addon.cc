@@ -1029,7 +1029,7 @@ bool WriteHandleBytes(
   return fsync(h) == 0;
 #endif
 }
-bool FlushDirectoryOrVolumePath(const std::string& path) {
+[[maybe_unused]] bool FlushDirectoryOrVolumePath(const std::string& path) {
 #ifdef _WIN32
   const std::wstring directory = Wide(path);
   wchar_t mount[MAX_PATH + 1]{};
