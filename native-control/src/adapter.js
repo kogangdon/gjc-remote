@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { basename, dirname, join, sep } from 'node:path';
+import { basename as pathBasename, dirname as pathDirname, join as pathJoin, sep as pathSep, win32 as win32Path } from 'node:path';
 import { advanceReaderVersionFloor, buildAttestedTokenFloorProof, commitTokenFloor, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from '@gjc-remote/shared/genesis-envelope';
 import { createGenesisEmptyChannels, isManagedV1Wrapper, validateManagedMappingRecord, validateManagedRouteRecord, validateManagedChannelsV2, validateManagementEnvelope } from '@gjc-remote/shared/mapping-envelope';
 import { buildMappingRecoveryRecords, validateManualCleanup, validateMappingRecoveryRecords } from '@gjc-remote/shared/recovery-envelope';
@@ -68,6 +68,11 @@ const validateManagementSnapshot = (snapshot) => {
 };
 
 export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, roles, platform = process.platform, identityNormalizer = normalizeNativeIdentity }) {
+  const pathOps = platform === 'win32' ? win32Path : { basename: pathBasename, dirname: pathDirname, join: pathJoin, sep: pathSep };
+  const basename = pathOps.basename;
+  const dirname = pathOps.dirname;
+  const join = pathOps.join;
+  const sep = pathOps.sep;
   const identityFingerprint = (identity) => {
     const normalized = identityNormalizer(identity);
     if (!normalized) throw new TypeError('unreadable native identity');
