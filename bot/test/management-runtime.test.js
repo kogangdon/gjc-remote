@@ -219,6 +219,54 @@ test('successor writes fail closed across request, head, publication, finality, 
     await failClosedSuccessorFailure(method, stage);
   }
 });
+test('token successor audit failure converges cleanup state to the committed durable token lineage', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old-secret'))).ok, true);
+  const before = await harness.native.readManagementState();
+  const appendAudit = harness.native.appendAudit.bind(harness.native);
+  harness.native.appendAudit = async (...args) => {
+    await appendAudit(...args);
+    throw new Error('INJECTED_TOKEN_AUDIT');
+  };
+
+  const result = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'token-floor-cleanup',
+    hostTokens: 'host=new-secret',
+  });
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.error, 'MANUAL_CLEANUP_REQUIRED', JSON.stringify(result));
+  assert.equal(result.routeDisposition, 'no-route');
+
+  const lineage = await harness.native.readSuccessorTokenLineage();
+  assert.equal(lineage.floor.floorPhase, 'committed');
+  assert.equal(lineage.floor.highestCommittedGeneration, before.tokenConfigGeneration + 1);
+  const state = await harness.native.readManagementState();
+  assert.equal(state.recovery.phase, 'manual_cleanup');
+  assert.equal(state.recovery.routeDisposition, 'no-route');
+  assert.deepEqual(state.tokenFloor, lineage.floor);
+  assert.equal(state.tokenConfigGeneration, lineage.floor.highestCommittedGeneration);
+  assert.deepEqual(state.tokenAttestation, {
+    fingerprint: lineage.attestation.tokenConfigHostSetFingerprint,
+    generation: lineage.attestation.tokenConfigGeneration,
+    attestationFingerprint: lineage.attestation.attestationFingerprint,
+    finalityFingerprint: lineage.floor.floorFingerprint,
+  });
+  assert.equal(state.tokenFloor.highestReservedGeneration, state.tokenFloor.highestCommittedGeneration);
+  assert.ok(fileEnding(harness.files, '/terminal-close.json'));
+
+  const blocked = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'token-floor-cleanup-blocked',
+    hostTokens: 'host=blocked-secret',
+  });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, 'RECOVERY_REQUIRED');
+  assert.equal(blocked.routeDisposition, 'no-route');
+});
 test('real management adapter receives canonical secret-free genesis records in order', async () => {
   const { native, files, writes } = adapter(); const runtime = new ManagementRuntime({ native });
   const result = await runtime.execute('genesis', genesisInput('b=secret-b\na=secret-a'));
@@ -1013,6 +1061,109 @@ function setSuccessorHeadPhase(fixture, phase) {
     if (typeof path === 'string' && deleted.some((prefix) => path.replaceAll('\\', '/').includes(`/${prefix}${fixture.successor.txId}`))) fixture.files.delete(path);
   }
 }
+async function boundCompletionFailureFixture(method) {
+  const fixture = await boundReaderRuntime();
+  fixture.setPrincipal(owner);
+  const state = await fixture.native.readManagementState();
+  const candidate = mappingInput(`bound-completion-${method}`);
+  const input = {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: `bound-completion-${method}`,
+    mappingId: candidate.mapping.mappingId, ...candidate,
+    expectedRevision: state.revision, expectedFingerprint: null,
+  };
+  const started = await fixture.runtime.execute('mapping-reconcile', input);
+  assert.equal(started.pending, true, JSON.stringify(started));
+  fixture.setPrincipal(botPrincipal);
+  const reader = await createTestManagedAuthorityReader({
+    expectedHostSetFingerprint: managedHostSetFingerprint('host=secret'),
+    roleBindings: roles,
+    native: fixture.native,
+  });
+  assert.equal((await reader.readSnapshot()).code, 'MANAGED_AUTHORITY_PENDING');
+  fixture.setPrincipal(owner);
+  const original = fixture.native[method].bind(fixture.native);
+  let injected = true;
+  fixture.native[method] = async (...args) => {
+    const result = await original(...args);
+    if (injected) {
+      injected = false;
+      throw new Error(`INJECTED_BOUND_${method}`);
+    }
+    return result;
+  };
+  return { ...fixture, input, started, restore: () => { fixture.native[method] = original; } };
+}
+
+async function noReaderCompletionFailureFixture(method) {
+  const fixture = await terminalMappingSuccessorFixture();
+  fixture.runtime = new ManagementRuntime({ native: fixture.native });
+  setSuccessorHeadPhase(fixture, 'reader-pending');
+  const original = fixture.native[method].bind(fixture.native);
+  let injected = true;
+  fixture.native[method] = async (...args) => {
+    const result = await original(...args);
+    if (injected) {
+      injected = false;
+      throw new Error(`INJECTED_NO_READER_${method}`);
+    }
+    return result;
+  };
+  return { ...fixture, restore: () => { fixture.native[method] = original; } };
+}
+
+test('bound and no-reader completion failures after durable writes remain transaction-bound and no-route', async () => {
+  for (const method of ['writeAuthoritySuccessorReceipt', 'commitManagedHistoryMarker', 'compareAndSwapManagementState', 'writeAuthoritySuccessorHead']) {
+    const bound = await boundCompletionFailureFixture(method);
+    const result = await bound.runtime.execute('mapping-reconcile', bound.input);
+    assert.equal(result.ok, false, JSON.stringify({ method, result }));
+    assert.equal(result.error, 'MANUAL_CLEANUP_REQUIRED', JSON.stringify({ method, result }));
+    assert.equal(result.routeDisposition, 'no-route');
+    const state = await bound.native.readManagementState();
+    assert.equal(state.recovery.phase, 'manual_cleanup');
+    assert.equal(state.recovery.txId, bound.started.txId);
+    assert.equal(state.recovery.routeDisposition, 'no-route');
+    assert.ok(fileEnding(bound.files, '/terminal-close.json'));
+    bound.restore();
+    const replay = await new ManagementRuntime({ native: bound.native }).execute('recover', {
+      actorPrincipal: owner, actorSecret: secret, idempotencyKey: bound.input.idempotencyKey,
+    });
+    assert.equal(replay.routeDisposition, 'no-route');
+    if (method === 'writeAuthoritySuccessorHead') {
+      assert.equal(replay.ok, true, JSON.stringify({ method, replay }));
+      assert.equal(replay.idempotent, true);
+      assert.equal(replay.phase, 'terminal');
+    } else {
+      assert.equal(replay.ok, false, JSON.stringify({ method, replay }));
+      assert.equal(replay.error, 'MANUAL_CLEANUP_REQUIRED');
+    }
+
+    const noReader = await noReaderCompletionFailureFixture(method);
+    const recovered = await noReader.runtime.execute('recover', {
+      actorPrincipal: owner, actorSecret: secret, idempotencyKey: noReader.successor.idempotencyKey ?? 'recoverable-mapping-key',
+    });
+    assert.equal(recovered.ok, false, JSON.stringify({ method, recovered }));
+    assert.equal(recovered.error, 'MANUAL_CLEANUP_REQUIRED');
+    assert.equal(recovered.routeDisposition, 'no-route');
+    const noReaderState = await noReader.native.readManagementState();
+    assert.equal(noReaderState.recovery.phase, 'manual_cleanup');
+    assert.equal(noReaderState.recovery.txId, noReader.successor.txId);
+    assert.equal(noReaderState.recovery.routeDisposition, 'no-route');
+    assert.ok(fileEnding(noReader.files, '/terminal-close.json'));
+    noReader.restore();
+    const noReaderReplay = await new ManagementRuntime({ native: noReader.native }).execute('recover', {
+      actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'recoverable-mapping-key',
+    });
+    assert.equal(noReaderReplay.routeDisposition, 'no-route');
+    if (method === 'writeAuthoritySuccessorHead') {
+      assert.equal(noReaderReplay.ok, true, JSON.stringify({ method, noReaderReplay }));
+      assert.equal(noReaderReplay.idempotent, true);
+      assert.equal(noReaderReplay.phase, 'terminal');
+    } else {
+      assert.equal(noReaderReplay.ok, false, JSON.stringify({ method, noReaderReplay }));
+      assert.equal(noReaderReplay.error, 'MANUAL_CLEANUP_REQUIRED');
+    }
+  }
+});
 
 test('public recover binds the active successor request and durably refuses unsupported phases', async () => {
   for (const phase of ['reserved', 'closed', 'replaced']) {

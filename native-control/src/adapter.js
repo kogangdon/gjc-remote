@@ -12,6 +12,11 @@ import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from '@gjc-
 import { capabilities } from './capabilities.js';
 
 const refused = (operation, reason) => { const error = new Error(`${operation} refused: ${reason}`); error.code = 'ERR_NATIVE_CONTROL_REFUSED'; error.operation = operation; error.reason = reason; error.writes = 0; throw error; };
+const rejectLegacyRetainedMapping = (operation, targetState, refusalOperation) => {
+  if (targetState === 'legacy-retained' && operation !== 'tokens-attest') {
+    refused(refusalOperation, 'legacy-retained target state is valid only for tokens-attest');
+  }
+};
 const pendingHandshake = () => {
   const error = new Error('managed reader handshake is pending');
   error.code = 'MANAGED_HANDSHAKE_PENDING';
@@ -892,6 +897,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
   };
   const exactLiveSuccessor = async ({ request, finality, lease, projection, ack, receipt }) => {
+    rejectLegacyRetainedMapping(request?.operation, request?.targetState, 'validate_live_successor');
     const [attestation, floor, attestationHistory, floorHistory, control] = await Promise.all([
       read(path('attestation')), read(path('token-floor')), read(path('attestation-history')),
       read(path('token-floor-history')), read(path('control-root')),
@@ -3453,6 +3459,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     },
     async writeAuthoritySuccessorRequest(value) {
       await requireManagementPrincipal('write_authority_successor_request');
+      rejectLegacyRetainedMapping(value?.operation, value?.targetState, 'write_authority_successor_request');
       try { validateAuthoritySuccessorRequest(value); } catch { refused('write_authority_successor_request', 'exact successor request is required'); }
       const [head, marker, floor, fenceFloor] = await Promise.all([
         read(path('authority-head')), rawRead(historyMarkerPath), read(path('reader-version-floor')), read(path('fence-generation-floor')),
@@ -3495,6 +3502,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (typeof txId !== 'string' || txId.length === 0) refused('read_bot_authority_successor_live_proof', 'successor transaction is required');
       const encodedTxId = encodeURIComponent(txId);
       const head = await verifiedBytes(path('authority-head'));
+      const request = await verifiedBytes(path(`authority-successor-request-${encodedTxId}`));
       const finality = await verifiedBytes(path(`authority-successor-finality-${encodedTxId}`));
       const attestation = await verifiedBytes(path('attestation'));
       const tokenFloor = await verifiedBytes(path('token-floor'));
@@ -3507,14 +3515,17 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const target = await targetProof({ sourceKind: controlValue.sourceKind });
       const headValue = parseCanonicalJsonBytes(head.bytes);
       const finalityValue = parseCanonicalJsonBytes(finality.bytes);
+      const requestValue = parseCanonicalJsonBytes(request.bytes);
       const attestationValue = parseCanonicalJsonBytes(attestation.bytes);
       const floorValue = parseCanonicalJsonBytes(tokenFloor.bytes);
       const attestationHistoryValue = parseCanonicalJsonBytes(attestationHistory.bytes);
       const floorHistoryValue = parseCanonicalJsonBytes(tokenFloorHistory.bytes);
       const publication = await readPublicationGraph(txId);
+      rejectLegacyRetainedMapping(requestValue.operation, requestValue.targetState, 'read_bot_authority_successor_live_proof');
       try {
-        validateAuthoritySuccessorHead(headValue);
-        validateAuthoritySuccessorFinality(finalityValue);
+        validateAuthoritySuccessorRequest(requestValue);
+        validateAuthoritySuccessorHead(headValue, requestValue);
+        validateAuthoritySuccessorFinality(finalityValue, requestValue);
         validateTokenConfigAttestation(attestationValue);
         validateTokenFloor(floorValue);
         if (!Array.isArray(attestationHistoryValue) || !Array.isArray(floorHistoryValue)) throw new TypeError('token histories');

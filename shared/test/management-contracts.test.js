@@ -246,6 +246,18 @@ test("mapping successors require exact next mapping generation", () => {
   }, "requestFingerprint");
 
   assert.doesNotThrow(() => validateAuthoritySuccessorRequest(request));
+  const retainedMapping = buildAuthoritySuccessorRecord({ ...request, targetState: "legacy-retained", requestFingerprint: null }, "requestFingerprint");
+  assert.throws(() => validateAuthoritySuccessorRequest(retainedMapping), /SR fields/);
+  const retainedAttestation = buildAuthoritySuccessorRecord({
+    ...request,
+    operation: "tokens-attest",
+    candidateTokenConfigGeneration: request.previousTokenConfigGeneration + 1,
+    candidateMappingGeneration: request.previousMappingGeneration,
+    mappingRecoveryTxFingerprint: null,
+    targetState: "legacy-retained",
+    requestFingerprint: null,
+  }, "requestFingerprint");
+  assert.doesNotThrow(() => validateAuthoritySuccessorRequest(retainedAttestation));
   const missingFence = { ...request }; delete missingFence.candidateFenceGeneration;
   assert.throws(() => validateAuthoritySuccessorRequest(missingFence), /SUCCESSOR_ENVELOPE_INVALID/);
   const regressedFence = buildAuthoritySuccessorRecord({ ...request, candidateFenceGeneration: request.previousFenceGeneration, requestFingerprint: null }, "requestFingerprint");

@@ -824,6 +824,19 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
     mappingRecoveryTxFingerprint: null, targetState: 'legacy-retained', readerMode: 'no-reader',
     readerInstanceId: null, readerStartNonce: null, readerNonce: null, requestFingerprint: null,
   }, 'requestFingerprint');
+  const mappingRetained = buildAuthoritySuccessorRecord({
+    ...request,
+    operation: 'mapping-reconcile',
+    candidateTokenConfigGeneration: request.previousTokenConfigGeneration,
+    candidateMappingGeneration: request.previousMappingGeneration + 1,
+    candidateAttestationFingerprint: request.previousAttestationFingerprint,
+    mappingRecoveryTxFingerprint: hex,
+    targetState: 'legacy-retained',
+    requestFingerprint: null,
+  }, 'requestFingerprint');
+  const beforeMappingRetained = new Map(files);
+  await assert.rejects(native.writeAuthoritySuccessorRequest(mappingRetained), /legacy-retained target state is valid only for tokens-attest/);
+  assert.deepEqual(files, beforeMappingRetained);
   const reserved = buildAuthoritySuccessorRecord({
     version: 1, kind: 'authority-successor-head', anchorFingerprint: request.anchorFingerprint, sequence: request.sequence,
     fenceGeneration: request.candidateFenceGeneration,
