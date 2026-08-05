@@ -17,6 +17,30 @@ const safe = (error) => ({ code: /^[A-Z0-9_]+$/.test(error?.code ?? "") ? error.
 const principal = (value, name) => { if (!isPrincipal(value)) throw new Error(`${name}_INVALID`); return value; };
 const protectedTokenFingerprint = (value) => managedHostSetFingerprint(parseManagedHostTokens(value));
 const recordHash = (record, field) => canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field)));
+const assertCommittedTokenLineage = (lineage, finality, baseline, { requireSuccessorFence = false, successorTxId = null } = {}) => {
+  const floor = lineage?.floor;
+  const attestation = lineage?.attestation;
+  if (!floor || !attestation ||
+      floor.floorFingerprint !== finality.tokenFloorFingerprint ||
+      floor.anchorFingerprint !== finality.anchorFingerprint ||
+      (requireSuccessorFence && floor.fenceGeneration !== finality.fenceGeneration) ||
+      floor.floorPhase !== "committed" ||
+      floor.highestCommittedGeneration !== finality.tokenConfigGeneration ||
+      floor.highestReservedGeneration !== finality.tokenConfigGeneration ||
+      floor.lastAttestationFingerprint !== attestation.attestationFingerprint ||
+      floor.fenceGeneration !== attestation.fenceGeneration ||
+      floor.lastCommittedTxId !== attestation.txId ||
+      (successorTxId !== null && floor.lastCommittedTxId !== successorTxId) ||
+      attestation.anchorFingerprint !== finality.anchorFingerprint ||
+      (requireSuccessorFence && attestation.fenceGeneration !== finality.fenceGeneration) ||
+      attestation.tokenConfigGeneration !== finality.tokenConfigGeneration ||
+      (successorTxId !== null && attestation.txId !== successorTxId) ||
+      attestation.attestationFingerprint !== finality.attestationFingerprint ||
+      attestation.tokenConfigHostSetFingerprint !== baseline.tokenConfigHostSetFingerprint) {
+    throw new Error("SUCCESSOR_TOKEN_LINEAGE_INVALID");
+  }
+  return lineage;
+};
 const validateManagedHistoryMarker = (marker, anchorFingerprint, expectedSequence = undefined) => {
   if (!marker || Object.getPrototypeOf(marker) !== Object.prototype ||
       Object.keys(marker).sort().join(',') !== 'anchorFingerprint,fenceGeneration,kind,markerFingerprint,previousMarkerFingerprint,sequence,version' ||
@@ -1110,14 +1134,10 @@ export class ManagementRuntime {
       throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
     }
     const lineage = await this.native.readSuccessorTokenLineage();
-    if (lineage.floor.floorFingerprint !== finality.tokenFloorFingerprint ||
-        lineage.floor.highestCommittedGeneration !== finality.tokenConfigGeneration ||
-        lineage.floor.lastAttestationFingerprint !== lineage.attestation.attestationFingerprint ||
-        lineage.attestation.attestationFingerprint !== finality.attestationFingerprint ||
-        lineage.attestation.tokenConfigGeneration !== finality.tokenConfigGeneration ||
-        lineage.attestation.tokenConfigHostSetFingerprint !== bundle.baseline.tokenConfigHostSetFingerprint) {
-      throw new Error("SUCCESSOR_TOKEN_LINEAGE_INVALID");
-    }
+    assertCommittedTokenLineage(lineage, finality, bundle.baseline, {
+      requireSuccessorFence: request.operation === "tokens-attest",
+      successorTxId: request.operation === "tokens-attest" ? txId : null,
+    });
     const receipt = buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-receipt", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId,
       operation: request.operation, requestFingerprint: request.requestFingerprint, previousReceiptFingerprint: request.previousReceiptFingerprint,
@@ -1208,6 +1228,11 @@ export class ManagementRuntime {
         throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
       }
     }
+    const lineage = await this.native.readSuccessorTokenLineage();
+    assertCommittedTokenLineage(lineage, finality, baseline, {
+      requireSuccessorFence: request.operation === "tokens-attest",
+      successorTxId: request.operation === "tokens-attest" ? txId : null,
+    });
     const receipt = buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-receipt", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId,
       operation: request.operation, requestFingerprint: request.requestFingerprint, previousReceiptFingerprint: request.previousReceiptFingerprint,
@@ -1248,6 +1273,7 @@ export class ManagementRuntime {
       state.mappings = structuredClone(recovery.candidateState.mappings);
       state.routes = structuredClone(recovery.candidateState.routes);
     }
+    state.tokenFloor = structuredClone(lineage.floor);
     state.tokenAttestation = {
       fingerprint: baseline.tokenConfigHostSetFingerprint,
       generation: finality.tokenConfigGeneration,
@@ -1404,6 +1430,9 @@ export class ManagementRuntime {
         !["managed-v1", "legacy-retained"].includes(predecessor.sourceKind) ||
         !Buffer.isBuffer(predecessor.targetBytes)) {
       throw new Error("RETAINED_TARGET_PROOF_REQUIRED");
+    }
+    if (operation !== "tokens-attest" && predecessor.sourceKind === "legacy-retained") {
+      throw new Error("LEGACY_MAPPING_MUTATION_REFUSED");
     }
     const candidateAuthorityEpoch = await this.#nextAuthorityEpoch(state);
     const preparedState = operation === "tokens-attest" ? null : structuredClone(state);
@@ -1713,17 +1742,19 @@ export class ManagementRuntime {
     await this.native.commitAuthoritySuccessorEpoch(epoch);
     let committedFloor;
     let committedAttestationFingerprint;
+    let committedLineage;
     if (operation === "tokens-attest") {
-      const lineage = await this.native.readSuccessorTokenLineage();
-      committedFloor = commitTokenFloor(lineage.floor, {
+      committedLineage = await this.native.readSuccessorTokenLineage();
+      committedFloor = commitTokenFloor(committedLineage.floor, {
         generation: request.candidateTokenConfigGeneration, txId, attestationFingerprint: request.candidateAttestationFingerprint, fenceGeneration: candidateFenceGeneration,
       });
       await this.native.commitTokenFloor({ floor: committedFloor, fenceGeneration: candidateFenceGeneration });
+      committedLineage = await this.native.readSuccessorTokenLineage();
       committedAttestationFingerprint = request.candidateAttestationFingerprint;
     } else {
-      const lineage = await this.native.readSuccessorTokenLineage();
-      committedFloor = lineage.floor;
-      committedAttestationFingerprint = lineage.attestation.attestationFingerprint;
+      committedLineage = await this.native.readSuccessorTokenLineage();
+      committedFloor = committedLineage.floor;
+      committedAttestationFingerprint = committedLineage.attestation.attestationFingerprint;
     }
     const auditEntryFingerprint = await this.#audit({
       actorPrincipal, action: operation, targetPrincipal: null, result: "replaced",
@@ -1744,6 +1775,10 @@ export class ManagementRuntime {
       tokenConfigGeneration: request.candidateTokenConfigGeneration, mappingGeneration: request.candidateMappingGeneration,
       snapshotFingerprint, routeDisposition: "no-route", finalityFingerprint: null,
     }, "finalityFingerprint");
+    assertCommittedTokenLineage(committedLineage, finality, baseline, {
+      requireSuccessorFence: operation === "tokens-attest",
+      successorTxId: operation === "tokens-attest" ? txId : null,
+    });
     setRecovery({
       phase: "replaced",
       successorPhase: "replaced",
@@ -1777,6 +1812,7 @@ export class ManagementRuntime {
         state.mappings = preparedState.mappings;
         state.routes = preparedState.routes;
       }
+      state.tokenFloor = structuredClone(committedFloor);
       state.tokenAttestation = {
         fingerprint: operation === "tokens-attest" ? intent.hostSetFingerprint : state.tokenAttestation.fingerprint,
         generation: request.candidateTokenConfigGeneration,
@@ -1838,6 +1874,7 @@ export class ManagementRuntime {
       state.mappings = preparedState.mappings;
       state.routes = preparedState.routes;
     }
+    state.tokenFloor = structuredClone(committedFloor);
     state.tokenAttestation = {
       fingerprint: operation === "tokens-attest" ? intent.hostSetFingerprint : state.tokenAttestation.fingerprint,
       generation: request.candidateTokenConfigGeneration,

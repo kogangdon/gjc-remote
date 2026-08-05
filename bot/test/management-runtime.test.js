@@ -500,6 +500,25 @@ test('durable authority floors and terminal state counters stay bound across a s
   assert.equal(genesisFloor.highestReservedAuthorityEpoch, 1);
   assert.equal(genesisFloor.highestCommittedAuthorityEpoch, 1);
   assert.equal(genesisState.authorityEpoch, genesisFloor.highestCommittedAuthorityEpoch);
+  const tamperedFloor = {
+    ...genesisState.tokenFloor,
+    fenceGeneration: genesisState.tokenFloor.fenceGeneration + 1,
+    floorFingerprint: null,
+  };
+  tamperedFloor.floorFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(tamperedFloor).filter(([key]) => key !== 'floorFingerprint')),
+  );
+  await assert.rejects(
+    native.compareAndSwapManagementState(genesisState.revision, { ...genesisState, tokenFloor: tamperedFloor }),
+    /token lineage/,
+  );
+  await assert.rejects(
+    native.compareAndSwapManagementState(genesisState.revision, {
+      ...genesisState,
+      tokenAttestation: { ...genesisState.tokenAttestation, finalityFingerprint: '0'.repeat(64) },
+    }),
+    /durable attestation/,
+  );
 
   const candidate = mappingInput('durable-epoch-map');
   const result = await runtime.execute('mapping-reconcile', {
@@ -769,6 +788,44 @@ test('recovered bound-reader Genesis uses its managed history marker for a pendi
   assert.equal(head.phase, 'reader-pending');
   assert.equal((await native.readManagedHistoryMarker()).markerFingerprint, genesisMarker.markerFingerprint);
 });
+test('legacy-retained mapping mutations refuse before any successor write', async () => {
+  const harness = adapter();
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=secret'))).ok, true);
+  const state = await harness.native.readManagementState();
+  const candidate = mappingInput('legacy-mutation');
+  const beforeFiles = new Map([...harness.files].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const beforeWrites = harness.writes.length;
+  const inputs = {
+    'mapping-reconcile': {
+      mappingId: candidate.mapping.mappingId, ...candidate,
+    },
+    'mapping-revoke': {
+      mappingId: candidate.mapping.mappingId,
+    },
+    'mapping-rollback': {
+      mappingId: candidate.mapping.mappingId, priorGeneration: 1, replacementMappingId: 'legacy-rollback',
+    },
+  };
+  for (const [command, extra] of Object.entries(inputs)) {
+    const result = await runtime.execute(command, {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: `legacy-${command}`,
+      expectedRevision: state.revision,
+      expectedFingerprint: null,
+      ...extra,
+    });
+    assert.equal(result.ok, false, JSON.stringify({ command, result }));
+    assert.equal(result.error, 'LEGACY_MAPPING_MUTATION_REFUSED');
+    assert.equal(result.routeDisposition, 'no-route');
+    assert.equal(harness.writes.length, beforeWrites);
+    assert.deepEqual(
+      [...harness.files].map(([path, bytes]) => [path, Buffer.from(bytes)]),
+      [...beforeFiles],
+    );
+  }
+});
 test('legacy-retained token rotation leaves target bytes, identity, and ACL immutable', async () => {
   const { files, native } = adapter();
   const runtime = new ManagementRuntime({ native });
@@ -792,6 +849,15 @@ test('legacy-retained token rotation leaves target bytes, identity, and ACL immu
   assert.equal(retainedAfter.aclFingerprint, retainedBefore.aclFingerprint);
   const stateAfter = await native.readManagementState();
   assert.equal(stateAfter.tokenConfigGeneration, stateBefore.tokenConfigGeneration + 1);
+  const floor = JSON.parse(fileEnding(files, '/token-floor.json'));
+  const attestation = JSON.parse(fileEnding(files, '/attestation.json'));
+  assert.deepEqual(stateAfter.tokenFloor, floor);
+  assert.equal(stateAfter.tokenFloor.floorFingerprint, floor.floorFingerprint);
+  assert.equal(stateAfter.tokenFloor.fenceGeneration, floor.fenceGeneration);
+  assert.equal(stateAfter.tokenFloor.highestCommittedGeneration, stateAfter.tokenConfigGeneration);
+  assert.equal(stateAfter.tokenFloor.lastAttestationFingerprint, attestation.attestationFingerprint);
+  assert.equal(stateAfter.tokenAttestation.attestationFingerprint, attestation.attestationFingerprint);
+  assert.equal(stateAfter.tokenAttestation.finalityFingerprint, floor.floorFingerprint);
   const head = JSON.parse(fileEnding(files, '/authority-head.json'));
   assert.equal(head.phase, 'terminal');
   assert.equal(head.sequence, 2);
@@ -1039,6 +1105,17 @@ test('public recover completes legacy-retained no-reader successor from the pred
   assert.equal(after.identityFingerprint, before.identityFingerprint);
   assert.equal(after.aclFingerprint, before.aclFingerprint);
   assert.equal(JSON.parse(fileEnding(fixture.files, '/authority-head.json')).phase, 'terminal');
+  const state = await fixture.native.readManagementState();
+  const floor = JSON.parse(fileEnding(fixture.files, '/token-floor.json'));
+  const attestation = JSON.parse(fileEnding(fixture.files, '/attestation.json'));
+  assert.equal(state.recovery.phase, 'terminal');
+  assert.deepEqual(state.tokenFloor, floor);
+  assert.equal(state.tokenFloor.floorFingerprint, floor.floorFingerprint);
+  assert.equal(state.tokenFloor.fenceGeneration, floor.fenceGeneration);
+  assert.equal(state.tokenFloor.highestCommittedGeneration, state.tokenConfigGeneration);
+  assert.equal(state.tokenFloor.lastAttestationFingerprint, attestation.attestationFingerprint);
+  assert.equal(state.tokenAttestation.attestationFingerprint, attestation.attestationFingerprint);
+  assert.equal(state.tokenAttestation.finalityFingerprint, floor.floorFingerprint);
 });
 test('missing post-Genesis fence floor converges to no-route manual cleanup without synthesis', async () => {
   const fixture = adapter({ legacy: false });

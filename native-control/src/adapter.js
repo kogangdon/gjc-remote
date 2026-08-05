@@ -372,6 +372,33 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         !Number.isSafeInteger(state.mappingGeneration) || state.mappingGeneration < 0) {
       refused('write_management_state', 'management state counters are invalid');
     }
+    if (state.tokenFloor !== undefined) {
+      const durableFloor = await read(path('token-floor'));
+      const durableAttestation = await read(path('attestation'));
+      try {
+        validateTokenFloor(state.tokenFloor);
+        validateTokenFloor(durableFloor);
+        validateTokenConfigAttestation(durableAttestation);
+      } catch {
+        refused('write_management_state', 'management state token lineage is invalid');
+      }
+      const localAttestation = state.tokenAttestation;
+      if (!localAttestation ||
+          canonical(state.tokenFloor) !== canonical(durableFloor) ||
+          state.tokenFloor.floorFingerprint !== durableFloor.floorFingerprint ||
+          state.tokenFloor.fenceGeneration !== durableFloor.fenceGeneration ||
+          state.tokenFloor.highestCommittedGeneration !== state.tokenConfigGeneration ||
+          state.tokenFloor.lastAttestationFingerprint !== durableAttestation.attestationFingerprint ||
+          state.tokenFloor.lastCommittedTxId !== durableAttestation.txId ||
+          durableAttestation.fenceGeneration !== durableFloor.fenceGeneration ||
+          durableAttestation.tokenConfigGeneration !== durableFloor.highestCommittedGeneration ||
+          localAttestation.fingerprint !== durableAttestation.tokenConfigHostSetFingerprint ||
+          localAttestation.generation !== durableAttestation.tokenConfigGeneration ||
+          localAttestation.attestationFingerprint !== durableAttestation.attestationFingerprint ||
+          localAttestation.finalityFingerprint !== durableFloor.floorFingerprint) {
+        refused('write_management_state', 'management state token lineage is not bound to durable attestation');
+      }
+    }
     if (phase === 'terminal') {
       const txId = state.recovery?.txId;
       const successorFinality = txId && await read(path(`authority-successor-finality-${encodeURIComponent(txId)}`));
