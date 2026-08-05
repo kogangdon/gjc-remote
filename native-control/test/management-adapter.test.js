@@ -426,6 +426,136 @@ test('terminal close is create-once, idempotent on exact replay, and rejects rep
   assert.deepEqual(files.get(terminal), before);
   assert.equal(calls.length, writes);
 });
+test('durable terminal close blocks successor reads, writes, recovery, and publication without writes', async () => {
+  const { files, roles, lowLevel, calls } = fake();
+  const native = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles });
+  const request = records().request;
+  await native.probeProspectiveCleanup({
+    txId: request.genesisTxId,
+    targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid },
+    botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64),
+    botProvisioningFingerprint: 'c'.repeat(64),
+    recoveryProvisioningFingerprint: 'd'.repeat(64),
+  });
+  await native.terminalCloseOrManualCleanup({ reason: 'successor-block' });
+  const before = new Map([...files].map(([name, bytes]) => [name, Buffer.from(bytes)]));
+  const writes = calls.length;
+  const blocked = [
+    ['writeAuthoritySuccessorRequest', {}],
+    ['readBotAuthoritySuccessorLiveProof', {}],
+    ['readSuccessorTokenLineage', {}],
+    ['writeSuccessorPublicationGraph', {}],
+    ['commitAuthoritySuccessorEpoch', {}],
+    ['writeAuthoritySuccessorHead', {}],
+    ['readRetainedTargetProof', {}],
+    ['readSuccessorRecovery', { predecessorReceiptFingerprint: 'a'.repeat(64) }],
+    ['readAuthoritySuccessorHeadRaw', {}],
+    ['readAuthoritySuccessorHead', {}],
+    ['readSuccessorBundle', {}],
+    ['readManagedHistoryMarker', {}],
+    ['commitManagedHistoryMarker', {}],
+    ['writeAuthoritySuccessorFence', {}],
+    ['writeAuthoritySuccessorReservation', {}],
+    ['writeAuthoritySuccessorCommit', {}],
+    ['writeAuthoritySuccessorClose', {}],
+    ['writeAuthoritySuccessorBaseline', {}],
+    ['writeAuthoritySuccessorFinality', {}],
+    ['writeAuthoritySuccessorReceipt', {}],
+    ['writeBotAuthoritySuccessorLease', {}],
+    ['writeBotAuthoritySuccessorProjection', {}],
+    ['writeBotAuthoritySuccessorAck', {}],
+    ['publishMapping', {}],
+    ['writePublicationGraph', {}],
+    ['rotateTokenSidecar', {}],
+    ['mappingTargetProof', {}],
+    ['readMappingGeneration', {}],
+    ['writeMappingRecovery', {}],
+    ['writeMappingGeneration', {}],
+    ['writeMappingTombstone', {}],
+    ['writeMappingHandoffReceipt', {}],
+    ['revokeMapping', {}],
+    ['appendAudit', {}],
+  ];
+  for (const [method, value] of blocked) {
+    await assert.rejects(native[method](value), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /no-route/);
+      return true;
+    }, method);
+    assert.deepEqual(files, before, `${method} must not write after terminal close`);
+    assert.equal(calls.length, writes, `${method} must not invoke a write primitive`);
+  }
+});
+test('exact terminal recovery replay is allowed only for the matching authority head', async () => {
+  const { files, roles, lowLevel, calls } = fake();
+  const native = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles });
+  const request = records().request;
+  await native.probeProspectiveCleanup({
+    txId: request.genesisTxId,
+    targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid },
+    botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64),
+    botProvisioningFingerprint: 'c'.repeat(64),
+    recoveryProvisioningFingerprint: 'd'.repeat(64),
+  });
+  await native.terminalCloseOrManualCleanup({ reason: 'exact-replay' });
+  const head = buildAuthoritySuccessorRecord({
+    version: 1,
+    kind: 'authority-successor-head',
+    fenceGeneration: 2,
+    anchorFingerprint: await native.managementAnchorFingerprint(),
+    sequence: 2,
+    txId: 'successor-replay',
+    rootGenesisTxId: request.genesisTxId,
+    operation: 'tokens-attest',
+    phase: 'reserved',
+    requestFingerprint: 'a'.repeat(64),
+    closeFingerprint: null,
+    authorityCommitSnapshotFingerprint: null,
+    baselineFingerprint: null,
+    publicationKFingerprint: null,
+    publicationYFingerprint: null,
+    finalityFingerprint: null,
+    receiptFingerprint: null,
+    historyMarkerFingerprint: null,
+    previousHeadFingerprint: null,
+    previousReceiptFingerprint: 'b'.repeat(64),
+    routeDisposition: 'no-route',
+    headFingerprint: null,
+  }, 'headFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\authority-head.json', Buffer.from(canonicalJson(head)));
+  files.set('C:\\state\\.gjc-remote-control\\management-state.json', Buffer.from(canonicalJson({
+    recovery: { phase: 'terminal', txId: head.txId },
+  })));
+  const before = new Map([...files].map(([name, bytes]) => [name, Buffer.from(bytes)]));
+  const writes = calls.length;
+  assert.deepEqual(await native.readAuthoritySuccessorHeadRaw(), head);
+  assert.deepEqual(files, before);
+  assert.equal(calls.length, writes);
+  await assert.rejects(native.writeAuthoritySuccessorReceipt({ txId: 'different' }), /no-route/);
+  await assert.rejects(native.writeAuthoritySuccessorHead({ txId: 'different' }), /no-route/);
+  await assert.rejects(native.commitManagedHistoryMarker({ markerFingerprint: 'different' }), /no-route/);
+  files.set('C:\\state\\.gjc-remote-control\\management-state.json', Buffer.from(canonicalJson({
+    recovery: { phase: 'terminalizing', txId: head.txId },
+  })));
+  assert.deepEqual(await native.readAuthoritySuccessorHeadRaw(), head);
+  files.set('C:\\state\\.gjc-remote-control\\management-state.json', Buffer.from(canonicalJson({
+    recovery: { phase: 'manual_cleanup', txId: head.txId },
+  })));
+  assert.equal(await native.readManagedHistoryMarker(), null);
+  assert.equal(calls.length, writes);
+  await assert.rejects(native.readSuccessorRecovery({ predecessorReceiptFingerprint: 'a'.repeat(64) }), (error) => {
+    assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+    assert.match(error.reason, /no-route/);
+    return true;
+  });
+  assert.equal(calls.length, writes);
+});
 
 test('fails closed before replacement when a retained authority ACL drifts', async () => {
   const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();

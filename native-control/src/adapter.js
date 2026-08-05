@@ -338,6 +338,49 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   const ensure = async () => { const parentIdentity = await verifiedParent(root); await lowLevel.ensure_control_directory(root, ...roleArguments('authority')); await lowLevel.open_no_follow(root); if (!await lowLevel.read_acl(root) || !await lowLevel.verify_exact_role_acl(root, ...roleArguments('authority'))) refused('ensure_control_directory', 'control-root exact role ACL is unreadable'); await assertParent(root, parentIdentity); };
   const ensureBotRoot = async () => { await ensure(); const parentIdentity = await verifiedParent(botRoot); await lowLevel.ensure_control_directory(botRoot, ...roleArguments('bot-state')); await lowLevel.open_no_follow(botRoot); if (!await lowLevel.read_acl(botRoot) || !await lowLevel.verify_exact_role_acl(botRoot, ...roleArguments('bot-state'))) refused('ensure_bot_directory', 'bot-state exact role ACL is unreadable'); await assertParent(botRoot, parentIdentity); };
   const hasPublishedAuthority = async () => (await lowLevel.read_verified_bytes(path('control-root'))) !== null;
+  const terminalReplayMatches = async ({ record = null, kind = null, readReplay = false } = {}) => {
+    try {
+      const state = await rawRead(path('management-state'));
+      const head = await rawRead(path('authority-head'));
+      const phase = state?.recovery?.phase;
+      if (readReplay) {
+        if (!['terminal', 'terminalizing', 'manual_cleanup'].includes(phase)) return false;
+        if (phase === 'manual_cleanup') {
+          if (state.recovery.txId && head?.txId && head.txId !== state.recovery.txId) return false;
+          return true;
+        }
+        if (!state.recovery.txId || head?.txId !== state.recovery.txId) return false;
+        return true;
+      }
+      if (!['terminal', 'terminalizing', 'manual_cleanup'].includes(phase) ||
+          !state.recovery.txId || (head?.txId && head.txId !== state.recovery.txId)) return false;
+      const terminalization = state.recovery.terminalization;
+      if (record === null) return phase === 'terminal';
+      if (kind !== 'marker' && record.txId !== state.recovery.txId) return false;
+      if (kind === 'receipt' &&
+          record.receiptFingerprint !== (head?.receiptFingerprint ?? terminalization?.receipt?.receiptFingerprint)) return false;
+      if (kind === 'marker' &&
+          record.markerFingerprint !== (head?.historyMarkerFingerprint ?? terminalization?.marker?.markerFingerprint)) return false;
+      if (kind === 'head' && (record.headFingerprint !==
+          (state.recovery.successorHeadFingerprint ?? terminalization?.terminalHead?.headFingerprint ?? head?.headFingerprint) ||
+          record.phase !== 'terminal')) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const requireNoTerminalClose = async (operation, { allowTerminalReplay = false, record = null, kind = null, readReplay = false } = {}) => {
+    const terminalPath = path('terminal-close');
+    const bytes = await lowLevel.read_verified_bytes(terminalPath);
+    if (bytes === null) return;
+    try {
+      await assertObject(terminalPath, Buffer.from(bytes));
+    } catch {
+      refused(operation, 'durable terminal-close record is unreadable; route disposition is no-route');
+    }
+    if (allowTerminalReplay && await terminalReplayMatches({ record, kind, readReplay })) return;
+    refused(operation, 'terminal cleanup state is active; route disposition is no-route');
+  };
   const requireGenesisProof = async () => { if (!prospectiveProof && !await hasPublishedAuthority()) refused('management_authority', 'prospective cleanup must complete before authority publication'); };
   const rawRead = async (name) => {
     const bytes = await lowLevel.read_verified_bytes(name);
@@ -371,8 +414,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (prospectiveProof || await hasPublishedAuthority()) await requireAuthorityRequest(operation);
   };
   const read = async (name) => rawRead(name);
-  const write = async (name, value, profile = 'authority', requireRequest = true) => {
+  const write = async (name, value, profile = 'authority', requireRequest = true, allowTerminalReplay = false) => {
     const cleanupOperation = profile === 'bot-state' ? 'write_bot_state' : 'write_management_state';
+    const manualCleanupState = name === path('management-state') && value?.recovery?.phase === 'manual_cleanup';
+    if (!manualCleanupState && !allowTerminalReplay) await requireNoTerminalClose(cleanupOperation);
     if (profile === 'bot-state') await requireBotPrincipal('write_bot_state');
     else await requireManagementPrincipal('write_management_state');
     if (requireRequest) await requireAuthorityRequest('write_management_state');
@@ -400,10 +445,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     await lowLevel.flush_file(name); await lowLevel.flush_directory_or_volume(dirname(name)); await assertParent(name, parentIdentity);
   };
-  const writeAuthority = async (name, value, requireRequest = true) => { await requireManagementPrincipal('write_management_state'); await requireGenesisProof(); await ensure(); await write(path(name), value, 'authority', requireRequest); };
-  const writeImmutableAuthority = async (name, value, authorityRequest = false) => { await requireManagementPrincipal('write_immutable_authority'); await requireGenesisProof(); await ensure(); if (!authorityRequest) await requireAuthorityRequest('write_immutable_authority'); const destination = path(name); const bytes = encode(value); const parentIdentity = await verifiedParent(destination); if (await lowLevel.read_verified_bytes(destination) !== null) refused('write_immutable_authority', 'immutable authority record already exists'); await lowLevel.create_absent_exclusive(destination, bytes, ...roleArguments('authority')); await assertObject(destination, bytes, parentIdentity); await lowLevel.flush_file(destination); await lowLevel.flush_directory_or_volume(dirname(destination)); await assertParent(destination, parentIdentity); };
-  const writeCreateOnceAuthority = async (name, value, requireRequest = true) => {
-    await requireManagementPrincipal('write_create_once_authority'); await requireGenesisProof(); await ensure(); if (requireRequest) await requireAuthorityRequest('write_create_once_authority');
+  const writeAuthority = async (name, value, requireRequest = true, allowTerminalReplay = false) => { await requireManagementPrincipal('write_management_state'); await requireGenesisProof(); await ensure(); await write(path(name), value, 'authority', requireRequest, allowTerminalReplay); };
+  const writeImmutableAuthority = async (name, value, authorityRequest = false) => { await requireManagementPrincipal('write_immutable_authority'); await requireNoTerminalClose('write_immutable_authority'); await requireGenesisProof(); await ensure(); if (!authorityRequest) await requireAuthorityRequest('write_immutable_authority'); const destination = path(name); const bytes = encode(value); const parentIdentity = await verifiedParent(destination); if (await lowLevel.read_verified_bytes(destination) !== null) refused('write_immutable_authority', 'immutable authority record already exists'); await lowLevel.create_absent_exclusive(destination, bytes, ...roleArguments('authority')); await assertObject(destination, bytes, parentIdentity); await lowLevel.flush_file(destination); await lowLevel.flush_directory_or_volume(dirname(destination)); await assertParent(destination, parentIdentity); };
+  const writeCreateOnceAuthority = async (name, value, requireRequest = true, allowTerminalReplay = false) => {
+    await requireManagementPrincipal('write_create_once_authority');
+    if (!allowTerminalReplay) await requireNoTerminalClose('write_create_once_authority');
+    await requireGenesisProof();
+    await ensure();
+    if (requireRequest) await requireAuthorityRequest('write_create_once_authority');
     const destination = path(name); const bytes = encode(value); const parentIdentity = await verifiedParent(destination);
     const existing = await lowLevel.read_verified_bytes(destination);
     if (existing !== null) {
@@ -1354,7 +1403,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           refused('write_management_state', 'manual cleanup state is not bound to the durable terminal close');
         }
       }
-      await write(path('management-state'), state, 'authority', !manualCleanup);
+      const terminalReplay = state?.recovery?.phase === 'terminal' && Boolean(state.recovery?.txId);
+      await write(path('management-state'), state, 'authority', !manualCleanup, terminalReplay);
       return true;
     },
     async readManagementAuth() {
@@ -1375,10 +1425,12 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return true;
     },
     async readManagedHistoryMarker() {
+      await requireNoTerminalClose('read_managed_history_marker', { allowTerminalReplay: true, readReplay: true });
       const { marker } = await readSealAwareHistoryMarker();
       return marker;
     },
     async commitManagedHistoryMarker(record) {
+      await requireNoTerminalClose('commit_managed_history_marker', { allowTerminalReplay: true, record, kind: 'marker' });
       const expectedAnchor = await anchorFingerprint();
       validateHistoryMarkerRelation(record, { anchorFingerprint: expectedAnchor });
       const authorityRequest = await requireAuthorityRequest('commit_managed_history_marker');
@@ -1417,9 +1469,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           refused('commit_managed_history_marker', 'managed history marker is absent after Genesis publication');
         }
         validateGenesisAuthorityReceiptForMarker(genesisAuthorityReceipt, authorityRequest);
-        await writeCreateOnceAuthority(historyMarkerSealName, record);
+        await writeCreateOnceAuthority(historyMarkerSealName, record, true, true);
       }
-      await write(historyMarkerPath, record, 'authority');
+      await write(historyMarkerPath, record, 'authority', true, true);
       const reopened = await rawRead(historyMarkerPath);
       if (!reopened || canonical(reopened) !== canonical(record)) refused('commit_managed_history_marker', 'managed history marker durable reopen failed');
       return record;
@@ -2177,6 +2229,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return record;
     },
     async writePublicationGraph(records) {
+      await requireNoTerminalClose('write_publication_graph');
 const fail = () => refused('write_publication_graph', 'exact acyclic publication graph is required');
       if (!records || Object.getPrototypeOf(records) !== Object.prototype) fail();
       const { transaction, u, p, s, prepared, replaced, committed, c, q, zp, k, y } = records;
@@ -2494,6 +2547,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         Boolean(await exactPrecommitBoundary(storedRequest, precommit));
     },
     async mappingTargetProof() {
+      await requireNoTerminalClose('mapping_target_proof');
       await requireAuthorityRequest('mapping_target_proof');
       const target = await targetProof();
       let snapshot;
@@ -2524,6 +2578,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       };
     },
     async writeMappingRecovery(records) {
+      await requireNoTerminalClose('write_mapping_recovery');
       try { validateMappingRecoveryRecords(records); } catch {
         refused('write_mapping_recovery', 'exact mapping TX/PUB/BK/RC recovery records are required');
       }
@@ -2555,6 +2610,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return checkpoint;
     },
     async writeMappingGeneration(record) {
+      await requireNoTerminalClose('write_mapping_generation');
       if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
           typeof record.mappingId !== 'string' || record.mappingId.length === 0 ||
           !Number.isSafeInteger(record.generation) || record.generation < 1 ||
@@ -2581,10 +2637,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return record;
     },
     async readMappingGeneration({ mappingId, generation }) {
+      await requireNoTerminalClose('read_mapping_generation');
       if (typeof mappingId !== 'string' || !Number.isSafeInteger(generation) || generation < 1) return null;
       return read(path(`mapping-generation-${encodeURIComponent(mappingId)}-${generation}`));
     },
     async writeMappingTombstone(record) {
+      await requireNoTerminalClose('write_mapping_tombstone');
       if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
           record.version !== 1 || record.kind !== 'mapping-tombstone' ||
           !['mapping-revoke', 'mapping-rollback'].includes(record.operation) ||
@@ -2605,6 +2663,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return record;
     },
     async writeMappingHandoffReceipt(record) {
+      await requireNoTerminalClose('write_mapping_handoff_receipt');
       if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
           record.version !== 1 || record.kind !== 'mapping-handoff-receipt' ||
           !['mapping-reconcile', 'mapping-revoke', 'mapping-rollback', 'mapping-recovery'].includes(record.operation) ||
@@ -2956,6 +3015,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async publishMapping(value) {
+      await requireNoTerminalClose('publish_mapping');
       await requireGenesisProof();
       if (value.refreshReaderFloor === true) {
         const floor = await readerFloor();
@@ -3068,6 +3128,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       await writeAuthority(`mapping-${encodeURIComponent(value.mappingId)}`, { mapping: snapshot.mappings[value.mappingId], routes, mappingFingerprint: snapshot.mappings[value.mappingId]?.mappingFingerprint });
     },
     async rotateTokenSidecar(record) {
+      await requireNoTerminalClose('rotate_token_sidecar');
       if (!hex(record?.hostSetFingerprint) ||
           !Number.isSafeInteger(record.generation) || record.generation < 1 ||
           !Number.isSafeInteger(record.revision) || record.revision < 0 ||
@@ -3179,7 +3240,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (existing !== null) {
         try { validateManualCleanup(existing); } catch { refused('terminal_close', 'durable terminal-close record is torn or invalid'); }
         const record = await manualCleanupRecord(value);
-        if (canonical(existing) !== canonical(record)) refused('terminal_close', 'terminal-close replay conflicts with the durable cleanup record');
+        if (canonical(existing) !== canonical(record)) {
+          if (existing.txId !== record.txId || !value?.recovery?.terminalization) refused('terminal_close', 'terminal-close replay conflicts with the durable cleanup record');
+          return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: existing.manualCleanupFingerprint };
+        }
         return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: existing.manualCleanupFingerprint };
       }
       const record = await manualCleanupRecord(value);
@@ -3231,6 +3295,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return manual('RECOVERY_PROOF_MISMATCH');
     },
     async revokeMapping({ mappingId, expectedFingerprint, expectedRevision, snapshot }) {
+      await requireNoTerminalClose('revoke_mapping');
       try { validateManagementSnapshot(snapshot); } catch { refused('revoke_mapping', 'exact workspace-only managed channels v2 snapshot is required'); }
       const state = await read(path('management-state'));
       if (!state || state.revision !== expectedRevision || state.admission?.phase !== 'closed') refused('revoke_mapping', 'management revision or admission closure CAS failed');
@@ -3272,6 +3337,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return false;
     },
     async appendAudit(entry) {
+      await requireNoTerminalClose('append_audit');
       const audit = await read(path('audit')) ?? [];
       if (!Array.isArray(audit) || audit.length > 10000) refused('append_audit', 'control audit is invalid or requires owner archival');
       let previousHash = null;
@@ -3714,6 +3780,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeAuthoritySuccessorRequest(value) {
+      await requireNoTerminalClose('write_authority_successor_request');
       await requireManagementPrincipal('write_authority_successor_request');
       rejectLegacyRetainedMapping(value?.operation, value?.targetState, 'write_authority_successor_request');
       try { validateAuthoritySuccessorRequest(value); } catch { refused('write_authority_successor_request', 'exact successor request is required'); }
@@ -3754,6 +3821,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async readBotAuthoritySuccessorLiveProof({ txId } = {}) {
+      await requireNoTerminalClose('read_bot_authority_successor_live_proof');
       await requireBotPrincipal('read_bot_authority_successor_live_proof');
       if (typeof txId !== 'string' || txId.length === 0) refused('read_bot_authority_successor_live_proof', 'successor transaction is required');
       const encodedTxId = encodeURIComponent(txId);
@@ -3877,10 +3945,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async readSuccessorTokenLineage() {
       await requireManagementPrincipal('read_successor_token_lineage');
       const [floor, attestation] = await Promise.all([read(path('token-floor')), read(path('attestation'))]);
-      try { validateTokenFloor(floor); validateTokenConfigAttestation(attestation); } catch { refused('read_successor_token_lineage', 'committed token lineage is invalid'); }
+      try { validateTokenFloor(floor); validateTokenConfigAttestation(attestation); } catch { refused('read_successor_token_lineage', 'committed token lineage is invalid; route disposition is no-route'); }
       return { floor, attestation };
     },
     async writeSuccessorPublicationGraph(records) {
+      await requireNoTerminalClose('write_successor_publication_graph');
       await requireManagementPrincipal('write_successor_publication_graph');
       const { transaction, u, p, s, prepared, replaced, committed, c, q, zp, k, y } = records ?? {};
       const txId = encodeURIComponent(transaction?.txId ?? '');
@@ -3914,6 +3983,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return records;
     },
     async commitAuthoritySuccessorEpoch(record) {
+      await requireNoTerminalClose('commit_authority_successor_epoch');
       await requireManagementPrincipal('commit_authority_successor_epoch');
       try { validateAuthorityEpoch(record); } catch { refused('commit_authority_successor_epoch', 'exact committed successor epoch is required'); }
       if (record.commitTxId !== record.reservationTxId) refused('commit_authority_successor_epoch', 'successor epoch commit transaction is invalid');
@@ -3945,13 +4015,14 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return record;
     },
     async writeAuthoritySuccessorHead(value) {
+      await requireNoTerminalClose('write_authority_successor_head', { allowTerminalReplay: true, record: value, kind: 'head' });
       await requireManagementPrincipal('write_authority_successor_head');
       const request = await read(path(`authority-successor-request-${encodeURIComponent(value?.txId ?? '')}`));
       const current = await read(path('authority-head'));
       if (current !== null && canonical(current) === canonical(value)) {
         try {
           validateAuthoritySuccessorHead(current, request);
-          await this.readSuccessorBundle();
+          await this.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true });
         } catch {
           refused('write_authority_successor_head', 'current successor head is invalid');
         }
@@ -4016,14 +4087,15 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const stored = await read(path(historical));
       if (stored !== null) {
         if (canonical(stored) !== canonical(value)) refused('write_authority_successor_head', 'historical successor head conflicts');
-        await writeAuthority('authority-head', stored);
+        await writeAuthority('authority-head', stored, true, true);
         return stored;
       }
-      await writeCreateOnceAuthority(historical, value);
-      await writeAuthority('authority-head', value);
+      await writeCreateOnceAuthority(historical, value, true, true);
+      await writeAuthority('authority-head', value, true, true);
       return value;
     },
     async readRetainedTargetProof() {
+      await requireNoTerminalClose('read_retained_target_proof');
       await requireManagementOrBotPrincipal('read_retained_target_proof');
       const control = await read(path('control-root'));
       if (!control?.sourceKind || !control.wrapperRelativeName) refused('read_retained_target_proof', 'retained target envelope is absent');
@@ -4059,6 +4131,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       };
     },
     async readSuccessorRecovery({ predecessorReceiptFingerprint } = {}) {
+      await requireNoTerminalClose('read_successor_recovery');
       await requireManagementPrincipal('read_successor_recovery');
       if (!hex(predecessorReceiptFingerprint)) refused('read_successor_recovery', 'exact predecessor receipt fingerprint is required');
       const bundle = await this.readSuccessorBundle();
@@ -4105,6 +4178,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       };
     },
     async readAuthoritySuccessorHeadRaw() {
+      await requireNoTerminalClose('read_authority_successor_head_raw', { allowTerminalReplay: true, readReplay: true });
       await requireManagementPrincipal('read_authority_successor_head_raw');
       const value = await read(path('authority-head'));
       if (value === null) return null;
@@ -4112,18 +4186,20 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async readAuthoritySuccessorHead() {
+      await requireNoTerminalClose('read_authority_successor_head', { allowTerminalReplay: true, readReplay: true });
       const value = await read(path('authority-head'));
       if (value === null) return null;
       try { validateAuthoritySuccessorHead(value); } catch { refused('read_authority_successor_head', 'successor head is invalid'); }
       if (['reader-pending', 'terminal'].includes(value.phase)) {
-        const bundle = await this.readSuccessorBundle();
+        const bundle = await this.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true });
         if (!bundle || bundle.head.headFingerprint !== value.headFingerprint) {
           refused('read_authority_successor_head', 'successor head live graph is absent or drifted');
         }
       }
       return value;
     },
-    async readSuccessorBundle() {
+    async readSuccessorBundle({ allowTerminalReplay = false, readReplay = false } = {}) {
+      await requireNoTerminalClose('read_authority_successor_bundle', { allowTerminalReplay, readReplay });
       await requireManagementPrincipal('read_authority_successor_bundle');
       const head = await read(path('authority-head'));
       if (head === null) return null;
@@ -4220,12 +4296,14 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return publicationGraph === null ? bundle : { ...bundle, publicationGraph };
     },
     async writeAuthoritySuccessorFence(value) {
+      await requireNoTerminalClose('write_authority_successor_fence');
       await requireManagementPrincipal('write_authority_successor_fence');
       try { validateAuthoritySuccessorFence(value); } catch { refused('write_authority_successor_fence', 'exact successor fence is required'); }
       await writeCreateOnceAuthority(`authority-successor-fence-${encodeURIComponent(value.txId)}`, value);
       return value;
     },
     async writeAuthoritySuccessorReservation(value) {
+      await requireNoTerminalClose('write_authority_successor_reservation');
       await requireManagementPrincipal('write_authority_successor_reservation');
       try { validateAuthorityReservation(value); } catch { refused('write_authority_successor_reservation', 'exact successor authority reservation is required'); }
       let floor = await read(path('authority-epoch-floor'));
@@ -4250,6 +4328,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeAuthoritySuccessorCommit(value) {
+      await requireNoTerminalClose('write_authority_successor_commit');
       await requireManagementPrincipal('write_authority_successor_commit');
       const reservation = await read(path(`authority-reservation-${encodeURIComponent(value.txId)}`));
       try { validateAuthorityCommitSnapshot(value, reservation); } catch { refused('write_authority_successor_commit', 'exact successor authority commit is required'); }
@@ -4257,6 +4336,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeAuthoritySuccessorClose(value) {
+      await requireNoTerminalClose('write_authority_successor_close');
       await requireManagementPrincipal('write_authority_successor_close');
       const request = await read(path(`authority-successor-request-${encodeURIComponent(value.txId)}`));
       try { validateAuthoritySuccessorRequest(request); validateAuthorityCloseProof(value, request); } catch { refused('write_authority_successor_close', 'exact successor close proof is required'); }
@@ -4264,6 +4344,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeAuthoritySuccessorBaseline(value) {
+      await requireNoTerminalClose('write_authority_successor_baseline');
       await requireManagementPrincipal('write_authority_successor_baseline');
       const request = await read(path(`authority-successor-request-${encodeURIComponent(value.txId)}`));
       const close = await read(path(`authority-close-proof-${encodeURIComponent(value.txId)}`));
@@ -4273,6 +4354,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeAuthoritySuccessorFinality(value) {
+      await requireNoTerminalClose('write_authority_successor_finality');
       await requireManagementPrincipal('write_authority_successor_finality');
       const tx = encodeURIComponent(value.txId);
       const [request, baseline, close, fence] = await Promise.all([
@@ -4294,6 +4376,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeAuthoritySuccessorReceipt(value) {
+      await requireNoTerminalClose('write_authority_successor_receipt', { allowTerminalReplay: true, record: value, kind: 'receipt' });
       await requireManagementPrincipal('write_authority_successor_receipt');
       const tx = encodeURIComponent(value.txId);
       const [request, finality, lease, projection, ack] = await Promise.all([
@@ -4302,10 +4385,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       ]);
       try { validateAuthoritySuccessorRequest(request); validateAuthoritySuccessorFinality(finality, request); validateAuthoritySuccessorReceipt(value, request, finality, lease, projection, ack); } catch { refused('write_authority_successor_receipt', 'exact successor receipt is required'); }
       await exactLiveSuccessor({ request, finality, lease, projection, ack, receipt: value });
-      await writeCreateOnceAuthority(`authority-successor-receipt-${tx}`, value);
+      await writeCreateOnceAuthority(`authority-successor-receipt-${tx}`, value, true, true);
       return value;
     },
     async writeBotAuthoritySuccessorLease(value) {
+      await requireNoTerminalClose('write_bot_authority_successor_lease');
       await requireBotPrincipal('write_bot_authority_successor_lease');
       await this.readBotAuthoritySuccessorLiveProof({ txId: value.txId });
       const head = await read(path('authority-head'));
@@ -4320,6 +4404,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeBotAuthoritySuccessorProjection(value) {
+      await requireNoTerminalClose('write_bot_authority_successor_projection');
       await requireBotPrincipal('write_bot_authority_successor_projection');
       await this.readBotAuthoritySuccessorLiveProof({ txId: value.txId });
       const head = await read(path('authority-head'));
@@ -4334,6 +4419,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeBotAuthoritySuccessorAck(value) {
+      await requireNoTerminalClose('write_bot_authority_successor_ack');
       await requireBotPrincipal('write_bot_authority_successor_ack');
       await this.readBotAuthoritySuccessorLiveProof({ txId: value.txId });
       const head = await read(path('authority-head'));

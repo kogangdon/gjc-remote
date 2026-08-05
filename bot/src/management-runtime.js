@@ -397,6 +397,81 @@ export class ManagementRuntime {
     }
     return marker;
   }
+  async #reopenGenesisProof(
+    anchorFingerprint,
+    expectedTxId,
+    expectedReceiptFingerprint,
+    expectedFinalityFingerprint,
+    expectedGeneration,
+    expectedAuthorityEpochFingerprint,
+    completed = null,
+  ) {
+    const evidence = completed?.finalityEvidence ??
+      (typeof this.native.readGenesisFinalityEvidence === "function"
+        ? await this.native.readGenesisFinalityEvidence({ txId: expectedTxId })
+        : null);
+    const finalityFingerprint = completed?.finalityFingerprint ??
+      evidence?.finalityProof?.finalityProofFingerprint ??
+      expectedFinalityFingerprint;
+    if (!expectedTxId || !expectedReceiptFingerprint || !finalityFingerprint) {
+      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+    }
+    if (evidence) {
+      if (!evidence.request || !evidence.zFinality ||
+          !evidence.finalityProof || !evidence.receipt ||
+          evidence.request.genesisTxId !== expectedTxId ||
+          evidence.receipt.genesisTxId !== expectedTxId ||
+          evidence.receipt.receiptFingerprint !== expectedReceiptFingerprint ||
+          evidence.finalityProof.finalityProofFingerprint !== finalityFingerprint ||
+          await this.native.recheckAdmissionFinality(evidence) !== true) {
+        throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+      }
+    }
+    await this.native.reopenAdmission({
+      txId: expectedTxId,
+      finalityFingerprint,
+    });
+    const marker = await this.#commitGenesisHistory(anchorFingerprint);
+    if (!marker ||
+        marker.anchorFingerprint !== anchorFingerprint ||
+        marker.fenceGeneration !== 1 ||
+        marker.sequence !== 1 ||
+        marker.previousMarkerFingerprint !== null) {
+      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+    }
+    const lineage = await this.native.readSuccessorTokenLineage();
+    validateTokenFloor(lineage?.floor);
+    validateTokenConfigAttestation(lineage?.attestation);
+    if (lineage.floor.anchorFingerprint !== anchorFingerprint ||
+        lineage.floor.fenceGeneration !== 1 ||
+        lineage.floor.lastCommittedTxId !== expectedTxId ||
+        lineage.floor.highestCommittedGeneration !== expectedGeneration ||
+        (evidence && lineage.floor.floorFingerprint !== evidence.zFinality.tokenFloorFingerprint)) {
+      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+    }
+    if (typeof this.native.readAuthorityEpoch !== "function" ||
+        typeof this.native.readAuthorityEpochFloor !== "function") {
+      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+    }
+    const epoch = await this.native.readAuthorityEpoch();
+    const epochFloor = await this.native.readAuthorityEpochFloor();
+    validateAuthorityEpoch(epoch);
+    if (!epochFloor ||
+        epoch.anchorFingerprint !== anchorFingerprint ||
+        epoch.commitTxId !== expectedTxId ||
+        epochFloor.anchorFingerprint !== anchorFingerprint ||
+        epochFloor.highestReservedAuthorityEpoch !== epoch.epoch ||
+        epochFloor.highestCommittedAuthorityEpoch !== epoch.epoch ||
+        epochFloor.lastReservationTxId !== epoch.reservationTxId ||
+        epochFloor.lastCommittedTxId !== epoch.commitTxId ||
+        epochFloor.floorFingerprint !== recordHash(epochFloor, "floorFingerprint") ||
+        (expectedAuthorityEpochFingerprint !== null &&
+          epoch.authorityEpochFingerprint !== expectedAuthorityEpochFingerprint) ||
+        (evidence && epoch.authorityEpochFingerprint !== evidence.zFinality.authorityEpochFingerprint)) {
+      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+    }
+    return { evidence, marker, lineage, epoch, finalityFingerprint };
+  }
   async #persistGenesisHandshakePending(state, { replayFingerprint, generation, hostSetFingerprint, admissionRequest, admissionGrant }) {
     const before = state.revision;
     state.recovery = {
@@ -418,25 +493,30 @@ export class ManagementRuntime {
     state.revision = before + 1;
     if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("MANUAL_CLEANUP_REQUIRED");
   }
-  async #finalizeRecoveredGenesis(anchorFingerprint, completed) {
-    const evidence = completed?.finalityEvidence ??
-      (typeof this.native.readGenesisFinalityEvidence === "function"
-        ? await this.native.readGenesisFinalityEvidence({ txId: completed?.txId })
-        : null);
-    if (evidence && await this.native.recheckAdmissionFinality(evidence) !== true) {
-      throw new Error("FINALITY_RECHECK_FAILED");
+  async #finalizeRecoveredGenesis(anchorFingerprint, completed, state = null) {
+    try {
+      const proof = await this.#reopenGenesisProof(
+        anchorFingerprint,
+        completed?.txId,
+        completed?.receiptFingerprint,
+        completed?.finalityFingerprint,
+        state?.recovery?.generation ?? state?.tokenConfigGeneration,
+        state?.genesis?.authorityEpochFingerprint ?? null,
+        completed,
+      );
+      const reopened = await this.native.reopenAdmission({
+        txId: completed.txId,
+        finalityFingerprint: proof.finalityFingerprint,
+      }) === true;
+      return {
+        reopened,
+        finalityFingerprint: proof.finalityFingerprint,
+        authorityEpochFingerprint: proof.epoch.authorityEpochFingerprint,
+      };
+    } catch (error) {
+      if (state) await this.#genesisManualCleanup(state, safe(error).code);
+      throw error;
     }
-    await this.#commitGenesisHistory(anchorFingerprint);
-    if (evidence && await this.native.recheckAdmissionFinality(evidence) !== true) {
-      throw new Error("FINALITY_RECHECK_FAILED");
-    }
-    const finalityFingerprint = completed?.finalityFingerprint ?? completed?.receiptFingerprint;
-    if (typeof finalityFingerprint !== "string") throw new Error("FINALITY_RECHECK_FAILED");
-    const reopened = await this.native.reopenAdmission({
-      txId: completed.txId,
-      finalityFingerprint,
-    }) === true;
-    return { reopened, finalityFingerprint };
   }
   async #restorePendingGenesisAdmission(recovery) {
     const pending = recovery?.readerHandshake;
@@ -494,7 +574,7 @@ export class ManagementRuntime {
         };
       } else {
         delete current.tokenFloor;
-        delete current.tokenConfigGeneration;
+        current.tokenConfigGeneration = 0;
         delete current.tokenAttestation;
       }
       const revision = current.revision;
@@ -504,6 +584,15 @@ export class ManagementRuntime {
         current.fenceGeneration = fenceFloor.highestCommittedFenceGeneration;
       }
       if (!await this.native.compareAndSwapManagementState(revision, current)) throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
+    }
+    throw new Error("MANUAL_CLEANUP_REQUIRED");
+  }
+  async #genesisManualCleanup(state, reason) {
+    try {
+      await this.#manualCleanup(state, reason);
+    } catch (error) {
+      if (safe(error).code === "MANUAL_CLEANUP_REQUIRED") throw error;
+      throw new Error("MANUAL_CLEANUP_REQUIRED");
     }
     throw new Error("MANUAL_CLEANUP_REQUIRED");
   }
@@ -606,7 +695,7 @@ export class ManagementRuntime {
       const state = await this.#read();
       const generation = state.recovery?.phase && state.recovery.phase !== "terminal"
         ? state.recovery.generation ?? state.recovery.genesisSecurityTuple?.generation
-        : state.tokenConfigGeneration + 1;
+        : state.genesis?.genesisSecurityTuple?.generation ?? state.tokenConfigGeneration + 1;
       const anchorFingerprint = await this.native.managementAnchorFingerprint();
       const expectedRoleBindings = exactRoleBindings(actorPrincipal, input.botPrincipal, input.recoveryPrincipal);
       const securityTuple = normalizedGenesisSecurityTuple({
@@ -642,7 +731,7 @@ export class ManagementRuntime {
           return { idempotent: true, pending: true, genesisTxId: state.recovery.txId, routeDisposition: "no-route" };
         }
         validateGenesisSuffixRecovery(completed, state.recovery);
-        const { reopened, finalityFingerprint } = await this.#finalizeRecoveredGenesis(anchorFingerprint, completed);
+        const { reopened, finalityFingerprint, authorityEpochFingerprint } = await this.#finalizeRecoveredGenesis(anchorFingerprint, completed, state);
         const lineage = await this.native.readSuccessorTokenLineage();
         const before = state.revision;
         state.recovery = { ...state.recovery, ...completed, finalityFingerprint: completed.receiptFingerprint, phase: "terminal", readerHandshake: null };
@@ -665,6 +754,8 @@ export class ManagementRuntime {
           genesisSecurityTuple: state.recovery.genesisSecurityTuple,
           requestFingerprint: state.recovery.requestFingerprint,
           finalityFingerprint: completed.receiptFingerprint,
+          finalityProofFingerprint: finalityFingerprint,
+          authorityEpochFingerprint,
         };
         state.revision = before + 1;
         state.authorityEpoch = await this.#committedAuthorityEpoch(state);
@@ -696,6 +787,20 @@ export class ManagementRuntime {
             !sameGenesisSecurityTuple(state.recovery.genesisSecurityTuple, securityTuple)) {
           await this.#manualCleanup(state, "RECOVERY_INPUT_MISMATCH");
         }
+        if (state.recovery.finalityFingerprint && state.recovery.finalityProofFingerprint) {
+          try {
+            await this.#reopenGenesisProof(
+              anchorFingerprint,
+              state.recovery.txId,
+              state.recovery.finalityFingerprint,
+              state.recovery.finalityProofFingerprint,
+              state.recovery.generation,
+              state.recovery.authorityEpochFingerprint ?? null,
+            );
+          } catch {
+            await this.#genesisManualCleanup(state, "GENESIS_PROOF_REOPEN_REQUIRED");
+          }
+        }
         let recovered;
         try {
           recovered = await this.native.recoverGenesisSuffix({
@@ -707,7 +812,7 @@ export class ManagementRuntime {
         } catch (error) {
           await this.#manualCleanup(state, "RECOVERY_SUFFIX_MISMATCH");
         }
-        const { reopened, finalityFingerprint } = await this.#finalizeRecoveredGenesis(anchorFingerprint, recovered);
+        const { reopened, finalityFingerprint, authorityEpochFingerprint } = await this.#finalizeRecoveredGenesis(anchorFingerprint, recovered, state);
         const lineage = await this.native.readSuccessorTokenLineage();
         state.recovery = { ...state.recovery, ...recovered, finalityFingerprint: recovered.receiptFingerprint, phase: "terminal" };
         state.admission = {
@@ -729,6 +834,8 @@ export class ManagementRuntime {
           genesisSecurityTuple: state.recovery.genesisSecurityTuple,
           requestFingerprint: state.recovery.requestFingerprint,
           finalityFingerprint: recovered.receiptFingerprint,
+          finalityProofFingerprint: finalityFingerprint,
+          authorityEpochFingerprint,
         };
         const before = state.revision;
         state.revision = before + 1;
@@ -743,7 +850,7 @@ export class ManagementRuntime {
             details: { txId: state.recovery.txId, finalityFingerprint: recovered.receiptFingerprint },
           });
         } catch (error) {
-          await this.#manualCleanup(state, safe(error).code);
+          await this.#genesisManualCleanup(state, safe(error).code);
         }
         return { idempotent: true, recovered: true, genesisTxId: state.recovery.txId, reopened, routeDisposition: "no-route" };
       }
@@ -765,6 +872,18 @@ export class ManagementRuntime {
             state.genesis.genesisSecurityTuple === undefined ||
             !sameGenesisSecurityTuple(state.genesis.genesisSecurityTuple, securityTuple)) {
           throw new Error("GENESIS_IDEMPOTENCY_CONFLICT");
+        }
+        try {
+          await this.#reopenGenesisProof(
+            anchorFingerprint,
+            state.genesis.txId,
+            state.genesis.finalityFingerprint,
+            state.genesis.finalityProofFingerprint,
+            state.tokenConfigGeneration,
+            state.genesis.authorityEpochFingerprint ?? null,
+          );
+        } catch (error) {
+          await this.#genesisManualCleanup(state, safe(error).code);
         }
         return { idempotent: true, genesisTxId: state.genesis.txId };
       }
@@ -1155,7 +1274,18 @@ export class ManagementRuntime {
         state.tokenFloor = committedFloor;
         state.tokenAttestation = { fingerprint: hostSetFingerprint, generation, attestationFingerprint: attestation.attestationFingerprint, finalityFingerprint: committedFloor.floorFingerprint };
         state.recovery.finalityFingerprint = receipt.receiptFingerprint;
-        state.genesis = { txId, fenceGeneration: 1, replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, requestFingerprint: request.requestFingerprint, finalityFingerprint: receipt.receiptFingerprint };
+        state.recovery.finalityProofFingerprint = finalityProof.finalityProofFingerprint;
+        state.recovery.authorityEpochFingerprint = committedAuthorityEpoch.authorityEpochFingerprint;
+        state.genesis = {
+          txId,
+          fenceGeneration: 1,
+          replayFingerprint,
+          genesisSecurityTuple: persistedGenesisSecurityTuple,
+          requestFingerprint: request.requestFingerprint,
+          finalityFingerprint: receipt.receiptFingerprint,
+          finalityProofFingerprint: finalityProof.finalityProofFingerprint,
+          authorityEpochFingerprint: committedAuthorityEpoch.authorityEpochFingerprint,
+        };
         state.recovery = { ...state.recovery, phase: "terminal", readerHandshake: null, replayFingerprint };
         state.admission = reopened
           ? { phase: "open", finalityFingerprint: finalityProof.finalityProofFingerprint }
@@ -1697,7 +1827,10 @@ export class ManagementRuntime {
       return await this.#reserveSuccessorMutation(operation, input, state, actorPrincipal, mutation);
     } catch (error) {
       if (!mutation.attempted) throw error;
-      await this.#manualCleanup(state, safe(error).code, mutation.recovery);
+      const recovery = state.recovery?.terminalization?.txId === mutation.recovery?.txId
+        ? state.recovery
+        : mutation.recovery;
+      await this.#manualCleanup(state, safe(error).code, recovery);
       throw error;
     }
   }
@@ -2176,35 +2309,6 @@ export class ManagementRuntime {
       finalityFingerprint: finality.finalityFingerprint,
     });
     await this.native.writeAuthoritySuccessorHead(finalityHead);
-    if (readerMode === "no-reader") {
-      const pendingBefore = state.revision;
-      state.revision = request.candidateRevision;
-      state.authorityEpoch = request.candidateAuthorityEpoch;
-      state.tokenConfigGeneration = request.candidateTokenConfigGeneration;
-      state.mappingGeneration = request.candidateMappingGeneration;
-      if (preparedState) {
-        state.mappings = preparedState.mappings;
-        state.routes = preparedState.routes;
-      }
-      state.tokenFloor = structuredClone(committedFloor);
-      state.tokenAttestation = {
-        fingerprint: operation === "tokens-attest" ? intent.hostSetFingerprint : state.tokenAttestation.fingerprint,
-        generation: request.candidateTokenConfigGeneration,
-        attestationFingerprint: committedAttestationFingerprint,
-        finalityFingerprint: committedFloor.floorFingerprint,
-      };
-      state.admission = { phase: "closed", finalityFingerprint: null };
-      state.recovery = {
-        ...state.recovery,
-        ...(mutation.recovery ?? {}),
-        phase: "reader-pending",
-        txId,
-        fenceGeneration: candidateFenceGeneration,
-        finalityFingerprint: finality.finalityFingerprint,
-      };
-      state.fenceGeneration = candidateFenceGeneration;
-      if (!await this.native.compareAndSwapManagementState(pendingBefore, state)) throw new Error("CAS_CONFLICT");
-    }
     if (readerMode === "bound-reader") {
       return { pending: true, idempotent: false, txId, phase: "reader-pending", routeDisposition: "no-route" };
     }
@@ -2218,7 +2322,7 @@ export class ManagementRuntime {
       tokenConfigGeneration: request.candidateTokenConfigGeneration, mappingGeneration: request.candidateMappingGeneration,
       phase: "terminal", routeDisposition: "no-route", receiptFingerprint: null,
     }, "receiptFingerprint");
-    await this.native.writeAuthoritySuccessorReceipt(receipt);
+    validateAuthoritySuccessorReceipt(receipt, request, finality);
     const previousMarker = await this.native.readManagedHistoryMarker();
     validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
     const marker = {
@@ -2226,39 +2330,32 @@ export class ManagementRuntime {
       previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null,
     };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
-    const committedMarker = await this.native.commitManagedHistoryMarker(marker);
-    validateManagedHistoryMarker(committedMarker, request.anchorFingerprint, request.sequence);
+    validateManagedHistoryMarker(marker, request.anchorFingerprint, request.sequence);
     const terminalHead = buildAuthoritySuccessorRecord({
       ...finalityHead, phase: "terminal", receiptFingerprint: receipt.receiptFingerprint,
       historyMarkerFingerprint: marker.markerFingerprint, previousHeadFingerprint: finalityHead.headFingerprint, headFingerprint: null,
     }, "headFingerprint");
-    setRecovery({
-      phase: "terminal",
-      successorPhase: "terminal",
-      requestFingerprint: request.requestFingerprint,
-      successorHeadFingerprint: terminalHead.headFingerprint,
-      reservationFingerprint: reservation.reservationFingerprint,
-      finalityFingerprint: finality.finalityFingerprint,
-    });
-    const before = state.revision;
-    state.revision = request.candidateRevision;
-    state.authorityEpoch = request.candidateAuthorityEpoch;
-    state.tokenConfigGeneration = request.candidateTokenConfigGeneration;
-    state.mappingGeneration = request.candidateMappingGeneration;
+    validateAuthoritySuccessorHeadTransition(finalityHead, terminalHead, request);
+    const terminalState = structuredClone(state);
+    terminalState.revision = request.candidateRevision;
+    terminalState.authorityEpoch = request.candidateAuthorityEpoch;
+    terminalState.tokenConfigGeneration = request.candidateTokenConfigGeneration;
+    terminalState.mappingGeneration = request.candidateMappingGeneration;
     if (preparedState) {
-      state.mappings = preparedState.mappings;
-      state.routes = preparedState.routes;
+      terminalState.mappings = preparedState.mappings;
+      terminalState.routes = preparedState.routes;
     }
-    state.tokenFloor = structuredClone(committedFloor);
-    state.tokenAttestation = {
+    terminalState.tokenFloor = structuredClone(committedFloor);
+    terminalState.tokenAttestation = {
       fingerprint: operation === "tokens-attest" ? intent.hostSetFingerprint : state.tokenAttestation.fingerprint,
       generation: request.candidateTokenConfigGeneration,
       attestationFingerprint: committedAttestationFingerprint,
       finalityFingerprint: committedFloor.floorFingerprint,
     };
-    state.admission = { phase: "closed", finalityFingerprint: null };
-    state.recovery = {
-      ...state.recovery,
+    terminalState.admission = { phase: "closed", finalityFingerprint: null };
+    terminalState.fenceGeneration = candidateFenceGeneration;
+    terminalState.recovery = {
+      ...terminalState.recovery,
       phase: "terminal",
       successorPhase: "terminal",
       txId,
@@ -2267,10 +2364,22 @@ export class ManagementRuntime {
       fenceGeneration: candidateFenceGeneration,
       finalityFingerprint: finality.finalityFingerprint,
     };
-    state.fenceGeneration = candidateFenceGeneration;
-    if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
-    await this.native.writeAuthoritySuccessorHead(terminalHead);
-    return { pending: false, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
+    const completed = await this.#terminalizeSuccessor({
+      state,
+      request,
+      finality,
+      receipt,
+      marker,
+      pendingHead: finalityHead,
+      terminalHead,
+      finalState: terminalState,
+    });
+    return {
+      pending: completed.pending,
+      txId: completed.txId,
+      receiptFingerprint: completed.receiptFingerprint,
+      routeDisposition: completed.routeDisposition,
+    };
   }
   async #recoverPublicSuccessor(state, input, actorPrincipal) {
     if (typeof input.idempotencyKey !== "string" || input.idempotencyKey.length === 0) {

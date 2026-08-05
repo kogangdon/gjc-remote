@@ -1182,6 +1182,65 @@ async function noReaderCompletionFailureFixture(method) {
   };
   return { ...fixture, restore: () => { fixture.native[method] = original; } };
 }
+async function initialNoReaderCompletionFailureFixture(method) {
+  const fixture = adapter({ legacy: false });
+  fixture.runtime = new ManagementRuntime({ native: fixture.native });
+  assert.equal((await fixture.runtime.execute('genesis', genesisInput('host=secret'))).ok, true);
+  const state = await fixture.native.readManagementState();
+  const candidate = mappingInput(`initial-no-reader-${method}`);
+  const input = {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: `initial-no-reader-${method}`,
+    mappingId: candidate.mapping.mappingId, ...candidate,
+    expectedRevision: state.revision, expectedFingerprint: null,
+  };
+  const original = fixture.native[method].bind(fixture.native);
+  const completionCall = method === 'writeAuthoritySuccessorHead' ? 5 : 1;
+  let calls = 0;
+  fixture.native[method] = async (...args) => {
+    const result = await original(...args);
+    calls += 1;
+    if (calls === completionCall) throw new Error(`INJECTED_INITIAL_NO_READER_${method}`);
+    return result;
+  };
+  return { ...fixture, input, restore: () => { fixture.native[method] = original; } };
+}
+test('initial no-reader completion failures persist and replay one terminalization suffix', async () => {
+  for (const method of ['writeAuthoritySuccessorReceipt', 'commitManagedHistoryMarker', 'compareAndSwapManagementState', 'writeAuthoritySuccessorHead']) {
+    const fixture = await initialNoReaderCompletionFailureFixture(method);
+    const interrupted = await fixture.runtime.execute('mapping-reconcile', fixture.input);
+    assert.equal(interrupted.ok, false, JSON.stringify({ method, interrupted }));
+    assert.equal(interrupted.error, 'MANUAL_CLEANUP_REQUIRED', JSON.stringify({ method, interrupted }));
+    assert.equal(interrupted.routeDisposition, 'no-route');
+    const state = await fixture.native.readManagementState();
+    const suffix = state.recovery.terminalization;
+    assert.equal(state.recovery.phase, 'manual_cleanup');
+    assert.ok(suffix);
+    assert.equal(suffix.phase, 'prepared');
+    assert.equal(suffix.txId, state.recovery.txId);
+    assert.equal(suffix.suffixFingerprint, canonicalJsonHash(
+      Object.fromEntries(Object.entries(suffix).filter(([key]) => key !== 'suffixFingerprint')),
+    ));
+    assert.equal(suffix.receipt.phase, 'terminal');
+    assert.equal(suffix.marker.sequence, suffix.request.sequence);
+    assert.equal(suffix.pendingHead.phase, 'reader-pending');
+    assert.equal(suffix.terminalHead.phase, 'terminal');
+
+    fixture.restore();
+    const replay = await new ManagementRuntime({ native: fixture.native }).execute('recover', {
+      actorPrincipal: owner, actorSecret: secret, idempotencyKey: fixture.input.idempotencyKey,
+    });
+    assert.equal(replay.ok, true, JSON.stringify({ method, replay }));
+    assert.equal(replay.idempotent, true);
+    assert.equal(replay.phase, 'terminal');
+    assert.equal(replay.routeDisposition, 'no-route');
+    const receipt = JSON.parse(fileEnding(fixture.files, `/authority-successor-receipt-${suffix.txId}.json`));
+    const head = JSON.parse(fileEnding(fixture.files, '/authority-head.json'));
+    assert.deepEqual(receipt, suffix.receipt);
+    assert.deepEqual(head, suffix.terminalHead);
+    assert.equal((await fixture.native.readManagedHistoryMarker()).markerFingerprint, suffix.marker.markerFingerprint);
+    assert.equal((await fixture.native.readManagementState()).recovery.terminalization, undefined);
+  }
+});
 
 test('bound and no-reader completion failures after durable writes remain transaction-bound and no-route', async () => {
   for (const method of ['writeAuthoritySuccessorReceipt', 'commitManagedHistoryMarker', 'compareAndSwapManagementState', 'writeAuthoritySuccessorHead']) {
@@ -1436,4 +1495,70 @@ test('an interrupted reserved successor becomes durable manual cleanup and block
   assert.equal(replay.error, 'RECOVERY_REQUIRED');
   assert.equal(replay.routeDisposition, 'no-route');
   assert.equal((await harness.native.readManagementState()).recovery.phase, 'manual_cleanup');
+});
+test('Genesis terminal replay reopens the exact durable proof graph and fails closed on proof drift', async () => {
+  const valid = adapter({ legacy: false });
+  const validRuntime = new ManagementRuntime({ native: valid.native });
+  const input = genesisInput('host=secret');
+  const filePath = (files, ending) => [...files.keys()].find((path) => path.replaceAll('\\', '/').endsWith(ending));
+  assert.equal((await validRuntime.execute('genesis', input)).ok, true);
+  const replay = await validRuntime.execute('genesis', input);
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(replay.idempotent, true);
+
+  for (const tamper of [
+    (harness) => harness.files.delete(filePath(harness.files, '/receipt.json')),
+    (harness) => harness.files.set(filePath(harness.files, '/rvf.json'), Buffer.from('{}')),
+    (harness) => {
+      const path = filePath(harness.files, '.managed-history.json');
+      const marker = JSON.parse(harness.files.get(path));
+      marker.markerFingerprint = '0'.repeat(64);
+      harness.files.set(path, Buffer.from(canonicalJson(marker)));
+    },
+    (harness) => {
+      const path = filePath(harness.files, '/token-floor.json');
+      const floor = JSON.parse(harness.files.get(path));
+      floor.floorFingerprint = '0'.repeat(64);
+      harness.files.set(path, Buffer.from(canonicalJson(floor)));
+    },
+    (harness) => {
+      const path = filePath(harness.files, '/authority-epoch.json');
+      const epoch = JSON.parse(harness.files.get(path));
+      epoch.authorityEpochFingerprint = '0'.repeat(64);
+      harness.files.set(path, Buffer.from(canonicalJson(epoch)));
+    },
+  ]) {
+    const harness = adapter({ legacy: false });
+    const runtime = new ManagementRuntime({ native: harness.native });
+    assert.equal((await runtime.execute('genesis', input)).ok, true);
+    tamper(harness);
+    const result = await runtime.execute('genesis', input);
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.error, 'MANUAL_CLEANUP_REQUIRED');
+    assert.equal(result.routeDisposition, 'no-route');
+    const state = await harness.native.readManagementState();
+    assert.equal(state.recovery.phase, 'manual_cleanup');
+    assert.equal(state.recovery.routeDisposition, 'no-route');
+    assert.ok(fileEnding(harness.files, '/terminal-close.json'));
+  }
+});
+test('Genesis replay refuses missing finality receipt before suffix reconstruction', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  const input = genesisInput('host=secret');
+  assert.equal((await runtime.execute('genesis', input)).ok, true);
+  const statePath = [...harness.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/management-state.json'));
+  const state = JSON.parse(harness.files.get(statePath));
+  state.genesis = null;
+  state.recovery.phase = 'replaced';
+  harness.files.set(statePath, Buffer.from(canonicalJson(state)));
+  const receiptPath = [...harness.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/receipt.json'));
+  harness.files.delete(receiptPath);
+
+  const replay = await runtime.execute('genesis', input);
+  assert.equal(replay.ok, false, JSON.stringify(replay));
+  assert.equal(replay.error, 'MANUAL_CLEANUP_REQUIRED');
+  assert.equal(replay.routeDisposition, 'no-route');
+  assert.equal((await harness.native.readManagementState()).recovery.phase, 'manual_cleanup');
+  assert.ok(fileEnding(harness.files, '/terminal-close.json'));
 });
