@@ -525,7 +525,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   };
   const exactTarget = async (candidate) => { const target = await targetProof({ sourceKind: 'legacy-retained' }); if (candidate.rawTargetByteFingerprint !== fingerprint(target.bytes) || candidate.rawTargetByteLength !== target.bytes.length || candidate.targetIdentity !== target.targetIdentity || candidate.targetAclFingerprint !== target.targetAclFingerprint) refused('publish_mapping', 'exact legacy target proof failed'); return target; };
   const anchor = async () => ({ anchorVersion: 1, configPathFingerprint: fingerprint(Buffer.from(configPath)), parentIdentity: identityFingerprint(await lowLevel.read_identity(parent)), targetRelativeName: 'channels.json', controlRootRelativeName: '.gjc-remote-control' });
-  const readerFloor = async () => { const existing = await read(path('reader-version-floor')); if (existing) { try { return validateReaderVersionFloor(existing); } catch { refused('publish_mapping', 'reader version floor is invalid'); } } const floor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: (await anchorFingerprint()), fenceGeneration: 1, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null }; floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint'); return validateReaderVersionFloor(floor); };
+  const readerFloor = async () => { const existing = await read(path('reader-version-floor')); if (existing) { try { return validateReaderVersionFloor(existing); } catch { refused('publish_mapping', 'reader version floor is invalid'); } } if (await hasPublishedAuthority()) refused('publish_mapping', 'durable reader version floor is absent'); const floor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: (await anchorFingerprint()), fenceGeneration: 1, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null }; floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint'); return validateReaderVersionFloor(floor); };
   const anchorFingerprint = async () => fingerprint(encode(await anchor()));
   const validateHistoryMarker = (record) => {
     if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
@@ -1286,7 +1286,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     async readManagedHistoryMarker() {
       const marker = await rawRead(historyMarkerPath);
       if (marker === null) return null;
-      return validateHistoryMarkerRelation(marker, { anchorFingerprint: await anchorFingerprint() });
+      const expectedAnchor = await anchorFingerprint();
+      const seal = await rawRead(path(historyMarkerSealName));
+      if (seal === null && await hasPublishedAuthority()) refused('read_managed_history_marker', 'durable Genesis history marker seal is absent');
+      if (seal !== null) {
+        validateHistoryMarkerSeal(seal, expectedAnchor);
+        if (marker.sequence === 1 && canonical(marker) !== canonical(seal)) refused('read_managed_history_marker', 'durable Genesis history marker seal mismatch');
+      }
+      return validateHistoryMarkerRelation(marker, { anchorFingerprint: expectedAnchor });
     },
     async commitManagedHistoryMarker(record) {
       const expectedAnchor = await anchorFingerprint();
