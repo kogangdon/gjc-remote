@@ -162,6 +162,68 @@ const buildFenceGenerationFloor = (anchorFingerprint, previous = null) => {
   floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint');
   return validateFenceGenerationFloor(floor);
 };
+const validateTokenHistory = ({
+  anchorFingerprint,
+  attestationHistory,
+  tokenFloorHistory,
+  currentAttestation,
+  currentTokenFloor,
+  genesisAttestation = null,
+  genesisTokenFloor = null,
+}) => {
+  if (genesisAttestation === null || genesisTokenFloor === null) throw new TypeError('token history anchors absent');
+  if (!Array.isArray(attestationHistory) || !Array.isArray(tokenFloorHistory) ||
+      attestationHistory.length === 0 || attestationHistory.length !== tokenFloorHistory.length) {
+    throw new TypeError('token history schema');
+  }
+  let previousAttestation = null;
+  let previousFloor = null;
+  for (const [index, attestation] of attestationHistory.entries()) {
+    const floor = tokenFloorHistory[index];
+    validateTokenConfigAttestation(attestation);
+    validateTokenFloor(floor);
+    if (attestation.anchorFingerprint !== anchorFingerprint ||
+        floor.anchorFingerprint !== anchorFingerprint ||
+        floor.genesisGeneration !== 1 ||
+        floor.floorPhase !== 'committed' ||
+        attestation.tokenConfigGeneration !== floor.highestCommittedGeneration ||
+        attestation.tokenConfigGeneration !== floor.highestReservedGeneration ||
+        attestation.fenceGeneration !== floor.fenceGeneration ||
+        floor.lastReservationTxId !== attestation.txId ||
+        floor.lastCommittedTxId !== attestation.txId ||
+        floor.lastAttestationFingerprint !== attestation.attestationFingerprint ||
+        (index === 0 && (attestation.tokenConfigGeneration !== 1 ||
+          attestation.fenceGeneration !== 1 ||
+          attestation.rotationKind !== 'genesis' ||
+          attestation.previousAttestationFingerprint !== null)) ||
+        (index > 0 && (attestation.tokenConfigGeneration !== previousAttestation.tokenConfigGeneration + 1 ||
+          floor.highestCommittedGeneration !== previousFloor.highestCommittedGeneration + 1 ||
+          attestation.previousAttestationFingerprint !== previousAttestation.attestationFingerprint ||
+          (attestation.rotationKind === 'same-key') !==
+            (attestation.tokenConfigHostSetFingerprint === previousAttestation.tokenConfigHostSetFingerprint) ||
+          (attestation.rotationKind === 'host-set-change') !==
+            (attestation.tokenConfigHostSetFingerprint !== previousAttestation.tokenConfigHostSetFingerprint)))) {
+      throw new TypeError('token history lineage');
+    }
+    previousAttestation = attestation;
+    previousFloor = floor;
+  }
+  if (genesisAttestation !== null &&
+      canonical(attestationHistory[0]) !== canonical(genesisAttestation)) {
+    throw new TypeError('Genesis attestation anchor');
+  }
+  if (genesisTokenFloor !== null &&
+      canonical(tokenFloorHistory[0]) !== canonical(genesisTokenFloor)) {
+    throw new TypeError('Genesis token floor anchor');
+  }
+  validateTokenConfigAttestation(currentAttestation);
+  validateTokenFloor(currentTokenFloor);
+  if (canonical(attestationHistory.at(-1)) !== canonical(currentAttestation) ||
+      canonical(tokenFloorHistory.at(-1)) !== canonical(currentTokenFloor)) {
+    throw new TypeError('token history tail');
+  }
+  return { attestations: attestationHistory, floors: tokenFloorHistory };
+};
 
 export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, roles, platform = process.platform, identityNormalizer = normalizeNativeIdentity }) {
   const pathOps = platform === 'win32' ? win32Path : { basename: pathBasename, dirname: pathDirname, join: pathJoin, sep: pathSep };
@@ -906,6 +968,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const target = control && await targetProof({ sourceKind: control.sourceKind });
     const authorityEpoch = await read(path('authority-epoch'));
     const liveFenceGeneration = request.candidateFenceGeneration;
+    let genesisAttestation = null;
+    let genesisTokenFloor = null;
     try {
       validateAuthoritySuccessorRequest(request);
       validateAuthoritySuccessorFinality(finality, request);
@@ -917,14 +981,22 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           authorityEpoch.commitTxId !== request.txId) {
         throw new TypeError('live successor authority epoch drift');
       }
-      validateTokenConfigAttestation(attestation);
-      validateTokenFloor(floor);
-      if (!target || !wrapper || !Array.isArray(attestationHistory) || !Array.isArray(floorHistory) ||
+      genesisAttestation = await read(path(`attestation-${encodeURIComponent(request.rootGenesisTxId)}`));
+      genesisTokenFloor = await read(path(`token-floor-commit-${encodeURIComponent(request.rootGenesisTxId)}`));
+      if (!genesisAttestation || !genesisTokenFloor) throw new TypeError('Genesis token lineage anchors are absent');
+      validateTokenHistory({
+        anchorFingerprint: request.anchorFingerprint,
+        attestationHistory,
+        tokenFloorHistory: floorHistory,
+        currentAttestation: attestation,
+        currentTokenFloor: floor,
+        genesisAttestation,
+        genesisTokenFloor,
+      });
+      if (!target ||
           control.fenceGeneration !== liveFenceGeneration ||
           wrapper.fenceGeneration !== liveFenceGeneration ||
           target.fenceGeneration !== liveFenceGeneration ||
-          canonical(attestationHistory.at(-1)) !== canonical(attestation) ||
-          canonical(floorHistory.at(-1)) !== canonical(floor) ||
           finality.attestationFingerprint !== attestation.attestationFingerprint ||
           finality.tokenFloorFingerprint !== floor.floorFingerprint ||
           finality.targetFingerprint !== fingerprint(target.bytes) ||
@@ -3216,6 +3288,30 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
             refused('read_managed_mapping_snapshot', 'successor publication graph is absent or drifted');
           }
         }
+        if (headBefore.phase === 'terminal') {
+          try {
+            const [currentAttestation, currentTokenFloor, attestationHistory, tokenFloorHistory,
+              genesisAttestation, genesisTokenFloor] = await Promise.all([
+              read(path('attestation')),
+              read(path('token-floor')),
+              read(path('attestation-history')),
+              read(path('token-floor-history')),
+              read(path(`attestation-${encodeURIComponent(bundle.request.rootGenesisTxId)}`)),
+              read(path(`token-floor-commit-${encodeURIComponent(bundle.request.rootGenesisTxId)}`)),
+            ]);
+            validateTokenHistory({
+              anchorFingerprint: bundle.request.anchorFingerprint,
+              attestationHistory,
+              tokenFloorHistory,
+              currentAttestation,
+              currentTokenFloor,
+              genesisAttestation,
+              genesisTokenFloor,
+            });
+          } catch {
+            refused('read_managed_mapping_snapshot', 'terminal token history or durable Genesis floor anchor is invalid');
+          }
+        }
         const liveControl = await verifiedBytes(path('control-root'));
         const liveWrapper = await verifiedBytes(join(root, rootValue.wrapperRelativeName));
         const liveTarget = await targetProof({ sourceKind: rootValue.sourceKind });
@@ -3256,6 +3352,19 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const currentTokenFloor = await verifiedBytes(path('token-floor'));
       const attestationHistory = await verifiedBytes(path('attestation-history'));
       const tokenFloorHistory = await verifiedBytes(path('token-floor-history'));
+      try {
+        validateTokenHistory({
+          anchorFingerprint: requestValue.anchorFingerprint,
+          attestationHistory: parseCanonicalJsonBytes(attestationHistory.bytes),
+          tokenFloorHistory: parseCanonicalJsonBytes(tokenFloorHistory.bytes),
+          currentAttestation: parseCanonicalJsonBytes(currentAttestation.bytes),
+          currentTokenFloor: parseCanonicalJsonBytes(currentTokenFloor.bytes),
+          genesisAttestation: parseCanonicalJsonBytes(attestation.bytes),
+          genesisTokenFloor: parseCanonicalJsonBytes(tokenFloor.bytes),
+        });
+      } catch {
+        refused('read_managed_mapping_snapshot', 'token attestation history or durable Genesis floor anchor is invalid');
+      }
       const reservation = await verifiedBytes(path(`token-floor-reservation-${encodeURIComponent(requestValue.genesisTxId)}`));
       const attestedProof = await verifiedBytes(path(`token-floor-attested-${encodeURIComponent(requestValue.genesisTxId)}`));
       const precommit = await verifiedBytes(path(`genesis-precommit-proof-${encodeURIComponent(requestValue.genesisTxId)}`));
@@ -3520,23 +3629,23 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const floorValue = parseCanonicalJsonBytes(tokenFloor.bytes);
       const attestationHistoryValue = parseCanonicalJsonBytes(attestationHistory.bytes);
       const floorHistoryValue = parseCanonicalJsonBytes(tokenFloorHistory.bytes);
+      const genesisAttestation = await read(path(`attestation-${encodeURIComponent(requestValue.rootGenesisTxId)}`));
+      const genesisTokenFloor = await read(path(`token-floor-commit-${encodeURIComponent(requestValue.rootGenesisTxId)}`));
       const publication = await readPublicationGraph(txId);
       rejectLegacyRetainedMapping(requestValue.operation, requestValue.targetState, 'read_bot_authority_successor_live_proof');
       try {
         validateAuthoritySuccessorRequest(requestValue);
         validateAuthoritySuccessorHead(headValue, requestValue);
         validateAuthoritySuccessorFinality(finalityValue, requestValue);
-        validateTokenConfigAttestation(attestationValue);
-        validateTokenFloor(floorValue);
-        if (!Array.isArray(attestationHistoryValue) || !Array.isArray(floorHistoryValue)) throw new TypeError('token histories');
-        for (const [index, entry] of attestationHistoryValue.entries()) {
-          validateTokenConfigAttestation(entry);
-          if (index && entry.previousAttestationFingerprint !== attestationHistoryValue[index - 1].attestationFingerprint) throw new TypeError('attestation lineage');
-        }
-        for (const [index, entry] of floorHistoryValue.entries()) {
-          validateTokenFloor(entry);
-          if (index && entry.highestCommittedGeneration !== floorHistoryValue[index - 1].highestCommittedGeneration + 1) throw new TypeError('floor lineage');
-        }
+        validateTokenHistory({
+          anchorFingerprint: requestValue.anchorFingerprint,
+          attestationHistory: attestationHistoryValue,
+          tokenFloorHistory: floorHistoryValue,
+          currentAttestation: attestationValue,
+          currentTokenFloor: floorValue,
+          genesisAttestation,
+          genesisTokenFloor,
+        });
         validatePublicationGraph(publication);
         if (publication.k['publication-kFingerprint'] !== finalityValue.publicationKFingerprint ||
             publication.y['publication-yFingerprint'] !== finalityValue.publicationYFingerprint ||

@@ -81,18 +81,28 @@ function validateTokenHistory(snapshot, anchorFingerprint, historicalAttestation
     const attestation = attestations[index];
     const floor = floors[index];
     validateCommittedLineage(attestation, floor, anchorFingerprint);
-    if (attestation.tokenConfigGeneration !== firstGeneration + index ||
-        (index === 0 && (attestation.rotationKind !== "genesis" || attestation.previousAttestationFingerprint !== null)) ||
+    if (attestation.anchorFingerprint !== anchorFingerprint ||
+        floor.anchorFingerprint !== anchorFingerprint ||
+        floor.genesisGeneration !== 1 ||
+        attestation.tokenConfigGeneration !== firstGeneration + index ||
+        floor.highestCommittedGeneration !== attestation.tokenConfigGeneration ||
+        floor.highestReservedGeneration !== attestation.tokenConfigGeneration ||
+        (index === 0 && (attestation.tokenConfigGeneration !== 1 ||
+          attestation.rotationKind !== "genesis" ||
+          attestation.fenceGeneration !== 1 ||
+          attestation.previousAttestationFingerprint !== null)) ||
         (index > 0 && (attestation.previousAttestationFingerprint !== previous.attestationFingerprint ||
+          floor.highestCommittedGeneration !== floors[index - 1].highestCommittedGeneration + 1 ||
           (attestation.rotationKind === "same-key") !== (attestation.tokenConfigHostSetFingerprint === previous.tokenConfigHostSetFingerprint) ||
           (attestation.rotationKind === "host-set-change") !== (attestation.tokenConfigHostSetFingerprint !== previous.tokenConfigHostSetFingerprint)))) {
       throw new TypeError("token history lineage");
     }
     previous = attestation;
   }
-  const historicalIndex = historicalAttestation.tokenConfigGeneration - firstGeneration;
-  if (attestations[historicalIndex]?.attestationFingerprint !== historicalAttestation.attestationFingerprint ||
-      floors[historicalIndex]?.floorFingerprint !== historicalFloor.floorFingerprint ||
+  const historicalIndex = historicalAttestation === null ? null : historicalAttestation.tokenConfigGeneration - firstGeneration;
+  if ((historicalAttestation !== null &&
+       (attestations[historicalIndex]?.attestationFingerprint !== historicalAttestation.attestationFingerprint ||
+        floors[historicalIndex]?.floorFingerprint !== historicalFloor.floorFingerprint)) ||
       previous.attestationFingerprint !== currentAttestation.attestationFingerprint ||
       floors.at(-1).floorFingerprint !== currentFloor.floorFingerprint) {
     throw new TypeError("token history snapshot binding");
@@ -164,8 +174,8 @@ function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerpr
   const { attestations, floors } = validateTokenHistory(
     evidence,
     request.anchorFingerprint,
-    attestation,
-    floor,
+    null,
+    null,
     attestation,
     floor,
   );
