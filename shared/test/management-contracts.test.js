@@ -6,7 +6,7 @@ import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from "../st
 import { validateFinalityProof } from "../admission-envelope.js";
 import { buildGenesisPrecommit, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateZFinality } from "../genesis-envelope.js";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationU, validatePublicationY, validatePublicationZp } from "../publication-envelope.js";
-import { buildAuthoritySuccessorRecord, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest } from "../successor-envelope.js";
+import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest } from "../successor-envelope.js";
 
 const hex = "a".repeat(64);
 const seal = (record, field) => ({ ...record, [field]: canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field))) });
@@ -243,6 +243,54 @@ test("mapping successors require exact next mapping generation", () => {
   }, "requestFingerprint");
 
   assert.doesNotThrow(() => validateAuthoritySuccessorRequest(request));
+  const noReader = buildAuthoritySuccessorRecord({
+    ...request,
+    readerMode: "no-reader",
+    readerInstanceId: null,
+    readerStartNonce: null,
+    readerNonce: null,
+    requestFingerprint: null,
+  }, "requestFingerprint");
+  assert.doesNotThrow(() => validateAuthoritySuccessorRequest(noReader));
+  const close = buildAuthoritySuccessorRecord({
+    version: 1,
+    kind: "authority-close-proof",
+    txId: noReader.txId,
+    rootGenesisTxId: noReader.rootGenesisTxId,
+    requestFingerprint: noReader.requestFingerprint,
+    previousReceiptFingerprint: noReader.previousReceiptFingerprint,
+    previousBarrierGeneration: 1,
+    barrierGeneration: 2,
+    affectedScope: "mapping",
+    affectedMappingIds: [],
+    affectedRouteFingerprints: [],
+    readerInstanceId: null,
+    readerStartNonce: null,
+    retiredGrantFingerprint: null,
+    retiredProjectionFingerprint: null,
+    retiredAckFingerprint: null,
+    admissionPhaseBefore: "closed",
+    admissionPhaseAfter: "closed-drained",
+    admissionDrained: true,
+    outstandingRouteGrantCount: 0,
+    routeDisposition: "no-route",
+    closeFingerprint: null,
+  }, "closeFingerprint");
+  assert.doesNotThrow(() => validateAuthorityCloseProof(close, noReader));
+  const mixedClose = buildAuthoritySuccessorRecord({
+    ...close,
+    readerInstanceId: "reader",
+    closeFingerprint: null,
+  }, "closeFingerprint");
+  assert.throws(() => validateAuthorityCloseProof(mixedClose, noReader), /CL/);
+  for (const field of ["readerInstanceId", "readerStartNonce", "readerNonce"]) {
+    const mixed = buildAuthoritySuccessorRecord({
+      ...noReader,
+      [field]: field === "readerNonce" ? "nonce" : "reader",
+      requestFingerprint: null,
+    }, "requestFingerprint");
+    assert.throws(() => validateAuthoritySuccessorRequest(mixed), /SR no-reader/);
+  }
   for (const generation of [0, 2, 3]) {
     const invalid = buildAuthoritySuccessorRecord({
       ...request,

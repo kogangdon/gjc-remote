@@ -31,6 +31,7 @@ test("management CLI separates actor and target principals", () => {
     "--actor-secret-stdin", "true",
     "--target-principal", "sid:S-1-5-19",
     "--target-secret-stdin", "true",
+    "--idempotency-key", "auth-add-001",
   ]);
 
   assert.deepEqual(parsed.input.actorPrincipal, { kind: "sid", value: "S-1-5-18" });
@@ -45,6 +46,7 @@ test("management CLI preserves canonical Linux UID argv values", () => {
     "--actor-secret-stdin", "true",
     "--target-principal", "uid:1001",
     "--target-secret-stdin", "true",
+    "--idempotency-key", "auth-add-uid-001",
   ]);
 
   assert.deepEqual(parsed.input.actorPrincipal, { kind: "uid", value: "uid:1000" });
@@ -64,7 +66,7 @@ test("management CLI rejects secrets in argv", () => {
     /USAGE_INVALID_ARGUMENT/
   );
 });
-test("management CLI accepts idempotency keys for successor mutations and rejects missing, duplicate, unknown, and secret argv flags", () => {
+test("management CLI accepts idempotency keys for successor and auth mutations and rejects missing, duplicate, unknown, and secret argv flags", () => {
   const auth = ["--actor-principal", "sid:S-1-5-18", "--actor-secret-stdin", "true"];
   const key = ["--idempotency-key", "successor-001"];
   for (const argv of [
@@ -73,8 +75,19 @@ test("management CLI accepts idempotency keys for successor mutations and reject
     ["mapping-revoke", ...auth, "--mapping-id", "map", "--expected-revision", "12", "--expected-fingerprint", "a".repeat(64), ...key],
     ["mapping-rollback", ...auth, "--mapping-id", "map", "--replacement-mapping-id", "replacement", "--expected-revision", "12", "--expected-fingerprint", "a".repeat(64), "--prior-generation", "2", ...key],
     ["recover", ...auth, ...key],
+    ["auth-add", ...auth, "--target-principal", "sid:S-1-5-19", "--target-secret-stdin", "true", ...key],
+    ["auth-rotate", ...auth, "--target-principal", "sid:S-1-5-19", "--target-secret-stdin", "true", ...key],
+    ["auth-revoke", ...auth, "--target-principal", "sid:S-1-5-19", ...key],
   ]) {
     assert.equal(parseManagementArgs(argv).input.idempotencyKey, "successor-001");
+  }
+  for (const command of ["auth-add", "auth-rotate", "auth-revoke"]) {
+    assert.throws(() => parseManagementArgs([
+      command,
+      ...auth,
+      "--target-principal", "sid:S-1-5-19",
+      ...(command === "auth-revoke" ? [] : ["--target-secret-stdin", "true"]),
+    ]), /USAGE_IDEMPOTENCY_KEY_REQUIRED/);
   }
   assert.throws(() => parseManagementArgs(["tokens-attest", ...auth, "--host-tokens-stdin", "true"]), /USAGE_IDEMPOTENCY_KEY_REQUIRED/);
   assert.throws(() => parseManagementArgs(["recover", ...auth]), /USAGE_IDEMPOTENCY_KEY_REQUIRED/);

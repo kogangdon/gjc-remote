@@ -3,6 +3,17 @@ import { isPrincipal } from "@gjc-remote/shared/identity";
 import { ManagementRuntime, EXIT } from "./management-runtime.js";
 
 const COMMANDS = new Set(["genesis", "mapping-validate", "mapping-snapshot", "mapping-reconcile", "mapping-revoke", "mapping-rollback", "tokens-attest", "auth-add", "auth-rotate", "auth-revoke", "recover", "status"]);
+const AUTH_MUTATION_COMMANDS = new Set(["auth-add", "auth-rotate", "auth-revoke"]);
+const AUTH_IDEMPOTENCY_KEY_MAX_LENGTH = 256;
+const validAuthIdempotencyKey = (value) => {
+  if (typeof value !== "string" || value.length === 0) return false;
+  try {
+    assertStrictText(value, "idempotency key", AUTH_IDEMPOTENCY_KEY_MAX_LENGTH);
+    return true;
+  } catch {
+    return false;
+  }
+};
 const SUCCESSOR_COMMANDS = new Set(["genesis", "mapping-reconcile", "mapping-revoke", "mapping-rollback", "tokens-attest", "recover"]);
 const SECRET_FLAGS = new Set(["--actor-secret", "--target-secret", "--host-tokens", "--audit-file", "--state-path"]);
 const COMMON_FLAGS = new Set(["--actor-principal", "--actor-secret-stdin"]);
@@ -14,9 +25,9 @@ const COMMAND_FLAGS = Object.freeze({
   "mapping-revoke": new Set(["--mapping-id", "--expected-revision", "--expected-fingerprint", "--idempotency-key"]),
   "mapping-rollback": new Set(["--mapping-id", "--replacement-mapping-id", "--expected-revision", "--expected-fingerprint", "--prior-generation", "--idempotency-key"]),
   "tokens-attest": new Set(["--host-tokens-stdin", "--idempotency-key"]),
-  "auth-add": new Set(["--target-principal", "--target-secret-stdin"]),
-  "auth-rotate": new Set(["--target-principal", "--target-secret-stdin"]),
-  "auth-revoke": new Set(["--target-principal"]),
+  "auth-add": new Set(["--target-principal", "--target-secret-stdin", "--idempotency-key"]),
+  "auth-rotate": new Set(["--target-principal", "--target-secret-stdin", "--idempotency-key"]),
+  "auth-revoke": new Set(["--target-principal", "--idempotency-key"]),
   recover: new Set(["--idempotency-key"]),
   status: new Set(),
 });
@@ -70,6 +81,7 @@ export function parseManagementArgs(argv) {
     if (!Number.isSafeInteger(input.priorGeneration)) throw new Error("USAGE_PRIOR_GENERATION_INVALID");
   }
   if (SUCCESSOR_COMMANDS.has(command) && (typeof input.idempotencyKey !== "string" || input.idempotencyKey.length === 0)) throw new Error("USAGE_IDEMPOTENCY_KEY_REQUIRED");
+  if (AUTH_MUTATION_COMMANDS.has(command) && !validAuthIdempotencyKey(input.idempotencyKey)) throw new Error("USAGE_IDEMPOTENCY_KEY_REQUIRED");
   if (command === "genesis" && (!input.targetPrincipal || !input.botPrincipal || !input.recoveryPrincipal || !/^[a-f0-9]{64}$/.test(input.managementProvisioningFingerprint ?? "") || !/^[a-f0-9]{64}$/.test(input.botProvisioningFingerprint ?? "") || !/^[a-f0-9]{64}$/.test(input.recoveryProvisioningFingerprint ?? ""))) throw new Error("USAGE_GENESIS_ROLES_REQUIRED");
   if (command === "genesis" && input.requestedReaderMode !== undefined &&
       (input.requestedReaderMode !== "no-reader" && input.requestedReaderMode !== "handshake" ||

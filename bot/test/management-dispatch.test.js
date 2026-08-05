@@ -31,7 +31,7 @@ function seal(record, field) {
   return { ...record, [field]: canonicalJsonHash(record) };
 }
 
-function managedSnapshot(sourceKind = "managed-v1") {
+function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = null) {
   const hostSetFingerprint = "d".repeat(64);
   const txId = "123e4567-e89b-42d3-a456-426614174000";
   const targetBytes = Buffer.from(canonicalJson(sourceKind === "managed-v1"
@@ -59,6 +59,10 @@ function managedSnapshot(sourceKind = "managed-v1") {
     readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null,
     firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null,
   }, "floorFingerprint");
+  const historyMarker = seal({
+    version: 1, kind: "managed-history-marker", anchorFingerprint,
+    sequence: 1, previousMarkerFingerprint: null,
+  }, "markerFingerprint");
   const root = seal({
     version: 1, kind: "management-control-root", managementStamp: "gjc-management-control/v1", anchor,
     anchorFingerprint, sourceKind, wrapperKind: sourceKind === "managed-v1" ? "managed-v1-wrapper" : "legacy-retained-wrapper",
@@ -129,11 +133,18 @@ function managedSnapshot(sourceKind = "managed-v1") {
     leaseBindingFingerprint: null, readerProjectionFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null,
   }, "baselineFingerprint");
   const targetFingerprint = createHash("sha256").update(targetBytes).digest("hex");
-  const canonicalMappingFingerprint = canonicalJsonHash({
-    mappingGeneration: sourceKind === "managed-v1" ? JSON.parse(targetBytes).mappingGeneration : 0,
-    mappings: sourceKind === "managed-v1" ? JSON.parse(targetBytes).mappings : {},
-    routes: sourceKind === "managed-v1" ? JSON.parse(targetBytes).routes : {},
-  });
+  const canonicalMappingFingerprint = sourceKind === "legacy-retained"
+    ? canonicalJsonHash({
+      sourceKind: "legacy-retained",
+      targetFingerprint,
+      identityFingerprint: retainedIdentityOverride ?? targetIdentity,
+      aclFingerprint: targetAclFingerprint,
+    })
+    : canonicalJsonHash({
+      mappingGeneration: JSON.parse(targetBytes).mappingGeneration,
+      mappings: JSON.parse(targetBytes).mappings,
+      routes: JSON.parse(targetBytes).routes,
+    });
   const stateFingerprint = canonicalJsonHash({
     targetState: baseline.targetState,
     targetFingerprint,
@@ -268,6 +279,7 @@ function managedSnapshot(sourceKind = "managed-v1") {
     currentAttestationBytes: bytes(attestation), currentTokenFloorBytes: bytes(tokenFloor),
     attestationHistoryBytes: bytes([attestation]), tokenFloorHistoryBytes: bytes([tokenFloor]),
     tokenFloorReservationBytes: bytes(reservation), readerVersionFloorBytes: bytes(readerFloor),
+    historyMarkerBytes: bytes(historyMarker),
     genesisRequestBytes: bytes(request), attestedProofBytes: bytes(attestedProof),
     precommitBytes: bytes(precommit), zFinalityBytes: bytes(zFinality),
     rvfBytes: bytes(proof), receiptBytes: bytes(receipt), authorityRequestBytes: bytes(authorityRequest),
@@ -470,6 +482,17 @@ test("verified native reader accepts canonical managed and retained snapshots", 
     assert.equal(result.ok, true);
     assert.equal(result.classification.sourceKind, sourceKind);
   }
+});
+test("legacy-retained publication rejects a mismatched canonical mapping fingerprint", () => {
+  assert.throws(
+    () => validateManagedProof(managedSnapshot("legacy-retained", "0".repeat(64))),
+    /publication/i,
+  );
+});
+test("legacy-retained canonical mapping tuple fields are required", () => {
+  const snapshot = managedSnapshot("legacy-retained");
+  snapshot.targetAclFingerprint = undefined;
+  assert.throws(() => validateManagedProof(snapshot), /management envelope/);
 });
 test("reader requires provisioned bindings before native construction and configures them before reads", async () => {
   let factoryCalls = 0;

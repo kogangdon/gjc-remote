@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { canonicalJsonHash } from "@gjc-remote/shared/strict-json";
+import { assertStrictText, canonicalJsonHash } from "@gjc-remote/shared/strict-json";
 import { isPrincipal } from "@gjc-remote/shared/identity";
 import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord } from "@gjc-remote/shared/mapping-envelope";
 import { attestTokenFloor, authorityRecordFingerprint, advanceReaderVersionFloor, buildAttestedTokenFloorProof, buildGenesisPrecommit, commitTokenFloor, reserveTokenGeneration, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisRequest, validateGenesisReceipt, validateReaderProjection, validateReaderVersionFloor, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
@@ -17,6 +17,73 @@ const safe = (error) => ({ code: /^[A-Z0-9_]+$/.test(error?.code ?? "") ? error.
 const principal = (value, name) => { if (!isPrincipal(value)) throw new Error(`${name}_INVALID`); return value; };
 const protectedTokenFingerprint = (value) => managedHostSetFingerprint(parseManagedHostTokens(value));
 const recordHash = (record, field) => canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field)));
+const validateManagedHistoryMarker = (marker, anchorFingerprint, expectedSequence = undefined) => {
+  if (!marker || Object.getPrototypeOf(marker) !== Object.prototype ||
+      Object.keys(marker).sort().join(',') !== 'anchorFingerprint,kind,markerFingerprint,previousMarkerFingerprint,sequence,version' ||
+      marker.version !== 1 || marker.kind !== 'managed-history-marker' ||
+      typeof marker.anchorFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(marker.anchorFingerprint) ||
+      !Number.isSafeInteger(marker.sequence) || marker.sequence < 1 ||
+      (marker.sequence === 1 ? marker.previousMarkerFingerprint !== null : !/^[a-f0-9]{64}$/.test(marker.previousMarkerFingerprint)) ||
+      typeof marker.markerFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(marker.markerFingerprint) ||
+      marker.markerFingerprint !== recordHash(marker, 'markerFingerprint') ||
+      marker.anchorFingerprint !== anchorFingerprint ||
+      (expectedSequence !== undefined && marker.sequence !== expectedSequence)) {
+    throw new Error('MANAGED_HISTORY_MARKER_REQUIRED');
+  }
+  return marker;
+};
+const AUTH_IDEMPOTENCY_KEY_MAX_LENGTH = 256;
+const AUTH_MUTATION_COMMANDS = new Set(["auth-add", "auth-rotate", "auth-revoke"]);
+const validAuthIdempotencyKey = (value) => {
+  if (typeof value !== "string" || value.length === 0) return false;
+  try {
+    assertStrictText(value, "idempotency key", AUTH_IDEMPOTENCY_KEY_MAX_LENGTH);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const authMutationIntentFingerprint = ({ action, actorPrincipal, targetPrincipal, targetSecret }) => canonicalJsonHash({
+  version: 1,
+  kind: "management-auth-mutation-intent",
+  action,
+  actorPrincipalFingerprint: canonicalJsonHash(actorPrincipal),
+  targetPrincipalFingerprint: canonicalJsonHash(targetPrincipal),
+  targetSecretFingerprint: targetSecret === undefined ? null : canonicalJsonHash(targetSecret),
+});
+const authMutationRecords = (auth) => {
+  if (auth.idempotency === undefined) auth.idempotency = {};
+  if (!auth.idempotency || Object.getPrototypeOf(auth.idempotency) !== Object.prototype) {
+    throw new Error("IDEMPOTENCY_RECORD_INVALID");
+  }
+  return auth.idempotency;
+};
+const authMutationRecord = ({ idempotencyKey, action, intentFingerprint, actorPrincipal, targetPrincipal, result, beforeFingerprint, afterFingerprint }) => ({
+  version: 1,
+  kind: "management-auth-idempotency-record",
+  idempotencyKey,
+  action,
+  intentFingerprint,
+  actorPrincipalFingerprint: canonicalJsonHash(actorPrincipal),
+  targetPrincipalFingerprint: canonicalJsonHash(targetPrincipal),
+  result: structuredClone(result),
+  authBeforeFingerprint: beforeFingerprint,
+  authAfterFingerprint: afterFingerprint,
+});
+const validAuthMutationRecord = (record, key) =>
+  record && Object.getPrototypeOf(record) === Object.prototype &&
+  record.version === 1 && record.kind === "management-auth-idempotency-record" &&
+  record.idempotencyKey === key &&
+  typeof record.action === "string" &&
+  /^[a-f0-9]{64}$/.test(record.intentFingerprint) &&
+  /^[a-f0-9]{64}$/.test(record.actorPrincipalFingerprint) &&
+  /^[a-f0-9]{64}$/.test(record.targetPrincipalFingerprint) &&
+  /^[a-f0-9]{64}$/.test(record.authBeforeFingerprint) &&
+  /^[a-f0-9]{64}$/.test(record.authAfterFingerprint) &&
+  record.result && Object.getPrototypeOf(record.result) === Object.prototype &&
+  Object.keys(record.result).length === 1 &&
+  Number.isSafeInteger(record.result.epoch) &&
+  record.result.epoch > 0;
 const normalizedGenesisSecurityTuple = ({
   anchorFingerprint,
   actorPrincipal,
@@ -190,6 +257,9 @@ export class ManagementRuntime {
 
   async execute(command, input) {
     try {
+      if (AUTH_MUTATION_COMMANDS.has(command) && !validAuthIdempotencyKey(input?.idempotencyKey)) {
+        throw new Error("IDEMPOTENCY_KEY_REQUIRED");
+      }
       this.#assertNative();
       await this.#configureRoles(command, input);
       const outcome = command === "genesis" ? await this.#genesis(input) : await this.#authenticated(command, input);
@@ -234,7 +304,13 @@ export class ManagementRuntime {
   async #audit(entry) {
     return this.native.appendAudit(redactAudit(entry));
   }
-  async #commitGenesisHistory(anchorFingerprint) {
+  async #commitGenesisHistory(anchorFingerprint, { allowCreate = false } = {}) {
+    const existing = await this.native.readManagedHistoryMarker();
+    if (existing !== null) {
+      validateManagedHistoryMarker(existing, anchorFingerprint, 1);
+      return existing;
+    }
+    if (!allowCreate) throw new Error("MANAGED_HISTORY_MARKER_REQUIRED");
     const marker = {
       version: 1,
       kind: "managed-history-marker",
@@ -246,6 +322,8 @@ export class ManagementRuntime {
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
     const committed = await this.native.commitManagedHistoryMarker(marker);
     const reopened = await this.native.readManagedHistoryMarker();
+    validateManagedHistoryMarker(committed, anchorFingerprint, 1);
+    validateManagedHistoryMarker(reopened, anchorFingerprint, 1);
     if (canonicalJsonHash(committed) !== canonicalJsonHash(marker) ||
         canonicalJsonHash(reopened) !== canonicalJsonHash(marker)) {
       throw new Error("MANAGED_HISTORY_MARKER_REQUIRED");
@@ -281,7 +359,11 @@ export class ManagementRuntime {
   }
 
   async #mutate(action, input, fn, locks = ["mapping"]) {
+    if (!validAuthIdempotencyKey(input.idempotencyKey)) {
+      throw new Error("IDEMPOTENCY_KEY_REQUIRED");
+    }
     const actorPrincipal = principal(input.actorPrincipal, "ACTOR_PRINCIPAL");
+    const targetPrincipal = principal(input.targetPrincipal, "TARGET_PRINCIPAL");
     const secret = input.actorSecret;
     if (typeof secret !== "string") throw new Error("AUTH_SECRET_REQUIRED");
     return this.native.withManagementLocks(locks, async () => {
@@ -291,10 +373,56 @@ export class ManagementRuntime {
       const authState = { auth };
       const identity = authenticate(authState, actorPrincipal, secret);
       const beforeFingerprint = canonicalJsonHash(auth);
+      const intentFingerprint = authMutationIntentFingerprint({
+        action,
+        actorPrincipal,
+        targetPrincipal,
+        targetSecret: input.targetSecret,
+      });
+      const records = authMutationRecords(auth);
+      const hasExisting = Object.hasOwn(records, input.idempotencyKey);
+      if (hasExisting) {
+        const existing = records[input.idempotencyKey];
+        if (!validAuthMutationRecord(existing, input.idempotencyKey) ||
+            existing.action !== action ||
+            existing.intentFingerprint !== intentFingerprint) {
+          throw new Error("IDEMPOTENCY_CONFLICT");
+        }
+        return structuredClone(existing.result);
+      }
       const result = await fn(authState, identity);
+      const afterFingerprint = canonicalJsonHash(authState.auth);
+      const record = authMutationRecord({
+        idempotencyKey: input.idempotencyKey,
+        action,
+        intentFingerprint,
+        actorPrincipal,
+        targetPrincipal,
+        result,
+        beforeFingerprint,
+        afterFingerprint,
+      });
+      Object.defineProperty(authState.auth.idempotency, input.idempotencyKey, {
+        configurable: true,
+        enumerable: true,
+        value: record,
+        writable: true,
+      });
       if (!await this.native.compareAndSwapManagementAuth(beforeFingerprint, authState.auth)) throw new Error("CAS_CONFLICT");
       try {
-        await this.#audit({ actorPrincipal, action, targetPrincipal: input.targetPrincipal ?? null, result: "committed", details: result });
+        await this.#audit({
+          actorPrincipal,
+          action,
+          targetPrincipal,
+          result: "committed",
+          details: {
+            idempotencyKey: input.idempotencyKey,
+            intentFingerprint,
+            authBeforeFingerprint: beforeFingerprint,
+            authAfterFingerprint: afterFingerprint,
+            result,
+          },
+        });
       } catch (error) {
         await this.#manualCleanup(state, safe(error).code);
       }
@@ -365,7 +493,7 @@ export class ManagementRuntime {
         validateGenesisSuffixRecovery(completed, state.recovery);
         const lineage = await this.native.readSuccessorTokenLineage();
         const before = state.revision;
-        state.recovery = { ...state.recovery, ...completed, phase: "terminal", readerHandshake: null };
+        state.recovery = { ...state.recovery, ...completed, finalityFingerprint: completed.receiptFingerprint, phase: "terminal", readerHandshake: null };
         state.admission = {
           phase: completed.admissionOpen === true ? "open" : "closed",
           finalityFingerprint: completed.admissionOpen === true ? completed.finalityFingerprint : null,
@@ -376,16 +504,16 @@ export class ManagementRuntime {
           fingerprint: lineage.attestation.tokenConfigHostSetFingerprint,
           generation: lineage.attestation.tokenConfigGeneration,
           attestationFingerprint: lineage.attestation.attestationFingerprint,
-          finalityFingerprint: completed.finalityFingerprint,
+          finalityFingerprint: lineage.floor.floorFingerprint,
         };
         state.genesis = {
           txId: state.recovery.txId,
           replayFingerprint,
           genesisSecurityTuple: state.recovery.genesisSecurityTuple,
           requestFingerprint: state.recovery.requestFingerprint,
-          finalityFingerprint: completed.finalityFingerprint,
+          finalityFingerprint: completed.receiptFingerprint,
         };
-        await this.#commitGenesisHistory(anchorFingerprint);
+        try { await this.#commitGenesisHistory(anchorFingerprint); } catch { await this.#manualCleanup(state, "MANAGED_HISTORY_MARKER_REQUIRED"); }
         state.revision = before + 1;
         state.authorityEpoch += 1;
         if (!await this.native.compareAndSwapManagementState(before, state)) {
@@ -396,7 +524,7 @@ export class ManagementRuntime {
           action: "genesis-handshake-complete",
           targetPrincipal,
           result: "terminal",
-          details: { txId: state.recovery.txId, finalityFingerprint: completed.finalityFingerprint },
+          details: { txId: state.recovery.txId, finalityFingerprint: completed.receiptFingerprint },
         });
         return {
           idempotent: true,
@@ -424,7 +552,7 @@ export class ManagementRuntime {
           await this.#manualCleanup(state, "RECOVERY_SUFFIX_MISMATCH");
         }
         const lineage = await this.native.readSuccessorTokenLineage();
-        state.recovery = { ...state.recovery, ...recovered, phase: "terminal" };
+        state.recovery = { ...state.recovery, ...recovered, finalityFingerprint: recovered.receiptFingerprint, phase: "terminal" };
         state.admission = { phase: recovered.admissionOpen === true ? "open" : "closed", finalityFingerprint: recovered.finalityFingerprint ?? null };
         state.tokenFloor = structuredClone(lineage.floor);
         state.tokenConfigGeneration = lineage.attestation.tokenConfigGeneration;
@@ -432,16 +560,16 @@ export class ManagementRuntime {
           fingerprint: lineage.attestation.tokenConfigHostSetFingerprint,
           generation: lineage.attestation.tokenConfigGeneration,
           attestationFingerprint: lineage.attestation.attestationFingerprint,
-          finalityFingerprint: recovered.finalityFingerprint,
+          finalityFingerprint: lineage.floor.floorFingerprint,
         };
         state.genesis = {
           txId: state.recovery.txId,
           replayFingerprint,
           genesisSecurityTuple: state.recovery.genesisSecurityTuple,
           requestFingerprint: state.recovery.requestFingerprint,
-          finalityFingerprint: recovered.finalityFingerprint,
+          finalityFingerprint: recovered.receiptFingerprint,
         };
-        await this.#commitGenesisHistory(anchorFingerprint);
+        try { await this.#commitGenesisHistory(anchorFingerprint); } catch { await this.#manualCleanup(state, "MANAGED_HISTORY_MARKER_REQUIRED"); }
         const before = state.revision;
         state.revision += 1;
         state.authorityEpoch += 1;
@@ -690,7 +818,7 @@ export class ManagementRuntime {
           checkpointFingerprint: semanticCheckpointFingerprint,
         });
         await this.native.writePublicationGraph(graph);
-        const authorityProof = await this.native.readBoundReaderProof();
+        const authorityProof = await this.native.readBoundReaderProof({ allowPending: true });
         const authorityReaderFloor = authorityProof?.readerVersionFloor;
         validateReaderVersionFloor(authorityReaderFloor);
         state.recovery.phase = "replaced";
@@ -763,10 +891,11 @@ export class ManagementRuntime {
         let readerProjection = null;
         let admissionAck = null;
         if (request.requestedReaderMode === "handshake") {
-          const bound = await this.native.readBoundReaderProof({ request, zFinality });
+          const bound = await this.native.readBoundReaderProof({ allowPending: true, request, zFinality });
           readerProjection = bound?.readerProjection;
           admissionAck = bound?.admissionAck;
           if (!readerProjection || !admissionAck) {
+            await this.#commitGenesisHistory(anchorFingerprint, { allowCreate: true });
             state.recovery = {
               ...state.recovery, phase: "handshake-pending", replayFingerprint,
               generation,
@@ -843,8 +972,8 @@ export class ManagementRuntime {
         const reopened = await this.native.reopenAdmission({ txId, finalityFingerprint: finalityProof.finalityProofFingerprint }) === true;
         state.tokenFloor = committedFloor;
         state.tokenAttestation = { fingerprint: hostSetFingerprint, generation, attestationFingerprint: attestation.attestationFingerprint, finalityFingerprint: committedFloor.floorFingerprint };
-        state.recovery.finalityFingerprint = committedFloor.floorFingerprint;
-        state.genesis = { txId, replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, requestFingerprint: request.requestFingerprint, finalityFingerprint: state.recovery.finalityFingerprint };
+        state.recovery.finalityFingerprint = receipt.receiptFingerprint;
+        state.genesis = { txId, replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, requestFingerprint: request.requestFingerprint, finalityFingerprint: receipt.receiptFingerprint };
         state.recovery = { ...state.recovery, phase: "terminal", readerHandshake: null, replayFingerprint };
         state.admission = reopened
           ? { phase: "open", finalityFingerprint: finalityProof.finalityProofFingerprint }
@@ -888,6 +1017,11 @@ export class ManagementRuntime {
     const bundle = await this.native.readSuccessorBundle();
     if (!bundle || bundle.head.txId !== txId || bundle.head.phase !== "reader-pending" || !bundle.lease || !bundle.projection || !bundle.ack) return null;
     validateAuthoritySuccessorBundle(bundle);
+    validateReaderVersionFloor(bundle.readerFloor);
+    if (bundle.readerFloor.readerVersionFloor !== 2 || bundle.request.readerMode !== "bound-reader") {
+      throw new Error("READER_FLOOR_PROOF_MISMATCH");
+    }
+    validateManagedHistoryMarker(bundle.historyMarker, bundle.request.anchorFingerprint, bundle.request.sequence - 1);
     const { request, finality, lease, projection, ack, head } = bundle;
     const recovery = await this.native.readSuccessorRecovery({
       predecessorReceiptFingerprint: request.previousReceiptFingerprint,
@@ -925,9 +1059,11 @@ export class ManagementRuntime {
     }, "receiptFingerprint");
     await this.native.writeAuthoritySuccessorReceipt(receipt);
     const previousMarker = await this.native.readManagedHistoryMarker();
-    const marker = { version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, sequence: request.sequence, previousMarkerFingerprint: previousMarker?.markerFingerprint ?? null, markerFingerprint: null };
+    validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
+    const marker = { version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, sequence: request.sequence, previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
-    await this.native.commitManagedHistoryMarker(marker);
+    const committedMarker = await this.native.commitManagedHistoryMarker(marker);
+    validateManagedHistoryMarker(committedMarker, request.anchorFingerprint, request.sequence);
     const terminal = buildAuthoritySuccessorRecord({ ...head, phase: "terminal", receiptFingerprint: receipt.receiptFingerprint, historyMarkerFingerprint: marker.markerFingerprint, previousHeadFingerprint: head.headFingerprint, headFingerprint: null }, "headFingerprint");
     const before = state.revision;
     state.revision = finality.revision;
@@ -993,17 +1129,40 @@ export class ManagementRuntime {
       mappingId: input.mappingId ?? null,
     };
     const txId = `successor-${canonicalJsonHash(intent)}`;
-    const existing = await this.native.readAuthoritySuccessorHead();
+    let existing;
+    try {
+      existing = await this.native.readAuthoritySuccessorHead();
+    } catch {
+      await this.#manualCleanup(state, "SUCCESSOR_FLOOR_OR_HISTORY_MARKER_INVALID");
+    }
     if (existing !== null && existing.phase !== "terminal") {
       return this.#recoverSuccessorHead({ state, input, actorPrincipal, operation, txId, intent, head: existing });
     }
-    const durableReaderProof = await this.native.readBoundReaderProof();
-    const readerMode = durableReaderProof?.readerProjection && durableReaderProof?.admissionAck ? "bound-reader" : "no-reader";
+    let durableReaderProof;
+    let readerFloor;
+    let historyMarker;
+    let readerMode;
+    try {
+      durableReaderProof = await this.native.readBoundReaderProof();
+      readerFloor = durableReaderProof?.readerVersionFloor;
+      validateReaderVersionFloor(readerFloor);
+      const hasBoundProof = Boolean(durableReaderProof.readerProjection && durableReaderProof.admissionAck && durableReaderProof.readerState);
+      if (readerFloor.readerVersionFloor === 2) {
+        if (!hasBoundProof) throw new Error("READER_BOUND_PROOF_REQUIRED");
+        readerMode = "bound-reader";
+      } else {
+        if (hasBoundProof) throw new Error("READER_FLOOR_PROOF_MISMATCH");
+        readerMode = "no-reader";
+      }
+      historyMarker = await this.native.readManagedHistoryMarker();
+      validateManagedHistoryMarker(historyMarker, anchorFingerprint);
+    } catch {
+      await this.#manualCleanup(state, "READER_FLOOR_OR_HISTORY_MARKER_INVALID");
+    }
     const readerInstanceId = readerMode === "bound-reader" ? durableReaderProof.readerProjection.readerInstanceId : null;
     const readerStartNonce = readerMode === "bound-reader" ? durableReaderProof.readerProjection.readerStartNonce : null;
     if (readerMode === "bound-reader" && (!readerInstanceId || !readerStartNonce)) throw new Error("READER_BINDING_REQUIRED");
-    const historyMarker = await this.native.readManagedHistoryMarker();
-    const sequence = Number.isSafeInteger(historyMarker?.sequence) ? historyMarker.sequence + 1 : 2;
+    const sequence = historyMarker.sequence + 1;
     const predecessor = await this.native.readRetainedTargetProof();
     if (!predecessor ||
         !/^[a-f0-9]{64}$/.test(predecessor.targetFingerprint) ||
@@ -1048,8 +1207,9 @@ export class ManagementRuntime {
         previousAttestationFingerprint: state.tokenAttestation?.attestationFingerprint ?? previousFingerprint, txId,
       }, "attestationFingerprint")
       : state.tokenAttestation?.attestationFingerprint ?? canonicalJsonHash({ genesis: state.genesis.txId });
-    let predecessorReceiptFingerprint = state.genesis.finalityFingerprint ?? previousFingerprint;
+    let predecessorReceiptFingerprint = state.genesis.finalityFingerprint;
     let predecessorHeadFingerprint = null;
+    if (existing === null) validateManagedHistoryMarker(historyMarker, anchorFingerprint, 1);
     if (existing?.phase === "terminal") {
       if (typeof this.native.readSuccessorBundle !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
       const terminalBundle = await this.native.readSuccessorBundle();
@@ -1061,7 +1221,14 @@ export class ManagementRuntime {
       validateAuthoritySuccessorBundle(terminalBundle);
       predecessorReceiptFingerprint = terminalBundle.receipt.receiptFingerprint;
       predecessorHeadFingerprint = existing.headFingerprint;
+      validateManagedHistoryMarker(terminalBundle.historyMarker, anchorFingerprint, existing.sequence);
+      validateReaderVersionFloor(terminalBundle.readerFloor);
+      if ((terminalBundle.readerFloor.readerVersionFloor === 2) !== (readerMode === "bound-reader") ||
+          terminalBundle.historyMarker.markerFingerprint !== existing.historyMarkerFingerprint) {
+        throw new Error("SUCCESSOR_TERMINAL_PREDECESSOR_INVALID");
+      }
     }
+    if (existing === null && !/^[a-f0-9]{64}$/.test(predecessorReceiptFingerprint)) throw new Error("GENESIS_RECEIPT_REQUIRED");
     const request = buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-request", sequence, txId, rootGenesisTxId: state.genesis.txId,
       idempotencyKey: input.idempotencyKey, operation, anchorFingerprint,
@@ -1297,12 +1464,14 @@ export class ManagementRuntime {
     }, "receiptFingerprint");
     await this.native.writeAuthoritySuccessorReceipt(receipt);
     const previousMarker = await this.native.readManagedHistoryMarker();
+    validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
     const marker = {
       version: 1, kind: "managed-history-marker", anchorFingerprint, sequence: request.sequence,
-      previousMarkerFingerprint: previousMarker?.markerFingerprint ?? null, markerFingerprint: null,
+      previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null,
     };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
-    await this.native.commitManagedHistoryMarker(marker);
+    const committedMarker = await this.native.commitManagedHistoryMarker(marker);
+    validateManagedHistoryMarker(committedMarker, request.anchorFingerprint, request.sequence);
     const terminalHead = buildAuthoritySuccessorRecord({
       ...finalityHead, phase: "terminal", receiptFingerprint: receipt.receiptFingerprint,
       historyMarkerFingerprint: marker.markerFingerprint, previousHeadFingerprint: finalityHead.headFingerprint, headFingerprint: null,

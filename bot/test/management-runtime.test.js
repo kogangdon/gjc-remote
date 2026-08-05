@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ManagementRuntime } from '../src/management-runtime.js';
-import { createManagementNativeForTest } from '../../native-control/src/index.js';
+import { createManagementNativeForTest } from '../../native-control/test/helpers/management-native.js';
 import { validateManagedProof } from '../src/managed-authority-reader.js';
 import { createTestManagedAuthorityReader } from './helpers/managed-authority-reader.js';
 import { buildAdmissionAck } from '../../shared/admission-envelope.js';
@@ -387,6 +387,51 @@ test('mapping reconcile creates successor authority rather than lifecycle refusa
   });
   assert.notEqual(result.error, 'MAPPING_LIFECYCLE_UNAVAILABLE');
   assert.equal(result.routeDisposition, 'no-route');
+});
+test('no-reader mapping successors reach the terminal graph with exact lineage and replay through recovery', async () => {
+  const { native, files } = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+  const beforeState = await native.readManagementState();
+  const genesisMarker = await native.readManagedHistoryMarker();
+  const candidate = mappingInput('workspace-map');
+  const result = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'mapping-successor-terminal',
+    mappingId: candidate.mapping.mappingId, ...candidate, expectedRevision: beforeState.revision, expectedFingerprint: null,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.pending, false);
+  assert.equal(result.routeDisposition, 'no-route');
+  const request = JSON.parse(fileEnding(files, `/authority-successor-request-${result.txId}.json`));
+  const close = JSON.parse(fileEnding(files, `/authority-close-proof-${result.txId}.json`));
+  const finality = JSON.parse(fileEnding(files, `/authority-successor-finality-${result.txId}.json`));
+  const receipt = JSON.parse(fileEnding(files, `/authority-successor-receipt-${result.txId}.json`));
+  assert.equal(request.readerMode, 'no-reader');
+  assert.equal(request.readerInstanceId, null);
+  assert.equal(request.readerStartNonce, null);
+  assert.equal(request.readerNonce, null);
+  assert.equal(request.candidateMappingGeneration, beforeState.mappingGeneration + 1);
+  assert.equal(close.readerInstanceId, null);
+  assert.equal(close.readerStartNonce, null);
+  assert.equal(close.routeDisposition, 'no-route');
+  assert.equal(finality.mappingGeneration, request.candidateMappingGeneration);
+  assert.equal(finality.routeDisposition, 'no-route');
+  assert.equal(receipt.readerMode, 'no-reader');
+  assert.equal(receipt.leaseBindingFingerprint, null);
+  assert.equal(receipt.readerProjectionFingerprint, null);
+  assert.equal(receipt.ackFingerprint, null);
+  const head = JSON.parse(fileEnding(files, '/authority-head.json'));
+  assert.equal(head.phase, 'terminal');
+  assert.equal(head.finalityFingerprint, finality.finalityFingerprint);
+  const marker = await native.readManagedHistoryMarker();
+  assert.equal(marker.sequence, genesisMarker.sequence + 1);
+  assert.equal(marker.previousMarkerFingerprint, genesisMarker.markerFingerprint);
+  const replay = await runtime.execute('recover', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'mapping-successor-terminal',
+  });
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.phase, 'terminal');
 });
 test('a post-publication audit failure persists manual cleanup and blocks later management commands', async () => {
   const { native } = adapter({ failAudit: true });

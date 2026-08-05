@@ -199,10 +199,68 @@ test("owner may add, rotate, and revoke a distinct actor credential", async () =
     assert.ok(native.calls.indexOf("attestation") < native.calls.indexOf("publication"));
     assert.ok(native.calls.indexOf("publication") < native.calls.indexOf("commit"));
     assert.equal(native.records.every((record) => !JSON.stringify(record).includes(ownerSecret) && !Object.hasOwn(record, "tokenBytes")), true);
-    assert.equal((await execute(runtime, "auth-add", { actorPrincipal: owner, actorSecret: ownerSecret, targetPrincipal: member, targetSecret: memberSecret })).ok, true);
-    assert.equal((await execute(runtime, "auth-rotate", { actorPrincipal: owner, actorSecret: ownerSecret, targetPrincipal: member, targetSecret: rotatedSecret })).ok, true);
+    const missing = await execute(runtime, "auth-add", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      targetSecret: memberSecret,
+    });
+    assert.equal(missing.error, "IDEMPOTENCY_KEY_REQUIRED");
+    const added = await execute(runtime, "auth-add", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      targetSecret: memberSecret,
+      idempotencyKey: "auth-add-001",
+    });
+    assert.equal(added.ok, true, JSON.stringify(added));
+    const replay = await execute(runtime, "auth-add", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      targetSecret: memberSecret,
+      idempotencyKey: "auth-add-001",
+    });
+    assert.deepEqual(replay, added);
+    const conflict = await execute(runtime, "auth-add", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      targetSecret: "different-member-secret-is-long-enough",
+      idempotencyKey: "auth-add-001",
+    });
+    assert.equal(conflict.error, "IDEMPOTENCY_CONFLICT");
+    const rotated = await execute(runtime, "auth-rotate", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      targetSecret: rotatedSecret,
+      idempotencyKey: "auth-rotate-001",
+    });
+    assert.equal(rotated.ok, true, JSON.stringify(rotated));
+    const rotatedReplay = await execute(runtime, "auth-rotate", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      targetSecret: rotatedSecret,
+      idempotencyKey: "auth-rotate-001",
+    });
+    assert.deepEqual(rotatedReplay, rotated);
     assert.equal((await execute(runtime, "status", { actorPrincipal: member, actorSecret: memberSecret })).error, "AUTH_DENIED");
-    assert.equal((await execute(runtime, "auth-revoke", { actorPrincipal: owner, actorSecret: ownerSecret, targetPrincipal: member })).ok, true);
+    const revoked = await execute(runtime, "auth-revoke", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      idempotencyKey: "auth-revoke-001",
+    });
+    assert.equal(revoked.ok, true, JSON.stringify(revoked));
+    const revokedReplay = await execute(runtime, "auth-revoke", {
+      actorPrincipal: owner,
+      actorSecret: ownerSecret,
+      targetPrincipal: member,
+      idempotencyKey: "auth-revoke-001",
+    });
+    assert.deepEqual(revokedReplay, revoked);
     const denied = await execute(runtime, "status", { actorPrincipal: member, actorSecret: rotatedSecret });
     assert.deepEqual(denied, { exitCode: EXIT.AUTH, ok: false, error: "AUTH_DENIED", routeDisposition: "no-route" });
   } finally { await rm(file, { force: true }); }

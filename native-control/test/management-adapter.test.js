@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { buildManifest, createManagementNativeForTest, validateBuildManifest } from '../src/index.js';
+import { buildManifest, validateBuildManifest } from '../src/index.js';
+import { createManagementNativeForTest } from './helpers/management-native.js';
 import * as publicApi from '../src/public.js';
 import { ManagementRuntime } from '../../bot/src/management-runtime.js';
 import { canonicalJson, canonicalJsonHash } from '@gjc-remote/shared/strict-json';
@@ -596,6 +597,10 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   const marker = { version: 1, kind: 'managed-history-marker', anchorFingerprint: request.anchorFingerprint, sequence: 1, previousMarkerFingerprint: null, markerFingerprint: null };
   marker.markerFingerprint = recordHash(marker, 'markerFingerprint');
   files.set('C:\\state\\.channels.json.managed-history.json', Buffer.from(canonicalJson(marker)));
+  files.set('C:\\state\\.gjc-remote-control\\token-floor.json', Buffer.from(canonicalJson(genesis.committed)));
+  const readerFloor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: request.anchorFingerprint, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null };
+  readerFloor.floorFingerprint = recordHash(readerFloor, 'floorFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\reader-version-floor.json', Buffer.from(canonicalJson(readerFloor)));
   await native.writeAuthoritySuccessorRequest(request);
   assert.deepEqual(await native.writeAuthoritySuccessorRequest(request), request);
   await assert.rejects(native.writeAuthoritySuccessorRequest(buildAuthoritySuccessorRecord({ ...request, idempotencyKey: 'conflict', requestFingerprint: null }, 'requestFingerprint')), /replay conflicts/);

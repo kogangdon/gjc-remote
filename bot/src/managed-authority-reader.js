@@ -5,7 +5,7 @@ import { authorityRecordFingerprint, validateAttestedTokenFloorProof, validateAu
 import { isOpaqueIdentity } from "@gjc-remote/shared/identity";
 import { validateManagedChannelsV2, validateManagementEnvelope } from "@gjc-remote/shared/mapping-envelope";
 import { validateManualCleanup } from "@gjc-remote/shared/recovery-envelope";
-import { validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationState, validatePublicationTransaction, validatePublicationU, validatePublicationY, validatePublicationZp } from "@gjc-remote/shared/publication-envelope";
+import { validatePublicationC, validatePublicationGraph as validateSharedPublicationGraph, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationState, validatePublicationTransaction, validatePublicationU, validatePublicationY, validatePublicationZp } from "@gjc-remote/shared/publication-envelope";
 import { canonicalJson, canonicalJsonHash, isHex64, parseCanonicalJsonBytes } from "@gjc-remote/shared/strict-json";
 import { authoritySuccessorPreviousLeaseBindingFingerprint, buildAuthoritySuccessorRecord, validateAuthoritySuccessorBundle } from "@gjc-remote/shared/successor-envelope";
 
@@ -120,6 +120,21 @@ function validateBotPayload(value, name) {
 function fingerprintBytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
+function validateHistoryMarker(marker, anchorFingerprint, expectedSequence = undefined) {
+  if (!marker || Object.getPrototypeOf(marker) !== Object.prototype ||
+      Object.keys(marker).sort().join(",") !== "anchorFingerprint,kind,markerFingerprint,previousMarkerFingerprint,sequence,version" ||
+      marker.version !== 1 || marker.kind !== "managed-history-marker" ||
+      !isHex64(marker.anchorFingerprint) ||
+      !Number.isSafeInteger(marker.sequence) || marker.sequence < 1 ||
+      (marker.sequence === 1 ? marker.previousMarkerFingerprint !== null : !isHex64(marker.previousMarkerFingerprint)) ||
+      !isHex64(marker.markerFingerprint) ||
+      marker.markerFingerprint !== canonicalJsonHash(Object.fromEntries(Object.entries(marker).filter(([key]) => key !== "markerFingerprint"))) ||
+      marker.anchorFingerprint !== anchorFingerprint ||
+      (expectedSequence !== undefined && marker.sequence !== expectedSequence)) {
+    throw new TypeError("history marker proof");
+  }
+  return marker;
+}
 function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerprint) {
   const { request, head, finality, baseline } = bundle;
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence) ||
@@ -207,10 +222,23 @@ function validatePublicationGraph({
 
   validatePublicationTransaction(transaction, baseline.baselineFingerprint);
   validatePublicationU(u, baseline.baselineFingerprint);
-  const canonicalMappingFingerprint = canonicalJsonHash(target === null
-    ? { mappingGeneration: 0, mappings: {}, routes: {} }
-    : { mappingGeneration: target.mappingGeneration, mappings: target.mappings, routes: target.routes });
   const targetFingerprint = fingerprintBytes(snapshot.targetBytes);
+  let canonicalMappingFingerprint;
+  if (controlRoot.sourceKind === "legacy-retained") {
+    if (!isHex64(snapshot.targetIdentity) || !isHex64(snapshot.targetAclFingerprint)) {
+      throw new TypeError("legacy-retained canonical mapping tuple");
+    }
+    canonicalMappingFingerprint = canonicalJsonHash({
+      sourceKind: "legacy-retained",
+      targetFingerprint,
+      identityFingerprint: snapshot.targetIdentity,
+      aclFingerprint: snapshot.targetAclFingerprint,
+    });
+  } else {
+    canonicalMappingFingerprint = canonicalJsonHash(target === null
+      ? { mappingGeneration: 0, mappings: {}, routes: {} }
+      : { mappingGeneration: target.mappingGeneration, mappings: target.mappings, routes: target.routes });
+  }
   const stateFingerprint = canonicalJsonHash({
     targetState: baseline.targetState,
     targetFingerprint,
@@ -272,6 +300,160 @@ function validatePublicationGraph({
   }
   return { transaction, u, p, s, prepared, replaced, committed, c, q, zp, k, y };
 }
+function validateSuccessorPublicationEvidence({ snapshot, bundle }) {
+  const { request, baseline, commit, reservation, authorityEpoch, readerFloor, finality, head } = bundle;
+  const publication = isBytes(bundle.publicationGraph)
+    ? parseAuthorityBytes(bundle.publicationGraph)
+    : bundle.publicationGraph;
+  if (!publication || typeof publication !== "object" || Array.isArray(publication)) {
+    throw new TypeError("successor publication graph absent");
+  }
+  validateSharedPublicationGraph(publication);
+  validateAuthoritySuccessorRequest(request);
+  validateAuthoritySuccessorFinality(finality, request, baseline);
+  validateAuthorityReservation(reservation);
+  validateAuthorityCommitSnapshot(commit, reservation);
+  validateAuthorityEpoch(authorityEpoch);
+  validateReaderVersionFloor(readerFloor);
+  if ((readerFloor.readerVersionFloor === 2) !== (request.readerMode === "bound-reader")) {
+    throw new TypeError("successor reader floor");
+  }
+  if (!isBytes(snapshot.historyMarkerBytes)) throw new TypeError("successor history marker absent");
+  const historyMarker = parseAuthorityBytes(snapshot.historyMarkerBytes);
+  validateHistoryMarker(historyMarker, request.anchorFingerprint, head.phase === "terminal" ? request.sequence : request.sequence - 1);
+  if (!bundle.historyMarker || canonicalJson(bundle.historyMarker) !== canonicalJson(historyMarker)) {
+    throw new TypeError("successor history marker substitution");
+  }
+  if (head.phase === "terminal" && request.readerMode === "bound-reader" && (!bundle.lease || !bundle.projection || !bundle.ack)) {
+    throw new TypeError("successor bound-reader proof absent");
+  }
+  const controlRoot = parseAuthorityBytes(snapshot.controlRootBytes);
+  const wrapper = parseAuthorityBytes(snapshot.wrapperBytes);
+  const targetBytes = snapshot.targetBytes;
+  const targetIdentity = snapshot.targetIdentity;
+  const targetAclFingerprint = snapshot.targetAclFingerprint;
+  const envelope = validateManagementEnvelope(controlRoot, wrapper, {
+    targetBytes,
+    targetIdentity,
+    targetAclFingerprint,
+  });
+  if (!envelope.ok) throw new TypeError("successor management envelope");
+  if (controlRoot.readerVersionFloorFingerprint !== readerFloor.floorFingerprint ||
+      controlRoot.anchorFingerprint !== readerFloor.anchorFingerprint ||
+      readerFloor.anchorFingerprint !== request.anchorFingerprint) {
+    throw new TypeError("successor control-root reader-floor binding");
+  }
+  const expectedSourceKind = request.targetState === "legacy-retained" ? "legacy-retained" : "managed-v1";
+  if (envelope.sourceKind !== expectedSourceKind) throw new TypeError("successor source kind");
+  const target = expectedSourceKind === "managed-v1" ? parseAuthorityBytes(targetBytes) : null;
+  if (target !== null) validateManagedChannelsV2(target);
+  const targetFingerprint = fingerprintBytes(targetBytes);
+  const canonicalMappingFingerprint = target === null
+    ? canonicalJsonHash({
+      sourceKind: "legacy-retained",
+      targetFingerprint,
+      identityFingerprint: targetIdentity,
+      aclFingerprint: targetAclFingerprint,
+    })
+    : canonicalJsonHash({
+      mappingGeneration: target.mappingGeneration,
+      mappings: target.mappings,
+      routes: target.routes,
+    });
+  const stateFingerprint = canonicalJsonHash({
+    targetState: baseline.targetState,
+    targetFingerprint,
+    targetIdentityFingerprint: targetIdentity,
+    targetAclFingerprint,
+    canonicalMappingFingerprint,
+  });
+  const payloadFingerprint = canonicalJsonHash({
+    targetFingerprint,
+    targetIdentityFingerprint: targetIdentity,
+    targetAclFingerprint,
+    wrapperFingerprint: wrapper.wrapperFingerprint,
+    controlRootFingerprint: controlRoot.controlRootFingerprint,
+    canonicalMappingFingerprint,
+  });
+  const snapshotFingerprint = canonicalJsonHash({ stateFingerprint, payloadFingerprint, targetFingerprint });
+  const publicationFingerprint = canonicalJsonHash({
+    stateFingerprint,
+    payloadFingerprint,
+    snapshotFingerprint,
+    targetFingerprint,
+  });
+  const checkpointFingerprint = canonicalJsonHash({
+    genesisTxId: request.rootGenesisTxId,
+    generation: request.candidateTokenConfigGeneration,
+    publicationFingerprint,
+    targetFingerprint,
+  });
+  const {
+    transaction, u, p, s, prepared, replaced, committed, c, q, zp, k, y,
+  } = publication;
+  const expectedTxId = request.txId;
+  const expectedGenesisTxId = request.rootGenesisTxId;
+  const expectedGeneration = request.candidateTokenConfigGeneration;
+  validatePublicationTransaction(transaction, baseline.baselineFingerprint);
+  validatePublicationU(u, baseline.baselineFingerprint);
+  validatePublicationP(p, u, stateFingerprint);
+  validatePublicationS(s, p, { stateFingerprint, payloadFingerprint });
+  validatePublicationC(c, s, { stateFingerprint, payloadFingerprint, snapshotFingerprint });
+  validatePublicationQ(q, c, { stateFingerprint, payloadFingerprint, snapshotFingerprint });
+  validatePublicationZp(zp, q, { stateFingerprint, payloadFingerprint, snapshotFingerprint, publicationFingerprint });
+  validatePublicationK(k, zp, { publicationFingerprint, checkpointFingerprint });
+  validatePublicationY(y, k, targetFingerprint, publicationFingerprint);
+  for (const phase of [prepared, replaced, committed]) {
+    validatePublicationState(phase, transaction);
+    if (phase.publicationFingerprint !== publicationFingerprint) throw new TypeError("successor publication phase");
+  }
+  if ([u, p, s, prepared, replaced, committed, c, q, zp, k, y].some((record) =>
+    record.txId !== expectedTxId ||
+    record.genesisTxId !== expectedGenesisTxId ||
+    record.generation !== expectedGeneration
+  )) throw new TypeError("successor publication transaction");
+  if (prepared.phase !== "prepared" || replaced.phase !== "replaced" || committed.phase !== "committed" ||
+      u.anchorFingerprint !== baseline.anchorFingerprint || u.targetState !== baseline.targetState ||
+      u.attestationFingerprint !== baseline.attestationFingerprint ||
+      u.authorityReservationFingerprint !== baseline.authorityReservationFingerprint ||
+      u.authorityCommitSnapshotFingerprint !== baseline.authorityCommitSnapshotFingerprint ||
+      u.fenceBindingFingerprint !== baseline.fenceBindingFingerprint ||
+      u.leaseBindingFingerprint !== baseline.leaseBindingFingerprint ||
+      u.readerProjectionFingerprint !== baseline.readerProjectionFingerprint ||
+      u.readerInstanceId !== baseline.readerInstanceId || u.readerStartNonce !== baseline.readerStartNonce ||
+      u.readerVersion !== baseline.readerVersion ||
+      reservation.txId !== expectedTxId || commit.txId !== expectedTxId ||
+      reservation.anchorFingerprint !== request.anchorFingerprint ||
+      commit.anchorFingerprint !== request.anchorFingerprint ||
+      authorityEpoch.anchorFingerprint !== request.anchorFingerprint ||
+      reservation.generation !== expectedGeneration || commit.generation !== expectedGeneration ||
+      reservation.epoch !== commit.epoch || authorityEpoch.epoch !== commit.epoch ||
+      authorityEpoch.reservationTxId !== expectedTxId || authorityEpoch.commitTxId !== expectedTxId ||
+      baseline.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint ||
+      baseline.candidateTargetFingerprint !== targetFingerprint ||
+      (target !== null && (
+        target.targetState !== baseline.targetState ||
+        target.mappingGeneration !== baseline.mappingGeneration ||
+        target.tokenConfigGeneration !== baseline.tokenConfigGeneration ||
+        target.tokenConfigHostSetFingerprint !== baseline.tokenConfigHostSetFingerprint
+      ))) {
+    throw new TypeError("successor publication binding");
+  }
+  if (k["publication-kFingerprint"] !== head.publicationKFingerprint ||
+      y["publication-yFingerprint"] !== head.publicationYFingerprint ||
+      finality.publicationKFingerprint !== k["publication-kFingerprint"] ||
+      finality.publicationYFingerprint !== y["publication-yFingerprint"] ||
+      finality.targetFingerprint !== targetFingerprint ||
+      finality.targetIdentityFingerprint !== targetIdentity ||
+      finality.targetAclFingerprint !== targetAclFingerprint ||
+      finality.wrapperFingerprint !== wrapper.wrapperFingerprint ||
+      finality.controlRootFingerprint !== controlRoot.controlRootFingerprint ||
+      finality.snapshotFingerprint !== snapshotFingerprint ||
+      head.finalityFingerprint !== finality.finalityFingerprint) {
+    throw new TypeError("successor publication finality");
+  }
+  return publication;
+}
 export function validateManagedProof(snapshot, expectedHostSetFingerprint = null) {
   const controlRoot = parseAuthorityBytes(snapshot.controlRootBytes);
   const wrapper = parseAuthorityBytes(snapshot.wrapperBytes);
@@ -285,6 +467,8 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   const proof = parseAuthorityBytes(snapshot.rvfBytes);
   const receipt = parseAuthorityBytes(snapshot.receiptBytes);
   const readerFloor = parseAuthorityBytes(snapshot.readerVersionFloorBytes);
+  const historyMarker = parseAuthorityBytes(snapshot.historyMarkerBytes);
+  validateHistoryMarker(historyMarker, request.anchorFingerprint, 1);
   const attestedProof = parseAuthorityBytes(snapshot.attestedProofBytes);
   const precommit = parseAuthorityBytes(snapshot.precommitBytes);
   const authorityRequest = parseAuthorityBytes(snapshot.authorityRequestBytes);
@@ -305,6 +489,9 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   rejectTerminalAuthorityState(snapshot, controlRoot.anchorFingerprint);
   const managedTarget = envelope.sourceKind === "managed-v1" ? parseAuthorityBytes(snapshot.targetBytes) : null;
   validateReaderVersionFloor(readerFloor);
+  if ((readerFloor.readerVersionFloor === 2) !== (request.requestedReaderMode === "handshake")) {
+    throw new TypeError("genesis reader floor branch");
+  }
   if (controlRoot.readerVersionFloorFingerprint !== readerFloor.floorFingerprint ||
       controlRoot.anchorFingerprint !== readerFloor.anchorFingerprint) throw new TypeError("control-root reader-floor binding");
 
@@ -685,13 +872,16 @@ export async function createManagedAuthorityReader({
           }
           if (head.phase !== "terminal") return unavailable("MANAGED_AUTHORITY_PENDING");
           if (!isBytes(snapshot.controlRootBytes) || !isBytes(snapshot.wrapperBytes) || !isBytes(snapshot.targetBytes) ||
+              !isBytes(snapshot.historyMarkerBytes) ||
               !isHex64(snapshot.targetIdentity) || !isHex64(snapshot.targetAclFingerprint)) {
             return unavailable("MANAGED_AUTHORITY_INVALID");
           }
+          validateSuccessorPublicationEvidence({ snapshot, bundle: snapshot.successorBundle });
           return {
             controlRootBytes: Buffer.from(snapshot.controlRootBytes),
             wrapperBytes: Buffer.from(snapshot.wrapperBytes),
             targetBytes: Buffer.from(snapshot.targetBytes),
+            historyMarkerBytes: Buffer.from(snapshot.historyMarkerBytes),
             targetIdentity: snapshot.targetIdentity,
             targetAclFingerprint: snapshot.targetAclFingerprint,
             nativeVerified: true,
@@ -710,6 +900,7 @@ export async function createManagedAuthorityReader({
           !isBytes(snapshot.currentAttestationBytes) || !isBytes(snapshot.currentTokenFloorBytes) ||
           !isBytes(snapshot.attestationHistoryBytes) || !isBytes(snapshot.tokenFloorHistoryBytes) ||
           !isBytes(snapshot.tokenFloorReservationBytes) || !isBytes(snapshot.readerVersionFloorBytes) ||
+          !isBytes(snapshot.historyMarkerBytes) ||
           !isBytes(snapshot.genesisRequestBytes) || !isBytes(snapshot.zFinalityBytes) || !isBytes(snapshot.rvfBytes) ||
           !isBytes(snapshot.receiptBytes) || !isBytes(snapshot.authorityRequestBytes) || !isBytes(snapshot.authorityReceiptBytes) ||
           !isBytes(snapshot.authorityReservationBytes) || !isBytes(snapshot.authorityCommitBytes) || !isBytes(snapshot.authorityBaselineBytes) ||

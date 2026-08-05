@@ -107,25 +107,120 @@ std::string Utf8(const std::wstring& input) {
   return output;
 }
 enum class VerifiedObjectType { Any, File, Directory };
+// Win32 OPEN_REPARSE_POINT does not protect intermediate components. Resolve each
+// component relative to a retained directory handle through NtCreateFile instead.
 
-HANDLE OpenNoFollow(const std::string& path, DWORD access, DWORD disposition, VerifiedObjectType expected_type) {
-  std::wstring wide = Wide(path);
-  if (wide.empty()) return INVALID_HANDLE_VALUE;
-  DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
-  if (expected_type != VerifiedObjectType::File) flags |= FILE_FLAG_BACKUP_SEMANTICS;
-  HANDLE handle = CreateFileW(wide.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                              disposition, flags, nullptr);
-  if (handle == INVALID_HANDLE_VALUE) return handle;
-  BY_HANDLE_FILE_INFORMATION info;
-  if (!GetFileInformationByHandle(handle, &info)) {
-    CloseHandle(handle);
-    SetLastError(ERROR_CANT_ACCESS_FILE);
-    return INVALID_HANDLE_VALUE;
+struct WindowsPathParts {
+  std::wstring root;
+  std::vector<std::wstring> components;
+};
+
+bool SafeWideName(const std::wstring& value) {
+  if (value.empty() || value == L"." || value == L".." ||
+      value.find(L'\0') != std::wstring::npos ||
+      value.find_first_of(L"\\/:*?<>|\"") != std::wstring::npos ||
+      value.back() == L'.' || value.back() == L' ') return false;
+  for (wchar_t character : value) if (character < 0x20) return false;
+  std::wstring upper = value;
+  for (wchar_t& character : upper) if (character >= L'a' && character <= L'z') character -= L'a' - L'A';
+  return upper != L"CON" && upper != L"PRN" && upper != L"AUX" && upper != L"NUL" &&
+      upper != L"COM1" && upper != L"COM2" && upper != L"COM3" && upper != L"COM4" &&
+      upper != L"COM5" && upper != L"COM6" && upper != L"COM7" && upper != L"COM8" &&
+      upper != L"COM9" && upper != L"LPT1" && upper != L"LPT2" && upper != L"LPT3" &&
+      upper != L"LPT4" && upper != L"LPT5" && upper != L"LPT6" && upper != L"LPT7" &&
+      upper != L"LPT8" && upper != L"LPT9";
+}
+
+bool ParseWindowsPath(const std::string& path, WindowsPathParts* result) {
+  const std::wstring wide = Wide(path);
+  if (wide.size() < 3 || wide[1] != L':' || wide[2] != L'\\' ||
+      !((wide[0] >= L'A' && wide[0] <= L'Z') || (wide[0] >= L'a' && wide[0] <= L'z')) ||
+      (wide.size() > 3 && wide.back() == L'\\')) {
+    SetLastError(ERROR_INVALID_NAME);
+    return false;
   }
+  result->root = wide.substr(0, 3);
+  result->components.clear();
+  size_t start = 3;
+  while (start < wide.size()) {
+    const size_t end = wide.find(L'\\', start);
+    const std::wstring component = wide.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+    if (!SafeWideName(component)) {
+      SetLastError(ERROR_INVALID_NAME);
+      return false;
+    }
+    result->components.push_back(component);
+    if (end == std::wstring::npos) break;
+    start = end + 1;
+  }
+  return true;
+}
+
+struct NativeUnicodeString {
+  USHORT Length;
+  USHORT MaximumLength;
+  PWSTR Buffer;
+};
+struct NativeObjectAttributes {
+  ULONG Length;
+  HANDLE RootDirectory;
+  NativeUnicodeString* ObjectName;
+  ULONG Attributes;
+  PVOID SecurityDescriptor;
+  PVOID SecurityQualityOfService;
+};
+struct NativeIoStatusBlock {
+  union { LONG Status; PVOID Pointer; };
+  ULONG_PTR Information;
+};
+using NtCreateFileFunction = LONG (NTAPI*)(
+    PHANDLE, ACCESS_MASK, NativeObjectAttributes*, NativeIoStatusBlock*, PLARGE_INTEGER,
+    ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+using NtSetInformationFileFunction = LONG (NTAPI*)(
+    HANDLE, NativeIoStatusBlock*, PVOID, ULONG, ULONG);
+
+NtCreateFileFunction NtCreateFileApi() {
+  static NtCreateFileFunction api = reinterpret_cast<NtCreateFileFunction>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+  return api;
+}
+NtSetInformationFileFunction NtSetInformationFileApi() {
+  static NtSetInformationFileFunction api = reinterpret_cast<NtSetInformationFileFunction>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile"));
+  return api;
+}
+void SetNtError(LONG status) {
+  if (static_cast<ULONG>(status) == 0xC0000035u) SetLastError(ERROR_ALREADY_EXISTS);
+  else if (static_cast<ULONG>(status) == 0xC0000034u) SetLastError(ERROR_FILE_NOT_FOUND);
+  else if (static_cast<ULONG>(status) == 0xC000003Au) SetLastError(ERROR_PATH_NOT_FOUND);
+  else if (static_cast<ULONG>(status) == 0xC0000022u) SetLastError(ERROR_ACCESS_DENIED);
+  else SetLastError(ERROR_CANT_ACCESS_FILE);
+}
+
+constexpr ULONG kFileOpen = 1;
+constexpr ULONG kFileCreate = 2;
+constexpr ULONG kFileOpenReparsePoint = 0x00200000;
+constexpr ULONG kFileDirectoryFile = 0x00000001;
+constexpr ULONG kFileNonDirectoryFile = 0x00000040;
+constexpr ULONG kObjCaseInsensitive = 0x00000040;
+constexpr ULONG kFileRenameInformation = 10;
+
+bool VerifyWindowsHandle(HANDLE handle, VerifiedObjectType expected_type) {
+  BY_HANDLE_FILE_INFORMATION info{};
+  if (!GetFileInformationByHandle(handle, &info)) return false;
   const bool is_directory = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-  if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-      (expected_type == VerifiedObjectType::File && is_directory) ||
-      (expected_type == VerifiedObjectType::Directory && !is_directory)) {
+  return (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+      (expected_type == VerifiedObjectType::Any ||
+       (expected_type == VerifiedObjectType::File && !is_directory) ||
+       (expected_type == VerifiedObjectType::Directory && is_directory));
+}
+
+HANDLE OpenWindowsRoot(const std::wstring& root, DWORD access) {
+  HANDLE handle = CreateFileW(root.c_str(), access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return handle;
+  if (!VerifyWindowsHandle(handle, VerifiedObjectType::Directory)) {
     CloseHandle(handle);
     SetLastError(ERROR_CANT_ACCESS_FILE);
     return INVALID_HANDLE_VALUE;
@@ -133,16 +228,142 @@ HANDLE OpenNoFollow(const std::string& path, DWORD access, DWORD disposition, Ve
   return handle;
 }
 
-HANDLE OpenNoFollowFile(const std::string& path, DWORD access, DWORD disposition = OPEN_EXISTING) {
-  return OpenNoFollow(path, access, disposition, VerifiedObjectType::File);
+HANDLE OpenWindowsRelative(HANDLE parent, const std::wstring& name, DWORD access,
+                           ULONG disposition, VerifiedObjectType expected_type,
+                           PSECURITY_DESCRIPTOR security = nullptr) {
+  NtCreateFileFunction create = NtCreateFileApi();
+  if (create == nullptr || parent == INVALID_HANDLE_VALUE || !SafeWideName(name) ||
+      name.size() > std::numeric_limits<USHORT>::max() / sizeof(wchar_t)) {
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return INVALID_HANDLE_VALUE;
+  }
+  NativeUnicodeString unicode{
+      static_cast<USHORT>(name.size() * sizeof(wchar_t)),
+      static_cast<USHORT>(name.size() * sizeof(wchar_t)),
+      const_cast<PWSTR>(name.c_str())};
+  NativeObjectAttributes attributes{
+      sizeof(attributes), parent, &unicode, kObjCaseInsensitive, security, nullptr};
+  NativeIoStatusBlock status{};
+  ULONG options = kFileOpenReparsePoint;
+  if (expected_type == VerifiedObjectType::Directory) options |= kFileDirectoryFile;
+  if (expected_type == VerifiedObjectType::File) options |= kFileNonDirectoryFile;
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  const LONG result = create(&handle, access | SYNCHRONIZE, &attributes, &status, nullptr,
+      FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      disposition, options, nullptr, 0);
+  if (result < 0 || handle == INVALID_HANDLE_VALUE) {
+    SetNtError(result);
+    return INVALID_HANDLE_VALUE;
+  }
+  if (!VerifyWindowsHandle(handle, expected_type)) {
+    CloseHandle(handle);
+    SetLastError(ERROR_CANT_ACCESS_FILE);
+    return INVALID_HANDLE_VALUE;
+  }
+  return handle;
 }
 
-HANDLE OpenNoFollowDirectory(const std::string& path, DWORD access, DWORD disposition = OPEN_EXISTING) {
-  return OpenNoFollow(path, access, disposition, VerifiedObjectType::Directory);
+constexpr DWORD kWindowsTraversalAccess =
+    FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
+constexpr DWORD kWindowsMutationParentAccess =
+    kWindowsTraversalAccess | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
+
+bool OpenWindowsParentNoFollow(const std::string& path, HANDLE* parent, std::wstring* name,
+                               DWORD directory_access = kWindowsTraversalAccess) {
+  WindowsPathParts parts;
+  if (!ParseWindowsPath(path, &parts) || parts.components.empty()) return false;
+  const DWORD root_access = parts.components.size() == 1 ? directory_access : kWindowsTraversalAccess;
+  HANDLE current = OpenWindowsRoot(parts.root, root_access);
+  if (current == INVALID_HANDLE_VALUE) return false;
+  for (size_t i = 0; i + 1 < parts.components.size(); ++i) {
+    const DWORD component_access =
+        i + 2 == parts.components.size() ? directory_access : kWindowsTraversalAccess;
+    HANDLE next = OpenWindowsRelative(current, parts.components[i], component_access,
+        kFileOpen, VerifiedObjectType::Directory);
+    CloseHandle(current);
+    if (next == INVALID_HANDLE_VALUE) return false;
+    current = next;
+  }
+  *parent = current;
+  *name = parts.components.back();
+  return true;
 }
 
-HANDLE OpenNoFollowObject(const std::string& path, DWORD access, DWORD disposition = OPEN_EXISTING) {
-  return OpenNoFollow(path, access, disposition, VerifiedObjectType::Any);
+HANDLE OpenWindowsPathNoFollow(const std::string& path, DWORD access,
+                               VerifiedObjectType expected_type) {
+  WindowsPathParts parts;
+  if (!ParseWindowsPath(path, &parts)) return INVALID_HANDLE_VALUE;
+  HANDLE current = OpenWindowsRoot(parts.root, kWindowsTraversalAccess);
+  if (current == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+  if (parts.components.empty()) {
+    if (expected_type != VerifiedObjectType::Directory) {
+      CloseHandle(current);
+      SetLastError(ERROR_CANT_ACCESS_FILE);
+      return INVALID_HANDLE_VALUE;
+    }
+    return current;
+  }
+  for (size_t i = 0; i < parts.components.size(); ++i) {
+    const bool final = i + 1 == parts.components.size();
+    HANDLE next = OpenWindowsRelative(current, parts.components[i],
+        final ? access : kWindowsTraversalAccess, kFileOpen,
+        final ? expected_type : VerifiedObjectType::Directory);
+    CloseHandle(current);
+    if (next == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+    current = next;
+  }
+  return current;
+}
+
+HANDLE OpenNoFollow(const std::string& path, DWORD access, DWORD, VerifiedObjectType expected_type) {
+  return OpenWindowsPathNoFollow(path, access, expected_type);
+}
+
+HANDLE OpenNoFollowFile(const std::string& path, DWORD access, DWORD = OPEN_EXISTING) {
+  return OpenWindowsPathNoFollow(path, access, VerifiedObjectType::File);
+}
+
+HANDLE OpenNoFollowDirectory(const std::string& path, DWORD access, DWORD = OPEN_EXISTING) {
+  return OpenWindowsPathNoFollow(path, access, VerifiedObjectType::Directory);
+}
+
+HANDLE OpenNoFollowObject(const std::string& path, DWORD access, DWORD = OPEN_EXISTING) {
+  return OpenWindowsPathNoFollow(path, access, VerifiedObjectType::Any);
+}
+
+// FileRenameInformation uses the retained parent handle, avoiding legacy
+// path-based replacement resolution and preserving the no-follow boundary.
+struct NativeFileRenameInformation {
+  BOOLEAN ReplaceIfExists;
+  HANDLE RootDirectory;
+  ULONG FileNameLength;
+  WCHAR FileName[1];
+};
+
+bool RenameWindowsRelative(HANDLE object, HANDLE parent, const std::wstring& name, bool replace) {
+  NtSetInformationFileFunction set_information = NtSetInformationFileApi();
+  if (set_information == nullptr || object == INVALID_HANDLE_VALUE ||
+      parent == INVALID_HANDLE_VALUE || !SafeWideName(name) ||
+      name.size() > (std::numeric_limits<ULONG>::max() - sizeof(NativeFileRenameInformation)) / sizeof(wchar_t)) {
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return false;
+  }
+  const size_t bytes = sizeof(NativeFileRenameInformation) +
+      (name.size() - 1) * sizeof(wchar_t);
+  std::vector<uint8_t> buffer(bytes);
+  auto* info = reinterpret_cast<NativeFileRenameInformation*>(buffer.data());
+  info->ReplaceIfExists = replace ? TRUE : FALSE;
+  info->RootDirectory = parent;
+  info->FileNameLength = static_cast<ULONG>(name.size() * sizeof(wchar_t));
+  std::memcpy(info->FileName, name.data(), name.size() * sizeof(wchar_t));
+  NativeIoStatusBlock status{};
+  const LONG result = set_information(object, &status, info, static_cast<ULONG>(buffer.size()),
+      kFileRenameInformation);
+  if (result < 0) {
+    SetNtError(result);
+    return false;
+  }
+  return true;
 }
 enum class RoleProfile { Authority, ManagementAuth, BotState, ProspectiveCleanup };
 
@@ -246,42 +467,43 @@ bool ApplyExactRoleAcl(HANDLE handle, const std::string& manager,
 }
 
 HANDLE CreateProtectedFileNoFollow(const std::string& path, DWORD access, PACL acl) {
-  std::wstring wide = Wide(path);
   SECURITY_DESCRIPTOR descriptor{};
-  SECURITY_ATTRIBUTES attributes{};
-  if (wide.empty() || !InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+  if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
       !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) ||
       !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
     SetLastError(ERROR_INVALID_SECURITY_DESCR);
     return INVALID_HANDLE_VALUE;
   }
-  attributes.nLength = sizeof(attributes);
-  attributes.lpSecurityDescriptor = &descriptor;
-  HANDLE handle = CreateFileW(wide.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              &attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-  if (handle == INVALID_HANDLE_VALUE) return handle;
-  BY_HANDLE_FILE_INFORMATION info;
-  if (!GetFileInformationByHandle(handle, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-    CloseHandle(handle);
-    SetLastError(ERROR_CANT_ACCESS_FILE);
+  HANDLE parent = INVALID_HANDLE_VALUE;
+  std::wstring name;
+  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsMutationParentAccess)) {
     return INVALID_HANDLE_VALUE;
   }
+  HANDLE handle = OpenWindowsRelative(parent, name, access, kFileCreate,
+      VerifiedObjectType::File, &descriptor);
+  CloseHandle(parent);
   return handle;
 }
 
 bool CreateProtectedDirectoryNoFollow(const std::string& path, PACL acl) {
-  std::wstring wide = Wide(path);
   SECURITY_DESCRIPTOR descriptor{};
-  SECURITY_ATTRIBUTES attributes{};
-  if (wide.empty() || !InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+  if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
       !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) ||
       !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
     SetLastError(ERROR_INVALID_SECURITY_DESCR);
     return false;
   }
-  attributes.nLength = sizeof(attributes);
-  attributes.lpSecurityDescriptor = &descriptor;
-  return CreateDirectoryW(wide.c_str(), &attributes) != 0;
+  HANDLE parent = INVALID_HANDLE_VALUE;
+  std::wstring name;
+  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsMutationParentAccess)) {
+    return false;
+  }
+  HANDLE handle = OpenWindowsRelative(parent, name, READ_CONTROL | FILE_READ_ATTRIBUTES,
+      kFileCreate, VerifiedObjectType::Directory, &descriptor);
+  const bool created = handle != INVALID_HANDLE_VALUE;
+  if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+  CloseHandle(parent);
+  return created;
 }
 void SetIdentity(napi_env env, napi_value result, HANDLE handle) {
   BY_HANDLE_FILE_INFORMATION info;
@@ -697,11 +919,16 @@ napi_value SetExactRoleAcl(napi_env env, napi_callback_info info) {
       !StringArg(env, info, 2, &bot, 6) || !StringArg(env, info, 3, &reader, 6) ||
       !StringArg(env, info, 4, &system, 6) || !StringArg(env, info, 5, &profile_text, 6)) return nullptr;
 #ifdef _WIN32
+  WindowsPathParts supported_path;
+  if (!ParseWindowsPath(path, &supported_path)) {
+    Refuse(env, "set_exact_role_acl", "path is not a supported absolute handle-relative Windows path");
+    return nullptr;
+  }
   RoleProfile profile;
   if (!ParseRoleProfile(profile_text, &profile)) { Refuse(env, "set_exact_role_acl", "role profile is invalid"); return nullptr; }
   HANDLE handle = OpenNoFollowObject(path, READ_CONTROL | WRITE_DAC);
   if (handle == INVALID_HANDLE_VALUE) {
-    Throw(env, "ERR_NATIVE_CONTROL_ACL", "unable to open ACL target without following reparse points");
+    Refuse(env, "set_exact_role_acl", "target cannot be opened through a verified no-follow path");
     return nullptr;
   }
   bool applied = ApplyExactRoleAcl(handle, manager, bot, reader, system, profile);
@@ -802,6 +1029,27 @@ bool WriteHandleBytes(
   return fsync(h) == 0;
 #endif
 }
+bool FlushDirectoryOrVolumePath(const std::string& path) {
+#ifdef _WIN32
+  const std::wstring directory = Wide(path);
+  wchar_t mount[MAX_PATH + 1]{};
+  wchar_t volume[MAX_PATH + 1]{};
+  if (directory.empty() || !GetVolumePathNameW(directory.c_str(), mount, MAX_PATH) ||
+      !GetVolumeNameForVolumeMountPointW(mount, volume, MAX_PATH)) return false;
+  HANDLE h = CreateFileW(volume, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  const bool flushed = FlushFileBuffers(h) != FALSE;
+  CloseHandle(h);
+  return flushed;
+#else
+  int fd = OpenDirectoryNoFollow(path);
+  if (fd < 0) return false;
+  const bool flushed = fsync(fd) == 0;
+  close(fd);
+  return flushed;
+#endif
+}
 
 napi_value CurrentOsPrincipal(napi_env env, napi_callback_info) {
 #ifdef _WIN32
@@ -836,6 +1084,10 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
       !StringArg(env, info, 6, &system, 8) || !StringArg(env, info, 7, &profile_text, 8)) return nullptr;
   if (prefix.empty() || prefix.find_first_of("/\\") != std::string::npos) { Refuse(env, "create_exclusive_temp", "prefix must be a non-empty file-name component"); return nullptr; }
 #ifdef _WIN32
+  if (!SafeWideName(Wide(prefix))) {
+    Refuse(env, "create_exclusive_temp", "prefix is not a supported Windows file-name component");
+    return nullptr;
+  }
   RoleProfile profile;
   if (!ParseRoleProfile(profile_text, &profile)) { Refuse(env, "create_exclusive_temp", "role profile is invalid"); return nullptr; }
   RoleAcl roles;
@@ -843,15 +1095,52 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
     Refuse(env, "create_exclusive_temp", "protected exact role DACL cannot be constructed");
     return nullptr;
   }
+  if (NtCreateFileApi() == nullptr) {
+    Refuse(env, "create_exclusive_temp", "handle-relative Windows open primitive is unavailable");
+    return nullptr;
+  }
+  HANDLE verified_parent = OpenWindowsPathNoFollow(
+      parent, kWindowsMutationParentAccess, VerifiedObjectType::Directory);
+  if (verified_parent == INVALID_HANDLE_VALUE) {
+    Refuse(env, "create_exclusive_temp", "parent is not a supported absolute handle-relative Windows directory");
+    return nullptr;
+  }
+  CloseHandle(verified_parent);
   for (unsigned i = 0; i < 128; ++i) {
     std::string candidate = (std::filesystem::u8path(parent) / (prefix + "." + std::to_string(i))).u8string();
-    HANDLE h = CreateProtectedFileNoFollow(candidate, GENERIC_READ | GENERIC_WRITE | WRITE_DAC, roles.acl);
-    if (h == INVALID_HANDLE_VALUE) { if (GetLastError() == ERROR_FILE_EXISTS) continue; Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to create exclusive temp file"); return nullptr; }
-    if (!VerifyExactRoleAcl(h, manager, bot, reader, system, profile)) {
-      CloseHandle(h); Throw(env, "ERR_NATIVE_CONTROL_ACL", "unable to verify protected exact temp DACL"); return nullptr;
+    HANDLE h = CreateProtectedFileNoFollow(candidate, GENERIC_READ | GENERIC_WRITE | WRITE_DAC | DELETE, roles.acl);
+    if (h == INVALID_HANDLE_VALUE) {
+      const DWORD error = GetLastError();
+      if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) continue;
+      Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to create exclusive temp file");
+      return nullptr;
     }
-    bool ok = WriteHandleBytes(h, bytes); CloseHandle(h);
-    if (!ok) { Throw(env, "ERR_NATIVE_CONTROL_WRITE", "unable to write and flush exclusive temp file"); return nullptr; }
+    const auto discard = [&](HANDLE handle) {
+      FILE_DISPOSITION_INFO disposition{};
+      disposition.DeleteFile = TRUE;
+      const bool removed = SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition)) != FALSE;
+      const bool durable = removed && FlushDirectoryOrVolumePath(parent);
+      CloseHandle(handle);
+      if (!durable) return false;
+      HANDLE probe = OpenNoFollowFile(candidate, FILE_READ_ATTRIBUTES);
+      if (probe != INVALID_HANDLE_VALUE) {
+        CloseHandle(probe);
+        return false;
+      }
+      const DWORD error = GetLastError();
+      return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    };
+    if (!VerifyExactRoleAcl(h, manager, bot, reader, system, profile)) {
+      if (!discard(h)) Refuse(env, "create_exclusive_temp", "failed temp ACL cleanup is ambiguous");
+      else Throw(env, "ERR_NATIVE_CONTROL_ACL", "unable to verify protected exact temp DACL");
+      return nullptr;
+    }
+    const bool ok = WriteHandleBytes(h, bytes);
+    if (!ok) {
+      if (!discard(h)) Refuse(env, "create_exclusive_temp", "failed temp write cleanup is ambiguous");
+      else Throw(env, "ERR_NATIVE_CONTROL_WRITE", "unable to write and flush exclusive temp file");
+      return nullptr;
+    }
     napi_value result; napi_create_string_utf8(env, candidate.c_str(), NAPI_AUTO_LENGTH, &result); return result;
   }
   Refuse(env, "create_exclusive_temp", "exclusive name space exhausted"); return nullptr;
@@ -862,10 +1151,41 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
     std::string name = prefix + "." + std::to_string(i);
     int fd = OpenObjectNoFollow(parent_fd, name, O_CREAT | O_EXCL | O_RDWR);
     if (fd < 0) { if (errno == EEXIST) continue; break; }
-    bool ok = ApplyAndVerifyExactRoleAcl(fd, manager, bot, reader, system, profile) && WriteHandleBytes(fd, bytes);
-    close(fd); if (!ok) { close(parent_fd); Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to create durable exact-ACL temp file"); return nullptr; }
-    if (fsync(parent_fd) != 0) { close(parent_fd); Throw(env, "ERR_NATIVE_CONTROL_FLUSH", "unable to flush temp parent directory"); return nullptr; }
-    close(parent_fd); std::string candidate = (std::filesystem::u8path(parent) / name).u8string();
+    const auto discard = [&](int descriptor) {
+      struct stat held{}, named{};
+      const bool exact = fstat(descriptor, &held) == 0 &&
+          fstatat(parent_fd, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+          held.st_dev == named.st_dev && held.st_ino == named.st_ino;
+      const bool removed = exact && unlinkat(parent_fd, name.c_str(), 0) == 0;
+      const bool durable = removed && fsync(parent_fd) == 0;
+      bool absent = false;
+      if (removed) {
+        struct stat after{};
+        errno = 0;
+        absent = fstatat(parent_fd, name.c_str(), &after, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+      }
+      close(descriptor);
+      return durable && absent;
+    };
+    const bool prepared = ApplyAndVerifyExactRoleAcl(fd, manager, bot, reader, system, profile) &&
+        WriteHandleBytes(fd, bytes);
+    if (!prepared) {
+      const bool clean = discard(fd);
+      close(parent_fd);
+      if (!clean) Refuse(env, "create_exclusive_temp", "failed temp creation cleanup is ambiguous");
+      else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to create durable exact-ACL temp file");
+      return nullptr;
+    }
+    if (fsync(parent_fd) != 0) {
+      const bool clean = discard(fd);
+      close(parent_fd);
+      if (!clean) Refuse(env, "create_exclusive_temp", "failed temp parent cleanup is ambiguous");
+      else Throw(env, "ERR_NATIVE_CONTROL_FLUSH", "unable to flush temp parent directory");
+      return nullptr;
+    }
+    close(fd);
+    close(parent_fd);
+    std::string candidate = (std::filesystem::u8path(parent) / name).u8string();
     napi_value result; napi_create_string_utf8(env, candidate.c_str(), NAPI_AUTO_LENGTH, &result); return result;
   }
   close(parent_fd); Refuse(env, "create_exclusive_temp", "exclusive name space exhausted"); return nullptr;
@@ -875,8 +1195,13 @@ napi_value RemoveVerifiedFile(napi_env env, napi_callback_info info) {
   std::string path; std::vector<uint8_t> expected;
   if (!StringArg(env, info, 0, &path, 2) || !BufferArg(env, info, 1, &expected)) return nullptr;
 #ifdef _WIN32
+  WindowsPathParts ignored_path;
+  if (!ParseWindowsPath(path, &ignored_path)) {
+    Refuse(env, "remove_verified_file", "path is not a supported absolute handle-relative Windows path");
+    return nullptr;
+  }
   HANDLE h = OpenNoFollowFile(path, GENERIC_READ | DELETE);
-  if (h == INVALID_HANDLE_VALUE) { Throw(env, "ERR_NATIVE_CONTROL_REMOVE", "unable to open verified scratch"); return nullptr; }
+  if (h == INVALID_HANDLE_VALUE) { Refuse(env, "remove_verified_file", "target cannot be opened through a verified no-follow path"); return nullptr; }
   LARGE_INTEGER size; DWORD read = 0; std::vector<uint8_t> actual;
   if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > 16 * 1024 * 1024) { CloseHandle(h); Refuse(env, "remove_verified_file", "scratch size is invalid"); return nullptr; }
   actual.resize(static_cast<size_t>(size.QuadPart));
@@ -933,21 +1258,74 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     Refuse(env, "create_absent_exclusive", "protected exact role DACL cannot be constructed");
     return nullptr;
   }
-  const std::string temporary = path + ".create." + std::to_string(GetCurrentProcessId()) + "." + std::to_string(GetTickCount64());
-  HANDLE h = CreateProtectedFileNoFollow(temporary, GENERIC_READ | GENERIC_WRITE | WRITE_DAC, roles.acl);
-  if (h == INVALID_HANDLE_VALUE) { Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to create same-parent temporary file"); return nullptr; }
-  const bool prepared = VerifyExactRoleAcl(h, manager, bot, reader, system, profile) && WriteHandleBytes(h, bytes);
-  CloseHandle(h);
-  if (!prepared || !MoveFileExW(Wide(temporary).c_str(), Wide(path).c_str(), MOVEFILE_WRITE_THROUGH)) {
-    DeleteFileW(Wide(temporary).c_str());
-    Throw(env, "ERR_NATIVE_CONTROL_CREATE", "atomic no-replace publication failed");
+  if (NtCreateFileApi() == nullptr || NtSetInformationFileApi() == nullptr) {
+    Refuse(env, "create_absent_exclusive", "handle-relative Windows open and rename primitives are unavailable");
     return nullptr;
   }
-  HANDLE published = OpenNoFollowFile(path, GENERIC_READ | READ_CONTROL);
-  const bool verified = published != INVALID_HANDLE_VALUE &&
-      VerifyExactRoleAcl(published, manager, bot, reader, system, profile);
-  if (published != INVALID_HANDLE_VALUE) CloseHandle(published);
-  if (!verified) { Throw(env, "ERR_NATIVE_CONTROL_ACL", "published absent-file DACL is invalid"); return nullptr; }
+  HANDLE parent = INVALID_HANDLE_VALUE;
+  std::wstring name;
+  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsMutationParentAccess)) {
+    Refuse(env, "create_absent_exclusive", "path is not a supported absolute handle-relative Windows path");
+    return nullptr;
+  }
+  SECURITY_DESCRIPTOR descriptor{};
+  if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+      !SetSecurityDescriptorDacl(&descriptor, TRUE, roles.acl, FALSE) ||
+      !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+    CloseHandle(parent);
+    Refuse(env, "create_absent_exclusive", "protected exact role DACL cannot be constructed");
+    return nullptr;
+  }
+  HANDLE temporary = INVALID_HANDLE_VALUE;
+  std::wstring temporary_name;
+  for (unsigned i = 0; i < 128; ++i) {
+    temporary_name = name + L".create." + std::to_wstring(GetCurrentProcessId()) +
+        L"." + std::to_wstring(GetTickCount64()) + L"." + std::to_wstring(i);
+    temporary = OpenWindowsRelative(parent, temporary_name,
+        GENERIC_READ | GENERIC_WRITE | WRITE_DAC | DELETE, kFileCreate,
+        VerifiedObjectType::File, &descriptor);
+    if (temporary != INVALID_HANDLE_VALUE || GetLastError() != ERROR_ALREADY_EXISTS) break;
+  }
+  if (temporary == INVALID_HANDLE_VALUE) {
+    CloseHandle(parent);
+    Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to create same-parent temporary file");
+    return nullptr;
+  }
+  const auto discard = [&]() {
+    FILE_DISPOSITION_INFO disposition{};
+    disposition.DeleteFile = TRUE;
+    const bool removed = SetFileInformationByHandle(
+        temporary, FileDispositionInfo, &disposition, sizeof(disposition)) != FALSE;
+    const bool durable = removed && FlushDirectoryOrVolumePath(path);
+    CloseHandle(temporary);
+    temporary = INVALID_HANDLE_VALUE;
+    return durable;
+  };
+  const bool prepared = VerifyExactRoleAcl(temporary, manager, bot, reader, system, profile) &&
+      WriteHandleBytes(temporary, bytes);
+  if (!prepared) {
+    const bool clean = discard();
+    CloseHandle(parent);
+    if (!clean) Refuse(env, "create_absent_exclusive", "failed temporary cleanup is ambiguous");
+    else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to prepare protected absent file");
+    return nullptr;
+  }
+  const bool renamed = RenameWindowsRelative(temporary, parent, name, false);
+  if (!renamed) {
+    const bool clean = discard();
+    CloseHandle(parent);
+    if (!clean) Refuse(env, "create_absent_exclusive", "failed temporary cleanup is ambiguous");
+    else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "atomic no-replace publication failed");
+    return nullptr;
+  }
+  const bool durable = FlushDirectoryOrVolumePath(path);
+  const bool verified = VerifyExactRoleAcl(temporary, manager, bot, reader, system, profile);
+  CloseHandle(temporary);
+  CloseHandle(parent);
+  if (!durable || !verified) {
+    Throw(env, "ERR_NATIVE_CONTROL_CREATE", "published absent-file durability or DACL verification failed");
+    return nullptr;
+  }
   napi_value result; napi_get_undefined(env, &result); return result;
 #else
   RoleProfile profile; int parent_fd; std::string name;
@@ -1029,39 +1407,84 @@ napi_value ReplaceExistingAtomic(napi_env env, napi_callback_info info) {
       !StringArg(env, info, 6, &profile_text, 7)) return nullptr;
 #ifdef _WIN32
   RoleProfile profile;
-  std::filesystem::path source_path = std::filesystem::u8path(source);
-  std::filesystem::path destination_path = std::filesystem::u8path(destination);
-  if (!ParseRoleProfile(profile_text, &profile) || source_path.parent_path() != destination_path.parent_path()) {
-    Refuse(env, "replace_existing_atomic", "same-parent exact role replacement is required"); return nullptr;
+  if (!ParseRoleProfile(profile_text, &profile)) {
+    Refuse(env, "replace_existing_atomic", "role profile is invalid");
+    return nullptr;
   }
-  const std::string parent = source_path.parent_path().u8string();
-  HANDLE parent_handle = OpenNoFollowDirectory(parent.empty() ? "." : parent, FILE_READ_ATTRIBUTES);
-  HANDLE source_handle = OpenNoFollowFile(source, GENERIC_READ | READ_CONTROL);
-  HANDLE destination_handle = OpenNoFollowFile(destination, GENERIC_READ | READ_CONTROL);
-  BY_HANDLE_FILE_INFORMATION parent_info{}, source_info{}, destination_info{};
-  bool verified = parent_handle != INVALID_HANDLE_VALUE && source_handle != INVALID_HANDLE_VALUE && destination_handle != INVALID_HANDLE_VALUE &&
-      GetFileInformationByHandle(parent_handle, &parent_info) && GetFileInformationByHandle(source_handle, &source_info) &&
+  if (NtCreateFileApi() == nullptr || NtSetInformationFileApi() == nullptr) {
+    Refuse(env, "replace_existing_atomic", "handle-relative Windows open and rename primitives are unavailable");
+    return nullptr;
+  }
+  HANDLE source_parent = INVALID_HANDLE_VALUE;
+  HANDLE destination_parent = INVALID_HANDLE_VALUE;
+  std::wstring source_name, destination_name;
+  const bool parents_open =
+      OpenWindowsParentNoFollow(source, &source_parent, &source_name, kWindowsMutationParentAccess) &&
+      OpenWindowsParentNoFollow(destination, &destination_parent, &destination_name, kWindowsMutationParentAccess);
+  auto close_parents = [&]() {
+    if (source_parent != INVALID_HANDLE_VALUE) CloseHandle(source_parent);
+    if (destination_parent != INVALID_HANDLE_VALUE) CloseHandle(destination_parent);
+  };
+  if (!parents_open || source_name == destination_name) {
+    close_parents();
+    Refuse(env, "replace_existing_atomic", "same verified parent and distinct object names are required");
+    return nullptr;
+  }
+  BY_HANDLE_FILE_INFORMATION source_parent_info{}, destination_parent_info{};
+  const bool same_parent =
+      GetFileInformationByHandle(source_parent, &source_parent_info) &&
+      GetFileInformationByHandle(destination_parent, &destination_parent_info) &&
+      source_parent_info.dwVolumeSerialNumber == destination_parent_info.dwVolumeSerialNumber &&
+      source_parent_info.nFileIndexHigh == destination_parent_info.nFileIndexHigh &&
+      source_parent_info.nFileIndexLow == destination_parent_info.nFileIndexLow;
+  HANDLE source_handle = same_parent
+      ? OpenWindowsRelative(source_parent, source_name,
+          GENERIC_READ | READ_CONTROL | DELETE, kFileOpen, VerifiedObjectType::File)
+      : INVALID_HANDLE_VALUE;
+  HANDLE destination_handle = same_parent
+      ? OpenWindowsRelative(destination_parent, destination_name,
+          GENERIC_READ | READ_CONTROL | DELETE, kFileOpen, VerifiedObjectType::File)
+      : INVALID_HANDLE_VALUE;
+  auto close_objects = [&]() {
+    if (source_handle != INVALID_HANDLE_VALUE) CloseHandle(source_handle);
+    if (destination_handle != INVALID_HANDLE_VALUE) CloseHandle(destination_handle);
+  };
+  BY_HANDLE_FILE_INFORMATION source_info{}, destination_info{};
+  const bool verified = same_parent &&
+      source_handle != INVALID_HANDLE_VALUE && destination_handle != INVALID_HANDLE_VALUE &&
+      GetFileInformationByHandle(source_handle, &source_info) &&
       GetFileInformationByHandle(destination_handle, &destination_info) &&
       VerifyExactRoleAcl(source_handle, manager, bot, reader, system, profile) &&
       VerifyExactRoleAcl(destination_handle, manager, bot, reader, system, profile);
-  auto close_verified = [&]() { if (source_handle != INVALID_HANDLE_VALUE) CloseHandle(source_handle); if (destination_handle != INVALID_HANDLE_VALUE) CloseHandle(destination_handle); if (parent_handle != INVALID_HANDLE_VALUE) CloseHandle(parent_handle); };
-  if (!verified) { close_verified(); Refuse(env, "replace_existing_atomic", "replacement source, destination, or parent is not verified"); return nullptr; }
-  HANDLE rechecked_parent = OpenNoFollowDirectory(parent.empty() ? "." : parent, FILE_READ_ATTRIBUTES);
-  BY_HANDLE_FILE_INFORMATION rechecked_info{};
-  bool parent_stable = rechecked_parent != INVALID_HANDLE_VALUE && GetFileInformationByHandle(rechecked_parent, &rechecked_info) &&
-      rechecked_info.dwVolumeSerialNumber == parent_info.dwVolumeSerialNumber && rechecked_info.nFileIndexHigh == parent_info.nFileIndexHigh && rechecked_info.nFileIndexLow == parent_info.nFileIndexLow;
-  if (rechecked_parent != INVALID_HANDLE_VALUE) CloseHandle(rechecked_parent);
-  if (!parent_stable || !ReplaceFileW(Wide(destination).c_str(), Wide(source).c_str(), nullptr, 0, nullptr, nullptr)) {
-    close_verified(); Throw(env, "ERR_NATIVE_CONTROL_REPLACE", "atomic replacement parent drifted or failed"); return nullptr;
+  if (!verified) {
+    close_objects();
+    close_parents();
+    Refuse(env, "replace_existing_atomic", "replacement source, destination, or parent is not verified");
+    return nullptr;
   }
-  HANDLE replaced = OpenNoFollowFile(destination, GENERIC_READ | GENERIC_WRITE | READ_CONTROL);
+  if (!RenameWindowsRelative(source_handle, source_parent, destination_name, true)) {
+    close_objects();
+    close_parents();
+    Throw(env, "ERR_NATIVE_CONTROL_REPLACE", "retained-parent atomic replacement failed");
+    return nullptr;
+  }
+  HANDLE replaced = OpenWindowsRelative(source_parent, destination_name,
+      GENERIC_READ | GENERIC_WRITE | READ_CONTROL, kFileOpen, VerifiedObjectType::File);
   BY_HANDLE_FILE_INFORMATION replaced_info{};
-  bool durable = replaced != INVALID_HANDLE_VALUE && GetFileInformationByHandle(replaced, &replaced_info) &&
+  const bool durable = replaced != INVALID_HANDLE_VALUE &&
+      GetFileInformationByHandle(replaced, &replaced_info) &&
       replaced_info.dwVolumeSerialNumber == source_info.dwVolumeSerialNumber &&
-      replaced_info.nFileIndexHigh == source_info.nFileIndexHigh && replaced_info.nFileIndexLow == source_info.nFileIndexLow &&
-      VerifyExactRoleAcl(replaced, manager, bot, reader, system, profile) && FlushFileBuffers(replaced);
-  if (replaced != INVALID_HANDLE_VALUE) CloseHandle(replaced); close_verified();
-  if (!durable) { Throw(env, "ERR_NATIVE_CONTROL_REPLACE", "replacement durability, identity, or DACL verification failed"); return nullptr; }
+      replaced_info.nFileIndexHigh == source_info.nFileIndexHigh &&
+      replaced_info.nFileIndexLow == source_info.nFileIndexLow &&
+      VerifyExactRoleAcl(replaced, manager, bot, reader, system, profile) &&
+      FlushFileBuffers(replaced) && FlushDirectoryOrVolumePath(destination);
+  if (replaced != INVALID_HANDLE_VALUE) CloseHandle(replaced);
+  close_objects();
+  close_parents();
+  if (!durable) {
+    Throw(env, "ERR_NATIVE_CONTROL_REPLACE", "replacement durability, identity, or DACL verification failed");
+    return nullptr;
+  }
 #else
   RoleProfile profile;
   int source_parent = -1, destination_parent = -1;
@@ -1158,6 +1581,12 @@ napi_value AcquireNativeLock(napi_env env, napi_callback_info info) {
       !StringArg(env, info, 4, &system, 6) || !StringArg(env, info, 5, &profile_text, 6)) return nullptr;
   NativeLock* lock = new NativeLock();
 #ifdef _WIN32
+  WindowsPathParts ignored_path;
+  if (!ParseWindowsPath(path, &ignored_path)) {
+    delete lock;
+    Refuse(env, "acquire_native_lock", "path is not a supported absolute handle-relative Windows lock path");
+    return nullptr;
+  }
   RoleProfile profile;
   RoleAcl roles;
   if (!ParseRoleProfile(profile_text, &profile) || !BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) {
@@ -1166,7 +1595,8 @@ napi_value AcquireNativeLock(napi_env env, napi_callback_info info) {
   lock->handle = OpenNoFollowFile(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL);
   if (lock->handle == INVALID_HANDLE_VALUE && (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND)) {
     lock->handle = CreateProtectedFileNoFollow(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL, roles.acl);
-    if (lock->handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_EXISTS) {
+    if (lock->handle == INVALID_HANDLE_VALUE &&
+        (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS)) {
       lock->handle = OpenNoFollowFile(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL);
     }
   }
@@ -1221,6 +1651,11 @@ napi_value EnsureControlDirectory(napi_env env, napi_callback_info info) {
       !StringArg(env, info, 2, &bot, 6) || !StringArg(env, info, 3, &reader, 6) ||
       !StringArg(env, info, 4, &system, 6) || !StringArg(env, info, 5, &profile_text, 6)) return nullptr;
 #ifdef _WIN32
+  WindowsPathParts ignored_path;
+  if (!ParseWindowsPath(path, &ignored_path)) {
+    Refuse(env, "ensure_control_directory", "path is not a supported absolute handle-relative Windows directory");
+    return nullptr;
+  }
   RoleProfile profile;
   RoleAcl roles;
   if (!ParseRoleProfile(profile_text, &profile) || !BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) {
