@@ -939,6 +939,47 @@ test('public recover completes an interrupted no-reader successor without reader
   assert.equal((await fixture.native.readManagementState()).recovery.phase, 'terminal');
 });
 
+test('public recover completes legacy-retained no-reader successor from the predecessor proof', async () => {
+  const fixture = await terminalSuccessorFixture();
+  const beforeBytes = Buffer.from(fixture.files.get('C:/state/channels.json'));
+  const before = await fixture.native.readRetainedTargetProof();
+  setSuccessorHeadPhase(fixture, 'reader-pending');
+  const recovered = await new ManagementRuntime({ native: fixture.native }).execute('recover', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'recoverable-successor-key',
+  });
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.pending, false);
+  assert.equal(recovered.idempotent, true);
+  assert.equal(recovered.routeDisposition, 'no-route');
+  assert.deepEqual(fixture.files.get('C:/state/channels.json'), beforeBytes);
+  const after = await fixture.native.readRetainedTargetProof();
+  assert.equal(after.sourceKind, 'legacy-retained');
+  assert.equal(after.fenceGeneration, before.fenceGeneration);
+  assert.equal(after.targetFingerprint, before.targetFingerprint);
+  assert.equal(after.identityFingerprint, before.identityFingerprint);
+  assert.equal(after.aclFingerprint, before.aclFingerprint);
+  assert.equal(JSON.parse(fileEnding(fixture.files, '/authority-head.json')).phase, 'terminal');
+});
+test('missing post-Genesis fence floor converges to no-route manual cleanup without synthesis', async () => {
+  const fixture = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: fixture.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=secret'))).ok, true);
+  const before = await fixture.native.readManagementState();
+  const floorPath = [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/fence-generation-floor.json'));
+  assert.ok(floorPath);
+  fixture.files.delete(floorPath);
+  const result = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner, actorSecret: secret, hostTokens: 'host=rotated-secret', idempotencyKey: 'missing-fence-floor',
+  });
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.error, 'MANUAL_CLEANUP_REQUIRED');
+  const state = await fixture.native.readManagementState();
+  assert.equal(state.recovery.phase, 'manual_cleanup');
+  assert.equal(state.recovery.routeDisposition, 'no-route');
+  assert.equal(state.fenceGeneration, before.fenceGeneration);
+  assert.equal([...fixture.files.keys()].some((path) => path.replaceAll('\\', '/').endsWith('/fence-generation-floor.json')), false);
+  assert.ok(fileEnding(fixture.files, '/terminal-close.json'));
+});
 test('public recover rejects a conflicting key with transaction-bound no-route cleanup', async () => {
   const fixture = await terminalSuccessorFixture();
   const recovered = await new ManagementRuntime({ native: fixture.native }).execute('recover', {

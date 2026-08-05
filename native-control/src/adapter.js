@@ -1109,6 +1109,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       await requireManagementPrincipal('write_management_state');
       await requireGenesisProof();
       await ensure();
+      const manualCleanup = state?.recovery?.phase === 'manual_cleanup' &&
+        state.recovery.routeDisposition === 'no-route' &&
+        /^[a-f0-9]{64}$/.test(state.recovery.manualCleanupFingerprint ?? '');
       const floor = await read(path('authority-epoch-floor'));
       if (floor !== null) {
         try { validateAuthorityEpochFloor(floor); } catch { refused('write_management_state', 'durable authority epoch floor is invalid'); }
@@ -1126,15 +1129,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         if (state?.fenceGeneration !== expectedFenceGeneration) {
           refused('write_management_state', 'management state fence generation is not bound to the durable fence floor');
         }
-      } else if (state?.fenceGeneration !== 1) {
+      } else if (!manualCleanup && state?.fenceGeneration !== 1) {
         refused('write_management_state', 'management state fence generation requires the Genesis floor');
       }
       await assertManagementStateCounters(state);
       const current = await read(path('management-state'));
+      if (manualCleanup && (!current || state.fenceGeneration !== current.fenceGeneration)) {
+        refused('write_management_state', 'manual cleanup state cannot advance a missing fence floor');
+      }
       if ((current?.revision ?? 0) !== expected) return false;
-      const manualCleanup = state?.recovery?.phase === 'manual_cleanup' &&
-        state.recovery.routeDisposition === 'no-route' &&
-        /^[a-f0-9]{64}$/.test(state.recovery.manualCleanupFingerprint ?? '');
       if (manualCleanup) {
         const terminal = await read(path('terminal-close'));
         if (terminal?.kind !== 'manual-cleanup' ||
@@ -2270,6 +2273,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         refused('mapping_target_proof', 'managed envelope fence proof is invalid');
       }
       return {
+        sourceKind: 'managed-v1',
         snapshotFingerprint: snapshot.configFingerprint,
         fenceGeneration: target.fenceGeneration,
         identityFingerprint: target.targetIdentity,
@@ -3588,13 +3592,20 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           bundle.finality?.finalityFingerprint !== bundle.head.finalityFingerprint) {
         refused('read_successor_recovery', 'exact pending successor recovery is absent');
       }
-      const candidate = await this.mappingTargetProof();
-      if (candidate.targetFingerprint !== bundle.finality.targetFingerprint ||
-          candidate.fenceGeneration !== bundle.request.candidateFenceGeneration ||
-          candidate.identityFingerprint !== bundle.finality.targetIdentityFingerprint ||
-          candidate.aclFingerprint !== bundle.finality.targetAclFingerprint ||
-          candidate.snapshotFingerprint !== bundle.request.candidateSnapshotFingerprint ||
-          canonicalJsonHash(candidate.snapshot) !== bundle.request.candidateTargetFingerprint) {
+      const legacyRetained = bundle.request.targetState === 'legacy-retained';
+      const candidate = legacyRetained ? await this.readRetainedTargetProof() : await this.mappingTargetProof();
+      const candidateTargetMatches = candidate.targetFingerprint === bundle.finality.targetFingerprint &&
+        candidate.identityFingerprint === bundle.finality.targetIdentityFingerprint &&
+        candidate.aclFingerprint === bundle.finality.targetAclFingerprint &&
+        candidate.snapshotFingerprint === bundle.request.candidateSnapshotFingerprint &&
+        (legacyRetained
+          ? candidate.sourceKind === 'legacy-retained' &&
+            candidate.fenceGeneration === bundle.request.previousFenceGeneration &&
+            candidate.targetFingerprint === bundle.request.candidateTargetFingerprint
+          : candidate.sourceKind === 'managed-v1' &&
+            candidate.fenceGeneration === bundle.request.candidateFenceGeneration &&
+            canonicalJsonHash(candidate.snapshot) === bundle.request.candidateTargetFingerprint);
+      if (!candidateTargetMatches) {
         refused('read_successor_recovery', 'candidate retained target proof is substituted');
       }
       return {
@@ -3605,8 +3616,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         predecessorSnapshotFingerprint: bundle.request.previousSnapshotFingerprint,
         candidateTargetFingerprint: bundle.request.candidateTargetFingerprint,
         candidateConfigFingerprint: bundle.request.candidateSnapshotFingerprint,
-        candidateState: structuredClone(candidate.snapshot),
-        candidateStateFingerprint: canonicalJsonHash(candidate.snapshot),
+        candidateState: legacyRetained ? null : structuredClone(candidate.snapshot),
+        candidateStateFingerprint: legacyRetained ? null : canonicalJsonHash(candidate.snapshot),
+        candidateTargetBytes: legacyRetained ? Buffer.from(candidate.targetBytes) : null,
+        candidateTargetIdentityFingerprint: legacyRetained ? candidate.identityFingerprint : null,
+        candidateTargetAclFingerprint: legacyRetained ? candidate.aclFingerprint : null,
         sequence: bundle.request.sequence,
         phase: bundle.head.phase,
         headFingerprint: bundle.head.headFingerprint,

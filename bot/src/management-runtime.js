@@ -1044,6 +1044,20 @@ export class ManagementRuntime {
     if (["mapping-reconcile", "mapping-revoke", "mapping-rollback", "recover"].includes(command)) return this.#mappingMutation(command, input);
     throw new Error("COMMAND_INVALID");
   }
+  #assertLegacyRetainedPredecessor(request, proof) {
+    if (request.targetState !== "legacy-retained" ||
+        proof?.sourceKind !== "legacy-retained" ||
+        !Buffer.isBuffer(proof.targetBytes) ||
+        proof.fenceGeneration !== request.previousFenceGeneration ||
+        proof.targetFingerprint !== request.previousTargetFingerprint ||
+        proof.wrapperFingerprint !== request.previousWrapperFingerprint ||
+        proof.snapshotFingerprint !== request.previousSnapshotFingerprint ||
+        !/^[a-f0-9]{64}$/.test(proof.identityFingerprint) ||
+        !/^[a-f0-9]{64}$/.test(proof.aclFingerprint)) {
+      throw new Error("SUCCESSOR_RECOVERY_EVIDENCE_INVALID");
+    }
+    return proof;
+  }
   async #completeBoundSuccessor(state, txId) {
     if (typeof this.native.readSuccessorBundle !== "function" ||
         typeof this.native.readSuccessorRecovery !== "function" ||
@@ -1053,6 +1067,7 @@ export class ManagementRuntime {
     const bundle = await this.native.readSuccessorBundle();
     if (!bundle || bundle.head.txId !== txId || bundle.head.phase !== "reader-pending" || !bundle.lease || !bundle.projection || !bundle.ack) return null;
     validateAuthoritySuccessorBundle(bundle);
+    if (bundle.request.targetState === "legacy-retained") throw new Error("LEGACY_READER_HANDSHAKE_REFUSED");
     validateReaderVersionFloor(bundle.readerFloor);
     if (bundle.readerFloor.readerVersionFloor !== 2 || bundle.request.readerMode !== "bound-reader") {
       throw new Error("READER_FLOOR_PROOF_MISMATCH");
@@ -1133,6 +1148,8 @@ export class ManagementRuntime {
       throw new Error("READER_FLOOR_PROOF_MISMATCH");
     }
     const { request, finality, baseline, head } = successor;
+    const legacyRetained = request.targetState === "legacy-retained";
+    const retained = legacyRetained ? this.#assertLegacyRetainedPredecessor(request, await this.native.readRetainedTargetProof()) : null;
     const recovery = await this.native.readSuccessorRecovery({
       predecessorReceiptFingerprint: request.previousReceiptFingerprint,
     });
@@ -1147,18 +1164,25 @@ export class ManagementRuntime {
         recovery.phase !== "reader-pending" ||
         recovery.headFingerprint !== head.headFingerprint ||
         recovery.phaseRecordFingerprint !== finality.finalityFingerprint ||
-        recovery.fenceGeneration !== finality.fenceGeneration ||
-        !recovery.candidateState ||
-        canonicalJsonHash(recovery.candidateState) !== recovery.candidateStateFingerprint) {
+        (legacyRetained ? recovery.fenceGeneration !== request.previousFenceGeneration : recovery.fenceGeneration !== finality.fenceGeneration) ||
+        (legacyRetained
+          ? (!Buffer.isBuffer(recovery.candidateTargetBytes) ||
+             !recovery.candidateTargetBytes.equals(retained.targetBytes) ||
+             recovery.candidateTargetIdentityFingerprint !== retained.identityFingerprint ||
+             recovery.candidateTargetAclFingerprint !== retained.aclFingerprint)
+          : (!recovery.candidateState ||
+             canonicalJsonHash(recovery.candidateState) !== recovery.candidateStateFingerprint))) {
       throw new Error("SUCCESSOR_RECOVERY_EVIDENCE_INVALID");
     }
-    validateManagedChannelsV2(recovery.candidateState);
-    if (recovery.candidateState.revision !== finality.revision ||
-        recovery.candidateState.authorityEpoch !== finality.authorityEpoch ||
-        recovery.candidateState.mappingGeneration !== finality.mappingGeneration ||
-        recovery.candidateState.fenceGeneration !== finality.fenceGeneration ||
-        recovery.candidateState.configFingerprint !== recovery.candidateConfigFingerprint) {
-      throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
+    if (!legacyRetained) {
+      validateManagedChannelsV2(recovery.candidateState);
+      if (recovery.candidateState.revision !== finality.revision ||
+          recovery.candidateState.authorityEpoch !== finality.authorityEpoch ||
+          recovery.candidateState.mappingGeneration !== finality.mappingGeneration ||
+          recovery.candidateState.fenceGeneration !== finality.fenceGeneration ||
+          recovery.candidateState.configFingerprint !== recovery.candidateConfigFingerprint) {
+        throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
+      }
     }
     const receipt = buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-receipt", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId,
@@ -1196,8 +1220,10 @@ export class ManagementRuntime {
     state.authorityEpoch = finality.authorityEpoch;
     state.tokenConfigGeneration = finality.tokenConfigGeneration;
     state.mappingGeneration = finality.mappingGeneration;
-    state.mappings = structuredClone(recovery.candidateState.mappings);
-    state.routes = structuredClone(recovery.candidateState.routes);
+    if (!legacyRetained) {
+      state.mappings = structuredClone(recovery.candidateState.mappings);
+      state.routes = structuredClone(recovery.candidateState.routes);
+    }
     state.tokenAttestation = {
       fingerprint: baseline.tokenConfigHostSetFingerprint,
       generation: finality.tokenConfigGeneration,
@@ -1225,21 +1251,30 @@ export class ManagementRuntime {
           bundle.request.previousRevision !== intent.expectedRevision) {
         throw new Error("RECOVERY_INPUT_MISMATCH_HEAD");
       }
-      if (operation === "tokens-attest") {
-        if (bundle.baseline?.tokenConfigHostSetFingerprint !== intent.hostSetFingerprint) {
-          throw new Error("RECOVERY_INPUT_MISMATCH_TOKENS");
+      const retained = await this.native.readRetainedTargetProof();
+      if (retained.sourceKind === "legacy-retained") {
+        this.#assertLegacyRetainedPredecessor(bundle.request, retained);
+        if (operation !== "tokens-attest") throw new Error("RECOVERY_INPUT_MISMATCH_LEGACY");
+      } else if (retained.sourceKind === "managed-v1") {
+        if (bundle.request.targetState === "legacy-retained") throw new Error("RECOVERY_INPUT_MISMATCH_SOURCE");
+        if (operation === "tokens-attest") {
+          if (bundle.baseline?.tokenConfigHostSetFingerprint !== intent.hostSetFingerprint) {
+            throw new Error("RECOVERY_INPUT_MISMATCH_TOKENS");
+          }
+        } else {
+          const recoveryState = structuredClone(state);
+          recoveryState.authorityEpoch = bundle.request.candidateAuthorityEpoch - 1;
+          recoveryState.fenceGeneration = bundle.request.candidateFenceGeneration;
+          const prepared = await this.#prepareMappingMutation(operation, recoveryState, input);
+          if (prepared.snapshot.configFingerprint !== bundle.request.candidateSnapshotFingerprint) {
+            throw new Error("RECOVERY_INPUT_MISMATCH");
+          }
+          if (canonicalJsonHash({ operation, mappingId: input.mappingId ?? null, snapshotFingerprint: prepared.snapshot.configFingerprint }) !== bundle.request.mappingRecoveryTxFingerprint) {
+            throw new Error("RECOVERY_INPUT_MISMATCH");
+          }
         }
       } else {
-        const recoveryState = structuredClone(state);
-        recoveryState.authorityEpoch = bundle.request.candidateAuthorityEpoch - 1;
-        recoveryState.fenceGeneration = bundle.request.candidateFenceGeneration;
-        const prepared = await this.#prepareMappingMutation(operation, recoveryState, input);
-        if (prepared.snapshot.configFingerprint !== bundle.request.candidateSnapshotFingerprint) {
-          throw new Error("RECOVERY_INPUT_MISMATCH");
-        }
-        if (canonicalJsonHash({ operation, mappingId: input.mappingId ?? null, snapshotFingerprint: prepared.snapshot.configFingerprint }) !== bundle.request.mappingRecoveryTxFingerprint) {
-          throw new Error("RECOVERY_INPUT_MISMATCH");
-        }
+        throw new Error("RECOVERY_INPUT_MISMATCH_SOURCE");
       }
     } catch {
       await this.#manualCleanup(state, "RECOVERY_INPUT_MISMATCH");
