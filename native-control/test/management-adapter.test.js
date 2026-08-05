@@ -78,6 +78,51 @@ async function writeAuthorityRequest(native, configPath, request, roles, targetB
   await native.writeGenesisAuthorityRequest(record);
   return record;
 }
+async function committedGenesisFixture(idempotencyKey) {
+  const fixture = fake();
+  const configPath = 'C:/state/channels.json';
+  fixture.lowLevel.current_os_principal = async () => ({ kind: 'sid', value: fixture.roles.managementSid });
+  const native = createManagementNativeForTest({ lowLevel: fixture.lowLevel, configPath, roles: fixture.roles });
+  const runtime = new ManagementRuntime({ native });
+  const result = await runtime.execute('genesis', {
+    actorPrincipal: { kind: 'sid', value: fixture.roles.managementSid },
+    targetPrincipal: { kind: 'sid', value: 'S-1-5-21-103' },
+    botPrincipal: { kind: 'sid', value: fixture.roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: fixture.roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64),
+    botProvisioningFingerprint: 'c'.repeat(64),
+    recoveryProvisioningFingerprint: 'd'.repeat(64),
+    actorSecret: 'owner-secret-is-long-enough',
+    idempotencyKey,
+    hostTokens: 'host=secret',
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const request = JSON.parse(fileEnding(fixture.files, '/.gjc-remote-control/genesis-request.json'));
+  return { ...fixture, native, request, recovery: { txId: request.genesisTxId, requestFingerprint: request.requestFingerprint } };
+}
+function restoreReservedAuthorityEpoch(fixture) {
+  const { files, request } = fixture;
+  const committedEpoch = JSON.parse(fileEnding(files, '/authority-epoch-1-committed.json'));
+  const precommit = JSON.parse(fileEnding(files, '/.gjc-remote-control/genesis-precommit-proof.json'));
+  const reservedEpoch = JSON.parse(fileEnding(files, '/authority-epoch-1-reserved.json'));
+  const floorPath = [...files.keys()].find((path) => normalize(path).endsWith('/.gjc-remote-control/authority-epoch-floor.json'));
+  const currentEpochPath = [...files.keys()].find((path) => normalize(path).endsWith('/.gjc-remote-control/authority-epoch.json'));
+  const floor = JSON.parse(files.get(floorPath));
+  floor.highestCommittedAuthorityEpoch = 0;
+  floor.lastCommittedTxId = null;
+  floor.floorFingerprint = recordHash(floor, 'floorFingerprint');
+  files.set(floorPath, Buffer.from(canonicalJson(floor)));
+  for (const ending of [
+    '/.gjc-remote-control/genesis-precommit-proof.json',
+    `/genesis-precommit-proof-${request.genesisTxId}.json`,
+    `/authority-epoch-${committedEpoch.epoch}-committed.json`,
+  ]) {
+    const key = [...files.keys()].find((path) => normalize(path).endsWith(`/.gjc-remote-control${ending}`) || normalize(path).endsWith(ending));
+    if (key !== undefined) files.delete(key);
+  }
+  files.set(currentEpochPath, Buffer.from(canonicalJson(reservedEpoch)));
+  return { committedEpoch, precommit, floorPath };
+}
 test('persists exact shared records in genesis order and confines bot writes', async () => {
   const { files, calls, roleCalls, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; files.set(configPath, Buffer.from('{"legacy":true}'));
   const native = createManagementNativeForTest({ lowLevel, configPath, roles }); const { floor, attestation, request, attestedProof, attestedFloor, committed } = records();
@@ -103,6 +148,47 @@ test('persists exact shared records in genesis order and confines bot writes', a
   assert.ok(calls.findIndex((p) => p.includes('token-floor-reservation-')) < calls.findIndex((p) => p.endsWith('attestation.json')));
   assert.equal([...files.values()].some((bytes) => bytes.includes(Buffer.from('secret'))), false);
   await native.terminalCloseOrManualCleanup({ reason: 'test' }); assert.match([...files.entries()].find(([path]) => path.replaceAll("\\", "/").endsWith('/terminal-close.json'))[1].toString(), /manual-cleanup/); assert.match([...files.entries()].find(([path]) => path.replaceAll("\\", "/").endsWith('/terminal-close.json'))[1].toString(), /no-route/); assert.equal(roleCalls.every((args) => args.slice(-5, -1).join(',') === `${roles.managementSid},${roles.botSid},${roles.recoverySid},${roles.systemSid}` && ['authority', 'bot-state', 'prospective-cleanup'].includes(args.at(-1))), true);
+});
+test('commitAuthorityEpoch validates the epoch floor before any commit writes', async () => {
+  for (const variant of ['missing', 'malformed', 'mismatched']) {
+    const fixture = await committedGenesisFixture(`authority-floor-${variant}`);
+    const { committedEpoch, precommit, floorPath } = restoreReservedAuthorityEpoch(fixture);
+    if (variant === 'missing') {
+      fixture.files.delete(floorPath);
+    } else if (variant === 'malformed') {
+      fixture.files.set(floorPath, Buffer.from(canonicalJson({ version: 1, kind: 'authority-epoch-floor' })));
+    } else {
+      const floor = JSON.parse(fixture.files.get(floorPath));
+      floor.anchorFingerprint = '0'.repeat(64);
+      floor.floorFingerprint = recordHash(floor, 'floorFingerprint');
+      fixture.files.set(floorPath, Buffer.from(canonicalJson(floor)));
+    }
+    const before = new Map([...fixture.files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+    await assert.rejects(
+      fixture.native.commitAuthorityEpoch(committedEpoch, precommit),
+      /durable authority epoch floor|authority epoch commit is not bound/,
+    );
+    assert.deepEqual(fixture.files, before, `${variant} floor refusal must be write-free`);
+  }
+});
+test('commitAuthorityEpoch replay and Genesis recovery repair only the exact floor binding', async () => {
+  const fixture = await committedGenesisFixture('authority-floor-replay');
+  const { committedEpoch, precommit, floorPath } = restoreReservedAuthorityEpoch(fixture);
+  const callStart = fixture.calls.length;
+  await fixture.native.commitAuthorityEpoch(committedEpoch, precommit);
+  const firstCommitCall = normalize(fixture.calls[callStart]);
+  assert.match(firstCommitCall, /authority-epoch-floor\.json$/);
+  const committedFloor = JSON.parse(fixture.files.get(floorPath));
+  assert.equal(committedFloor.highestCommittedAuthorityEpoch, committedEpoch.epoch);
+  assert.equal(committedFloor.lastCommittedTxId, committedEpoch.commitTxId);
+  const committedPath = [...fixture.files.keys()].find((path) => normalize(path).endsWith(`/authority-epoch-${committedEpoch.epoch}-committed.json`));
+  fixture.files.delete(committedPath);
+  await fixture.native.commitAuthorityEpoch(committedEpoch, precommit);
+  assert.ok(fileEnding(fixture.files, `/authority-epoch-${committedEpoch.epoch}-committed.json`));
+  fixture.files.delete(floorPath);
+  await fixture.native.recoverGenesisSuffix({ recovery: fixture.recovery });
+  const repairedFloor = JSON.parse(fixture.files.get(floorPath));
+  assert.deepEqual(repairedFloor, committedFloor);
 });
 
 test('orders parent-scoped locks before the prospective cleanup proof without authority creation', async () => {

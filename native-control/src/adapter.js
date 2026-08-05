@@ -825,13 +825,13 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     try {
       validateGenesisRequest(request); validateGenesisPrecommit(precommit);
       const publication = await readPublicationGraph(request.genesisTxId);
-      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, control] = await Promise.all([
+      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, control, authorityEpochFloor] = await Promise.all([
         read(path(`token-floor-reservation-${encodeURIComponent(request.genesisTxId)}`)),
         read(path(`token-floor-attested-${encodeURIComponent(request.genesisTxId)}`)),
         read(path('attestation')), read(path('reader-version-floor')),
         read(path(`authority-reservation-${encodeURIComponent(request.genesisTxId)}`)),
         read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`)),
-        read(path('authority-epoch')), read(path('control-root')),
+        read(path('authority-epoch')), read(path('control-root')), read(path('authority-epoch-floor')),
       ]);
       const committedEpoch = authorityEpoch && await read(path(`authority-epoch-${authorityEpoch.epoch}-committed`));
       const wrapper = control?.wrapperRelativeName ? await read(join(root, control.wrapperRelativeName)) : null;
@@ -840,7 +840,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const wrapperProof = wrapper && await authorityObjectProof(join(root, control.wrapperRelativeName));
       validateTokenFloorReservation(reservation); validateAttestedTokenFloorProof(attestedProof, reservation, attestation);
       validateReaderVersionFloor(readerVersionFloor); validateAuthorityReservation(authorityReservation);
-      validateAuthorityCommitSnapshot(authorityCommit, authorityReservation); validateAuthorityEpoch(authorityEpoch); validateAuthorityEpoch(committedEpoch);
+      validateAuthorityCommitSnapshot(authorityCommit, authorityReservation); validateAuthorityEpoch(authorityEpoch); validateAuthorityEpoch(committedEpoch); validateAuthorityEpochFloor(authorityEpochFloor);
+      const expectedAuthorityEpochFloor = buildAuthorityEpochFloor(authorityEpoch.anchorFingerprint, {
+        ...authorityEpochFloor,
+        highestReservedAuthorityEpoch: authorityEpoch.epoch,
+        lastReservationTxId: authorityEpoch.reservationTxId,
+        highestCommittedAuthorityEpoch: authorityEpoch.epoch,
+        lastCommittedTxId: authorityEpoch.commitTxId,
+        floorFingerprint: null,
+      });
       const envelope = validateManagementEnvelope(control, wrapper, {
         targetBytes: target.bytes, targetIdentity: target.targetIdentity, targetAclFingerprint: target.targetAclFingerprint,
       });
@@ -853,6 +861,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           authorityReservation.reservationFingerprint !== precommit.authorityReservationFingerprint ||
           authorityCommit.authorityCommitSnapshotFingerprint !== precommit.authorityCommitSnapshotFingerprint ||
           canonical(authorityEpoch) !== canonical(committedEpoch) ||
+          authorityEpochFloor.anchorFingerprint !== authorityEpoch.anchorFingerprint ||
+          authorityEpochFloor.highestReservedAuthorityEpoch !== authorityEpoch.epoch ||
+          authorityEpochFloor.lastReservationTxId !== authorityEpoch.reservationTxId ||
+          canonical(authorityEpochFloor) !== canonical(expectedAuthorityEpochFloor) ||
           authorityEpoch.commitTxId !== request.genesisTxId ||
           authorityEpoch.anchorFingerprint !== request.anchorFingerprint ||
           authorityEpoch.authorityEpochFingerprint !== precommit.authorityEpochFingerprint ||
@@ -1358,10 +1370,12 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const request = await read(path('genesis-request'));
       const reservation = await read(path(`authority-reservation-${encodeURIComponent(record.reservationTxId)}`));
       const commit = await read(path(`authority-commit-${encodeURIComponent(record.reservationTxId)}`));
-      if (!prior || prior.commitTxId !== null || !request || !reservation || !commit ||
+      const priorCommittedReplay = prior?.commitTxId !== null;
+      if (!prior || !request || !reservation || !commit ||
           record.commitTxId !== request.genesisTxId || record.reservationTxId !== request.genesisTxId ||
           record.epoch !== prior.epoch || record.anchorFingerprint !== prior.anchorFingerprint ||
-          record.authorityEpochFingerprint === prior.authorityEpochFingerprint ||
+          (!priorCommittedReplay && record.authorityEpochFingerprint === prior.authorityEpochFingerprint) ||
+          (priorCommittedReplay && canonical(prior) !== canonical(record)) ||
           precommit.genesisTxId !== request.genesisTxId ||
           precommit.generation !== request.generation ||
           precommit.requestFingerprint !== request.requestFingerprint ||
@@ -1370,29 +1384,59 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           precommit.authorityEpochFingerprint !== record.authorityEpochFingerprint) {
         refused('commit_authority_epoch', 'authority epoch commit relation is invalid');
       }
-      await writeImmutableAuthority(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`, precommit);
-      await writeAuthority('genesis-precommit-proof', precommit);
-      await writeImmutableAuthority(`authority-epoch-${record.epoch}-committed`, record);
-      await writeAuthority('authority-epoch', record);
       let floor = await read(path('authority-epoch-floor'));
       try { floor = validateAuthorityEpochFloor(floor); } catch { refused('commit_authority_epoch', 'durable authority epoch floor is invalid'); }
       if (floor.anchorFingerprint !== record.anchorFingerprint ||
           floor.highestReservedAuthorityEpoch !== record.epoch ||
-          floor.highestCommittedAuthorityEpoch !== record.epoch - 1) {
+          floor.lastReservationTxId !== record.reservationTxId ||
+          (floor.highestCommittedAuthorityEpoch !== record.epoch - 1 &&
+            !(floor.highestCommittedAuthorityEpoch === record.epoch && floor.lastCommittedTxId === record.commitTxId))) {
         refused('commit_authority_epoch', 'authority epoch commit is not bound to the reserved floor');
       }
-      floor = buildAuthorityEpochFloor(record.anchorFingerprint, {
+      const nextFloor = buildAuthorityEpochFloor(record.anchorFingerprint, {
         ...floor,
         highestCommittedAuthorityEpoch: record.epoch,
         lastCommittedTxId: record.commitTxId,
         floorFingerprint: null,
       });
-      await writeAuthority('authority-epoch-floor', floor);
+      if (floor.highestCommittedAuthorityEpoch === record.epoch &&
+          floor.lastCommittedTxId !== record.commitTxId) {
+        refused('commit_authority_epoch', 'authority epoch floor commit transaction is invalid');
+      }
+      if (canonical(floor) !== canonical(nextFloor)) {
+        await writeAuthority('authority-epoch-floor', nextFloor);
+      }
+      const writeExactImmutable = async (name, value) => {
+        const existing = await read(path(name));
+        if (existing !== null) {
+          if (canonical(existing) !== canonical(value)) refused('commit_authority_epoch', 'immutable authority epoch predecessor is substituted');
+          return existing;
+        }
+        await writeImmutableAuthority(name, value);
+        return value;
+      };
+      const writeExactCurrent = async (name, value) => {
+        const existing = await read(path(name));
+        if (existing !== null && canonical(existing) === canonical(value)) return existing;
+        if (existing !== null && name === 'genesis-precommit-proof') {
+          refused('commit_authority_epoch', 'genesis precommit proof replay is invalid');
+        }
+        await writeAuthority(name, value);
+        return value;
+      };
+      await writeExactImmutable(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`, precommit);
+      await writeExactCurrent('genesis-precommit-proof', precommit);
+      await writeExactImmutable(`authority-epoch-${record.epoch}-committed`, record);
+      await writeExactCurrent('authority-epoch', record);
+      const reopenedFloor = await read(path('authority-epoch-floor'));
       const reopened = await read(path('authority-epoch'));
       const reopenedPrecommit = await read(path('genesis-precommit-proof'));
-      if (!reopened || canonical(reopened) !== canonical(record) ||
+      const reopenedCommitted = await read(path(`authority-epoch-${record.epoch}-committed`));
+      if (!reopenedFloor || canonical(reopenedFloor) !== canonical(nextFloor) ||
+          !reopened || canonical(reopened) !== canonical(record) ||
+          !reopenedCommitted || canonical(reopenedCommitted) !== canonical(record) ||
           !reopenedPrecommit || canonical(reopenedPrecommit) !== canonical(precommit)) {
-        refused('commit_authority_epoch', 'authority epoch or precommit durable reopen failed');
+        refused('commit_authority_epoch', 'authority epoch, floor, or precommit durable reopen failed');
       }
       return record;
     },
@@ -2494,6 +2538,24 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           attestation.txId !== request.genesisTxId || attestation.tokenConfigGeneration !== request.generation ||
           !controlRoot) fail();
       if (request.requestedReaderMode === 'handshake' && controlRoot.sourceKind === 'legacy-retained') fail();
+      const preflightEpoch = await read(path('authority-epoch'));
+      const preflightAuthorityEpochFloor = await read(path('authority-epoch-floor'));
+      try {
+        validateAuthorityEpoch(preflightEpoch);
+        if (preflightEpoch.commitTxId !== request.genesisTxId) throw new TypeError('Genesis authority epoch is not committed');
+        if (preflightAuthorityEpochFloor !== null) {
+          validateAuthorityEpochFloor(preflightAuthorityEpochFloor);
+          if (preflightAuthorityEpochFloor.anchorFingerprint !== preflightEpoch.anchorFingerprint ||
+              preflightAuthorityEpochFloor.highestReservedAuthorityEpoch !== preflightEpoch.epoch ||
+              preflightAuthorityEpochFloor.lastReservationTxId !== preflightEpoch.reservationTxId ||
+              preflightAuthorityEpochFloor.highestCommittedAuthorityEpoch > preflightEpoch.epoch ||
+              preflightAuthorityEpochFloor.highestCommittedAuthorityEpoch < preflightEpoch.epoch - 1 ||
+              (preflightAuthorityEpochFloor.highestCommittedAuthorityEpoch === preflightEpoch.epoch &&
+                preflightAuthorityEpochFloor.lastCommittedTxId !== preflightEpoch.commitTxId)) {
+            throw new TypeError('Genesis authority epoch floor binding is invalid');
+          }
+        }
+      } catch { fail(); }
       let fenceFloor = await read(path('fence-generation-floor'));
       try { validateFenceGenerationFloor(fenceFloor); } catch { fail(); }
       if (fenceFloor.highestCommittedFenceGeneration !== request.fenceGeneration ||
@@ -2528,6 +2590,40 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         validateAuthorityCommitSnapshot(authorityCommit, authorityReservation);
         validatePublicationK(k);
         validatePublicationY(y, k['publication-kFingerprint']);
+      } catch { fail(); }
+      const committedEpoch = await read(path(`authority-epoch-${epoch.epoch}-committed`));
+      let authorityEpochFloor = await read(path('authority-epoch-floor'));
+      try {
+        validateAuthorityEpoch(committedEpoch);
+        if (canonical(epoch) !== canonical(committedEpoch)) throw new TypeError('committed authority epoch drift');
+        if (authorityEpochFloor === null) {
+          if (epoch.epoch !== 1) throw new TypeError('authority epoch floor predecessor is absent');
+          authorityEpochFloor = buildAuthorityEpochFloor(epoch.anchorFingerprint, {
+            ...buildAuthorityEpochFloor(epoch.anchorFingerprint),
+            highestReservedAuthorityEpoch: epoch.epoch,
+            lastReservationTxId: epoch.reservationTxId,
+            floorFingerprint: null,
+          });
+        } else validateAuthorityEpochFloor(authorityEpochFloor);
+        if (authorityEpochFloor.anchorFingerprint !== epoch.anchorFingerprint ||
+            authorityEpochFloor.highestReservedAuthorityEpoch !== epoch.epoch ||
+            authorityEpochFloor.lastReservationTxId !== epoch.reservationTxId ||
+            authorityEpochFloor.highestCommittedAuthorityEpoch > epoch.epoch ||
+            (authorityEpochFloor.highestCommittedAuthorityEpoch === epoch.epoch &&
+              authorityEpochFloor.lastCommittedTxId !== epoch.commitTxId) ||
+            (authorityEpochFloor.highestCommittedAuthorityEpoch < epoch.epoch - 1)) {
+          throw new TypeError('authority epoch floor predecessor is invalid');
+        }
+        const expectedAuthorityEpochFloor = buildAuthorityEpochFloor(epoch.anchorFingerprint, {
+          ...authorityEpochFloor,
+          highestCommittedAuthorityEpoch: epoch.epoch,
+          lastCommittedTxId: epoch.commitTxId,
+          floorFingerprint: null,
+        });
+        if (canonical(authorityEpochFloor) !== canonical(expectedAuthorityEpochFloor)) {
+          await writeAuthority('authority-epoch-floor', expectedAuthorityEpochFloor);
+          authorityEpochFloor = expectedAuthorityEpochFloor;
+        }
       } catch { fail(); }
       if (precommit.requestFingerprint !== request.requestFingerprint ||
           precommit.reservationFingerprint !== reservation.floorFingerprint ||
