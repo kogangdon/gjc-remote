@@ -102,6 +102,13 @@ function fakeNative() {
       return structuredClone(fenceGenerationFloor);
     },
     async readFenceGenerationFloor() { return structuredClone(fenceGenerationFloor); },
+    async readSuccessorTokenLineage() {
+      return {
+        floor: { version: 1, kind: "token-floor", anchorFingerprint: hex, floorPhase: "committed", fenceGeneration: 1, highestReservedGeneration: 1, highestCommittedGeneration: 1, lastReservationTxId: "genesis", lastCommittedTxId: "genesis", lastAttestationFingerprint: hex, floorFingerprint: hex },
+        attestation: { version: 1, kind: "token-config-attestation", anchorFingerprint: hex, fenceGeneration: 1, tokenConfigGeneration: 1, tokenConfigHostSetFingerprint: hex, txId: "genesis", attestationFingerprint: hex },
+      };
+    },
+    async readAuthoritySuccessorHeadRaw() { return null; },
     async writeReaderFenceBinding() {},
     async casReaderVersionFloor() { throw new Error("UNEXPECTED_READER_HANDSHAKE"); },
     async withManagementLocks(_locks, fn) { return fn(); },
