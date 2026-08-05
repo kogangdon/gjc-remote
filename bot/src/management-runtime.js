@@ -397,6 +397,66 @@ export class ManagementRuntime {
     }
     return marker;
   }
+  async #persistGenesisHandshakePending(state, { replayFingerprint, generation, hostSetFingerprint, admissionRequest, admissionGrant }) {
+    const before = state.revision;
+    state.recovery = {
+      ...state.recovery,
+      phase: "handshake-pending",
+      replayFingerprint,
+      generation,
+      hostSetFingerprint,
+      routeDisposition: "no-route",
+      readerHandshake: {
+        requestFingerprint: admissionRequest.requestFingerprint,
+        grantFingerprint: admissionGrant.grantFingerprint,
+        expiresAt: admissionGrant.expiresAt,
+        request: structuredClone(admissionRequest),
+        grant: structuredClone(admissionGrant),
+      },
+    };
+    state.admission = { phase: "closed", finalityFingerprint: null };
+    state.revision = before + 1;
+    if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("MANUAL_CLEANUP_REQUIRED");
+  }
+  async #finalizeRecoveredGenesis(anchorFingerprint, completed) {
+    const evidence = completed?.finalityEvidence ??
+      (typeof this.native.readGenesisFinalityEvidence === "function"
+        ? await this.native.readGenesisFinalityEvidence({ txId: completed?.txId })
+        : null);
+    if (evidence && await this.native.recheckAdmissionFinality(evidence) !== true) {
+      throw new Error("FINALITY_RECHECK_FAILED");
+    }
+    await this.#commitGenesisHistory(anchorFingerprint);
+    if (evidence && await this.native.recheckAdmissionFinality(evidence) !== true) {
+      throw new Error("FINALITY_RECHECK_FAILED");
+    }
+    const finalityFingerprint = completed?.finalityFingerprint ?? completed?.receiptFingerprint;
+    if (typeof finalityFingerprint !== "string") throw new Error("FINALITY_RECHECK_FAILED");
+    const reopened = await this.native.reopenAdmission({
+      txId: completed.txId,
+      finalityFingerprint,
+    }) === true;
+    return { reopened, finalityFingerprint };
+  }
+  async #restorePendingGenesisAdmission(recovery) {
+    const pending = recovery?.readerHandshake;
+    if (!pending?.request || !pending?.grant ||
+        pending.requestFingerprint !== pending.request.requestFingerprint ||
+        pending.grantFingerprint !== pending.grant.grantFingerprint ||
+        pending.request.genesisTxId !== recovery.txId) {
+      throw new Error("RECOVERY_PENDING_TUPLE_REQUIRED");
+    }
+    for (const [method, value] of [
+      ["writeAdmissionRequest", pending.request],
+      ["writeAdmissionGrant", pending.grant],
+    ]) {
+      try {
+        await this.native[method](value);
+      } catch (error) {
+        if (error?.reason !== "immutable authority record already exists") throw error;
+      }
+    }
+  }
 
   async #manualCleanup(state, reason, recovery = state.recovery) {
     const durableRecovery = structuredClone(recovery ?? state.recovery ?? {});
@@ -561,6 +621,7 @@ export class ManagementRuntime {
           state.recovery.genesisSecurityTuple !== undefined &&
           sameGenesisSecurityTuple(state.recovery.genesisSecurityTuple, securityTuple)) {
         authenticate({ auth }, actorPrincipal, input.actorSecret);
+        await this.#restorePendingGenesisAdmission(state.recovery);
         const completed = await this.native.completePendingGenesis({
           recovery: state.recovery,
           replayFingerprint,
@@ -570,12 +631,13 @@ export class ManagementRuntime {
           return { idempotent: true, pending: true, genesisTxId: state.recovery.txId, routeDisposition: "no-route" };
         }
         validateGenesisSuffixRecovery(completed, state.recovery);
+        const { reopened, finalityFingerprint } = await this.#finalizeRecoveredGenesis(anchorFingerprint, completed);
         const lineage = await this.native.readSuccessorTokenLineage();
         const before = state.revision;
         state.recovery = { ...state.recovery, ...completed, finalityFingerprint: completed.receiptFingerprint, phase: "terminal", readerHandshake: null };
         state.admission = {
-          phase: completed.admissionOpen === true ? "open" : "closed",
-          finalityFingerprint: completed.admissionOpen === true ? completed.finalityFingerprint : null,
+          phase: reopened ? "open" : "closed",
+          finalityFingerprint: reopened ? finalityFingerprint : null,
         };
         state.tokenFloor = structuredClone(lineage.floor);
         state.tokenConfigGeneration = lineage.attestation.tokenConfigGeneration;
@@ -593,24 +655,27 @@ export class ManagementRuntime {
           requestFingerprint: state.recovery.requestFingerprint,
           finalityFingerprint: completed.receiptFingerprint,
         };
-        try { await this.#commitGenesisHistory(anchorFingerprint); } catch { await this.#manualCleanup(state, "MANAGED_HISTORY_MARKER_REQUIRED"); }
         state.revision = before + 1;
         state.authorityEpoch = await this.#committedAuthorityEpoch(state);
         if (!await this.native.compareAndSwapManagementState(before, state)) {
           throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
         }
-        await this.#audit({
-          actorPrincipal,
-          action: "genesis-handshake-complete",
-          targetPrincipal,
-          result: "terminal",
-          details: { txId: state.recovery.txId, finalityFingerprint: completed.receiptFingerprint },
-        });
+        try {
+          await this.#audit({
+            actorPrincipal,
+            action: "genesis-handshake-complete",
+            targetPrincipal,
+            result: "terminal",
+            details: { txId: state.recovery.txId, finalityFingerprint: completed.receiptFingerprint },
+          });
+        } catch (error) {
+          await this.#manualCleanup(state, safe(error).code);
+        }
         return {
           idempotent: true,
           recovered: true,
           genesisTxId: state.recovery.txId,
-          reopened: completed.admissionOpen === true,
+          reopened,
           routeDisposition: "no-route",
         };
       }
@@ -631,9 +696,13 @@ export class ManagementRuntime {
         } catch (error) {
           await this.#manualCleanup(state, "RECOVERY_SUFFIX_MISMATCH");
         }
+        const { reopened, finalityFingerprint } = await this.#finalizeRecoveredGenesis(anchorFingerprint, recovered);
         const lineage = await this.native.readSuccessorTokenLineage();
         state.recovery = { ...state.recovery, ...recovered, finalityFingerprint: recovered.receiptFingerprint, phase: "terminal" };
-        state.admission = { phase: recovered.admissionOpen === true ? "open" : "closed", finalityFingerprint: recovered.finalityFingerprint ?? null };
+        state.admission = {
+          phase: reopened ? "open" : "closed",
+          finalityFingerprint: reopened ? finalityFingerprint : null,
+        };
         state.tokenFloor = structuredClone(lineage.floor);
         state.tokenConfigGeneration = lineage.attestation.tokenConfigGeneration;
         state.tokenAttestation = {
@@ -650,12 +719,22 @@ export class ManagementRuntime {
           requestFingerprint: state.recovery.requestFingerprint,
           finalityFingerprint: recovered.receiptFingerprint,
         };
-        try { await this.#commitGenesisHistory(anchorFingerprint); } catch { await this.#manualCleanup(state, "MANAGED_HISTORY_MARKER_REQUIRED"); }
         const before = state.revision;
-        state.revision += 1;
+        state.revision = before + 1;
         state.authorityEpoch = await this.#committedAuthorityEpoch(state);
         if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
-        return { idempotent: true, recovered: true, genesisTxId: state.recovery.txId, routeDisposition: "no-route" };
+        try {
+          await this.#audit({
+            actorPrincipal,
+            action: "genesis-recovery",
+            targetPrincipal,
+            result: "terminal",
+            details: { txId: state.recovery.txId, finalityFingerprint: recovered.receiptFingerprint },
+          });
+        } catch (error) {
+          await this.#manualCleanup(state, safe(error).code);
+        }
+        return { idempotent: true, recovered: true, genesisTxId: state.recovery.txId, reopened, routeDisposition: "no-route" };
       }
       const authState = { auth };
       let bootstrapAuth = null;
@@ -721,6 +800,7 @@ export class ManagementRuntime {
       const attestedFloor = attestTokenFloor(reservedFloor, attestedProof);
       const committedFloor = commitTokenFloor(attestedFloor, { txId, generation, attestationFingerprint: attestation.attestationFingerprint, fenceGeneration: 1 });
       let nativeMutation = false;
+      let genesisHandshakePending = false;
       try {
         const genesisProbe = await this.native.probeProspectiveCleanup({
           txId,
@@ -982,8 +1062,17 @@ export class ManagementRuntime {
             expiresAt: Date.now() + 30_000,
           });
           admissionGrant = buildAdmissionGrant(admissionRequest, { grantId: randomUUID(), expiresAt: admissionRequest.expiresAt });
+          await this.#persistGenesisHandshakePending(state, {
+            replayFingerprint,
+            generation,
+            hostSetFingerprint,
+            admissionRequest,
+            admissionGrant,
+          });
+          genesisHandshakePending = true;
           await this.native.writeAdmissionRequest(admissionRequest);
           await this.native.writeAdmissionGrant(admissionGrant);
+          await this.#commitGenesisHistory(anchorFingerprint, { allowCreate: true });
         }
         let readerProjection = null;
         let admissionAck = null;
@@ -992,22 +1081,6 @@ export class ManagementRuntime {
           readerProjection = bound?.readerProjection;
           admissionAck = bound?.admissionAck;
           if (!readerProjection || !admissionAck) {
-            await this.#commitGenesisHistory(anchorFingerprint, { allowCreate: true });
-            state.recovery = {
-              ...state.recovery, phase: "handshake-pending", replayFingerprint,
-              generation,
-              hostSetFingerprint,
-              readerHandshake: {
-                requestFingerprint: admissionRequest.requestFingerprint,
-                grantFingerprint: admissionGrant.grantFingerprint,
-                expiresAt: admissionGrant.expiresAt,
-              },
-            };
-            state.admission = { phase: "closed", finalityFingerprint: null };
-            const before = state.revision;
-            state.revision = before + 1;
-            state.authorityEpoch = authorityReservation.epoch;
-            if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("MANUAL_CLEANUP_REQUIRED");
             return { genesisTxId: txId, pending: true, reopened: false, routeDisposition: "no-route" };
           }
           validateAdmissionAck(admissionAck, admissionGrant, readerProjection.readerProjectionFingerprint);
@@ -1088,7 +1161,21 @@ export class ManagementRuntime {
         return { genesisTxId: txId, authorityEpoch: state.authorityEpoch, tokenConfigGeneration: state.tokenConfigGeneration, reopened, routeDisposition: "no-route" };
       } catch (error) {
         if (safe(error).code === "MANUAL_CLEANUP_DURABILITY_FAILED") throw error;
-        if (nativeMutation) await this.#manualCleanup(state, safe(error).code);
+        if (nativeMutation) {
+          let preservePending = genesisHandshakePending;
+          if (!preservePending && state.recovery?.phase === "handshake-pending" && state.recovery.readerHandshake) {
+            try {
+              const durable = await this.#read();
+              preservePending = durable.recovery?.phase === "handshake-pending" &&
+                durable.recovery.txId === state.recovery.txId &&
+                durable.recovery.readerHandshake?.requestFingerprint === state.recovery.readerHandshake.requestFingerprint &&
+                durable.recovery.readerHandshake?.grantFingerprint === state.recovery.readerHandshake.grantFingerprint;
+            } catch {
+              preservePending = false;
+            }
+          }
+          if (!preservePending) await this.#manualCleanup(state, safe(error).code);
+        }
         throw error;
       }
     });

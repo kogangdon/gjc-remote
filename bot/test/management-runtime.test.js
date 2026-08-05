@@ -336,6 +336,78 @@ test('Genesis suffix recovery reconstructs the exact authority receipt before te
   assert.deepEqual(immutableReceipt, receipt);
   assert.ok(fileEnding(harness.files, '/genesis-suffix-recovery.json'));
 });
+test('Genesis handshake state CAS crash preserves the exact pending admission tuple', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  const input = {
+    ...genesisInput('host=secret'),
+    requestedReaderMode: 'handshake',
+    readerInstanceId: 'reader-cas-crash',
+    readerStartNonce: 'reader-cas-crash-start',
+  };
+  const compare = harness.native.compareAndSwapManagementState.bind(harness.native);
+  let injected = false;
+  harness.native.compareAndSwapManagementState = async (expected, next) => {
+    const result = await compare(expected, next);
+    if (!injected && next.recovery?.phase === 'handshake-pending') {
+      injected = true;
+      throw new Error('INJECTED_HANDSHAKE_STATE_CAS_CRASH');
+    }
+    return result;
+  };
+
+  const interrupted = await runtime.execute('genesis', input);
+  assert.equal(interrupted.ok, false, JSON.stringify(interrupted));
+  harness.native.compareAndSwapManagementState = compare;
+
+  const pendingState = await harness.native.readManagementState();
+  assert.equal(pendingState.recovery.phase, 'handshake-pending');
+  assert.equal(pendingState.recovery.routeDisposition, 'no-route');
+  assert.equal(pendingState.recovery.readerHandshake.request.genesisTxId, pendingState.recovery.txId);
+  assert.equal(
+    pendingState.recovery.readerHandshake.requestFingerprint,
+    pendingState.recovery.readerHandshake.request.requestFingerprint,
+  );
+  assert.equal(
+    pendingState.recovery.readerHandshake.grantFingerprint,
+    pendingState.recovery.readerHandshake.grant.grantFingerprint,
+  );
+  assert.equal(fileEnding(harness.files, '/admission-request.json'), undefined);
+  assert.equal(fileEnding(harness.files, '/admission-grant.json'), undefined);
+
+  const resumed = await runtime.execute('genesis', input);
+  assert.equal(resumed.ok, true, JSON.stringify(resumed));
+  assert.equal(resumed.pending, true);
+  assert.equal((await harness.native.readManagementState()).recovery.phase, 'handshake-pending');
+  const request = JSON.parse(fileEnding(harness.files, '/admission-request.json'));
+  const grant = JSON.parse(fileEnding(harness.files, '/admission-grant.json'));
+  assert.equal(request.requestFingerprint, pendingState.recovery.readerHandshake.requestFingerprint);
+  assert.equal(grant.grantFingerprint, pendingState.recovery.readerHandshake.grantFingerprint);
+});
+
+test('Genesis suffix recovery audit failure converges manual cleanup after terminal state CAS', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  const input = genesisInput('host=secret');
+  assert.equal((await runtime.execute('genesis', input)).ok, true);
+  const statePath = [...harness.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/management-state.json'));
+  const interrupted = JSON.parse(harness.files.get(statePath));
+  interrupted.genesis = null;
+  interrupted.recovery.phase = 'replaced';
+  harness.files.set(statePath, Buffer.from(canonicalJson(interrupted)));
+  for (const path of [...harness.files.keys()]) {
+    if (path.replaceAll('\\', '/').includes('/genesis-authority-receipt')) harness.files.delete(path);
+  }
+  harness.native.appendAudit = async () => { throw new Error('INJECTED_RECOVERY_AUDIT_FAILURE'); };
+
+  const result = await runtime.execute('genesis', input);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'MANUAL_CLEANUP_REQUIRED');
+  const state = await harness.native.readManagementState();
+  assert.equal(state.recovery.phase, 'manual_cleanup');
+  assert.equal(state.recovery.routeDisposition, 'no-route');
+  assert.equal(state.admission.phase, 'closed');
+});
 test('legacy-retained Genesis refuses a bound-reader handshake', async () => {
   const runtime = new ManagementRuntime({ native: adapter().native });
   const result = await runtime.execute('genesis', {
