@@ -506,6 +506,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   };
   const assertManagementStateCounters = async (state) => {
     const phase = state?.recovery?.phase;
+    const manualCleanup = phase === 'manual_cleanup';
     if (!state || !Number.isSafeInteger(state.revision) || state.revision < 0 ||
         !Number.isSafeInteger(state.authorityEpoch) || state.authorityEpoch < 0 ||
         !Number.isSafeInteger(state.fenceGeneration) || state.fenceGeneration < 1 ||
@@ -516,7 +517,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (phase === 'terminal' && state.tokenAttestation && state.tokenFloor === undefined) {
       refused('write_management_state', 'terminal management state token floor is required');
     }
-    if (state.tokenFloor !== undefined) {
+    if (state.tokenFloor !== undefined && !manualCleanup) {
       const durableFloor = await read(path('token-floor'));
       const durableAttestation = await read(path('attestation'));
       try {

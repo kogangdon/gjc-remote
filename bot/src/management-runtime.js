@@ -2465,7 +2465,10 @@ export class ManagementRuntime {
           : await this.#completeBoundSuccessor(state, head.txId);
         if (!completed) throw new Error("SUCCESSOR_READER_PENDING_BUNDLE_REQUIRED");
         return completed;
-      } catch {
+      } catch (error) {
+        if (error?.message === "SUCCESSOR_READER_PENDING_BUNDLE_REQUIRED") {
+          return { pending: true, idempotent: true, txId: head.txId, phase: "reader-pending", routeDisposition: "no-route" };
+        }
         await this.#manualCleanup(state, "SUCCESSOR_RECOVERY_EVIDENCE_INVALID", {
           ...recovery,
           ...(state.recovery?.terminalization ? { terminalization: state.recovery.terminalization } : {}),
