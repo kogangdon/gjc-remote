@@ -1160,7 +1160,7 @@ export class ManagementRuntime {
         }
         return { genesisTxId: txId, authorityEpoch: state.authorityEpoch, tokenConfigGeneration: state.tokenConfigGeneration, reopened, routeDisposition: "no-route" };
       } catch (error) {
-        if (safe(error).code === "MANUAL_CLEANUP_DURABILITY_FAILED") throw error;
+        if (["MANUAL_CLEANUP_REQUIRED", "MANUAL_CLEANUP_DURABILITY_FAILED"].includes(safe(error).code)) throw error;
         if (nativeMutation) {
           let preservePending = genesisHandshakePending;
           if (!preservePending && state.recovery?.phase === "handshake-pending" && state.recovery.readerHandshake) {
