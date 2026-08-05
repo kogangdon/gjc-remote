@@ -3542,6 +3542,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           headValue.finalityFingerprint !== finalityValue.finalityFingerprint ||
           canonical(attestationHistoryValue.at(-1)) !== canonical(attestationValue) ||
           canonical(floorHistoryValue.at(-1)) !== canonical(floorValue) ||
+          attestationValue.fenceGeneration !== floorValue.fenceGeneration ||
+          (finalityValue.operation === 'tokens-attest' &&
+           (attestationValue.fenceGeneration !== finalityValue.fenceGeneration ||
+            floorValue.fenceGeneration !== finalityValue.fenceGeneration)) ||
           attestationValue.tokenConfigGeneration !== floorValue.highestCommittedGeneration ||
           attestationValue.attestationFingerprint !== floorValue.lastAttestationFingerprint ||
           finalityValue.attestationFingerprint !== attestationValue.attestationFingerprint ||
