@@ -469,7 +469,12 @@ export class ManagementRuntime {
       current = structuredClone(state);
     }
     if (!current.recovery || current.recovery.phase !== "manual_cleanup") {
-      const lineage = validateCommittedTokenLineage(await this.native.readSuccessorTokenLineage());
+      let lineage = null;
+      try {
+        lineage = validateCommittedTokenLineage(await this.native.readSuccessorTokenLineage());
+      } catch {
+        lineage = null;
+      }
       current.recovery = {
         ...durableRecovery,
         phase: "manual_cleanup",
@@ -478,14 +483,20 @@ export class ManagementRuntime {
         manualCleanupFingerprint: terminal.manualCleanupFingerprint ?? null,
       };
       current.admission = { phase: "closed", finalityFingerprint: null };
-      current.tokenFloor = structuredClone(lineage.floor);
-      current.tokenConfigGeneration = lineage.floor.highestCommittedGeneration;
-      current.tokenAttestation = {
-        fingerprint: lineage.attestation.tokenConfigHostSetFingerprint,
-        generation: lineage.attestation.tokenConfigGeneration,
-        attestationFingerprint: lineage.attestation.attestationFingerprint,
-        finalityFingerprint: lineage.floor.floorFingerprint,
-      };
+      if (lineage) {
+        current.tokenFloor = structuredClone(lineage.floor);
+        current.tokenConfigGeneration = lineage.floor.highestCommittedGeneration;
+        current.tokenAttestation = {
+          fingerprint: lineage.attestation.tokenConfigHostSetFingerprint,
+          generation: lineage.attestation.tokenConfigGeneration,
+          attestationFingerprint: lineage.attestation.attestationFingerprint,
+          finalityFingerprint: lineage.floor.floorFingerprint,
+        };
+      } else {
+        delete current.tokenFloor;
+        delete current.tokenConfigGeneration;
+        delete current.tokenAttestation;
+      }
       const revision = current.revision;
       current.authorityEpoch = (await this.#readAuthorityEpochFloor())?.highestReservedAuthorityEpoch ?? current.authorityEpoch;
       const fenceFloor = typeof this.native.readFenceGenerationFloor === "function" ? await this.native.readFenceGenerationFloor() : null;
