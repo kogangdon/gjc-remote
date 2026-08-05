@@ -296,7 +296,7 @@ export class ManagementRuntime {
   }
 
   #assertNative() {
-    const methods = ["readManagementState", "compareAndSwapManagementState", "readManagementAuth", "compareAndSwapManagementAuth", "readManagedHistoryMarker", "commitManagedHistoryMarker", "configureManagementRoles", "currentOsPrincipal", "managementAnchorFingerprint", "withManagementLocks", "probeProspectiveCleanup", "writeGenesisAuthorityRequest", "writeGenesisAuthorityReceipt", "reserveFenceGeneration", "commitFenceGeneration", "readFenceGenerationFloor", "reserveAuthorityEpoch", "commitAuthorityEpoch", "writeAuthorityReservation", "writeAuthorityCommitSnapshot", "writeAuthorityBaseline", "writeReaderFenceBinding", "casReaderVersionFloor", "reserveTokenFloor", "writeTokenConfigAttestation", "writeAttestedTokenFloor", "writeGenesisRequest", "commitTokenFloor", "writePublicationGraph", "writeZFinality", "writeAdmissionRequest", "writeAdmissionGrant", "readBoundReaderProof", "completePendingGenesis", "writeFinalityProof", "writeGenesisReceipt", "recheckAdmissionFinality", "publishMapping", "reopenAdmission", "revokeMapping", "writeMappingGeneration", "readMappingGeneration", "writeMappingTombstone", "writeMappingHandoffReceipt", "mappingTargetProof", "recoverGenesisSuffix", "appendAudit", "terminalCloseOrManualCleanup", "rotateTokenSidecar"];
+    const methods = ["readManagementState", "compareAndSwapManagementState", "readManagementAuth", "compareAndSwapManagementAuth", "readManagedHistoryMarker", "commitManagedHistoryMarker", "configureManagementRoles", "currentOsPrincipal", "managementAnchorFingerprint", "withManagementLocks", "probeProspectiveCleanup", "writeGenesisAuthorityRequest", "writeGenesisAuthorityReceipt", "reserveFenceGeneration", "commitFenceGeneration", "readFenceGenerationFloor", "reserveAuthorityEpoch", "commitAuthorityEpoch", "writeAuthorityReservation", "writeAuthorityCommitSnapshot", "writeAuthorityBaseline", "writeReaderFenceBinding", "casReaderVersionFloor", "reserveTokenFloor", "writeTokenConfigAttestation", "writeAttestedTokenFloor", "writeGenesisRequest", "commitTokenFloor", "writePublicationGraph", "writeZFinality", "writeAdmissionRequest", "writeAdmissionGrant", "readBoundReaderProof", "readSuccessorTokenLineage", "readAuthoritySuccessorHeadRaw", "completePendingGenesis", "writeFinalityProof", "writeGenesisReceipt", "recheckAdmissionFinality", "publishMapping", "reopenAdmission", "revokeMapping", "writeMappingGeneration", "readMappingGeneration", "writeMappingTombstone", "writeMappingHandoffReceipt", "mappingTargetProof", "recoverGenesisSuffix", "appendAudit", "terminalCloseOrManualCleanup", "rotateTokenSidecar"];
     for (const method of methods) if (typeof this.native?.[method] !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
   }
   async #configureRoles(command, input) {
@@ -742,6 +742,15 @@ export class ManagementRuntime {
         };
         authorityRequest.requestFingerprint = recordHash(authorityRequest, "requestFingerprint");
         validateGenesisAuthorityRequest(authorityRequest);
+        state.recovery = {
+          ...(state.recovery ?? {}),
+          txId,
+          fenceGeneration: 1,
+          phase: "prepared",
+          requestFingerprint: authorityRequest.requestFingerprint,
+          routeDisposition: "no-route",
+        };
+        nativeMutation = true;
         await this.native.writeGenesisAuthorityRequest(authorityRequest);
         await this.native.reserveFenceGeneration({ fenceGeneration: 1, txId });
         nativeMutation = true;
