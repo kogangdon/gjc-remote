@@ -1195,19 +1195,16 @@ test('bound and no-reader completion failures after durable writes remain transa
     assert.equal(state.recovery.txId, bound.started.txId);
     assert.equal(state.recovery.routeDisposition, 'no-route');
     assert.ok(fileEnding(bound.files, '/terminal-close.json'));
+    assert.ok(state.recovery.terminalization);
+    assert.equal(state.recovery.terminalization.txId, bound.started.txId);
     bound.restore();
     const replay = await new ManagementRuntime({ native: bound.native }).execute('recover', {
       actorPrincipal: owner, actorSecret: secret, idempotencyKey: bound.input.idempotencyKey,
     });
     assert.equal(replay.routeDisposition, 'no-route');
-    if (method === 'writeAuthoritySuccessorHead') {
-      assert.equal(replay.ok, true, JSON.stringify({ method, replay }));
-      assert.equal(replay.idempotent, true);
-      assert.equal(replay.phase, 'terminal');
-    } else {
-      assert.equal(replay.ok, false, JSON.stringify({ method, replay }));
-      assert.equal(replay.error, 'MANUAL_CLEANUP_REQUIRED');
-    }
+    assert.equal(replay.ok, true, JSON.stringify({ method, replay }));
+    assert.equal(replay.idempotent, true);
+    assert.equal(replay.phase, 'terminal');
 
     const noReader = await noReaderCompletionFailureFixture(method);
     const recovered = await noReader.runtime.execute('recover', {
@@ -1219,6 +1216,8 @@ test('bound and no-reader completion failures after durable writes remain transa
     const noReaderState = await noReader.native.readManagementState();
     assert.equal(noReaderState.recovery.phase, 'manual_cleanup');
     assert.equal(noReaderState.recovery.txId, noReader.successor.txId);
+    assert.ok(noReaderState.recovery.terminalization);
+    assert.equal(noReaderState.recovery.terminalization.txId, noReader.successor.txId);
     assert.equal(noReaderState.recovery.routeDisposition, 'no-route');
     assert.ok(fileEnding(noReader.files, '/terminal-close.json'));
     noReader.restore();
@@ -1226,14 +1225,9 @@ test('bound and no-reader completion failures after durable writes remain transa
       actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'recoverable-mapping-key',
     });
     assert.equal(noReaderReplay.routeDisposition, 'no-route');
-    if (method === 'writeAuthoritySuccessorHead') {
-      assert.equal(noReaderReplay.ok, true, JSON.stringify({ method, noReaderReplay }));
-      assert.equal(noReaderReplay.idempotent, true);
-      assert.equal(noReaderReplay.phase, 'terminal');
-    } else {
-      assert.equal(noReaderReplay.ok, false, JSON.stringify({ method, noReaderReplay }));
-      assert.equal(noReaderReplay.error, 'MANUAL_CLEANUP_REQUIRED');
-    }
+    assert.equal(noReaderReplay.ok, true, JSON.stringify({ method, noReaderReplay }));
+    assert.equal(noReaderReplay.idempotent, true);
+    assert.equal(noReaderReplay.phase, 'terminal');
   }
 });
 

@@ -76,10 +76,20 @@ function managedHistoryMarkerPresent() {
     return true;
   }
 }
+function bootstrapBlockerPresent() {
+  try {
+    lstatSync(bootstrapBlockerPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    // Inability to inspect the bootstrap blocker is itself fail-closed.
+    return true;
+  }
+}
 
 function observeManagementAuthority() {
   managedAuthoritySelection.observe({
-    managementMarkerPresent: existsSync(controlDirectoryPath) || existsSync(controlRootPath) || existsSync(bootstrapBlockerPath),
+    managementMarkerPresent: existsSync(controlDirectoryPath) || existsSync(controlRootPath) || bootstrapBlockerPresent(),
     managedHistoryMarkerPresent: managedHistoryMarkerPresent(),
   });
   return managedAuthoritySelection.observed;
@@ -131,7 +141,7 @@ let channelMap;
 let channelMapping;
 channelMap = await loadChannelMap({ fatal: true });
 watchConfigHints(
-  [channelsPath, managedHistoryMarkerPath],
+  [channelsPath, managedHistoryMarkerPath, bootstrapBlockerPath],
   () => {
     const authorityWasObserved = managedAuthoritySelection.observed;
     observeManagementAuthority();
@@ -625,6 +635,7 @@ function readChannelMappingSnapshot() {
       controlDirectoryPath,
       controlRootPath,
       managedHistoryMarkerPath,
+      bootstrapBlockerPath,
     });
   } catch {
     // A source or marker inspection failure must not reopen legacy-v0.
@@ -653,6 +664,7 @@ function verifyLegacyFence(fence) {
     controlDirectoryPath,
     controlRootPath,
     managedHistoryMarkerPath,
+    bootstrapBlockerPath,
   }, fence);
 }
 

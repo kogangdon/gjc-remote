@@ -8,6 +8,7 @@ import {
   parseChannelMap,
   parseHostTokens,
   readLegacyV0SourceSnapshot,
+  verifyLegacyV0SourceFence,
   parseHostTokensForAuthority,
   validateChannelHosts,
 } from "../src/config.js";
@@ -348,6 +349,119 @@ test("managed-history creation during legacy load cannot be accepted as legacy-v
       },
     },
   }), /changed while loading/);
+});
+test("bootstrap blocker present before a legacy read fails closed", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const blockerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  const absent = () => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+  let targetRead = false;
+
+  const snapshot = readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs: {
+      lstatSync: (path) => path === blockerPath ? blockerStat : absent(),
+      readFileSync: () => {
+        targetRead = true;
+        return Buffer.from("{}");
+      },
+    },
+  });
+
+  assert.equal(snapshot.legacyV0Verified, false);
+  assert.equal(snapshot.bootstrapBlockerPresent, true);
+  assert.equal(targetRead, false);
+});
+
+test("bootstrap blocker appearance during a legacy read fails closed", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const targetStat = { dev: 1, ino: 2, size: 2, mtimeMs: 3, ctimeMs: 4, isFile: () => true, isSymbolicLink: () => false };
+  const blockerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  let blockerPresent = false;
+  const absent = () => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+
+  assert.throws(() => readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs: {
+      lstatSync: (path) => {
+        if (path === blockerPath) return blockerPresent ? blockerStat : absent();
+        if (path === targetPath) return targetStat;
+        return absent();
+      },
+      readFileSync: () => {
+        blockerPresent = true;
+        return Buffer.from("{}");
+      },
+    },
+  }), /changed while loading/);
+});
+
+test("bootstrap blocker appearance after a legacy read invalidates its fence", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const targetStat = { dev: 1, ino: 2, size: 2, mtimeMs: 3, ctimeMs: 4, isFile: () => true, isSymbolicLink: () => false };
+  const blockerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  let blockerPresent = false;
+  const absent = () => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+  const fs = {
+    lstatSync: (path) => {
+      if (path === blockerPath) return blockerPresent ? blockerStat : absent();
+      if (path === targetPath) return targetStat;
+      return absent();
+    },
+    readFileSync: () => Buffer.from("{}"),
+  };
+  const options = {
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs,
+  };
+  const snapshot = readLegacyV0SourceSnapshot(options);
+  blockerPresent = true;
+
+  assert.equal(verifyLegacyV0SourceFence(options, snapshot.legacyFence), false);
+});
+
+test("bootstrap blocker inspection errors fail closed", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const denied = () => {
+    const error = new Error("access denied");
+    error.code = "EACCES";
+    throw error;
+  };
+
+  assert.throws(() => readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs: {
+      lstatSync: (path) => path === blockerPath ? denied() : denied(),
+      readFileSync: () => Buffer.from("{}"),
+    },
+  }), /access denied/);
 });
 
 test("managed selection remains latched after its marker is deleted", async () => {

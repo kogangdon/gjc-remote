@@ -8,7 +8,8 @@ function sameLegacyFence(left, right) {
   return left?.generation === right?.generation &&
     left?.targetIdentity === right?.targetIdentity &&
     left?.controlDirectoryIdentity === right?.controlDirectoryIdentity &&
-    left?.controlRootIdentity === right?.controlRootIdentity;
+    left?.controlRootIdentity === right?.controlRootIdentity &&
+    left?.bootstrapBlockerIdentity === right?.bootstrapBlockerIdentity;
 }
 export function createManagedAuthoritySelection() {
   let observed = false;
@@ -46,6 +47,7 @@ export function readLegacyV0SourceSnapshot({
   controlDirectoryPath,
   controlRootPath,
   managedHistoryMarkerPath,
+  bootstrapBlockerPath,
   fs = { lstatSync, readFileSync },
 }) {
   const beforeControlDirectory = lstatOrAbsent(controlDirectoryPath, fs);
@@ -53,11 +55,15 @@ export function readLegacyV0SourceSnapshot({
   const beforeManagedHistoryMarker = managedHistoryMarkerPath
     ? lstatOrAbsent(managedHistoryMarkerPath, fs)
     : null;
-  if (beforeControlDirectory || beforeControlRoot || beforeManagedHistoryMarker) {
+  const beforeBootstrapBlocker = bootstrapBlockerPath
+    ? lstatOrAbsent(bootstrapBlockerPath, fs)
+    : null;
+  if (beforeControlDirectory || beforeControlRoot || beforeManagedHistoryMarker || beforeBootstrapBlocker) {
     return {
       legacyV0Verified: false,
       managementMarkerPresent: true,
       managedHistoryMarkerPresent: Boolean(beforeManagedHistoryMarker),
+      ...(bootstrapBlockerPath ? { bootstrapBlockerPresent: Boolean(beforeBootstrapBlocker) } : {}),
       controlRootBytes: null,
       targetBytes: Buffer.alloc(0),
     };
@@ -74,24 +80,30 @@ export function readLegacyV0SourceSnapshot({
   const afterManagedHistoryMarker = managedHistoryMarkerPath
     ? lstatOrAbsent(managedHistoryMarkerPath, fs)
     : null;
-  if (afterControlDirectory || afterControlRoot || afterManagedHistoryMarker ||
+  const afterBootstrapBlocker = bootstrapBlockerPath
+    ? lstatOrAbsent(bootstrapBlockerPath, fs)
+    : null;
+  if (afterControlDirectory || afterControlRoot || afterManagedHistoryMarker || afterBootstrapBlocker ||
       sourceIdentity(beforeTarget) !== sourceIdentity(afterTarget)) {
     throw new Error("legacy mapping source changed while loading");
   }
 
+  const legacyFence = {
+    generation: createHash("sha256").update(targetBytes).digest("hex"),
+    targetIdentity: sourceIdentity(afterTarget),
+    controlDirectoryIdentity: null,
+    controlRootIdentity: null,
+    ...(bootstrapBlockerPath ? { bootstrapBlockerIdentity: null } : {}),
+  };
   return {
     legacyV0Verified: true,
     controlRootAbsent: true,
     controlRootBytes: null,
     managementMarkerPresent: false,
     managedHistoryMarkerPresent: false,
+    ...(bootstrapBlockerPath ? { bootstrapBlockerPresent: false } : {}),
     targetBytes,
-    legacyFence: {
-      generation: createHash("sha256").update(targetBytes).digest("hex"),
-      targetIdentity: sourceIdentity(afterTarget),
-      controlDirectoryIdentity: null,
-      controlRootIdentity: null,
-    },
+    legacyFence,
   };
 }
 

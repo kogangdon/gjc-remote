@@ -137,6 +137,16 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
     version: 1, kind: "authority-epoch", anchorFingerprint, epoch: 1, reservationTxId: txId,
     commitTxId: txId, previousAuthorityCommitSnapshotFingerprint: null,
   }, "authorityEpochFingerprint");
+  const authorityEpochFloor = seal({
+    version: 1, kind: "authority-epoch-floor", anchorFingerprint, genesisAuthorityEpoch: 1,
+    highestReservedAuthorityEpoch: 1, highestCommittedAuthorityEpoch: 1,
+    lastReservationTxId: txId, lastCommittedTxId: txId,
+  }, "floorFingerprint");
+  const fenceGenerationFloor = seal({
+    version: 1, kind: "fence-generation-floor", anchorFingerprint, genesisFenceGeneration: 1,
+    highestReservedFenceGeneration: 1, highestCommittedFenceGeneration: 1,
+    lastReservationTxId: txId, lastCommittedTxId: txId,
+  }, "floorFingerprint");
   const baseline = seal({
     version: 1, kind: "authority-baseline", anchorFingerprint, genesisTxId: txId, idempotencyKey: "idempotency-key",
     fenceGeneration: 1,
@@ -294,6 +304,9 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
     attestationHistoryBytes: bytes([attestation]), tokenFloorHistoryBytes: bytes([tokenFloor]),
     tokenFloorReservationBytes: bytes(reservation), readerVersionFloorBytes: bytes(readerFloor),
     historyMarkerBytes: bytes(historyMarker),
+    historyMarkerSealBytes: bytes(historyMarker),
+    authorityEpochFloorBytes: bytes(authorityEpochFloor),
+    fenceGenerationFloorBytes: bytes(fenceGenerationFloor),
     genesisRequestBytes: bytes(request), attestedProofBytes: bytes(attestedProof),
     precommitBytes: bytes(precommit), zFinalityBytes: bytes(zFinality),
     rvfBytes: bytes(proof), receiptBytes: bytes(receipt), authorityRequestBytes: bytes(authorityRequest),
@@ -591,7 +604,7 @@ test("native reader fails closed for malformed, swapped, missing, or identity- a
   const baseline = await reader.readSnapshot();
   assert.equal(baseline.nativeVerified, true, JSON.stringify({ code: baseline.code }));
   assert.equal((await loadManagedChannelMapState({ current: {}, readSnapshot: async () => baseline })).ok, true);
-  for (const key of ["attestationBytes", "tokenFloorBytes", "currentAttestationBytes", "currentTokenFloorBytes", "attestationHistoryBytes", "tokenFloorHistoryBytes", "tokenFloorReservationBytes", "readerVersionFloorBytes", "genesisRequestBytes", "zFinalityBytes", "rvfBytes", "receiptBytes", "authorityRequestBytes", "authorityReceiptBytes", "authorityReservationBytes", "authorityCommitBytes", "authorityBaselineBytes", "authorityEpochBytes", "publicationTransactionBytes", "publicationUBytes", "publicationPBytes", "publicationSBytes", "publicationPreparedBytes", "publicationReplacedBytes", "publicationCommittedBytes", "publicationCBytes", "publicationQBytes", "publicationZpBytes", "publicationKBytes", "publicationYBytes"]) {
+  for (const key of ["attestationBytes", "tokenFloorBytes", "currentAttestationBytes", "currentTokenFloorBytes", "attestationHistoryBytes", "tokenFloorHistoryBytes", "tokenFloorReservationBytes", "readerVersionFloorBytes", "historyMarkerSealBytes", "authorityEpochFloorBytes", "fenceGenerationFloorBytes", "genesisRequestBytes", "zFinalityBytes", "rvfBytes", "receiptBytes", "authorityRequestBytes", "authorityReceiptBytes", "authorityReservationBytes", "authorityCommitBytes", "authorityBaselineBytes", "authorityEpochBytes", "publicationTransactionBytes", "publicationUBytes", "publicationPBytes", "publicationSBytes", "publicationPreparedBytes", "publicationReplacedBytes", "publicationCommittedBytes", "publicationCBytes", "publicationQBytes", "publicationZpBytes", "publicationKBytes", "publicationYBytes"]) {
     native.readManagedMappingSnapshot = async () => ({
       ...source, controlRootName: "control-root.json", wrapperName: "managed-v1-wrapper.json", [key]: Buffer.from("{}"),
     });

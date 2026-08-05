@@ -7,7 +7,7 @@ import { addCredential, authenticate, bootstrapOwner, revokeCredential, rotateCr
 import { buildAdmissionGrant, buildAdmissionRequest, validateAdmissionAck, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
 import { validateGenesisSuffixRecovery } from "@gjc-remote/shared/recovery-envelope";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationState, buildPublicationTransaction, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationY, validatePublicationZp } from "@gjc-remote/shared/publication-envelope";
-import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest } from "@gjc-remote/shared/successor-envelope";
+import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest } from "@gjc-remote/shared/successor-envelope";
 
 export const EXIT = Object.freeze({ OK: 0, USAGE: 2, AUTH: 3, CONFLICT: 4, NATIVE: 5, INVALID: 6, RECOVERY: 7, INTERNAL: 70 });
 const LOCK_ORDER = ["genesis", "mapping", "admission"];
@@ -1215,12 +1215,151 @@ export class ManagementRuntime {
     }
     return proof;
   }
+  #terminalizationSuffix(state, suffix) {
+    const current = state?.recovery?.terminalization;
+    if (!current) return null;
+    if (current.kind !== "authority-successor-terminalization" ||
+        current.version !== 1 || current.phase !== "prepared" ||
+        current.txId !== suffix.txId ||
+        current.requestFingerprint !== suffix.requestFingerprint ||
+        current.suffixFingerprint !== recordHash(current, "suffixFingerprint")) {
+      throw new Error("SUCCESSOR_TERMINALIZATION_INVALID");
+    }
+    return current;
+  }
+  #validateTerminalizationSuffix(suffix) {
+    if (!suffix || suffix.kind !== "authority-successor-terminalization" || suffix.version !== 1 ||
+        suffix.phase !== "prepared" || typeof suffix.txId !== "string" ||
+        !/^[a-f0-9]{64}$/.test(suffix.requestFingerprint) ||
+        suffix.suffixFingerprint !== recordHash(suffix, "suffixFingerprint")) {
+      throw new Error("SUCCESSOR_TERMINALIZATION_INVALID");
+    }
+    validateAuthoritySuccessorRequest(suffix.request);
+    validateAuthoritySuccessorFinality(suffix.finality, suffix.request);
+    validateAuthoritySuccessorReceipt(
+      suffix.receipt,
+      suffix.request,
+      suffix.finality,
+      suffix.lease,
+      suffix.projection,
+      suffix.ack,
+    );
+    validateManagedHistoryMarker(suffix.marker, suffix.request.anchorFingerprint, suffix.request.sequence);
+    validateAuthoritySuccessorHeadTransition(suffix.pendingHead, suffix.terminalHead, suffix.request);
+    if (!suffix.finalState || suffix.finalState.recovery?.phase !== "terminal" ||
+        suffix.finalState.recovery.txId !== suffix.txId ||
+        suffix.finalState.recovery.successorHeadFingerprint !== suffix.terminalHead.headFingerprint) {
+      throw new Error("SUCCESSOR_TERMINALIZATION_STATE_INVALID");
+    }
+    return suffix;
+  }
+  async #resumeTerminalization(state, suffix) {
+    this.#validateTerminalizationSuffix(suffix);
+    let head = await this.native.readAuthoritySuccessorHeadRaw();
+    if (!head || head.txId !== suffix.txId ||
+        (head.phase !== "terminal" && head.headFingerprint !== suffix.pendingHead.headFingerprint) ||
+        (head.phase === "terminal" && head.headFingerprint !== suffix.terminalHead.headFingerprint)) {
+      throw new Error("SUCCESSOR_TERMINALIZATION_HEAD_INVALID");
+    }
+    await this.native.writeAuthoritySuccessorReceipt(suffix.receipt);
+    const marker = await this.native.readManagedHistoryMarker();
+    if (marker === null || marker.markerFingerprint !== suffix.marker.markerFingerprint) {
+      if (marker !== null &&
+          (marker.sequence !== suffix.marker.sequence - 1 ||
+           marker.markerFingerprint !== suffix.marker.previousMarkerFingerprint)) {
+        throw new Error("SUCCESSOR_TERMINALIZATION_MARKER_INVALID");
+      }
+      await this.native.commitManagedHistoryMarker(suffix.marker);
+    }
+    let current = await this.#read();
+    if (current.recovery?.phase !== "terminal" ||
+        current.recovery.txId !== suffix.txId ||
+        current.recovery.successorHeadFingerprint !== suffix.terminalHead.headFingerprint) {
+      if (current.revision !== suffix.finalState.revision) {
+        throw new Error("SUCCESSOR_TERMINALIZATION_STATE_INVALID");
+      }
+      if (!await this.native.compareAndSwapManagementState(current.revision, structuredClone(suffix.finalState))) {
+        throw new Error("CAS_CONFLICT");
+      }
+      current = await this.#read();
+    }
+    head = await this.native.readAuthoritySuccessorHeadRaw();
+    if (head.phase !== "terminal") {
+      if (head.headFingerprint !== suffix.pendingHead.headFingerprint) {
+        throw new Error("SUCCESSOR_TERMINALIZATION_HEAD_INVALID");
+      }
+      await this.native.writeAuthoritySuccessorHead(suffix.terminalHead);
+    } else if (head.headFingerprint !== suffix.terminalHead.headFingerprint) {
+      throw new Error("SUCCESSOR_TERMINALIZATION_HEAD_INVALID");
+    }
+    return {
+      pending: false,
+      idempotent: true,
+      txId: suffix.txId,
+      phase: "terminal",
+      receiptFingerprint: suffix.receipt.receiptFingerprint,
+      routeDisposition: "no-route",
+    };
+  }
+  async #persistTerminalization({ state, suffix }) {
+    this.#validateTerminalizationSuffix(suffix);
+    const existing = this.#terminalizationSuffix(state, suffix);
+    if (existing) return existing;
+    const pendingState = structuredClone(suffix.finalState);
+    pendingState.recovery = {
+      ...structuredClone(suffix.finalState.recovery),
+      phase: "terminalizing",
+      successorPhase: "terminalizing",
+      terminalization: structuredClone(suffix),
+      routeDisposition: "no-route",
+    };
+    Object.assign(state.recovery ?? (state.recovery = {}), pendingState.recovery);
+    try {
+      if (!await this.native.compareAndSwapManagementState(state.revision, pendingState)) {
+        const reopened = await this.#read();
+        this.#terminalizationSuffix(reopened, suffix);
+        throw new Error("CAS_CONFLICT");
+      }
+    } catch (error) {
+      try {
+        const reopened = await this.#read();
+        this.#terminalizationSuffix(reopened, suffix);
+      } catch {}
+      throw error;
+    }
+    return suffix;
+  }
+  async #terminalizeSuccessor({ state, request, finality, lease = null, projection = null, ack = null, receipt, marker, pendingHead, terminalHead, finalState }) {
+    const suffix = {
+      version: 1,
+      kind: "authority-successor-terminalization",
+      phase: "prepared",
+      txId: request.txId,
+      requestFingerprint: request.requestFingerprint,
+      request: structuredClone(request),
+      finality: structuredClone(finality),
+      lease: lease === null ? null : structuredClone(lease),
+      projection: projection === null ? null : structuredClone(projection),
+      ack: ack === null ? null : structuredClone(ack),
+      receipt: structuredClone(receipt),
+      marker: structuredClone(marker),
+      pendingHead: structuredClone(pendingHead),
+      terminalHead: structuredClone(terminalHead),
+      finalState: structuredClone(finalState),
+      suffixFingerprint: null,
+    };
+    suffix.suffixFingerprint = recordHash(suffix, "suffixFingerprint");
+    const persisted = await this.#persistTerminalization({ state, suffix });
+    return this.#resumeTerminalization(state, persisted);
+  }
   async #completeBoundSuccessor(state, txId) {
     if (typeof this.native.readSuccessorBundle !== "function" ||
         typeof this.native.readSuccessorRecovery !== "function" ||
         typeof this.native.writeAuthoritySuccessorReceipt !== "function") {
       throw new Error("MANAGED_NATIVE_UNAVAILABLE");
     }
+    const terminalization = state.recovery?.terminalization;
+    if (terminalization?.txId === txId) return this.#resumeTerminalization(state, terminalization);
     const bundle = await this.native.readSuccessorBundle();
     if (!bundle || bundle.head.txId !== txId || bundle.head.phase !== "reader-pending" || !bundle.lease || !bundle.projection || !bundle.ack) return null;
     validateAuthoritySuccessorBundle(bundle);
@@ -1274,38 +1413,45 @@ export class ManagementRuntime {
       phase: "terminal", routeDisposition: "no-route", receiptFingerprint: null,
     }, "receiptFingerprint");
     validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack);
-    await this.native.writeAuthoritySuccessorReceipt(receipt);
     const previousMarker = await this.native.readManagedHistoryMarker();
     validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
-    const marker = { version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, fenceGeneration: request.candidateFenceGeneration, sequence: request.sequence, previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null };
+    const marker = {
+      version: 1,
+      kind: "managed-history-marker",
+      anchorFingerprint: request.anchorFingerprint,
+      fenceGeneration: request.candidateFenceGeneration,
+      sequence: request.sequence,
+      previousMarkerFingerprint: previousMarker.markerFingerprint,
+      markerFingerprint: null,
+    };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
-    const committedMarker = await this.native.commitManagedHistoryMarker(marker);
-    if (!committedMarker ||
-        canonicalJsonHash(committedMarker) !== canonicalJsonHash(marker) ||
-        canonicalJsonHash(await this.native.readManagedHistoryMarker()) !== canonicalJsonHash(marker)) {
-      throw new Error("MANAGED_HISTORY_MARKER_REQUIRED");
-    }
-    validateManagedHistoryMarker(committedMarker, request.anchorFingerprint, request.sequence);
-    const terminal = buildAuthoritySuccessorRecord({ ...head, phase: "terminal", receiptFingerprint: receipt.receiptFingerprint, historyMarkerFingerprint: marker.markerFingerprint, previousHeadFingerprint: head.headFingerprint, headFingerprint: null }, "headFingerprint");
+    const terminal = buildAuthoritySuccessorRecord({
+      ...head,
+      phase: "terminal",
+      receiptFingerprint: receipt.receiptFingerprint,
+      historyMarkerFingerprint: marker.markerFingerprint,
+      previousHeadFingerprint: head.headFingerprint,
+      headFingerprint: null,
+    }, "headFingerprint");
     validateAuthoritySuccessorHeadTransition(head, terminal, request);
-    const before = state.revision;
-    state.revision = finality.revision;
-    state.authorityEpoch = finality.authorityEpoch;
-    state.tokenConfigGeneration = finality.tokenConfigGeneration;
-    state.mappingGeneration = finality.mappingGeneration;
-    state.mappings = structuredClone(recovery.candidateState.mappings);
-    state.routes = structuredClone(recovery.candidateState.routes);
-    state.admission = { phase: "closed", finalityFingerprint: null };
-    state.tokenFloor = structuredClone(lineage.floor);
-    state.tokenAttestation = {
+    const terminalState = structuredClone(state);
+    terminalState.revision = finality.revision;
+    terminalState.authorityEpoch = finality.authorityEpoch;
+    terminalState.tokenConfigGeneration = finality.tokenConfigGeneration;
+    terminalState.mappingGeneration = finality.mappingGeneration;
+    terminalState.mappings = structuredClone(recovery.candidateState.mappings);
+    terminalState.routes = structuredClone(recovery.candidateState.routes);
+    terminalState.admission = { phase: "closed", finalityFingerprint: null };
+    terminalState.tokenFloor = structuredClone(lineage.floor);
+    terminalState.tokenAttestation = {
       fingerprint: lineage.attestation.tokenConfigHostSetFingerprint,
       generation: lineage.attestation.tokenConfigGeneration,
       attestationFingerprint: lineage.attestation.attestationFingerprint,
       finalityFingerprint: lineage.floor.floorFingerprint,
     };
-    state.fenceGeneration = finality.fenceGeneration;
-    state.recovery = {
-      ...state.recovery,
+    terminalState.fenceGeneration = finality.fenceGeneration;
+    terminalState.recovery = {
+      ...terminalState.recovery,
       phase: "terminal",
       successorPhase: "terminal",
       txId,
@@ -1314,9 +1460,19 @@ export class ManagementRuntime {
       fenceGeneration: finality.fenceGeneration,
       finalityFingerprint: finality.finalityFingerprint,
     };
-    if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
-    await this.native.writeAuthoritySuccessorHead(terminal);
-    return { pending: false, idempotent: true, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
+    return this.#terminalizeSuccessor({
+      state,
+      request,
+      finality,
+      lease,
+      projection,
+      ack,
+      receipt,
+      marker,
+      pendingHead: head,
+      terminalHead: terminal,
+      finalState: terminalState,
+    });
   }
   async #completeNoReaderSuccessor(state, txId, bundle = null) {
     if (typeof this.native.readSuccessorBundle !== "function" ||
@@ -1324,6 +1480,8 @@ export class ManagementRuntime {
         typeof this.native.writeAuthoritySuccessorReceipt !== "function") {
       throw new Error("MANAGED_NATIVE_UNAVAILABLE");
     }
+    const terminalization = state.recovery?.terminalization;
+    if (terminalization?.txId === txId) return this.#resumeTerminalization(state, terminalization);
     const successor = bundle ?? await this.native.readSuccessorBundle();
     if (!successor || successor.head.txId !== txId || successor.head.phase !== "reader-pending") return null;
     validateAuthoritySuccessorBundle(successor);
@@ -1385,48 +1543,62 @@ export class ManagementRuntime {
       phase: "terminal", routeDisposition: "no-route", receiptFingerprint: null,
     }, "receiptFingerprint");
     validateAuthoritySuccessorReceipt(receipt, request, finality);
-    await this.native.writeAuthoritySuccessorReceipt(receipt);
     const previousMarker = await this.native.readManagedHistoryMarker();
     validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
     const marker = {
-      version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, fenceGeneration: request.candidateFenceGeneration, sequence: request.sequence,
-      previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null,
+      version: 1,
+      kind: "managed-history-marker",
+      anchorFingerprint: request.anchorFingerprint,
+      fenceGeneration: request.candidateFenceGeneration,
+      sequence: request.sequence,
+      previousMarkerFingerprint: previousMarker.markerFingerprint,
+      markerFingerprint: null,
     };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
-    const committedMarker = await this.native.commitManagedHistoryMarker(marker);
-    if (!committedMarker ||
-        canonicalJsonHash(committedMarker) !== canonicalJsonHash(marker) ||
-        canonicalJsonHash(await this.native.readManagedHistoryMarker()) !== canonicalJsonHash(marker)) {
-      throw new Error("MANAGED_HISTORY_MARKER_REQUIRED");
-    }
-    validateManagedHistoryMarker(committedMarker, request.anchorFingerprint, request.sequence);
     const terminal = buildAuthoritySuccessorRecord({
-      ...head, phase: "terminal", receiptFingerprint: receipt.receiptFingerprint,
-      historyMarkerFingerprint: marker.markerFingerprint, previousHeadFingerprint: head.headFingerprint, headFingerprint: null,
+      ...head,
+      phase: "terminal",
+      receiptFingerprint: receipt.receiptFingerprint,
+      historyMarkerFingerprint: marker.markerFingerprint,
+      previousHeadFingerprint: head.headFingerprint,
+      headFingerprint: null,
     }, "headFingerprint");
     validateAuthoritySuccessorHeadTransition(head, terminal, request);
-    const before = state.revision;
-    state.revision = finality.revision;
-    state.authorityEpoch = finality.authorityEpoch;
-    state.tokenConfigGeneration = finality.tokenConfigGeneration;
-    state.mappingGeneration = finality.mappingGeneration;
+    const terminalState = structuredClone(state);
+    terminalState.revision = finality.revision;
+    terminalState.authorityEpoch = finality.authorityEpoch;
+    terminalState.tokenConfigGeneration = finality.tokenConfigGeneration;
+    terminalState.mappingGeneration = finality.mappingGeneration;
     if (!legacyRetained) {
-      state.mappings = structuredClone(recovery.candidateState.mappings);
-      state.routes = structuredClone(recovery.candidateState.routes);
+      terminalState.mappings = structuredClone(recovery.candidateState.mappings);
+      terminalState.routes = structuredClone(recovery.candidateState.routes);
     }
-    state.tokenFloor = structuredClone(lineage.floor);
-    state.tokenAttestation = {
+    terminalState.tokenFloor = structuredClone(lineage.floor);
+    terminalState.tokenAttestation = {
       fingerprint: baseline.tokenConfigHostSetFingerprint,
       generation: finality.tokenConfigGeneration,
       attestationFingerprint: finality.attestationFingerprint,
       finalityFingerprint: finality.tokenFloorFingerprint,
     };
-    state.admission = { phase: "closed", finalityFingerprint: null };
-    state.fenceGeneration = finality.fenceGeneration;
-    state.recovery = { phase: "terminal", txId, fenceGeneration: finality.fenceGeneration, finalityFingerprint: finality.finalityFingerprint };
-    if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
-    await this.native.writeAuthoritySuccessorHead(terminal);
-    return { pending: false, idempotent: true, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
+    terminalState.admission = { phase: "closed", finalityFingerprint: null };
+    terminalState.fenceGeneration = finality.fenceGeneration;
+    terminalState.recovery = {
+      phase: "terminal",
+      txId,
+      fenceGeneration: finality.fenceGeneration,
+      finalityFingerprint: finality.finalityFingerprint,
+      successorHeadFingerprint: terminal.headFingerprint,
+    };
+    return this.#terminalizeSuccessor({
+      state,
+      request,
+      finality,
+      receipt,
+      marker,
+      pendingHead: head,
+      terminalHead: terminal,
+      finalState: terminalState,
+    });
   }
   async #recoverSuccessorHead({ state, input, actorPrincipal, operation, txId, intent, head }) {
     const recovery = {
@@ -1438,6 +1610,22 @@ export class ManagementRuntime {
       successorHeadFingerprint: head.headFingerprint,
       routeDisposition: "no-route",
     };
+    const terminalization = state.recovery?.terminalization;
+    if (terminalization?.txId === head.txId) {
+      try {
+        if (terminalization.request?.actorPrincipalFingerprint !== canonicalJsonHash(actorPrincipal) ||
+            terminalization.request?.idempotencyKey !== input.idempotencyKey ||
+            terminalization.request?.operation !== operation) {
+          throw new Error("RECOVERY_INPUT_MISMATCH");
+        }
+        return await this.#resumeTerminalization(state, terminalization);
+      } catch {
+        await this.#manualCleanup(state, "SUCCESSOR_TERMINALIZATION_INVALID", {
+          ...recovery,
+          terminalization,
+        });
+      }
+    }
     if (head.txId !== txId) await this.#manualCleanup(state, "RECOVERY_INPUT_MISMATCH", recovery);
     let bundle;
     try {
@@ -1518,12 +1706,14 @@ export class ManagementRuntime {
     };
     const txId = `successor-${canonicalJsonHash(intent)}`;
     const setRecovery = (patch = {}) => {
-      mutation.recovery = {
+      const recovery = {
         ...(mutation.recovery ?? state.recovery ?? {}),
         txId,
         ...patch,
         routeDisposition: "no-route",
       };
+      mutation.recovery = recovery;
+      state.recovery = recovery;
     };
     let existing;
     try {
@@ -1541,6 +1731,14 @@ export class ManagementRuntime {
           successorHeadFingerprint: rawHead.headFingerprint,
           routeDisposition: "no-route",
         };
+      if (recovery.terminalization?.txId && recovery.terminalization?.txId === recovery.txId &&
+          recovery.terminalization.request?.idempotencyKey === input.idempotencyKey &&
+          recovery.terminalization.request?.operation === operation) {
+        mutation.attempted = true;
+        mutation.recovery = recovery;
+        state.recovery = recovery;
+        return this.#resumeTerminalization(state, recovery.terminalization);
+      }
       } catch {
         // Preserve the state-bound recovery when the active head cannot be reopened.
       }
@@ -2076,6 +2274,24 @@ export class ManagementRuntime {
       successorHeadFingerprint: head.headFingerprint,
       successorPhase: head.phase,
     };
+    const terminalization = state.recovery?.terminalization;
+    if (terminalization?.txId === head.txId) {
+      if (terminalization.request?.actorPrincipalFingerprint !== canonicalJsonHash(actorPrincipal) ||
+          terminalization.request?.idempotencyKey !== input.idempotencyKey) {
+        await this.#manualCleanup(state, "RECOVERY_INPUT_MISMATCH", {
+          ...recovery,
+          terminalization,
+        });
+      }
+      try {
+        return await this.#resumeTerminalization(state, terminalization);
+      } catch {
+        await this.#manualCleanup(state, "SUCCESSOR_TERMINALIZATION_INVALID", {
+          ...recovery,
+          terminalization,
+        });
+      }
+    }
     let bundle;
     try {
       bundle = await this.native.readSuccessorBundle();
@@ -2101,7 +2317,10 @@ export class ManagementRuntime {
           ? await this.#completeNoReaderSuccessor(state, head.txId, bundle)
           : await this.#completeBoundSuccessor(state, head.txId);
       } catch {
-        await this.#manualCleanup(state, "SUCCESSOR_RECOVERY_EVIDENCE_INVALID", recovery);
+        await this.#manualCleanup(state, "SUCCESSOR_RECOVERY_EVIDENCE_INVALID", {
+          ...recovery,
+          ...(state.recovery?.terminalization ? { terminalization: state.recovery.terminalization } : {}),
+        });
       }
       return completed ?? {
         pending: true, idempotent: true, txId: head.txId, phase: "reader-pending", routeDisposition: "no-route",

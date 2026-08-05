@@ -147,6 +147,93 @@ function validateHistoryMarker(marker, anchorFingerprint, expectedSequence = und
   }
   return marker;
 }
+const AUTHORITY_EPOCH_FLOOR_KEYS = [
+  "version", "kind", "anchorFingerprint", "genesisAuthorityEpoch",
+  "highestReservedAuthorityEpoch", "highestCommittedAuthorityEpoch",
+  "lastReservationTxId", "lastCommittedTxId", "floorFingerprint",
+];
+const FENCE_GENERATION_FLOOR_KEYS = [
+  "version", "kind", "anchorFingerprint", "genesisFenceGeneration",
+  "highestReservedFenceGeneration", "highestCommittedFenceGeneration",
+  "lastReservationTxId", "lastCommittedTxId", "floorFingerprint",
+];
+function validateAuthorityEpochFloor(floor, anchorFingerprint) {
+  if (!floor || Object.getPrototypeOf(floor) !== Object.prototype ||
+      Object.keys(floor).length !== AUTHORITY_EPOCH_FLOOR_KEYS.length ||
+      !AUTHORITY_EPOCH_FLOOR_KEYS.every((key) => Object.hasOwn(floor, key)) ||
+      floor.version !== 1 || floor.kind !== "authority-epoch-floor" ||
+      !isHex64(floor.anchorFingerprint) || floor.genesisAuthorityEpoch !== 1 ||
+      !Number.isSafeInteger(floor.highestReservedAuthorityEpoch) ||
+      !Number.isSafeInteger(floor.highestCommittedAuthorityEpoch) ||
+      floor.highestReservedAuthorityEpoch < 0 ||
+      floor.highestCommittedAuthorityEpoch < 0 ||
+      floor.highestCommittedAuthorityEpoch > floor.highestReservedAuthorityEpoch ||
+      ![floor.lastReservationTxId, floor.lastCommittedTxId].every((value) => value === null || (typeof value === "string" && value.length > 0 && value.length <= 256)) ||
+      !isHex64(floor.floorFingerprint) ||
+      floor.floorFingerprint !== authorityRecordFingerprint(floor, "floorFingerprint") ||
+      floor.anchorFingerprint !== anchorFingerprint ||
+      (floor.highestReservedAuthorityEpoch < 1) !== (floor.lastReservationTxId === null) ||
+      (floor.highestCommittedAuthorityEpoch < 1) !== (floor.lastCommittedTxId === null)) {
+    throw new TypeError("authority epoch floor proof");
+  }
+  return floor;
+}
+function validateFenceGenerationFloor(floor, anchorFingerprint) {
+  if (!floor || Object.getPrototypeOf(floor) !== Object.prototype ||
+      Object.keys(floor).length !== FENCE_GENERATION_FLOOR_KEYS.length ||
+      !FENCE_GENERATION_FLOOR_KEYS.every((key) => Object.hasOwn(floor, key)) ||
+      floor.version !== 1 || floor.kind !== "fence-generation-floor" ||
+      !isHex64(floor.anchorFingerprint) || floor.genesisFenceGeneration !== 1 ||
+      !Number.isSafeInteger(floor.highestReservedFenceGeneration) ||
+      !Number.isSafeInteger(floor.highestCommittedFenceGeneration) ||
+      floor.highestReservedFenceGeneration < 0 ||
+      floor.highestCommittedFenceGeneration < 0 ||
+      floor.highestCommittedFenceGeneration > floor.highestReservedFenceGeneration ||
+      ![floor.lastReservationTxId, floor.lastCommittedTxId].every((value) => value === null || (typeof value === "string" && value.length > 0 && value.length <= 256)) ||
+      !isHex64(floor.floorFingerprint) ||
+      floor.floorFingerprint !== authorityRecordFingerprint(floor, "floorFingerprint") ||
+      floor.anchorFingerprint !== anchorFingerprint ||
+      (floor.highestReservedFenceGeneration < 1) !== (floor.lastReservationTxId === null) ||
+      (floor.highestCommittedFenceGeneration < 1) !== (floor.lastCommittedTxId === null)) {
+    throw new TypeError("fence generation floor proof");
+  }
+  return floor;
+}
+function validatePublishedFloors({ authorityEpochFloor, fenceGenerationFloor, authorityEpoch, anchorFingerprint, request, head = null }) {
+  validateAuthorityEpochFloor(authorityEpochFloor, anchorFingerprint);
+  validateFenceGenerationFloor(fenceGenerationFloor, anchorFingerprint);
+  validateAuthorityEpoch(authorityEpoch);
+  if (authorityEpoch.anchorFingerprint !== anchorFingerprint) throw new TypeError("authority epoch floor anchor");
+  const successor = head !== null;
+  const terminal = !successor || head.phase === "terminal";
+  const expectedEpoch = successor ? request.candidateAuthorityEpoch : authorityEpoch.epoch;
+  const expectedFence = successor ? request.candidateFenceGeneration : request.fenceGeneration;
+  if (authorityEpoch.epoch !== expectedEpoch ||
+      authorityEpochFloor.highestReservedAuthorityEpoch !== expectedEpoch ||
+      authorityEpochFloor.lastReservationTxId !== authorityEpoch.reservationTxId ||
+      fenceGenerationFloor.highestReservedFenceGeneration !== expectedFence ||
+      fenceGenerationFloor.lastReservationTxId !== (successor ? request.txId : request.genesisTxId)) {
+    throw new TypeError("authority floor reservation binding");
+  }
+  const committedSuccessor = successor && ["reader-pending", "terminal"].includes(head.phase);
+  const expectedCommittedEpoch = successor ? (committedSuccessor ? expectedEpoch : request.previousAuthorityEpoch) : expectedEpoch;
+  const expectedCommittedFence = successor ? (committedSuccessor ? expectedFence : request.previousFenceGeneration) : expectedFence;
+  if (authorityEpochFloor.highestCommittedAuthorityEpoch !== expectedCommittedEpoch ||
+      fenceGenerationFloor.highestCommittedFenceGeneration !== expectedCommittedFence ||
+      (committedSuccessor || !successor
+        ? authorityEpochFloor.lastCommittedTxId !== authorityEpoch.commitTxId ||
+          fenceGenerationFloor.lastCommittedTxId !== (successor ? request.txId : request.genesisTxId)
+        : authorityEpochFloor.lastCommittedTxId === null ||
+          fenceGenerationFloor.lastCommittedTxId === null)) {
+    throw new TypeError("authority floor commit binding");
+  }
+}
+function validateHistoryMarkerSeal(marker, seal, anchorFingerprint) {
+  validateHistoryMarker(seal, anchorFingerprint, 1);
+  if (marker.sequence === 1 && canonicalJson(marker) !== canonicalJson(seal)) {
+    throw new TypeError("history marker seal mismatch");
+  }
+}
 function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerprint) {
   const { request, head, finality, baseline } = bundle;
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence) ||
@@ -155,7 +242,9 @@ function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerpr
       !isBytes(evidence.attestationBytes) || !isBytes(evidence.tokenFloorBytes) ||
       !isBytes(evidence.attestationHistoryBytes) || !isBytes(evidence.tokenFloorHistoryBytes) ||
       !isBytes(evidence.controlRootBytes) || !isBytes(evidence.wrapperBytes) || !isBytes(evidence.targetBytes) ||
-      !isHex64(evidence.targetIdentity) || !isHex64(evidence.targetAclFingerprint)) {
+      !isHex64(evidence.targetIdentity) || !isHex64(evidence.targetAclFingerprint) ||
+      !isBytes(evidence.authorityEpochFloorBytes) || !isBytes(evidence.fenceGenerationFloorBytes) ||
+      !isBytes(evidence.historyMarkerBytes) || !isBytes(evidence.historyMarkerSealBytes)) {
     throw new Error("SUCCESSOR_LIVE_PROOF_INVALID");
   }
 
@@ -171,6 +260,23 @@ function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerpr
   const attestation = parseAuthorityBytes(evidence.attestationBytes);
   const floor = parseAuthorityBytes(evidence.tokenFloorBytes);
   validateCommittedLineage(attestation, floor, request.anchorFingerprint);
+  const authorityEpochFloor = parseAuthorityBytes(evidence.authorityEpochFloorBytes);
+  const fenceGenerationFloor = parseAuthorityBytes(evidence.fenceGenerationFloorBytes);
+  const liveHistoryMarker = parseAuthorityBytes(evidence.historyMarkerBytes);
+  const historyMarkerSeal = parseAuthorityBytes(evidence.historyMarkerSealBytes);
+  validatePublishedFloors({
+    authorityEpochFloor,
+    fenceGenerationFloor,
+    authorityEpoch: bundle.authorityEpoch,
+    anchorFingerprint: request.anchorFingerprint,
+    request,
+    head: liveHead,
+  });
+  validateHistoryMarkerSeal(liveHistoryMarker, historyMarkerSeal, request.anchorFingerprint);
+  if (canonicalJson(liveHistoryMarker) !== canonicalJson(bundle.historyMarker) ||
+      canonicalJson(historyMarkerSeal) !== canonicalJson(bundle.historyMarkerSeal)) {
+    throw new Error("SUCCESSOR_LIVE_HISTORY_MARKER_STALE");
+  }
   const { attestations, floors } = validateTokenHistory(
     evidence,
     request.anchorFingerprint,
@@ -339,15 +445,34 @@ function validateSuccessorPublicationEvidence({ snapshot, bundle }) {
   validateAuthorityReservation(reservation);
   validateAuthorityCommitSnapshot(commit, reservation);
   validateAuthorityEpoch(authorityEpoch);
+  if (!isBytes(snapshot.authorityEpochFloorBytes) || !isBytes(snapshot.fenceGenerationFloorBytes)) {
+    throw new TypeError("successor authority floor absent");
+  }
+  const authorityEpochFloor = parseAuthorityBytes(snapshot.authorityEpochFloorBytes);
+  const fenceGenerationFloor = parseAuthorityBytes(snapshot.fenceGenerationFloorBytes);
+  validatePublishedFloors({
+    authorityEpochFloor,
+    fenceGenerationFloor,
+    authorityEpoch,
+    anchorFingerprint: request.anchorFingerprint,
+    request,
+    head,
+  });
   validateReaderVersionFloor(readerFloor);
   if ((readerFloor.readerVersionFloor === 2) !== (request.readerMode === "bound-reader")) {
     throw new TypeError("successor reader floor");
   }
   if (!isBytes(snapshot.historyMarkerBytes)) throw new TypeError("successor history marker absent");
+  if (!isBytes(snapshot.historyMarkerSealBytes)) throw new TypeError("successor history marker seal absent");
   const historyMarker = parseAuthorityBytes(snapshot.historyMarkerBytes);
+  const historyMarkerSeal = parseAuthorityBytes(snapshot.historyMarkerSealBytes);
   validateHistoryMarker(historyMarker, request.anchorFingerprint, head.phase === "terminal" ? request.sequence : request.sequence - 1);
+  validateHistoryMarkerSeal(historyMarker, historyMarkerSeal, request.anchorFingerprint);
   if (!bundle.historyMarker || canonicalJson(bundle.historyMarker) !== canonicalJson(historyMarker)) {
     throw new TypeError("successor history marker substitution");
+  }
+  if (!bundle.historyMarkerSeal || canonicalJson(bundle.historyMarkerSeal) !== canonicalJson(historyMarkerSeal)) {
+    throw new TypeError("successor history marker seal substitution");
   }
   if (head.phase === "terminal" && request.readerMode === "bound-reader" && (!bundle.lease || !bundle.projection || !bundle.ack)) {
     throw new TypeError("successor bound-reader proof absent");
@@ -501,8 +626,12 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   const proof = parseAuthorityBytes(snapshot.rvfBytes);
   const receipt = parseAuthorityBytes(snapshot.receiptBytes);
   const readerFloor = parseAuthorityBytes(snapshot.readerVersionFloorBytes);
+  const authorityEpochFloor = parseAuthorityBytes(snapshot.authorityEpochFloorBytes);
+  const fenceGenerationFloor = parseAuthorityBytes(snapshot.fenceGenerationFloorBytes);
   const historyMarker = parseAuthorityBytes(snapshot.historyMarkerBytes);
+  const historyMarkerSeal = parseAuthorityBytes(snapshot.historyMarkerSealBytes);
   validateHistoryMarker(historyMarker, request.anchorFingerprint, 1);
+  validateHistoryMarkerSeal(historyMarker, historyMarkerSeal, request.anchorFingerprint);
   const attestedProof = parseAuthorityBytes(snapshot.attestedProofBytes);
   const precommit = parseAuthorityBytes(snapshot.precommitBytes);
   const authorityRequest = parseAuthorityBytes(snapshot.authorityRequestBytes);
@@ -511,6 +640,13 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   const authorityCommit = parseAuthorityBytes(snapshot.authorityCommitBytes);
   const authorityBaseline = parseAuthorityBytes(snapshot.authorityBaselineBytes);
   const authorityEpoch = parseAuthorityBytes(snapshot.authorityEpochBytes);
+  validatePublishedFloors({
+    authorityEpochFloor,
+    fenceGenerationFloor,
+    authorityEpoch,
+    anchorFingerprint: request.anchorFingerprint,
+    request,
+  });
   const publicationK = parseAuthorityBytes(snapshot.publicationKBytes);
   const publicationY = parseAuthorityBytes(snapshot.publicationYBytes);
 
@@ -768,10 +904,17 @@ export async function createManagedAuthorityReader({
       return false;
     }
     const pending = await native.readPendingReaderBootstrap();
-    const { request, floor, tokenFloor, zFinality, precommit, commit, fence, admissionRequest, admissionGrant } = pending;
+    const { request, floor, tokenFloor, zFinality, precommit, commit, fence, admissionRequest, admissionGrant, authorityEpoch, authorityEpochFloor, fenceGenerationFloor } = pending;
     validateReaderVersionFloor(floor);
     validateTokenFloor(tokenFloor);
     validateZFinality(zFinality, request, tokenFloor, precommit);
+    validatePublishedFloors({
+      authorityEpochFloor,
+      fenceGenerationFloor,
+      authorityEpoch,
+      anchorFingerprint: request.anchorFingerprint,
+      request,
+    });
     validateFenceBinding(fence, commit, floor);
     validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
 
@@ -831,6 +974,15 @@ export async function createManagedAuthorityReader({
   };
   const completePendingSuccessor = async (bundle) => {
     const { request, fence, finality, lease, projection, ack, head } = bundle;
+    validatePublishedFloors({
+      authorityEpochFloor: bundle.authorityEpochFloor,
+      fenceGenerationFloor: bundle.fenceGenerationFloor,
+      authorityEpoch: bundle.authorityEpoch,
+      anchorFingerprint: request.anchorFingerprint,
+      request,
+      head,
+    });
+    validateHistoryMarkerSeal(bundle.historyMarker, bundle.historyMarkerSeal, request.anchorFingerprint);
     if (head.phase !== "reader-pending" || request.readerMode !== "bound-reader") return false;
     if (!fence || !finality) throw new Error("SUCCESSOR_PENDING_INVALID");
     if (typeof native.readBotAuthoritySuccessorLiveProof !== "function") throw new Error("BOT_NATIVE_WRITE_REFUSED");
@@ -915,7 +1067,8 @@ export async function createManagedAuthorityReader({
           }
           if (head.phase !== "terminal") return unavailable("MANAGED_AUTHORITY_PENDING");
           if (!isBytes(snapshot.controlRootBytes) || !isBytes(snapshot.wrapperBytes) || !isBytes(snapshot.targetBytes) ||
-              !isBytes(snapshot.historyMarkerBytes) ||
+              !isBytes(snapshot.historyMarkerBytes) || !isBytes(snapshot.historyMarkerSealBytes) ||
+              !isBytes(snapshot.authorityEpochFloorBytes) || !isBytes(snapshot.fenceGenerationFloorBytes) ||
               !isHex64(snapshot.targetIdentity) || !isHex64(snapshot.targetAclFingerprint)) {
             return unavailable("MANAGED_AUTHORITY_INVALID");
           }
@@ -925,6 +1078,9 @@ export async function createManagedAuthorityReader({
             wrapperBytes: Buffer.from(snapshot.wrapperBytes),
             targetBytes: Buffer.from(snapshot.targetBytes),
             historyMarkerBytes: Buffer.from(snapshot.historyMarkerBytes),
+            historyMarkerSealBytes: Buffer.from(snapshot.historyMarkerSealBytes),
+            authorityEpochFloorBytes: Buffer.from(snapshot.authorityEpochFloorBytes),
+            fenceGenerationFloorBytes: Buffer.from(snapshot.fenceGenerationFloorBytes),
             targetIdentity: snapshot.targetIdentity,
             targetAclFingerprint: snapshot.targetAclFingerprint,
             nativeVerified: true,
@@ -942,7 +1098,8 @@ export async function createManagedAuthorityReader({
           !isBytes(snapshot.currentAttestationBytes) || !isBytes(snapshot.currentTokenFloorBytes) ||
           !isBytes(snapshot.attestationHistoryBytes) || !isBytes(snapshot.tokenFloorHistoryBytes) ||
           !isBytes(snapshot.tokenFloorReservationBytes) || !isBytes(snapshot.readerVersionFloorBytes) ||
-          !isBytes(snapshot.historyMarkerBytes) ||
+          !isBytes(snapshot.historyMarkerBytes) || !isBytes(snapshot.historyMarkerSealBytes) ||
+          !isBytes(snapshot.authorityEpochFloorBytes) || !isBytes(snapshot.fenceGenerationFloorBytes) ||
           !isBytes(snapshot.genesisRequestBytes) || !isBytes(snapshot.zFinalityBytes) || !isBytes(snapshot.rvfBytes) ||
           !isBytes(snapshot.receiptBytes) || !isBytes(snapshot.authorityRequestBytes) || !isBytes(snapshot.authorityReceiptBytes) ||
           !isBytes(snapshot.authorityReservationBytes) || !isBytes(snapshot.authorityCommitBytes) || !isBytes(snapshot.authorityBaselineBytes) ||

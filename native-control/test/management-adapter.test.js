@@ -865,6 +865,7 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   const marker = { version: 1, kind: 'managed-history-marker', anchorFingerprint: request.anchorFingerprint, sequence: 1, fenceGeneration: 1, previousMarkerFingerprint: null, markerFingerprint: null };
   marker.markerFingerprint = recordHash(marker, 'markerFingerprint');
   files.set('C:\\state\\.channels.json.managed-history.json', Buffer.from(canonicalJson(marker)));
+  files.set('C:\\state\\.gjc-remote-control\\managed-history-marker-seal.json', Buffer.from(canonicalJson(marker)));
   files.set('C:\\state\\.gjc-remote-control\\token-floor.json', Buffer.from(canonicalJson(genesis.committed)));
   const readerFloor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: request.anchorFingerprint, fenceGeneration: 1, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null };
   readerFloor.floorFingerprint = recordHash(readerFloor, 'floorFingerprint');
@@ -882,6 +883,32 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   };
   fenceFloor.floorFingerprint = recordHash(fenceFloor, 'floorFingerprint');
   files.set('C:\\state\\.gjc-remote-control\\fence-generation-floor.json', Buffer.from(canonicalJson(fenceFloor)));
+  const epochFloor = {
+    version: 1,
+    kind: 'authority-epoch-floor',
+    anchorFingerprint: request.anchorFingerprint,
+    genesisAuthorityEpoch: 1,
+    highestReservedAuthorityEpoch: 2,
+    highestCommittedAuthorityEpoch: 1,
+    lastReservationTxId: request.txId,
+    lastCommittedTxId: genesis.request.genesisTxId,
+    floorFingerprint: null,
+  };
+  epochFloor.floorFingerprint = recordHash(epochFloor, 'floorFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\authority-epoch-floor.json', Buffer.from(canonicalJson(epochFloor)));
+  const authorityEpoch = {
+    version: 1,
+    kind: 'authority-epoch',
+    anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.candidateFenceGeneration,
+    epoch: request.candidateAuthorityEpoch,
+    reservationTxId: request.txId,
+    commitTxId: null,
+    previousAuthorityCommitSnapshotFingerprint: 'a'.repeat(64),
+    authorityEpochFingerprint: null,
+  };
+  authorityEpoch.authorityEpochFingerprint = recordHash(authorityEpoch, 'authorityEpochFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\authority-epoch.json', Buffer.from(canonicalJson(authorityEpoch)));
   await native.writeAuthoritySuccessorRequest(request);
   assert.deepEqual(await native.writeAuthoritySuccessorRequest(request), request);
   await assert.rejects(native.writeAuthoritySuccessorRequest(buildAuthoritySuccessorRecord({ ...request, idempotencyKey: 'conflict', requestFingerprint: null }, 'requestFingerprint')), /replay conflicts/);
