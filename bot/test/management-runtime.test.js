@@ -611,6 +611,12 @@ test('bound successors bind exact candidates, require fresh B proof, and roll fo
   const afterToken = await native.readManagementState();
   assert.equal(afterToken.tokenConfigGeneration, afterMapping.tokenConfigGeneration + 1);
   assert.equal(afterToken.mappingGeneration, afterMapping.mappingGeneration);
+  const tokenFloor = JSON.parse(fileEnding(files, '/token-floor.json'));
+  const tokenAttestation = JSON.parse(fileEnding(files, '/attestation.json'));
+  assert.equal(afterToken.tokenFloor.floorFingerprint, tokenFloor.floorFingerprint);
+  assert.equal(afterToken.tokenFloor.lastAttestationFingerprint, tokenAttestation.attestationFingerprint);
+  assert.equal(afterToken.tokenAttestation.attestationFingerprint, tokenAttestation.attestationFingerprint);
+  assert.equal(afterToken.tokenAttestation.fingerprint, tokenAttestation.tokenConfigHostSetFingerprint);
 });
 test('a second ManagementRuntime adopts only the same stable genesis probe tuple', async () => {
   const harness = adapter();
@@ -789,6 +795,80 @@ test('legacy-retained token rotation leaves target bytes, identity, and ACL immu
   const head = JSON.parse(fileEnding(files, '/authority-head.json'));
   assert.equal(head.phase, 'terminal');
   assert.equal(head.sequence, 2);
+});
+test('legacy-retained token rotations advance only the durable envelope fence chain', async () => {
+  const { files, native } = adapter();
+  const runtime = new ManagementRuntime({ native });
+  const targetBytes = Buffer.from(files.get('C:/state/channels.json'));
+
+  assert.equal((await runtime.execute('genesis', genesisInput('host=secret'))).ok, true);
+  const before = await native.readRetainedTargetProof();
+  const genesisRoot = JSON.parse(fileEnding(files, '/control-root.json'));
+  const genesisWrapper = JSON.parse(fileEnding(files, '/legacy-retained.json'));
+  assert.equal(genesisRoot.fenceGeneration, 1);
+  assert.equal(genesisWrapper.fenceGeneration, 1);
+  assert.equal(genesisWrapper.previousWrapperFingerprint, null);
+
+  const first = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner, actorSecret: secret, hostTokens: 'host=rotated-secret',
+    idempotencyKey: 'legacy-retained-token-rotation-1',
+  });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const firstRoot = JSON.parse(fileEnding(files, '/control-root.json'));
+  const firstWrapper = JSON.parse(fileEnding(files, '/legacy-retained.json'));
+  assert.equal(firstRoot.fenceGeneration, 2);
+  assert.equal(firstWrapper.fenceGeneration, 2);
+  assert.equal(firstWrapper.previousWrapperFingerprint, genesisWrapper.wrapperFingerprint);
+  assert.notEqual(firstRoot.controlRootFingerprint, genesisRoot.controlRootFingerprint);
+  assert.notEqual(firstWrapper.wrapperFingerprint, genesisWrapper.wrapperFingerprint);
+
+  const second = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner, actorSecret: secret, hostTokens: 'host=rotated-secret-2',
+    idempotencyKey: 'legacy-retained-token-rotation-2',
+  });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  const secondRoot = JSON.parse(fileEnding(files, '/control-root.json'));
+  const secondWrapper = JSON.parse(fileEnding(files, '/legacy-retained.json'));
+  assert.equal(secondRoot.fenceGeneration, 3);
+  assert.equal(secondWrapper.fenceGeneration, 3);
+  assert.equal(secondWrapper.previousWrapperFingerprint, firstWrapper.wrapperFingerprint);
+  assert.equal(secondRoot.wrapperFingerprint, secondWrapper.wrapperFingerprint);
+  assert.equal(secondWrapper.routeDisposition, 'no-route');
+  assert.notEqual(secondRoot.controlRootFingerprint, firstRoot.controlRootFingerprint);
+  assert.notEqual(secondWrapper.wrapperFingerprint, firstWrapper.wrapperFingerprint);
+
+  const after = await native.readRetainedTargetProof();
+  assert.equal(after.fenceGeneration, 3);
+  assert.deepEqual(after.targetBytes, targetBytes);
+  assert.equal(after.targetFingerprint, before.targetFingerprint);
+  assert.equal(after.identityFingerprint, before.identityFingerprint);
+  assert.equal(after.aclFingerprint, before.aclFingerprint);
+  assert.equal((await native.readManagementState()).tokenConfigGeneration, 3);
+  const floor = JSON.parse(fileEnding(files, '/token-floor.json'));
+  assert.equal(floor.fenceGeneration, 3);
+  assert.equal(JSON.parse(fileEnding(files, '/authority-head.json')).sequence, 3);
+});
+test('legacy-retained token rotation refuses a stale management fence without writes', async () => {
+  const { files, native } = adapter();
+  const runtime = new ManagementRuntime({ native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=secret'))).ok, true);
+  const statePath = [...files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/management-state.json'));
+  assert.ok(statePath);
+  const state = await native.readManagementState();
+  const root = JSON.parse(fileEnding(files, '/control-root.json'));
+  files.set(statePath, Buffer.from(canonicalJson({ ...state, fenceGeneration: root.fenceGeneration - 1 })));
+  const writesBefore = files.size;
+  await assert.rejects(native.rotateTokenSidecar({
+    generation: state.tokenConfigGeneration + 1,
+    revision: state.revision + 1,
+    authorityEpoch: state.authorityEpoch + 1,
+    mappingGeneration: state.mappingGeneration,
+    fenceGeneration: root.fenceGeneration + 1,
+    hostSetFingerprint: 'a'.repeat(64),
+  }), /legacy token rotation counters are not the durable successor/);
+  assert.equal(files.size, writesBefore);
+  const wrapper = JSON.parse(fileEnding(files, '/legacy-retained.json'));
+  assert.equal(wrapper.fenceGeneration, root.fenceGeneration);
 });
 test('public recover refuses when no durable successor head is active', async () => {
   const { runtime, setPrincipal } = await boundReaderRuntime();
@@ -979,6 +1059,44 @@ test('missing post-Genesis fence floor converges to no-route manual cleanup with
   assert.equal(state.fenceGeneration, before.fenceGeneration);
   assert.equal([...fixture.files.keys()].some((path) => path.replaceAll('\\', '/').endsWith('/fence-generation-floor.json')), false);
   assert.ok(fileEnding(fixture.files, '/terminal-close.json'));
+});
+test('public recover persists transaction-bound cleanup when successor marker or reader floor is missing', async () => {
+  const markerFixture = await terminalMappingSuccessorFixture();
+  setSuccessorHeadPhase(markerFixture, 'reader-pending');
+  const markerPath = [...markerFixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('.managed-history.json'));
+  assert.ok(markerPath);
+  markerFixture.files.delete(markerPath);
+  const markerResult = await new ManagementRuntime({ native: markerFixture.native }).execute('recover', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'recoverable-mapping-key',
+  });
+  assert.equal(markerResult.error, 'MANUAL_CLEANUP_REQUIRED', JSON.stringify(markerResult));
+  const markerState = await markerFixture.native.readManagementState();
+  assert.equal(markerState.recovery.phase, 'manual_cleanup');
+  assert.equal(markerState.recovery.txId, markerFixture.successor.txId);
+  assert.equal(markerState.recovery.routeDisposition, 'no-route');
+  assert.ok(fileEnding(markerFixture.files, '/terminal-close.json'));
+
+  const floorFixture = await boundReaderRuntime();
+  floorFixture.setPrincipal(owner);
+  const before = await floorFixture.native.readManagementState();
+  const candidate = mappingInput('missing-reader-floor-map');
+  const started = await floorFixture.runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'missing-reader-floor-successor',
+    mappingId: candidate.mapping.mappingId, ...candidate, expectedRevision: before.revision, expectedFingerprint: null,
+  });
+  assert.equal(started.pending, true, JSON.stringify(started));
+  const floorPath = [...floorFixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/reader-version-floor.json'));
+  assert.ok(floorPath);
+  floorFixture.files.delete(floorPath);
+  const floorResult = await floorFixture.runtime.execute('recover', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'missing-reader-floor-successor',
+  });
+  assert.equal(floorResult.error, 'MANUAL_CLEANUP_REQUIRED', JSON.stringify(floorResult));
+  const floorState = await floorFixture.native.readManagementState();
+  assert.equal(floorState.recovery.phase, 'manual_cleanup');
+  assert.equal(floorState.recovery.txId, started.txId);
+  assert.equal(floorState.recovery.routeDisposition, 'no-route');
+  assert.ok(fileEnding(floorFixture.files, '/terminal-close.json'));
 });
 test('public recover rejects a conflicting key with transaction-bound no-route cleanup', async () => {
   const fixture = await terminalSuccessorFixture();

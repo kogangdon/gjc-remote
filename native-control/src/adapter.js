@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isPrincipal } from '@gjc-remote/shared/identity';
 import { basename as pathBasename, dirname as pathDirname, join as pathJoin, sep as pathSep, win32 as win32Path } from 'node:path';
 import { advanceReaderVersionFloor, buildAttestedTokenFloorProof, commitTokenFloor, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from '@gjc-remote/shared/genesis-envelope';
-import { createGenesisEmptyChannels, isManagedV1Wrapper, validateManagedMappingRecord, validateManagedRouteRecord, validateManagedChannelsV2, validateManagementEnvelope } from '@gjc-remote/shared/mapping-envelope';
+import { createGenesisEmptyChannels, isLegacyRetainedWrapper, isManagedV1Wrapper, validateManagedMappingRecord, validateManagedRouteRecord, validateManagedChannelsV2, validateManagementEnvelope } from '@gjc-remote/shared/mapping-envelope';
 import { buildMappingRecoveryRecords, validateManualCleanup, validateMappingRecoveryRecords } from '@gjc-remote/shared/recovery-envelope';
 import { canCleanGenesisScratch, fingerprintGenesisProbe, transitionGenesisProspectiveProbe, validateGenesisProspectiveProbe } from '@gjc-remote/shared/genesis-probe';
 import { validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGrant, validateAdmissionRequest, validateFinalityProof } from '@gjc-remote/shared/admission-envelope';
@@ -618,13 +618,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     });
     const baselineGenesisTxId = successorBaseline ? baseline.rootGenesisTxId : baseline.genesisTxId;
     const baselineGeneration = successorBaseline ? baseline.tokenConfigGeneration : baseline.generation;
-    const legacyRetainedEnvelope = successorBaseline !== null &&
-      control.sourceKind === 'legacy-retained' &&
-      baseline.targetState === 'legacy-retained' &&
-      control.fenceGeneration === successorRequest.previousFenceGeneration &&
-      wrapper?.fenceGeneration === successorRequest.previousFenceGeneration &&
-      target.fenceGeneration === successorRequest.previousFenceGeneration;
-    if (!envelope.ok || !wrapperProof || control.controlRootFingerprint !== controlProof.value.controlRootFingerprint ||
+    const legacyChainOriginValid = control.sourceKind !== 'legacy-retained' ||
+      (control.fenceGeneration === 1 ? wrapper?.previousWrapperFingerprint === null : hex(wrapper?.previousWrapperFingerprint));
+    if (!envelope.ok || !wrapperProof || !legacyChainOriginValid || control.controlRootFingerprint !== controlProof.value.controlRootFingerprint ||
         (!pendingStatePredecessor && state.fenceGeneration !== baseline.fenceGeneration) ||
         wrapper.routeDisposition !== 'no-route' || baselineGenesisTxId !== genesisTxId ||
         transaction.fenceGeneration !== baseline.fenceGeneration || baseline.anchorFingerprint !== commit.anchorFingerprint ||
@@ -637,7 +633,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         baseline.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint ||
         control.readerVersionFloorFingerprint !== floor.floorFingerprint ||
         control.anchorFingerprint !== floor.anchorFingerprint ||
-        (!legacyRetainedEnvelope && control.fenceGeneration !== baseline.fenceGeneration) ||
+        control.fenceGeneration !== baseline.fenceGeneration ||
         floor.anchorFingerprint !== baseline.anchorFingerprint ||
         control.sourceKind !== (['legacy-retained', 'legacy-unmigrated'].includes(baseline.targetState) ? 'legacy-retained' : 'managed-v1')) {
       throw new TypeError('live publication authority relation');
@@ -821,7 +817,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const envelope = validateManagementEnvelope(control, wrapper, {
         targetBytes: target.bytes, targetIdentity: target.targetIdentity, targetAclFingerprint: target.targetAclFingerprint,
       });
-      if (!envelope.ok || !controlProof || !wrapperProof ||
+      const legacyChainOriginValid = control?.sourceKind !== 'legacy-retained' ||
+        (control.fenceGeneration === 1 ? wrapper?.previousWrapperFingerprint === null : hex(wrapper?.previousWrapperFingerprint));
+      if (!envelope.ok || !controlProof || !wrapperProof || !legacyChainOriginValid ||
           request.requestFingerprint !== precommit.requestFingerprint ||
           reservation.floorFingerprint !== precommit.reservationFingerprint ||
           attestedProof.attestedProofFingerprint !== precommit.attestedProofFingerprint ||
@@ -859,9 +857,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const wrapper = control?.wrapperRelativeName && await read(join(root, control.wrapperRelativeName));
     const target = control && await targetProof({ sourceKind: control.sourceKind });
     const authorityEpoch = await read(path('authority-epoch'));
-    const liveFenceGeneration = control?.sourceKind === 'legacy-retained'
-      ? request.previousFenceGeneration
-      : request.candidateFenceGeneration;
+    const liveFenceGeneration = request.candidateFenceGeneration;
     try {
       validateAuthoritySuccessorRequest(request);
       validateAuthoritySuccessorFinality(finality, request);
@@ -1134,8 +1130,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       await assertManagementStateCounters(state);
       const current = await read(path('management-state'));
-      if (manualCleanup && (!current || state.fenceGeneration !== current.fenceGeneration)) {
-        refused('write_management_state', 'manual cleanup state cannot advance a missing fence floor');
+      if (manualCleanup && (!current || state.fenceGeneration < current.fenceGeneration ||
+          (state.fenceGeneration > current.fenceGeneration && fenceFloor === null))) {
+        refused('write_management_state', 'manual cleanup state cannot rewind or outrun the durable fence floor');
       }
       if ((current?.revision ?? 0) !== expected) return false;
       if (manualCleanup) {
@@ -2823,6 +2820,53 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         };
         snapshot.configFingerprint = recordFingerprint(snapshot, 'configFingerprint');
         await publishManagedSnapshot(snapshot);
+      } else if (controlRoot?.sourceKind === 'legacy-retained') {
+        const state = await read(path('management-state'));
+        if (!state ||
+            state.fenceGeneration !== controlRoot.fenceGeneration ||
+            record.generation !== state.tokenConfigGeneration + 1 ||
+            record.revision !== state.revision + 1 ||
+            record.authorityEpoch !== state.authorityEpoch + 1 ||
+            record.mappingGeneration !== state.mappingGeneration) {
+          refused('rotate_token_sidecar', 'legacy token rotation counters are not the durable successor');
+        }
+        const predecessor = await this.readRetainedTargetProof();
+        if (predecessor.fenceGeneration !== controlRoot.fenceGeneration) {
+          refused('rotate_token_sidecar', 'legacy target fence is not the durable predecessor');
+        }
+        const wrapper = await read(join(root, controlRoot.wrapperRelativeName));
+        if (!isLegacyRetainedWrapper(wrapper) ||
+            controlRoot.wrapperFingerprint !== wrapper.wrapperFingerprint ||
+            controlRoot.fenceGeneration !== wrapper.fenceGeneration ||
+            record.fenceGeneration !== controlRoot.fenceGeneration + 1 ||
+            !validateManagementEnvelope(controlRoot, wrapper, {
+              targetBytes: predecessor.targetBytes,
+              targetIdentity: predecessor.identityFingerprint,
+              targetAclFingerprint: predecessor.aclFingerprint,
+            }).ok) {
+          refused('rotate_token_sidecar', 'legacy envelope predecessor is not an exact durable fence');
+        }
+        const nextWrapper = {
+          ...wrapper,
+          fenceGeneration: record.fenceGeneration,
+          previousWrapperFingerprint: wrapper.wrapperFingerprint,
+          wrapperFingerprint: null,
+        };
+        nextWrapper.wrapperFingerprint = recordFingerprint(nextWrapper, 'wrapperFingerprint');
+        if (!isLegacyRetainedWrapper(nextWrapper)) {
+          refused('rotate_token_sidecar', 'legacy envelope successor is invalid');
+        }
+        await publishEnvelope(nextWrapper);
+        const successor = await this.readRetainedTargetProof();
+        if (successor.fenceGeneration !== record.fenceGeneration ||
+            !successor.targetBytes.equals(predecessor.targetBytes) ||
+            successor.identityFingerprint !== predecessor.identityFingerprint ||
+            successor.aclFingerprint !== predecessor.aclFingerprint ||
+            successor.targetFingerprint !== predecessor.targetFingerprint) {
+          refused('rotate_token_sidecar', 'legacy target bytes or native identity changed during envelope rotation');
+        }
+      } else {
+        refused('rotate_token_sidecar', 'management envelope source is unsupported');
       }
       await writeAuthority('token-sidecar', record);
     },
@@ -3566,6 +3610,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       }).ok) {
         refused('read_retained_target_proof', 'retained target envelope is absent or not an exact target proof');
       }
+      if (control.sourceKind === 'legacy-retained' &&
+          ((control.fenceGeneration === 1 && wrapper.previousWrapperFingerprint !== null) ||
+           (control.fenceGeneration > 1 && !hex(wrapper.previousWrapperFingerprint)))) {
+        refused('read_retained_target_proof', 'legacy envelope fence chain origin is invalid');
+      }
       let snapshot = null;
       if (control.sourceKind === 'managed-v1') {
         try { snapshot = validateManagementSnapshot(parseCanonicalJsonBytes(target.bytes)); } catch { refused('read_retained_target_proof', 'retained managed target is invalid'); }
@@ -3597,10 +3646,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const candidateTargetMatches = candidate.targetFingerprint === bundle.finality.targetFingerprint &&
         candidate.identityFingerprint === bundle.finality.targetIdentityFingerprint &&
         candidate.aclFingerprint === bundle.finality.targetAclFingerprint &&
+        candidate.wrapperFingerprint === bundle.finality.wrapperFingerprint &&
+        candidate.controlRootFingerprint === bundle.finality.controlRootFingerprint &&
         candidate.snapshotFingerprint === bundle.request.candidateSnapshotFingerprint &&
         (legacyRetained
           ? candidate.sourceKind === 'legacy-retained' &&
-            candidate.fenceGeneration === bundle.request.previousFenceGeneration &&
+            candidate.fenceGeneration === bundle.request.candidateFenceGeneration &&
             candidate.targetFingerprint === bundle.request.candidateTargetFingerprint
           : candidate.sourceKind === 'managed-v1' &&
             candidate.fenceGeneration === bundle.request.candidateFenceGeneration &&
@@ -3626,6 +3677,13 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         headFingerprint: bundle.head.headFingerprint,
         phaseRecordFingerprint: bundle.finality.finalityFingerprint,
       };
+    },
+    async readAuthoritySuccessorHeadRaw() {
+      await requireManagementPrincipal('read_authority_successor_head_raw');
+      const value = await read(path('authority-head'));
+      if (value === null) return null;
+      try { validateAuthoritySuccessorHead(value); } catch { refused('read_authority_successor_head_raw', 'successor head is invalid'); }
+      return value;
     },
     async readAuthoritySuccessorHead() {
       const value = await read(path('authority-head'));

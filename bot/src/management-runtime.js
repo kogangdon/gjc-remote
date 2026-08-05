@@ -1044,16 +1044,24 @@ export class ManagementRuntime {
     if (["mapping-reconcile", "mapping-revoke", "mapping-rollback", "recover"].includes(command)) return this.#mappingMutation(command, input);
     throw new Error("COMMAND_INVALID");
   }
-  #assertLegacyRetainedPredecessor(request, proof) {
+  #assertLegacyRetainedPredecessor(request, proof, finality = null) {
+    const predecessorEnvelope =
+      proof?.fenceGeneration === request.previousFenceGeneration &&
+      proof.wrapperFingerprint === request.previousWrapperFingerprint;
+    const successorEnvelope =
+      finality !== null &&
+      proof?.fenceGeneration === request.candidateFenceGeneration &&
+      proof.wrapperFingerprint === finality.wrapperFingerprint &&
+      proof.controlRootFingerprint === finality.controlRootFingerprint;
     if (request.targetState !== "legacy-retained" ||
         proof?.sourceKind !== "legacy-retained" ||
         !Buffer.isBuffer(proof.targetBytes) ||
-        proof.fenceGeneration !== request.previousFenceGeneration ||
+        (!predecessorEnvelope && !successorEnvelope) ||
         proof.targetFingerprint !== request.previousTargetFingerprint ||
-        proof.wrapperFingerprint !== request.previousWrapperFingerprint ||
         proof.snapshotFingerprint !== request.previousSnapshotFingerprint ||
         !/^[a-f0-9]{64}$/.test(proof.identityFingerprint) ||
-        !/^[a-f0-9]{64}$/.test(proof.aclFingerprint)) {
+        !/^[a-f0-9]{64}$/.test(proof.aclFingerprint) ||
+        !/^[a-f0-9]{64}$/.test(proof.controlRootFingerprint)) {
       throw new Error("SUCCESSOR_RECOVERY_EVIDENCE_INVALID");
     }
     return proof;
@@ -1101,6 +1109,15 @@ export class ManagementRuntime {
         recovery.candidateState.configFingerprint !== recovery.candidateConfigFingerprint) {
       throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
     }
+    const lineage = await this.native.readSuccessorTokenLineage();
+    if (lineage.floor.floorFingerprint !== finality.tokenFloorFingerprint ||
+        lineage.floor.highestCommittedGeneration !== finality.tokenConfigGeneration ||
+        lineage.floor.lastAttestationFingerprint !== lineage.attestation.attestationFingerprint ||
+        lineage.attestation.attestationFingerprint !== finality.attestationFingerprint ||
+        lineage.attestation.tokenConfigGeneration !== finality.tokenConfigGeneration ||
+        lineage.attestation.tokenConfigHostSetFingerprint !== bundle.baseline.tokenConfigHostSetFingerprint) {
+      throw new Error("SUCCESSOR_TOKEN_LINEAGE_INVALID");
+    }
     const receipt = buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-receipt", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId,
       operation: request.operation, requestFingerprint: request.requestFingerprint, previousReceiptFingerprint: request.previousReceiptFingerprint,
@@ -1127,6 +1144,13 @@ export class ManagementRuntime {
     state.mappings = structuredClone(recovery.candidateState.mappings);
     state.routes = structuredClone(recovery.candidateState.routes);
     state.admission = { phase: "closed", finalityFingerprint: null };
+    state.tokenFloor = structuredClone(lineage.floor);
+    state.tokenAttestation = {
+      fingerprint: lineage.attestation.tokenConfigHostSetFingerprint,
+      generation: lineage.attestation.tokenConfigGeneration,
+      attestationFingerprint: lineage.attestation.attestationFingerprint,
+      finalityFingerprint: lineage.floor.floorFingerprint,
+    };
     state.fenceGeneration = finality.fenceGeneration;
     state.recovery = { phase: "terminal", txId, fenceGeneration: finality.fenceGeneration, finalityFingerprint: finality.finalityFingerprint };
     if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
@@ -1149,7 +1173,7 @@ export class ManagementRuntime {
     }
     const { request, finality, baseline, head } = successor;
     const legacyRetained = request.targetState === "legacy-retained";
-    const retained = legacyRetained ? this.#assertLegacyRetainedPredecessor(request, await this.native.readRetainedTargetProof()) : null;
+    const retained = legacyRetained ? this.#assertLegacyRetainedPredecessor(request, await this.native.readRetainedTargetProof(), finality) : null;
     const recovery = await this.native.readSuccessorRecovery({
       predecessorReceiptFingerprint: request.previousReceiptFingerprint,
     });
@@ -1164,7 +1188,7 @@ export class ManagementRuntime {
         recovery.phase !== "reader-pending" ||
         recovery.headFingerprint !== head.headFingerprint ||
         recovery.phaseRecordFingerprint !== finality.finalityFingerprint ||
-        (legacyRetained ? recovery.fenceGeneration !== request.previousFenceGeneration : recovery.fenceGeneration !== finality.fenceGeneration) ||
+        recovery.fenceGeneration !== finality.fenceGeneration ||
         (legacyRetained
           ? (!Buffer.isBuffer(recovery.candidateTargetBytes) ||
              !recovery.candidateTargetBytes.equals(retained.targetBytes) ||
@@ -1253,7 +1277,7 @@ export class ManagementRuntime {
       }
       const retained = await this.native.readRetainedTargetProof();
       if (retained.sourceKind === "legacy-retained") {
-        this.#assertLegacyRetainedPredecessor(bundle.request, retained);
+        this.#assertLegacyRetainedPredecessor(bundle.request, retained, bundle.finality);
         if (operation !== "tokens-attest") throw new Error("RECOVERY_INPUT_MISMATCH_LEGACY");
       } else if (retained.sourceKind === "managed-v1") {
         if (bundle.request.targetState === "legacy-retained") throw new Error("RECOVERY_INPUT_MISMATCH_SOURCE");
@@ -1831,7 +1855,7 @@ export class ManagementRuntime {
     if (typeof input.idempotencyKey !== "string" || input.idempotencyKey.length === 0) {
       throw new Error("IDEMPOTENCY_KEY_REQUIRED");
     }
-    const head = await this.native.readAuthoritySuccessorHead();
+    const head = await this.native.readAuthoritySuccessorHeadRaw();
     if (head === null) throw new Error("RECOVERY_REQUIRED");
     const recovery = {
       txId: head.txId,
