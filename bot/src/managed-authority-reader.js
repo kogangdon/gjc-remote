@@ -60,6 +60,7 @@ function validateCommittedLineage(attestation, floor, anchorFingerprint) {
   if (floor.floorPhase !== "committed" ||
       attestation.anchorFingerprint !== anchorFingerprint ||
       floor.anchorFingerprint !== anchorFingerprint ||
+      attestation.fenceGeneration !== floor.fenceGeneration ||
       floor.highestReservedGeneration !== attestation.tokenConfigGeneration ||
       floor.highestCommittedGeneration !== attestation.tokenConfigGeneration ||
       floor.lastReservationTxId !== attestation.txId ||
