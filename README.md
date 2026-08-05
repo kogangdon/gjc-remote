@@ -9,6 +9,11 @@ Discord-controlled remote GJC sessions.
 > bot ships fail-closed (`GJC_REMOTE_REQUIRE_ALLOWLIST=1`) and refuses to start
 > with an empty allowlist. See [SECURITY.md](SECURITY.md) before exposing it to
 > anyone else.
+>
+> Management mapping control-plane operations are documented in
+> [`docs/management-mapping-envelope.md`](docs/management-mapping-envelope.md).
+> They require a verified native capability; native serving and readiness remain
+> blocked and are outside #44.
 
 ## Architecture
 
@@ -62,7 +67,13 @@ option (tracked in #33).
 ## Setup
 
 ```bash
-bun install   # installs all workspaces (bot, daemon, shared) from bun.lock
+bun install   # installs all workspaces (bot, daemon, shared, native-control) from bun.lock
+
+# The management authority CLI (not native serving) requires native-control.
+# Issue #44 management writes require a C++ toolchain, Node headers, and the
+# platform ACL dependencies. The verified addon manifest and platform-specific
+# retained-handle/ACL/no-follow/durability probes must pass before any write;
+# there is no portable filesystem fallback.
 
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS

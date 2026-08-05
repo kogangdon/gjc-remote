@@ -3,5 +3,19 @@
   "version": "0.2.4",
   "private": true,
   "type": "module",
-  "main": "protocol.js"
+  "main": "protocol.js",
+  "exports": {
+    ".": "./protocol.js",
+    "./admission-envelope": "./admission-envelope.js",
+    "./genesis-envelope": "./genesis-envelope.js",
+    "./genesis-probe": "./genesis-probe.js",
+    "./identity": "./identity.js",
+    "./mapping-envelope": "./mapping-envelope.js",
+    "./protocol": "./protocol.js",
+    "./publication-envelope": "./publication-envelope.js",
+    "./recovery-envelope": "./recovery-envelope.js",
+    "./strict-json": "./strict-json.js",
+    "./successor-envelope": "./successor-envelope.js",
+    "./*": "./*"
+  }
 }

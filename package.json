@@ -12,6 +12,7 @@
   "workspaces": [
     "bot",
     "daemon",
+    "native-control",
     "shared"
   ]
 }

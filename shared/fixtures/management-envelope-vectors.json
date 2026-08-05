@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "encoding": "utf-8",
+  "vectors": [
+    {
+      "name": "tokenFloorReserved",
+      "canonicalJson": "{\"anchorFingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attestedProofFingerprint\":null,\"floorFingerprint\":\"9e509cf80ba732b9c9c811ab46c39572f125b465d8006cd93e6cf5ea202443c2\",\"floorPhase\":\"reserved\",\"genesisGeneration\":1,\"highestCommittedGeneration\":0,\"highestReservedGeneration\":1,\"kind\":\"token-generation-floor\",\"lastAttestationFingerprint\":null,\"lastCommittedTxId\":null,\"lastReservationTxId\":\"g\",\"version\":1}",
+      "sha256": "2d154013da09c7c07ce0f742ca4f9e073a2dbbf847d917914a1d341f998bc8fb"
+    },
+    {
+      "name": "tokenFloorAttestedProof",
+      "canonicalJson": "{\"attestationFingerprint\":\"0a46154ffe5c7e4826e0e62e3709257b09a219ce376f65e22ea3fa2d51f57932\",\"attestedProofFingerprint\":\"bd1911081a109e5f0e98ff0fe32a76b4a0d4bbb2adbbf037ce25374193a6e191\",\"generation\":1,\"genesisTxId\":\"g\",\"kind\":\"attested-token-floor-proof\",\"reservationFingerprint\":\"9e509cf80ba732b9c9c811ab46c39572f125b465d8006cd93e6cf5ea202443c2\",\"version\":1}",
+      "sha256": "4438b02ca6e9a5328af4bc3fcf0f7d477e4d7f49ec9b32a0c5f37b723f1b66ce"
+    },
+    {
+      "name": "tokenFloorAttested",
+      "canonicalJson": "{\"anchorFingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attestedProofFingerprint\":\"bd1911081a109e5f0e98ff0fe32a76b4a0d4bbb2adbbf037ce25374193a6e191\",\"floorFingerprint\":\"50cac1a65edd71d26e4a8aec3d2a3f5916f73dd415fb4f40c2b218e494631173\",\"floorPhase\":\"attested\",\"genesisGeneration\":1,\"highestCommittedGeneration\":0,\"highestReservedGeneration\":1,\"kind\":\"token-generation-floor\",\"lastAttestationFingerprint\":null,\"lastCommittedTxId\":null,\"lastReservationTxId\":\"g\",\"version\":1}",
+      "sha256": "b6c27acb9daf696086c23a9779efadcf842379b108f11cea1e5d0e6dcf3d11a9"
+    },
+    {
+      "name": "tokenFloorCommitted",
+      "canonicalJson": "{\"anchorFingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"attestedProofFingerprint\":\"bd1911081a109e5f0e98ff0fe32a76b4a0d4bbb2adbbf037ce25374193a6e191\",\"floorFingerprint\":\"0ad529b6a19e719c0f0492d5fa54289a9b70b5eb37d6e1dcd207e39e76a33c0f\",\"floorPhase\":\"committed\",\"genesisGeneration\":1,\"highestCommittedGeneration\":1,\"highestReservedGeneration\":1,\"kind\":\"token-generation-floor\",\"lastAttestationFingerprint\":\"0a46154ffe5c7e4826e0e62e3709257b09a219ce376f65e22ea3fa2d51f57932\",\"lastCommittedTxId\":\"g\",\"lastReservationTxId\":\"g\",\"version\":1}",
+      "sha256": "7f46bfde2f6868c5f3d10645179e2ee3b3d8393dbad18270562b9514556bf461"
+    },
+    {
+      "name": "zf",
+      "canonicalJson": "{\"anchorFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"attestationFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"authorityEpochFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"checkpointFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"finalityFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":1,\"genesisTxId\":\"g\",\"kind\":\"genesis-finality\",\"precommitFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"publicationKFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"publicationYFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"tokenFloorFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"version\":1,\"zFinalityFingerprint\":\"90d097fcbfe7a78acf4874aa4cca555fe055f974eefe52d5b972fbf065f9f63b\"}",
+      "sha256": "c50b9c06bdd47c6771d5061101c17b4811b1a9f7c23032ee62648487a8157450"
+    },
+    {
+      "name": "noReaderFP",
+      "canonicalJson": "{\"ackFingerprint\":null,\"finalityProofFingerprint\":\"afc72f900ff04f9522f00e6c0535d3cca626d0c4dde90d136061193a462c2247\",\"generation\":1,\"genesisTxId\":\"g\",\"kind\":\"finality-proof\",\"readerProjectionFingerprint\":null,\"routeFingerprint\":\"no-route\",\"version\":1,\"zFinalityFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}",
+      "sha256": "8d38c532d237e87ecd02b4d474b3ca6d68e7b95c1558c1dd91054729cb73ce5e"
+    },
+    {
+      "name": "boundFP",
+      "canonicalJson": "{\"ackFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"finalityProofFingerprint\":\"655bef8ae9a63d7f44d2ce08cdda9a87a9f394c011429721b6a4df1fd1c17072\",\"generation\":1,\"genesisTxId\":\"g\",\"kind\":\"finality-proof\",\"readerProjectionFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"routeFingerprint\":\"route\",\"version\":1,\"zFinalityFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}",
+      "sha256": "0fa697d8b81f77e2233964ddc13e68e2dc3e0be24ccccafc4bcd133d7896b3d1"
+    },
+    {
+      "name": "noReaderGRR",
+      "canonicalJson": "{\"ackFingerprint\":null,\"finalityProofFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":1,\"genesisTxId\":\"g\",\"kind\":\"genesis-receipt\",\"phase\":\"terminal\",\"readerInstanceId\":null,\"readerProjectionFingerprint\":null,\"readerStartNonce\":null,\"receiptFingerprint\":\"61f1e3fdcbb8dc75ee50ca982ab5b127670b1571cb31dfc603f4704511822301\",\"requestedReaderMode\":\"no-reader\",\"version\":1}",
+      "sha256": "ed3a342f908dcc61bb29dec4ab87b966b6423c42154b57af1a83d862cc894167"
+    },
+    {
+      "name": "boundGRR",
+      "canonicalJson": "{\"ackFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"finalityProofFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":1,\"genesisTxId\":\"g\",\"kind\":\"genesis-receipt\",\"phase\":\"terminal\",\"readerInstanceId\":\"reader\",\"readerProjectionFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"readerStartNonce\":\"start\",\"receiptFingerprint\":\"a8daf237192f3f8f4295833eb552fd1ab923a75870eb90130fe55c8aa89da028\",\"requestedReaderMode\":\"handshake\",\"version\":1}",
+      "sha256": "9533a29c2dc14ec9b02bdd2738e6c9d705c26c161759eee3bdd71d386ef72f8c"
+    },
+    {
+      "name": "authorityReceipt",
+      "canonicalJson": "{\"anchorFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"authorityCommitSnapshotFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"generation\":1,\"genesisTxId\":\"g\",\"kind\":\"genesis-authority-receipt\",\"readerVersionFloorFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"receiptFingerprint\":\"203f23976990048029055b499ee6124416f7d698f0baa062a84bb324fedf74f9\",\"requestFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"sequence\":2,\"version\":1}",
+      "sha256": "10a73eb63f19a51d8334a2a3910b95282c0157bd576595f6f07831194905d0e7"
+    },
+    {
+      "name": "manualCleanup",
+      "canonicalJson": "{\"anchorFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"blockedUntilOwnerAction\":true,\"expectedFingerprint\":null,\"expectedFloorFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"kind\":\"manual-cleanup\",\"manualCleanupFingerprint\":\"9f700a6ee3e09840fc089db236e91aa1131e21f640137e14485a37145c5e28f3\",\"observedFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"observedFloorFingerprint\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"reason\":\"fingerprint-mismatch\",\"routeDisposition\":\"no-route\",\"txId\":\"g\",\"version\":1}",
+      "sha256": "b20dec6ffdbe4439758a8558e45679c0476922aa8b7701a3b891535538c7628f"
+    }
+  ]
+}

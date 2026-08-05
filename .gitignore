@@ -8,3 +8,4 @@ channels.json
 .gjc-bot-sessions/
 .gjc/
 *.log
+native-control/build/

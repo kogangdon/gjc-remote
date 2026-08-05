@@ -1,0 +1,28 @@
+{
+  "name": "@gjc-remote/native-control",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/public.js",
+  "exports": {
+    ".": "./src/public.js"
+  },
+  "nativeControlContract": {
+    "version": 1,
+    "napi": 8,
+    "platforms": ["linux-x64", "linux-arm64", "win32-x64"]
+  },
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "node-gyp rebuild && node scripts/verify-build.mjs --write-manifest",
+    "verify-build": "node scripts/verify-build.mjs",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@gjc-remote/shared": "*"
+  },
+  "devDependencies": {
+    "node-gyp": "11.2.0"
+  },
+  "gypfile": true
+}
