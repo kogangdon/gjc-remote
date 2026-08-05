@@ -1819,8 +1819,9 @@ napi_value OpenVerifiedObjectHandle(napi_env env, napi_callback_info info) {
   if (!SafeName(name)) { Refuse(env, "open_verified_object_handle", "object name must be one path component"); return nullptr; }
   auto* value = new VerifiedHandle();
 #ifdef _WIN32
-  value->path = (std::filesystem::u8path(parent->path) / name).u8string();
-  value->handle = OpenNoFollowFile(value->path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE);
+  value->handle = OpenWindowsRelative(parent->handle, Wide(name),
+      GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE, kFileOpen,
+      VerifiedObjectType::File);
   if (value->handle == INVALID_HANDLE_VALUE) { delete value; napi_value absent; napi_get_null(env, &absent); return absent; }
 #else
   value->fd = openat(parent->fd, name.c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
