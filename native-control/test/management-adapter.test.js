@@ -573,6 +573,38 @@ test('terminal replay requires an immutable terminalization suffix, not phase an
   });
   assert.equal(calls.length, writes);
 });
+test('terminal replay CAS rejects a complete-state mismatch without writes', async () => {
+  const { files, roles, lowLevel, calls } = fake();
+  const configPath = 'C:/state/channels.json';
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  const request = records().request;
+  await native.probeProspectiveCleanup({
+    txId: request.genesisTxId,
+    targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid },
+    botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64),
+    botProvisioningFingerprint: 'c'.repeat(64),
+    recoveryProvisioningFingerprint: 'd'.repeat(64),
+  });
+  await native.terminalCloseOrManualCleanup({ reason: 'state-replay-mismatch' });
+  const writes = calls.length;
+  const current = {
+    revision: 0,
+    authorityEpoch: 0,
+    fenceGeneration: 1,
+    tokenConfigGeneration: 0,
+    mappingGeneration: 0,
+    recovery: { phase: 'terminal', txId: 'state-replay-mismatch' },
+    completeState: 'durable',
+  };
+  files.set('C:\\state\\.gjc-remote-control\\management-state.json', Buffer.from(canonicalJson(current)));
+  const before = new Map(files);
+  await assert.rejects(native.compareAndSwapManagementState(0, { ...current, completeState: 'substituted' }), /immutable terminal replay evidence/);
+  assert.deepEqual(files, before);
+  assert.equal(calls.length, writes);
+});
 
 test('fails closed before replacement when a retained authority ACL drifts', async () => {
   const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
@@ -934,6 +966,11 @@ test('managed history marker loss is terminal and marker rewinds are write-free'
   const sealPath = 'C:\\state\\.gjc-remote-control\\managed-history-marker-seal.json';
   assert.ok(files.has(markerPath));
   assert.ok(files.has(sealPath));
+  files.delete(sealPath);
+  const beforeMissingSealReplay = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(marker), /seal is absent/);
+  assert.deepEqual(files, beforeMissingSealReplay);
+  files.set(sealPath, Buffer.from(canonicalJson(marker)));
   const beforeReplay = new Map(files);
   assert.deepEqual(await native.commitManagedHistoryMarker(marker), marker);
   assert.deepEqual(files, beforeReplay);
@@ -968,6 +1005,32 @@ test('managed history marker loss is terminal and marker rewinds are write-free'
     routeDisposition: 'no-route',
     headFingerprint: null,
   }, 'headFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\authority-head.json', Buffer.from(canonicalJson(successorHead)));
+  const pendingHead = buildAuthoritySuccessorRecord({
+    ...successorHead,
+    phase: 'reader-pending',
+    closeFingerprint: '3'.repeat(64),
+    authorityCommitSnapshotFingerprint: '4'.repeat(64),
+    baselineFingerprint: '5'.repeat(64),
+    publicationKFingerprint: '6'.repeat(64),
+    publicationYFingerprint: '7'.repeat(64),
+    finalityFingerprint: '8'.repeat(64),
+    headFingerprint: null,
+  }, 'headFingerprint');
+  const successorMarker = {
+    version: 1,
+    kind: 'managed-history-marker',
+    fenceGeneration: 2,
+    anchorFingerprint: marker.anchorFingerprint,
+    sequence: 2,
+    previousMarkerFingerprint: marker.markerFingerprint,
+    markerFingerprint: null,
+  };
+  successorMarker.markerFingerprint = recordHash(successorMarker, 'markerFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\authority-head.json', Buffer.from(canonicalJson(pendingHead)));
+  const beforeReceiptBeforeMarker = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(successorMarker), /matching durable successor receipt/);
+  assert.deepEqual(files, beforeReceiptBeforeMarker);
   files.set('C:\\state\\.gjc-remote-control\\authority-head.json', Buffer.from(canonicalJson(successorHead)));
   files.delete(markerPath);
   const beforeSuccessorMissing = new Map(files);

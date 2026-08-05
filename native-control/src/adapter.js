@@ -347,6 +347,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         ? await rawRead(path(`terminalization-suffix-${encodeURIComponent(state.recovery.txId)}`))
         : null;
       const suffix = candidateSuffix ?? state.recovery?.terminalization ?? persistedSuffix;
+      if (state.recovery?.phase === 'manual_cleanup' && suffix !== null && persistedSuffix !== null) {
+        validateTerminalizationSuffix(suffix);
+        if (canonical(persistedSuffix) !== canonical(suffix)) return false;
+        return true;
+      }
       if (!suffix || !['terminal', 'terminalizing', 'manual_cleanup'].includes(state.recovery?.phase)) return false;
       validateManualCleanup(terminal);
       if (persistedSuffix === null || canonical(persistedSuffix) !== canonical(suffix)) return false;
@@ -379,6 +384,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       refused(operation, 'durable terminal-close record is unreadable; route disposition is no-route');
     }
     if (allowTerminalReplay && await terminalReplayMatches({ record, kind, readReplay })) return;
+    if (allowTerminalReplay && readReplay && record === null) {
+      try {
+        const state = await rawRead(path('management-state'));
+        if (state?.recovery?.phase === 'manual_cleanup' && state.recovery.terminalization !== undefined) {
+          validateTerminalizationSuffix(state.recovery.terminalization);
+          return;
+        }
+      } catch {}
+    }
     refused(operation, 'terminal cleanup state is active; route disposition is no-route');
   };
   const requireGenesisProof = async () => { if (!prospectiveProof && !await hasPublishedAuthority()) refused('management_authority', 'prospective cleanup must complete before authority publication'); };
@@ -657,6 +671,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   const validateHistoryMarkerSeal = (seal, expectedAnchor) => {
     if (seal === null) return;
     validateHistoryMarkerRelation(seal, { anchorFingerprint: expectedAnchor, sequence: 1 });
+    if (seal.fenceGeneration !== 1) throw new TypeError('Genesis history marker seal fence');
   };
   const readSealAwareHistoryMarker = async (operation = 'read_managed_history_marker') => {
     const marker = await rawRead(historyMarkerPath);
@@ -728,13 +743,28 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     return suffix;
   };
   const managementStateTerminalReplayMatches = (state, suffix) => {
+    const recovery = state?.recovery;
+    if (recovery?.phase === 'manual_cleanup' && recovery?.terminalization !== undefined) {
+      try { validateTerminalizationSuffix(recovery.terminalization); } catch { return false; }
+      return canonical(recovery.terminalization) === canonical(suffix);
+    }
     const withoutRecovery = (value) => {
       const clone = structuredClone(value);
       delete clone.recovery;
       return clone;
     };
-    return canonical(withoutRecovery(state)) === canonical(withoutRecovery(suffix.finalState)) &&
-      canonical(state?.recovery) === canonical(suffix.finalState.recovery);
+    if (canonical(withoutRecovery(state)) !== canonical(withoutRecovery(suffix.finalState))) return false;
+    if (canonical(state?.recovery) === canonical(suffix.finalState.recovery)) return true;
+    if (!recovery || !['terminalizing', 'manual_cleanup'].includes(recovery.phase) ||
+        recovery.routeDisposition !== 'no-route' ||
+        recovery.txId !== suffix.txId ||
+        recovery.requestFingerprint !== suffix.request.requestFingerprint ||
+        recovery.successorHeadFingerprint !== suffix.terminalHead.headFingerprint ||
+        recovery.fenceGeneration !== suffix.finality.fenceGeneration ||
+        recovery.finalityFingerprint !== suffix.finality.finalityFingerprint ||
+        recovery.terminalization === undefined) return false;
+    try { validateTerminalizationSuffix(recovery.terminalization); } catch { return false; }
+    return canonical(recovery.terminalization) === canonical(suffix);
   };
   const validateTerminalizationBinding = async ({ state, terminal, suffix }) => {
     try {
@@ -744,13 +774,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           terminal.txId !== suffix.txId ||
           terminal.fenceGeneration !== suffix.finality.fenceGeneration ||
           terminal.expectedFingerprint !== suffix.request.requestFingerprint) return false;
-      const stateSuffix = state.recovery?.terminalization;
-      if (stateSuffix === undefined) {
-        if (!managementStateTerminalReplayMatches(state, suffix)) return false;
-      } else {
-        validateTerminalizationSuffix(stateSuffix);
-        if (stateSuffix.suffixFingerprint !== suffix.suffixFingerprint) return false;
-      }
+      if (!managementStateTerminalReplayMatches(state, suffix)) return false;
       const tx = encodeURIComponent(suffix.txId);
       const expected = [
         [`authority-successor-request-${tx}`, suffix.request],
@@ -762,7 +786,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       if (suffix.ack !== null) expected.push([`bot-state/successor-ack-${tx}`, suffix.ack]);
       for (const [name, value] of expected) {
         const durable = await read(path(name));
-        if (durable !== null && canonical(durable) !== canonical(value)) return false;
+        if (durable === null || canonical(durable) !== canonical(value)) return false;
       }
       const currentMarker = (await readSealAwareHistoryMarker()).marker;
       if (currentMarker !== null &&
@@ -792,6 +816,12 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           validateTerminalizationSuffix(suffix);
         } catch {
           return false;
+        }
+        if (state.recovery.phase === 'manual_cleanup') {
+          if (terminal.txId !== suffix.txId ||
+              terminal.fenceGeneration !== suffix.finality.fenceGeneration ||
+              terminal.expectedFingerprint !== suffix.request.requestFingerprint) return false;
+          return true;
         }
         if (!await validateTerminalizationBinding({ state, terminal, suffix })) return false;
         const currentHead = await rawRead(path('authority-head'));
@@ -1288,6 +1318,36 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       refused('validate_live_successor', 'committed successor history or live authority drifted');
     }
   };
+  const requireMatchingSuccessorReceipt = async (head, operation) => {
+    try {
+      if (!head || !['reader-pending', 'terminal'].includes(head.phase)) {
+        throw new TypeError('reader-pending successor head');
+      }
+      const tx = encodeURIComponent(head.txId);
+      const [request, finality, lease, projection, ack, receipt] = await Promise.all([
+        read(path(`authority-successor-request-${tx}`)),
+        read(path(`authority-successor-finality-${tx}`)),
+        read(botPath(`successor-lease-${tx}`)),
+        read(botPath(`successor-reader-projection-${tx}`)),
+        read(botPath(`successor-ack-${tx}`)),
+        read(path(`authority-successor-receipt-${tx}`)),
+      ]);
+      validateAuthoritySuccessorRequest(request);
+      validateAuthoritySuccessorHead(head, request);
+      if (head.phase === 'reader-pending' &&
+          (head.receiptFingerprint !== null || head.historyMarkerFingerprint !== null)) {
+        throw new TypeError('reader-pending successor head is already terminal');
+      }
+      validateAuthoritySuccessorFinality(finality, request);
+      validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack);
+      if (head.phase === 'terminal' && head.receiptFingerprint !== receipt.receiptFingerprint) {
+        throw new TypeError('successor head receipt binding');
+      }
+      return receipt;
+    } catch {
+      refused(operation, 'matching durable successor receipt is required for the active reader-pending authority head');
+    }
+  };
   const adapter = {
     async runStartupSelfTest() {
       const principal = await lowLevel.current_os_principal();
@@ -1573,7 +1633,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         rawRead(path(historyMarkerSealName)),
         read(path('genesis-authority-receipt')),
       ]);
-      validateHistoryMarkerSeal(seal, expectedAnchor);
+      try { validateHistoryMarkerSeal(seal, expectedAnchor); } catch { refused('commit_managed_history_marker', 'durable Genesis history marker seal is invalid'); }
       if (current !== null) {
         validateHistoryMarkerRelation(current, { anchorFingerprint: expectedAnchor });
         if (current.sequence === 1) validateGenesisAuthorityReceiptForMarker(genesisAuthorityReceipt, authorityRequest);
@@ -1582,7 +1642,16 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         }
         if (head !== null) validateHistoryMarkerHeadRelation(current, head);
         else if (current.sequence > 1) validateHistoryMarkerHeadRelation(current, head);
-        if (canonical(current) === canonical(record)) return record;
+        if (canonical(current) === canonical(record)) {
+          if (seal === null) {
+            refused('commit_managed_history_marker', 'durable Genesis history marker seal is absent');
+          }
+          validateHistoryMarkerSeal(seal, expectedAnchor);
+          if (head && ['reader-pending', 'terminal'].includes(head.phase)) {
+            await requireMatchingSuccessorReceipt(head, 'commit_managed_history_marker');
+          }
+          return record;
+        }
         if (current.sequence === 1 && seal === null) {
           refused('commit_managed_history_marker', 'durable Genesis history marker seal is absent');
         }
@@ -1590,6 +1659,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           refused('commit_managed_history_marker', 'managed history marker is not a monotonic replay successor');
         }
         validateHistoryMarkerHeadRelation(current, head, record);
+        if (!head || !['reader-pending', 'terminal'].includes(head.phase)) {
+          refused('commit_managed_history_marker', 'matching durable successor receipt is required before marker progression');
+        }
+        await requireMatchingSuccessorReceipt(head, 'commit_managed_history_marker');
       } else {
         if (record.sequence !== 1 || record.fenceGeneration !== 1 || record.previousMarkerFingerprint !== null) {
           refused('commit_managed_history_marker', 'managed history marker genesis is invalid');
@@ -4539,6 +4612,20 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         read(botPath(`successor-lease-${tx}`)), read(botPath(`successor-reader-projection-${tx}`)), read(botPath(`successor-ack-${tx}`)),
       ]);
       try { validateAuthoritySuccessorRequest(request); validateAuthoritySuccessorFinality(finality, request); validateAuthoritySuccessorReceipt(value, request, finality, lease, projection, ack); } catch { refused('write_authority_successor_receipt', 'exact successor receipt is required'); }
+      const head = await read(path('authority-head'));
+      try {
+        validateAuthoritySuccessorHead(head, request);
+        if (head.phase === 'reader-pending') {
+          if (head.txId !== value.txId || head.finalityFingerprint !== finality.finalityFingerprint) throw new TypeError('matching reader-pending authority head');
+        } else if (head.phase === 'terminal' && head.receiptFingerprint === value.receiptFingerprint) {
+          const durable = await read(path(`authority-successor-receipt-${tx}`));
+          if (durable === null || canonical(durable) !== canonical(value)) throw new TypeError('durable terminal receipt replay');
+        } else {
+          throw new TypeError('matching reader-pending authority head');
+        }
+      } catch {
+        refused('write_authority_successor_receipt', 'matching reader-pending authority head is required');
+      }
       await exactLiveSuccessor({ request, finality, lease, projection, ack, receipt: value });
       await writeCreateOnceAuthority(`authority-successor-receipt-${tx}`, value, true, true);
       return value;
