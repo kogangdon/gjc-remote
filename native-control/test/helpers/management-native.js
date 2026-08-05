@@ -19,6 +19,6 @@ const normalizeTestIdentity = (identity) => {
   return null;
 };
 
-export function createManagementNativeForTest({ lowLevel, configPath, arbitraryPrincipalProbe = true, roles, platform } = {}) {
+export function createManagementNativeForTest({ lowLevel, configPath, arbitraryPrincipalProbe = true, roles, platform = 'win32' } = {}) {
   return createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, roles, platform, identityNormalizer: normalizeTestIdentity });
 }
