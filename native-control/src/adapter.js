@@ -113,6 +113,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     return [configuredRoles.managementSid, configuredRoles.botSid, configuredRoles.recoverySid, configuredRoles.systemSid, profile];
   };
   const targetPath = configPath; const parent = dirname(configPath); const root = join(parent, '.gjc-remote-control'); const botRoot = join(root, 'bot-state'); const historyMarkerPath = join(parent, `.${basename(configPath)}.managed-history.json`); const path = (name) => join(root, `${name}.json`); const botPath = (name) => join(botRoot, `${name}.json`); const bootstrapBlockerPath = join(parent, `.${basename(configPath)}.genesis-bootstrap-blocker`); const lockPath = (name) => join(parent, `.${basename(configPath)}.${name}.lock`); const tempPrefix = `${basename(configPath)}.tmp`; let prospectiveProof = null; let bootstrapBlocker = null;
+  const historyMarkerSealName = 'managed-history-marker-seal';
   const requireBotPrincipal = async (operation) => {
     const principal = await lowLevel.current_os_principal();
     if (!configuredRoles || principal?.kind !== roleKind || principal.value !== configuredRoles.botSid) refused(operation, `current OS principal is not the configured bot ${roleKind.toUpperCase()}`);
@@ -285,6 +286,37 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       refused('managed_history_marker', 'managed history marker predecessor is not contiguous');
     }
     return record;
+  };
+  const validateHistoryMarkerHeadRelation = (marker, head, candidate = null) => {
+    if (head === null) {
+      if (marker.sequence > 1 || candidate?.sequence > 1) {
+        refused('commit_managed_history_marker', 'successor history marker requires an active authority head');
+      }
+      return;
+    }
+    try { validateAuthoritySuccessorHead(head); } catch {
+      refused('commit_managed_history_marker', 'active authority head is torn or invalid');
+    }
+    const expectedMarkerSequence = head.phase === 'terminal' ? head.sequence : head.sequence - 1;
+    if (expectedMarkerSequence < 1 || marker.sequence !== expectedMarkerSequence ||
+        (head.phase === 'terminal' && head.historyMarkerFingerprint !== marker.markerFingerprint)) {
+      refused('commit_managed_history_marker', 'managed history marker does not bind the active authority head');
+    }
+    if (candidate !== null) {
+      const expectedCandidateSequence = head.phase === 'terminal' ? head.sequence + 1 : head.sequence;
+      if (candidate.sequence !== expectedCandidateSequence || candidate.previousMarkerFingerprint !== marker.markerFingerprint) {
+        refused('commit_managed_history_marker', 'managed history marker successor does not bind the active authority head');
+      }
+    }
+  };
+  const validateHistoryMarkerSeal = (seal, expectedAnchor) => {
+    if (seal === null) return;
+    validateHistoryMarkerRelation(seal, { anchorFingerprint: expectedAnchor, sequence: 1 });
+  };
+  const validateGenesisAuthorityReceiptForMarker = (receipt, request) => {
+    try { validateGenesisAuthorityReceipt(receipt, request); } catch {
+      refused('commit_managed_history_marker', 'committed Genesis authority receipt is required before marker mutation');
+    }
   };
   const publishEnvelope = async (wrapper) => { const currentAnchor = await anchor(); const currentAnchorFingerprint = fingerprint(encode(currentAnchor)); if (wrapper.anchorFingerprint !== currentAnchorFingerprint) refused('publish_mapping', 'wrapper anchor does not bind this management parent'); const floor = await readerFloor(); await writeAuthority('reader-version-floor', floor); const wrapperName = wrapper.sourceKind === 'legacy-retained' ? 'legacy-retained' : 'managed-v1-wrapper'; await writeAuthority(wrapperName, wrapper); const rootRecord = { version: 1, kind: 'management-control-root', managementStamp: 'gjc-management-control/v1', anchor: currentAnchor, anchorFingerprint: currentAnchorFingerprint, sourceKind: wrapper.sourceKind, wrapperKind: wrapper.kind, wrapperRelativeName: `${wrapperName}.json`, targetRelativeName: 'channels.json', controlRootRelativeName: '.gjc-remote-control', readerVersionFloorFingerprint: floor.floorFingerprint, wrapperFingerprint: wrapper.wrapperFingerprint, controlRootFingerprint: null }; rootRecord.controlRootFingerprint = recordFingerprint(rootRecord, 'controlRootFingerprint'); await writeAuthority('control-root', rootRecord); await ensureBotRoot(); await releaseBootstrapBlocker(); };
   const releaseBootstrapBlocker = async () => {
@@ -905,16 +937,43 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     async commitManagedHistoryMarker(record) {
       const expectedAnchor = await anchorFingerprint();
       validateHistoryMarkerRelation(record, { anchorFingerprint: expectedAnchor });
-      await requireAuthorityRequest('commit_managed_history_marker');
-      const current = await rawRead(historyMarkerPath);
+      const authorityRequest = await requireAuthorityRequest('commit_managed_history_marker');
+      const [current, head, seal, genesisAuthorityReceipt] = await Promise.all([
+        rawRead(historyMarkerPath),
+        read(path('authority-head')),
+        rawRead(path(historyMarkerSealName)),
+        read(path('genesis-authority-receipt')),
+      ]);
+      validateHistoryMarkerSeal(seal, expectedAnchor);
       if (current !== null) {
         validateHistoryMarkerRelation(current, { anchorFingerprint: expectedAnchor });
+        if (current.sequence === 1) validateGenesisAuthorityReceiptForMarker(genesisAuthorityReceipt, authorityRequest);
+        if (current.sequence === 1 && seal !== null && canonical(seal) !== canonical(current)) {
+          refused('commit_managed_history_marker', 'durable Genesis history marker seal does not match the live marker');
+        }
+        if (head !== null) validateHistoryMarkerHeadRelation(current, head);
+        else if (current.sequence > 1) validateHistoryMarkerHeadRelation(current, head);
         if (canonical(current) === canonical(record)) return record;
+        if (current.sequence === 1 && seal === null) {
+          refused('commit_managed_history_marker', 'durable Genesis history marker seal is absent');
+        }
         if (record.sequence !== current.sequence + 1 || record.previousMarkerFingerprint !== current.markerFingerprint) {
           refused('commit_managed_history_marker', 'managed history marker is not a monotonic replay successor');
         }
-      } else if (record.sequence !== 1 || record.previousMarkerFingerprint !== null) {
-        refused('commit_managed_history_marker', 'managed history marker genesis is invalid');
+        validateHistoryMarkerHeadRelation(current, head, record);
+      } else {
+        if (record.sequence !== 1 || record.previousMarkerFingerprint !== null) {
+          refused('commit_managed_history_marker', 'managed history marker genesis is invalid');
+        }
+        if (head !== null) {
+          validateHistoryMarkerHeadRelation(record, head);
+          refused('commit_managed_history_marker', 'managed history marker is absent after successor authority publication');
+        }
+        if (seal !== null) {
+          refused('commit_managed_history_marker', 'managed history marker is absent after Genesis publication');
+        }
+        validateGenesisAuthorityReceiptForMarker(genesisAuthorityReceipt, authorityRequest);
+        await writeCreateOnceAuthority(historyMarkerSealName, record);
       }
       await write(historyMarkerPath, record, 'authority');
       const reopened = await rawRead(historyMarkerPath);

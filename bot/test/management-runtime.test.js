@@ -164,6 +164,58 @@ function mappingInput(mappingId, generation = 1) {
   }, mapping);
   return { mapping, routes: [route] };
 }
+async function failClosedSuccessorFailure(method, stage) {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old-secret'))).ok, true);
+  const original = harness.native[method].bind(harness.native);
+  harness.native[method] = async (...args) => {
+    await original(...args);
+    throw new Error(`INJECTED_${stage}`);
+  };
+  const before = await harness.native.readManagementState();
+  const candidate = mappingInput(`failure-${stage}`);
+  const result = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: `failure-${stage}`,
+    mappingId: candidate.mapping.mappingId, ...candidate,
+    expectedRevision: before.revision, expectedFingerprint: null,
+  });
+  assert.equal(result.ok, false, JSON.stringify({ stage, result }));
+  assert.equal(result.routeDisposition, 'no-route');
+  assert.equal(Object.hasOwn(result, 'txId'), false);
+  assert.equal(result.error, 'MANUAL_CLEANUP_REQUIRED');
+  const state = await harness.native.readManagementState();
+  assert.equal(state.recovery.phase, 'manual_cleanup');
+  assert.equal(state.recovery.routeDisposition, 'no-route');
+  assert.equal(state.admission.phase, 'closed');
+  assert.match(state.recovery.txId, /^successor-[a-f0-9]{64}$/);
+  const request = JSON.parse(fileEnding(harness.files, `/authority-successor-request-${state.recovery.txId}.json`));
+  assert.equal(request.requestFingerprint, state.recovery.requestFingerprint);
+  const cleanup = JSON.parse(fileEnding(harness.files, '/terminal-close.json'));
+  assert.equal(cleanup.txId, state.recovery.txId);
+  assert.equal(cleanup.routeDisposition, 'no-route');
+  assert.equal(cleanup.blockedUntilOwnerAction, true);
+  const persisted = [...harness.files.values()].map((bytes) => bytes.toString()).join('\n');
+  assert.equal(persisted.includes('old-secret'), false);
+  assert.equal(persisted.includes('later-secret'), false);
+  const blocked = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner, actorSecret: secret, idempotencyKey: `blocked-${stage}`, hostTokens: 'host=later-secret',
+  });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, 'RECOVERY_REQUIRED');
+  assert.equal(blocked.routeDisposition, 'no-route');
+}
+test('successor writes fail closed across request, head, publication, finality, and audit stages', async () => {
+  for (const [method, stage] of [
+    ['writeAuthoritySuccessorRequest', 'REQUEST'],
+    ['writeAuthoritySuccessorHead', 'HEAD'],
+    ['publishMapping', 'PUBLICATION'],
+    ['writeAuthoritySuccessorFinality', 'FINALITY'],
+    ['appendAudit', 'AUDIT'],
+  ]) {
+    await failClosedSuccessorFailure(method, stage);
+  }
+});
 test('real management adapter receives canonical secret-free genesis records in order', async () => {
   const { native, files, writes } = adapter(); const runtime = new ManagementRuntime({ native });
   const result = await runtime.execute('genesis', genesisInput('b=secret-b\na=secret-a'));
@@ -823,7 +875,7 @@ test('public recover rejects a conflicting key with transaction-bound no-route c
   assert.equal(state.recovery.successorPhase, 'terminal');
   assert.equal(state.recovery.routeDisposition, 'no-route');
 });
-test('an interrupted reserved successor becomes durable manual cleanup on exact replay', async () => {
+test('an interrupted reserved successor becomes durable manual cleanup and blocks replay', async () => {
   const harness = await boundReaderRuntime();
   harness.setPrincipal(owner);
   const runtime = harness.runtime;
@@ -851,7 +903,7 @@ test('an interrupted reserved successor becomes durable manual cleanup on exact 
   });
 
   assert.equal(replay.ok, false);
-  assert.equal(replay.error, 'MANUAL_CLEANUP_REQUIRED');
+  assert.equal(replay.error, 'RECOVERY_REQUIRED');
   assert.equal(replay.routeDisposition, 'no-route');
   assert.equal((await harness.native.readManagementState()).recovery.phase, 'manual_cleanup');
 });

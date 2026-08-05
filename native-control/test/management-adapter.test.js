@@ -551,6 +551,107 @@ test('successor recovery keeps retained proof source-aware for B and management-
   lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.managementSid });
   await assert.rejects(native.readSuccessorRecovery({ predecessorReceiptFingerprint: 'a'.repeat(64) }), /exact pending successor recovery is absent/);
 });
+test('managed history marker loss is terminal and marker rewinds are write-free', async () => {
+  const { files, roles, lowLevel } = fake();
+  const configPath = 'C:/state/channels.json';
+  const targetBytes = Buffer.from('{"legacy":true}');
+  files.set(configPath, targetBytes);
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  const genesis = records();
+  await native.probeProspectiveCleanup({
+    txId: genesis.request.genesisTxId,
+    targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid },
+    botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64),
+    botProvisioningFingerprint: 'c'.repeat(64),
+    recoveryProvisioningFingerprint: 'd'.repeat(64),
+  });
+  const authorityRequest = await writeAuthorityRequest(native, configPath, genesis.request, roles, targetBytes);
+  const authorityReceipt = {
+    version: 1,
+    kind: 'genesis-authority-receipt',
+    genesisTxId: authorityRequest.genesisTxId,
+    requestFingerprint: authorityRequest.requestFingerprint,
+    sequence: 2,
+    anchorFingerprint: authorityRequest.anchorFingerprint,
+    generation: authorityRequest.generation,
+    readerVersionFloorFingerprint: 'e'.repeat(64),
+    authorityCommitSnapshotFingerprint: 'f'.repeat(64),
+    receiptFingerprint: null,
+  };
+  authorityReceipt.receiptFingerprint = recordHash(authorityReceipt, 'receiptFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\genesis-authority-receipt.json', Buffer.from(canonicalJson(authorityReceipt)));
+  files.set(`C:\\state\\.gjc-remote-control\\genesis-authority-receipt-${authorityRequest.genesisTxId}.json`, Buffer.from(canonicalJson(authorityReceipt)));
+  const marker = {
+    version: 1,
+    kind: 'managed-history-marker',
+    anchorFingerprint: authorityRequest.anchorFingerprint,
+    sequence: 1,
+    previousMarkerFingerprint: null,
+    markerFingerprint: null,
+  };
+  marker.markerFingerprint = recordHash(marker, 'markerFingerprint');
+
+  assert.deepEqual(await native.commitManagedHistoryMarker(marker), marker);
+  const markerPath = 'C:\\state\\.channels.json.managed-history.json';
+  const sealPath = 'C:\\state\\.gjc-remote-control\\managed-history-marker-seal.json';
+  assert.ok(files.has(markerPath));
+  assert.ok(files.has(sealPath));
+  const beforeReplay = new Map(files);
+  assert.deepEqual(await native.commitManagedHistoryMarker(marker), marker);
+  assert.deepEqual(files, beforeReplay);
+
+  files.delete(markerPath);
+  const beforeMissing = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(marker), /absent after Genesis/);
+  assert.deepEqual(files, beforeMissing);
+
+  files.set(markerPath, Buffer.from(canonicalJson(marker)));
+  const successorHead = buildAuthoritySuccessorRecord({
+    version: 1,
+    kind: 'authority-successor-head',
+    anchorFingerprint: marker.anchorFingerprint,
+    sequence: 2,
+    txId: 'successor-2',
+    rootGenesisTxId: authorityRequest.genesisTxId,
+    operation: 'tokens-attest',
+    phase: 'reserved',
+    requestFingerprint: '1'.repeat(64),
+    closeFingerprint: null,
+    authorityCommitSnapshotFingerprint: null,
+    baselineFingerprint: null,
+    publicationKFingerprint: null,
+    publicationYFingerprint: null,
+    finalityFingerprint: null,
+    receiptFingerprint: null,
+    historyMarkerFingerprint: null,
+    previousHeadFingerprint: null,
+    previousReceiptFingerprint: '2'.repeat(64),
+    routeDisposition: 'no-route',
+    headFingerprint: null,
+  }, 'headFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\authority-head.json', Buffer.from(canonicalJson(successorHead)));
+  files.delete(markerPath);
+  const beforeSuccessorMissing = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(marker), /absent after successor authority publication/);
+  assert.deepEqual(files, beforeSuccessorMissing);
+
+  files.set(markerPath, Buffer.from(canonicalJson(marker)));
+  files.delete('C:\\state\\.gjc-remote-control\\authority-head.json');
+
+  const rewind = { ...marker, sequence: 2, previousMarkerFingerprint: '0'.repeat(64), markerFingerprint: null };
+  rewind.markerFingerprint = recordHash(rewind, 'markerFingerprint');
+  const beforeRewind = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(rewind), /monotonic replay successor/);
+  assert.deepEqual(files, beforeRewind);
+
+  files.set(markerPath, Buffer.from('{}'));
+  const beforeTorn = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(marker), /exact canonical managed history marker/);
+  assert.deepEqual(files, beforeTorn);
+});
 test('successor head writes are principal-confined, exact-replay idempotent, and phase-complete', async () => {
   const { files, lowLevel, roles } = fake();
   const configPath = 'C:/state/channels.json';

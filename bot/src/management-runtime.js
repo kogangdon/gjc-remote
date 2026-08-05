@@ -1115,6 +1115,16 @@ export class ManagementRuntime {
   }
 
   async #reserveSuccessor(operation, input, state, actorPrincipal) {
+    const mutation = { attempted: false, recovery: null };
+    try {
+      return await this.#reserveSuccessorMutation(operation, input, state, actorPrincipal, mutation);
+    } catch (error) {
+      if (!mutation.attempted) throw error;
+      await this.#manualCleanup(state, safe(error).code, mutation.recovery);
+      throw error;
+    }
+  }
+  async #reserveSuccessorMutation(operation, input, state, actorPrincipal, mutation) {
     for (const method of ["writeAuthoritySuccessorRequest", "writeAuthoritySuccessorHead", "writeAuthoritySuccessorClose", "writeAuthoritySuccessorReservation", "writeAuthoritySuccessorCommit", "writeAuthoritySuccessorBaseline", "writeSuccessorPublicationGraph", "mappingTargetProof", "readRetainedTargetProof", "readAuthoritySuccessorHead"]) {
       if (typeof this.native[method] !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
     }
@@ -1129,6 +1139,14 @@ export class ManagementRuntime {
       mappingId: input.mappingId ?? null,
     };
     const txId = `successor-${canonicalJsonHash(intent)}`;
+    const setRecovery = (patch = {}) => {
+      mutation.recovery = {
+        ...(mutation.recovery ?? state.recovery ?? {}),
+        txId,
+        ...patch,
+        routeDisposition: "no-route",
+      };
+    };
     let existing;
     try {
       existing = await this.native.readAuthoritySuccessorHead();
@@ -1136,6 +1154,13 @@ export class ManagementRuntime {
       await this.#manualCleanup(state, "SUCCESSOR_FLOOR_OR_HISTORY_MARKER_INVALID");
     }
     if (existing !== null && existing.phase !== "terminal") {
+      setRecovery({
+        phase: existing.phase,
+        successorPhase: existing.phase,
+        requestFingerprint: existing.requestFingerprint,
+        successorHeadFingerprint: existing.headFingerprint,
+      });
+      mutation.attempted = true;
       return this.#recoverSuccessorHead({ state, input, actorPrincipal, operation, txId, intent, head: existing });
     }
     let durableReaderProof;
@@ -1253,6 +1278,14 @@ export class ManagementRuntime {
       requestFingerprint: null,
     }, "requestFingerprint");
     validateAuthoritySuccessorRequest(request);
+    setRecovery({
+      phase: "reserved",
+      successorPhase: "reserved",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: null,
+      reservationFingerprint: null,
+    });
+    mutation.attempted = true;
     await this.native.writeAuthoritySuccessorRequest(request);
     const head = buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-head", anchorFingerprint, sequence, txId, rootGenesisTxId: state.genesis.txId,
@@ -1262,6 +1295,12 @@ export class ManagementRuntime {
       receiptFingerprint: null, historyMarkerFingerprint: null, previousHeadFingerprint: predecessorHeadFingerprint,
       previousReceiptFingerprint: request.previousReceiptFingerprint, routeDisposition: "no-route", headFingerprint: null,
     }, "headFingerprint");
+    setRecovery({
+      phase: "reserved",
+      successorPhase: "reserved",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: head.headFingerprint,
+    });
     await this.native.writeAuthoritySuccessorHead(head);
     const close = buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-close-proof", txId, rootGenesisTxId: request.rootGenesisTxId,
@@ -1280,6 +1319,12 @@ export class ManagementRuntime {
     const closedHead = buildAuthoritySuccessorRecord({
       ...head, phase: "closed", closeFingerprint: close.closeFingerprint, previousHeadFingerprint: head.headFingerprint, headFingerprint: null,
     }, "headFingerprint");
+    setRecovery({
+      phase: "closed",
+      successorPhase: "closed",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: closedHead.headFingerprint,
+    });
     await this.native.writeAuthoritySuccessorHead(closedHead);
     const reservation = {
       version: 1, kind: "authority-reservation", anchorFingerprint, txId,
@@ -1290,6 +1335,13 @@ export class ManagementRuntime {
     };
     reservation.reservationFingerprint = authorityRecordFingerprint(reservation, "reservationFingerprint");
     validateAuthorityReservation(reservation);
+    setRecovery({
+      phase: "closed",
+      successorPhase: "closed",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: closedHead.headFingerprint,
+      reservationFingerprint: reservation.reservationFingerprint,
+    });
     await this.native.writeAuthoritySuccessorReservation(reservation);
     const commit = {
       version: 1, kind: "authority-commit-snapshot", anchorFingerprint, txId,
@@ -1399,6 +1451,13 @@ export class ManagementRuntime {
       baselineFingerprint: baseline.baselineFingerprint, publicationKFingerprint: graph.k["publication-kFingerprint"],
       publicationYFingerprint: graph.y["publication-yFingerprint"], previousHeadFingerprint: closedHead.headFingerprint, headFingerprint: null,
     }, "headFingerprint");
+    setRecovery({
+      phase: "replaced",
+      successorPhase: "replaced",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: replacedHead.headFingerprint,
+      reservationFingerprint: reservation.reservationFingerprint,
+    });
     await this.native.writeAuthoritySuccessorHead(replacedHead);
     if (typeof this.native.commitAuthoritySuccessorEpoch !== "function" || typeof this.native.writeAuthoritySuccessorFinality !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
     const epoch = {
@@ -1443,11 +1502,27 @@ export class ManagementRuntime {
       tokenConfigGeneration: request.candidateTokenConfigGeneration, mappingGeneration: request.candidateMappingGeneration,
       snapshotFingerprint, routeDisposition: "no-route", finalityFingerprint: null,
     }, "finalityFingerprint");
+    setRecovery({
+      phase: "replaced",
+      successorPhase: "replaced",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: replacedHead.headFingerprint,
+      reservationFingerprint: reservation.reservationFingerprint,
+      finalityFingerprint: finality.finalityFingerprint,
+    });
     await this.native.writeAuthoritySuccessorFinality(finality);
     const finalityHead = buildAuthoritySuccessorRecord({
       ...replacedHead, phase: "reader-pending",
       finalityFingerprint: finality.finalityFingerprint, previousHeadFingerprint: replacedHead.headFingerprint, headFingerprint: null,
     }, "headFingerprint");
+    setRecovery({
+      phase: "reader-pending",
+      successorPhase: "reader-pending",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: finalityHead.headFingerprint,
+      reservationFingerprint: reservation.reservationFingerprint,
+      finalityFingerprint: finality.finalityFingerprint,
+    });
     await this.native.writeAuthoritySuccessorHead(finalityHead);
     if (readerMode === "bound-reader") {
       return { pending: true, idempotent: false, txId, phase: "reader-pending", routeDisposition: "no-route" };
@@ -1476,6 +1551,14 @@ export class ManagementRuntime {
       ...finalityHead, phase: "terminal", receiptFingerprint: receipt.receiptFingerprint,
       historyMarkerFingerprint: marker.markerFingerprint, previousHeadFingerprint: finalityHead.headFingerprint, headFingerprint: null,
     }, "headFingerprint");
+    setRecovery({
+      phase: "terminal",
+      successorPhase: "terminal",
+      requestFingerprint: request.requestFingerprint,
+      successorHeadFingerprint: terminalHead.headFingerprint,
+      reservationFingerprint: reservation.reservationFingerprint,
+      finalityFingerprint: finality.finalityFingerprint,
+    });
     const before = state.revision;
     state.revision = request.candidateRevision;
     state.authorityEpoch = request.candidateAuthorityEpoch;

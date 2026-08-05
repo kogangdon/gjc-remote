@@ -1141,6 +1141,7 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
       else Throw(env, "ERR_NATIVE_CONTROL_WRITE", "unable to write and flush exclusive temp file");
       return nullptr;
     }
+    CloseHandle(h);
     napi_value result; napi_create_string_utf8(env, candidate.c_str(), NAPI_AUTO_LENGTH, &result); return result;
   }
   Refuse(env, "create_exclusive_temp", "exclusive name space exhausted"); return nullptr;
