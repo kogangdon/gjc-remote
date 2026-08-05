@@ -21,9 +21,9 @@ test("management authority accepts only canonical bytes", () => {
 });
 
 test("no-reader finality has literal null fields and the no-route target", () => {
-  const request = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, requestedReaderMode: "no-reader", readerInstanceId: null, readerStartNonce: null, attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
-  const zf = { zFinalityFingerprint: hex };
-  const proof = seal({ version: 1, kind: "finality-proof", genesisTxId: "g", generation: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: null, ackFingerprint: null, routeFingerprint: "no-route" }, "finalityProofFingerprint");
+  const request = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, fenceGeneration: 1, requestedReaderMode: "no-reader", readerInstanceId: null, readerStartNonce: null, attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
+  const zf = { zFinalityFingerprint: hex, fenceGeneration: 1 };
+  const proof = seal({ version: 1, kind: "finality-proof", genesisTxId: "g", generation: 1, fenceGeneration: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: null, ackFingerprint: null, routeFingerprint: "no-route" }, "finalityProofFingerprint");
   assert.equal(validateFinalityProof(proof, request, zf), proof);
   for (const value of [{ ...proof, readerProjectionFingerprint: hex }, { ...proof, ackFingerprint: hex }, { ...proof, routeFingerprint: "route" }, (() => { const copy = { ...proof }; delete copy.ackFingerprint; return copy; })()]) {
     assert.throws(() => validateFinalityProof(value, request, zf));
@@ -31,18 +31,18 @@ test("no-reader finality has literal null fields and the no-route target", () =>
 });
 
 test("handshake finality requires the bound acknowledgement", () => {
-  const request = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, requestedReaderMode: "handshake", readerInstanceId: "reader", readerStartNonce: "start", attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
-  const ack = seal({ version: 1, kind: "admission-ack", grantFingerprint: hex, grantId: "grant", genesisTxId: "g", generation: 1, readerInstanceId: "reader", readerStartNonce: "start", routeFingerprint: "route", readerProjectionFingerprint: "b".repeat(64), nonce: "nonce" }, "ackFingerprint");
-  const proof = seal({ version: 1, kind: "finality-proof", genesisTxId: "g", generation: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: ack.readerProjectionFingerprint, ackFingerprint: ack.ackFingerprint, routeFingerprint: "route" }, "finalityProofFingerprint");
-  assert.equal(validateFinalityProof(proof, request, { zFinalityFingerprint: hex }, ack, ack.readerProjectionFingerprint), proof);
-  assert.throws(() => validateFinalityProof(proof, request, { zFinalityFingerprint: hex }, { ...ack, generation: 2 }, ack.readerProjectionFingerprint));
-  assert.throws(() => validateFinalityProof({ ...proof, readerProjectionFingerprint: hex }, request, { zFinalityFingerprint: hex }, ack, ack.readerProjectionFingerprint));
+  const request = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, fenceGeneration: 1, requestedReaderMode: "handshake", readerInstanceId: "reader", readerStartNonce: "start", attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
+  const ack = seal({ version: 1, kind: "admission-ack", grantFingerprint: hex, grantId: "grant", genesisTxId: "g", generation: 1, fenceGeneration: 1, readerInstanceId: "reader", readerStartNonce: "start", routeFingerprint: "route", readerProjectionFingerprint: "b".repeat(64), nonce: "nonce" }, "ackFingerprint");
+  const proof = seal({ version: 1, kind: "finality-proof", genesisTxId: "g", generation: 1, fenceGeneration: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: ack.readerProjectionFingerprint, ackFingerprint: ack.ackFingerprint, routeFingerprint: "route" }, "finalityProofFingerprint");
+  assert.equal(validateFinalityProof(proof, request, { zFinalityFingerprint: hex, fenceGeneration: 1 }, ack, ack.readerProjectionFingerprint), proof);
+  assert.throws(() => validateFinalityProof(proof, request, { zFinalityFingerprint: hex, fenceGeneration: 1 }, { ...ack, generation: 2 }, ack.readerProjectionFingerprint));
+  assert.throws(() => validateFinalityProof({ ...proof, readerProjectionFingerprint: hex }, request, { zFinalityFingerprint: hex, fenceGeneration: 1 }, ack, ack.readerProjectionFingerprint));
 });
 test("genesis receipts bind handshake proof fields and preserve no-reader nulls", () => {
-  const handshakeRequest = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, requestedReaderMode: "handshake", readerInstanceId: "reader", readerStartNonce: "start", attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
-  const zf = seal({ version: 1, kind: "genesis-finality", genesisTxId: "g", generation: 1 }, "zFinalityFingerprint");
+  const handshakeRequest = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, fenceGeneration: 1, requestedReaderMode: "handshake", readerInstanceId: "reader", readerStartNonce: "start", attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
+  const zf = seal({ version: 1, kind: "genesis-finality", genesisTxId: "g", generation: 1, fenceGeneration: 1 }, "zFinalityFingerprint");
   const proof = { finalityProofFingerprint: hex, readerProjectionFingerprint: "b".repeat(64), ackFingerprint: "c".repeat(64) };
-  const receipt = seal({ version: 1, kind: "genesis-receipt", genesisTxId: "g", generation: 1, requestedReaderMode: "handshake", readerInstanceId: "reader", readerStartNonce: "start", readerProjectionFingerprint: proof.readerProjectionFingerprint, ackFingerprint: proof.ackFingerprint, finalityProofFingerprint: proof.finalityProofFingerprint, phase: "terminal" }, "receiptFingerprint");
+  const receipt = seal({ version: 1, kind: "genesis-receipt", genesisTxId: "g", generation: 1, fenceGeneration: 1, requestedReaderMode: "handshake", readerInstanceId: "reader", readerStartNonce: "start", readerProjectionFingerprint: proof.readerProjectionFingerprint, ackFingerprint: proof.ackFingerprint, finalityProofFingerprint: proof.finalityProofFingerprint, phase: "terminal" }, "receiptFingerprint");
   assert.equal(validateGenesisReceipt(receipt, handshakeRequest, zf, proof), receipt);
   for (const value of [
     seal({ ...receipt, readerProjectionFingerprint: hex }, "receiptFingerprint"),
@@ -60,13 +60,13 @@ test("genesis receipts bind handshake proof fields and preserve no-reader nulls"
 });
 
 test("proof fingerprints are record-specific", () => {
-  const first = seal({ version: 1, kind: "finality-proof", genesisTxId: "g", generation: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: null, ackFingerprint: null, routeFingerprint: "no-route" }, "finalityProofFingerprint");
-  const second = seal({ version: 1, kind: "finality-proof", genesisTxId: "other", generation: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: null, ackFingerprint: null, routeFingerprint: "no-route" }, "finalityProofFingerprint");
+  const first = seal({ version: 1, kind: "finality-proof", genesisTxId: "g", generation: 1, fenceGeneration: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: null, ackFingerprint: null, routeFingerprint: "no-route" }, "finalityProofFingerprint");
+  const second = seal({ version: 1, kind: "finality-proof", genesisTxId: "other", generation: 1, fenceGeneration: 1, zFinalityFingerprint: hex, readerProjectionFingerprint: null, ackFingerprint: null, routeFingerprint: "no-route" }, "finalityProofFingerprint");
   assert.notEqual(first.finalityProofFingerprint, second.finalityProofFingerprint);
 });
 test("genesis precommit binds upstream prospective, role, and zero-grant proofs without finality cycles", () => {
   const inputs = {
-    genesisTxId: "genesis", generation: 1,
+    genesisTxId: "genesis", fenceGeneration: 1, generation: 1,
     genesisProbeFingerprint: hex, targetFingerprint: hex, targetIdentityFingerprint: hex, targetAclFingerprint: hex,
     controlRootFingerprint: hex, controlIdentityFingerprint: hex, controlAclFingerprint: hex,
     wrapperIdentityFingerprint: hex, wrapperAclFingerprint: hex, wrapperFingerprint: hex,
@@ -88,13 +88,13 @@ test("genesis precommit binds upstream prospective, role, and zero-grant proofs 
 test("semantic publication projections bind the approved baseline state instead of predecessor labels", () => {
   const baselineFingerprint = "b".repeat(64);
   const u = buildPublicationU({
-    txId: "tx", genesisTxId: "tx", generation: 1, baselineFingerprint, anchorFingerprint: hex,
+    txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, baselineFingerprint, anchorFingerprint: hex,
     targetState: "genesis-empty", attestationFingerprint: hex, authorityReservationFingerprint: hex,
     authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, leaseBindingFingerprint: null,
     readerProjectionFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null,
   });
   const p = buildPublicationP({
-    txId: "tx", genesisTxId: "tx", generation: 1, uFingerprint: u["publication-uFingerprint"],
+    txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, uFingerprint: u["publication-uFingerprint"],
     stateFingerprint: "c".repeat(64), targetState: u.targetState,
     authorityCommitSnapshotFingerprint: u.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: null,
     leaseBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null,
@@ -111,13 +111,13 @@ test("semantic publication chain rejects independently mutated projections and p
   const snapshotFingerprint = "3".repeat(64);
   const publicationFingerprint = "4".repeat(64);
   const checkpointFingerprint = "5".repeat(64);
-  const u = buildPublicationU({ txId: "tx", genesisTxId: "tx", generation: 1, baselineFingerprint: hex, anchorFingerprint: hex, targetState: "genesis-empty", attestationFingerprint: hex, authorityReservationFingerprint: hex, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerProjectionFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
-  const p = buildPublicationP({ txId: "tx", genesisTxId: "tx", generation: 1, uFingerprint: u["publication-uFingerprint"], stateFingerprint, targetState: u.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
-  const s = buildPublicationS({ txId: "tx", genesisTxId: "tx", generation: 1, pFingerprint: p["publication-pFingerprint"], stateFingerprint, payloadFingerprint, targetState: u.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, readerVersion: null });
-  const c = buildPublicationC({ txId: "tx", genesisTxId: "tx", generation: 1, sFingerprint: s["publication-sFingerprint"], stateFingerprint, payloadFingerprint, snapshotFingerprint, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
-  const q = buildPublicationQ({ txId: "tx", genesisTxId: "tx", generation: 1, cFingerprint: c["publication-cFingerprint"], baselineFingerprint: hex, stateFingerprint, payloadFingerprint, snapshotFingerprint, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null });
-  const zp = buildPublicationZp({ txId: "tx", genesisTxId: "tx", generation: 1, qFingerprint: q["publication-qFingerprint"], publicationFingerprint, stateFingerprint, payloadFingerprint, snapshotFingerprint });
-  const k = buildPublicationK({ txId: "tx", genesisTxId: "tx", generation: 1, zpFingerprint: zp["publication-zpFingerprint"], publicationFingerprint, authorityCommitSnapshotFingerprint: hex, checkpointFingerprint });
+  const u = buildPublicationU({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, baselineFingerprint: hex, anchorFingerprint: hex, targetState: "genesis-empty", attestationFingerprint: hex, authorityReservationFingerprint: hex, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerProjectionFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
+  const p = buildPublicationP({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, uFingerprint: u["publication-uFingerprint"], stateFingerprint, targetState: u.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
+  const s = buildPublicationS({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, pFingerprint: p["publication-pFingerprint"], stateFingerprint, payloadFingerprint, targetState: u.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, readerVersion: null });
+  const c = buildPublicationC({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, sFingerprint: s["publication-sFingerprint"], stateFingerprint, payloadFingerprint, snapshotFingerprint, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
+  const q = buildPublicationQ({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, cFingerprint: c["publication-cFingerprint"], baselineFingerprint: hex, stateFingerprint, payloadFingerprint, snapshotFingerprint, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null });
+  const zp = buildPublicationZp({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, qFingerprint: q["publication-qFingerprint"], publicationFingerprint, stateFingerprint, payloadFingerprint, snapshotFingerprint });
+  const k = buildPublicationK({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, zpFingerprint: zp["publication-zpFingerprint"], publicationFingerprint, authorityCommitSnapshotFingerprint: hex, checkpointFingerprint });
   assert.equal(validatePublicationS(s, p, { stateFingerprint, payloadFingerprint }), s);
   assert.equal(validatePublicationC(c, s, { stateFingerprint, payloadFingerprint, snapshotFingerprint }), c);
   assert.equal(validatePublicationQ(q, c, { stateFingerprint, payloadFingerprint, snapshotFingerprint }), q);
@@ -129,7 +129,7 @@ test("semantic publication chain rejects independently mutated projections and p
 });
 test("prepared GR is complete, owner-bound, and branch-explicit before later authority records", () => {
   const request = seal({
-    version: 1, kind: "genesis-authority-request", genesisTxId: "g", sequence: 1, anchorFingerprint: hex,
+    version: 1, kind: "genesis-authority-request", genesisTxId: "g", sequence: 1, fenceGeneration: 1, anchorFingerprint: hex,
     ownerPrincipalFingerprint: hex, managementPrincipalFingerprint: "b".repeat(64), botPrincipalFingerprint: "c".repeat(64), recoveryPrincipalFingerprint: "d".repeat(64), targetPrincipalFingerprint: "e".repeat(64),
     managementProvisioningFingerprint: "f".repeat(64), botProvisioningFingerprint: "1".repeat(64), recoveryProvisioningFingerprint: "2".repeat(64),
     generation: 1, requestedReaderMode: "no-reader", readerInstanceId: null, readerStartNonce: null, idempotencyKey: "idem",
@@ -148,27 +148,28 @@ test("prepared GR is complete, owner-bound, and branch-explicit before later aut
 test("Y binds the canonical target rather than a substituted predecessor", () => {
   const targetFingerprint = "7".repeat(64);
   const u = buildPublicationU({
-    txId: "tx", genesisTxId: "tx", generation: 1, baselineFingerprint: "b".repeat(64), anchorFingerprint: hex,
+    txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, baselineFingerprint: "b".repeat(64), anchorFingerprint: hex,
     targetState: "genesis-empty", attestationFingerprint: hex, authorityReservationFingerprint: hex, authorityCommitSnapshotFingerprint: hex,
     fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerProjectionFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null,
   });
-  const p = buildPublicationP({ txId: "tx", genesisTxId: "tx", generation: 1, uFingerprint: u["publication-uFingerprint"], stateFingerprint: u["publication-uFingerprint"], targetState: u.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
-  const k = buildPublicationK({ txId: "tx", genesisTxId: "tx", generation: 1, zpFingerprint: hex, publicationFingerprint: hex, authorityCommitSnapshotFingerprint: hex, checkpointFingerprint: hex });
-  const y = buildPublicationY({ txId: "tx", genesisTxId: "tx", generation: 1, kFingerprint: k["publication-kFingerprint"], publicationFingerprint: k.publicationFingerprint, targetState: p.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, targetFingerprint });
+  const p = buildPublicationP({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, uFingerprint: u["publication-uFingerprint"], stateFingerprint: u["publication-uFingerprint"], targetState: u.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null });
+  const k = buildPublicationK({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, zpFingerprint: hex, publicationFingerprint: hex, authorityCommitSnapshotFingerprint: hex, checkpointFingerprint: hex });
+  const y = buildPublicationY({ txId: "tx", genesisTxId: "tx", fenceGeneration: 1, generation: 1, kFingerprint: k["publication-kFingerprint"], publicationFingerprint: k.publicationFingerprint, targetState: p.targetState, authorityCommitSnapshotFingerprint: hex, fenceBindingFingerprint: null, targetFingerprint });
   assert.equal(validatePublicationY(y, k, targetFingerprint), y);
   assert.throws(() => validatePublicationY(y, k, k["publication-kFingerprint"]));
   assert.throws(() => validatePublicationY(seal({ ...y, kFingerprint: "9".repeat(64) }, "publication-yFingerprint"), k, targetFingerprint));
 });
 test("Genesis Zf rejects an attested token floor", () => {
-  const request = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, requestedReaderMode: "no-reader", readerInstanceId: null, readerStartNonce: null, attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
-  const floor = seal({ version: 1, kind: "token-generation-floor", anchorFingerprint: hex, genesisGeneration: 1, highestReservedGeneration: 1, highestCommittedGeneration: 0, lastReservationTxId: "g", lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: "attested", attestedProofFingerprint: hex }, "floorFingerprint");
+  const request = seal({ version: 1, kind: "genesis-request", genesisTxId: "g", idempotencyKey: "i", anchorFingerprint: hex, ownerPrincipalFingerprint: hex, generation: 1, fenceGeneration: 1, requestedReaderMode: "no-reader", readerInstanceId: null, readerStartNonce: null, attestationFingerprint: hex, tokenFloorFingerprint: hex }, "requestFingerprint");
+  const floor = seal({ version: 1, kind: "token-generation-floor", anchorFingerprint: hex, fenceGeneration: 1, genesisGeneration: 1, highestReservedGeneration: 1, highestCommittedGeneration: 0, lastReservationTxId: "g", lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: "attested", attestedProofFingerprint: hex }, "floorFingerprint");
   const precommit = buildGenesisPrecommit({
+    fenceGeneration: 1,
     genesisTxId: "g", generation: 1, genesisProbeFingerprint: hex, targetFingerprint: hex, targetIdentityFingerprint: hex, targetAclFingerprint: hex,
     controlRootFingerprint: hex, controlIdentityFingerprint: hex, controlAclFingerprint: hex, wrapperIdentityFingerprint: hex, wrapperAclFingerprint: hex, wrapperFingerprint: hex,
     readerVersionFloorFingerprint: hex, requestFingerprint: request.requestFingerprint, reservationFingerprint: hex, attestedProofFingerprint: hex,
     authorityReservationFingerprint: hex, authorityCommitSnapshotFingerprint: hex, authorityEpochFingerprint: hex, publicationKFingerprint: hex, publicationYFingerprint: hex, zeroGrantProofFingerprint: hex,
   });
-  const zf = seal({ version: 1, kind: "genesis-finality", genesisTxId: "g", generation: 1, anchorFingerprint: hex, attestationFingerprint: hex, tokenFloorFingerprint: floor.floorFingerprint, checkpointFingerprint: canonicalJsonHash(request), publicationKFingerprint: hex, publicationYFingerprint: hex, authorityEpochFingerprint: hex, precommitFingerprint: precommit.precommitFingerprint, finalityFingerprint: floor.floorFingerprint }, "zFinalityFingerprint");
+  const zf = seal({ version: 1, kind: "genesis-finality", genesisTxId: "g", generation: 1, fenceGeneration: 1, anchorFingerprint: hex, attestationFingerprint: hex, tokenFloorFingerprint: floor.floorFingerprint, checkpointFingerprint: canonicalJsonHash(request), publicationKFingerprint: hex, publicationYFingerprint: hex, authorityEpochFingerprint: hex, precommitFingerprint: precommit.precommitFingerprint, finalityFingerprint: floor.floorFingerprint }, "zFinalityFingerprint");
   assert.throws(() => validateZFinality(zf, request, floor, precommit));
 });
 test("frozen management envelope vectors bind canonical UTF-8 bytes independently", () => {
@@ -189,7 +190,7 @@ test("frozen management envelope vectors bind canonical UTF-8 bytes independentl
 });
 test("successor heads require exact one-step and terminal rolling lineage", () => {
   const base = {
-    version: 1, kind: "authority-successor-head", anchorFingerprint: hex, sequence: 2, txId: "successor-2",
+    version: 1, kind: "authority-successor-head", anchorFingerprint: hex, sequence: 2, fenceGeneration: 2, txId: "successor-2",
     rootGenesisTxId: "genesis", operation: "tokens-attest", phase: "reserved", requestFingerprint: hex,
     closeFingerprint: null, authorityCommitSnapshotFingerprint: null, baselineFingerprint: null,
     publicationKFingerprint: null, publicationYFingerprint: null, finalityFingerprint: null,
@@ -202,7 +203,7 @@ test("successor heads require exact one-step and terminal rolling lineage", () =
   assert.doesNotThrow(() => validateAuthoritySuccessorHeadTransition(reserved, closed));
   assert.throws(() => validateAuthoritySuccessorHeadTransition(reserved, buildAuthoritySuccessorRecord({ ...closed, phase: "replaced", previousHeadFingerprint: reserved.headFingerprint, headFingerprint: null }, "headFingerprint")), /SUCCESSOR_ENVELOPE_INVALID/);
   const terminal = buildAuthoritySuccessorRecord({ ...closed, phase: "terminal", authorityCommitSnapshotFingerprint: hex, baselineFingerprint: hex, publicationKFingerprint: hex, publicationYFingerprint: hex, finalityFingerprint: hex, receiptFingerprint: "c".repeat(64), historyMarkerFingerprint: "d".repeat(64), previousHeadFingerprint: closed.headFingerprint, headFingerprint: null }, "headFingerprint");
-  const next = buildAuthoritySuccessorRecord({ ...base, sequence: 3, txId: "successor-3", previousHeadFingerprint: terminal.headFingerprint, previousReceiptFingerprint: terminal.receiptFingerprint, headFingerprint: null }, "headFingerprint");
+  const next = buildAuthoritySuccessorRecord({ ...base, sequence: 3, fenceGeneration: 3, txId: "successor-3", previousHeadFingerprint: terminal.headFingerprint, previousReceiptFingerprint: terminal.receiptFingerprint, headFingerprint: null }, "headFingerprint");
   assert.doesNotThrow(() => validateAuthoritySuccessorHeadTransition(terminal, next));
   assert.throws(() => validateAuthoritySuccessorHeadTransition(terminal, buildAuthoritySuccessorRecord({ ...next, sequence: 4, headFingerprint: null }, "headFingerprint")), /SUCCESSOR_ENVELOPE_INVALID/);
 });
@@ -211,6 +212,8 @@ test("mapping successors require exact next mapping generation", () => {
     version: 1,
     kind: "authority-successor-request",
     sequence: 2,
+    previousFenceGeneration: 1,
+    candidateFenceGeneration: 2,
     txId: "successor-mapping-2",
     rootGenesisTxId: "genesis",
     idempotencyKey: "mapping-key",
@@ -243,6 +246,10 @@ test("mapping successors require exact next mapping generation", () => {
   }, "requestFingerprint");
 
   assert.doesNotThrow(() => validateAuthoritySuccessorRequest(request));
+  const missingFence = { ...request }; delete missingFence.candidateFenceGeneration;
+  assert.throws(() => validateAuthoritySuccessorRequest(missingFence), /SUCCESSOR_ENVELOPE_INVALID/);
+  const regressedFence = buildAuthoritySuccessorRecord({ ...request, candidateFenceGeneration: request.previousFenceGeneration, requestFingerprint: null }, "requestFingerprint");
+  assert.throws(() => validateAuthoritySuccessorRequest(regressedFence), /fence/);
   const noReader = buildAuthoritySuccessorRecord({
     ...request,
     readerMode: "no-reader",
@@ -259,6 +266,7 @@ test("mapping successors require exact next mapping generation", () => {
     rootGenesisTxId: noReader.rootGenesisTxId,
     requestFingerprint: noReader.requestFingerprint,
     previousReceiptFingerprint: noReader.previousReceiptFingerprint,
+    fenceGeneration: noReader.candidateFenceGeneration,
     previousBarrierGeneration: 1,
     barrierGeneration: 2,
     affectedScope: "mapping",
@@ -302,7 +310,7 @@ test("mapping successors require exact next mapping generation", () => {
 });
 test("successor phase recovery retains exact evidence and refuses malformed or skipped heads", () => {
   const base = {
-    version: 1, kind: "authority-successor-head", anchorFingerprint: hex, sequence: 2, txId: "successor-2",
+    version: 1, kind: "authority-successor-head", anchorFingerprint: hex, sequence: 2, fenceGeneration: 2, txId: "successor-2",
     rootGenesisTxId: "genesis", operation: "tokens-attest", phase: "reserved", requestFingerprint: hex,
     closeFingerprint: null, authorityCommitSnapshotFingerprint: null, baselineFingerprint: null,
     publicationKFingerprint: null, publicationYFingerprint: null, finalityFingerprint: null,
@@ -326,7 +334,7 @@ test("successor phase recovery retains exact evidence and refuses malformed or s
 });
 test("successor reader records reject every substituted authoritative scalar", () => {
   const request = buildAuthoritySuccessorRecord({
-    version: 1, kind: "authority-successor-request", sequence: 2, txId: "successor", rootGenesisTxId: "genesis", idempotencyKey: "key", operation: "tokens-attest",
+    version: 1, kind: "authority-successor-request", sequence: 2, previousFenceGeneration: 1, candidateFenceGeneration: 2, txId: "successor", rootGenesisTxId: "genesis", idempotencyKey: "key", operation: "tokens-attest",
     anchorFingerprint: hex, actorPrincipalFingerprint: hex, previousReceiptFingerprint: hex, previousTargetFingerprint: hex, previousWrapperFingerprint: hex,
     previousRevision: 1, candidateRevision: 2, previousAuthorityEpoch: 1, candidateAuthorityEpoch: 2, previousTokenConfigGeneration: 1, candidateTokenConfigGeneration: 2,
     previousAttestationFingerprint: hex, candidateAttestationFingerprint: "b".repeat(64), previousMappingGeneration: 0, candidateMappingGeneration: 0,
@@ -335,11 +343,12 @@ test("successor reader records reject every substituted authoritative scalar", (
   }, "requestFingerprint");
   const fence = buildAuthoritySuccessorRecord({
     version: 1, kind: "authority-successor-fence", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId, requestFingerprint: request.requestFingerprint,
+    fenceGeneration: request.candidateFenceGeneration,
     anchorFingerprint: request.anchorFingerprint, authorityCommitSnapshotFingerprint: hex, readerInstanceId: request.readerInstanceId, readerStartNonce: request.readerStartNonce,
     readerVersion: 2, previousFenceBindingFingerprint: hex, fenceBindingFingerprint: null,
   }, "fenceBindingFingerprint");
   const finality = buildAuthoritySuccessorRecord({
-    version: 1, kind: "authority-successor-finality", sequence: request.sequence, txId: request.txId, rootGenesisTxId: request.rootGenesisTxId, operation: request.operation,
+    version: 1, kind: "authority-successor-finality", sequence: request.sequence, fenceGeneration: request.candidateFenceGeneration, txId: request.txId, rootGenesisTxId: request.rootGenesisTxId, operation: request.operation,
     requestFingerprint: request.requestFingerprint, baselineFingerprint: hex, closeFingerprint: hex, anchorFingerprint: request.anchorFingerprint,
     authorityReservationFingerprint: hex, authorityCommitSnapshotFingerprint: fence.authorityCommitSnapshotFingerprint, authorityEpochFingerprint: hex, tokenFloorFingerprint: hex,
     attestationFingerprint: request.candidateAttestationFingerprint, publicationKFingerprint: hex, publicationYFingerprint: hex, operationEvidenceFingerprint: hex, auditEntryFingerprint: hex,
@@ -349,11 +358,13 @@ test("successor reader records reject every substituted authoritative scalar", (
   }, "finalityFingerprint");
   const lease = buildAuthoritySuccessorRecord({
     version: 1, kind: "authority-successor-lease", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId, requestFingerprint: request.requestFingerprint,
+    fenceGeneration: request.candidateFenceGeneration,
     readerInstanceId: request.readerInstanceId, readerStartNonce: request.readerStartNonce, readerVersion: 2, fenceBindingFingerprint: fence.fenceBindingFingerprint,
     previousLeaseBindingFingerprint: request.previousReceiptFingerprint, leaseBindingFingerprint: null,
   }, "leaseBindingFingerprint");
   const projection = buildAuthoritySuccessorRecord({
     version: 1, kind: "authority-successor-reader-projection", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId, requestFingerprint: request.requestFingerprint,
+    fenceGeneration: request.candidateFenceGeneration,
     finalityFingerprint: finality.finalityFingerprint, anchorFingerprint: request.anchorFingerprint, authorityCommitSnapshotFingerprint: finality.authorityCommitSnapshotFingerprint,
     targetFingerprint: finality.targetFingerprint, wrapperFingerprint: finality.wrapperFingerprint, revision: finality.revision, authorityEpoch: finality.authorityEpoch,
     tokenConfigGeneration: finality.tokenConfigGeneration, mappingGeneration: finality.mappingGeneration, readerInstanceId: request.readerInstanceId,
@@ -362,6 +373,7 @@ test("successor reader records reject every substituted authoritative scalar", (
   }, "readerProjectionFingerprint");
   const ack = buildAuthoritySuccessorRecord({
     version: 1, kind: "authority-successor-ack", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId, requestFingerprint: request.requestFingerprint,
+    fenceGeneration: request.candidateFenceGeneration,
     finalityFingerprint: finality.finalityFingerprint, readerProjectionFingerprint: projection.readerProjectionFingerprint, leaseBindingFingerprint: lease.leaseBindingFingerprint,
     readerInstanceId: request.readerInstanceId, readerStartNonce: request.readerStartNonce, readerVersion: 2, readerNonce: request.readerNonce,
     ackDisposition: "verified-no-route", ackFingerprint: null,
@@ -371,13 +383,13 @@ test("successor reader records reject every substituted authoritative scalar", (
   assert.doesNotThrow(() => validateAuthoritySuccessorReaderProjection(projection, request, finality, lease));
   assert.doesNotThrow(() => validateAuthoritySuccessorAck(ack, request, finality, projection));
   const rollingRequest = buildAuthoritySuccessorRecord({
-    ...request, sequence: 3, txId: "successor-rolling", previousReceiptFingerprint: "7".repeat(64), requestFingerprint: null,
+    ...request, sequence: 3, txId: "successor-rolling", previousReceiptFingerprint: "7".repeat(64), previousFenceGeneration: 2, candidateFenceGeneration: 3, requestFingerprint: null,
   }, "requestFingerprint");
   const rollingFence = buildAuthoritySuccessorRecord({
-    ...fence, txId: rollingRequest.txId, requestFingerprint: rollingRequest.requestFingerprint, fenceBindingFingerprint: null,
+    ...fence, txId: rollingRequest.txId, requestFingerprint: rollingRequest.requestFingerprint, fenceGeneration: rollingRequest.candidateFenceGeneration, fenceBindingFingerprint: null,
   }, "fenceBindingFingerprint");
   const rollingLease = buildAuthoritySuccessorRecord({
-    ...lease, txId: rollingRequest.txId, requestFingerprint: rollingRequest.requestFingerprint,
+    ...lease, txId: rollingRequest.txId, requestFingerprint: rollingRequest.requestFingerprint, fenceGeneration: rollingRequest.candidateFenceGeneration,
     fenceBindingFingerprint: rollingFence.fenceBindingFingerprint,
     previousLeaseBindingFingerprint: rollingRequest.previousReceiptFingerprint, leaseBindingFingerprint: null,
   }, "leaseBindingFingerprint");
@@ -388,8 +400,8 @@ test("successor reader records reject every substituted authoritative scalar", (
   assert.throws(() => validateAuthoritySuccessorLease(lease, foreignReceiptRequest, fence), /L2 predecessor relation/);
 
   const sealedMutation = (record, field, fingerprintField) => buildAuthoritySuccessorRecord({ ...record, [field]: typeof record[field] === "number" ? record[field] + 1 : record[field] === "genesis" ? "foreign-genesis" : record[field] === "reader" ? "foreign-reader" : record[field] === "start" ? "foreign-start" : record[field] === "nonce" ? "foreign-nonce" : "9".repeat(64), [fingerprintField]: null }, fingerprintField);
-  for (const field of ["rootGenesisTxId", "requestFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "previousLeaseBindingFingerprint"]) assert.throws(() => validateAuthoritySuccessorLease(sealedMutation(lease, field, "leaseBindingFingerprint"), request, fence), /L2/);
-  for (const field of ["rootGenesisTxId", "requestFingerprint", "anchorFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion"]) assert.throws(() => validateAuthoritySuccessorFence(sealedMutation(fence, field, "fenceBindingFingerprint"), request), /F2/);
-  for (const field of ["rootGenesisTxId", "requestFingerprint", "finalityFingerprint", "anchorFingerprint", "authorityCommitSnapshotFingerprint", "targetFingerprint", "wrapperFingerprint", "revision", "authorityEpoch", "tokenConfigGeneration", "mappingGeneration", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce", "fenceBindingFingerprint", "leaseBindingFingerprint"]) assert.throws(() => validateAuthoritySuccessorReaderProjection(sealedMutation(projection, field, "readerProjectionFingerprint"), request, finality, lease), /RP2/);
-  for (const field of ["rootGenesisTxId", "requestFingerprint", "finalityFingerprint", "readerProjectionFingerprint", "leaseBindingFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce"]) assert.throws(() => validateAuthoritySuccessorAck(sealedMutation(ack, field, "ackFingerprint"), request, finality, projection), /AK2/);
+  for (const field of ["rootGenesisTxId", "requestFingerprint", "fenceGeneration", "readerInstanceId", "readerStartNonce", "readerVersion", "previousLeaseBindingFingerprint"]) assert.throws(() => validateAuthoritySuccessorLease(sealedMutation(lease, field, "leaseBindingFingerprint"), request, fence), /L2/);
+  for (const field of ["rootGenesisTxId", "requestFingerprint", "fenceGeneration", "anchorFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion"]) assert.throws(() => validateAuthoritySuccessorFence(sealedMutation(fence, field, "fenceBindingFingerprint"), request), /F2/);
+  for (const field of ["rootGenesisTxId", "requestFingerprint", "fenceGeneration", "finalityFingerprint", "anchorFingerprint", "authorityCommitSnapshotFingerprint", "targetFingerprint", "wrapperFingerprint", "revision", "authorityEpoch", "tokenConfigGeneration", "mappingGeneration", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce", "fenceBindingFingerprint", "leaseBindingFingerprint"]) assert.throws(() => validateAuthoritySuccessorReaderProjection(sealedMutation(projection, field, "readerProjectionFingerprint"), request, finality, lease), /RP2/);
+  for (const field of ["rootGenesisTxId", "requestFingerprint", "fenceGeneration", "finalityFingerprint", "readerProjectionFingerprint", "leaseBindingFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce"]) assert.throws(() => validateAuthoritySuccessorAck(sealedMutation(ack, field, "ackFingerprint"), request, finality, projection), /AK2/);
 });

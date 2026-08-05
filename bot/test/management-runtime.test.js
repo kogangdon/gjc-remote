@@ -97,6 +97,7 @@ async function boundReaderRuntime() {
   const fence = JSON.parse(fileEnding(harness.files, '/reader-fence-binding.json'));
   const lease = {
     version: 1, kind: 'reader-lease-binding', anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.fenceGeneration,
     genesisTxId: request.genesisTxId, readerInstanceId: floor.firstReaderInstanceId,
     readerStartNonce: floor.firstReaderStartNonce, readerVersion: 2,
     fenceBindingFingerprint: fence.fenceBindingFingerprint, leaseBindingFingerprint: null,
@@ -106,6 +107,7 @@ async function boundReaderRuntime() {
   );
   const projection = {
     version: 1, kind: 'reader-projection', anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.fenceGeneration,
     genesisTxId: request.genesisTxId, generation: request.generation,
     readerInstanceId: floor.firstReaderInstanceId, readerStartNonce: floor.firstReaderStartNonce,
     readerVersion: 2, fenceBindingFingerprint: fence.fenceBindingFingerprint,
@@ -151,13 +153,14 @@ async function boundReaderRuntime() {
 
 function mappingInput(mappingId, generation = 1) {
   const mapping = fingerprintManagedMappingRecord({
-    mappingId, hostId: 'host', mappingGeneration: generation, mappingVersion: 1,
+    mappingId, hostId: 'host', fenceGeneration: 1, mappingGeneration: generation, mappingVersion: 1,
     sourcePlatform: 'posix', workspaceId: 'workspace-a', workDir: null,
     sourceRoot: '/source', containerRoot: '/workspace', volumeIdentity: 'volume-a',
     casePolicy: 'sensitive', immutableDefault: false, mappingFingerprint: null,
   });
   const route = fingerprintManagedRouteRecord({
     channelId: '123', hostId: mapping.hostId, mappingId: mapping.mappingId,
+    fenceGeneration: mapping.fenceGeneration,
     mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion,
     sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId,
     workDir: mapping.workDir, routeFingerprint: null,
@@ -322,6 +325,7 @@ test('bound-reader Genesis resumes only after exact B projection and acknowledge
     version: 1,
     kind: 'reader-lease-binding',
     anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.fenceGeneration,
     genesisTxId: request.genesisTxId,
     readerInstanceId: floor.firstReaderInstanceId,
     readerStartNonce: floor.firstReaderStartNonce,
@@ -336,6 +340,7 @@ test('bound-reader Genesis resumes only after exact B projection and acknowledge
     version: 1,
     kind: 'reader-projection',
     anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.fenceGeneration,
     genesisTxId: request.genesisTxId,
     generation: request.generation,
     readerInstanceId: floor.firstReaderInstanceId,

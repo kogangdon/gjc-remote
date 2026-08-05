@@ -33,6 +33,14 @@ function fakeNative() {
   let auth = null;
   let request = null;
   let managedHistoryMarker = null;
+  let fenceGenerationFloor = {
+    version: 1, kind: "fence-generation-floor", anchorFingerprint: hex, genesisFenceGeneration: 1,
+    highestReservedFenceGeneration: 0, highestCommittedFenceGeneration: 0,
+    lastReservationTxId: null, lastCommittedTxId: null, floorFingerprint: null,
+  };
+  fenceGenerationFloor.floorFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(fenceGenerationFloor).filter(([key]) => key !== "floorFingerprint")),
+  );
   return {
     calls,
     records,
@@ -64,6 +72,36 @@ function fakeNative() {
     async writeAuthorityReservation() {},
     async writeAuthorityCommitSnapshot() {},
     async writeAuthorityBaseline() {},
+    async reserveFenceGeneration({ fenceGeneration, txId }) {
+      if (fenceGeneration !== fenceGenerationFloor.highestReservedFenceGeneration + 1 ||
+          fenceGeneration <= fenceGenerationFloor.highestCommittedFenceGeneration) throw new Error("FENCE_RESERVATION_INVALID");
+      fenceGenerationFloor = {
+        ...fenceGenerationFloor,
+        highestReservedFenceGeneration: fenceGeneration,
+        lastReservationTxId: txId,
+        floorFingerprint: null,
+      };
+      fenceGenerationFloor.floorFingerprint = canonicalJsonHash(
+        Object.fromEntries(Object.entries(fenceGenerationFloor).filter(([key]) => key !== "floorFingerprint")),
+      );
+      return structuredClone(fenceGenerationFloor);
+    },
+    async commitFenceGeneration({ fenceGeneration, txId }) {
+      if (fenceGenerationFloor.highestReservedFenceGeneration !== fenceGeneration ||
+          fenceGenerationFloor.lastReservationTxId !== txId ||
+          fenceGenerationFloor.highestCommittedFenceGeneration !== fenceGeneration - 1) throw new Error("FENCE_COMMIT_INVALID");
+      fenceGenerationFloor = {
+        ...fenceGenerationFloor,
+        highestCommittedFenceGeneration: fenceGeneration,
+        lastCommittedTxId: txId,
+        floorFingerprint: null,
+      };
+      fenceGenerationFloor.floorFingerprint = canonicalJsonHash(
+        Object.fromEntries(Object.entries(fenceGenerationFloor).filter(([key]) => key !== "floorFingerprint")),
+      );
+      return structuredClone(fenceGenerationFloor);
+    },
+    async readFenceGenerationFloor() { return structuredClone(fenceGenerationFloor); },
     async writeReaderFenceBinding() {},
     async casReaderVersionFloor() { throw new Error("UNEXPECTED_READER_HANDSHAKE"); },
     async withManagementLocks(_locks, fn) { return fn(); },
@@ -135,7 +173,7 @@ function fakeNative() {
     async writeZFinality(value) { records.push(value); calls.push("zf"); return value; },
     async readBoundReaderProof() {
       const floor = {
-        version: 1, kind: "reader-version-floor", anchorFingerprint: hex,
+        version: 1, kind: "reader-version-floor", anchorFingerprint: hex, fenceGeneration: 1,
         readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null,
         firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null,
         floorFingerprint: null,
@@ -294,7 +332,7 @@ test("issue #44 management rejects serving-shaped workDir mappings", async () =>
   });
   assert.equal(genesis.ok, true, JSON.stringify(genesis));
   const mapping = fingerprintManagedMappingRecord({
-    mappingId: "serving-shaped", hostId: "host", mappingGeneration: 1,
+    mappingId: "serving-shaped", hostId: "host", fenceGeneration: 1, mappingGeneration: 1,
     mappingVersion: 1, sourcePlatform: "posix", workspaceId: null,
     workDir: "/srv/workspace", sourceRoot: "/srv/workspace",
     containerRoot: null, volumeIdentity: "volume-a", casePolicy: "sensitive",

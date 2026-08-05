@@ -46,34 +46,38 @@ test("prospective probe remains non-authoritative and cleanup needs the exact ob
 });
 
 test("reader floor is literal-null at genesis and irreversible after handshake", () => {
-  const floor = seal({ version: 1, kind: "reader-version-floor", anchorFingerprint: hex, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null }, "floorFingerprint");
-  const advanced = advanceReaderVersionFloor(floor, { txId: "tx", readerInstanceId: "reader", readerStartNonce: "nonce" });
+  const floor = seal({ version: 1, kind: "reader-version-floor", anchorFingerprint: hex, fenceGeneration: 1, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null }, "floorFingerprint");
+  const advanced = advanceReaderVersionFloor(floor, { txId: "tx", readerInstanceId: "reader", readerStartNonce: "nonce", fenceGeneration: 2 });
   assert.equal(validateReaderVersionFloor(advanced).readerVersionFloor, 2);
+  assert.equal(advanced.fenceGeneration, 2);
   assert.throws(() => advanceReaderVersionFloor(advanced, { txId: "other", readerInstanceId: "reader", readerStartNonce: "nonce" }));
 });
 
 test("token generation floor reserves, attests, and commits with monotonic CAS", () => {
-  const floor = seal({ version: 1, kind: "token-generation-floor", anchorFingerprint: hex, genesisGeneration: 7, highestReservedGeneration: 6, highestCommittedGeneration: 6, lastReservationTxId: null, lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: "committed", attestedProofFingerprint: hex }, "floorFingerprint");
-  const attestation = seal({ version: 1, kind: "token-config-attestation", anchorFingerprint: hex, tokenConfigGeneration: 7, tokenConfigHostSetFingerprint: hex, managedGrammarVersion: 1, sourceKind: "protected-stdin", producerPrincipal: `management/${hex}`, rotationKind: "genesis", previousAttestationFingerprint: null, txId: "genesis" }, "attestationFingerprint");
-  const reserved = reserveTokenGeneration(floor, { txId: "genesis", generation: 7 });
+  const floor = seal({ version: 1, kind: "token-generation-floor", anchorFingerprint: hex, fenceGeneration: 1, genesisGeneration: 7, highestReservedGeneration: 6, highestCommittedGeneration: 6, lastReservationTxId: null, lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: "committed", attestedProofFingerprint: hex }, "floorFingerprint");
+  const attestation = seal({ version: 1, kind: "token-config-attestation", anchorFingerprint: hex, fenceGeneration: 1, tokenConfigGeneration: 7, tokenConfigHostSetFingerprint: hex, managedGrammarVersion: 1, sourceKind: "protected-stdin", producerPrincipal: `management/${hex}`, rotationKind: "genesis", previousAttestationFingerprint: null, txId: "genesis" }, "attestationFingerprint");
+  const reserved = reserveTokenGeneration(floor, { txId: "genesis", generation: 7, fenceGeneration: 1 });
   const proof = buildAttestedTokenFloorProof(reserved, attestation);
   const attested = attestTokenFloor(reserved, proof);
-  const committed = commitTokenFloor(attested, { txId: "genesis", generation: 7, attestationFingerprint: attestation.attestationFingerprint });
+  const committed = commitTokenFloor(attested, { txId: "genesis", generation: 7, attestationFingerprint: attestation.attestationFingerprint, fenceGeneration: 1 });
   assert.equal(committed.highestCommittedGeneration, 7);
   assert.throws(() => commitTokenFloor(reserved, { txId: "genesis", generation: 7, attestationFingerprint: attestation.attestationFingerprint }));
   assert.throws(() => commitTokenFloor(attested, { txId: "genesis", generation: 8, attestationFingerprint: attestation.attestationFingerprint }));
   assert.equal(validateTokenFloor(floor).highestCommittedGeneration, 6);
+  const missingFence = { ...floor }; delete missingFence.fenceGeneration;
+  assert.throws(() => validateTokenFloor(missingFence));
+  assert.throws(() => validateTokenFloor({ ...floor, fenceGeneration: 0 }));
 });
 
 test("token attestation is secret-free and has exact protected-stdin lineage", () => {
-  const attestation = seal({ version: 1, kind: "token-config-attestation", anchorFingerprint: hex, tokenConfigGeneration: 1, tokenConfigHostSetFingerprint: hex, managedGrammarVersion: 1, sourceKind: "protected-stdin", producerPrincipal: `management/${hex}`, rotationKind: "genesis", previousAttestationFingerprint: null, txId: "genesis" }, "attestationFingerprint");
+  const attestation = seal({ version: 1, kind: "token-config-attestation", anchorFingerprint: hex, fenceGeneration: 1, tokenConfigGeneration: 1, tokenConfigHostSetFingerprint: hex, managedGrammarVersion: 1, sourceKind: "protected-stdin", producerPrincipal: `management/${hex}`, rotationKind: "genesis", previousAttestationFingerprint: null, txId: "genesis" }, "attestationFingerprint");
   assert.equal(validateTokenConfigAttestation(attestation).tokenConfigHostSetFingerprint, hex);
   assert.throws(() => validateTokenConfigAttestation({ ...attestation, tokenBytes: "secret" }));
 });
 
 test("admission rejects expiry, replay, and reader mismatches", () => {
-  const request = seal({ version: 1, kind: "admission-request", requestId: "rq", genesisTxId: "g", generation: 1, readerInstanceId: "reader", readerStartNonce: "start", routeFingerprint: "route", nonce: "nonce", expiresAt: 10 }, "requestFingerprint");
-  const grant = seal({ version: 1, kind: "admission-grant", grantId: "at", requestFingerprint: request.requestFingerprint, genesisTxId: "g", generation: 1, readerInstanceId: "reader", readerStartNonce: "start", routeFingerprint: "route", nonce: "nonce", expiresAt: 10 }, "grantFingerprint");
+  const request = seal({ version: 1, kind: "admission-request", requestId: "rq", genesisTxId: "g", generation: 1, fenceGeneration: 1, readerInstanceId: "reader", readerStartNonce: "start", routeFingerprint: "route", nonce: "nonce", expiresAt: 10 }, "requestFingerprint");
+  const grant = seal({ version: 1, kind: "admission-grant", grantId: "at", requestFingerprint: request.requestFingerprint, genesisTxId: "g", generation: 1, fenceGeneration: 1, readerInstanceId: "reader", readerStartNonce: "start", routeFingerprint: "route", nonce: "nonce", expiresAt: 10 }, "grantFingerprint");
   assert.equal(validateAdmissionGrant(grant, request, 10).grantId, "at");
   assert.throws(() => validateAdmissionGrant(grant, request, 11));
   assert.throws(() => validateAdmissionGrant(grant, request, 10, new Set(["at"])));
@@ -81,7 +85,7 @@ test("admission rejects expiry, replay, and reader mismatches", () => {
 });
 
 test("manual cleanup wins over torn recovery and remains no-route", () => {
-  const cleanup = seal({ version: 1, kind: "manual-cleanup", anchorFingerprint: hex, txId: "tx", reason: "fingerprint-mismatch", expectedFingerprint: null, observedFingerprint: hex, expectedFloorFingerprint: hex, observedFloorFingerprint: hex, routeDisposition: "no-route", blockedUntilOwnerAction: true }, "manualCleanupFingerprint");
+  const cleanup = seal({ version: 1, kind: "manual-cleanup", anchorFingerprint: hex, fenceGeneration: 1, txId: "tx", reason: "fingerprint-mismatch", expectedFingerprint: null, observedFingerprint: hex, expectedFloorFingerprint: hex, observedFloorFingerprint: hex, routeDisposition: "no-route", blockedUntilOwnerAction: true }, "manualCleanupFingerprint");
   assert.equal(validateManualCleanup(cleanup).routeDisposition, "no-route");
   assert.equal(recoveryDisposition({ manualCleanup: cleanup }), "manual_cleanup");
 });

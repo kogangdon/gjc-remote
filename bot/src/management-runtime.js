@@ -12,16 +12,17 @@ import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAut
 export const EXIT = Object.freeze({ OK: 0, USAGE: 2, AUTH: 3, CONFLICT: 4, NATIVE: 5, INVALID: 6, RECOVERY: 7, INTERNAL: 70 });
 const LOCK_ORDER = ["genesis", "mapping", "admission"];
 const MAX_MAPPING_BYTES = 1024 * 1024;
-const emptyState = () => ({ version: 1, revision: 0, authorityEpoch: 0, tokenConfigGeneration: 0, mappingGeneration: 0, roleBindings: null, mappings: {}, routes: {}, tokenAttestation: null, recovery: null, genesis: null, admission: { phase: "closed", finalityFingerprint: null } });
+const emptyState = () => ({ version: 1, revision: 0, authorityEpoch: 0, fenceGeneration: 1, tokenConfigGeneration: 0, mappingGeneration: 0, roleBindings: null, mappings: {}, routes: {}, tokenAttestation: null, recovery: null, genesis: null, admission: { phase: "closed", finalityFingerprint: null } });
 const safe = (error) => ({ code: /^[A-Z0-9_]+$/.test(error?.code ?? "") ? error.code : /^[A-Z0-9_]+$/.test(error?.message ?? "") ? error.message : "MANAGEMENT_FAILED" });
 const principal = (value, name) => { if (!isPrincipal(value)) throw new Error(`${name}_INVALID`); return value; };
 const protectedTokenFingerprint = (value) => managedHostSetFingerprint(parseManagedHostTokens(value));
 const recordHash = (record, field) => canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field)));
 const validateManagedHistoryMarker = (marker, anchorFingerprint, expectedSequence = undefined) => {
   if (!marker || Object.getPrototypeOf(marker) !== Object.prototype ||
-      Object.keys(marker).sort().join(',') !== 'anchorFingerprint,kind,markerFingerprint,previousMarkerFingerprint,sequence,version' ||
+      Object.keys(marker).sort().join(',') !== 'anchorFingerprint,fenceGeneration,kind,markerFingerprint,previousMarkerFingerprint,sequence,version' ||
       marker.version !== 1 || marker.kind !== 'managed-history-marker' ||
       typeof marker.anchorFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(marker.anchorFingerprint) ||
+      !Number.isSafeInteger(marker.fenceGeneration) || marker.fenceGeneration < 1 ||
       !Number.isSafeInteger(marker.sequence) || marker.sequence < 1 ||
       (marker.sequence === 1 ? marker.previousMarkerFingerprint !== null : !/^[a-f0-9]{64}$/.test(marker.previousMarkerFingerprint)) ||
       typeof marker.markerFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(marker.markerFingerprint) ||
@@ -183,17 +184,17 @@ const redactAudit = (value) => {
 const channelsSnapshot = (state, revision = state.revision, authorityEpoch = state.authorityEpoch) => {
   const snapshot = {
     version: 2, managementStamp: "gjc-management-channels/v2", revision, authorityEpoch,
-    mappingGeneration: state.mappingGeneration, tokenConfigGeneration: state.tokenConfigGeneration,
+    fenceGeneration: state.fenceGeneration, mappingGeneration: state.mappingGeneration, tokenConfigGeneration: state.tokenConfigGeneration,
     tokenConfigHostSetFingerprint: state.tokenAttestation?.fingerprint, targetState: Object.keys(state.routes ?? {}).length ? "managed" : "managed-empty",
     dispatchClass: "workspace-only", mappings: structuredClone(state.mappings), routes: structuredClone(state.routes ?? {}), configFingerprint: null,
   };
   snapshot.configFingerprint = recordHash(snapshot, "configFingerprint");
   return validateManagedChannelsV2(snapshot);
 };
-const publicationGraph = ({ txId, genesisTxId, generation, baseline, targetFingerprint, stateFingerprint, payloadFingerprint, snapshotFingerprint, publicationFingerprint, checkpointFingerprint }) => {
-  const transaction = buildPublicationTransaction({ txId, genesisTxId, generation, baselineFingerprint: baseline.baselineFingerprint });
+const publicationGraph = ({ txId, genesisTxId, generation, fenceGeneration, baseline, targetFingerprint, stateFingerprint, payloadFingerprint, snapshotFingerprint, publicationFingerprint, checkpointFingerprint }) => {
+  const transaction = buildPublicationTransaction({ txId, genesisTxId, generation, fenceGeneration, baselineFingerprint: baseline.baselineFingerprint });
   const u = buildPublicationU({
-    txId, genesisTxId, generation, baselineFingerprint: baseline.baselineFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, baselineFingerprint: baseline.baselineFingerprint,
     anchorFingerprint: baseline.anchorFingerprint, targetState: baseline.targetState,
     attestationFingerprint: baseline.attestationFingerprint,
     authorityReservationFingerprint: baseline.authorityReservationFingerprint,
@@ -204,44 +205,44 @@ const publicationGraph = ({ txId, genesisTxId, generation, baseline, targetFinge
     readerInstanceId: baseline.readerInstanceId, readerStartNonce: baseline.readerStartNonce, readerVersion: baseline.readerVersion,
   });
   const p = buildPublicationP({
-    txId, genesisTxId, generation, uFingerprint: u["publication-uFingerprint"], stateFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, uFingerprint: u["publication-uFingerprint"], stateFingerprint,
     targetState: u.targetState, authorityCommitSnapshotFingerprint: u.authorityCommitSnapshotFingerprint,
     fenceBindingFingerprint: u.fenceBindingFingerprint, leaseBindingFingerprint: u.leaseBindingFingerprint,
     readerInstanceId: u.readerInstanceId, readerStartNonce: u.readerStartNonce, readerVersion: u.readerVersion,
   });
   const s = buildPublicationS({
-    txId, genesisTxId, generation, pFingerprint: p["publication-pFingerprint"], stateFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, pFingerprint: p["publication-pFingerprint"], stateFingerprint,
     payloadFingerprint, targetState: p.targetState,
     authorityCommitSnapshotFingerprint: p.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: p.fenceBindingFingerprint, readerVersion: p.readerVersion,
   });
-  const phase = (value) => buildPublicationState({ txId, genesisTxId, generation, publicationFingerprint, phase: value });
+  const phase = (value) => buildPublicationState({ txId, genesisTxId, generation, fenceGeneration, publicationFingerprint, phase: value });
   const prepared = phase("prepared");
   const replaced = phase("replaced");
   const c = buildPublicationC({
-    txId, genesisTxId, generation, sFingerprint: s["publication-sFingerprint"], stateFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, sFingerprint: s["publication-sFingerprint"], stateFingerprint,
     payloadFingerprint, snapshotFingerprint,
     authorityCommitSnapshotFingerprint: s.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: s.fenceBindingFingerprint,
     readerInstanceId: p.readerInstanceId, readerStartNonce: p.readerStartNonce, readerVersion: s.readerVersion,
   });
   const q = buildPublicationQ({
-    txId, genesisTxId, generation, cFingerprint: c["publication-cFingerprint"], baselineFingerprint: baseline.baselineFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, cFingerprint: c["publication-cFingerprint"], baselineFingerprint: baseline.baselineFingerprint,
     stateFingerprint: c.stateFingerprint, payloadFingerprint: c.payloadFingerprint, snapshotFingerprint: c.snapshotFingerprint,
     authorityCommitSnapshotFingerprint: c.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: c.fenceBindingFingerprint,
   });
   const zp = buildPublicationZp({
-    txId, genesisTxId, generation, qFingerprint: q["publication-qFingerprint"], publicationFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, qFingerprint: q["publication-qFingerprint"], publicationFingerprint,
     stateFingerprint: q.stateFingerprint, payloadFingerprint: q.payloadFingerprint, snapshotFingerprint: q.snapshotFingerprint,
   });
   const k = buildPublicationK({
-    txId, genesisTxId, generation, zpFingerprint: zp["publication-zpFingerprint"], publicationFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, zpFingerprint: zp["publication-zpFingerprint"], publicationFingerprint,
     authorityCommitSnapshotFingerprint: q.authorityCommitSnapshotFingerprint, checkpointFingerprint,
   });
   const y = buildPublicationY({
-    txId, genesisTxId, generation, kFingerprint: k["publication-kFingerprint"], publicationFingerprint,
+    txId, genesisTxId, generation, fenceGeneration, kFingerprint: k["publication-kFingerprint"], publicationFingerprint,
     targetState: baseline.targetState, authorityCommitSnapshotFingerprint: k.authorityCommitSnapshotFingerprint,
     fenceBindingFingerprint: q.fenceBindingFingerprint, targetFingerprint,
   });
-  const committed = buildPublicationState({ txId, genesisTxId, generation, publicationFingerprint, phase: "committed" });
+  const committed = buildPublicationState({ txId, genesisTxId, generation, fenceGeneration, publicationFingerprint, phase: "committed" });
   validatePublicationP(p, u, stateFingerprint);
   validatePublicationS(s, p, { stateFingerprint, payloadFingerprint });
   validatePublicationC(c, s, { stateFingerprint, payloadFingerprint, snapshotFingerprint });
@@ -271,7 +272,7 @@ export class ManagementRuntime {
   }
 
   #assertNative() {
-    const methods = ["readManagementState", "compareAndSwapManagementState", "readManagementAuth", "compareAndSwapManagementAuth", "readManagedHistoryMarker", "commitManagedHistoryMarker", "configureManagementRoles", "currentOsPrincipal", "managementAnchorFingerprint", "withManagementLocks", "probeProspectiveCleanup", "writeGenesisAuthorityRequest", "writeGenesisAuthorityReceipt", "reserveAuthorityEpoch", "commitAuthorityEpoch", "writeAuthorityReservation", "writeAuthorityCommitSnapshot", "writeAuthorityBaseline", "writeReaderFenceBinding", "casReaderVersionFloor", "reserveTokenFloor", "writeTokenConfigAttestation", "writeAttestedTokenFloor", "writeGenesisRequest", "commitTokenFloor", "writePublicationGraph", "writeZFinality", "writeAdmissionRequest", "writeAdmissionGrant", "readBoundReaderProof", "completePendingGenesis", "writeFinalityProof", "writeGenesisReceipt", "recheckAdmissionFinality", "publishMapping", "reopenAdmission", "revokeMapping", "writeMappingGeneration", "readMappingGeneration", "writeMappingTombstone", "writeMappingHandoffReceipt", "mappingTargetProof", "recoverGenesisSuffix", "appendAudit", "terminalCloseOrManualCleanup", "rotateTokenSidecar"];
+    const methods = ["readManagementState", "compareAndSwapManagementState", "readManagementAuth", "compareAndSwapManagementAuth", "readManagedHistoryMarker", "commitManagedHistoryMarker", "configureManagementRoles", "currentOsPrincipal", "managementAnchorFingerprint", "withManagementLocks", "probeProspectiveCleanup", "writeGenesisAuthorityRequest", "writeGenesisAuthorityReceipt", "reserveFenceGeneration", "commitFenceGeneration", "readFenceGenerationFloor", "reserveAuthorityEpoch", "commitAuthorityEpoch", "writeAuthorityReservation", "writeAuthorityCommitSnapshot", "writeAuthorityBaseline", "writeReaderFenceBinding", "casReaderVersionFloor", "reserveTokenFloor", "writeTokenConfigAttestation", "writeAttestedTokenFloor", "writeGenesisRequest", "commitTokenFloor", "writePublicationGraph", "writeZFinality", "writeAdmissionRequest", "writeAdmissionGrant", "readBoundReaderProof", "completePendingGenesis", "writeFinalityProof", "writeGenesisReceipt", "recheckAdmissionFinality", "publishMapping", "reopenAdmission", "revokeMapping", "writeMappingGeneration", "readMappingGeneration", "writeMappingTombstone", "writeMappingHandoffReceipt", "mappingTargetProof", "recoverGenesisSuffix", "appendAudit", "terminalCloseOrManualCleanup", "rotateTokenSidecar"];
     for (const method of methods) if (typeof this.native?.[method] !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
   }
   async #configureRoles(command, input) {
@@ -336,6 +337,7 @@ export class ManagementRuntime {
       version: 1,
       kind: "managed-history-marker",
       anchorFingerprint,
+      fenceGeneration: 1,
       sequence: 1,
       previousMarkerFingerprint: null,
       markerFingerprint: null,
@@ -373,6 +375,10 @@ export class ManagementRuntime {
       current.admission = { phase: "closed", finalityFingerprint: null };
       const revision = current.revision;
       current.authorityEpoch = (await this.#readAuthorityEpochFloor())?.highestReservedAuthorityEpoch ?? current.authorityEpoch;
+      const fenceFloor = typeof this.native.readFenceGenerationFloor === "function" ? await this.native.readFenceGenerationFloor() : null;
+      if (Number.isSafeInteger(fenceFloor?.highestCommittedFenceGeneration) && fenceFloor.highestCommittedFenceGeneration >= 1) {
+        current.fenceGeneration = fenceFloor.highestCommittedFenceGeneration;
+      }
       if (!await this.native.compareAndSwapManagementState(revision, current)) throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
     }
     throw new Error("MANUAL_CLEANUP_REQUIRED");
@@ -528,6 +534,7 @@ export class ManagementRuntime {
         };
         state.genesis = {
           txId: state.recovery.txId,
+          fenceGeneration: 1,
           replayFingerprint,
           genesisSecurityTuple: state.recovery.genesisSecurityTuple,
           requestFingerprint: state.recovery.requestFingerprint,
@@ -584,6 +591,7 @@ export class ManagementRuntime {
         };
         state.genesis = {
           txId: state.recovery.txId,
+          fenceGeneration: 1,
           replayFingerprint,
           genesisSecurityTuple: state.recovery.genesisSecurityTuple,
           requestFingerprint: state.recovery.requestFingerprint,
@@ -617,38 +625,38 @@ export class ManagementRuntime {
         }
         return { idempotent: true, genesisTxId: state.genesis.txId };
       }
-      const baseFloor = state.tokenFloor ?? { version: 1, kind: "token-generation-floor", anchorFingerprint, genesisGeneration: generation, highestReservedGeneration: generation - 1, highestCommittedGeneration: generation - 1, lastReservationTxId: null, lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: "reserved", attestedProofFingerprint: null, floorFingerprint: null };
+      const baseFloor = state.tokenFloor ?? { version: 1, kind: "token-generation-floor", anchorFingerprint, fenceGeneration: 1, genesisGeneration: generation, highestReservedGeneration: generation - 1, highestCommittedGeneration: generation - 1, lastReservationTxId: null, lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: "reserved", attestedProofFingerprint: null, floorFingerprint: null };
       if (baseFloor.floorFingerprint === null) baseFloor.floorFingerprint = recordHash(baseFloor, "floorFingerprint");
-      const reservedFloor = reserveTokenGeneration(baseFloor, { generation, txId });
+      const reservedFloor = reserveTokenGeneration(baseFloor, { generation, txId, fenceGeneration: 1 });
       validateTokenFloorReservation(reservedFloor);
-      const attestation = { version: 1, kind: "token-config-attestation", anchorFingerprint, tokenConfigGeneration: generation, tokenConfigHostSetFingerprint: hostSetFingerprint, managedGrammarVersion: 1, sourceKind: "protected-stdin", producerPrincipal: `management/${canonicalJsonHash(actorPrincipal)}`, rotationKind: generation === baseFloor.genesisGeneration ? "genesis" : hostSetFingerprint === state.tokenAttestation?.fingerprint ? "same-key" : "host-set-change", previousAttestationFingerprint: baseFloor.lastAttestationFingerprint, txId, attestationFingerprint: null };
+      const attestation = { version: 1, kind: "token-config-attestation", anchorFingerprint, fenceGeneration: 1, tokenConfigGeneration: generation, tokenConfigHostSetFingerprint: hostSetFingerprint, managedGrammarVersion: 1, sourceKind: "protected-stdin", producerPrincipal: `management/${canonicalJsonHash(actorPrincipal)}`, rotationKind: generation === baseFloor.genesisGeneration ? "genesis" : hostSetFingerprint === state.tokenAttestation?.fingerprint ? "same-key" : "host-set-change", previousAttestationFingerprint: baseFloor.lastAttestationFingerprint, txId, attestationFingerprint: null };
       attestation.attestationFingerprint = recordHash(attestation, "attestationFingerprint");
-      const request = { version: 1, kind: "genesis-request", genesisTxId: txId, idempotencyKey: input.idempotencyKey, anchorFingerprint, ownerPrincipalFingerprint: canonicalJsonHash(actorPrincipal), generation, requestedReaderMode: input.requestedReaderMode ?? "no-reader", readerInstanceId: input.requestedReaderMode === "handshake" ? input.readerInstanceId : null, readerStartNonce: input.requestedReaderMode === "handshake" ? input.readerStartNonce : null, attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: reservedFloor.floorFingerprint, requestFingerprint: null };
+      const request = { version: 1, kind: "genesis-request", genesisTxId: txId, fenceGeneration: 1, idempotencyKey: input.idempotencyKey, anchorFingerprint, ownerPrincipalFingerprint: canonicalJsonHash(actorPrincipal), generation, requestedReaderMode: input.requestedReaderMode ?? "no-reader", readerInstanceId: input.requestedReaderMode === "handshake" ? input.readerInstanceId : null, readerStartNonce: input.requestedReaderMode === "handshake" ? input.readerStartNonce : null, attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: reservedFloor.floorFingerprint, requestFingerprint: null };
       request.requestFingerprint = recordHash(request, "requestFingerprint");
       validateGenesisRequest(request);
       let authorityRequest;
       const authorityEpochCandidate = await this.#nextAuthorityEpoch(state);
       const authorityReservation = {
-        version: 1, kind: "authority-reservation", anchorFingerprint, txId, epoch: authorityEpochCandidate,
+        version: 1, kind: "authority-reservation", anchorFingerprint, fenceGeneration: 1, txId, epoch: authorityEpochCandidate,
         generation, candidateFingerprint: request.requestFingerprint, previousAuthorityCommitSnapshotFingerprint: null, reservationFingerprint: null,
       };
       authorityReservation.reservationFingerprint = recordHash(authorityReservation, "reservationFingerprint");
       validateAuthorityReservation(authorityReservation);
       const authorityCommit = {
-        version: 1, kind: "authority-commit-snapshot", anchorFingerprint, txId, epoch: authorityReservation.epoch,
+        version: 1, kind: "authority-commit-snapshot", anchorFingerprint, fenceGeneration: 1, txId, epoch: authorityReservation.epoch,
         generation, candidateFingerprint: authorityReservation.candidateFingerprint, reservationFingerprint: authorityReservation.reservationFingerprint,
         previousAuthorityCommitSnapshotFingerprint: null, authorityCommitSnapshotFingerprint: null,
       };
       authorityCommit.authorityCommitSnapshotFingerprint = recordHash(authorityCommit, "authorityCommitSnapshotFingerprint");
       validateAuthorityCommitSnapshot(authorityCommit, authorityReservation);
       const authorityEpoch = {
-        version: 1, kind: "authority-epoch", anchorFingerprint, epoch: authorityReservation.epoch, reservationTxId: txId,
+        version: 1, kind: "authority-epoch", anchorFingerprint, fenceGeneration: 1, epoch: authorityReservation.epoch, reservationTxId: txId,
         commitTxId: null, previousAuthorityCommitSnapshotFingerprint: null, authorityEpochFingerprint: null,
       };
       authorityEpoch.authorityEpochFingerprint = recordHash(authorityEpoch, "authorityEpochFingerprint");
       validateAuthorityEpoch(authorityEpoch);
       let baseline = {
-        version: 1, kind: "authority-baseline", anchorFingerprint, genesisTxId: txId, idempotencyKey: input.idempotencyKey,
+        version: 1, kind: "authority-baseline", anchorFingerprint, genesisTxId: txId, idempotencyKey: input.idempotencyKey, fenceGeneration: 1,
         targetState: request.requestedReaderMode === "handshake" ? "handshake-pending" : "genesis-empty", generation,
         tokenConfigHostSetFingerprint: hostSetFingerprint, attestationFingerprint: attestation.attestationFingerprint,
         authorityReservationFingerprint: authorityReservation.reservationFingerprint, authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint,
@@ -658,7 +666,7 @@ export class ManagementRuntime {
       baseline.baselineFingerprint = recordHash(baseline, "baselineFingerprint");
       const attestedProof = buildAttestedTokenFloorProof(reservedFloor, attestation);
       const attestedFloor = attestTokenFloor(reservedFloor, attestedProof);
-      const committedFloor = commitTokenFloor(attestedFloor, { txId, generation, attestationFingerprint: attestation.attestationFingerprint });
+      const committedFloor = commitTokenFloor(attestedFloor, { txId, generation, attestationFingerprint: attestation.attestationFingerprint, fenceGeneration: 1 });
       let nativeMutation = false;
       try {
         const genesisProbe = await this.native.probeProspectiveCleanup({
@@ -692,7 +700,7 @@ export class ManagementRuntime {
              typeof expectedLegacyTarget.targetIdentity !== "string" ||
              !/^[a-f0-9]{64}$/.test(expectedLegacyTarget.targetAclFingerprint))) throw new Error("LEGACY_TARGET_PROOF_REQUIRED");
         authorityRequest = {
-          version: 1, kind: "genesis-authority-request", genesisTxId: txId, sequence: 1, anchorFingerprint,
+          version: 1, kind: "genesis-authority-request", genesisTxId: txId, fenceGeneration: 1, sequence: 1, anchorFingerprint,
           ownerPrincipalFingerprint: canonicalJsonHash(actorPrincipal), managementPrincipalFingerprint: canonicalJsonHash(actorPrincipal),
           botPrincipalFingerprint: canonicalJsonHash(input.botPrincipal), recoveryPrincipalFingerprint: canonicalJsonHash(input.recoveryPrincipal),
           targetPrincipalFingerprint: canonicalJsonHash(targetPrincipal),
@@ -711,9 +719,10 @@ export class ManagementRuntime {
         authorityRequest.requestFingerprint = recordHash(authorityRequest, "requestFingerprint");
         validateGenesisAuthorityRequest(authorityRequest);
         await this.native.writeGenesisAuthorityRequest(authorityRequest);
+        await this.native.reserveFenceGeneration({ fenceGeneration: 1, txId });
         nativeMutation = true;
         if (bootstrapAuth && !await this.native.compareAndSwapManagementAuth(null, bootstrapAuth)) throw new Error("CAS_CONFLICT");
-        state.recovery = { txId, phase: "prepared", replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, generation, hostSetFingerprint, requestFingerprint: request.requestFingerprint, reservationFingerprint: reservedFloor.floorFingerprint, attestationFingerprint: attestation.attestationFingerprint, finalityFingerprint: null };
+        state.recovery = { txId, fenceGeneration: 1, phase: "prepared", replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, generation, hostSetFingerprint, requestFingerprint: request.requestFingerprint, reservationFingerprint: reservedFloor.floorFingerprint, attestationFingerprint: attestation.attestationFingerprint, finalityFingerprint: null };
         const preparedRevision = state.revision;
         state.revision = preparedRevision + 1;
         state.authorityEpoch = authorityReservation.epoch;
@@ -743,6 +752,7 @@ export class ManagementRuntime {
             txId,
             readerInstanceId: request.readerInstanceId,
             readerStartNonce: request.readerStartNonce,
+            fenceGeneration: 1,
           });
           if (readerVersionFloor?.readerVersionFloor !== 2 || readerVersionFloor.firstPendingTxId !== txId ||
               readerVersionFloor.firstReaderInstanceId !== request.readerInstanceId ||
@@ -753,6 +763,7 @@ export class ManagementRuntime {
             version: 1,
             kind: "reader-fence-binding",
             anchorFingerprint,
+            fenceGeneration: 1,
             genesisTxId: txId,
             readerInstanceId: request.readerInstanceId,
             readerStartNonce: request.readerStartNonce,
@@ -833,7 +844,7 @@ export class ManagementRuntime {
         });
         await this.native.writeAuthorityBaseline(baseline);
         const graph = publicationGraph({
-          txId, genesisTxId: txId, generation, baseline, targetFingerprint: publicationEvidence.targetFingerprint,
+          txId, genesisTxId: txId, generation, fenceGeneration: 1, baseline, targetFingerprint: publicationEvidence.targetFingerprint,
           stateFingerprint: semanticStateFingerprint, payloadFingerprint: semanticPayloadFingerprint,
           snapshotFingerprint: semanticSnapshotFingerprint, publicationFingerprint: semanticPublicationFingerprint,
           checkpointFingerprint: semanticCheckpointFingerprint,
@@ -853,6 +864,7 @@ export class ManagementRuntime {
         committedAuthorityEpoch.authorityEpochFingerprint = recordHash(committedAuthorityEpoch, "authorityEpochFingerprint");
         validateAuthorityEpoch(committedAuthorityEpoch);
         const precommit = buildGenesisPrecommit({
+          fenceGeneration: 1,
           genesisTxId: txId,
           generation,
           genesisProbeFingerprint: genesisProbe.probe.probeFingerprint,
@@ -884,12 +896,14 @@ export class ManagementRuntime {
           }),
         });
         await this.native.commitAuthorityEpoch(committedAuthorityEpoch, precommit);
-        await this.native.commitTokenFloor({ floor: committedFloor, precommit });
-        const zFinality = { version: 1, kind: "genesis-finality", genesisTxId: txId, generation, anchorFingerprint, attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: committedFloor.floorFingerprint, checkpointFingerprint: canonicalJsonHash(request), publicationKFingerprint: graph.k["publication-kFingerprint"], publicationYFingerprint: graph.y["publication-yFingerprint"], authorityEpochFingerprint: committedAuthorityEpoch.authorityEpochFingerprint, precommitFingerprint: precommit.precommitFingerprint, finalityFingerprint: committedFloor.floorFingerprint, zFinalityFingerprint: null };
+        await this.native.commitTokenFloor({ floor: committedFloor, precommit, fenceGeneration: 1 });
+        await this.native.commitFenceGeneration({ fenceGeneration: 1, txId });
+        const zFinality = { version: 1, kind: "genesis-finality", genesisTxId: txId, fenceGeneration: 1, generation, anchorFingerprint, attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: committedFloor.floorFingerprint, checkpointFingerprint: canonicalJsonHash(request), publicationKFingerprint: graph.k["publication-kFingerprint"], publicationYFingerprint: graph.y["publication-yFingerprint"], authorityEpochFingerprint: committedAuthorityEpoch.authorityEpochFingerprint, precommitFingerprint: precommit.precommitFingerprint, finalityFingerprint: committedFloor.floorFingerprint, zFinalityFingerprint: null };
         zFinality.zFinalityFingerprint = recordHash(zFinality, "zFinalityFingerprint");
         validateZFinality(zFinality, request, committedFloor, precommit);
         await this.native.writeZFinality(zFinality);
         const authorityReceipt = {
+          fenceGeneration: 1,
           version: 1, kind: "genesis-authority-receipt", genesisTxId: txId, requestFingerprint: authorityRequest.requestFingerprint,
           sequence: 2, anchorFingerprint, generation, readerVersionFloorFingerprint: authorityReaderFloor.floorFingerprint,
           authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint, receiptFingerprint: null,
@@ -901,7 +915,7 @@ export class ManagementRuntime {
         let admissionGrant = null;
         if (request.requestedReaderMode === "handshake") {
           admissionRequest = buildAdmissionRequest({
-            requestId: randomUUID(), genesisTxId: txId, generation, readerInstanceId: request.readerInstanceId,
+            requestId: randomUUID(), genesisTxId: txId, generation, fenceGeneration: 1, readerInstanceId: request.readerInstanceId,
             readerStartNonce: request.readerStartNonce, routeFingerprint: "no-route", nonce: randomUUID(),
             expiresAt: Date.now() + 30_000,
           });
@@ -937,13 +951,13 @@ export class ManagementRuntime {
           validateAdmissionAck(admissionAck, admissionGrant, readerProjection.readerProjectionFingerprint);
           validateReaderProjection(readerProjection, bound?.readerVersionFloor, committedFloor, zFinality.zFinalityFingerprint);
           validateFinalityProof({
-            version: 1, kind: "finality-proof", genesisTxId: txId, generation,
+            version: 1, kind: "finality-proof", genesisTxId: txId, fenceGeneration: 1, generation,
             zFinalityFingerprint: zFinality.zFinalityFingerprint,
             readerProjectionFingerprint: readerProjection.readerProjectionFingerprint,
             ackFingerprint: admissionAck?.ackFingerprint,
             routeFingerprint: admissionAck?.routeFingerprint,
             finalityProofFingerprint: canonicalJsonHash({
-              version: 1, kind: "finality-proof", genesisTxId: txId, generation,
+              version: 1, kind: "finality-proof", genesisTxId: txId, fenceGeneration: 1, generation,
               zFinalityFingerprint: zFinality.zFinalityFingerprint,
               readerProjectionFingerprint: readerProjection.readerProjectionFingerprint,
               ackFingerprint: admissionAck?.ackFingerprint,
@@ -952,7 +966,7 @@ export class ManagementRuntime {
           }, request, zFinality, admissionAck, readerProjection.readerProjectionFingerprint);
         }
         const finalityProof = {
-          version: 1, kind: "finality-proof", genesisTxId: txId, generation,
+          version: 1, kind: "finality-proof", genesisTxId: txId, fenceGeneration: 1, generation,
           zFinalityFingerprint: zFinality.zFinalityFingerprint,
           readerProjectionFingerprint: readerProjection?.readerProjectionFingerprint ?? null,
           ackFingerprint: admissionAck?.ackFingerprint ?? null,
@@ -962,7 +976,7 @@ export class ManagementRuntime {
         finalityProof.finalityProofFingerprint = recordHash(finalityProof, "finalityProofFingerprint");
         validateFinalityProof(finalityProof, request, zFinality, admissionAck, readerProjection?.readerProjectionFingerprint ?? null);
         const receipt = {
-          version: 1, kind: "genesis-receipt", genesisTxId: txId, generation,
+          version: 1, kind: "genesis-receipt", genesisTxId: txId, fenceGeneration: 1, generation,
           requestedReaderMode: request.requestedReaderMode, readerInstanceId: request.readerInstanceId,
           readerStartNonce: request.readerStartNonce,
           readerProjectionFingerprint: readerProjection?.readerProjectionFingerprint ?? null,
@@ -976,6 +990,7 @@ export class ManagementRuntime {
         if (await this.native.recheckAdmissionFinality({ request, zFinality, readerProjection, admissionAck, finalityProof, receipt }) !== true) throw new Error("FINALITY_RECHECK_FAILED");
         const historyMarker = {
           version: 1,
+          fenceGeneration: 1,
           kind: "managed-history-marker",
           anchorFingerprint,
           sequence: 1,
@@ -994,7 +1009,7 @@ export class ManagementRuntime {
         state.tokenFloor = committedFloor;
         state.tokenAttestation = { fingerprint: hostSetFingerprint, generation, attestationFingerprint: attestation.attestationFingerprint, finalityFingerprint: committedFloor.floorFingerprint };
         state.recovery.finalityFingerprint = receipt.receiptFingerprint;
-        state.genesis = { txId, replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, requestFingerprint: request.requestFingerprint, finalityFingerprint: receipt.receiptFingerprint };
+        state.genesis = { txId, fenceGeneration: 1, replayFingerprint, genesisSecurityTuple: persistedGenesisSecurityTuple, requestFingerprint: request.requestFingerprint, finalityFingerprint: receipt.receiptFingerprint };
         state.recovery = { ...state.recovery, phase: "terminal", readerHandshake: null, replayFingerprint };
         state.admission = reopened
           ? { phase: "open", finalityFingerprint: finalityProof.finalityProofFingerprint }
@@ -1058,6 +1073,7 @@ export class ManagementRuntime {
         recovery.phase !== "reader-pending" ||
         recovery.headFingerprint !== head.headFingerprint ||
         recovery.phaseRecordFingerprint !== finality.finalityFingerprint ||
+        recovery.fenceGeneration !== finality.fenceGeneration ||
         !recovery.candidateState ||
         canonicalJsonHash(recovery.candidateState) !== recovery.candidateStateFingerprint) {
       throw new Error("SUCCESSOR_RECOVERY_EVIDENCE_INVALID");
@@ -1066,6 +1082,7 @@ export class ManagementRuntime {
     if (recovery.candidateState.revision !== finality.revision ||
         recovery.candidateState.authorityEpoch !== finality.authorityEpoch ||
         recovery.candidateState.mappingGeneration !== finality.mappingGeneration ||
+        recovery.candidateState.fenceGeneration !== finality.fenceGeneration ||
         recovery.candidateState.configFingerprint !== recovery.candidateConfigFingerprint) {
       throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
     }
@@ -1076,12 +1093,13 @@ export class ManagementRuntime {
       leaseBindingFingerprint: lease.leaseBindingFingerprint, readerProjectionFingerprint: projection.readerProjectionFingerprint, ackFingerprint: ack.ackFingerprint,
       snapshotFingerprint: finality.snapshotFingerprint, revision: finality.revision, authorityEpoch: finality.authorityEpoch,
       tokenConfigGeneration: finality.tokenConfigGeneration, mappingGeneration: finality.mappingGeneration,
+      fenceGeneration: finality.fenceGeneration,
       phase: "terminal", routeDisposition: "no-route", receiptFingerprint: null,
     }, "receiptFingerprint");
     await this.native.writeAuthoritySuccessorReceipt(receipt);
     const previousMarker = await this.native.readManagedHistoryMarker();
     validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
-    const marker = { version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, sequence: request.sequence, previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null };
+    const marker = { version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, fenceGeneration: request.candidateFenceGeneration, sequence: request.sequence, previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
     const committedMarker = await this.native.commitManagedHistoryMarker(marker);
     validateManagedHistoryMarker(committedMarker, request.anchorFingerprint, request.sequence);
@@ -1094,7 +1112,8 @@ export class ManagementRuntime {
     state.mappings = structuredClone(recovery.candidateState.mappings);
     state.routes = structuredClone(recovery.candidateState.routes);
     state.admission = { phase: "closed", finalityFingerprint: null };
-    state.recovery = { phase: "terminal", txId, finalityFingerprint: finality.finalityFingerprint };
+    state.fenceGeneration = finality.fenceGeneration;
+    state.recovery = { phase: "terminal", txId, fenceGeneration: finality.fenceGeneration, finalityFingerprint: finality.finalityFingerprint };
     if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
     await this.native.writeAuthoritySuccessorHead(terminal);
     return { pending: false, idempotent: true, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
@@ -1128,6 +1147,7 @@ export class ManagementRuntime {
         recovery.phase !== "reader-pending" ||
         recovery.headFingerprint !== head.headFingerprint ||
         recovery.phaseRecordFingerprint !== finality.finalityFingerprint ||
+        recovery.fenceGeneration !== finality.fenceGeneration ||
         !recovery.candidateState ||
         canonicalJsonHash(recovery.candidateState) !== recovery.candidateStateFingerprint) {
       throw new Error("SUCCESSOR_RECOVERY_EVIDENCE_INVALID");
@@ -1136,6 +1156,7 @@ export class ManagementRuntime {
     if (recovery.candidateState.revision !== finality.revision ||
         recovery.candidateState.authorityEpoch !== finality.authorityEpoch ||
         recovery.candidateState.mappingGeneration !== finality.mappingGeneration ||
+        recovery.candidateState.fenceGeneration !== finality.fenceGeneration ||
         recovery.candidateState.configFingerprint !== recovery.candidateConfigFingerprint) {
       throw new Error("SUCCESSOR_RECOVERY_STATE_INVALID");
     }
@@ -1146,6 +1167,7 @@ export class ManagementRuntime {
       leaseBindingFingerprint: null, readerProjectionFingerprint: null, ackFingerprint: null,
       snapshotFingerprint: finality.snapshotFingerprint, revision: finality.revision, authorityEpoch: finality.authorityEpoch,
       tokenConfigGeneration: finality.tokenConfigGeneration, mappingGeneration: finality.mappingGeneration,
+      fenceGeneration: finality.fenceGeneration,
       phase: "terminal", routeDisposition: "no-route", receiptFingerprint: null,
     }, "receiptFingerprint");
     validateAuthoritySuccessorReceipt(receipt, request, finality);
@@ -1153,7 +1175,7 @@ export class ManagementRuntime {
     const previousMarker = await this.native.readManagedHistoryMarker();
     validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
     const marker = {
-      version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, sequence: request.sequence,
+      version: 1, kind: "managed-history-marker", anchorFingerprint: request.anchorFingerprint, fenceGeneration: request.candidateFenceGeneration, sequence: request.sequence,
       previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null,
     };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
@@ -1183,7 +1205,8 @@ export class ManagementRuntime {
       finalityFingerprint: finality.tokenFloorFingerprint,
     };
     state.admission = { phase: "closed", finalityFingerprint: null };
-    state.recovery = { phase: "terminal", txId, finalityFingerprint: finality.finalityFingerprint };
+    state.fenceGeneration = finality.fenceGeneration;
+    state.recovery = { phase: "terminal", txId, fenceGeneration: finality.fenceGeneration, finalityFingerprint: finality.finalityFingerprint };
     if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
     await this.native.writeAuthoritySuccessorHead(terminal);
     return { pending: false, idempotent: true, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
@@ -1209,6 +1232,7 @@ export class ManagementRuntime {
       } else {
         const recoveryState = structuredClone(state);
         recoveryState.authorityEpoch = bundle.request.candidateAuthorityEpoch - 1;
+        recoveryState.fenceGeneration = bundle.request.candidateFenceGeneration;
         const prepared = await this.#prepareMappingMutation(operation, recoveryState, input);
         if (prepared.snapshot.configFingerprint !== bundle.request.candidateSnapshotFingerprint) {
           throw new Error("RECOVERY_INPUT_MISMATCH");
@@ -1286,10 +1310,13 @@ export class ManagementRuntime {
     let readerFloor;
     let historyMarker;
     let readerMode;
+    let fenceFloor;
     try {
       durableReaderProof = await this.native.readBoundReaderProof();
       readerFloor = durableReaderProof?.readerVersionFloor;
       validateReaderVersionFloor(readerFloor);
+      fenceFloor = await this.native.readFenceGenerationFloor();
+      if (!fenceFloor || fenceFloor.highestCommittedFenceGeneration !== state.fenceGeneration) throw new Error("FENCE_FLOOR_PROOF_MISMATCH");
       const hasBoundProof = Boolean(durableReaderProof.readerProjection && durableReaderProof.admissionAck && durableReaderProof.readerState);
       if (readerFloor.readerVersionFloor === 2) {
         if (!hasBoundProof) throw new Error("READER_BOUND_PROOF_REQUIRED");
@@ -1303,6 +1330,8 @@ export class ManagementRuntime {
     } catch {
       await this.#manualCleanup(state, "READER_FLOOR_OR_HISTORY_MARKER_INVALID");
     }
+    const previousFenceGeneration = fenceFloor.highestCommittedFenceGeneration;
+    const candidateFenceGeneration = previousFenceGeneration + 1;
     const readerInstanceId = readerMode === "bound-reader" ? durableReaderProof.readerProjection.readerInstanceId : null;
     const readerStartNonce = readerMode === "bound-reader" ? durableReaderProof.readerProjection.readerStartNonce : null;
     if (readerMode === "bound-reader" && (!readerInstanceId || !readerStartNonce)) throw new Error("READER_BINDING_REQUIRED");
@@ -1311,6 +1340,7 @@ export class ManagementRuntime {
     if (!predecessor ||
         !/^[a-f0-9]{64}$/.test(predecessor.targetFingerprint) ||
         !/^[a-f0-9]{64}$/.test(predecessor.identityFingerprint) ||
+        !Number.isSafeInteger(predecessor.fenceGeneration) || predecessor.fenceGeneration !== previousFenceGeneration ||
         !/^[a-f0-9]{64}$/.test(predecessor.aclFingerprint) ||
         !["managed-v1", "legacy-retained"].includes(predecessor.sourceKind) ||
         !Buffer.isBuffer(predecessor.targetBytes)) {
@@ -1319,14 +1349,42 @@ export class ManagementRuntime {
     const candidateAuthorityEpoch = await this.#nextAuthorityEpoch(state);
     const preparedState = operation === "tokens-attest" ? null : structuredClone(state);
     if (preparedState) preparedState.authorityEpoch = candidateAuthorityEpoch - 1;
+    if (preparedState) preparedState.fenceGeneration = candidateFenceGeneration;
     const prepared = preparedState ? await this.#prepareMappingMutation(operation, preparedState, input) : null;
     let candidateSnapshot = prepared?.snapshot ?? null;
     if (operation === "tokens-attest" && predecessor.sourceKind === "managed-v1") {
+      const candidateMappings = Object.fromEntries(Object.entries(predecessor.snapshot.mappings).map(([mappingId, mapping]) => [
+        mappingId,
+        fingerprintManagedMappingRecord({
+          ...structuredClone(mapping),
+          fenceGeneration: candidateFenceGeneration,
+          mappingFingerprint: null,
+        }),
+      ]));
+      const candidateRoutes = Object.fromEntries(Object.entries(predecessor.snapshot.routes).map(([channelId, route]) => {
+        const mapping = candidateMappings[route.mappingId];
+        if (!mapping) throw new Error("CANDIDATE_TARGET_PROOF_REQUIRED");
+        return [channelId, fingerprintManagedRouteRecord({
+          ...structuredClone(route),
+          fenceGeneration: candidateFenceGeneration,
+          hostId: mapping.hostId,
+          mappingId: mapping.mappingId,
+          mappingGeneration: mapping.mappingGeneration,
+          mappingVersion: mapping.mappingVersion,
+          sourcePlatform: mapping.sourcePlatform,
+          workspaceId: mapping.workspaceId,
+          workDir: mapping.workDir,
+          routeFingerprint: null,
+        }, mapping)];
+      }));
       candidateSnapshot = {
         ...structuredClone(predecessor.snapshot),
+        mappings: candidateMappings,
+        routes: candidateRoutes,
         revision: state.revision + 1,
         authorityEpoch: candidateAuthorityEpoch,
         mappingGeneration: state.mappingGeneration,
+        fenceGeneration: candidateFenceGeneration,
         targetState: predecessor.snapshot.targetState === "genesis-empty" ? "managed-empty" : predecessor.snapshot.targetState,
         tokenConfigGeneration: state.tokenConfigGeneration + 1,
         tokenConfigHostSetFingerprint: intent.hostSetFingerprint,
@@ -1346,7 +1404,7 @@ export class ManagementRuntime {
     const previousFingerprint = predecessor.targetFingerprint;
     const candidateAttestationFingerprint = operation === "tokens-attest"
       ? authorityRecordFingerprint({
-        version: 1, kind: "token-config-attestation", anchorFingerprint,
+        version: 1, kind: "token-config-attestation", anchorFingerprint, fenceGeneration: candidateFenceGeneration,
         tokenConfigGeneration: state.tokenConfigGeneration + 1, tokenConfigHostSetFingerprint: intent.hostSetFingerprint,
         managedGrammarVersion: 1, sourceKind: "protected-stdin", producerPrincipal: `management/${canonicalJsonHash(actorPrincipal)}`,
         rotationKind: state.tokenAttestation?.fingerprint === intent.hostSetFingerprint ? "same-key" : "host-set-change",
@@ -1392,6 +1450,8 @@ export class ManagementRuntime {
       previousSnapshotFingerprint: predecessor.snapshotFingerprint,
       candidateSnapshotFingerprint,
       candidateTargetFingerprint,
+      previousFenceGeneration,
+      candidateFenceGeneration,
       mappingRecoveryTxFingerprint: operation === "tokens-attest" ? null : canonicalJsonHash({ operation, mappingId: input.mappingId ?? null, snapshotFingerprint: candidateSnapshotFingerprint }),
       targetState: candidateTargetState,
       readerMode, readerInstanceId, readerStartNonce,
@@ -1408,8 +1468,9 @@ export class ManagementRuntime {
     });
     mutation.attempted = true;
     await this.native.writeAuthoritySuccessorRequest(request);
+    await this.native.reserveFenceGeneration({ fenceGeneration: candidateFenceGeneration, txId });
     const head = buildAuthoritySuccessorRecord({
-      version: 1, kind: "authority-successor-head", anchorFingerprint, sequence, txId, rootGenesisTxId: state.genesis.txId,
+      version: 1, kind: "authority-successor-head", anchorFingerprint, fenceGeneration: candidateFenceGeneration, sequence, txId, rootGenesisTxId: state.genesis.txId,
       operation, phase: "reserved", requestFingerprint: request.requestFingerprint,
       closeFingerprint: null, authorityCommitSnapshotFingerprint: null, baselineFingerprint: null,
       publicationKFingerprint: null, publicationYFingerprint: null, finalityFingerprint: null,
@@ -1424,7 +1485,7 @@ export class ManagementRuntime {
     });
     await this.native.writeAuthoritySuccessorHead(head);
     const close = buildAuthoritySuccessorRecord({
-      version: 1, kind: "authority-close-proof", txId, rootGenesisTxId: request.rootGenesisTxId,
+      version: 1, kind: "authority-close-proof", txId, rootGenesisTxId: request.rootGenesisTxId, fenceGeneration: candidateFenceGeneration,
       requestFingerprint: request.requestFingerprint, previousReceiptFingerprint: request.previousReceiptFingerprint,
       previousBarrierGeneration: state.revision, barrierGeneration: state.revision + 1,
       affectedScope: operation === "tokens-attest" ? "all" : "mapping",
@@ -1448,7 +1509,7 @@ export class ManagementRuntime {
     });
     await this.native.writeAuthoritySuccessorHead(closedHead);
     const reservation = {
-      version: 1, kind: "authority-reservation", anchorFingerprint, txId,
+      version: 1, kind: "authority-reservation", anchorFingerprint, fenceGeneration: candidateFenceGeneration, txId,
       epoch: request.candidateAuthorityEpoch, generation: request.candidateTokenConfigGeneration,
       candidateFingerprint: request.requestFingerprint,
       previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
@@ -1465,7 +1526,7 @@ export class ManagementRuntime {
     });
     await this.native.writeAuthoritySuccessorReservation(reservation);
     const commit = {
-      version: 1, kind: "authority-commit-snapshot", anchorFingerprint, txId,
+      version: 1, kind: "authority-commit-snapshot", anchorFingerprint, fenceGeneration: candidateFenceGeneration, txId,
       epoch: reservation.epoch, generation: reservation.generation, candidateFingerprint: reservation.candidateFingerprint,
       reservationFingerprint: reservation.reservationFingerprint,
       previousAuthorityCommitSnapshotFingerprint: reservation.previousAuthorityCommitSnapshotFingerprint,
@@ -1478,7 +1539,7 @@ export class ManagementRuntime {
     if (readerMode === "bound-reader") {
       if (typeof this.native.writeAuthoritySuccessorFence !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
       fence = buildAuthoritySuccessorRecord({
-        version: 1, kind: "authority-successor-fence", txId, rootGenesisTxId: request.rootGenesisTxId,
+        version: 1, kind: "authority-successor-fence", txId, rootGenesisTxId: request.rootGenesisTxId, fenceGeneration: candidateFenceGeneration,
         requestFingerprint: request.requestFingerprint, anchorFingerprint,
         authorityCommitSnapshotFingerprint: commit.authorityCommitSnapshotFingerprint,
         readerInstanceId, readerStartNonce, readerVersion: 2,
@@ -1489,7 +1550,7 @@ export class ManagementRuntime {
     }
     if (typeof this.native.writeAuthoritySuccessorBaseline !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
     const baseline = buildAuthoritySuccessorRecord({
-      version: 1, kind: "authority-successor-baseline", txId, rootGenesisTxId: request.rootGenesisTxId,
+      version: 1, kind: "authority-successor-baseline", txId, rootGenesisTxId: request.rootGenesisTxId, fenceGeneration: candidateFenceGeneration,
       requestFingerprint: request.requestFingerprint, anchorFingerprint, operation, targetState: request.targetState,
       revision: request.candidateRevision, authorityEpoch: request.candidateAuthorityEpoch,
       tokenConfigGeneration: request.candidateTokenConfigGeneration,
@@ -1513,9 +1574,9 @@ export class ManagementRuntime {
         attestation = lineage.attestation;
         if (attestation.txId !== txId || attestation.attestationFingerprint !== request.candidateAttestationFingerprint) throw new Error("IDEMPOTENCY_CONFLICT");
       } else {
-        const tokenReservation = reserveTokenGeneration(lineage.floor, { generation: request.candidateTokenConfigGeneration, txId });
+        const tokenReservation = reserveTokenGeneration(lineage.floor, { generation: request.candidateTokenConfigGeneration, txId, fenceGeneration: candidateFenceGeneration });
         attestation = {
-          version: 1, kind: "token-config-attestation", anchorFingerprint,
+          version: 1, kind: "token-config-attestation", anchorFingerprint, fenceGeneration: candidateFenceGeneration,
           tokenConfigGeneration: request.candidateTokenConfigGeneration,
           tokenConfigHostSetFingerprint: intent.hostSetFingerprint, managedGrammarVersion: 1,
           sourceKind: "protected-stdin", producerPrincipal: `management/${canonicalJsonHash(actorPrincipal)}`,
@@ -1531,6 +1592,7 @@ export class ManagementRuntime {
       }
       await this.native.rotateTokenSidecar({
         generation: request.candidateTokenConfigGeneration,
+        fenceGeneration: candidateFenceGeneration,
         hostSetFingerprint: intent.hostSetFingerprint,
         revision: request.candidateRevision,
         authorityEpoch: request.candidateAuthorityEpoch,
@@ -1562,7 +1624,7 @@ export class ManagementRuntime {
     const snapshotFingerprint = canonicalJsonHash({ stateFingerprint, payloadFingerprint, targetFingerprint });
     const publicationFingerprint = canonicalJsonHash({ stateFingerprint, payloadFingerprint, snapshotFingerprint, targetFingerprint });
     const graph = publicationGraph({
-      txId, genesisTxId: request.rootGenesisTxId, generation: request.candidateTokenConfigGeneration, baseline, targetFingerprint,
+      txId, genesisTxId: request.rootGenesisTxId, generation: request.candidateTokenConfigGeneration, fenceGeneration: candidateFenceGeneration, baseline, targetFingerprint,
       stateFingerprint, payloadFingerprint, snapshotFingerprint, publicationFingerprint,
       checkpointFingerprint: canonicalJsonHash({ genesisTxId: request.rootGenesisTxId, generation: request.candidateTokenConfigGeneration, publicationFingerprint, targetFingerprint }),
     });
@@ -1582,7 +1644,7 @@ export class ManagementRuntime {
     await this.native.writeAuthoritySuccessorHead(replacedHead);
     if (typeof this.native.commitAuthoritySuccessorEpoch !== "function" || typeof this.native.writeAuthoritySuccessorFinality !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
     const epoch = {
-      version: 1, kind: "authority-epoch", anchorFingerprint, epoch: request.candidateAuthorityEpoch,
+      version: 1, kind: "authority-epoch", anchorFingerprint, fenceGeneration: candidateFenceGeneration, epoch: request.candidateAuthorityEpoch,
       reservationTxId: txId, commitTxId: txId,
       previousAuthorityCommitSnapshotFingerprint: reservation.previousAuthorityCommitSnapshotFingerprint,
       authorityEpochFingerprint: null,
@@ -1595,9 +1657,9 @@ export class ManagementRuntime {
     if (operation === "tokens-attest") {
       const lineage = await this.native.readSuccessorTokenLineage();
       committedFloor = commitTokenFloor(lineage.floor, {
-        generation: request.candidateTokenConfigGeneration, txId, attestationFingerprint: request.candidateAttestationFingerprint,
+        generation: request.candidateTokenConfigGeneration, txId, attestationFingerprint: request.candidateAttestationFingerprint, fenceGeneration: candidateFenceGeneration,
       });
-      await this.native.commitTokenFloor({ floor: committedFloor });
+      await this.native.commitTokenFloor({ floor: committedFloor, fenceGeneration: candidateFenceGeneration });
       committedAttestationFingerprint = request.candidateAttestationFingerprint;
     } else {
       const lineage = await this.native.readSuccessorTokenLineage();
@@ -1609,7 +1671,7 @@ export class ManagementRuntime {
       details: { txId, publicationKFingerprint: graph.k["publication-kFingerprint"], publicationYFingerprint: graph.y["publication-yFingerprint"] },
     });
     const finality = buildAuthoritySuccessorRecord({
-      version: 1, kind: "authority-successor-finality", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId,
+      version: 1, kind: "authority-successor-finality", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId, fenceGeneration: candidateFenceGeneration,
       operation, requestFingerprint: request.requestFingerprint, baselineFingerprint: baseline.baselineFingerprint,
       closeFingerprint: close.closeFingerprint, anchorFingerprint, authorityReservationFingerprint: reservation.reservationFingerprint,
       authorityCommitSnapshotFingerprint: commit.authorityCommitSnapshotFingerprint, authorityEpochFingerprint: epoch.authorityEpochFingerprint,
@@ -1632,6 +1694,7 @@ export class ManagementRuntime {
       finalityFingerprint: finality.finalityFingerprint,
     });
     await this.native.writeAuthoritySuccessorFinality(finality);
+    await this.native.commitFenceGeneration({ fenceGeneration: candidateFenceGeneration, txId });
     const finalityHead = buildAuthoritySuccessorRecord({
       ...replacedHead, phase: "reader-pending",
       finalityFingerprint: finality.finalityFingerprint, previousHeadFingerprint: replacedHead.headFingerprint, headFingerprint: null,
@@ -1645,12 +1708,39 @@ export class ManagementRuntime {
       finalityFingerprint: finality.finalityFingerprint,
     });
     await this.native.writeAuthoritySuccessorHead(finalityHead);
+    if (readerMode === "no-reader") {
+      const pendingBefore = state.revision;
+      state.revision = request.candidateRevision;
+      state.authorityEpoch = request.candidateAuthorityEpoch;
+      state.tokenConfigGeneration = request.candidateTokenConfigGeneration;
+      state.mappingGeneration = request.candidateMappingGeneration;
+      if (preparedState) {
+        state.mappings = preparedState.mappings;
+        state.routes = preparedState.routes;
+      }
+      state.tokenAttestation = {
+        fingerprint: operation === "tokens-attest" ? intent.hostSetFingerprint : state.tokenAttestation.fingerprint,
+        generation: request.candidateTokenConfigGeneration,
+        attestationFingerprint: committedAttestationFingerprint,
+        finalityFingerprint: committedFloor.floorFingerprint,
+      };
+      state.admission = { phase: "closed", finalityFingerprint: null };
+      state.recovery = {
+        ...state.recovery,
+        phase: "reader-pending",
+        txId,
+        fenceGeneration: candidateFenceGeneration,
+        finalityFingerprint: finality.finalityFingerprint,
+      };
+      state.fenceGeneration = candidateFenceGeneration;
+      if (!await this.native.compareAndSwapManagementState(pendingBefore, state)) throw new Error("CAS_CONFLICT");
+    }
     if (readerMode === "bound-reader") {
       return { pending: true, idempotent: false, txId, phase: "reader-pending", routeDisposition: "no-route" };
     }
     if (typeof this.native.writeAuthoritySuccessorReceipt !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
     const receipt = buildAuthoritySuccessorRecord({
-      version: 1, kind: "authority-successor-receipt", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId,
+      version: 1, kind: "authority-successor-receipt", sequence: request.sequence, txId, rootGenesisTxId: request.rootGenesisTxId, fenceGeneration: candidateFenceGeneration,
       operation, requestFingerprint: request.requestFingerprint, previousReceiptFingerprint: request.previousReceiptFingerprint,
       finalityFingerprint: finality.finalityFingerprint, readerMode: "no-reader",
       leaseBindingFingerprint: null, readerProjectionFingerprint: null, ackFingerprint: null,
@@ -1662,7 +1752,7 @@ export class ManagementRuntime {
     const previousMarker = await this.native.readManagedHistoryMarker();
     validateManagedHistoryMarker(previousMarker, request.anchorFingerprint, request.sequence - 1);
     const marker = {
-      version: 1, kind: "managed-history-marker", anchorFingerprint, sequence: request.sequence,
+      version: 1, kind: "managed-history-marker", anchorFingerprint, fenceGeneration: candidateFenceGeneration, sequence: request.sequence,
       previousMarkerFingerprint: previousMarker.markerFingerprint, markerFingerprint: null,
     };
     marker.markerFingerprint = recordHash(marker, "markerFingerprint");
@@ -1696,7 +1786,8 @@ export class ManagementRuntime {
       finalityFingerprint: committedFloor.floorFingerprint,
     };
     state.admission = { phase: "closed", finalityFingerprint: null };
-    state.recovery = { phase: "terminal", txId, finalityFingerprint: finality.finalityFingerprint };
+    state.recovery = { phase: "terminal", txId, fenceGeneration: candidateFenceGeneration, finalityFingerprint: finality.finalityFingerprint };
+    state.fenceGeneration = candidateFenceGeneration;
     if (!await this.native.compareAndSwapManagementState(before, state)) throw new Error("CAS_CONFLICT");
     await this.native.writeAuthoritySuccessorHead(terminalHead);
     return { pending: false, txId, receiptFingerprint: receipt.receiptFingerprint, routeDisposition: "no-route" };
@@ -1798,12 +1889,14 @@ export class ManagementRuntime {
       const snapshot = channelsSnapshot(state, state.revision + 1, state.authorityEpoch + 1);
       const publicationTxId = randomUUID();
       const tombstone = {
+        fenceGeneration: state.fenceGeneration,
         version: 1, kind: "mapping-tombstone", operation: command, publicationTxId,
         mappingId: key, mappingGeneration: current.mappingGeneration, mappingFingerprint: current.mappingFingerprint,
         snapshotFingerprint: snapshot.configFingerprint, routeDisposition: "no-route", tombstoneFingerprint: null,
       };
       tombstone.tombstoneFingerprint = recordHash(tombstone, "tombstoneFingerprint");
       const handoffReceipt = {
+        fenceGeneration: state.fenceGeneration,
         version: 1, kind: "mapping-handoff-receipt", operation: command, publicationTxId,
         oldMappingId: key, oldMappingGeneration: current.mappingGeneration, newMappingId: null, newMappingGeneration: null,
         snapshotFingerprint: snapshot.configFingerprint, routeDisposition: "no-route", tombstoneFingerprint: tombstone.tombstoneFingerprint, handoffReceiptFingerprint: null,
@@ -1837,10 +1930,10 @@ export class ManagementRuntime {
     const mappingId = command === "mapping-rollback" ? input.replacementMappingId : key;
     if (!validMappingCandidate(candidate) || candidate.mappingId !== mappingId || !Array.isArray(routeCandidates)) throw new Error("MAPPING_INVALID");
     if (input.expectedRevision !== state.revision || input.expectedFingerprint !== (current?.mappingFingerprint ?? null)) throw new Error("CAS_CONFLICT");
-    const mapping = fingerprintManagedMappingRecord({ ...candidate, mappingGeneration: state.mappingGeneration + 1 });
+    const mapping = fingerprintManagedMappingRecord({ ...candidate, fenceGeneration: state.fenceGeneration, mappingGeneration: state.mappingGeneration + 1 });
     const routes = {};
     for (const candidateRoute of routeCandidates) {
-      const route = fingerprintManagedRouteRecord({ ...candidateRoute, hostId: mapping.hostId, mappingId: mapping.mappingId, mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion, sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId, workDir: mapping.workDir }, mapping);
+      const route = fingerprintManagedRouteRecord({ ...candidateRoute, fenceGeneration: mapping.fenceGeneration, hostId: mapping.hostId, mappingId: mapping.mappingId, mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion, sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId, workDir: mapping.workDir }, mapping);
       if (Object.hasOwn(routes, route.channelId)) throw new Error("MAPPING_INVALID");
       routes[route.channelId] = route;
     }
@@ -1852,12 +1945,14 @@ export class ManagementRuntime {
     const publicationTxId = randomUUID();
     const snapshot = channelsSnapshot(state, state.revision + 1, state.authorityEpoch + 1);
     const tombstone = command === "mapping-rollback" ? {
+      fenceGeneration: state.fenceGeneration,
       version: 1, kind: "mapping-tombstone", operation: command, publicationTxId,
       mappingId: key, mappingGeneration: current.mappingGeneration, mappingFingerprint: current.mappingFingerprint,
       snapshotFingerprint: snapshot.configFingerprint, routeDisposition: "no-route", tombstoneFingerprint: null,
     } : null;
     if (tombstone) tombstone.tombstoneFingerprint = recordHash(tombstone, "tombstoneFingerprint");
     const handoffReceipt = {
+      fenceGeneration: state.fenceGeneration,
       version: 1, kind: "mapping-handoff-receipt", operation: command, publicationTxId,
       oldMappingId: current?.mappingId ?? null, oldMappingGeneration: current?.mappingGeneration ?? null,
       newMappingId: mapping.mappingId, newMappingGeneration: mapping.mappingGeneration,
@@ -1873,6 +1968,7 @@ export class ManagementRuntime {
       result: { fingerprint: mapping.mappingFingerprint, mappingGeneration: mapping.mappingGeneration, routeCount: Object.keys(routes).length },
       publish: async () => {
         await this.native.writeMappingGeneration({
+          fenceGeneration: mapping.fenceGeneration,
           mappingId: mapping.mappingId,
           generation: mapping.mappingGeneration,
           mapping,

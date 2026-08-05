@@ -7,6 +7,7 @@ const MAX_HOST_TOKENS_BYTES = 1024 * 1024;
 const HEX_OR_NULL = (value) => value === null || isHex64(value);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+const positiveFence = (value) => Number.isSafeInteger(value) && value >= 1;
 function object(value) { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function exact(value, keys) { return object(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key)); }
 function validText(value, max) { try { return typeof value === "string" && value.length > 0 && assertStrictText(value, "text", max) === value; } catch { return false; } }
@@ -44,24 +45,24 @@ export function managedHostSetFingerprint(tokensOrInput) {
   return createHash("sha256").update(Buffer.from(json, "utf8")).digest("hex");
 }
 
-const CONTROL_ROOT_KEYS = ["version", "kind", "managementStamp", "anchor", "anchorFingerprint", "sourceKind", "wrapperKind", "wrapperRelativeName", "targetRelativeName", "controlRootRelativeName", "readerVersionFloorFingerprint", "wrapperFingerprint", "controlRootFingerprint"];
+const CONTROL_ROOT_KEYS = ["version", "kind", "managementStamp", "anchor", "anchorFingerprint", "fenceGeneration", "sourceKind", "wrapperKind", "wrapperRelativeName", "targetRelativeName", "controlRootRelativeName", "readerVersionFloorFingerprint", "wrapperFingerprint", "controlRootFingerprint"];
 export function isControlRoot(value) {
   if (!exact(value, CONTROL_ROOT_KEYS)) return false;
   const source = value.sourceKind;
   const subordinate = source === "managed-v1" ? ["managed-v1-wrapper", "managed-v1-wrapper.json"] : source === "legacy-retained" ? ["legacy-retained-wrapper", "legacy-retained.json"] : null;
   return value.version === 1 && value.kind === "management-control-root" && value.managementStamp === "gjc-management-control/v1" &&
-    isManagementAnchor(value.anchor) && value.anchorFingerprint === canonicalJsonHash(value.anchor) && subordinate !== null &&
+    isManagementAnchor(value.anchor) && value.anchorFingerprint === canonicalJsonHash(value.anchor) && positiveFence(value.fenceGeneration) && subordinate !== null &&
     value.wrapperKind === subordinate[0] && value.wrapperRelativeName === subordinate[1] && value.targetRelativeName === "channels.json" &&
     value.controlRootRelativeName === ".gjc-remote-control" && isHex64(value.readerVersionFloorFingerprint) && isHex64(value.wrapperFingerprint) &&
     isHex64(value.controlRootFingerprint) && value.controlRootFingerprint === hashWithout(value, "controlRootFingerprint");
 }
 
-const RETAINED_KEYS = ["version", "kind", "sourceKind", "managementStamp", "anchorFingerprint", "targetRelativeName", "targetState", "rawTargetByteFingerprint", "rawTargetByteLength", "targetIdentity", "targetAclFingerprint", "readerVersion", "legacyRetention", "dispatchClass", "routeDisposition", "retentionTxId", "retentionSequence", "previousWrapperFingerprint", "wrapperFingerprint"];
-const MANAGED_KEYS = ["version", "kind", "sourceKind", "managementStamp", "anchorFingerprint", "targetRelativeName", "targetState", "targetIdentity", "targetAclFingerprint", "semanticStateFingerprint", "readerVersion", "dispatchClass", "routeDisposition", "wrapperSequence", "previousWrapperFingerprint", "wrapperFingerprint"];
+const RETAINED_KEYS = ["version", "kind", "sourceKind", "managementStamp", "anchorFingerprint", "fenceGeneration", "targetRelativeName", "targetState", "rawTargetByteFingerprint", "rawTargetByteLength", "targetIdentity", "targetAclFingerprint", "readerVersion", "legacyRetention", "dispatchClass", "routeDisposition", "retentionTxId", "retentionSequence", "previousWrapperFingerprint", "wrapperFingerprint"];
+const MANAGED_KEYS = ["version", "kind", "sourceKind", "managementStamp", "anchorFingerprint", "fenceGeneration", "targetRelativeName", "targetState", "targetIdentity", "targetAclFingerprint", "semanticStateFingerprint", "readerVersion", "dispatchClass", "routeDisposition", "wrapperSequence", "previousWrapperFingerprint", "wrapperFingerprint"];
 
 export function isLegacyRetainedWrapper(value) {
   return exact(value, RETAINED_KEYS) && value.version === 1 && value.kind === "legacy-retained-wrapper" && value.sourceKind === "legacy-retained" && value.managementStamp === "gjc-management-envelope/v1" &&
-    isHex64(value.anchorFingerprint) && value.targetRelativeName === "channels.json" && value.targetState === "legacy-unmigrated" && isHex64(value.rawTargetByteFingerprint) && Number.isSafeInteger(value.rawTargetByteLength) && value.rawTargetByteLength >= 0 && isOpaqueIdentity(value.targetIdentity) && isHex64(value.targetAclFingerprint) && value.readerVersion === null && value.legacyRetention === "exact" && value.dispatchClass === "workspace-only" && value.routeDisposition === "no-route" && typeof value.retentionTxId === "string" && UUID.test(value.retentionTxId) && value.retentionSequence === 1 && HEX_OR_NULL(value.previousWrapperFingerprint) && isHex64(value.wrapperFingerprint) && value.wrapperFingerprint === hashWithout(value, "wrapperFingerprint");
+    isHex64(value.anchorFingerprint) && positiveFence(value.fenceGeneration) && value.targetRelativeName === "channels.json" && value.targetState === "legacy-unmigrated" && isHex64(value.rawTargetByteFingerprint) && Number.isSafeInteger(value.rawTargetByteLength) && value.rawTargetByteLength >= 0 && isOpaqueIdentity(value.targetIdentity) && isHex64(value.targetAclFingerprint) && value.readerVersion === null && value.legacyRetention === "exact" && value.dispatchClass === "workspace-only" && value.routeDisposition === "no-route" && typeof value.retentionTxId === "string" && UUID.test(value.retentionTxId) && value.retentionSequence === 1 && HEX_OR_NULL(value.previousWrapperFingerprint) && isHex64(value.wrapperFingerprint) && value.wrapperFingerprint === hashWithout(value, "wrapperFingerprint");
 }
 
 export function isManagedV1Wrapper(value) {
@@ -70,13 +71,13 @@ export function isManagedV1Wrapper(value) {
     ((value.wrapperSequence === 1 && value.previousWrapperFingerprint === null) ||
      (value.wrapperSequence > 1 && isHex64(value.previousWrapperFingerprint)));
   return exact(value, MANAGED_KEYS) && value.version === 1 && value.kind === "managed-v1-wrapper" && value.sourceKind === "managed-v1" && value.managementStamp === "gjc-management-envelope/v1" &&
-    isHex64(value.anchorFingerprint) && value.targetRelativeName === "channels.json" && (state === "genesis-empty" || state === "managed-empty" || state === "managed") && isOpaqueIdentity(value.targetIdentity) && isHex64(value.targetAclFingerprint) && HEX_OR_NULL(value.semanticStateFingerprint) && (value.readerVersion === null || value.readerVersion === 2) && value.dispatchClass === "workspace-only" && value.routeDisposition === "no-route" && validSequence && isHex64(value.wrapperFingerprint) && value.wrapperFingerprint === hashWithout(value, "wrapperFingerprint");
+    isHex64(value.anchorFingerprint) && positiveFence(value.fenceGeneration) && value.targetRelativeName === "channels.json" && (state === "genesis-empty" || state === "managed-empty" || state === "managed") && (state !== "genesis-empty" || value.fenceGeneration === 1) && isOpaqueIdentity(value.targetIdentity) && isHex64(value.targetAclFingerprint) && HEX_OR_NULL(value.semanticStateFingerprint) && (value.readerVersion === null || value.readerVersion === 2) && value.dispatchClass === "workspace-only" && value.routeDisposition === "no-route" && validSequence && isHex64(value.wrapperFingerprint) && value.wrapperFingerprint === hashWithout(value, "wrapperFingerprint");
 }
 
 export function validateManagementEnvelope(controlRoot, wrapper, context = {}) {
   if (!isControlRoot(controlRoot)) return { ok: false, code: "MANAGEMENT_ENVELOPE_INVALID" };
   const validWrapper = controlRoot.sourceKind === "legacy-retained" ? isLegacyRetainedWrapper(wrapper) : isManagedV1Wrapper(wrapper);
-  if (!validWrapper || wrapper.wrapperFingerprint !== controlRoot.wrapperFingerprint || wrapper.anchorFingerprint !== controlRoot.anchorFingerprint) return { ok: false, code: "MANAGEMENT_ENVELOPE_INVALID" };
+  if (!validWrapper || wrapper.wrapperFingerprint !== controlRoot.wrapperFingerprint || wrapper.anchorFingerprint !== controlRoot.anchorFingerprint || wrapper.fenceGeneration !== controlRoot.fenceGeneration) return { ok: false, code: "MANAGEMENT_ENVELOPE_INVALID" };
   if (context.targetIdentity === undefined || context.targetAclFingerprint === undefined || wrapper.targetIdentity !== context.targetIdentity || wrapper.targetAclFingerprint !== context.targetAclFingerprint) return { ok: false, code: "MANAGEMENT_ENVELOPE_INVALID" };
   if (controlRoot.sourceKind === "legacy-retained") {
     if (context.targetBytes === undefined) return { ok: false, code: "MANAGEMENT_ENVELOPE_INVALID" };
@@ -107,19 +108,19 @@ export function classifyMappingEnvelope({ controlRootBytes, wrapperBytes, target
 export const parseManagedHostTokensV1 = parseManagedHostTokens;
 export const classifyMapping = classifyMappingEnvelope;
 const MANAGED_CHANNEL_KEYS = [
-  "version", "managementStamp", "revision", "authorityEpoch",
+  "version", "managementStamp", "revision", "authorityEpoch", "fenceGeneration",
   "mappingGeneration", "tokenConfigGeneration",
   "tokenConfigHostSetFingerprint", "targetState", "dispatchClass",
   "mappings", "routes", "configFingerprint",
 ];
 const MAPPING_KEYS = [
-  "mappingId", "hostId", "mappingGeneration", "mappingVersion",
+  "mappingId", "hostId", "fenceGeneration", "mappingGeneration", "mappingVersion",
   "sourcePlatform", "workspaceId", "workDir", "sourceRoot",
   "containerRoot", "volumeIdentity", "casePolicy", "immutableDefault",
   "mappingFingerprint",
 ];
 const ROUTE_KEYS = [
-  "channelId", "hostId", "mappingId", "mappingGeneration",
+  "channelId", "hostId", "mappingId", "fenceGeneration", "mappingGeneration",
   "mappingVersion", "sourcePlatform", "workspaceId", "workDir",
   "routeFingerprint",
 ];
@@ -163,7 +164,7 @@ function validMappingLocation(mapping) {
 
 export function validateManagedMappingRecord(mapping) {
   if (!exact(mapping, MAPPING_KEYS) || !OPAQUE_TOKEN.test(mapping.mappingId) ||
-      !exactHostId(mapping.hostId) || !Number.isSafeInteger(mapping.mappingGeneration) ||
+      !exactHostId(mapping.hostId) || !positiveFence(mapping.fenceGeneration) || !Number.isSafeInteger(mapping.mappingGeneration) ||
       mapping.mappingGeneration < 1 || mapping.mappingVersion !== 1 ||
       !validMappingLocation(mapping) || typeof mapping.immutableDefault !== "boolean" ||
       !isHex64(mapping.mappingFingerprint)) throw new TypeError("MANAGED_MAPPING_INVALID");
@@ -180,7 +181,7 @@ export function validateManagedRouteRecord(route, mapping) {
   if (!exact(route, ROUTE_KEYS) || !DISCORD_ID.test(route.channelId) ||
       !isHex64(route.routeFingerprint)) throw new TypeError("MANAGED_ROUTE_INVALID");
   validateManagedMappingRecord(mapping);
-  for (const key of ["hostId", "mappingId", "mappingGeneration", "mappingVersion", "sourcePlatform", "workspaceId", "workDir"]) {
+  for (const key of ["hostId", "mappingId", "fenceGeneration", "mappingGeneration", "mappingVersion", "sourcePlatform", "workspaceId", "workDir"]) {
     if (route[key] !== mapping[key]) throw new TypeError("MANAGED_ROUTE_INVALID");
   }
   if (hashWithout(route, "routeFingerprint") !== route.routeFingerprint) throw new TypeError("MANAGED_ROUTE_INVALID");
@@ -191,6 +192,7 @@ export function validateManagedChannelsV2(value) {
   if (!exact(value, MANAGED_CHANNEL_KEYS) || value.version !== 2 ||
       value.managementStamp !== "gjc-management-channels/v2" ||
       value.dispatchClass !== "workspace-only" ||
+      !positiveFence(value.fenceGeneration) ||
       !Number.isSafeInteger(value.mappingGeneration) || value.mappingGeneration < 0 ||
       !Number.isSafeInteger(value.tokenConfigGeneration) || value.tokenConfigGeneration < 1 ||
       !isHex64(value.tokenConfigHostSetFingerprint) ||
@@ -199,6 +201,7 @@ export function validateManagedChannelsV2(value) {
     throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
   }
   const empty = value.targetState === "genesis-empty";
+  if (empty && value.fenceGeneration !== 1) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
   if (empty !== (value.revision === null && value.authorityEpoch === null)) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
   if (!empty && (!Number.isSafeInteger(value.revision) || value.revision < 1 ||
       !Number.isSafeInteger(value.authorityEpoch) || value.authorityEpoch < 1)) {
@@ -211,11 +214,13 @@ export function validateManagedChannelsV2(value) {
   for (const [mappingId, mapping] of Object.entries(value.mappings)) {
     if (mappingId !== mapping.mappingId) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
     validateManagedMappingRecord(mapping);
+    if (mapping.fenceGeneration !== value.fenceGeneration) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
     maximumGeneration = Math.max(maximumGeneration, mapping.mappingGeneration);
   }
   for (const [channelId, route] of Object.entries(value.routes)) {
     if (channelId !== route.channelId || !Object.hasOwn(value.mappings, route.mappingId)) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
     validateManagedRouteRecord(route, value.mappings[route.mappingId]);
+    if (route.fenceGeneration !== value.fenceGeneration) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
   }
   if (maximumGeneration > value.mappingGeneration) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
   if (value.targetState === "managed-empty" && Object.keys(value.routes).length !== 0) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
@@ -227,12 +232,14 @@ export function validateManagedChannelsV2(value) {
 export function createGenesisEmptyChannels({
   tokenConfigGeneration,
   tokenConfigHostSetFingerprint,
+  fenceGeneration,
 }) {
   const value = {
     version: 2,
     managementStamp: "gjc-management-channels/v2",
     revision: null,
     authorityEpoch: null,
+    fenceGeneration,
     mappingGeneration: 0,
     tokenConfigGeneration,
     tokenConfigHostSetFingerprint,

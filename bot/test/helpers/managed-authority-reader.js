@@ -53,14 +53,14 @@ export async function createTestManagedAuthorityReader({
     if (!required.every((method) => typeof native[method] === "function")) throw new Error("BOT_NATIVE_WRITE_REFUSED");
     const l2 = lease ?? buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-lease", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
-      requestFingerprint: request.requestFingerprint, readerInstanceId: request.readerInstanceId,
+      requestFingerprint: request.requestFingerprint, fenceGeneration: request.candidateFenceGeneration, readerInstanceId: request.readerInstanceId,
       readerStartNonce: request.readerStartNonce, readerVersion: 2, fenceBindingFingerprint: fence.fenceBindingFingerprint,
       previousLeaseBindingFingerprint: authoritySuccessorPreviousLeaseBindingFingerprint(request), leaseBindingFingerprint: null,
     }, "leaseBindingFingerprint");
     if (!lease) await native.writeBotAuthoritySuccessorLease(l2);
     const rp2 = projection ?? buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-reader-projection", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
-      requestFingerprint: request.requestFingerprint, finalityFingerprint: finality.finalityFingerprint,
+      requestFingerprint: request.requestFingerprint, fenceGeneration: request.candidateFenceGeneration, finalityFingerprint: finality.finalityFingerprint,
       anchorFingerprint: request.anchorFingerprint, authorityCommitSnapshotFingerprint: finality.authorityCommitSnapshotFingerprint,
       targetFingerprint: finality.targetFingerprint, wrapperFingerprint: finality.wrapperFingerprint,
       revision: finality.revision, authorityEpoch: finality.authorityEpoch,
@@ -72,7 +72,7 @@ export async function createTestManagedAuthorityReader({
     if (!projection) await native.writeBotAuthoritySuccessorProjection(rp2);
     const ak2 = ack ?? buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-ack", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
-      requestFingerprint: request.requestFingerprint, finalityFingerprint: finality.finalityFingerprint,
+      requestFingerprint: request.requestFingerprint, fenceGeneration: request.candidateFenceGeneration, finalityFingerprint: finality.finalityFingerprint,
       readerProjectionFingerprint: rp2.readerProjectionFingerprint, leaseBindingFingerprint: l2.leaseBindingFingerprint,
       readerInstanceId: request.readerInstanceId, readerStartNonce: request.readerStartNonce, readerVersion: 2,
       readerNonce: request.readerNonce, ackDisposition: "verified-no-route", ackFingerprint: null,

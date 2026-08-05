@@ -35,7 +35,7 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
   const hostSetFingerprint = "d".repeat(64);
   const txId = "123e4567-e89b-42d3-a456-426614174000";
   const targetBytes = Buffer.from(canonicalJson(sourceKind === "managed-v1"
-    ? createGenesisEmptyChannels({ tokenConfigGeneration: 1, tokenConfigHostSetFingerprint: hostSetFingerprint })
+    ? createGenesisEmptyChannels({ tokenConfigGeneration: 1, tokenConfigHostSetFingerprint: hostSetFingerprint, fenceGeneration: 1 })
     : {}));
   const targetIdentity = canonicalJsonHash("target-identity");
   const targetAclFingerprint = createHash("sha256").update("target-acl").digest("hex");
@@ -43,12 +43,14 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
   const wrapper = sourceKind === "managed-v1"
     ? seal({
       version: 1, kind: "managed-v1-wrapper", sourceKind, managementStamp: "gjc-management-envelope/v1",
+      fenceGeneration: 1,
       anchorFingerprint, targetRelativeName: "channels.json", targetState: "genesis-empty",
       targetIdentity, targetAclFingerprint, semanticStateFingerprint: JSON.parse(targetBytes).configFingerprint, readerVersion: null,
       dispatchClass: "workspace-only", routeDisposition: "no-route", wrapperSequence: 1, previousWrapperFingerprint: null,
     }, "wrapperFingerprint")
     : seal({
       version: 1, kind: "legacy-retained-wrapper", sourceKind, managementStamp: "gjc-management-envelope/v1",
+      fenceGeneration: 1,
       anchorFingerprint, targetRelativeName: "channels.json", targetState: "legacy-unmigrated",
       rawTargetByteFingerprint: createHash("sha256").update(targetBytes).digest("hex"), rawTargetByteLength: targetBytes.length,
       targetIdentity, targetAclFingerprint, readerVersion: null,
@@ -56,32 +58,38 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
     }, "wrapperFingerprint");
   const readerFloor = seal({
     version: 1, kind: "reader-version-floor", anchorFingerprint,
+    fenceGeneration: 1,
     readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null,
     firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null,
   }, "floorFingerprint");
   const historyMarker = seal({
     version: 1, kind: "managed-history-marker", anchorFingerprint,
+    fenceGeneration: 1,
     sequence: 1, previousMarkerFingerprint: null,
   }, "markerFingerprint");
   const root = seal({
     version: 1, kind: "management-control-root", managementStamp: "gjc-management-control/v1", anchor,
+    fenceGeneration: 1,
     anchorFingerprint, sourceKind, wrapperKind: sourceKind === "managed-v1" ? "managed-v1-wrapper" : "legacy-retained-wrapper",
     wrapperRelativeName: sourceKind === "managed-v1" ? "managed-v1-wrapper.json" : "legacy-retained.json", targetRelativeName: "channels.json", controlRootRelativeName: ".gjc-remote-control",
     readerVersionFloorFingerprint: readerFloor.floorFingerprint, wrapperFingerprint: wrapper.wrapperFingerprint,
   }, "controlRootFingerprint");
   const reservation = seal({
     version: 1, kind: "token-generation-floor", anchorFingerprint, genesisGeneration: 1,
+    fenceGeneration: 1,
     highestReservedGeneration: 1, highestCommittedGeneration: 0, lastReservationTxId: txId,
     lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: "reserved", attestedProofFingerprint: null,
   }, "floorFingerprint");
   const attestation = seal({
     version: 1, kind: "token-config-attestation", anchorFingerprint, tokenConfigGeneration: 1,
+    fenceGeneration: 1,
     tokenConfigHostSetFingerprint: hostSetFingerprint, managedGrammarVersion: 1, sourceKind: "protected-stdin",
     producerPrincipal: `management/${"e".repeat(64)}`, rotationKind: "genesis",
     previousAttestationFingerprint: null, txId,
   }, "attestationFingerprint");
   const request = seal({
     version: 1, kind: "genesis-request", genesisTxId: txId, idempotencyKey: "idempotency-key",
+    fenceGeneration: 1,
     anchorFingerprint, ownerPrincipalFingerprint: "e".repeat(64), generation: 1,
     requestedReaderMode: "no-reader", readerInstanceId: null, readerStartNonce: null,
     attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: reservation.floorFingerprint,
@@ -89,7 +97,7 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
   const attestedProof = buildAttestedTokenFloorProof(reservation, attestation);
   const attestedFloor = attestTokenFloor(reservation, attestedProof);
   const tokenFloor = commitTokenFloor(attestedFloor, {
-    txId, generation: 1, attestationFingerprint: attestation.attestationFingerprint,
+    txId, generation: 1, fenceGeneration: 1, attestationFingerprint: attestation.attestationFingerprint,
   });
   const legacyProof = sourceKind === "legacy-retained" ? {
     rawTargetByteFingerprint: createHash("sha256").update(targetBytes).digest("hex"),
@@ -99,6 +107,7 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
   } : null;
   const authorityRequest = seal({
     version: 1, kind: "genesis-authority-request", genesisTxId: txId, sequence: 1, anchorFingerprint,
+    fenceGeneration: 1,
     ownerPrincipalFingerprint: "e".repeat(64), managementPrincipalFingerprint: "e".repeat(64),
     botPrincipalFingerprint: "f".repeat(64), recoveryPrincipalFingerprint: "c".repeat(64),
     targetPrincipalFingerprint: "b".repeat(64),
@@ -114,19 +123,23 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
   }, "requestFingerprint");
   const authorityReservation = seal({
     version: 1, kind: "authority-reservation", anchorFingerprint, txId, epoch: 1, generation: 1,
+    fenceGeneration: 1,
     candidateFingerprint: request.requestFingerprint, previousAuthorityCommitSnapshotFingerprint: null,
   }, "reservationFingerprint");
   const authorityCommit = seal({
     version: 1, kind: "authority-commit-snapshot", anchorFingerprint, txId, epoch: 1, generation: 1,
+    fenceGeneration: 1,
     candidateFingerprint: request.requestFingerprint, reservationFingerprint: authorityReservation.reservationFingerprint,
     previousAuthorityCommitSnapshotFingerprint: null,
   }, "authorityCommitSnapshotFingerprint");
   const authorityEpoch = seal({
+    fenceGeneration: 1,
     version: 1, kind: "authority-epoch", anchorFingerprint, epoch: 1, reservationTxId: txId,
     commitTxId: txId, previousAuthorityCommitSnapshotFingerprint: null,
   }, "authorityEpochFingerprint");
   const baseline = seal({
     version: 1, kind: "authority-baseline", anchorFingerprint, genesisTxId: txId, idempotencyKey: "idempotency-key",
+    fenceGeneration: 1,
     targetState: sourceKind === "managed-v1" ? "genesis-empty" : "legacy-unmigrated", generation: 1, tokenConfigHostSetFingerprint: hostSetFingerprint,
     attestationFingerprint: attestation.attestationFingerprint, authorityReservationFingerprint: authorityReservation.reservationFingerprint,
     authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: null,
@@ -164,10 +177,10 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
   const publicationFingerprint = canonicalJsonHash({ stateFingerprint, payloadFingerprint, snapshotFingerprint, targetFingerprint });
   const checkpointFingerprint = canonicalJsonHash({ genesisTxId: txId, generation: 1, publicationFingerprint, targetFingerprint });
   const transaction = buildPublicationTransaction({
-    txId, genesisTxId: txId, generation: 1, baselineFingerprint: baseline.baselineFingerprint,
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, baselineFingerprint: baseline.baselineFingerprint,
   });
   const u = buildPublicationU({
-    txId, genesisTxId: txId, generation: 1, baselineFingerprint: baseline.baselineFingerprint, anchorFingerprint,
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, baselineFingerprint: baseline.baselineFingerprint, anchorFingerprint,
     targetState: baseline.targetState, attestationFingerprint: baseline.attestationFingerprint,
     authorityReservationFingerprint: baseline.authorityReservationFingerprint,
     authorityCommitSnapshotFingerprint: baseline.authorityCommitSnapshotFingerprint,
@@ -175,48 +188,48 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
     readerInstanceId: null, readerStartNonce: null, readerVersion: null,
   });
   const p = buildPublicationP({
-    txId, genesisTxId: txId, generation: 1, uFingerprint: u["publication-uFingerprint"], stateFingerprint,
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, uFingerprint: u["publication-uFingerprint"], stateFingerprint,
     targetState: u.targetState, authorityCommitSnapshotFingerprint: u.authorityCommitSnapshotFingerprint,
     fenceBindingFingerprint: null, leaseBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null,
   });
   const s = buildPublicationS({
-    txId, genesisTxId: txId, generation: 1, pFingerprint: p["publication-pFingerprint"], stateFingerprint,
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, pFingerprint: p["publication-pFingerprint"], stateFingerprint,
     payloadFingerprint, targetState: p.targetState, authorityCommitSnapshotFingerprint: p.authorityCommitSnapshotFingerprint,
     fenceBindingFingerprint: null, readerVersion: null,
   });
   const prepared = buildPublicationState({
-    txId, genesisTxId: txId, generation: 1, publicationFingerprint, phase: "prepared",
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, publicationFingerprint, phase: "prepared",
   });
   const replaced = buildPublicationState({
-    txId, genesisTxId: txId, generation: 1, publicationFingerprint, phase: "replaced",
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, publicationFingerprint, phase: "replaced",
   });
   const c = buildPublicationC({
-    txId, genesisTxId: txId, generation: 1, sFingerprint: s["publication-sFingerprint"], stateFingerprint,
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, sFingerprint: s["publication-sFingerprint"], stateFingerprint,
     payloadFingerprint, snapshotFingerprint, authorityCommitSnapshotFingerprint: s.authorityCommitSnapshotFingerprint,
     fenceBindingFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null,
   });
   const q = buildPublicationQ({
-    txId, genesisTxId: txId, generation: 1, cFingerprint: c["publication-cFingerprint"], baselineFingerprint: baseline.baselineFingerprint,
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, cFingerprint: c["publication-cFingerprint"], baselineFingerprint: baseline.baselineFingerprint,
     stateFingerprint, payloadFingerprint, snapshotFingerprint, authorityCommitSnapshotFingerprint: c.authorityCommitSnapshotFingerprint,
     fenceBindingFingerprint: null,
   });
   const zp = buildPublicationZp({
-    txId, genesisTxId: txId, generation: 1, qFingerprint: q["publication-qFingerprint"], publicationFingerprint,
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, qFingerprint: q["publication-qFingerprint"], publicationFingerprint,
     stateFingerprint, payloadFingerprint, snapshotFingerprint,
   });
   const publicationK = buildPublicationK({
-    txId, genesisTxId: txId, generation: 1, zpFingerprint: zp["publication-zpFingerprint"],
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, zpFingerprint: zp["publication-zpFingerprint"],
     publicationFingerprint, authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint,
     checkpointFingerprint,
   });
   const publicationY = buildPublicationY({
-    txId, genesisTxId: txId, generation: 1, kFingerprint: publicationK["publication-kFingerprint"],
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, kFingerprint: publicationK["publication-kFingerprint"],
     publicationFingerprint, targetState: baseline.targetState,
     authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: null,
     targetFingerprint,
   });
   const committed = buildPublicationState({
-    txId, genesisTxId: txId, generation: 1, publicationFingerprint, phase: "committed",
+    txId, genesisTxId: txId, generation: 1, fenceGeneration: 1, publicationFingerprint, phase: "committed",
   });
   const zeroGrantProofFingerprint = canonicalJsonHash({
     admissionClosed: true,
@@ -228,6 +241,7 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
   });
   const precommit = buildGenesisPrecommit({
     genesisTxId: txId,
+    fenceGeneration: 1,
     generation: 1,
     genesisProbeFingerprint: canonicalJsonHash({ kind: "fixture-genesis-probe", txId }),
     targetFingerprint,
@@ -251,23 +265,23 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
     zeroGrantProofFingerprint,
   });
   const zFinality = seal({
-    version: 1, kind: "genesis-finality", genesisTxId: txId, generation: 1,
+    version: 1, kind: "genesis-finality", genesisTxId: txId, fenceGeneration: 1, generation: 1,
     anchorFingerprint, attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: tokenFloor.floorFingerprint,
     checkpointFingerprint: canonicalJsonHash(request), publicationKFingerprint: publicationK["publication-kFingerprint"],
     publicationYFingerprint: publicationY["publication-yFingerprint"], authorityEpochFingerprint: authorityEpoch.authorityEpochFingerprint,
     precommitFingerprint: precommit.precommitFingerprint, finalityFingerprint: tokenFloor.floorFingerprint,
   }, "zFinalityFingerprint");
   const proof = seal({
-    version: 1, kind: "finality-proof", genesisTxId: txId, generation: 1,
+    version: 1, kind: "finality-proof", genesisTxId: txId, fenceGeneration: 1, generation: 1,
     zFinalityFingerprint: zFinality.zFinalityFingerprint, readerProjectionFingerprint: null, ackFingerprint: null, routeFingerprint: "no-route",
   }, "finalityProofFingerprint");
   const receipt = seal({
-    version: 1, kind: "genesis-receipt", genesisTxId: txId, generation: 1,
+    version: 1, kind: "genesis-receipt", genesisTxId: txId, fenceGeneration: 1, generation: 1,
     requestedReaderMode: "no-reader", readerInstanceId: null, readerStartNonce: null, readerProjectionFingerprint: null, ackFingerprint: null,
     finalityProofFingerprint: proof.finalityProofFingerprint, phase: "terminal",
   }, "receiptFingerprint");
   const authorityReceipt = seal({
-    version: 1, kind: "genesis-authority-receipt", genesisTxId: txId, requestFingerprint: authorityRequest.requestFingerprint,
+    version: 1, kind: "genesis-authority-receipt", genesisTxId: txId, fenceGeneration: 1, requestFingerprint: authorityRequest.requestFingerprint,
     sequence: 2, anchorFingerprint, generation: 1, readerVersionFloorFingerprint: readerFloor.floorFingerprint,
     authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint,
   }, "receiptFingerprint");
@@ -533,9 +547,10 @@ test("loader rejects a Genesis proof after an otherwise valid G+1 token rotation
   const tokenFloor = JSON.parse(snapshot.tokenFloorBytes);
   const { attestationFingerprint: _attestationFingerprint, ...attestationFields } = attestation;
   const txId = "223e4567-e89b-42d3-a456-426614174000";
-  const reservation = reserveTokenGeneration(tokenFloor, { generation: 2, txId });
+  const reservation = reserveTokenGeneration(tokenFloor, { generation: 2, txId, fenceGeneration: 2 });
   const currentAttestation = seal({
     ...attestationFields,
+    fenceGeneration: 2,
     tokenConfigGeneration: 2,
     rotationKind: "same-key",
     previousAttestationFingerprint: attestation.attestationFingerprint,
@@ -545,6 +560,7 @@ test("loader rejects a Genesis proof after an otherwise valid G+1 token rotation
   const currentTokenFloor = commitTokenFloor(attestTokenFloor(reservation, attestedProof), {
     generation: 2,
     txId,
+    fenceGeneration: 2,
     attestationFingerprint: currentAttestation.attestationFingerprint,
   });
   const rotated = {

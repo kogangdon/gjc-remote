@@ -15,7 +15,7 @@ const anchor = {
 function managedWrapper() {
   const wrapper = {
     version: 1, kind: "managed-v1-wrapper", sourceKind: "managed-v1", managementStamp: "gjc-management-envelope/v1",
-    anchorFingerprint: managementAnchorFingerprint(anchor), targetRelativeName: "channels.json", targetState: "genesis-empty",
+    anchorFingerprint: managementAnchorFingerprint(anchor), fenceGeneration: 1, targetRelativeName: "channels.json", targetState: "genesis-empty",
     targetIdentity: "target-identity", targetAclFingerprint: "b".repeat(64), semanticStateFingerprint: null, readerVersion: null,
     dispatchClass: "workspace-only", routeDisposition: "no-route", wrapperSequence: 1, previousWrapperFingerprint: null,
   };
@@ -25,7 +25,7 @@ function managedWrapper() {
 function rootFor(wrapper) {
   const root = {
     version: 1, kind: "management-control-root", managementStamp: "gjc-management-control/v1", anchor,
-    anchorFingerprint: managementAnchorFingerprint(anchor), sourceKind: "managed-v1", wrapperKind: "managed-v1-wrapper",
+    anchorFingerprint: managementAnchorFingerprint(anchor), fenceGeneration: 1, sourceKind: "managed-v1", wrapperKind: "managed-v1-wrapper",
     wrapperRelativeName: "managed-v1-wrapper.json", targetRelativeName: "channels.json", controlRootRelativeName: ".gjc-remote-control",
     readerVersionFloorFingerprint: "c".repeat(64), wrapperFingerprint: wrapper.wrapperFingerprint,
   };
@@ -73,6 +73,9 @@ test("managed wrapper pointer rejects mismatch, foreign wrapper, and control-roo
   const target = Buffer.from('{}');
   assert.equal(classifyMappingEnvelope({ controlRootBytes: Buffer.from(JSON.stringify(root)), wrapperBytes: Buffer.from(JSON.stringify(wrapper)), targetBytes: target, targetIdentity: "target-identity", targetAclFingerprint: "b".repeat(64) }).ok, true);
   assert.equal(classifyMappingEnvelope({ controlRootBytes: Buffer.from(JSON.stringify({ ...root, wrapperFingerprint: "d".repeat(64) })), wrapperBytes: Buffer.from(JSON.stringify(wrapper)), targetBytes: target }).ok, false);
+  assert.equal(classifyMappingEnvelope({ controlRootBytes: Buffer.from(JSON.stringify({ ...root, fenceGeneration: 0 })), wrapperBytes: Buffer.from(JSON.stringify(wrapper)), targetBytes: target }).ok, false);
+  const missingFenceRoot = { ...root }; delete missingFenceRoot.fenceGeneration;
+  assert.equal(classifyMappingEnvelope({ controlRootBytes: Buffer.from(JSON.stringify(missingFenceRoot)), wrapperBytes: Buffer.from(JSON.stringify(wrapper)), targetBytes: target }).ok, false);
   const foreign = { ...wrapper, anchorFingerprint: "e".repeat(64) };
   foreign.wrapperFingerprint = canonicalJsonHash(Object.fromEntries(Object.entries(foreign).filter(([key]) => key !== "wrapperFingerprint")));
   assert.equal(classifyMappingEnvelope({ controlRootBytes: Buffer.from(JSON.stringify(root)), wrapperBytes: Buffer.from(JSON.stringify(foreign)), targetBytes: target }).ok, false);
@@ -91,6 +94,7 @@ test("versioned channels bind routes to exact mapping identity and generation", 
   const mapping = fingerprintManagedMappingRecord({
     mappingId: "mapping-1",
     hostId: "host-A",
+    fenceGeneration: 1,
     mappingGeneration: 3,
     mappingVersion: 1,
     sourcePlatform: "posix",
@@ -106,6 +110,7 @@ test("versioned channels bind routes to exact mapping identity and generation", 
     channelId: "123456789",
     hostId: mapping.hostId,
     mappingId: mapping.mappingId,
+    fenceGeneration: mapping.fenceGeneration,
     mappingGeneration: mapping.mappingGeneration,
     mappingVersion: mapping.mappingVersion,
     sourcePlatform: mapping.sourcePlatform,
@@ -117,6 +122,7 @@ test("versioned channels bind routes to exact mapping identity and generation", 
     managementStamp: "gjc-management-channels/v2",
     revision: 4,
     authorityEpoch: 7,
+    fenceGeneration: 1,
     mappingGeneration: 3,
     tokenConfigGeneration: 2,
     tokenConfigHostSetFingerprint: "f".repeat(64),
@@ -132,12 +138,16 @@ test("versioned channels bind routes to exact mapping identity and generation", 
     ...config,
     routes: { [route.channelId]: { ...route, mappingGeneration: 2 } },
   }), /MANAGED/);
+  const missingFence = { ...config }; delete missingFence.fenceGeneration;
+  assert.throws(() => validateManagedChannelsV2(missingFence), /MANAGED/);
+  assert.throws(() => validateManagedChannelsV2({ ...config, fenceGeneration: 0 }), /MANAGED/);
 });
 
 test("genesis-empty target is exact, route-less, and token-bound", () => {
   const value = createGenesisEmptyChannels({
     tokenConfigGeneration: 1,
     tokenConfigHostSetFingerprint: "a".repeat(64),
+    fenceGeneration: 1,
   });
   assert.deepEqual(value.mappings, {});
   assert.deepEqual(value.routes, {});

@@ -122,9 +122,10 @@ function fingerprintBytes(bytes) {
 }
 function validateHistoryMarker(marker, anchorFingerprint, expectedSequence = undefined) {
   if (!marker || Object.getPrototypeOf(marker) !== Object.prototype ||
-      Object.keys(marker).sort().join(",") !== "anchorFingerprint,kind,markerFingerprint,previousMarkerFingerprint,sequence,version" ||
+      Object.keys(marker).sort().join(",") !== "anchorFingerprint,fenceGeneration,kind,markerFingerprint,previousMarkerFingerprint,sequence,version" ||
       marker.version !== 1 || marker.kind !== "managed-history-marker" ||
       !isHex64(marker.anchorFingerprint) ||
+      !Number.isSafeInteger(marker.fenceGeneration) || marker.fenceGeneration < 1 ||
       !Number.isSafeInteger(marker.sequence) || marker.sequence < 1 ||
       (marker.sequence === 1 ? marker.previousMarkerFingerprint !== null : !isHex64(marker.previousMarkerFingerprint)) ||
       !isHex64(marker.markerFingerprint) ||
@@ -187,6 +188,17 @@ function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerpr
     targetAclFingerprint: evidence.targetAclFingerprint,
   });
   const expectedSourceKind = request.targetState === "legacy-retained" ? "legacy-retained" : "managed-v1";
+  if (controlRoot.fenceGeneration !== request.candidateFenceGeneration ||
+      wrapper.fenceGeneration !== request.candidateFenceGeneration) {
+    throw new Error("SUCCESSOR_FENCE_PROOF_INVALID");
+  }
+  if (evidence.sourceKind === "managed-v1") {
+    const target = parseAuthorityBytes(evidence.targetBytes);
+    validateManagedChannelsV2(target);
+    if (target.fenceGeneration !== request.candidateFenceGeneration) {
+      throw new Error("SUCCESSOR_LIVE_TARGET_FENCE_INVALID");
+    }
+  }
   if (!envelope.ok || envelope.sourceKind !== evidence.sourceKind || evidence.sourceKind !== expectedSourceKind ||
       fingerprintBytes(evidence.targetBytes) !== finality.targetFingerprint ||
       evidence.targetIdentity !== finality.targetIdentityFingerprint ||
@@ -277,11 +289,13 @@ function validatePublicationGraph({
   if ([u, p, s, prepared, replaced, committed, c, q, zp, k, y].some((record) =>
     record.txId !== transaction.txId ||
     record.genesisTxId !== transaction.genesisTxId ||
-    record.generation !== transaction.generation
+    record.generation !== transaction.generation ||
+    record.fenceGeneration !== transaction.fenceGeneration
   )) throw new TypeError("publication transaction branch");
   if (prepared.phase !== "prepared" || replaced.phase !== "replaced" || committed.phase !== "committed" ||
       transaction.txId !== request.genesisTxId || transaction.genesisTxId !== request.genesisTxId ||
       transaction.generation !== request.generation ||
+      transaction.fenceGeneration !== request.fenceGeneration ||
       u.txId !== transaction.txId || u.genesisTxId !== transaction.genesisTxId || u.generation !== transaction.generation ||
       u.anchorFingerprint !== baseline.anchorFingerprint || u.targetState !== baseline.targetState ||
       u.attestationFingerprint !== baseline.attestationFingerprint ||
@@ -338,6 +352,10 @@ function validateSuccessorPublicationEvidence({ snapshot, bundle }) {
     targetAclFingerprint,
   });
   if (!envelope.ok) throw new TypeError("successor management envelope");
+  if (controlRoot.fenceGeneration !== request.candidateFenceGeneration ||
+      wrapper.fenceGeneration !== request.candidateFenceGeneration) {
+    throw new TypeError("successor envelope fence");
+  }
   if (controlRoot.readerVersionFloorFingerprint !== readerFloor.floorFingerprint ||
       controlRoot.anchorFingerprint !== readerFloor.anchorFingerprint ||
       readerFloor.anchorFingerprint !== request.anchorFingerprint) {
@@ -347,6 +365,9 @@ function validateSuccessorPublicationEvidence({ snapshot, bundle }) {
   if (envelope.sourceKind !== expectedSourceKind) throw new TypeError("successor source kind");
   const target = expectedSourceKind === "managed-v1" ? parseAuthorityBytes(targetBytes) : null;
   if (target !== null) validateManagedChannelsV2(target);
+  if (target !== null && target.fenceGeneration !== request.candidateFenceGeneration) {
+    throw new TypeError("successor target fence");
+  }
   const targetFingerprint = fingerprintBytes(targetBytes);
   const canonicalMappingFingerprint = target === null
     ? canonicalJsonHash({
@@ -410,9 +431,11 @@ function validateSuccessorPublicationEvidence({ snapshot, bundle }) {
   if ([u, p, s, prepared, replaced, committed, c, q, zp, k, y].some((record) =>
     record.txId !== expectedTxId ||
     record.genesisTxId !== expectedGenesisTxId ||
-    record.generation !== expectedGeneration
+    record.generation !== expectedGeneration ||
+    record.fenceGeneration !== request.candidateFenceGeneration
   )) throw new TypeError("successor publication transaction");
   if (prepared.phase !== "prepared" || replaced.phase !== "replaced" || committed.phase !== "committed" ||
+      transaction.fenceGeneration !== request.candidateFenceGeneration ||
       u.anchorFingerprint !== baseline.anchorFingerprint || u.targetState !== baseline.targetState ||
       u.attestationFingerprint !== baseline.attestationFingerprint ||
       u.authorityReservationFingerprint !== baseline.authorityReservationFingerprint ||
@@ -488,6 +511,11 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   if (!envelope.ok) throw new TypeError("management envelope");
   rejectTerminalAuthorityState(snapshot, controlRoot.anchorFingerprint);
   const managedTarget = envelope.sourceKind === "managed-v1" ? parseAuthorityBytes(snapshot.targetBytes) : null;
+  if (controlRoot.fenceGeneration !== request.fenceGeneration ||
+      wrapper.fenceGeneration !== request.fenceGeneration ||
+      (managedTarget !== null && managedTarget.fenceGeneration !== request.fenceGeneration)) {
+    throw new TypeError("genesis fence proof");
+  }
   validateReaderVersionFloor(readerFloor);
   if ((readerFloor.readerVersionFloor === 2) !== (request.requestedReaderMode === "handshake")) {
     throw new TypeError("genesis reader floor branch");
@@ -741,6 +769,7 @@ export async function createManagedAuthorityReader({
       kind: "reader-lease-binding",
       anchorFingerprint: request.anchorFingerprint,
       genesisTxId: request.genesisTxId,
+      fenceGeneration: request.fenceGeneration,
       readerInstanceId: request.readerInstanceId,
       readerStartNonce: request.readerStartNonce,
       readerVersion: 2,
@@ -755,6 +784,7 @@ export async function createManagedAuthorityReader({
       kind: "reader-projection",
       anchorFingerprint: request.anchorFingerprint,
       genesisTxId: request.genesisTxId,
+      fenceGeneration: request.fenceGeneration,
       generation: request.generation,
       readerInstanceId: request.readerInstanceId,
       readerStartNonce: request.readerStartNonce,
@@ -802,6 +832,7 @@ export async function createManagedAuthorityReader({
     const l2 = lease ?? buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-lease", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
       requestFingerprint: request.requestFingerprint, readerInstanceId: request.readerInstanceId,
+      fenceGeneration: request.candidateFenceGeneration,
       readerStartNonce: request.readerStartNonce, readerVersion: 2, fenceBindingFingerprint: fence.fenceBindingFingerprint,
       previousLeaseBindingFingerprint: authoritySuccessorPreviousLeaseBindingFingerprint(request), leaseBindingFingerprint: null,
     }, "leaseBindingFingerprint");
@@ -812,6 +843,7 @@ export async function createManagedAuthorityReader({
     const rp2 = projection ?? buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-reader-projection", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
       requestFingerprint: request.requestFingerprint, finalityFingerprint: finality.finalityFingerprint,
+      fenceGeneration: request.candidateFenceGeneration,
       anchorFingerprint: request.anchorFingerprint, authorityCommitSnapshotFingerprint: finality.authorityCommitSnapshotFingerprint,
       targetFingerprint: finality.targetFingerprint, wrapperFingerprint: finality.wrapperFingerprint,
       revision: finality.revision, authorityEpoch: finality.authorityEpoch,
@@ -827,6 +859,7 @@ export async function createManagedAuthorityReader({
     const ak2 = ack ?? buildAuthoritySuccessorRecord({
       version: 1, kind: "authority-successor-ack", txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
       requestFingerprint: request.requestFingerprint, finalityFingerprint: finality.finalityFingerprint,
+      fenceGeneration: request.candidateFenceGeneration,
       readerProjectionFingerprint: rp2.readerProjectionFingerprint, leaseBindingFingerprint: l2.leaseBindingFingerprint,
       readerInstanceId: request.readerInstanceId, readerStartNonce: request.readerStartNonce, readerVersion: 2,
       readerNonce: request.readerNonce, ackDisposition: "verified-no-route", ackFingerprint: null,
@@ -865,7 +898,6 @@ export async function createManagedAuthorityReader({
             try {
               await completePendingSuccessor(snapshot.successorBundle);
             } catch (error) {
-              if (process.env.GJC_TRACE_TEST_ERROR === "1") console.error(error?.stack);
               return unavailable("MANAGED_AUTHORITY_INVALID");
             }
             return unavailable("MANAGED_AUTHORITY_PENDING");
@@ -889,7 +921,6 @@ export async function createManagedAuthorityReader({
             routeDisposition: "no-route",
           };
         } catch (error) {
-          if (process.env.GJC_TRACE_TEST_ERROR === "1") console.error(error?.stack);
           return unavailable("MANAGED_AUTHORITY_INVALID");
         }
       }

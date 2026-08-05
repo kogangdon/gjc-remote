@@ -41,12 +41,12 @@ function fake() {
 }
 function records(managementSid = 'S-1-5-21-100') {
   const h = 'a'.repeat(64); const tx = '123e4567-e89b-42d3-a456-426614174000';
-  const floor = { version: 1, kind: 'token-generation-floor', anchorFingerprint: h, genesisGeneration: 1, highestReservedGeneration: 1, highestCommittedGeneration: 0, lastReservationTxId: tx, lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: 'reserved', attestedProofFingerprint: null, floorFingerprint: null }; floor.floorFingerprint = recordHash(floor, 'floorFingerprint');
-  const attestation = { version: 1, kind: 'token-config-attestation', anchorFingerprint: h, tokenConfigGeneration: 1, tokenConfigHostSetFingerprint: h, managedGrammarVersion: 1, sourceKind: 'protected-stdin', producerPrincipal: `management/${h}`, rotationKind: 'genesis', previousAttestationFingerprint: null, txId: tx, attestationFingerprint: null }; attestation.attestationFingerprint = recordHash(attestation, 'attestationFingerprint');
-  const request = { version: 1, kind: 'genesis-request', genesisTxId: tx, idempotencyKey: 'key', anchorFingerprint: h, ownerPrincipalFingerprint: canonicalJsonHash({ kind: 'sid', value: managementSid }), generation: 1, requestedReaderMode: 'no-reader', readerInstanceId: null, readerStartNonce: null, attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: floor.floorFingerprint, requestFingerprint: null }; request.requestFingerprint = recordHash(request, 'requestFingerprint');
+  const floor = { version: 1, kind: 'token-generation-floor', anchorFingerprint: h, fenceGeneration: 1, genesisGeneration: 1, highestReservedGeneration: 1, highestCommittedGeneration: 0, lastReservationTxId: tx, lastCommittedTxId: null, lastAttestationFingerprint: null, floorPhase: 'reserved', attestedProofFingerprint: null, floorFingerprint: null }; floor.floorFingerprint = recordHash(floor, 'floorFingerprint');
+  const attestation = { version: 1, kind: 'token-config-attestation', anchorFingerprint: h, fenceGeneration: 1, tokenConfigGeneration: 1, tokenConfigHostSetFingerprint: h, managedGrammarVersion: 1, sourceKind: 'protected-stdin', producerPrincipal: `management/${h}`, rotationKind: 'genesis', previousAttestationFingerprint: null, txId: tx, attestationFingerprint: null }; attestation.attestationFingerprint = recordHash(attestation, 'attestationFingerprint');
+  const request = { version: 1, kind: 'genesis-request', genesisTxId: tx, idempotencyKey: 'key', anchorFingerprint: h, ownerPrincipalFingerprint: canonicalJsonHash({ kind: 'sid', value: managementSid }), generation: 1, fenceGeneration: 1, requestedReaderMode: 'no-reader', readerInstanceId: null, readerStartNonce: null, attestationFingerprint: attestation.attestationFingerprint, tokenFloorFingerprint: floor.floorFingerprint, requestFingerprint: null }; request.requestFingerprint = recordHash(request, 'requestFingerprint');
   const attestedProof = buildAttestedTokenFloorProof(floor, attestation);
   const attestedFloor = attestTokenFloor(floor, attestedProof);
-  const committed = commitTokenFloor(attestedFloor, { txId: tx, generation: 1, attestationFingerprint: attestation.attestationFingerprint });
+  const committed = commitTokenFloor(attestedFloor, { txId: tx, generation: 1, attestationFingerprint: attestation.attestationFingerprint, fenceGeneration: 1 });
   return { floor, attestation, request, attestedProof, attestedFloor, committed };
 }
 async function writeAuthorityRequest(native, configPath, request, roles, targetBytes) {
@@ -60,6 +60,7 @@ async function writeAuthorityRequest(native, configPath, request, roles, targetB
   };
   const record = {
     version: 1, kind: 'genesis-authority-request', genesisTxId: request.genesisTxId, sequence: 1,
+    fenceGeneration: 1,
     anchorFingerprint: await native.managementAnchorFingerprint(),
     ownerPrincipalFingerprint: canonicalJsonHash({ kind: 'sid', value: roles.managementSid }),
     managementPrincipalFingerprint: canonicalJsonHash({ kind: 'sid', value: roles.managementSid }),
@@ -93,7 +94,7 @@ test('persists exact shared records in genesis order and confines bot writes', a
   assert.ok(calls.findIndex((p) => p.endsWith('attestation.json')) < calls.findIndex((p) => p.includes('token-floor-attested-')));
   await native.publishMapping({ request, attestation, targetPrincipal: null });
   await assert.rejects(native.commitTokenFloor(committed), /exact committed generation floor is required/);
-  await assert.rejects(native.commitTokenFloor({ floor: committed }), /attested token-floor predecessor is absent|exact precommit graph is invalid/);
+  await assert.rejects(native.commitTokenFloor({ floor: committed }), /attested token-floor predecessor is absent|exact precommit graph is invalid|committed generation floor fence is invalid/);
   lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.botSid });
   await assert.rejects(native.writeBotReaderState({ revision: 1 }), /handshake/);
   lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.managementSid });
@@ -534,10 +535,73 @@ test('successor recovery keeps retained proof source-aware for B and management-
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   const targetBytes = Buffer.from('{"legacy":true}');
   files.set(configPath, targetBytes);
-  files.set('C:\\state\\.gjc-remote-control\\control-root.json', Buffer.from(canonicalJson({
-    sourceKind: 'legacy-retained', wrapperRelativeName: 'legacy-retained.json', controlRootFingerprint: 'a'.repeat(64),
-  })));
-  files.set('C:\\state\\.gjc-remote-control\\legacy-retained.json', Buffer.from(canonicalJson({ wrapperFingerprint: 'b'.repeat(64) })));
+  const anchor = {
+    anchorVersion: 1,
+    configPathFingerprint: sha(Buffer.from(configPath)),
+    parentIdentity: sha(canonicalJson({ kind: 'test', path: 'C:/state', owner: roles.managementSid })),
+    targetRelativeName: 'channels.json',
+    controlRootRelativeName: '.gjc-remote-control',
+  };
+  const anchorFingerprint = canonicalJsonHash(anchor);
+  const readerFloor = {
+    version: 1,
+    kind: 'reader-version-floor',
+    anchorFingerprint,
+    fenceGeneration: 1,
+    readerVersionFloor: null,
+    firstPendingTxId: null,
+    firstReaderInstanceId: null,
+    firstReaderStartNonce: null,
+    lastTransitionTxId: null,
+    previousFloorFingerprint: null,
+    floorFingerprint: null,
+  };
+  readerFloor.floorFingerprint = recordHash(readerFloor, 'floorFingerprint');
+  const targetIdentity = sha(canonicalJson({ kind: 'test', path: configPath, owner: roles.managementSid }));
+  const targetAclFingerprint = sha('protected:M,B,R,SYSTEM');
+  const wrapper = {
+    version: 1,
+    kind: 'legacy-retained-wrapper',
+    sourceKind: 'legacy-retained',
+    managementStamp: 'gjc-management-envelope/v1',
+    anchorFingerprint,
+    fenceGeneration: 1,
+    targetRelativeName: 'channels.json',
+    targetState: 'legacy-unmigrated',
+    rawTargetByteFingerprint: sha(targetBytes),
+    rawTargetByteLength: targetBytes.length,
+    targetIdentity,
+    targetAclFingerprint,
+    readerVersion: null,
+    legacyRetention: 'exact',
+    dispatchClass: 'workspace-only',
+    routeDisposition: 'no-route',
+    retentionTxId: '123e4567-e89b-42d3-a456-426614174000',
+    retentionSequence: 1,
+    previousWrapperFingerprint: null,
+    wrapperFingerprint: null,
+  };
+  wrapper.wrapperFingerprint = recordHash(wrapper, 'wrapperFingerprint');
+  const controlRoot = {
+    version: 1,
+    kind: 'management-control-root',
+    managementStamp: 'gjc-management-control/v1',
+    anchor,
+    anchorFingerprint,
+    fenceGeneration: 1,
+    sourceKind: 'legacy-retained',
+    wrapperKind: 'legacy-retained-wrapper',
+    wrapperRelativeName: 'legacy-retained.json',
+    targetRelativeName: 'channels.json',
+    controlRootRelativeName: '.gjc-remote-control',
+    readerVersionFloorFingerprint: readerFloor.floorFingerprint,
+    wrapperFingerprint: wrapper.wrapperFingerprint,
+    controlRootFingerprint: null,
+  };
+  controlRoot.controlRootFingerprint = recordHash(controlRoot, 'controlRootFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\reader-version-floor.json', Buffer.from(canonicalJson(readerFloor)));
+  files.set('C:\\state\\.gjc-remote-control\\control-root.json', Buffer.from(canonicalJson(controlRoot)));
+  files.set('C:\\state\\.gjc-remote-control\\legacy-retained.json', Buffer.from(canonicalJson(wrapper)));
 
   assert.equal(typeof native.readRetainedTargetProof, 'function');
   assert.equal(typeof native.readSuccessorRecovery, 'function');
@@ -573,6 +637,7 @@ test('managed history marker loss is terminal and marker rewinds are write-free'
     version: 1,
     kind: 'genesis-authority-receipt',
     genesisTxId: authorityRequest.genesisTxId,
+    fenceGeneration: 1,
     requestFingerprint: authorityRequest.requestFingerprint,
     sequence: 2,
     anchorFingerprint: authorityRequest.anchorFingerprint,
@@ -587,6 +652,7 @@ test('managed history marker loss is terminal and marker rewinds are write-free'
   const marker = {
     version: 1,
     kind: 'managed-history-marker',
+    fenceGeneration: 1,
     anchorFingerprint: authorityRequest.anchorFingerprint,
     sequence: 1,
     previousMarkerFingerprint: null,
@@ -612,6 +678,7 @@ test('managed history marker loss is terminal and marker rewinds are write-free'
   const successorHead = buildAuthoritySuccessorRecord({
     version: 1,
     kind: 'authority-successor-head',
+    fenceGeneration: 2,
     anchorFingerprint: marker.anchorFingerprint,
     sequence: 2,
     txId: 'successor-2',
@@ -661,7 +728,7 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   files.set(configPath, targetBytes);
   const hex = 'a'.repeat(64);
   const request = buildAuthoritySuccessorRecord({
-    version: 1, kind: 'authority-successor-request', sequence: 2, txId: 'successor-2', rootGenesisTxId: genesis.request.genesisTxId,
+    version: 1, kind: 'authority-successor-request', sequence: 2, previousFenceGeneration: 1, candidateFenceGeneration: 2, txId: 'successor-2', rootGenesisTxId: genesis.request.genesisTxId,
     idempotencyKey: 'successor-key', operation: 'tokens-attest', anchorFingerprint: await native.managementAnchorFingerprint(),
     actorPrincipalFingerprint: hex, previousReceiptFingerprint: hex, previousTargetFingerprint: hex, previousWrapperFingerprint: hex,
     previousRevision: 1, candidateRevision: 2, previousAuthorityEpoch: 1, candidateAuthorityEpoch: 2,
@@ -673,6 +740,7 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   }, 'requestFingerprint');
   const reserved = buildAuthoritySuccessorRecord({
     version: 1, kind: 'authority-successor-head', anchorFingerprint: request.anchorFingerprint, sequence: request.sequence,
+    fenceGeneration: request.candidateFenceGeneration,
     txId: request.txId, rootGenesisTxId: request.rootGenesisTxId, operation: request.operation, phase: 'reserved',
     requestFingerprint: request.requestFingerprint, closeFingerprint: null, authorityCommitSnapshotFingerprint: null,
     baselineFingerprint: null, publicationKFingerprint: null, publicationYFingerprint: null, finalityFingerprint: null,
@@ -695,13 +763,26 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
     recoveryProvisioningFingerprint: 'd'.repeat(64),
   });
   await writeAuthorityRequest(native, configPath, genesis.request, roles, targetBytes);
-  const marker = { version: 1, kind: 'managed-history-marker', anchorFingerprint: request.anchorFingerprint, sequence: 1, previousMarkerFingerprint: null, markerFingerprint: null };
+  const marker = { version: 1, kind: 'managed-history-marker', anchorFingerprint: request.anchorFingerprint, sequence: 1, fenceGeneration: 1, previousMarkerFingerprint: null, markerFingerprint: null };
   marker.markerFingerprint = recordHash(marker, 'markerFingerprint');
   files.set('C:\\state\\.channels.json.managed-history.json', Buffer.from(canonicalJson(marker)));
   files.set('C:\\state\\.gjc-remote-control\\token-floor.json', Buffer.from(canonicalJson(genesis.committed)));
-  const readerFloor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: request.anchorFingerprint, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null };
+  const readerFloor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: request.anchorFingerprint, fenceGeneration: 1, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null };
   readerFloor.floorFingerprint = recordHash(readerFloor, 'floorFingerprint');
   files.set('C:\\state\\.gjc-remote-control\\reader-version-floor.json', Buffer.from(canonicalJson(readerFloor)));
+  const fenceFloor = {
+    version: 1,
+    kind: 'fence-generation-floor',
+    anchorFingerprint: request.anchorFingerprint,
+    genesisFenceGeneration: 1,
+    highestReservedFenceGeneration: 2,
+    highestCommittedFenceGeneration: 1,
+    lastReservationTxId: request.txId,
+    lastCommittedTxId: genesis.request.genesisTxId,
+    floorFingerprint: null,
+  };
+  fenceFloor.floorFingerprint = recordHash(fenceFloor, 'floorFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\fence-generation-floor.json', Buffer.from(canonicalJson(fenceFloor)));
   await native.writeAuthoritySuccessorRequest(request);
   assert.deepEqual(await native.writeAuthoritySuccessorRequest(request), request);
   await assert.rejects(native.writeAuthoritySuccessorRequest(buildAuthoritySuccessorRecord({ ...request, idempotencyKey: 'conflict', requestFingerprint: null }, 'requestFingerprint')), /replay conflicts/);

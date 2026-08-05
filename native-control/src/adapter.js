@@ -115,6 +115,48 @@ const buildAuthorityEpochFloor = (anchorFingerprint, previous = null) => {
   floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint');
   return validateAuthorityEpochFloor(floor);
 };
+const fenceGenerationFloorKeys = [
+  'version', 'kind', 'anchorFingerprint', 'genesisFenceGeneration',
+  'highestReservedFenceGeneration', 'highestCommittedFenceGeneration',
+  'lastReservationTxId', 'lastCommittedTxId', 'floorFingerprint',
+];
+const validateFenceGenerationFloor = (floor) => {
+  if (!floor || Object.getPrototypeOf(floor) !== Object.prototype ||
+      Object.keys(floor).length !== fenceGenerationFloorKeys.length ||
+      !fenceGenerationFloorKeys.every((key) => Object.hasOwn(floor, key)) ||
+      floor.version !== 1 || floor.kind !== 'fence-generation-floor' ||
+      !hex(floor.anchorFingerprint) || floor.genesisFenceGeneration !== 1 ||
+      !Number.isSafeInteger(floor.highestReservedFenceGeneration) ||
+      !Number.isSafeInteger(floor.highestCommittedFenceGeneration) ||
+      floor.highestReservedFenceGeneration < 0 ||
+      floor.highestCommittedFenceGeneration < 0 ||
+      floor.highestCommittedFenceGeneration > floor.highestReservedFenceGeneration ||
+      ![floor.lastReservationTxId, floor.lastCommittedTxId].every((value) => value === null || isOpaque(value)) ||
+      !hex(floor.floorFingerprint) ||
+      floor.floorFingerprint !== recordFingerprint(floor, 'floorFingerprint')) {
+    throw new TypeError('fence generation floor schema');
+  }
+  if ((floor.highestReservedFenceGeneration < 1) !== (floor.lastReservationTxId === null) ||
+      (floor.highestCommittedFenceGeneration < 1) !== (floor.lastCommittedTxId === null)) {
+    throw new TypeError('fence generation floor relation');
+  }
+  return floor;
+};
+const buildFenceGenerationFloor = (anchorFingerprint, previous = null) => {
+  const floor = previous ?? {
+    version: 1,
+    kind: 'fence-generation-floor',
+    anchorFingerprint,
+    genesisFenceGeneration: 1,
+    highestReservedFenceGeneration: 0,
+    highestCommittedFenceGeneration: 0,
+    lastReservationTxId: null,
+    lastCommittedTxId: null,
+    floorFingerprint: null,
+  };
+  floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint');
+  return validateFenceGenerationFloor(floor);
+};
 
 export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, roles, platform = process.platform, identityNormalizer = normalizeNativeIdentity }) {
   const pathOps = platform === 'win32' ? win32Path : { basename: pathBasename, dirname: pathDirname, join: pathJoin, sep: pathSep };
@@ -284,7 +326,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   const verifiedBytes = async (name) => { const bytes = await lowLevel.read_verified_bytes(name); if (bytes === null) refused('read_managed_mapping_snapshot', 'required managed record is absent'); const verified = await assertObject(name, Buffer.from(bytes)); return { bytes: Buffer.from(bytes), ...verified }; };
   const reservationValid = (r) => { try { validateTokenFloorReservation(r); return true; } catch { return false; } };
   const attestationValid = (a) => { try { validateTokenConfigAttestation(a); return true; } catch { return false; } };
-  const targetProof = async ({ sourceKind = 'managed-v1' } = {}) => {
+  const targetProof = async ({ sourceKind = 'managed-v1', expectedFenceGeneration = undefined } = {}) => {
     if (!['managed-v1', 'legacy-retained'].includes(sourceKind)) refused('read_managed_mapping_snapshot', 'target source kind is invalid');
     const managed = sourceKind === 'managed-v1';
     await assertConfigParentOwner('read_managed_mapping_snapshot');
@@ -297,12 +339,35 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const access = await Promise.all(principals.map(async ([principal, mode, expected]) =>
       (await lowLevel.principal_access_check(targetPath, roleKind, principal, mode)) === expected));
     if (!access.every(Boolean)) refused('read_managed_mapping_snapshot', managed ? 'managed target M/B/R access proof failed' : 'retained target M/B read equality proof failed');
-    return { bytes: Buffer.from(bytes), targetIdentity: identityFingerprint(target.identity), targetAclFingerprint: fingerprint(Buffer.from(String(target.acl))) };
+    const control = await read(path('control-root'));
+    const parsed = managed ? parseCanonicalJsonBytes(Buffer.from(bytes)) : null;
+    if (expectedFenceGeneration !== undefined &&
+        (!Number.isSafeInteger(expectedFenceGeneration) || expectedFenceGeneration < 1 ||
+         (managed && parsed?.fenceGeneration !== expectedFenceGeneration))) {
+      refused('read_managed_mapping_snapshot', 'target fence proof does not match the requested successor');
+    }
+    if (control !== null) {
+      if (control.sourceKind !== sourceKind ||
+          !Number.isSafeInteger(control.fenceGeneration) || control.fenceGeneration < 1 ||
+          (expectedFenceGeneration === undefined && managed && parsed !== null && parsed.fenceGeneration !== control.fenceGeneration)) {
+        refused('read_managed_mapping_snapshot', 'target fence proof does not bind the durable control root');
+      }
+    }
+    const fenceGeneration = expectedFenceGeneration !== undefined
+      ? expectedFenceGeneration
+      : control !== null
+        ? control.fenceGeneration
+        : managed
+          ? parsed?.fenceGeneration
+          : 1;
+    if (!Number.isSafeInteger(fenceGeneration) || fenceGeneration < 1) refused('read_managed_mapping_snapshot', 'target fence proof is invalid');
+    return { bytes: Buffer.from(bytes), targetIdentity: identityFingerprint(target.identity), targetAclFingerprint: fingerprint(Buffer.from(String(target.acl))), fenceGeneration };
   };
   const assertManagementStateCounters = async (state) => {
     const phase = state?.recovery?.phase;
     if (!state || !Number.isSafeInteger(state.revision) || state.revision < 0 ||
         !Number.isSafeInteger(state.authorityEpoch) || state.authorityEpoch < 0 ||
+        !Number.isSafeInteger(state.fenceGeneration) || state.fenceGeneration < 1 ||
         !Number.isSafeInteger(state.tokenConfigGeneration) || state.tokenConfigGeneration < 0 ||
         !Number.isSafeInteger(state.mappingGeneration) || state.mappingGeneration < 0) {
       refused('write_management_state', 'management state counters are invalid');
@@ -311,7 +376,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const txId = state.recovery?.txId;
       const successorFinality = txId && await read(path(`authority-successor-finality-${encodeURIComponent(txId)}`));
       if (successorFinality !== null) {
-        const fields = ['revision', 'authorityEpoch', 'tokenConfigGeneration', 'mappingGeneration'];
+        const fields = ['revision', 'authorityEpoch', 'fenceGeneration', 'tokenConfigGeneration', 'mappingGeneration'];
         if (fields.some((field) => state[field] !== successorFinality[field])) {
           refused('write_management_state', 'management state counters are not bound to successor finality');
         }
@@ -320,6 +385,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         if (request?.genesisTxId === txId) {
           const epoch = await read(path('authority-epoch'));
           if (!epoch || state.authorityEpoch !== epoch.epoch ||
+              state.fenceGeneration !== request.fenceGeneration ||
               state.tokenConfigGeneration !== request.generation || state.mappingGeneration !== 0) {
             refused('write_management_state', 'management state counters are not bound to Genesis finality');
           }
@@ -334,7 +400,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         } catch {
           refused('write_management_state', 'managed target counter proof is invalid');
         }
-        if (state.tokenConfigGeneration !== snapshot.tokenConfigGeneration ||
+        if (state.fenceGeneration !== snapshot.fenceGeneration ||
+            state.tokenConfigGeneration !== snapshot.tokenConfigGeneration ||
             state.mappingGeneration !== snapshot.mappingGeneration ||
             (snapshot.revision !== null &&
              (state.revision !== snapshot.revision || state.authorityEpoch !== snapshot.authorityEpoch))) {
@@ -361,12 +428,13 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   };
   const exactTarget = async (candidate) => { const target = await targetProof({ sourceKind: 'legacy-retained' }); if (candidate.rawTargetByteFingerprint !== fingerprint(target.bytes) || candidate.rawTargetByteLength !== target.bytes.length || candidate.targetIdentity !== target.targetIdentity || candidate.targetAclFingerprint !== target.targetAclFingerprint) refused('publish_mapping', 'exact legacy target proof failed'); return target; };
   const anchor = async () => ({ anchorVersion: 1, configPathFingerprint: fingerprint(Buffer.from(configPath)), parentIdentity: identityFingerprint(await lowLevel.read_identity(parent)), targetRelativeName: 'channels.json', controlRootRelativeName: '.gjc-remote-control' });
-  const readerFloor = async () => { const existing = await read(path('reader-version-floor')); if (existing) { try { return validateReaderVersionFloor(existing); } catch { refused('publish_mapping', 'reader version floor is invalid'); } } const floor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: (await anchorFingerprint()), readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null }; floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint'); return validateReaderVersionFloor(floor); };
+  const readerFloor = async () => { const existing = await read(path('reader-version-floor')); if (existing) { try { return validateReaderVersionFloor(existing); } catch { refused('publish_mapping', 'reader version floor is invalid'); } } const floor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: (await anchorFingerprint()), fenceGeneration: 1, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null }; floor.floorFingerprint = recordFingerprint(floor, 'floorFingerprint'); return validateReaderVersionFloor(floor); };
   const anchorFingerprint = async () => fingerprint(encode(await anchor()));
   const validateHistoryMarker = (record) => {
     if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
-        !same(Object.keys(record).sort(), ['anchorFingerprint', 'kind', 'markerFingerprint', 'previousMarkerFingerprint', 'sequence', 'version']) ||
+        !same(Object.keys(record).sort(), ['anchorFingerprint', 'fenceGeneration', 'kind', 'markerFingerprint', 'previousMarkerFingerprint', 'sequence', 'version']) ||
         record.version !== 1 || record.kind !== 'managed-history-marker' || !hex(record.anchorFingerprint) ||
+        !Number.isSafeInteger(record.fenceGeneration) || record.fenceGeneration < 1 ||
         !Number.isSafeInteger(record.sequence) || record.sequence < 1 ||
         (record.sequence === 1 ? record.previousMarkerFingerprint !== null : !hex(record.previousMarkerFingerprint)) ||
         !hex(record.markerFingerprint) || record.markerFingerprint !== recordFingerprint(record, 'markerFingerprint')) {
@@ -388,6 +456,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     return record;
   };
   const validateHistoryMarkerHeadRelation = (marker, head, candidate = null) => {
+    const expectedMarkerFenceGeneration = head?.phase === 'terminal' ? head.fenceGeneration : (head === null ? marker.fenceGeneration : head.fenceGeneration - 1);
+    if (marker.fenceGeneration !== expectedMarkerFenceGeneration ||
+        (candidate !== null && candidate.fenceGeneration !== head?.fenceGeneration)) {
+      refused('commit_managed_history_marker', 'managed history marker fence does not bind the active authority head');
+    }
     if (head === null) {
       if (marker.sequence > 1 || candidate?.sequence > 1) {
         refused('commit_managed_history_marker', 'successor history marker requires an active authority head');
@@ -418,7 +491,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       refused('commit_managed_history_marker', 'committed Genesis authority receipt is required before marker mutation');
     }
   };
-  const publishEnvelope = async (wrapper) => { const currentAnchor = await anchor(); const currentAnchorFingerprint = fingerprint(encode(currentAnchor)); if (wrapper.anchorFingerprint !== currentAnchorFingerprint) refused('publish_mapping', 'wrapper anchor does not bind this management parent'); const floor = await readerFloor(); await writeAuthority('reader-version-floor', floor); const wrapperName = wrapper.sourceKind === 'legacy-retained' ? 'legacy-retained' : 'managed-v1-wrapper'; await writeAuthority(wrapperName, wrapper); const rootRecord = { version: 1, kind: 'management-control-root', managementStamp: 'gjc-management-control/v1', anchor: currentAnchor, anchorFingerprint: currentAnchorFingerprint, sourceKind: wrapper.sourceKind, wrapperKind: wrapper.kind, wrapperRelativeName: `${wrapperName}.json`, targetRelativeName: 'channels.json', controlRootRelativeName: '.gjc-remote-control', readerVersionFloorFingerprint: floor.floorFingerprint, wrapperFingerprint: wrapper.wrapperFingerprint, controlRootFingerprint: null }; rootRecord.controlRootFingerprint = recordFingerprint(rootRecord, 'controlRootFingerprint'); await writeAuthority('control-root', rootRecord); await ensureBotRoot(); await releaseBootstrapBlocker(); };
+  const publishEnvelope = async (wrapper) => { const currentAnchor = await anchor(); const currentAnchorFingerprint = fingerprint(encode(currentAnchor)); if (wrapper.anchorFingerprint !== currentAnchorFingerprint) refused('publish_mapping', 'wrapper anchor does not bind this management parent'); const floor = await readerFloor(); await writeAuthority('reader-version-floor', floor); const wrapperName = wrapper.sourceKind === 'legacy-retained' ? 'legacy-retained' : 'managed-v1-wrapper'; await writeAuthority(wrapperName, wrapper); const rootRecord = { version: 1, kind: 'management-control-root', managementStamp: 'gjc-management-control/v1', anchor: currentAnchor, anchorFingerprint: currentAnchorFingerprint, fenceGeneration: wrapper.fenceGeneration, sourceKind: wrapper.sourceKind, wrapperKind: wrapper.kind, wrapperRelativeName: `${wrapperName}.json`, targetRelativeName: 'channels.json', controlRootRelativeName: '.gjc-remote-control', readerVersionFloorFingerprint: floor.floorFingerprint, wrapperFingerprint: wrapper.wrapperFingerprint, controlRootFingerprint: null }; rootRecord.controlRootFingerprint = recordFingerprint(rootRecord, 'controlRootFingerprint'); await writeAuthority('control-root', rootRecord); await ensureBotRoot(); await releaseBootstrapBlocker(); };
   const releaseBootstrapBlocker = async () => {
     if (!bootstrapBlocker) return;
     const { bytes, parentIdentity, identity } = bootstrapBlocker;
@@ -450,10 +523,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         controlRoot.wrapperFingerprint !== currentWrapper.wrapperFingerprint) {
       refused('publish_mapping', 'managed envelope predecessor is invalid');
     }
+    if (snapshot.fenceGeneration !== controlRoot.fenceGeneration + 1) {
+      refused('publish_mapping', 'managed target snapshot fence is not the durable successor');
+    }
     await write(targetPath, snapshot);
-    const target = await targetProof();
+    const target = await targetProof({ expectedFenceGeneration: snapshot.fenceGeneration });
     const wrapper = {
       ...currentWrapper,
+      fenceGeneration: snapshot.fenceGeneration,
       targetState: snapshot.targetState,
       targetIdentity: target.targetIdentity,
       targetAclFingerprint: target.targetAclFingerprint,
@@ -474,6 +551,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       version: 1,
       kind: 'manual-cleanup',
       anchorFingerprint: await anchorFingerprint(),
+      fenceGeneration: value.recovery?.fenceGeneration ?? value.recovery?.records?.transaction?.fenceGeneration ?? tokenFloor?.fenceGeneration ?? request?.fenceGeneration ?? 1,
       txId: value.request?.genesisTxId ?? value.recovery?.txId ?? value.recovery?.records?.transaction?.txId ?? request?.genesisTxId ?? null,
       reason: typeof value.reason === 'string' && value.reason.length > 0 ? value.reason.slice(0, 256) : 'MANUAL_CLEANUP_REQUIRED',
       expectedFingerprint: value.recovery?.requestFingerprint ?? value.recovery?.records?.transaction?.candidateSnapshot?.configFingerprint ?? request?.requestFingerprint ?? null,
@@ -508,6 +586,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       read(path('reader-version-floor')),
       read(path('reader-fence-binding')),
     ]);
+    const activeHead = successorBaseline === null ? null : await read(path('authority-head'));
+    const pendingStatePredecessor = successorBaseline !== null &&
+      activeHead?.phase === 'reader-pending' &&
+      activeHead.txId === txId &&
+      state?.revision === successorRequest?.previousRevision &&
+      state?.authorityEpoch === successorRequest?.previousAuthorityEpoch &&
+      state?.fenceGeneration === successorRequest?.previousFenceGeneration &&
+      state?.tokenConfigGeneration === successorRequest?.previousTokenConfigGeneration &&
+      state?.mappingGeneration === successorRequest?.previousMappingGeneration;
     const baseline = successorBaseline ?? rootBaseline;
     const commit = successorCommit ?? rootCommit;
     if (!baseline || !state || !control || !commit || !attestation || !floor) throw new TypeError('live publication authority is absent');
@@ -531,9 +618,16 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     });
     const baselineGenesisTxId = successorBaseline ? baseline.rootGenesisTxId : baseline.genesisTxId;
     const baselineGeneration = successorBaseline ? baseline.tokenConfigGeneration : baseline.generation;
+    const legacyRetainedEnvelope = successorBaseline !== null &&
+      control.sourceKind === 'legacy-retained' &&
+      baseline.targetState === 'legacy-retained' &&
+      control.fenceGeneration === successorRequest.previousFenceGeneration &&
+      wrapper?.fenceGeneration === successorRequest.previousFenceGeneration &&
+      target.fenceGeneration === successorRequest.previousFenceGeneration;
     if (!envelope.ok || !wrapperProof || control.controlRootFingerprint !== controlProof.value.controlRootFingerprint ||
+        (!pendingStatePredecessor && state.fenceGeneration !== baseline.fenceGeneration) ||
         wrapper.routeDisposition !== 'no-route' || baselineGenesisTxId !== genesisTxId ||
-        baselineGeneration !== transaction.generation || baseline.anchorFingerprint !== commit.anchorFingerprint ||
+        transaction.fenceGeneration !== baseline.fenceGeneration || baseline.anchorFingerprint !== commit.anchorFingerprint ||
         baseline.attestationFingerprint !== attestation.attestationFingerprint ||
         baselineGeneration !== attestation.tokenConfigGeneration ||
         (floor.floorPhase === 'committed' && (
@@ -543,6 +637,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         baseline.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint ||
         control.readerVersionFloorFingerprint !== floor.floorFingerprint ||
         control.anchorFingerprint !== floor.anchorFingerprint ||
+        (!legacyRetainedEnvelope && control.fenceGeneration !== baseline.fenceGeneration) ||
         floor.anchorFingerprint !== baseline.anchorFingerprint ||
         control.sourceKind !== (['legacy-retained', 'legacy-unmigrated'].includes(baseline.targetState) ? 'legacy-retained' : 'managed-v1')) {
       throw new TypeError('live publication authority relation');
@@ -594,7 +689,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const snapshotFingerprint = canonicalJsonHash({ stateFingerprint, payloadFingerprint, targetFingerprint });
     const publicationFingerprint = canonicalJsonHash({ stateFingerprint, payloadFingerprint, snapshotFingerprint, targetFingerprint });
     const checkpointFingerprint = canonicalJsonHash({ genesisTxId, generation: transaction.generation, publicationFingerprint, targetFingerprint });
-    const common = { txId, genesisTxId, generation: transaction.generation };
+    const common = { txId, genesisTxId, generation: transaction.generation, fenceGeneration: baseline.fenceGeneration };
     const expectedTransaction = buildPublicationTransaction({ ...common, baselineFingerprint: baseline.baselineFingerprint });
     const u = buildPublicationU({ ...common, baselineFingerprint: baseline.baselineFingerprint, anchorFingerprint: baseline.anchorFingerprint, targetState: baseline.targetState, attestationFingerprint: baseline.attestationFingerprint, authorityReservationFingerprint: baseline.authorityReservationFingerprint, authorityCommitSnapshotFingerprint: baseline.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: baseline.fenceBindingFingerprint, leaseBindingFingerprint: baseline.leaseBindingFingerprint, readerProjectionFingerprint: baseline.readerProjectionFingerprint, readerInstanceId: baseline.readerInstanceId, readerStartNonce: baseline.readerStartNonce, readerVersion: baseline.readerVersion });
     const p = buildPublicationP({ ...common, uFingerprint: u['publication-uFingerprint'], stateFingerprint, targetState: u.targetState, authorityCommitSnapshotFingerprint: u.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: u.fenceBindingFingerprint, leaseBindingFingerprint: u.leaseBindingFingerprint, readerInstanceId: u.readerInstanceId, readerStartNonce: u.readerStartNonce, readerVersion: u.readerVersion });
@@ -764,6 +859,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const wrapper = control?.wrapperRelativeName && await read(join(root, control.wrapperRelativeName));
     const target = control && await targetProof({ sourceKind: control.sourceKind });
     const authorityEpoch = await read(path('authority-epoch'));
+    const liveFenceGeneration = control?.sourceKind === 'legacy-retained'
+      ? request.previousFenceGeneration
+      : request.candidateFenceGeneration;
     try {
       validateAuthoritySuccessorRequest(request);
       validateAuthoritySuccessorFinality(finality, request);
@@ -778,6 +876,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       validateTokenConfigAttestation(attestation);
       validateTokenFloor(floor);
       if (!target || !wrapper || !Array.isArray(attestationHistory) || !Array.isArray(floorHistory) ||
+          control.fenceGeneration !== liveFenceGeneration ||
+          wrapper.fenceGeneration !== liveFenceGeneration ||
+          target.fenceGeneration !== liveFenceGeneration ||
           canonical(attestationHistory.at(-1)) !== canonical(attestation) ||
           canonical(floorHistory.at(-1)) !== canonical(floor) ||
           finality.attestationFingerprint !== attestation.attestationFingerprint ||
@@ -1018,6 +1119,16 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           refused('write_management_state', 'management state authority epoch is not bound to the durable authority floor');
         }
       }
+      const fenceFloor = await read(path('fence-generation-floor'));
+      if (fenceFloor !== null) {
+        try { validateFenceGenerationFloor(fenceFloor); } catch { refused('write_management_state', 'durable fence generation floor is invalid'); }
+        const expectedFenceGeneration = Math.max(1, fenceFloor.highestCommittedFenceGeneration);
+        if (state?.fenceGeneration !== expectedFenceGeneration) {
+          refused('write_management_state', 'management state fence generation is not bound to the durable fence floor');
+        }
+      } else if (state?.fenceGeneration !== 1) {
+        refused('write_management_state', 'management state fence generation requires the Genesis floor');
+      }
       await assertManagementStateCounters(state);
       const current = await read(path('management-state'));
       if ((current?.revision ?? 0) !== expected) return false;
@@ -1085,7 +1196,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         }
         validateHistoryMarkerHeadRelation(current, head, record);
       } else {
-        if (record.sequence !== 1 || record.previousMarkerFingerprint !== null) {
+        if (record.sequence !== 1 || record.fenceGeneration !== 1 || record.previousMarkerFingerprint !== null) {
           refused('commit_managed_history_marker', 'managed history marker genesis is invalid');
         }
         if (head !== null) {
@@ -1300,16 +1411,17 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       await writeAuthority('reader-fence-binding', record);
       return record;
     },
-    async casReaderVersionFloor({ txId, readerInstanceId, readerStartNonce }) {
+    async casReaderVersionFloor({ txId, readerInstanceId, readerStartNonce, fenceGeneration }) {
       const current = await readerFloor();
       if (current.readerVersionFloor === 2) {
         if (current.firstPendingTxId !== txId || current.firstReaderInstanceId !== readerInstanceId ||
-            current.firstReaderStartNonce !== readerStartNonce) {
+            current.firstReaderStartNonce !== readerStartNonce ||
+            current.fenceGeneration !== fenceGeneration) {
           refused('cas_reader_version_floor', 'reader floor is already bound to another reader');
         }
         return current;
       }
-      const next = advanceReaderVersionFloor(current, { txId, readerInstanceId, readerStartNonce });
+      const next = advanceReaderVersionFloor(current, { txId, readerInstanceId, readerStartNonce, fenceGeneration });
       const existing = await read(path('reader-version-floor'));
       if (existing !== null && canonical(existing) !== canonical(current)) {
         refused('cas_reader_version_floor', 'reader floor CAS predecessor changed');
@@ -1646,9 +1758,89 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return floor;
     },
     async writeGenesisRequest(record) { try { validateGenesisRequest(record); } catch { refused('write_genesis_request', 'exact genesis request is required'); } if (prospectiveProof?.txId !== record.genesisTxId || record.ownerPrincipalFingerprint !== fingerprint(encode(prospectiveProof.managementPrincipal))) refused('write_genesis_request', 'prospective owner proof is invalid'); await writeImmutableAuthority('genesis-request', record); return record; },
+    async readFenceGenerationFloor() {
+      await requireManagementPrincipal('read_fence_generation_floor');
+      const floor = await read(path('fence-generation-floor'));
+      if (floor === null) return null;
+      try { return validateFenceGenerationFloor(floor); } catch { refused('read_fence_generation_floor', 'durable fence generation floor is invalid'); }
+    },
+    async reserveFenceGeneration({ fenceGeneration, txId } = {}) {
+      await requireManagementPrincipal('reserve_fence_generation');
+      await requireGenesisProof();
+      await ensure();
+      if (!Number.isSafeInteger(fenceGeneration) || fenceGeneration < 1 || !isOpaque(txId)) {
+        refused('reserve_fence_generation', 'positive fence generation and transaction identity are required');
+      }
+      const anchorFp = await anchorFingerprint();
+      let floor = await read(path('fence-generation-floor'));
+      try { floor = floor === null ? buildFenceGenerationFloor(anchorFp) : validateFenceGenerationFloor(floor); } catch { refused('reserve_fence_generation', 'durable fence generation floor is invalid'); }
+      if (floor.anchorFingerprint !== anchorFp) refused('reserve_fence_generation', 'fence generation floor anchor is invalid');
+      const replay = floor.highestReservedFenceGeneration === fenceGeneration && floor.lastReservationTxId === txId;
+      if (!replay && (fenceGeneration !== floor.highestReservedFenceGeneration + 1 || fenceGeneration <= floor.highestCommittedFenceGeneration)) {
+        refused('reserve_fence_generation', 'fence generation reservation is not a durable monotonic successor');
+      }
+      if (replay) {
+        const existing = await read(path(`fence-generation-reservation-${encodeURIComponent(txId)}`));
+        if (!existing || canonical(existing) !== canonical(floor)) {
+          refused('reserve_fence_generation', 'fence generation reservation replay is invalid');
+        }
+        return floor;
+      }
+      const observed = await read(path('fence-generation-floor'));
+      if (observed !== null && canonical(observed) !== canonical(floor)) {
+        refused('reserve_fence_generation', 'fence generation floor CAS predecessor changed');
+      }
+      const next = buildFenceGenerationFloor(anchorFp, {
+        ...floor,
+        highestReservedFenceGeneration: fenceGeneration,
+        lastReservationTxId: txId,
+        floorFingerprint: null,
+      });
+      await writeCreateOnceAuthority(`fence-generation-reservation-${encodeURIComponent(txId)}`, next);
+      await writeAuthority('fence-generation-floor', next);
+      return next;
+    },
+    async commitFenceGeneration({ fenceGeneration, txId } = {}) {
+      await requireManagementPrincipal('commit_fence_generation');
+      await requireGenesisProof();
+      await ensure();
+      if (!Number.isSafeInteger(fenceGeneration) || fenceGeneration < 1 || !isOpaque(txId)) {
+        refused('commit_fence_generation', 'positive fence generation and transaction identity are required');
+      }
+      let floor = await read(path('fence-generation-floor'));
+      try { floor = validateFenceGenerationFloor(floor); } catch { refused('commit_fence_generation', 'durable fence generation floor is invalid'); }
+      if (floor.lastReservationTxId !== txId || floor.highestReservedFenceGeneration !== fenceGeneration) {
+        refused('commit_fence_generation', 'fence generation commit is not bound to the reserved floor');
+      }
+      const replay = floor.lastCommittedTxId === txId && floor.highestCommittedFenceGeneration === fenceGeneration;
+      if (replay) {
+        const existing = await read(path(`fence-generation-commit-${encodeURIComponent(txId)}`));
+        if (existing && canonical(existing) === canonical(floor)) return floor;
+        refused('commit_fence_generation', 'fence generation commit replay is invalid');
+      }
+      if (floor.highestCommittedFenceGeneration !== fenceGeneration - 1) {
+        refused('commit_fence_generation', 'fence generation commit is not contiguous');
+      }
+      const observed = await read(path('fence-generation-floor'));
+      if (observed === null || canonical(observed) !== canonical(floor)) {
+        refused('commit_fence_generation', 'fence generation floor CAS predecessor changed');
+      }
+      const next = buildFenceGenerationFloor(floor.anchorFingerprint, {
+        ...floor,
+        highestCommittedFenceGeneration: fenceGeneration,
+        lastCommittedTxId: txId,
+        floorFingerprint: null,
+      });
+      await writeCreateOnceAuthority(`fence-generation-commit-${encodeURIComponent(txId)}`, next);
+      await writeAuthority('fence-generation-floor', next);
+      return next;
+    },
     async commitTokenFloor(value) {
-      const { floor: record, precommit } = value ?? {};
+      const { floor: record, precommit, fenceGeneration } = value ?? {};
       try { validateTokenFloor(record); } catch { refused('commit_token_floor', 'exact committed generation floor is required'); }
+      if (!Number.isSafeInteger(fenceGeneration) || fenceGeneration < 1 || record.fenceGeneration !== fenceGeneration) {
+        refused('commit_token_floor', 'committed generation floor fence is invalid');
+      }
       const prior = await read(path('token-floor'));
       const attestation = await read(path('attestation'));
       const request = await read(path('genesis-request'));
@@ -1725,6 +1917,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       const expected = commitTokenFloor(prior, {
         generation: record.highestReservedGeneration,
+        fenceGeneration: record.fenceGeneration,
         txId: prior.lastReservationTxId,
         attestationFingerprint: attestation.attestationFingerprint,
       });
@@ -2068,8 +2261,17 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const control = await read(path('control-root'));
       const wrapper = control?.wrapperRelativeName ? await read(join(root, control.wrapperRelativeName)) : null;
       if (!control || !wrapper) refused('mapping_target_proof', 'managed envelope proof is absent');
+      const envelope = validateManagementEnvelope(control, wrapper, {
+        targetBytes: target.bytes,
+        targetIdentity: target.targetIdentity,
+        targetAclFingerprint: target.targetAclFingerprint,
+      });
+      if (!envelope.ok || snapshot.fenceGeneration !== target.fenceGeneration) {
+        refused('mapping_target_proof', 'managed envelope fence proof is invalid');
+      }
       return {
         snapshotFingerprint: snapshot.configFingerprint,
+        fenceGeneration: target.fenceGeneration,
         identityFingerprint: target.targetIdentity,
         aclFingerprint: target.targetAclFingerprint,
         snapshot: structuredClone(snapshot),
@@ -2097,9 +2299,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         const state = await read(path('management-state'));
         if (state?.revision !== transaction.expectedRevision ||
             live.snapshotFingerprint !== transaction.oldSnapshot.configFingerprint ||
+            live.fenceGeneration !== transaction.oldSnapshot.fenceGeneration ||
             live.identityFingerprint !== backup.backupIdentityFingerprint ||
             live.aclFingerprint !== backup.backupAclFingerprint) {
-          refused('write_mapping_recovery', 'prepared recovery does not bind the exact verified old target snapshot');
+          refused('write_mapping_recovery', 'prepared recovery does not bind the exact verified old target snapshot and fence');
         }
       }
       const recordsByKind = { tx: transaction, pub: publication, bk: backup, rc: checkpoint };
@@ -2112,7 +2315,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
           typeof record.mappingId !== 'string' || record.mappingId.length === 0 ||
           !Number.isSafeInteger(record.generation) || record.generation < 1 ||
+          !Number.isSafeInteger(record.fenceGeneration) || record.fenceGeneration < 1 ||
           record.mapping?.mappingId !== record.mappingId ||
+          record.mapping?.fenceGeneration !== record.fenceGeneration ||
           record.mapping?.mappingGeneration !== record.generation ||
           !Array.isArray(record.routes) || typeof record.publicationTxId !== 'string') {
         refused('write_mapping_generation', 'exact immutable mapping generation is required');
@@ -2142,6 +2347,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           !['mapping-revoke', 'mapping-rollback'].includes(record.operation) ||
           typeof record.mappingId !== 'string' || record.mappingId.length === 0 ||
           !Number.isSafeInteger(record.mappingGeneration) || record.mappingGeneration < 1 ||
+          !Number.isSafeInteger(record.fenceGeneration) || record.fenceGeneration < 1 ||
           !hex(record.mappingFingerprint) || typeof record.publicationTxId !== 'string' ||
           !hex(record.snapshotFingerprint) || record.routeDisposition !== 'no-route' ||
           !hex(record.tombstoneFingerprint) ||
@@ -2149,7 +2355,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         refused('write_mapping_tombstone', 'exact immutable mapping tombstone is required');
       }
       const generation = await read(path(`mapping-generation-${encodeURIComponent(record.mappingId)}-${record.mappingGeneration}`));
-      if (!generation || generation.mapping?.mappingFingerprint !== record.mappingFingerprint) {
+      if (!generation || generation.fenceGeneration !== record.fenceGeneration || generation.mapping?.mappingFingerprint !== record.mappingFingerprint) {
         refused('write_mapping_tombstone', 'tombstone does not bind an immutable mapping generation');
       }
       await writeCreateOnceAuthority(`mapping-tombstone-${encodeURIComponent(record.mappingId)}`, record);
@@ -2159,6 +2365,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
           record.version !== 1 || record.kind !== 'mapping-handoff-receipt' ||
           !['mapping-reconcile', 'mapping-revoke', 'mapping-rollback', 'mapping-recovery'].includes(record.operation) ||
+          !Number.isSafeInteger(record.fenceGeneration) || record.fenceGeneration < 1 ||
           typeof record.publicationTxId !== 'string' || typeof record.oldMappingId !== 'string' && record.oldMappingId !== null ||
           !Number.isSafeInteger(record.oldMappingGeneration) && record.oldMappingGeneration !== null ||
           typeof record.newMappingId !== 'string' && record.newMappingId !== null ||
@@ -2186,6 +2393,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const snapshot = await read(targetPath);
       try { validateManagementSnapshot(snapshot); } catch { refused('write_mapping_handoff_receipt', 'managed snapshot is invalid'); }
       if (snapshot.configFingerprint !== record.snapshotFingerprint) refused('write_mapping_handoff_receipt', 'handoff snapshot binding is invalid');
+      if (snapshot.fenceGeneration !== record.fenceGeneration) refused('write_mapping_handoff_receipt', 'handoff fence binding is invalid');
       if (record.oldMappingId !== null) {
         const oldGeneration = await read(path(`mapping-generation-${encodeURIComponent(record.oldMappingId)}-${record.oldMappingGeneration}`));
         if (!oldGeneration) refused('write_mapping_handoff_receipt', 'old mapping generation is not durable');
@@ -2258,6 +2466,21 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           attestation.txId !== request.genesisTxId || attestation.tokenConfigGeneration !== request.generation ||
           !controlRoot) fail();
       if (request.requestedReaderMode === 'handshake' && controlRoot.sourceKind === 'legacy-retained') fail();
+      let fenceFloor = await read(path('fence-generation-floor'));
+      try { validateFenceGenerationFloor(fenceFloor); } catch { fail(); }
+      if (fenceFloor.highestCommittedFenceGeneration !== request.fenceGeneration ||
+          fenceFloor.lastCommittedTxId !== request.genesisTxId) {
+        try {
+          fenceFloor = await adapter.commitFenceGeneration({
+            fenceGeneration: request.fenceGeneration,
+            txId: request.genesisTxId,
+          });
+        } catch {
+          fail();
+        }
+      }
+      if (fenceFloor.highestCommittedFenceGeneration !== request.fenceGeneration ||
+          fenceFloor.lastCommittedTxId !== request.genesisTxId) fail();
 
       let committed = await read(path('token-floor'));
       let zFinality = await read(path('z-finality'));
@@ -2291,11 +2514,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (committed.floorPhase === 'attested') {
         const expected = commitTokenFloor(committed, {
           generation: request.generation,
+          fenceGeneration: request.fenceGeneration,
           txId: request.genesisTxId,
           attestationFingerprint: attestation.attestationFingerprint,
         });
         try {
-          committed = await adapter.commitTokenFloor({ floor: expected, precommit });
+          committed = await adapter.commitTokenFloor({ floor: expected, precommit, fenceGeneration: request.fenceGeneration });
         } catch {
           fail();
         }
@@ -2311,6 +2535,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         kind: 'genesis-finality',
         genesisTxId: request.genesisTxId,
         generation: request.generation,
+        fenceGeneration: request.fenceGeneration,
         anchorFingerprint: request.anchorFingerprint,
         attestationFingerprint: attestation.attestationFingerprint,
         tokenFloorFingerprint: committed.floorFingerprint,
@@ -2340,6 +2565,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const authorityReceipt = {
         version: 1, kind: 'genesis-authority-receipt', genesisTxId: request.genesisTxId,
         requestFingerprint: authorityRequest.requestFingerprint, sequence: 2, anchorFingerprint: request.anchorFingerprint,
+        fenceGeneration: request.fenceGeneration,
         generation: request.generation, readerVersionFloorFingerprint: (await read(path('reader-version-floor')))?.floorFingerprint,
         authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint, receiptFingerprint: null,
       };
@@ -2397,7 +2623,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         fail();
       }
       const proof = {
-        version: 1, kind: 'finality-proof', genesisTxId: request.genesisTxId, generation: request.generation,
+        version: 1, kind: 'finality-proof', genesisTxId: request.genesisTxId, fenceGeneration: request.fenceGeneration, generation: request.generation,
         zFinalityFingerprint: zFinality.zFinalityFingerprint,
         readerProjectionFingerprint: projection?.readerProjectionFingerprint ?? null, ackFingerprint: acknowledgement?.ackFingerprint ?? null,
         routeFingerprint: acknowledgement?.routeFingerprint ?? 'no-route', finalityProofFingerprint: null,
@@ -2406,7 +2632,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       try { validateFinalityProof(proof, request, zFinality, acknowledgement, projection?.readerProjectionFingerprint ?? null); } catch { fail(); }
       await exact('rvf', proof);
       const receipt = {
-        version: 1, kind: 'genesis-receipt', genesisTxId: request.genesisTxId, generation: request.generation,
+        version: 1, kind: 'genesis-receipt', genesisTxId: request.genesisTxId, fenceGeneration: request.fenceGeneration, generation: request.generation,
         requestedReaderMode: request.requestedReaderMode, readerInstanceId: request.readerInstanceId, readerStartNonce: request.readerStartNonce,
         readerProjectionFingerprint: projection?.readerProjectionFingerprint ?? null, ackFingerprint: acknowledgement?.ackFingerprint ?? null,
         finalityProofFingerprint: proof.finalityProofFingerprint, phase: 'terminal', receiptFingerprint: null,
@@ -2415,7 +2641,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       try { validateGenesisReceipt(receipt, request, zFinality, proof); } catch { fail(); }
       await exact('receipt', receipt);
       const value = {
-        version: 1, kind: 'genesis-suffix-recovery', txId: request.genesisTxId, requestFingerprint: request.requestFingerprint,
+        version: 1, kind: 'genesis-suffix-recovery', txId: request.genesisTxId, fenceGeneration: request.fenceGeneration, requestFingerprint: request.requestFingerprint,
         finalityFingerprint: proof.finalityProofFingerprint, receiptFingerprint: receipt.receiptFingerprint,
         admissionOpen: false, phase: 'terminal', suffixFingerprint: null,
       };
@@ -2476,7 +2702,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         if (present === null) {
           const attestation = value.attestation;
           if (!attestationValid(attestation)) refused('publish_mapping', 'exact protected-stream attestation is required');
-          await write(targetPath, createGenesisEmptyChannels({ tokenConfigGeneration: attestation.tokenConfigGeneration, tokenConfigHostSetFingerprint: attestation.tokenConfigHostSetFingerprint }));
+          await write(targetPath, createGenesisEmptyChannels({ tokenConfigGeneration: attestation.tokenConfigGeneration, tokenConfigHostSetFingerprint: attestation.tokenConfigHostSetFingerprint, fenceGeneration: 1 }));
           if (!(await Promise.all([
             configuredRoles.managementSid,
             configuredRoles.botSid,
@@ -2485,7 +2711,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
             refused('publish_mapping', 'new managed target is not readable by M/B/R');
           }
           const target = await targetProof();
-          const wrapper = { version: 1, kind: 'managed-v1-wrapper', sourceKind: 'managed-v1', managementStamp: 'gjc-management-envelope/v1', anchorFingerprint: await anchorFingerprint(), targetRelativeName: 'channels.json', targetState: 'genesis-empty', targetIdentity: target.targetIdentity, targetAclFingerprint: target.targetAclFingerprint, semanticStateFingerprint: parseCanonicalJsonBytes(target.bytes).configFingerprint, readerVersion: null, dispatchClass: 'workspace-only', routeDisposition: 'no-route', wrapperSequence: 1, previousWrapperFingerprint: null, wrapperFingerprint: null };
+          const wrapper = { version: 1, kind: 'managed-v1-wrapper', sourceKind: 'managed-v1', managementStamp: 'gjc-management-envelope/v1', anchorFingerprint: await anchorFingerprint(), fenceGeneration: 1, targetRelativeName: 'channels.json', targetState: 'genesis-empty', targetIdentity: target.targetIdentity, targetAclFingerprint: target.targetAclFingerprint, semanticStateFingerprint: parseCanonicalJsonBytes(target.bytes).configFingerprint, readerVersion: null, dispatchClass: 'workspace-only', routeDisposition: 'no-route', wrapperSequence: 1, previousWrapperFingerprint: null, wrapperFingerprint: null };
           wrapper.wrapperFingerprint = recordFingerprint(wrapper, 'wrapperFingerprint');
           await publishEnvelope(wrapper);
           const rootProof = await authorityObjectProof(path('control-root'));
@@ -2507,7 +2733,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           refused('publish_mapping', 'legacy target is not bound to the prospective proof');
         }
         const target = await exactTarget(expectedLegacyTarget);
-        const wrapper = { version: 1, kind: 'legacy-retained-wrapper', sourceKind: 'legacy-retained', managementStamp: 'gjc-management-envelope/v1', anchorFingerprint: await anchorFingerprint(), targetRelativeName: 'channels.json', targetState: 'legacy-unmigrated', rawTargetByteFingerprint: fingerprint(target.bytes), rawTargetByteLength: target.bytes.length, targetIdentity: target.targetIdentity, targetAclFingerprint: target.targetAclFingerprint, readerVersion: null, legacyRetention: 'exact', dispatchClass: 'workspace-only', routeDisposition: 'no-route', retentionTxId: value.request?.genesisTxId, retentionSequence: 1, previousWrapperFingerprint: null, wrapperFingerprint: null };
+        const wrapper = { version: 1, kind: 'legacy-retained-wrapper', sourceKind: 'legacy-retained', managementStamp: 'gjc-management-envelope/v1', anchorFingerprint: await anchorFingerprint(), fenceGeneration: 1, targetRelativeName: 'channels.json', targetState: 'legacy-unmigrated', rawTargetByteFingerprint: fingerprint(target.bytes), rawTargetByteLength: target.bytes.length, targetIdentity: target.targetIdentity, targetAclFingerprint: target.targetAclFingerprint, readerVersion: null, legacyRetention: 'exact', dispatchClass: 'workspace-only', routeDisposition: 'no-route', retentionTxId: value.request?.genesisTxId, retentionSequence: 1, previousWrapperFingerprint: null, wrapperFingerprint: null };
         wrapper.wrapperFingerprint = recordFingerprint(wrapper, 'wrapperFingerprint');
         await publishEnvelope(wrapper);
         await exactTarget(expectedLegacyTarget);
@@ -2541,7 +2767,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           !Number.isSafeInteger(record.generation) || record.generation < 1 ||
           !Number.isSafeInteger(record.revision) || record.revision < 0 ||
           !Number.isSafeInteger(record.authorityEpoch) || record.authorityEpoch < 1 ||
-          !Number.isSafeInteger(record.mappingGeneration) || record.mappingGeneration < 0) {
+          !Number.isSafeInteger(record.mappingGeneration) || record.mappingGeneration < 0 ||
+          !Number.isSafeInteger(record.fenceGeneration) || record.fenceGeneration < 1) {
         refused('rotate_token_sidecar', 'attested host-set generation and exact successor counters are required');
       }
       const controlRoot = await read(path('control-root'));
@@ -2550,11 +2777,38 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         try { validateManagementSnapshot(current); } catch { refused('rotate_token_sidecar', 'managed target is invalid'); }
         if (record.revision <= current.revision ||
             record.authorityEpoch <= current.authorityEpoch ||
-            record.mappingGeneration !== current.mappingGeneration) {
-          refused('rotate_token_sidecar', 'token rotation successor counters are invalid');
+            record.mappingGeneration !== current.mappingGeneration ||
+            record.fenceGeneration !== current.fenceGeneration + 1) {
+          refused('rotate_token_sidecar', 'token rotation successor counters or fence are invalid');
         }
+        const mappings = Object.fromEntries(Object.entries(current.mappings).map(([mappingId, mapping]) => {
+          const next = { ...mapping, fenceGeneration: record.fenceGeneration, mappingFingerprint: null };
+          next.mappingFingerprint = recordFingerprint(next, 'mappingFingerprint');
+          return [mappingId, next];
+        }));
+        const routes = Object.fromEntries(Object.entries(current.routes).map(([channelId, route]) => {
+          const mapping = mappings[route.mappingId];
+          if (!mapping) refused('rotate_token_sidecar', 'managed mapping relation is invalid');
+          const next = {
+            ...route,
+            fenceGeneration: record.fenceGeneration,
+            hostId: mapping.hostId,
+            mappingId: mapping.mappingId,
+            mappingGeneration: mapping.mappingGeneration,
+            mappingVersion: mapping.mappingVersion,
+            sourcePlatform: mapping.sourcePlatform,
+            workspaceId: mapping.workspaceId,
+            workDir: mapping.workDir,
+            routeFingerprint: null,
+          };
+          next.routeFingerprint = recordFingerprint(next, 'routeFingerprint');
+          return [channelId, next];
+        }));
         const snapshot = {
           ...current,
+          mappings,
+          routes,
+          fenceGeneration: record.fenceGeneration,
           revision: record.revision,
           authorityEpoch: record.authorityEpoch,
           mappingGeneration: record.mappingGeneration,
@@ -2595,8 +2849,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (!records || canonical(records.transaction) !== canonical(recovery.records.transaction)) return manual('RECOVERY_RECORD_MISMATCH');
       const live = await this.mappingTargetProof();
       const candidateMatches = live.snapshotFingerprint === records.transaction.candidateSnapshot.configFingerprint &&
+        live.fenceGeneration === records.transaction.candidateSnapshot.fenceGeneration &&
         (records.publication.phase === 'prepared' || (live.identityFingerprint === records.publication.targetIdentityFingerprint && live.aclFingerprint === records.publication.targetAclFingerprint));
       const oldMatches = live.snapshotFingerprint === records.transaction.oldSnapshot.configFingerprint &&
+        live.fenceGeneration === records.transaction.oldSnapshot.fenceGeneration &&
         live.identityFingerprint === records.backup.backupIdentityFingerprint && live.aclFingerprint === records.backup.backupAclFingerprint;
       if (committed && candidateMatches) return { phase: 'terminal', routeDisposition: 'no-route', records: committed };
       if (replaced && candidateMatches) {
@@ -2687,6 +2943,16 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const rootValue = parseCanonicalJsonBytes(rootRecord.bytes);
       const wrapper = await verifiedBytes(join(root, rootValue.wrapperRelativeName));
       const target = await targetProof({ sourceKind: rootValue.sourceKind });
+      const envelope = validateManagementEnvelope(
+        rootValue,
+        parseCanonicalJsonBytes(wrapper.bytes),
+        {
+          targetBytes: target.bytes,
+          targetIdentity: target.targetIdentity,
+          targetAclFingerprint: target.targetAclFingerprint,
+        },
+      );
+      if (!envelope.ok) refused('read_managed_mapping_snapshot', 'managed target envelope proof is invalid');
       const terminalCloseBefore = await lowLevel.read_verified_bytes(path('terminal-close'));
       if (terminalCloseBefore !== null) {
         await assertObject(path('terminal-close'), Buffer.from(terminalCloseBefore));
@@ -2696,6 +2962,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (historyMarker === null) refused('read_managed_mapping_snapshot', 'Genesis history marker is absent');
       validateHistoryMarkerRelation(historyMarker, { anchorFingerprint: rootValue.anchorFingerprint });
       const headBefore = await read(path('authority-head'));
+      if (historyMarker.fenceGeneration !== rootValue.fenceGeneration &&
+          !(headBefore?.phase === 'reader-pending' && historyMarker.fenceGeneration === headBefore.fenceGeneration - 1)) {
+        refused('read_managed_mapping_snapshot', 'Genesis history marker fence does not bind the published root');
+      }
       if (headBefore !== null) {
         try { validateAuthoritySuccessorHead(headBefore); } catch { refused('read_managed_mapping_snapshot', 'successor authority head is invalid'); }
         const tx = encodeURIComponent(headBefore.txId);
@@ -2727,6 +2997,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
             anchorFingerprint: bundle.request.anchorFingerprint,
             sequence: headBefore.phase === 'terminal' ? bundle.request.sequence : bundle.request.sequence - 1,
           });
+          const expectedHistoryMarkerFence = headBefore.phase === 'terminal'
+            ? bundle.request.candidateFenceGeneration
+            : bundle.request.previousFenceGeneration;
+          if (bundle.historyMarker.fenceGeneration !== expectedHistoryMarkerFence) {
+            throw new TypeError('successor history marker fence');
+          }
           if (headBefore.phase === 'terminal' &&
               (bundle.historyMarker.markerFingerprint !== headBefore.historyMarkerFingerprint ||
                (bundle.request.readerMode === 'bound-reader' && (!bundle.lease || !bundle.projection || !bundle.ack)))) {
@@ -3004,13 +3280,18 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async writeAuthoritySuccessorRequest(value) {
       await requireManagementPrincipal('write_authority_successor_request');
       try { validateAuthoritySuccessorRequest(value); } catch { refused('write_authority_successor_request', 'exact successor request is required'); }
-      const [head, marker, floor] = await Promise.all([
-        read(path('authority-head')), rawRead(historyMarkerPath), read(path('reader-version-floor')),
+      const [head, marker, floor, fenceFloor] = await Promise.all([
+        read(path('authority-head')), rawRead(historyMarkerPath), read(path('reader-version-floor')), read(path('fence-generation-floor')),
       ]);
-      try { validateReaderVersionFloor(floor); } catch { refused('write_authority_successor_request', 'committed reader version floor is absent or invalid'); }
+      try { validateReaderVersionFloor(floor); validateFenceGenerationFloor(fenceFloor); } catch { refused('write_authority_successor_request', 'committed reader and fence floors are absent or invalid'); }
+      if (value.previousFenceGeneration !== fenceFloor.highestCommittedFenceGeneration ||
+          value.candidateFenceGeneration !== fenceFloor.highestCommittedFenceGeneration + 1) {
+        refused('write_authority_successor_request', 'successor request fence is not the durable monotonic successor');
+      }
       if ((floor.readerVersionFloor === 2) !== (value.readerMode === 'bound-reader')) {
         refused('write_authority_successor_request', 'successor reader mode does not follow the committed reader floor');
       }
+      if (!marker || marker.fenceGeneration !== value.previousFenceGeneration) refused('write_authority_successor_request', 'successor request predecessor marker fence is invalid');
       if (head === null) {
         validateHistoryMarkerRelation(marker, { anchorFingerprint: value.anchorFingerprint, sequence: 1 });
         if (value.sequence !== 2) refused('write_authority_successor_request', 'Genesis history marker must precede the first successor');
@@ -3218,8 +3499,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const projection = phase >= 4 ? await read(botPath(`successor-reader-projection-${tx}`)) : null;
       const ack = phase >= 4 ? await read(botPath(`successor-ack-${tx}`)) : null;
       const readerFloor = await read(path('reader-version-floor'));
+      const fenceFloor = await read(path('fence-generation-floor'));
       try {
         validateReaderVersionFloor(readerFloor);
+        validateFenceGenerationFloor(fenceFloor);
+        if (request?.candidateFenceGeneration !== fenceFloor.highestReservedFenceGeneration) throw new TypeError('successor fence floor reservation');
         if (phase >= 2 && ((readerFloor.readerVersionFloor === 2) !== (request?.readerMode === 'bound-reader'))) {
           throw new TypeError('successor reader floor branch');
         }
@@ -3271,12 +3555,20 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (!control?.sourceKind || !control.wrapperRelativeName) refused('read_retained_target_proof', 'retained target envelope is absent');
       const wrapper = await read(join(root, control.wrapperRelativeName));
       const target = await targetProof({ sourceKind: control.sourceKind });
+      if (!wrapper || !validateManagementEnvelope(control, wrapper, {
+        targetBytes: target.bytes,
+        targetIdentity: target.targetIdentity,
+        targetAclFingerprint: target.targetAclFingerprint,
+      }).ok) {
+        refused('read_retained_target_proof', 'retained target envelope is absent or not an exact target proof');
+      }
       let snapshot = null;
       if (control.sourceKind === 'managed-v1') {
         try { snapshot = validateManagementSnapshot(parseCanonicalJsonBytes(target.bytes)); } catch { refused('read_retained_target_proof', 'retained managed target is invalid'); }
       }
       return {
         sourceKind: control.sourceKind,
+        fenceGeneration: target.fenceGeneration,
         targetBytes: Buffer.from(target.bytes),
         targetFingerprint: fingerprint(target.bytes),
         identityFingerprint: target.targetIdentity,
@@ -3298,6 +3590,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       }
       const candidate = await this.mappingTargetProof();
       if (candidate.targetFingerprint !== bundle.finality.targetFingerprint ||
+          candidate.fenceGeneration !== bundle.request.candidateFenceGeneration ||
           candidate.identityFingerprint !== bundle.finality.targetIdentityFingerprint ||
           candidate.aclFingerprint !== bundle.finality.targetAclFingerprint ||
           candidate.snapshotFingerprint !== bundle.request.candidateSnapshotFingerprint ||
@@ -3306,6 +3599,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       }
       return {
         predecessorReceiptFingerprint,
+        fenceGeneration: candidate.fenceGeneration,
         predecessorTargetFingerprint: bundle.request.previousTargetFingerprint,
         predecessorWrapperFingerprint: bundle.request.previousWrapperFingerprint,
         predecessorSnapshotFingerprint: bundle.request.previousSnapshotFingerprint,
@@ -3365,6 +3659,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           anchorFingerprint: bundle.request.anchorFingerprint,
           sequence: head.phase === 'terminal' ? bundle.request.sequence : bundle.request.sequence - 1,
         });
+        const expectedHistoryMarkerFence = head.phase === 'terminal'
+          ? bundle.request.candidateFenceGeneration
+          : bundle.request.previousFenceGeneration;
+        if (bundle.historyMarker.fenceGeneration !== expectedHistoryMarkerFence) {
+          throw new TypeError('successor history marker fence');
+        }
         if (head.phase === 'terminal' &&
             (bundle.historyMarker.markerFingerprint !== head.historyMarkerFingerprint ||
              (bundle.request.readerMode === 'bound-reader' && (!bundle.lease || !bundle.projection || !bundle.ack)))) {
