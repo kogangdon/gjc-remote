@@ -489,7 +489,7 @@ test('durable terminal close blocks successor reads, writes, recovery, and publi
     assert.equal(calls.length, writes, `${method} must not invoke a write primitive`);
   }
 });
-test('exact terminal recovery replay is allowed only for the matching authority head', async () => {
+test('terminal replay requires an immutable terminalization suffix, not phase and transaction booleans', async () => {
   const { files, roles, lowLevel, calls } = fake();
   const native = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles });
   const request = records().request;
@@ -530,11 +530,28 @@ test('exact terminal recovery replay is allowed only for the matching authority 
   }, 'headFingerprint');
   files.set('C:\\state\\.gjc-remote-control\\authority-head.json', Buffer.from(canonicalJson(head)));
   files.set('C:\\state\\.gjc-remote-control\\management-state.json', Buffer.from(canonicalJson({
+    revision: 0,
+    authorityEpoch: 0,
+    fenceGeneration: 1,
+    tokenConfigGeneration: 0,
+    mappingGeneration: 0,
     recovery: { phase: 'terminal', txId: head.txId },
   })));
   const before = new Map([...files].map(([name, bytes]) => [name, Buffer.from(bytes)]));
   const writes = calls.length;
-  assert.deepEqual(await native.readAuthoritySuccessorHeadRaw(), head);
+  await assert.rejects(native.readAuthoritySuccessorHeadRaw(), (error) => {
+    assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+    assert.match(error.reason, /no-route/);
+    return true;
+  });
+  await assert.rejects(native.compareAndSwapManagementState(0, {
+    revision: 0,
+    authorityEpoch: 0,
+    fenceGeneration: 1,
+    tokenConfigGeneration: 0,
+    mappingGeneration: 0,
+    recovery: { phase: 'terminal', txId: head.txId },
+  }), /immutable terminal replay evidence/);
   assert.deepEqual(files, before);
   assert.equal(calls.length, writes);
   await assert.rejects(native.writeAuthoritySuccessorReceipt({ txId: 'different' }), /no-route/);
@@ -543,11 +560,11 @@ test('exact terminal recovery replay is allowed only for the matching authority 
   files.set('C:\\state\\.gjc-remote-control\\management-state.json', Buffer.from(canonicalJson({
     recovery: { phase: 'terminalizing', txId: head.txId },
   })));
-  assert.deepEqual(await native.readAuthoritySuccessorHeadRaw(), head);
+  await assert.rejects(native.readAuthoritySuccessorHeadRaw(), /no-route/);
   files.set('C:\\state\\.gjc-remote-control\\management-state.json', Buffer.from(canonicalJson({
     recovery: { phase: 'manual_cleanup', txId: head.txId },
   })));
-  assert.equal(await native.readManagedHistoryMarker(), null);
+  await assert.rejects(native.readManagedHistoryMarker(), /no-route/);
   assert.equal(calls.length, writes);
   await assert.rejects(native.readSuccessorRecovery({ predecessorReceiptFingerprint: 'a'.repeat(64) }), (error) => {
     assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');

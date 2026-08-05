@@ -1097,7 +1097,24 @@ async function terminalMappingSuccessorFixture() {
   assert.equal(successor.ok, true, JSON.stringify(successor));
   return { ...harness, genesisMarker, successor };
 }
-
+async function pendingBoundSuccessorFixture(idempotencyKey = 'reader-pending-recovery') {
+  const harness = await boundReaderRuntime();
+  harness.setPrincipal(owner);
+  const state = await harness.native.readManagementState();
+  const candidate = mappingInput(`${idempotencyKey}-map`);
+  const input = {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey,
+    mappingId: candidate.mapping.mappingId,
+    ...candidate,
+    expectedRevision: state.revision,
+    expectedFingerprint: null,
+  };
+  const started = await harness.runtime.execute('mapping-reconcile', input);
+  assert.equal(started.pending, true, JSON.stringify(started));
+  return { ...harness, input, started };
+}
 function setSuccessorHeadPhase(fixture, phase) {
   const headPath = [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/authority-head.json'));
   const markerPath = [...fixture.files.keys()].find((path) => typeof path === 'string' && path.replaceAll('\\', '/').endsWith('.managed-history.json'));
@@ -1284,7 +1301,7 @@ test('bound and no-reader completion failures after durable writes remain transa
       actorPrincipal: owner, actorSecret: secret, idempotencyKey: 'recoverable-mapping-key',
     });
     assert.equal(noReaderReplay.routeDisposition, 'no-route');
-    assert.equal(noReaderReplay.ok, true, JSON.stringify({ method, noReaderReplay }));
+    assert.equal(noReaderReplay.ok, true, JSON.stringify({ method, noReaderReplay, terminal: JSON.parse(fileEnding(noReader.files, '/terminal-close.json')), state: await noReader.native.readManagementState() }));
     assert.equal(noReaderReplay.idempotent, true);
     assert.equal(noReaderReplay.phase, 'terminal');
   }
@@ -1340,6 +1357,66 @@ test('public recover exactly replays terminal and reader-pending successor heads
   assert.equal(resumed.pending, true);
   assert.equal(resumed.phase, 'reader-pending');
   assert.equal(JSON.parse(fileEnding(pending.files, '/authority-head.json')).phase, 'reader-pending');
+});
+test('public recover turns missing, torn, or phase-drifted reader-pending bundles into durable cleanup', async () => {
+  for (const [kind, mutate] of [
+    ['missing', () => null],
+    ['torn', (bundle) => ({ ...bundle, finality: null })],
+    ['phase-drifted', (bundle) => ({ ...bundle, head: { ...bundle.head, phase: 'replaced' } })],
+  ]) {
+    const fixture = await pendingBoundSuccessorFixture(`reader-pending-${kind}`);
+    const original = fixture.native.readSuccessorBundle.bind(fixture.native);
+    fixture.native.readSuccessorBundle = async (...args) => mutate(await original(...args));
+    const recovered = await new ManagementRuntime({ native: fixture.native }).execute('recover', {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: fixture.input.idempotencyKey,
+    });
+    assert.equal(recovered.ok, false, JSON.stringify({ kind, recovered }));
+    assert.equal(recovered.error, 'MANUAL_CLEANUP_REQUIRED');
+    assert.equal(recovered.routeDisposition, 'no-route');
+    assert.equal(Object.hasOwn(recovered, 'pending'), false);
+    const state = await fixture.native.readManagementState();
+    assert.equal(state.recovery.phase, 'manual_cleanup');
+    assert.equal(state.recovery.routeDisposition, 'no-route');
+    assert.equal(state.recovery.txId, fixture.started.txId);
+    const cleanup = JSON.parse(fileEnding(fixture.files, '/terminal-close.json'));
+    assert.equal(cleanup.txId, fixture.started.txId);
+    assert.equal(cleanup.routeDisposition, 'no-route');
+    assert.equal(cleanup.blockedUntilOwnerAction, true);
+    assert.ok(fileEnding(fixture.files, '/terminal-close.json'));
+  }
+});
+test('cleanup lineage read failure preserves token high-water state with unresolved evidence', async () => {
+  const fixture = await terminalSuccessorFixture();
+  const before = await fixture.native.readManagementState();
+  const floor = structuredClone(before.tokenFloor);
+  const attestation = structuredClone(before.tokenAttestation);
+  const lineageGeneration = before.tokenConfigGeneration;
+  fixture.native.readSuccessorTokenLineage = async () => {
+    throw new Error('TOKEN_LINEAGE_READ_FAILED');
+  };
+  const recovered = await new ManagementRuntime({ native: fixture.native }).execute('recover', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'conflicting-lineage-recovery-key',
+  });
+  assert.equal(recovered.ok, false, JSON.stringify(recovered));
+  assert.equal(recovered.error, 'MANUAL_CLEANUP_REQUIRED');
+  assert.equal(recovered.routeDisposition, 'no-route');
+  const state = await fixture.native.readManagementState();
+  assert.equal(state.recovery.phase, 'manual_cleanup');
+  assert.equal(state.recovery.routeDisposition, 'no-route');
+  assert.deepEqual(state.tokenFloor, floor);
+  assert.deepEqual(state.tokenAttestation, attestation);
+  assert.equal(state.tokenConfigGeneration, lineageGeneration);
+  assert.deepEqual(state.recovery.tokenLineage, {
+    phase: 'unresolved',
+    reason: 'TOKEN_LINEAGE_READ_FAILED',
+    floorFingerprint: floor.floorFingerprint,
+    attestationFingerprint: attestation.attestationFingerprint,
+    generation: lineageGeneration,
+  });
 });
 test('public recover completes an interrupted no-reader successor without reader proof', async () => {
   const fixture = await terminalMappingSuccessorFixture();

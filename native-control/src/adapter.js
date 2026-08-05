@@ -338,32 +338,32 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   const ensure = async () => { const parentIdentity = await verifiedParent(root); await lowLevel.ensure_control_directory(root, ...roleArguments('authority')); await lowLevel.open_no_follow(root); if (!await lowLevel.read_acl(root) || !await lowLevel.verify_exact_role_acl(root, ...roleArguments('authority'))) refused('ensure_control_directory', 'control-root exact role ACL is unreadable'); await assertParent(root, parentIdentity); };
   const ensureBotRoot = async () => { await ensure(); const parentIdentity = await verifiedParent(botRoot); await lowLevel.ensure_control_directory(botRoot, ...roleArguments('bot-state')); await lowLevel.open_no_follow(botRoot); if (!await lowLevel.read_acl(botRoot) || !await lowLevel.verify_exact_role_acl(botRoot, ...roleArguments('bot-state'))) refused('ensure_bot_directory', 'bot-state exact role ACL is unreadable'); await assertParent(botRoot, parentIdentity); };
   const hasPublishedAuthority = async () => (await lowLevel.read_verified_bytes(path('control-root'))) !== null;
-  const terminalReplayMatches = async ({ record = null, kind = null, readReplay = false } = {}) => {
+  const terminalReplayMatches = async ({ record = null, kind = null, readReplay = false, candidateSuffix = null } = {}) => {
     try {
       const state = await rawRead(path('management-state'));
-      const head = await rawRead(path('authority-head'));
-      const phase = state?.recovery?.phase;
-      if (readReplay) {
-        if (!['terminal', 'terminalizing', 'manual_cleanup'].includes(phase)) return false;
-        if (phase === 'manual_cleanup') {
-          if (state.recovery.txId && head?.txId && head.txId !== state.recovery.txId) return false;
-          return true;
-        }
-        if (!state.recovery.txId || head?.txId !== state.recovery.txId) return false;
-        return true;
+      const terminal = await rawRead(path('terminal-close'));
+      if (!state || !terminal) return false;
+      const persistedSuffix = state.recovery?.txId
+        ? await rawRead(path(`terminalization-suffix-${encodeURIComponent(state.recovery.txId)}`))
+        : null;
+      const suffix = candidateSuffix ?? state.recovery?.terminalization ?? persistedSuffix;
+      if (!suffix || !['terminal', 'terminalizing', 'manual_cleanup'].includes(state.recovery?.phase)) return false;
+      validateManualCleanup(terminal);
+      if (persistedSuffix === null || canonical(persistedSuffix) !== canonical(suffix)) return false;
+      if (!await validateTerminalizationBinding({ state, terminal, suffix })) return false;
+      const currentHead = await rawRead(path('authority-head'));
+      if (!currentHead ||
+          (canonical(currentHead) !== canonical(suffix.pendingHead) &&
+           canonical(currentHead) !== canonical(suffix.terminalHead))) return false;
+      if (record !== null) {
+        if (kind === 'receipt' && canonical(record) !== canonical(suffix.receipt)) return false;
+        if (kind === 'marker' && canonical(record) !== canonical(suffix.marker)) return false;
+        if (kind === 'head' && canonical(record) !== canonical(suffix.terminalHead)) return false;
+        if (kind === 'state' && !managementStateTerminalReplayMatches(record, suffix)) return false;
+        if (!['receipt', 'marker', 'head', 'state'].includes(kind)) return false;
+      } else if (!readReplay) {
+        return false;
       }
-      if (!['terminal', 'terminalizing', 'manual_cleanup'].includes(phase) ||
-          !state.recovery.txId || (head?.txId && head.txId !== state.recovery.txId)) return false;
-      const terminalization = state.recovery.terminalization;
-      if (record === null) return phase === 'terminal';
-      if (kind !== 'marker' && record.txId !== state.recovery.txId) return false;
-      if (kind === 'receipt' &&
-          record.receiptFingerprint !== (head?.receiptFingerprint ?? terminalization?.receipt?.receiptFingerprint)) return false;
-      if (kind === 'marker' &&
-          record.markerFingerprint !== (head?.historyMarkerFingerprint ?? terminalization?.marker?.markerFingerprint)) return false;
-      if (kind === 'head' && (record.headFingerprint !==
-          (state.recovery.successorHeadFingerprint ?? terminalization?.terminalHead?.headFingerprint ?? head?.headFingerprint) ||
-          record.phase !== 'terminal')) return false;
       return true;
     } catch {
       return false;
@@ -416,8 +416,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   const read = async (name) => rawRead(name);
   const write = async (name, value, profile = 'authority', requireRequest = true, allowTerminalReplay = false) => {
     const cleanupOperation = profile === 'bot-state' ? 'write_bot_state' : 'write_management_state';
-    const manualCleanupState = name === path('management-state') && value?.recovery?.phase === 'manual_cleanup';
-    if (!manualCleanupState && !allowTerminalReplay) await requireNoTerminalClose(cleanupOperation);
+    if (!allowTerminalReplay) await requireNoTerminalClose(cleanupOperation);
     if (profile === 'bot-state') await requireBotPrincipal('write_bot_state');
     else await requireManagementPrincipal('write_management_state');
     if (requireRequest) await requireAuthorityRequest('write_management_state');
@@ -681,6 +680,139 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     return { marker, seal };
   };
+  const terminalizationKeys = [
+    'version', 'kind', 'phase', 'txId', 'requestFingerprint',
+    'request', 'finality', 'lease', 'projection', 'ack', 'receipt',
+    'marker', 'pendingHead', 'terminalHead', 'finalState', 'suffixFingerprint',
+  ];
+  const validateTerminalizationSuffix = (suffix) => {
+    if (!suffix || Object.getPrototypeOf(suffix) !== Object.prototype ||
+        Object.keys(suffix).length !== terminalizationKeys.length ||
+        !terminalizationKeys.every((key) => Object.hasOwn(suffix, key)) ||
+        suffix.version !== 1 || suffix.kind !== 'authority-successor-terminalization' ||
+        suffix.phase !== 'prepared' || !isOpaque(suffix.txId) || !hex(suffix.requestFingerprint) ||
+        !hex(suffix.suffixFingerprint) || suffix.suffixFingerprint !== recordFingerprint(suffix, 'suffixFingerprint')) {
+      throw new TypeError('terminalization suffix schema');
+    }
+    validateAuthoritySuccessorRequest(suffix.request);
+    validateAuthoritySuccessorFinality(suffix.finality, suffix.request);
+    validateAuthoritySuccessorReceipt(suffix.receipt, suffix.request, suffix.finality, suffix.lease, suffix.projection, suffix.ack);
+    validateHistoryMarkerRelation(suffix.marker, {
+      anchorFingerprint: suffix.request.anchorFingerprint,
+      sequence: suffix.request.sequence,
+    });
+    if (suffix.marker.fenceGeneration !== suffix.request.candidateFenceGeneration ||
+        suffix.pendingHead.phase !== 'reader-pending' ||
+        suffix.terminalHead.phase !== 'terminal') {
+      throw new TypeError('terminalization successor phase');
+    }
+    validateAuthoritySuccessorHeadTransition(suffix.pendingHead, suffix.terminalHead, suffix.request);
+    if (!suffix.finalState || Object.getPrototypeOf(suffix.finalState) !== Object.prototype ||
+        !suffix.finalState.recovery || Object.getPrototypeOf(suffix.finalState.recovery) !== Object.prototype ||
+        suffix.finalState.recovery.phase !== 'terminal' ||
+        suffix.finalState.recovery.txId !== suffix.txId ||
+        suffix.finalState.recovery.successorHeadFingerprint !== suffix.terminalHead.headFingerprint ||
+        suffix.finalState.recovery.finalityFingerprint !== suffix.finality.finalityFingerprint ||
+        suffix.finalState.recovery.fenceGeneration !== suffix.finality.fenceGeneration) {
+      throw new TypeError('terminalization final state relation');
+    }
+    if (suffix.requestFingerprint !== suffix.request.requestFingerprint ||
+        suffix.pendingHead.requestFingerprint !== suffix.request.requestFingerprint ||
+        suffix.terminalHead.requestFingerprint !== suffix.request.requestFingerprint ||
+        suffix.terminalHead.finalityFingerprint !== suffix.finality.finalityFingerprint ||
+        suffix.terminalHead.receiptFingerprint !== suffix.receipt.receiptFingerprint ||
+        suffix.terminalHead.historyMarkerFingerprint !== suffix.marker.markerFingerprint) {
+      throw new TypeError('terminalization immutable record binding');
+    }
+    return suffix;
+  };
+  const managementStateTerminalReplayMatches = (state, suffix) => {
+    const withoutRecovery = (value) => {
+      const clone = structuredClone(value);
+      delete clone.recovery;
+      return clone;
+    };
+    return canonical(withoutRecovery(state)) === canonical(withoutRecovery(suffix.finalState)) &&
+      canonical(state?.recovery) === canonical(suffix.finalState.recovery);
+  };
+  const validateTerminalizationBinding = async ({ state, terminal, suffix }) => {
+    try {
+      validateManualCleanup(terminal);
+      validateTerminalizationSuffix(suffix);
+      if (terminal.anchorFingerprint !== suffix.request.anchorFingerprint ||
+          terminal.txId !== suffix.txId ||
+          terminal.fenceGeneration !== suffix.finality.fenceGeneration ||
+          terminal.expectedFingerprint !== suffix.request.requestFingerprint) return false;
+      const stateSuffix = state.recovery?.terminalization;
+      if (stateSuffix === undefined) {
+        if (!managementStateTerminalReplayMatches(state, suffix)) return false;
+      } else {
+        validateTerminalizationSuffix(stateSuffix);
+        if (stateSuffix.suffixFingerprint !== suffix.suffixFingerprint) return false;
+      }
+      const tx = encodeURIComponent(suffix.txId);
+      const expected = [
+        [`authority-successor-request-${tx}`, suffix.request],
+        [`authority-successor-finality-${tx}`, suffix.finality],
+        [`authority-successor-receipt-${tx}`, suffix.receipt],
+      ];
+      if (suffix.lease !== null) expected.push([`bot-state/successor-lease-${tx}`, suffix.lease]);
+      if (suffix.projection !== null) expected.push([`bot-state/successor-reader-projection-${tx}`, suffix.projection]);
+      if (suffix.ack !== null) expected.push([`bot-state/successor-ack-${tx}`, suffix.ack]);
+      for (const [name, value] of expected) {
+        const durable = await read(path(name));
+        if (durable !== null && canonical(durable) !== canonical(value)) return false;
+      }
+      const currentMarker = (await readSealAwareHistoryMarker()).marker;
+      if (currentMarker !== null &&
+          canonical(currentMarker) !== canonical(suffix.marker) &&
+          (currentMarker.markerFingerprint !== suffix.marker.previousMarkerFingerprint ||
+           currentMarker.sequence !== suffix.marker.sequence - 1 ||
+           currentMarker.anchorFingerprint !== suffix.marker.anchorFingerprint)) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const validateManualCleanupBinding = async (state) => {
+    try {
+      const terminal = await rawRead(path('terminal-close'));
+      validateManualCleanup(terminal);
+      if (terminal.anchorFingerprint !== await anchorFingerprint() ||
+          terminal.routeDisposition !== 'no-route') {
+        return false;
+      }
+      if (terminal.manualCleanupFingerprint !== state?.recovery?.manualCleanupFingerprint) {
+        return false;
+      }
+      if (state.recovery?.terminalization !== undefined) {
+        const suffix = state.recovery.terminalization;
+        try {
+          validateTerminalizationSuffix(suffix);
+        } catch {
+          return false;
+        }
+        if (!await validateTerminalizationBinding({ state, terminal, suffix })) return false;
+        const currentHead = await rawRead(path('authority-head'));
+        if (!currentHead ||
+            (canonical(currentHead) !== canonical(suffix.pendingHead) &&
+             canonical(currentHead) !== canonical(suffix.terminalHead))) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const persistTerminalizationSuffix = async (suffix) => {
+    validateTerminalizationSuffix(suffix);
+    const name = `terminalization-suffix-${encodeURIComponent(suffix.txId)}`;
+    const existing = await read(path(name));
+    if (existing !== null && canonical(existing) !== canonical(suffix)) {
+      refused('terminal_close', 'immutable terminalization suffix conflicts with the durable suffix');
+    }
+    if (existing === null) await writeCreateOnceAuthority(name, suffix, false, true);
+    return suffix;
+  };
   const validatePublishedFloors = ({ authorityEpochFloor, fenceGenerationFloor, authorityEpoch, anchorFingerprint: expectedAnchor, request, head = null }) => {
     try {
       validateAuthorityEpochFloor(authorityEpochFloor);
@@ -788,10 +920,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       version: 1,
       kind: 'manual-cleanup',
       anchorFingerprint: await anchorFingerprint(),
-      fenceGeneration: value.recovery?.fenceGeneration ?? value.recovery?.records?.transaction?.fenceGeneration ?? tokenFloor?.fenceGeneration ?? request?.fenceGeneration ?? 1,
-      txId: value.request?.genesisTxId ?? value.recovery?.txId ?? value.recovery?.records?.transaction?.txId ?? request?.genesisTxId ?? null,
+      fenceGeneration: value.recovery?.terminalization?.finality?.fenceGeneration ?? value.recovery?.fenceGeneration ?? value.recovery?.records?.transaction?.fenceGeneration ?? tokenFloor?.fenceGeneration ?? request?.fenceGeneration ?? 1,
+      txId: value.recovery?.terminalization?.txId ?? value.request?.genesisTxId ?? value.recovery?.txId ?? value.recovery?.records?.transaction?.txId ?? request?.genesisTxId ?? null,
       reason: typeof value.reason === 'string' && value.reason.length > 0 ? value.reason.slice(0, 256) : 'MANUAL_CLEANUP_REQUIRED',
-      expectedFingerprint: value.recovery?.requestFingerprint ?? value.recovery?.records?.transaction?.candidateSnapshot?.configFingerprint ?? request?.requestFingerprint ?? null,
+      expectedFingerprint: value.recovery?.terminalization?.requestFingerprint ?? value.recovery?.requestFingerprint ?? value.recovery?.records?.transaction?.candidateSnapshot?.configFingerprint ?? request?.requestFingerprint ?? null,
       observedFingerprint: null,
       expectedFloorFingerprint: value.recovery?.reservationFingerprint ?? null,
       observedFloorFingerprint: tokenFloor?.floorFingerprint ?? null,
@@ -1395,15 +1527,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         refused('write_management_state', 'manual cleanup state cannot rewind or outrun the durable fence floor');
       }
       if ((current?.revision ?? 0) !== expected) return false;
-      if (manualCleanup) {
-        const terminal = await read(path('terminal-close'));
-        if (terminal?.kind !== 'manual-cleanup' ||
-            terminal.manualCleanupFingerprint !== state.recovery.manualCleanupFingerprint ||
-            terminal.routeDisposition !== 'no-route') {
-          refused('write_management_state', 'manual cleanup state is not bound to the durable terminal close');
-        }
+      if (manualCleanup && !await validateManualCleanupBinding(state)) {
+        refused('write_management_state', 'manual cleanup state is not bound to immutable terminal-close evidence');
       }
-      const terminalReplay = state?.recovery?.phase === 'terminal' && Boolean(state.recovery?.txId);
+      const terminalStateReplay = state?.recovery?.phase === 'terminal' &&
+        await lowLevel.read_verified_bytes(path('terminal-close')) !== null;
+      const terminalReplay = manualCleanup || terminalStateReplay;
+      if (terminalStateReplay && !await terminalReplayMatches({ record: state, kind: 'state' })) {
+        refused('write_management_state', 'terminal management state is not bound to immutable terminal replay evidence');
+      }
       await write(path('management-state'), state, 'authority', !manualCleanup, terminalReplay);
       return true;
     },
@@ -3240,14 +3372,36 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (existing !== null) {
         try { validateManualCleanup(existing); } catch { refused('terminal_close', 'durable terminal-close record is torn or invalid'); }
         const record = await manualCleanupRecord(value);
-        if (canonical(existing) !== canonical(record)) {
-          if (existing.txId !== record.txId || !value?.recovery?.terminalization) refused('terminal_close', 'terminal-close replay conflicts with the durable cleanup record');
-          return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: existing.manualCleanupFingerprint };
+        const suffix = value?.recovery?.terminalization ?? null;
+        if (suffix !== null) validateTerminalizationSuffix(suffix);
+        if (suffix !== null) {
+          const durableSuffix = await read(path(`terminalization-suffix-${encodeURIComponent(suffix.txId)}`));
+          if (durableSuffix !== null && canonical(durableSuffix) !== canonical(suffix)) {
+            refused('terminal_close', 'immutable terminalization suffix conflicts with the durable suffix');
+          }
         }
+        if (canonical(existing) !== canonical(record)) {
+          if (existing.txId !== record.txId || suffix === null ||
+              !await terminalReplayMatches({ candidateSuffix: suffix, readReplay: true })) {
+            refused('terminal_close', 'terminal-close replay conflicts with the durable cleanup record');
+          }
+        } else if (suffix !== null && !await terminalReplayMatches({ candidateSuffix: suffix, readReplay: true })) {
+          refused('terminal_close', 'terminal-close replay conflicts with the immutable terminalization suffix');
+        }
+        if (suffix !== null) await persistTerminalizationSuffix(suffix);
         return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: existing.manualCleanupFingerprint };
       }
       const record = await manualCleanupRecord(value);
+      const suffix = value?.recovery?.terminalization ?? null;
+      if (suffix !== null) validateTerminalizationSuffix(suffix);
+      if (suffix !== null) {
+        const durableSuffix = await read(path(`terminalization-suffix-${encodeURIComponent(suffix.txId)}`));
+        if (durableSuffix !== null && canonical(durableSuffix) !== canonical(suffix)) {
+          refused('terminal_close', 'immutable terminalization suffix conflicts with the durable suffix');
+        }
+      }
       await writeCreateOnceAuthority('terminal-close', record, false);
+      if (suffix !== null) await persistTerminalizationSuffix(suffix);
       return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: record.manualCleanupFingerprint };
     },
     async recoverManagementState(recovery) {

@@ -550,10 +550,24 @@ export class ManagementRuntime {
     }
     if (!current.recovery || current.recovery.phase !== "manual_cleanup") {
       let lineage = null;
+      let lineageReadFailure = null;
       try {
         lineage = validateCommittedTokenLineage(await this.native.readSuccessorTokenLineage());
-      } catch {
+      } catch (error) {
+        lineageReadFailure = safe(error).code;
+      }
+      const currentGeneration = Math.max(
+        Number.isSafeInteger(current.tokenConfigGeneration) ? current.tokenConfigGeneration : 0,
+        Number.isSafeInteger(current.tokenFloor?.highestCommittedGeneration) ? current.tokenFloor.highestCommittedGeneration : 0,
+        Number.isSafeInteger(current.tokenAttestation?.generation) ? current.tokenAttestation.generation : 0,
+      );
+      if (lineage &&
+          (lineage.floor.highestCommittedGeneration < currentGeneration ||
+           (lineage.floor.highestCommittedGeneration === currentGeneration &&
+            ((current.tokenFloor && current.tokenFloor.floorFingerprint !== lineage.floor.floorFingerprint) ||
+             (current.tokenAttestation && current.tokenAttestation.attestationFingerprint !== lineage.attestation.attestationFingerprint))))) {
         lineage = null;
+        lineageReadFailure = "TOKEN_LINEAGE_HIGH_WATER_REGRESSION";
       }
       current.recovery = {
         ...durableRecovery,
@@ -561,6 +575,17 @@ export class ManagementRuntime {
         routeDisposition: "no-route",
         reason,
         manualCleanupFingerprint: terminal.manualCleanupFingerprint ?? null,
+        ...(lineageReadFailure
+          ? {
+            tokenLineage: {
+              phase: "unresolved",
+              reason: lineageReadFailure,
+              floorFingerprint: current.tokenFloor?.floorFingerprint ?? null,
+              attestationFingerprint: current.tokenAttestation?.attestationFingerprint ?? null,
+              generation: current.tokenConfigGeneration,
+            },
+          }
+          : {}),
       };
       current.admission = { phase: "closed", finalityFingerprint: null };
       if (lineage) {
@@ -572,10 +597,6 @@ export class ManagementRuntime {
           attestationFingerprint: lineage.attestation.attestationFingerprint,
           finalityFingerprint: lineage.floor.floorFingerprint,
         };
-      } else {
-        delete current.tokenFloor;
-        current.tokenConfigGeneration = 0;
-        delete current.tokenAttestation;
       }
       const revision = current.revision;
       current.authorityEpoch = (await this.#readAuthorityEpochFloor())?.highestReservedAuthorityEpoch ?? current.authorityEpoch;
@@ -1502,7 +1523,9 @@ export class ManagementRuntime {
     const terminalization = state.recovery?.terminalization;
     if (terminalization?.txId === txId) return this.#resumeTerminalization(state, terminalization);
     const bundle = await this.native.readSuccessorBundle();
-    if (!bundle || bundle.head.txId !== txId || bundle.head.phase !== "reader-pending" || !bundle.lease || !bundle.projection || !bundle.ack) return null;
+    if (!bundle || bundle.head.txId !== txId || bundle.head.phase !== "reader-pending" || !bundle.lease || !bundle.projection || !bundle.ack) {
+      throw new Error("SUCCESSOR_READER_PENDING_BUNDLE_REQUIRED");
+    }
     validateAuthoritySuccessorBundle(bundle);
     if (bundle.request.targetState === "legacy-retained") throw new Error("LEGACY_READER_HANDSHAKE_REFUSED");
     validateReaderVersionFloor(bundle.readerFloor);
@@ -1624,7 +1647,9 @@ export class ManagementRuntime {
     const terminalization = state.recovery?.terminalization;
     if (terminalization?.txId === txId) return this.#resumeTerminalization(state, terminalization);
     const successor = bundle ?? await this.native.readSuccessorBundle();
-    if (!successor || successor.head.txId !== txId || successor.head.phase !== "reader-pending") return null;
+    if (!successor || successor.head.txId !== txId || successor.head.phase !== "reader-pending") {
+      throw new Error("SUCCESSOR_READER_PENDING_BUNDLE_REQUIRED");
+    }
     validateAuthoritySuccessorBundle(successor);
     validateReaderVersionFloor(successor.readerFloor);
     if (!successor.baseline || successor.readerFloor.readerVersionFloor !== null || successor.request.readerMode !== "no-reader" ||
@@ -1773,6 +1798,8 @@ export class ManagementRuntime {
       if (typeof this.native.readSuccessorBundle !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
       bundle = await this.native.readSuccessorBundle();
       if (!bundle || bundle.head.headFingerprint !== head.headFingerprint ||
+          bundle.head.phase !== head.phase ||
+          bundle.head.txId !== head.txId ||
           bundle.request.txId !== txId ||
           bundle.request.actorPrincipalFingerprint !== canonicalJsonHash(actorPrincipal) ||
           bundle.request.idempotencyKey !== input.idempotencyKey ||
@@ -1810,13 +1837,13 @@ export class ManagementRuntime {
     }
     if (head.phase === "reader-pending") {
       if (bundle.request.readerMode === "no-reader") {
-        return (await this.#completeNoReaderSuccessor(state, txId, bundle)) ?? {
-          pending: true, idempotent: true, txId, phase: head.phase, routeDisposition: "no-route",
-        };
+        const completed = await this.#completeNoReaderSuccessor(state, txId, bundle);
+        if (!completed) throw new Error("SUCCESSOR_READER_PENDING_BUNDLE_REQUIRED");
+        return completed;
       }
-      return (await this.#completeBoundSuccessor(state, txId)) ?? {
-        pending: true, idempotent: true, txId, phase: head.phase, routeDisposition: "no-route",
-      };
+      const completed = await this.#completeBoundSuccessor(state, txId);
+      if (!completed) throw new Error("SUCCESSOR_READER_PENDING_BUNDLE_REQUIRED");
+      return completed;
     }
     await this.#manualCleanup(state, "SUCCESSOR_RECOVERY_NATIVE_UNAVAILABLE", recovery);
   }
@@ -2417,6 +2444,7 @@ export class ManagementRuntime {
       bundle = await this.native.readSuccessorBundle();
       if (!bundle ||
           bundle.head.headFingerprint !== head.headFingerprint ||
+          bundle.head.phase !== head.phase ||
           bundle.head.txId !== head.txId ||
           bundle.request.txId !== head.txId ||
           bundle.request.actorPrincipalFingerprint !== canonicalJsonHash(actorPrincipal) ||
@@ -2431,20 +2459,18 @@ export class ManagementRuntime {
       return { idempotent: true, txId: head.txId, phase: "terminal", routeDisposition: "no-route" };
     }
     if (head.phase === "reader-pending") {
-      let completed;
       try {
-        completed = bundle.request.readerMode === "no-reader"
+        const completed = bundle.request.readerMode === "no-reader"
           ? await this.#completeNoReaderSuccessor(state, head.txId, bundle)
           : await this.#completeBoundSuccessor(state, head.txId);
+        if (!completed) throw new Error("SUCCESSOR_READER_PENDING_BUNDLE_REQUIRED");
+        return completed;
       } catch {
         await this.#manualCleanup(state, "SUCCESSOR_RECOVERY_EVIDENCE_INVALID", {
           ...recovery,
           ...(state.recovery?.terminalization ? { terminalization: state.recovery.terminalization } : {}),
         });
       }
-      return completed ?? {
-        pending: true, idempotent: true, txId: head.txId, phase: "reader-pending", routeDisposition: "no-route",
-      };
     }
     await this.#manualCleanup(state, "SUCCESSOR_RECOVERY_UNSUPPORTED_PHASE", recovery);
   }
