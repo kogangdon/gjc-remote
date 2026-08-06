@@ -84,6 +84,9 @@ test("genesis precommit binds upstream prospective, role, and zero-grant proofs 
   const missing = { ...precommit }; delete missing.wrapperFingerprint;
   assert.throws(() => validateGenesisPrecommit(missing));
   assert.throws(() => validateGenesisPrecommit({ ...precommit, precommitFingerprint: hex }));
+  const indexed = { ...precommit, admissionArchiveIds: ["archive-id"], precommitFingerprint: null };
+  indexed.precommitFingerprint = canonicalJsonHash(Object.fromEntries(Object.entries(indexed).filter(([key]) => key !== "precommitFingerprint")));
+  assert.throws(() => validateGenesisPrecommit(indexed), /zero-grant|precommit/);
 });
 test("semantic publication projections bind the approved baseline state instead of predecessor labels", () => {
   const baselineFingerprint = "b".repeat(64);

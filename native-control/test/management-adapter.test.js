@@ -1464,6 +1464,15 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   const beforeDetachedFinality = new Map(files);
   const detachedFinalityWrites = calls.length;
   await assert.rejects(native.writeAuthoritySuccessorFinality(detachedFinality), /finality|epoch/);
+  const archivePath = [...files.keys()].find((name) => normalize(name).endsWith(`/authority-epoch-${request.candidateAuthorityEpoch}-committed.json`));
+  const archiveBytes = files.get(archivePath);
+  files.delete(archivePath);
+  const beforeMissingArchive = new Map(files);
+  const missingArchiveWrites = calls.length;
+  await assert.rejects(native.writeAuthoritySuccessorFinality(finality), /finality|epoch/);
+  assert.deepEqual(files, beforeMissingArchive);
+  assert.equal(calls.length, missingArchiveWrites);
+  files.set(archivePath, archiveBytes);
   assert.deepEqual(files, beforeDetachedFinality);
   assert.equal(calls.length, detachedFinalityWrites);
   await native.writeAuthoritySuccessorFinality(finality);

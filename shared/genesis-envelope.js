@@ -140,7 +140,21 @@ export function validateGenesisRequest(request) {
   return request;
 }
 
-const precommitKeys = ["version", "kind", "genesisTxId", "fenceGeneration", "generation", "genesisProbeFingerprint", "targetFingerprint", "targetIdentityFingerprint", "targetAclFingerprint", "controlRootFingerprint", "controlIdentityFingerprint", "controlAclFingerprint", "wrapperIdentityFingerprint", "wrapperAclFingerprint", "wrapperFingerprint", "readerVersionFloorFingerprint", "requestFingerprint", "reservationFingerprint", "attestedProofFingerprint", "authorityReservationFingerprint", "authorityCommitSnapshotFingerprint", "authorityEpochFingerprint", "publicationKFingerprint", "publicationYFingerprint", "zeroGrantProofFingerprint", "admissionState", "admissionClosed", "admissionDrained", "outstandingAdmissionGrants", "admissionGrantWrites", "admissionAckWrites", "routeDisposition", "precommitFingerprint"];
+const precommitKeys = ["version", "kind", "genesisTxId", "fenceGeneration", "generation", "genesisProbeFingerprint", "targetFingerprint", "targetIdentityFingerprint", "targetAclFingerprint", "controlRootFingerprint", "controlIdentityFingerprint", "controlAclFingerprint", "wrapperIdentityFingerprint", "wrapperAclFingerprint", "wrapperFingerprint", "readerVersionFloorFingerprint", "requestFingerprint", "reservationFingerprint", "attestedProofFingerprint", "authorityReservationFingerprint", "authorityCommitSnapshotFingerprint", "authorityEpochFingerprint", "publicationKFingerprint", "publicationYFingerprint", "zeroGrantProofFingerprint", "admissionArchiveIds", "admissionState", "admissionClosed", "admissionDrained", "outstandingAdmissionGrants", "admissionGrantWrites", "admissionAckWrites", "routeDisposition", "precommitFingerprint"];
+const precommitFingerprintKeys = ["genesisProbeFingerprint", "targetFingerprint", "targetIdentityFingerprint", "targetAclFingerprint", "controlRootFingerprint", "controlIdentityFingerprint", "controlAclFingerprint", "wrapperIdentityFingerprint", "wrapperAclFingerprint", "wrapperFingerprint", "readerVersionFloorFingerprint", "requestFingerprint", "reservationFingerprint", "attestedProofFingerprint", "authorityReservationFingerprint", "authorityCommitSnapshotFingerprint", "authorityEpochFingerprint", "publicationKFingerprint", "publicationYFingerprint", "zeroGrantProofFingerprint"];
+const sortedOpaqueIds = (value) => Array.isArray(value) && value.every(isOpaqueIdentity) && value.every((id, index) => index === 0 || value[index - 1] < id);
+export function buildGenesisZeroGrantProofFingerprint({ genesisTxId, admissionArchiveIds = [] }) {
+  if (!isOpaqueIdentity(genesisTxId) || !sortedOpaqueIds(admissionArchiveIds)) fail("zero-grant archive index");
+  return canonicalJsonHash({
+    admissionClosed: true,
+    admissionDrained: true,
+    admissionGrantWrites: 0,
+    admissionAckWrites: 0,
+    outstandingAdmissionGrants: 0,
+    admissionArchiveIds,
+    txId: genesisTxId,
+  });
+}
 export function buildGenesisPrecommit({
   fenceGeneration,
   genesisTxId,
@@ -165,6 +179,7 @@ export function buildGenesisPrecommit({
   publicationKFingerprint,
   publicationYFingerprint,
   zeroGrantProofFingerprint,
+  admissionArchiveIds = [],
 }) {
   const precommit = {
     version: 1,
@@ -191,7 +206,8 @@ export function buildGenesisPrecommit({
     authorityEpochFingerprint,
     publicationKFingerprint,
     publicationYFingerprint,
-    zeroGrantProofFingerprint,
+    zeroGrantProofFingerprint: buildGenesisZeroGrantProofFingerprint({ genesisTxId, admissionArchiveIds }),
+    admissionArchiveIds,
     admissionState: "closed-drained-zero-grants",
     admissionClosed: true,
     admissionDrained: true,
@@ -209,6 +225,8 @@ export function validateGenesisPrecommit(precommit) {
       precommit.kind !== "genesis-precommit-proof" ||
       !isOpaqueIdentity(precommit.genesisTxId) ||
       !Number.isSafeInteger(precommit.generation) || precommit.generation < 1 ||
+      !precommit.admissionArchiveIds ||
+      !sortedOpaqueIds(precommit.admissionArchiveIds) ||
       precommit.admissionState !== "closed-drained-zero-grants" ||
       precommit.admissionClosed !== true || precommit.admissionDrained !== true ||
       precommit.outstandingAdmissionGrants !== 0 || precommit.admissionGrantWrites !== 0 ||
@@ -216,7 +234,11 @@ export function validateGenesisPrecommit(precommit) {
     fail("precommit schema");
   }
   assertFence(precommit, 1);
-  for (const key of precommitKeys.slice(5, 25)) if (!isHex64(precommit[key])) fail(`${key} fingerprint`);
+  for (const key of precommitFingerprintKeys) if (!isHex64(precommit[key])) fail(`${key} fingerprint`);
+  if (precommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
+    genesisTxId: precommit.genesisTxId,
+    admissionArchiveIds: precommit.admissionArchiveIds,
+  })) fail("zero-grant proof fingerprint");
   if (!isHex64(precommit.precommitFingerprint) ||
       hash(precommit, "precommitFingerprint") !== precommit.precommitFingerprint) {
     fail("precommit fingerprint");

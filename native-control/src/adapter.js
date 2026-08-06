@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isPrincipal } from '@gjc-remote/shared/identity';
 import { basename as pathBasename, dirname as pathDirname, join as pathJoin, sep as pathSep, win32 as win32Path } from 'node:path';
-import { advanceReaderVersionFloor, buildAttestedTokenFloorProof, commitTokenFloor, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from '@gjc-remote/shared/genesis-envelope';
+import { advanceReaderVersionFloor, buildAttestedTokenFloorProof, buildGenesisZeroGrantProofFingerprint, commitTokenFloor, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from '@gjc-remote/shared/genesis-envelope';
 import { createGenesisEmptyChannels, isLegacyRetainedWrapper, isManagedV1Wrapper, validateManagedMappingRecord, validateManagedRouteRecord, validateManagedChannelsV2, validateManagementEnvelope } from '@gjc-remote/shared/mapping-envelope';
 import { buildMappingRecoveryRecords, validateManualCleanup, validateMappingRecoveryRecords } from '@gjc-remote/shared/recovery-envelope';
 import { canCleanGenesisScratch, fingerprintGenesisProbe, transitionGenesisProspectiveProbe, validateGenesisProspectiveProbe } from '@gjc-remote/shared/genesis-probe';
@@ -630,34 +630,29 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const readerHandshake = managementState?.recovery?.readerHandshake ?? null;
     if (request.requestedReaderMode === 'no-reader') {
       const precommit = await read(path(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`));
-      const zeroGrantProofFingerprint = canonicalJsonHash({
-        admissionClosed: true,
-        admissionDrained: true,
-        admissionGrantWrites: 0,
-        admissionAckWrites: 0,
-        outstandingAdmissionGrants: 0,
-        txId: request.genesisTxId,
-      });
       try {
         validateGenesisPrecommit(precommit);
         if (precommit.genesisTxId !== request.genesisTxId ||
-            precommit.zeroGrantProofFingerprint !== zeroGrantProofFingerprint) {
+            precommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
+              genesisTxId: request.genesisTxId,
+              admissionArchiveIds: precommit.admissionArchiveIds,
+            })) {
           throw new TypeError('no-reader admission absence proof mismatch');
         }
       } catch {
         throw new TypeError('no-reader admission absence proof is absent or invalid');
       }
+      if (managementState?.admissionArchiveIds !== undefined &&
+          (!Array.isArray(managementState.admissionArchiveIds) ||
+           !managementState.admissionArchiveIds.every(isOpaque) ||
+           canonical(managementState.admissionArchiveIds) !== canonical(precommit.admissionArchiveIds))) {
+        throw new TypeError('no-reader admission archive index is not bound to Genesis proof');
+      }
       // The native primitive set has no directory enumeration. The immutable
       // Genesis zero-grant proof is the durable absence/index boundary; only
-      // archive names reachable from validated graph IDs can be checked here.
-      const reachableArchiveIds = new Set([request.genesisTxId]);
-      const indexedArchiveIds = managementState?.admissionArchiveIds;
-      if (indexedArchiveIds !== undefined) {
-        if (!Array.isArray(indexedArchiveIds) || !indexedArchiveIds.every(isOpaque)) {
-          throw new TypeError('no-reader admission archive index is invalid');
-        }
-        for (const id of indexedArchiveIds) reachableArchiveIds.add(id);
-      }
+      // archive names reachable from its cryptographically bound inventory can
+      // be checked here.
+      const reachableArchiveIds = new Set([request.genesisTxId, ...precommit.admissionArchiveIds]);
       for (const id of reachableArchiveIds) {
         const names = [
           path(`admission-request-${encodeURIComponent(id)}`),
@@ -1927,13 +1922,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         (control.fenceGeneration === 1 ? wrapper?.previousWrapperFingerprint === null : hex(wrapper?.previousWrapperFingerprint));
       if (!envelope.ok || !controlProof || !wrapperProof || !legacyChainOriginValid ||
           request.requestFingerprint !== precommit.requestFingerprint ||
-          precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
-            admissionClosed: true,
-            admissionDrained: true,
-            admissionGrantWrites: 0,
-            admissionAckWrites: 0,
-            outstandingAdmissionGrants: 0,
-            txId: request.genesisTxId,
+          precommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
+            genesisTxId: request.genesisTxId,
+            admissionArchiveIds: precommit.admissionArchiveIds,
           }) ||
           canonical(precommit) !== canonical(archivedPrecommit) ||
           reservation.floorFingerprint !== precommit.reservationFingerprint ||
@@ -2055,6 +2046,22 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       validateAuthoritySuccessorFinality(finality, request, null, null, null, null, genesisAuthorityRequest);
       validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack, genesisAuthorityRequest);
+      const historyEvidence = await readSealAwareHistoryMarker(operation);
+      const expectedHistorySequence = head.phase === 'terminal' ? head.sequence : head.sequence - 1;
+      validateHistoryMarkerRelation(historyEvidence.marker, {
+        anchorFingerprint: request.anchorFingerprint,
+        sequence: expectedHistorySequence,
+      });
+      validateHistoryMarkerSeal(
+        historyEvidence.seal,
+        request.anchorFingerprint,
+        historyEvidence.marker,
+        historyEvidence.predecessors,
+      );
+      if (historyEvidence.marker.fenceGeneration !==
+          (head.phase === 'terminal' ? head.fenceGeneration : request.previousFenceGeneration)) {
+        throw new TypeError('successor history marker fence');
+      }
       if (head.phase === 'terminal' && head.receiptFingerprint !== receipt.receiptFingerprint) {
         throw new TypeError('successor head receipt binding');
       }
@@ -4948,13 +4955,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         });
         validateGenesisPrecommit(precommit);
         if (request.requestedReaderMode === 'no-reader' &&
-            precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
-              admissionClosed: true,
-              admissionDrained: true,
-              admissionGrantWrites: 0,
-              admissionAckWrites: 0,
-              outstandingAdmissionGrants: 0,
-              txId: request.genesisTxId,
+            precommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
+              genesisTxId: request.genesisTxId,
+              admissionArchiveIds: precommit.admissionArchiveIds,
             })) throw new Error('invalid zero-grant proof');
         validateGenesisRequest(request);
         if (!zFinality || zFinality.kind !== 'genesis-finality') throw new Error('invalid finality');
@@ -6275,7 +6278,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       await requireNoTerminalClose('write_authority_successor_finality');
       await requireManagementPrincipal('write_authority_successor_finality');
       const tx = encodeURIComponent(value?.txId ?? '');
-      const [request, baseline, close, fence, reservation, commit, authorityEpoch] = await Promise.all([
+      const [request, baseline, close, fence, reservation, commit, authorityEpoch, authorityEpochArchive] = await Promise.all([
         read(path(`authority-successor-request-${tx}`)),
         read(path(`authority-successor-baseline-${tx}`)),
         read(path(`authority-close-proof-${tx}`)),
@@ -6283,6 +6286,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         read(path(`authority-reservation-${tx}`)),
         read(path(`authority-commit-${tx}`)),
         read(path('authority-epoch')),
+        read(path(`authority-epoch-${encodeURIComponent(value?.authorityEpoch ?? '')}-committed`)),
       ]);
       const genesisAuthorityRequest = await requireSuccessorGenesisAuthority('write_authority_successor_finality', value);
       try {
@@ -6293,6 +6297,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit, genesisAuthorityRequest);
         validateAuthoritySuccessorBaseline(baseline, request, close, fence, reservation, commit, genesisAuthorityRequest);
         validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+        validateAuthorityEpoch(authorityEpochArchive, request, reservation, commit);
+        if (authorityEpoch === null || authorityEpochArchive === null ||
+            canonical(authorityEpochArchive) !== canonical(authorityEpoch)) {
+          throw new TypeError('successor authority epoch archive pair');
+        }
         validateAuthoritySuccessorFinality(value, request, baseline, reservation, commit, authorityEpoch, genesisAuthorityRequest);
       } catch {
         refused('write_authority_successor_finality', 'exact successor finality is required');

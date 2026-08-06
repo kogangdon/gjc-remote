@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { createManagementNative } from "@gjc-remote/native-control";
 import { buildAdmissionAck, validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGenesisBinding, validateAdmissionGrant, validateAdmissionRequest, validateAdmissionRecordPair, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
-import { authorityRecordFingerprint, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
+import { buildGenesisZeroGrantProofFingerprint, authorityRecordFingerprint, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
 import { isOpaqueIdentity } from "@gjc-remote/shared/identity";
 import { validateManagedChannelsV2, validateManagementEnvelope } from "@gjc-remote/shared/mapping-envelope";
 import { validateManualCleanup } from "@gjc-remote/shared/recovery-envelope";
@@ -766,13 +766,9 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
       authorityReceipt.readerVersionFloorFingerprint !== readerFloor.floorFingerprint ||
       precommit.reservationFingerprint !== reservation.floorFingerprint ||
       precommit.attestedProofFingerprint !== attestedProof.attestedProofFingerprint ||
-      precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
-        admissionClosed: true,
-        admissionDrained: true,
-        admissionGrantWrites: 0,
-        admissionAckWrites: 0,
-        outstandingAdmissionGrants: 0,
-        txId: request.genesisTxId,
+      precommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
+        genesisTxId: request.genesisTxId,
+        admissionArchiveIds: precommit.admissionArchiveIds,
       }) ||
       precommit.authorityReservationFingerprint !== authorityReservation.reservationFingerprint ||
       precommit.authorityCommitSnapshotFingerprint !== authorityCommit.authorityCommitSnapshotFingerprint ||
@@ -1007,13 +1003,9 @@ export async function createManagedAuthorityReader({
         precommit.genesisTxId !== request.genesisTxId ||
         precommit.generation !== request.generation ||
         precommit.requestFingerprint !== request.requestFingerprint ||
-        precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
-          admissionClosed: true,
-          admissionDrained: true,
-          admissionGrantWrites: 0,
-          admissionAckWrites: 0,
-          outstandingAdmissionGrants: 0,
-          txId: request.genesisTxId,
+        precommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
+          genesisTxId: request.genesisTxId,
+          admissionArchiveIds: precommit.admissionArchiveIds,
         }) ||
         precommit.authorityReservationFingerprint !== authorityReservation.reservationFingerprint ||
         precommit.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint ||

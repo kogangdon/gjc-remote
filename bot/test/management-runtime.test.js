@@ -2102,6 +2102,24 @@ test('no-reader finality rejects reachable admission identifiers from durable st
   );
   assert.equal(harness.writes.length, writes);
 });
+test('unbound management-state archive IDs cannot satisfy no-reader absence proof', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=unbound-archive-index'))).ok, true);
+  const statePath = filePathEnding(harness.files, '/management-state.json');
+  const state = JSON.parse(harness.files.get(statePath));
+  state.admissionArchiveIds = ['unbound-archive-id'];
+  harness.files.set(statePath, Buffer.from(canonicalJson(state)));
+  const root = filePathEnding(harness.files, '/genesis-request.json').replace(/genesis-request\.json$/, '');
+  harness.files.set(`${root}admission-request-unbound-archive-id.json`, Buffer.from('{}'));
+  const proof = JSON.parse(fileEnding(harness.files, '/rvf.json'));
+  const writes = harness.writes.length;
+  await assert.rejects(
+    harness.native.writeFinalityProof(proof),
+    /complete bound-reader finality graph is invalid|archive index|no-reader/i,
+  );
+  assert.equal(harness.writes.length, writes);
+});
 test('managed successor snapshot carries sequence-three history predecessors and committed epoch archive', async () => {
   const harness = adapter({ legacy: false });
   const runtime = new ManagementRuntime({ native: harness.native });

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { assertStrictText, canonicalJsonHash } from "@gjc-remote/shared/strict-json";
 import { isPrincipal } from "@gjc-remote/shared/identity";
 import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord } from "@gjc-remote/shared/mapping-envelope";
-import { attestTokenFloor, authorityRecordFingerprint, advanceReaderVersionFloor, buildAttestedTokenFloorProof, buildGenesisPrecommit, commitTokenFloor, reserveTokenGeneration, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisRequest, validateGenesisReceipt, validateReaderProjection, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
+import { attestTokenFloor, authorityRecordFingerprint, advanceReaderVersionFloor, buildAttestedTokenFloorProof, buildGenesisPrecommit, buildGenesisZeroGrantProofFingerprint, commitTokenFloor, reserveTokenGeneration, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisRequest, validateGenesisReceipt, validateReaderProjection, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
 import { addCredential, authenticate, bootstrapOwner, revokeCredential, rotateCredential, requireOwner } from "./management-auth.js";
 import { buildAdmissionGrant, buildAdmissionRequest, validateAdmissionAck, validateAdmissionGenesisBinding, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
 import { validateGenesisSuffixRecovery } from "@gjc-remote/shared/recovery-envelope";
@@ -1241,13 +1241,9 @@ export class ManagementRuntime {
           authorityEpochFingerprint: committedAuthorityEpoch.authorityEpochFingerprint,
           publicationKFingerprint: graph.k["publication-kFingerprint"],
           publicationYFingerprint: graph.y["publication-yFingerprint"],
-          zeroGrantProofFingerprint: canonicalJsonHash({
-            admissionClosed: true,
-            admissionDrained: true,
-            admissionGrantWrites: 0,
-            admissionAckWrites: 0,
-            outstandingAdmissionGrants: 0,
-            txId,
+          zeroGrantProofFingerprint: buildGenesisZeroGrantProofFingerprint({
+            genesisTxId: txId,
+            admissionArchiveIds: [],
           }),
         });
         await this.native.commitAuthorityEpoch(committedAuthorityEpoch, precommit);
@@ -2098,6 +2094,7 @@ export class ManagementRuntime {
       : state.tokenAttestation?.attestationFingerprint ?? canonicalJsonHash({ genesis: state.genesis.txId });
     let predecessorReceiptFingerprint = state.genesis.finalityFingerprint;
     let predecessorHeadFingerprint = null;
+    let terminalPredecessorTuple = null;
     if (existing === null) validateManagedHistoryMarker(historyMarker, anchorFingerprint, 1);
     if (existing?.phase === "terminal") {
       if (typeof this.native.readSuccessorBundle !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
@@ -2109,6 +2106,15 @@ export class ManagementRuntime {
       }
       validateAuthoritySuccessorBundle(terminalBundle);
       predecessorReceiptFingerprint = terminalBundle.receipt.receiptFingerprint;
+      terminalPredecessorTuple = {
+        snapshotFingerprint: terminalBundle.receipt.snapshotFingerprint,
+        targetFingerprint: terminalBundle.finality.targetFingerprint,
+        wrapperFingerprint: terminalBundle.finality.wrapperFingerprint,
+      };
+      if (terminalPredecessorTuple.targetFingerprint !== predecessor.targetFingerprint ||
+          terminalPredecessorTuple.wrapperFingerprint !== predecessor.wrapperFingerprint) {
+        throw new Error("SUCCESSOR_TERMINAL_PREDECESSOR_TUPLE_INVALID");
+      }
       predecessorHeadFingerprint = existing.headFingerprint;
       validateManagedHistoryMarker(terminalBundle.historyMarker, anchorFingerprint, existing.sequence);
       validateReaderVersionFloor(terminalBundle.readerFloor);
@@ -2123,7 +2129,8 @@ export class ManagementRuntime {
       idempotencyKey: input.idempotencyKey, operation, anchorFingerprint,
       actorPrincipalFingerprint: canonicalJsonHash(actorPrincipal),
       previousReceiptFingerprint: predecessorReceiptFingerprint,
-      previousTargetFingerprint: predecessor.targetFingerprint, previousWrapperFingerprint: predecessor.wrapperFingerprint,
+      previousTargetFingerprint: terminalPredecessorTuple?.targetFingerprint ?? predecessor.targetFingerprint,
+      previousWrapperFingerprint: terminalPredecessorTuple?.wrapperFingerprint ?? predecessor.wrapperFingerprint,
       previousRevision: state.revision, candidateRevision: state.revision + 1,
       previousAuthorityEpoch: state.authorityEpoch, candidateAuthorityEpoch,
       previousTokenConfigGeneration: state.tokenConfigGeneration,
@@ -2132,7 +2139,7 @@ export class ManagementRuntime {
       candidateAttestationFingerprint,
       previousMappingGeneration: state.mappingGeneration,
       candidateMappingGeneration: state.mappingGeneration + (operation === "tokens-attest" ? 0 : 1),
-      previousSnapshotFingerprint: predecessor.snapshotFingerprint,
+      previousSnapshotFingerprint: terminalPredecessorTuple?.snapshotFingerprint ?? predecessor.snapshotFingerprint,
       candidateSnapshotFingerprint,
       candidateTargetFingerprint,
       previousFenceGeneration,
