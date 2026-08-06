@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <limits>
 #include <initializer_list>
 
@@ -24,6 +25,8 @@
 #include <unistd.h>
 #include <sys/acl.h>
 #include <acl/libacl.h>
+#include <grp.h>
+#include <pwd.h>
 #endif
 
 namespace {
@@ -367,6 +370,19 @@ bool RenameWindowsRelative(HANDLE object, HANDLE parent, const std::wstring& nam
   }
   return true;
 }
+bool VerifyWindowsNamedIdentity(HANDLE parent, const std::wstring& name,
+                                const BY_HANDLE_FILE_INFORMATION& expected) {
+  HANDLE handle = OpenWindowsRelative(parent, name, FILE_READ_ATTRIBUTES, kFileOpen,
+      VerifiedObjectType::File);
+  if (handle == INVALID_HANDLE_VALUE) return false;
+  BY_HANDLE_FILE_INFORMATION actual{};
+  const bool same = GetFileInformationByHandle(handle, &actual) &&
+      actual.dwVolumeSerialNumber == expected.dwVolumeSerialNumber &&
+      actual.nFileIndexHigh == expected.nFileIndexHigh &&
+      actual.nFileIndexLow == expected.nFileIndexLow;
+  CloseHandle(handle);
+  return same;
+}
 enum class RoleProfile { Authority, ManagementAuth, BotState, ProspectiveCleanup };
 
 bool ParseRoleProfile(const std::string& value, RoleProfile* result) {
@@ -466,6 +482,49 @@ bool ApplyExactRoleAcl(HANDLE handle, const std::string& manager,
       DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
       nullptr, nullptr, roles.acl, nullptr) != ERROR_SUCCESS) return false;
   return VerifyExactRoleAcl(handle, manager, bot, reader, system, profile);
+}
+bool VerifyNoGroupMutationAcl(HANDLE handle) {
+  PACL dacl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                      &dacl, nullptr, &descriptor) != ERROR_SUCCESS) return false;
+  SECURITY_DESCRIPTOR_CONTROL control = 0;
+  DWORD revision = 0;
+  ACL_SIZE_INFORMATION size{};
+  bool valid = descriptor != nullptr &&
+      GetSecurityDescriptorControl(descriptor, &control, &revision) &&
+      (control & SE_DACL_PROTECTED) != 0 && dacl != nullptr &&
+      GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation) &&
+      size.AceCount == 4;
+  for (DWORD index = 0; valid && index < size.AceCount; ++index) {
+    void* raw = nullptr;
+    if (!GetAce(dacl, index, &raw)) { valid = false; break; }
+    ACE_HEADER* header = static_cast<ACE_HEADER*>(raw);
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE ||
+        (header->AceFlags & INHERITED_ACE) != 0) { valid = false; break; }
+    ACCESS_ALLOWED_ACE* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
+    PSID sid = reinterpret_cast<PSID>(&ace->SidStart);
+    if (!IsValidSid(sid)) { valid = false; break; }
+    DWORD name_length = 0, domain_length = 0;
+    SID_NAME_USE use = SidTypeUnknown;
+    LookupAccountSidW(nullptr, sid, nullptr, &name_length, nullptr, &domain_length, &use);
+    const DWORD lookup_error = GetLastError();
+    if (lookup_error == ERROR_NONE_MAPPED || lookup_error == ERROR_TRUSTED_RELATIONSHIP_FAILURE) {
+      continue;
+    }
+    if (lookup_error != ERROR_INSUFFICIENT_BUFFER ||
+        name_length == 0 || domain_length == 0) { valid = false; break; }
+    std::vector<wchar_t> account(name_length);
+    std::vector<wchar_t> domain(domain_length);
+    if (!LookupAccountSidW(nullptr, sid, account.data(), &name_length, domain.data(),
+                           &domain_length, &use) ||
+        use == SidTypeGroup || use == SidTypeAlias || use == SidTypeWellKnownGroup) {
+      valid = false;
+      break;
+    }
+  }
+  LocalFree(descriptor);
+  return valid;
 }
 
 HANDLE CreateProtectedFileNoFollow(const std::string& path, DWORD access, PACL acl) {
@@ -664,6 +723,29 @@ bool VerifyExactRoleAcl(int fd, const std::string& manager, const std::string& b
   for (size_t i = 0; i < 4; ++i) if (static_cast<ssize_t>(i) != owner_role && !seen[i]) ok = false;
   return ok && seen_user_object && seen_group && seen_mask && seen_other && count == 7;
 }
+bool PrincipalGroups(uid_t principal, std::vector<gid_t>* groups) {
+  struct passwd record{};
+  struct passwd* result = nullptr;
+  std::vector<char> buffer(4096);
+  for (;;) {
+    const int error = getpwuid_r(principal, &record, buffer.data(), buffer.size(), &result);
+    if (error == 0 && result != nullptr) break;
+    if (error != ERANGE || buffer.size() >= 1024 * 1024) return false;
+    buffer.resize(buffer.size() * 2);
+  }
+  int count = 16;
+  for (;;) {
+    groups->resize(static_cast<size_t>(count));
+    int capacity = count;
+    if (getgrouplist(record.pw_name, record.pw_gid, groups->data(), &capacity) >= 0) {
+      groups->resize(static_cast<size_t>(capacity));
+      return true;
+    }
+    if (capacity <= count || capacity > 65536) return false;
+    count = capacity;
+  }
+}
+
 bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   struct stat st{};
   if (fstat(fd, &st) != 0 || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) return false;
@@ -672,11 +754,12 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
     if (acl) acl_free(acl);
     return false;
   }
-  mode_t selected = 0;
-  mode_t mask = 0;
-  bool selected_match = false;
+  mode_t owner_bits = 0, named_user_bits = 0, group_object_bits = 0;
+  mode_t named_group_bits = 0, other_bits = 0, mask = 0;
+  bool selected_named_user = false;
   bool seen_user_object = false, seen_group_object = false, seen_other = false, seen_mask = false;
   bool has_named_entries = false;
+  std::vector<gid_t> named_groups;
   acl_entry_t entry;
   int state = ACL_FIRST_ENTRY;
   int entry_result = 0;
@@ -696,28 +779,35 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
     if (tag == ACL_USER_OBJ) {
       if (seen_user_object) { acl_free(acl); return false; }
       seen_user_object = true;
-      if (principal == st.st_uid) { selected = bits(); selected_match = true; }
+      owner_bits = bits();
     } else if (tag == ACL_USER) {
       has_named_entries = true;
       uid_t* qualifier = static_cast<uid_t*>(acl_get_qualifier(entry));
       if (!qualifier) { acl_free(acl); return false; }
       if (principal != st.st_uid && *qualifier == principal) {
-        if (selected_match) { acl_free(qualifier); acl_free(acl); return false; }
-        selected = bits();
-        selected_match = true;
+        if (selected_named_user) { acl_free(qualifier); acl_free(acl); return false; }
+        named_user_bits = bits();
+        selected_named_user = true;
       }
       acl_free(qualifier);
     } else if (tag == ACL_GROUP_OBJ) {
       if (seen_group_object) { acl_free(acl); return false; }
       seen_group_object = true;
+      group_object_bits = bits();
     } else if (tag == ACL_GROUP) {
       has_named_entries = true;
+      gid_t* qualifier = static_cast<gid_t*>(acl_get_qualifier(entry));
+      if (!qualifier) { acl_free(acl); return false; }
+      named_groups.push_back(*qualifier);
+      named_group_bits |= bits();
+      acl_free(qualifier);
     } else if (tag == ACL_MASK) {
       if (seen_mask) { acl_free(acl); return false; }
       mask = bits();
       seen_mask = true;
     } else if (tag == ACL_OTHER) {
       if (seen_other) { acl_free(acl); return false; }
+      other_bits = bits();
       seen_other = true;
     } else {
       acl_free(acl);
@@ -726,9 +816,24 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   }
   acl_free(acl);
   if (entry_result != 0 || !seen_user_object || !seen_group_object || !seen_other ||
-      (has_named_entries && !seen_mask) || !selected_match) return false;
-  if (principal != st.st_uid) selected &= mask;
-  return (selected & requested) == requested;
+      (has_named_entries && !seen_mask)) return false;
+  if (!seen_mask) mask = S_IRUSR | S_IWUSR | S_IXUSR;
+  if (principal == st.st_uid) return (owner_bits & requested) == requested;
+  if (selected_named_user) return ((named_user_bits & mask) & requested) == requested;
+
+  std::vector<gid_t> principal_groups;
+  if (!PrincipalGroups(principal, &principal_groups)) return false;
+  bool group_match = false;
+  for (gid_t group : principal_groups) {
+    if (group == st.st_gid) { group_match = true; break; }
+    for (gid_t named : named_groups) {
+      if (group == named) { group_match = true; break; }
+    }
+    if (group_match) break;
+  }
+  const mode_t effective_group = (group_object_bits | named_group_bits) & mask;
+  if (group_match) return (effective_group & requested) == requested;
+  return (other_bits & requested) == requested;
 }
 
 bool ApplyAndVerifyExactRoleAcl(int fd, const std::string& manager, const std::string& bot,
@@ -1304,8 +1409,12 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     temporary = INVALID_HANDLE_VALUE;
     return durable;
   };
-  const bool prepared = VerifyExactRoleAcl(temporary, manager, bot, reader, system, profile) &&
-      WriteHandleBytes(temporary, bytes);
+  BY_HANDLE_FILE_INFORMATION temporary_info{};
+  const bool owned = GetFileInformationByHandle(temporary, &temporary_info) != FALSE;
+  const bool prepared = owned &&
+      VerifyExactRoleAcl(temporary, manager, bot, reader, system, profile) &&
+      WriteHandleBytes(temporary, bytes) &&
+      GetFileInformationByHandle(temporary, &temporary_info) != FALSE;
   if (!prepared) {
     const bool clean = discard();
     CloseHandle(parent);
@@ -1321,28 +1430,110 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "atomic no-replace publication failed");
     return nullptr;
   }
-  const bool durable = FlushDirectoryOrVolumePath(path);
-  const bool verified = VerifyExactRoleAcl(temporary, manager, bot, reader, system, profile);
+  HANDLE published = OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL,
+      kFileOpen, VerifiedObjectType::File);
+  BY_HANDLE_FILE_INFORMATION published_info{};
+  const bool verified = published != INVALID_HANDLE_VALUE &&
+      GetFileInformationByHandle(published, &published_info) &&
+      published_info.dwVolumeSerialNumber == temporary_info.dwVolumeSerialNumber &&
+      published_info.nFileIndexHigh == temporary_info.nFileIndexHigh &&
+      published_info.nFileIndexLow == temporary_info.nFileIndexLow &&
+      VerifyExactRoleAcl(published, manager, bot, reader, system, profile) &&
+      GetFileInformationByHandle(temporary, &temporary_info) &&
+      temporary_info.dwVolumeSerialNumber == published_info.dwVolumeSerialNumber &&
+      temporary_info.nFileIndexHigh == published_info.nFileIndexHigh &&
+      temporary_info.nFileIndexLow == published_info.nFileIndexLow;
+  const bool durable = verified && FlushFileBuffers(published) &&
+      FlushDirectoryOrVolumePath(path);
+  if (published != INVALID_HANDLE_VALUE) CloseHandle(published);
   CloseHandle(temporary);
+  temporary = INVALID_HANDLE_VALUE;
   CloseHandle(parent);
-  if (!durable || !verified) {
-    Throw(env, "ERR_NATIVE_CONTROL_CREATE", "published absent-file durability or DACL verification failed");
+  if (!durable) {
+    Throw(env, "ERR_NATIVE_CONTROL_CREATE", "published absent-file durability, identity, or DACL verification failed");
     return nullptr;
   }
   napi_value result; napi_get_undefined(env, &result); return result;
 #else
   RoleProfile profile; int parent_fd; std::string name;
-  if (!ParseRoleProfile(profile_text, &profile) || !OpenParentNoFollow(path, &parent_fd, &name)) { Refuse(env, "create_absent_exclusive", "role profile or descriptor-relative path is invalid"); return nullptr; }
-  const std::string temporary = "." + name + ".create." + std::to_string(getpid());
-  int fd = openat(parent_fd, temporary.c_str(), O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
-  bool ok = fd >= 0 && ApplyAndVerifyExactRoleAcl(fd, manager, bot, reader, system, profile) && WriteHandleBytes(fd, bytes);
-  if (fd >= 0) close(fd);
-  if (ok) ok = linkat(parent_fd, temporary.c_str(), parent_fd, name.c_str(), 0) == 0;
-  if (ok) ok = fsync(parent_fd) == 0;
-  const bool removed = unlinkat(parent_fd, temporary.c_str(), 0) == 0;
-  if (removed) ok = ok && fsync(parent_fd) == 0;
+  if (!ParseRoleProfile(profile_text, &profile) || !OpenParentNoFollow(path, &parent_fd, &name)) {
+    Refuse(env, "create_absent_exclusive", "role profile or descriptor-relative path is invalid");
+    return nullptr;
+  }
+  static std::atomic<unsigned long long> sequence{0};
+  const std::string temporary = "." + name + ".create." + std::to_string(getpid()) + "." +
+      std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+  int fd = OpenObjectNoFollow(parent_fd, temporary, O_CREAT | O_EXCL | O_RDWR);
+  if (fd < 0) {
+    const int open_error = errno;
+    close(parent_fd);
+    if (open_error == EEXIST) {
+      Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to create unique absent-file temporary");
+    } else {
+      Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to open absent-file temporary");
+    }
+    return nullptr;
+  }
+  struct stat held{};
+  const bool owned = fstat(fd, &held) == 0 && S_ISREG(held.st_mode);
+  const auto same_identity = [&](const char* entry_name) {
+    struct stat named{};
+    return owned && fstatat(parent_fd, entry_name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+        named.st_dev == held.st_dev && named.st_ino == held.st_ino;
+  };
+  const auto discard = [&]() {
+    const bool removed = same_identity(temporary.c_str()) &&
+        unlinkat(parent_fd, temporary.c_str(), 0) == 0;
+    const bool durable = removed && fsync(parent_fd) == 0;
+    bool absent = false;
+    if (removed) {
+      struct stat after{};
+      errno = 0;
+      absent = fstatat(parent_fd, temporary.c_str(), &after, AT_SYMLINK_NOFOLLOW) != 0 &&
+          errno == ENOENT;
+    }
+    close(fd);
+    fd = -1;
+    return durable && absent;
+  };
+  if (!owned || !ApplyAndVerifyExactRoleAcl(fd, manager, bot, reader, system, profile) ||
+      !WriteHandleBytes(fd, bytes) || !same_identity(temporary.c_str())) {
+    const bool clean = discard();
+    close(parent_fd);
+    if (!clean) Refuse(env, "create_absent_exclusive", "failed temporary cleanup is ambiguous");
+    else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to prepare protected absent file");
+    return nullptr;
+  }
+#ifdef AT_EMPTY_PATH
+  const bool linked = linkat(fd, "", parent_fd, name.c_str(), AT_EMPTY_PATH) == 0;
+#else
+  const bool linked = same_identity(temporary.c_str()) &&
+      linkat(parent_fd, temporary.c_str(), parent_fd, name.c_str(), 0) == 0;
+#endif
+  struct stat published{};
+  const bool publication_verified = linked &&
+      fstatat(parent_fd, name.c_str(), &published, AT_SYMLINK_NOFOLLOW) == 0 &&
+      published.st_dev == held.st_dev && published.st_ino == held.st_ino;
+  if (!publication_verified || fsync(parent_fd) != 0) {
+    const bool clean = discard();
+    close(parent_fd);
+    if (!clean) Refuse(env, "create_absent_exclusive", "failed absent-file publication cleanup is ambiguous");
+    else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to atomically publish durable exact-ACL absent file");
+    return nullptr;
+  }
+  const bool removed = same_identity(temporary.c_str()) &&
+      unlinkat(parent_fd, temporary.c_str(), 0) == 0;
+  struct stat after_publish{};
+  const bool destination_stable = removed &&
+      fstatat(parent_fd, name.c_str(), &after_publish, AT_SYMLINK_NOFOLLOW) == 0 &&
+      after_publish.st_dev == held.st_dev && after_publish.st_ino == held.st_ino &&
+      fsync(parent_fd) == 0;
+  close(fd);
   close(parent_fd);
-  if (!ok || !removed) { Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to atomically publish durable exact-ACL absent file"); return nullptr; }
+  if (!removed || !destination_stable) {
+    Refuse(env, "create_absent_exclusive", "published absent-file identity changed during cleanup");
+    return nullptr;
+  }
   napi_value result; napi_get_undefined(env, &result); return result;
 #endif
 }
@@ -1465,6 +1656,13 @@ napi_value ReplaceExistingAtomic(napi_env env, napi_callback_info info) {
     Refuse(env, "replace_existing_atomic", "replacement source, destination, or parent is not verified");
     return nullptr;
   }
+  if (!VerifyWindowsNamedIdentity(source_parent, source_name, source_info) ||
+      !VerifyWindowsNamedIdentity(destination_parent, destination_name, destination_info)) {
+    close_objects();
+    close_parents();
+    Refuse(env, "replace_existing_atomic", "replacement source or destination changed before publication");
+    return nullptr;
+  }
   if (!RenameWindowsRelative(source_handle, source_parent, destination_name, true)) {
     close_objects();
     close_parents();
@@ -1517,12 +1715,23 @@ napi_value ReplaceExistingAtomic(napi_env env, napi_callback_info info) {
       destination_stat.st_dev == destination_named.st_dev && destination_stat.st_ino == destination_named.st_ino &&
       VerifyExactRoleAcl(source_fd, manager, bot, reader, system, profile) &&
       VerifyExactRoleAcl(destination_fd, manager, bot, reader, system, profile);
-  const bool replaced = retained &&
+  struct stat source_before{}, destination_before{};
+  const bool verified_before_rename = retained &&
+      fstatat(source_parent, source_name.c_str(), &source_before, AT_SYMLINK_NOFOLLOW) == 0 &&
+      fstatat(destination_parent, destination_name.c_str(), &destination_before, AT_SYMLINK_NOFOLLOW) == 0 &&
+      source_before.st_dev == source_stat.st_dev && source_before.st_ino == source_stat.st_ino &&
+      destination_before.st_dev == destination_stat.st_dev &&
+      destination_before.st_ino == destination_stat.st_ino;
+  const bool replaced = verified_before_rename &&
       renameat(source_parent, source_name.c_str(), destination_parent, destination_name.c_str()) == 0;
   int replaced_fd = replaced ? OpenObjectNoFollow(destination_parent, destination_name, O_RDONLY) : -1;
-  struct stat replaced_stat{}, replaced_named{};
+  struct stat replaced_stat{}, replaced_named{}, source_after{};
+  errno = 0;
+  const bool source_absent = replaced &&
+      fstatat(source_parent, source_name.c_str(), &source_after, AT_SYMLINK_NOFOLLOW) != 0 &&
+      errno == ENOENT;
   const bool durable =
-      replaced_fd >= 0 &&
+      replaced_fd >= 0 && source_absent &&
       fstat(replaced_fd, &replaced_stat) == 0 &&
       fstatat(destination_parent, destination_name.c_str(), &replaced_named, AT_SYMLINK_NOFOLLOW) == 0 &&
       replaced_stat.st_dev == source_stat.st_dev && replaced_stat.st_ino == source_stat.st_ino &&
@@ -1733,6 +1942,7 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
     Throw(env, "ERR_NATIVE_CONTROL_PROBE", "unable to read target DACL");
     return nullptr;
   }
+  const bool no_group_acl = VerifyNoGroupMutationAcl(handle);
   ACCESS_MASK desired_access = FILE_GENERIC_READ;
   BY_HANDLE_FILE_INFORMATION metadata{};
   if (mode == "write") {
@@ -1764,7 +1974,8 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
       reply.ResultListLength = 1;
       reply.GrantedAccessMask = &granted;
       reply.Error = &access_error;
-      allowed = AuthzAccessCheck(0, context, &request, nullptr, descriptor, nullptr, 0, &reply, nullptr) &&
+      allowed = no_group_acl &&
+          AuthzAccessCheck(0, context, &request, nullptr, descriptor, nullptr, 0, &reply, nullptr) &&
           access_error == ERROR_SUCCESS && (granted & request.DesiredAccess) == request.DesiredAccess;
     }
   }

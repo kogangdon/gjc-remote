@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, symlinkSync } from "node:fs";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { basename, join } from "node:path";
@@ -143,4 +143,54 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+test("POSIX principal access honors ACL_OTHER when no group entry matches", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("POSIX ACL probe is Linux-only");
+    return;
+  }
+  if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
+    t.skip("verified native addon is not built for this checkout");
+    return;
+  }
+  const addonBytes = readFileSync(addonUrl);
+  const manifest = JSON.parse(readFileSync(manifestUrl, "utf8"));
+  const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
+  if (!validateBuildManifest(manifest, packageJson, addonBytes, "linux", process.arch)) {
+    t.skip("native build belongs to a different platform or architecture");
+    return;
+  }
+  const addon = require(fileURLToPath(addonUrl));
+  const currentUid = Number(String(addon.current_os_principal().value).replace(/^uid:/, ""));
+  const currentGid = typeof process.getgid === "function" ? process.getgid() : null;
+  const candidate = readFileSync("/etc/passwd", "utf8").split("\n")
+    .map((line) => line.split(":"))
+    .find((fields) => fields.length > 3 && Number.isInteger(Number(fields[2])) &&
+      Number(fields[2]) !== currentUid && (currentGid === null || Number(fields[3]) !== currentGid));
+  if (!candidate) {
+    t.skip("no distinct local POSIX principal is available");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "gjc-native-acl-"));
+  const target = join(root, "acl-other.txt");
+  try {
+    await writeFile(target, Buffer.from("acl-other"));
+    await chmod(target, 0o644);
+    const principal = `uid:${candidate[2]}`;
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "read"), true);
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("native source contains fail-closed ACL and publication guards", () => {
+  const source = readFileSync(fileURLToPath(new URL("../src/addon.cc", import.meta.url)), "utf8");
+  assert.match(source, /bool PrincipalGroups\(uid_t principal/);
+  assert.match(source, /ACL_GROUP_OBJ/);
+  assert.match(source, /ACL_OTHER/);
+  assert.match(source, /AT_EMPTY_PATH/);
+  assert.match(source, /bool VerifyNoGroupMutationAcl\(HANDLE handle\)/);
+  assert.match(source, /bool VerifyWindowsNamedIdentity\(HANDLE parent/);
+  assert.match(source, /published_info\.nFileIndexHigh == temporary_info\.nFileIndexHigh/);
+  assert.match(source, /source_absent/);
 });
