@@ -307,20 +307,43 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (expectedParent && !sameIdentity(currentParent, expectedParent)) {
       refused(operation, 'config parent identity changed');
     }
-    if (prospectiveProof?.probe?.parentIdentity &&
-        identityFingerprint(currentParent) !== prospectiveProof.probe.parentIdentity) {
-      refused(operation, 'config parent identity changed since prospective proof');
+    let mutationProof = prospectiveProof;
+    if (!mutationProof) {
+      const authorityPath = path('genesis-authority-request');
+      const bytes = await lowLevel.read_verified_bytes(authorityPath);
+      if (bytes === null) refused(operation, 'durable Genesis parent mutation proof is absent');
+      let request;
+      try {
+        await assertObject(authorityPath, Buffer.from(bytes));
+        request = parseCanonicalJsonBytes(Buffer.from(bytes));
+        validateGenesisAuthorityRequest(request);
+      } catch {
+        refused(operation, 'durable Genesis parent mutation proof is invalid');
+      }
+      if (!Object.hasOwn(request, 'parentIdentityFingerprint') ||
+          request.anchorFingerprint !== await anchorFingerprint()) {
+        refused(operation, 'durable Genesis parent mutation proof is absent');
+      }
+      mutationProof = {
+        targetPrincipal: request.targetPrincipal,
+        parentIdentityFingerprint: request.parentIdentityFingerprint,
+        parentAclFingerprint: request.parentAclFingerprint,
+      };
+    }
+    if (mutationProof.parentIdentityFingerprint &&
+        identityFingerprint(currentParent) !== mutationProof.parentIdentityFingerprint) {
+      refused(operation, 'config parent identity changed since Genesis parent proof');
     }
     const identity = await assertConfigParentOwner(operation);
     const acl = await lowLevel.read_acl(parent);
     if (acl === null || acl === undefined || acl === '') {
       refused(operation, 'actual config parent DACL is unreadable');
     }
-    if (prospectiveProof?.parentAclFingerprint &&
-        fingerprint(Buffer.from(String(acl))) !== prospectiveProof.parentAclFingerprint) {
-      refused(operation, 'actual config parent DACL changed since prospective proof');
+    if (mutationProof.parentAclFingerprint &&
+        fingerprint(Buffer.from(String(acl))) !== mutationProof.parentAclFingerprint) {
+      refused(operation, 'actual config parent DACL changed since Genesis parent proof');
     }
-    const targetPrincipal = prospectiveProof?.targetPrincipal;
+    const targetPrincipal = mutationProof.targetPrincipal;
     const principals = [
       [targetPrincipal, false],
       [{ kind: roleKind, value: configuredRoles?.managementSid }, true],
@@ -807,6 +830,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const tx = encodeURIComponent(suffix?.txId ?? '');
     const [
       request, close, fence, baseline, reservation, commit, authorityEpoch,
+      authorityEpochFloor, fenceGenerationFloor, attestation, tokenFloor,
+      attestationHistory, tokenFloorHistory, genesisAttestation, genesisTokenFloor,
       publicationK, publicationY, finality, lease, projection, ack, receipt, head,
     ] = await Promise.all([
       read(path(`authority-successor-request-${tx}`)),
@@ -816,6 +841,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       read(path(`authority-reservation-${tx}`)),
       read(path(`authority-commit-${tx}`)),
       read(path('authority-epoch')),
+      read(path('authority-epoch-floor')),
+      read(path('fence-generation-floor')),
+      read(path('attestation')),
+      read(path('token-floor')),
+      read(path('attestation-history')),
+      read(path('token-floor-history')),
+      read(path(`attestation-${encodeURIComponent(suffix?.request?.rootGenesisTxId ?? '')}`)),
+      read(path(`token-floor-commit-${encodeURIComponent(suffix?.request?.rootGenesisTxId ?? '')}`)),
       read(path(`publication-k-${tx}`)),
       read(path(`publication-y-${tx}`)),
       read(path(`authority-successor-finality-${tx}`)),
@@ -847,6 +880,23 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           canonical(committedEpoch) !== canonical(authorityEpoch)) {
         throw new TypeError('terminal successor committed epoch substitution');
       }
+      validatePublishedFloors({
+        authorityEpochFloor,
+        fenceGenerationFloor,
+        authorityEpoch,
+        anchorFingerprint: request.anchorFingerprint,
+        request,
+        head,
+      });
+      validateTokenHistory({
+        anchorFingerprint: request.anchorFingerprint,
+        attestationHistory,
+        tokenFloorHistory,
+        currentAttestation: attestation,
+        currentTokenFloor: tokenFloor,
+        genesisAttestation,
+        genesisTokenFloor,
+      });
       validateAuthoritySuccessorHead(head, request, genesisAuthorityRequest);
       if (canonical(request) !== canonical(suffix.request) ||
           canonical(finality) !== canonical(suffix.finality) ||
@@ -1003,6 +1053,13 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   };
   const persistTerminalizationSuffix = async (suffix, genesisAuthorityRequest = null) => {
     validateTerminalizationSuffix(suffix, genesisAuthorityRequest);
+    const receiptName = path(`authority-successor-receipt-${encodeURIComponent(suffix.txId)}`);
+    const lineage = await readTerminalizationLineage({
+      suffix,
+      allowMissingName: receiptName,
+      genesisAuthorityRequest,
+    });
+    if (!lineage) refused('terminal_close', 'terminalization lineage is incomplete or not bound to durable token and authority floors');
     const name = `terminalization-suffix-${encodeURIComponent(suffix.txId)}`;
     const existing = await read(path(name));
     if (existing !== null && canonical(existing) !== canonical(suffix)) {
@@ -1904,7 +1961,18 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         record.targetFingerprint === (tuple.legacyTargetProof?.rawTargetByteFingerprint ?? null) &&
         record.targetIdentityFingerprint === (tuple.legacyTargetProof ? fingerprint(encode(tuple.legacyTargetProof.targetIdentity)) : null) &&
         record.targetAclFingerprint === (tuple.legacyTargetProof?.targetAclFingerprint ?? null) &&
-        record.legacyTargetProofFingerprint === (tuple.legacyTargetProof ? fingerprint(encode(tuple.legacyTargetProof)) : null));
+        record.legacyTargetProofFingerprint === (tuple.legacyTargetProof ? fingerprint(encode(tuple.legacyTargetProof)) : null) &&
+        (!Object.hasOwn(record, 'parentIdentityFingerprint') ||
+          (record.parentIdentityFingerprint === prospectiveProof.parentIdentityFingerprint &&
+           record.parentAclFingerprint === prospectiveProof.parentAclFingerprint &&
+           canonical(record.targetPrincipal) === canonical(prospectiveProof.targetPrincipal) &&
+           record.parentMutationProofFingerprint === canonicalJsonHash({
+             version: 1,
+             kind: 'genesis-parent-mutation-proof',
+             parentIdentityFingerprint: record.parentIdentityFingerprint,
+             parentAclFingerprint: record.parentAclFingerprint,
+             targetPrincipal: record.targetPrincipal,
+           }))));
       if (!tupleMatches) refused('write_genesis_authority_request', 'live prospective security tuple does not bind the request');
       const existing = await rawRead(path('genesis-authority-request'));
       if (existing !== null) {
@@ -2412,10 +2480,19 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       prospectiveProof = {
         txId, targetPrincipal, managementPrincipal, botPrincipal, recoveryPrincipal,
         managementProvisioningFingerprint, botProvisioningFingerprint, recoveryProvisioningFingerprint,
+        parentIdentityFingerprint: identityFingerprint(parentIdentity),
         parentAclFingerprint: fingerprint(Buffer.from(String(parentAcl))),
         legacyTargetProof, securityTuple, probe,
       };
-      return { targetInputState: targetBytes === null ? 'absent' : 'legacy-unmigrated', legacyTargetProof, genesisSecurityTuple: securityTuple, probe };
+      return {
+        targetInputState: targetBytes === null ? 'absent' : 'legacy-unmigrated',
+        legacyTargetProof,
+        parentIdentityFingerprint: identityFingerprint(parentIdentity),
+        parentAclFingerprint: fingerprint(Buffer.from(String(parentAcl))),
+        targetPrincipal: structuredClone(targetPrincipal),
+        genesisSecurityTuple: securityTuple,
+        probe,
+      };
     },
     async reserveTokenFloor(record) { await requireAuthorityRequest('reserve_token_floor'); if (Object.hasOwn(record ?? {}, 'tokenBytes') || !reservationValid(record)) refused('reserve_token_floor', 'exact secret-free generation reservation is required'); const published = await hasPublishedAuthority(); const request = published ? null : await read(path('genesis-request')); if (!published && (prospectiveProof?.txId !== record.lastReservationTxId || !request || request.genesisTxId !== record.lastReservationTxId || request.tokenFloorFingerprint !== record.floorFingerprint)) refused('reserve_token_floor', 'owner-bound request does not bind reservation'); await writeImmutableAuthority(`token-floor-reservation-${encodeURIComponent(record.lastReservationTxId)}`, record); await writeAuthority('token-floor', record); return record; },
     async writeTokenConfigAttestation(record) {
@@ -2767,6 +2844,32 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           (allowPending !== true || request?.requestedReaderMode !== 'handshake' || managementState?.recovery?.phase === 'terminal')) {
         refused('read_bound_reader_proof', 'committed reader floor requires an exact bound reader proof');
       }
+      if (readerProjection === null) {
+        try {
+          validateGenesisRequest(request);
+          if (request.requestedReaderMode === 'handshake') {
+            if (admissionRequest === null && admissionGrant === null &&
+                managementState?.recovery?.phase !== 'handshake-pending') {
+              // Genesis authority has not opened its reader admission yet.
+            } else {
+              validateAdmissionRequest(admissionRequest);
+              validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
+              if (admissionRequest.genesisTxId !== request.genesisTxId ||
+                  admissionRequest.generation !== request.generation ||
+                  admissionRequest.fenceGeneration !== request.fenceGeneration ||
+                  admissionRequest.readerInstanceId !== request.readerInstanceId ||
+                  admissionRequest.readerStartNonce !== request.readerStartNonce ||
+                  admissionRequest.routeFingerprint !== 'no-route') {
+                throw new TypeError('pending admission tuple relation');
+              }
+            }
+          } else if (admissionRequest !== null || admissionGrant !== null) {
+            throw new TypeError('no-reader admission tuple');
+          }
+        } catch {
+          refused('read_bound_reader_proof', 'pending admission tuple is not bound to Genesis authority');
+        }
+      }
       if (readerVersionFloor.readerVersionFloor === null && readerProjection !== null) {
         refused('read_bound_reader_proof', 'uncommitted reader floor cannot contain bound reader proof');
       }
@@ -2777,6 +2880,28 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           validateTokenFloor(tokenFloor);
           validateZFinality(zFinality, request, tokenFloor, await read(path('genesis-precommit-proof')));
           validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
+          if (admissionRequest.genesisTxId !== request.genesisTxId ||
+              admissionRequest.generation !== request.generation ||
+              admissionRequest.fenceGeneration !== request.fenceGeneration ||
+              admissionRequest.readerInstanceId !== request.readerInstanceId ||
+              admissionRequest.readerStartNonce !== request.readerStartNonce ||
+              admissionRequest.routeFingerprint !== 'no-route' ||
+              admissionGrant.genesisTxId !== request.genesisTxId ||
+              admissionGrant.generation !== request.generation ||
+              admissionGrant.fenceGeneration !== request.fenceGeneration ||
+              admissionGrant.readerInstanceId !== request.readerInstanceId ||
+              admissionGrant.readerStartNonce !== request.readerStartNonce ||
+              admissionGrant.routeFingerprint !== 'no-route' ||
+              readerProjection.readerInstanceId !== request.readerInstanceId ||
+              readerProjection.readerStartNonce !== request.readerStartNonce ||
+              admissionAck.genesisTxId !== request.genesisTxId ||
+              admissionAck.generation !== request.generation ||
+              admissionAck.fenceGeneration !== request.fenceGeneration ||
+              admissionAck.readerInstanceId !== request.readerInstanceId ||
+              admissionAck.readerStartNonce !== request.readerStartNonce ||
+              admissionAck.routeFingerprint !== 'no-route') {
+            throw new TypeError('reader authority tuple relation');
+          }
           validateReaderProjection(readerProjection, readerVersionFloor, tokenFloor, zFinality.zFinalityFingerprint);
           validateAdmissionAck(admissionAck, admissionGrant, readerProjection.readerProjectionFingerprint);
           validateReaderRelations(readerState, readerVersionFloor);
@@ -3152,10 +3277,53 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       }
       return { request, floor, tokenFloor, zFinality, precommit, commit, fence, admissionRequest, admissionGrant, authorityEpoch, authorityEpochFloor, fenceGenerationFloor };
     },
+    async readPendingGenesisAdmission() {
+      await requireManagementOrBotPrincipal('read_pending_genesis_admission');
+      const [request, admissionRequest, admissionGrant] = await Promise.all([
+        read(path('genesis-request')),
+        read(path('admission-request')),
+        read(path('admission-grant')),
+      ]);
+      try {
+        validateGenesisRequest(request);
+        validateAdmissionRequest(admissionRequest);
+        validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
+        if (request.requestedReaderMode !== 'handshake' ||
+            admissionRequest.genesisTxId !== request.genesisTxId ||
+            admissionRequest.generation !== request.generation ||
+            admissionRequest.fenceGeneration !== request.fenceGeneration ||
+            admissionRequest.readerInstanceId !== request.readerInstanceId ||
+            admissionRequest.readerStartNonce !== request.readerStartNonce ||
+            admissionRequest.routeFingerprint !== 'no-route' ||
+            admissionGrant.genesisTxId !== request.genesisTxId ||
+            admissionGrant.generation !== request.generation ||
+            admissionGrant.fenceGeneration !== request.fenceGeneration ||
+            admissionGrant.readerInstanceId !== request.readerInstanceId ||
+            admissionGrant.readerStartNonce !== request.readerStartNonce ||
+            admissionGrant.routeFingerprint !== 'no-route') {
+          throw new TypeError('pending Genesis admission tuple');
+        }
+      } catch {
+        refused('read_pending_genesis_admission', 'pending Genesis admission is incomplete or not bound to its reader tuple');
+      }
+      return { request, admissionRequest, admissionGrant };
+    },
     async completePendingGenesis({ recovery }) {
       const projection = await read(botPath('reader-projection'));
       const acknowledgement = await read(botPath('acknowledgement'));
-      if (projection === null && acknowledgement === null) return null;
+      if (projection === null && acknowledgement === null) {
+        const pending = await adapter.readBoundReaderProof({ allowPending: true });
+        const request = await read(path('genesis-request'));
+        const admissionRequest = await read(path('admission-request'));
+        const admissionGrant = await read(path('admission-grant'));
+        if (pending?.readerVersionFloor?.readerVersionFloor === 2 &&
+            pending.readerProjection === null &&
+            pending.admissionAck === null &&
+            request?.requestedReaderMode === 'handshake' &&
+            admissionRequest !== null &&
+            admissionGrant !== null) return null;
+        return adapter.recoverGenesisSuffix({ recovery });
+      }
       if (projection === null || acknowledgement === null) {
         refused('complete_pending_genesis', 'reader projection and acknowledgement must appear atomically as a bound pair');
       }
@@ -3408,11 +3576,26 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           if (preflightProjection.genesisTxId !== request.genesisTxId ||
               preflightProjection.generation !== request.generation ||
               preflightProjection.fenceGeneration !== request.fenceGeneration ||
+              preflightProjection.readerInstanceId !== request.readerInstanceId ||
+              preflightProjection.readerStartNonce !== request.readerStartNonce ||
               preflightAdmissionRequest.genesisTxId !== request.genesisTxId ||
               preflightAdmissionRequest.generation !== request.generation ||
+              preflightAdmissionRequest.fenceGeneration !== request.fenceGeneration ||
+              preflightAdmissionRequest.readerInstanceId !== request.readerInstanceId ||
+              preflightAdmissionRequest.readerStartNonce !== request.readerStartNonce ||
+              preflightAdmissionRequest.routeFingerprint !== 'no-route' ||
+              preflightAdmissionGrant.genesisTxId !== request.genesisTxId ||
+              preflightAdmissionGrant.generation !== request.generation ||
+              preflightAdmissionGrant.fenceGeneration !== request.fenceGeneration ||
+              preflightAdmissionGrant.readerInstanceId !== request.readerInstanceId ||
+              preflightAdmissionGrant.readerStartNonce !== request.readerStartNonce ||
+              preflightAdmissionGrant.routeFingerprint !== 'no-route' ||
               preflightAcknowledgement.genesisTxId !== request.genesisTxId ||
               preflightAcknowledgement.generation !== request.generation ||
               preflightAcknowledgement.fenceGeneration !== request.fenceGeneration ||
+              preflightAcknowledgement.readerInstanceId !== request.readerInstanceId ||
+              preflightAcknowledgement.readerStartNonce !== request.readerStartNonce ||
+              preflightAcknowledgement.routeFingerprint !== 'no-route' ||
               preflightReaderState.readerInstanceId !== request.readerInstanceId ||
               preflightReaderState.readerStartNonce !== request.readerStartNonce ||
               preflightReaderState.readerProjectionFingerprint !== preflightProjection.readerProjectionFingerprint) {
@@ -4488,9 +4671,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       rejectLegacyRetainedMapping(value?.operation, value?.targetState, 'write_authority_successor_request');
       const genesisAuthorityRequest = await requireSuccessorGenesisAuthority('write_authority_successor_request', value);
       try { validateAuthoritySuccessorRequest(value, genesisAuthorityRequest); } catch { refused('write_authority_successor_request', 'exact successor request is required'); }
-      const [head, marker, floor, fenceFloor, authorityEpochFloor, tokenFloor] = await Promise.all([
-        read(path('authority-head')), rawRead(historyMarkerPath), read(path('reader-version-floor')), read(path('fence-generation-floor')), read(path('authority-epoch-floor')), read(path('token-floor')),
+      const [head, floor, fenceFloor, authorityEpochFloor, tokenFloor] = await Promise.all([
+        read(path('authority-head')), read(path('reader-version-floor')), read(path('fence-generation-floor')), read(path('authority-epoch-floor')), read(path('token-floor')),
       ]);
+      const { marker } = await readSealAwareHistoryMarker('write_authority_successor_request');
       try {
         validateReaderVersionFloor(floor);
         validateFenceGenerationFloor(fenceFloor);

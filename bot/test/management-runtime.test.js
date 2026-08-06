@@ -79,7 +79,7 @@ function adapter({ legacy = true, failAudit = false, roleBindings = roles, initi
   const native = { ...baseNative };
   return { files, writes, payloads, setPrincipal: (value) => { currentPrincipal = value; }, native };
 }
-async function boundReaderRuntime() {
+async function boundReaderRuntime({ complete = true } = {}) {
   const harness = adapter({ legacy: false });
   const runtime = new ManagementRuntime({ native: harness.native });
   const input = {
@@ -128,28 +128,54 @@ async function boundReaderRuntime() {
     readerStartNonce: request.readerStartNonce,
     readerVersion: 2,
   };
-  harness.setPrincipal(botPrincipal);
-  await harness.native.acquireBotLease(lease);
-  await harness.native.writeBotReaderProjection(projection);
-  await harness.native.writeBotReaderState(readerState);
-  assert.ok(fileEnding(harness.files, '/bot-state/reader-state.json'));
-  await harness.native.writeBotAcknowledgement(buildAdmissionAck(grant, projection.readerProjectionFingerprint));
-  assert.ok(fileEnding(harness.files, '/bot-state/reader-state.json'));
-  assert.ok((await harness.native.readBoundReaderProof()).readerState);
-  harness.setPrincipal(owner);
-  const completed = await runtime.execute('genesis', input);
-  assert.ok(fileEnding(harness.files, '/bot-state/reader-state.json'));
-  assert.equal(completed.recovered, true, JSON.stringify(completed));
-  harness.setPrincipal(botPrincipal);
-  const snapshot = await harness.native.readManagedMappingSnapshot();
-  assert.equal(JSON.parse(snapshot.wrapperBytes).readerVersion, 2);
-  assert.equal(
-    JSON.parse(snapshot.controlRootBytes).readerVersionFloorFingerprint,
-    JSON.parse(snapshot.readerVersionFloorBytes).floorFingerprint,
-  );
-  assert.doesNotThrow(() => validateManagedProof(snapshot, managedHostSetFingerprint('host=secret')));
-  return { ...harness, runtime };
+  if (complete) {
+    harness.setPrincipal(botPrincipal);
+    await harness.native.acquireBotLease(lease);
+    await harness.native.writeBotReaderProjection(projection);
+    await harness.native.writeBotReaderState(readerState);
+    assert.ok(fileEnding(harness.files, '/bot-state/reader-state.json'));
+    await harness.native.writeBotAcknowledgement(buildAdmissionAck(grant, projection.readerProjectionFingerprint));
+    assert.ok(fileEnding(harness.files, '/bot-state/reader-state.json'));
+    assert.ok((await harness.native.readBoundReaderProof()).readerState);
+    harness.setPrincipal(owner);
+    const completed = await runtime.execute('genesis', input);
+    assert.ok(fileEnding(harness.files, '/bot-state/reader-state.json'));
+    assert.equal(completed.recovered, true, JSON.stringify(completed));
+    harness.setPrincipal(botPrincipal);
+    const snapshot = await harness.native.readManagedMappingSnapshot();
+    assert.equal(JSON.parse(snapshot.wrapperBytes).readerVersion, 2);
+    assert.equal(
+      JSON.parse(snapshot.controlRootBytes).readerVersionFloorFingerprint,
+      JSON.parse(snapshot.readerVersionFloorBytes).floorFingerprint,
+    );
+    assert.doesNotThrow(() => validateManagedProof(snapshot, managedHostSetFingerprint('host=secret')));
+  } else {
+    harness.setPrincipal(owner);
+    assert.equal((await harness.native.readBoundReaderProof({ allowPending: true })).readerProjection, null);
+  }
+  return { ...harness, runtime, input };
 }
+test('prepared Genesis recovery promotes durable authorized handshake to pending', async () => {
+  const { native, runtime, input, setPrincipal, files } = await boundReaderRuntime({ complete: false });
+  const before = await native.readManagementState();
+  const crashed = structuredClone(before);
+  crashed.recovery.phase = 'prepared';
+  delete crashed.recovery.readerHandshake;
+  crashed.revision = before.revision + 1;
+  assert.equal(await native.compareAndSwapManagementState(before.revision, crashed), true);
+  setPrincipal(owner);
+  const recovered = await runtime.execute('genesis', input);
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.pending, true, JSON.stringify(recovered));
+  const after = await native.readManagementState();
+  assert.equal(after.recovery.phase, 'handshake-pending');
+  assert.equal(after.recovery.txId, before.recovery.txId);
+  assert.equal(after.recovery.requestFingerprint, before.recovery.requestFingerprint);
+  assert.equal(
+    after.recovery.readerHandshake.requestFingerprint,
+    JSON.parse(fileEnding(files, '/admission-request.json')).requestFingerprint,
+  );
+});
 
 function mappingInput(mappingId, generation = 1) {
   const mapping = fingerprintManagedMappingRecord({

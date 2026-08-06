@@ -1,5 +1,5 @@
 import { canonicalJsonHash, isHex64 } from "./strict-json.js";
-import { isOpaqueIdentity } from "./identity.js";
+import { isOpaqueIdentity, isPrincipal } from "./identity.js";
 
 const plain = (value) => value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 const exact = (value, expected) => plain(value) && Object.keys(value).length === expected.length && expected.every((key) => Object.hasOwn(value, key));
@@ -397,14 +397,37 @@ export function validateBaselineSnapshot(baseline, floor = null) {
 }
 
 const genesisRequestKeys = ["version", "kind", "genesisTxId", "fenceGeneration", "sequence", "anchorFingerprint", "ownerPrincipalFingerprint", "managementPrincipalFingerprint", "botPrincipalFingerprint", "recoveryPrincipalFingerprint", "targetPrincipalFingerprint", "managementProvisioningFingerprint", "botProvisioningFingerprint", "recoveryProvisioningFingerprint", "generation", "requestedReaderMode", "readerInstanceId", "readerStartNonce", "idempotencyKey", "targetInputState", "targetFingerprint", "targetIdentityFingerprint", "targetAclFingerprint", "legacyTargetProofFingerprint", "protectedInputFingerprint", "requestFingerprint"];
+const genesisRequestProofKeys = ["parentIdentityFingerprint", "parentAclFingerprint", "targetPrincipal", "parentMutationProofFingerprint"];
+const parentMutationProofFingerprint = (request) => canonicalJsonHash({
+  version: 1,
+  kind: "genesis-parent-mutation-proof",
+  parentIdentityFingerprint: request.parentIdentityFingerprint,
+  parentAclFingerprint: request.parentAclFingerprint,
+  targetPrincipal: request.targetPrincipal,
+});
 export function validateGenesisAuthorityRequest(request) {
-  if (!exact(request, genesisRequestKeys) || request.version !== 1 || request.kind !== "genesis-authority-request" || !isOpaqueIdentity(request.genesisTxId) || request.sequence !== 1 || !Number.isSafeInteger(request.generation) || request.generation < 1 || !["no-reader", "handshake"].includes(request.requestedReaderMode) || !isOpaqueIdentity(request.idempotencyKey) || !["absent", "legacy-unmigrated"].includes(request.targetInputState)) fail("genesis authority request schema");
+  const hasParentProof = exact(request, [...genesisRequestKeys, ...genesisRequestProofKeys]);
+  if ((!exact(request, genesisRequestKeys) && !hasParentProof) ||
+      request.version !== 1 || request.kind !== "genesis-authority-request" ||
+      !isOpaqueIdentity(request.genesisTxId) || request.sequence !== 1 ||
+      !Number.isSafeInteger(request.generation) || request.generation < 1 ||
+      !["no-reader", "handshake"].includes(request.requestedReaderMode) ||
+      !isOpaqueIdentity(request.idempotencyKey) || !["absent", "legacy-unmigrated"].includes(request.targetInputState)) {
+    fail("genesis authority request schema");
+  }
   assertFence(request, 1);
   for (const key of ["anchorFingerprint", "ownerPrincipalFingerprint", "managementPrincipalFingerprint", "botPrincipalFingerprint", "recoveryPrincipalFingerprint", "targetPrincipalFingerprint", "managementProvisioningFingerprint", "botProvisioningFingerprint", "recoveryProvisioningFingerprint", "protectedInputFingerprint", "requestFingerprint"]) if (!isHex64(request[key])) fail("genesis authority request fingerprint");
   if (new Set([request.managementPrincipalFingerprint, request.botPrincipalFingerprint, request.recoveryPrincipalFingerprint]).size !== 3 ||
       (request.requestedReaderMode === "no-reader" ? request.readerInstanceId !== null || request.readerStartNonce !== null : !isOpaqueIdentity(request.readerInstanceId) || !isOpaqueIdentity(request.readerStartNonce)) ||
       (request.targetInputState === "absent" ? [request.targetFingerprint, request.targetIdentityFingerprint, request.targetAclFingerprint, request.legacyTargetProofFingerprint].some((value) => value !== null) : ![request.targetFingerprint, request.targetIdentityFingerprint, request.targetAclFingerprint, request.legacyTargetProofFingerprint].every(isHex64)) ||
       hash(request, "requestFingerprint") !== request.requestFingerprint) fail("genesis authority request relation");
+  if (hasParentProof &&
+      (!isHex64(request.parentIdentityFingerprint) || !isHex64(request.parentAclFingerprint) ||
+       !isPrincipal(request.targetPrincipal) ||
+       request.targetPrincipalFingerprint !== canonicalJsonHash(request.targetPrincipal) ||
+       request.parentMutationProofFingerprint !== parentMutationProofFingerprint(request))) {
+    fail("genesis authority parent mutation proof");
+  }
   return request;
 }
 

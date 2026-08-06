@@ -17,6 +17,13 @@ const safe = (error) => ({ code: /^[A-Z0-9_]+$/.test(error?.code ?? "") ? error.
 const principal = (value, name) => { if (!isPrincipal(value)) throw new Error(`${name}_INVALID`); return value; };
 const protectedTokenFingerprint = (value) => managedHostSetFingerprint(parseManagedHostTokens(value));
 const recordHash = (record, field) => canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field)));
+const parentMutationProofFingerprint = ({ parentIdentityFingerprint, parentAclFingerprint, targetPrincipal }) => canonicalJsonHash({
+  version: 1,
+  kind: "genesis-parent-mutation-proof",
+  parentIdentityFingerprint,
+  parentAclFingerprint,
+  targetPrincipal,
+});
 const assertCommittedTokenLineage = (lineage, finality, baseline, { requireSuccessorFence = false, successorTxId = null } = {}) => {
   const floor = lineage?.floor;
   const attestation = lineage?.attestation;
@@ -819,11 +826,36 @@ export class ManagementRuntime {
         }
         let recovered;
         try {
-          recovered = await this.native.recoverGenesisSuffix({
+          const pending = await this.native.completePendingGenesis({
             recovery: state.recovery,
             replayFingerprint,
             genesisSecurityTuple: state.recovery.genesisSecurityTuple,
           });
+          if (pending === null) {
+            const bootstrap = await this.native.readPendingGenesisAdmission();
+            if (!bootstrap?.request ||
+                bootstrap.request.genesisTxId !== state.recovery.txId ||
+                bootstrap.request.requestFingerprint !== state.recovery.requestFingerprint ||
+                bootstrap.request.requestedReaderMode !== "handshake" ||
+                bootstrap.request.generation !== state.recovery.generation ||
+                !bootstrap.admissionRequest ||
+                !bootstrap.admissionGrant ||
+                bootstrap.admissionRequest.genesisTxId !== bootstrap.request.genesisTxId ||
+                bootstrap.admissionGrant.genesisTxId !== bootstrap.request.genesisTxId ||
+                bootstrap.admissionRequest.requestFingerprint === undefined ||
+                bootstrap.admissionGrant.grantFingerprint === undefined) {
+              throw new Error("RECOVERY_PENDING_TUPLE_MISMATCH");
+            }
+            await this.#persistGenesisHandshakePending(state, {
+              replayFingerprint,
+              generation: bootstrap.request.generation,
+              hostSetFingerprint: state.recovery.hostSetFingerprint,
+              admissionRequest: bootstrap.admissionRequest,
+              admissionGrant: bootstrap.admissionGrant,
+            });
+            return { idempotent: true, pending: true, genesisTxId: state.recovery.txId, routeDisposition: "no-route" };
+          }
+          recovered = pending;
           validateGenesisSuffixRecovery(recovered, state.recovery);
         } catch (error) {
           await this.#manualCleanup(state, "RECOVERY_SUFFIX_MISMATCH");
@@ -978,6 +1010,18 @@ export class ManagementRuntime {
              !Number.isSafeInteger(expectedLegacyTarget.rawTargetByteLength) || expectedLegacyTarget.rawTargetByteLength < 0 ||
              typeof expectedLegacyTarget.targetIdentity !== "string" ||
              !/^[a-f0-9]{64}$/.test(expectedLegacyTarget.targetAclFingerprint))) throw new Error("LEGACY_TARGET_PROOF_REQUIRED");
+        const durableParentProof = genesisProbe?.parentIdentityFingerprint && genesisProbe?.parentAclFingerprint
+          ? {
+            parentIdentityFingerprint: genesisProbe.parentIdentityFingerprint,
+            parentAclFingerprint: genesisProbe.parentAclFingerprint,
+            targetPrincipal: structuredClone(targetPrincipal),
+            parentMutationProofFingerprint: parentMutationProofFingerprint({
+              parentIdentityFingerprint: genesisProbe.parentIdentityFingerprint,
+              parentAclFingerprint: genesisProbe.parentAclFingerprint,
+              targetPrincipal,
+            }),
+          }
+          : {};
         authorityRequest = {
           version: 1, kind: "genesis-authority-request", genesisTxId: txId, fenceGeneration: 1, sequence: 1, anchorFingerprint,
           ownerPrincipalFingerprint: canonicalJsonHash(actorPrincipal), managementPrincipalFingerprint: canonicalJsonHash(actorPrincipal),
@@ -993,6 +1037,7 @@ export class ManagementRuntime {
           targetIdentityFingerprint: expectedLegacyTarget ? canonicalJsonHash(expectedLegacyTarget.targetIdentity) : null,
           targetAclFingerprint: expectedLegacyTarget?.targetAclFingerprint ?? null,
           legacyTargetProofFingerprint: expectedLegacyTarget ? canonicalJsonHash(expectedLegacyTarget) : null,
+          ...durableParentProof,
           protectedInputFingerprint: hostSetFingerprint, requestFingerprint: null,
         };
         authorityRequest.requestFingerprint = recordHash(authorityRequest, "requestFingerprint");
