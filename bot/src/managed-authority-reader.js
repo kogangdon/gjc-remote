@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createManagementNative } from "@gjc-remote/native-control";
-import { buildAdmissionAck, validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGenesisBinding, validateAdmissionGrant, validateAdmissionRequest, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
+import { buildAdmissionAck, validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGenesisBinding, validateAdmissionGrant, validateAdmissionRequest, validateAdmissionRecordPair, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
 import { authorityRecordFingerprint, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
 import { isOpaqueIdentity } from "@gjc-remote/shared/identity";
 import { validateManagedChannelsV2, validateManagementEnvelope } from "@gjc-remote/shared/mapping-envelope";
@@ -634,6 +634,7 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   validateHistoryMarkerSeal(historyMarker, historyMarkerSeal, request.anchorFingerprint);
   const attestedProof = parseAuthorityBytes(snapshot.attestedProofBytes);
   const precommit = parseAuthorityBytes(snapshot.precommitBytes);
+  const recovery = snapshot.recoveryBytes === undefined ? null : parseAuthorityBytes(snapshot.recoveryBytes);
   const authorityRequest = parseAuthorityBytes(snapshot.authorityRequestBytes);
   const authorityReceipt = parseAuthorityBytes(snapshot.authorityReceiptBytes);
   const authorityReservation = parseAuthorityBytes(snapshot.authorityReservationBytes);
@@ -797,26 +798,44 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   let projection = null;
   let readerState = null;
   let ack = null;
+  let admissionRequestArchive = null;
+  let admissionGrantArchive = null;
+  let acknowledgementArchive = null;
   if (request.requestedReaderMode === "no-reader") {
     if (snapshot.readerProjectionBytes !== undefined || snapshot.readerStateBytes !== undefined ||
-        snapshot.admissionAckBytes !== undefined || snapshot.fenceBindingBytes !== undefined ||
-        snapshot.readerLeaseBytes !== undefined) {
+        snapshot.admissionAckBytes !== undefined || snapshot.admissionAckArchiveBytes !== undefined ||
+        snapshot.fenceBindingBytes !== undefined || snapshot.readerLeaseBytes !== undefined) {
       throw new TypeError("no-reader proof branch");
     }
-    if (snapshot.admissionRequestBytes !== undefined || snapshot.admissionGrantBytes !== undefined) throw new TypeError("no-reader admission branch");
+    if (snapshot.admissionRequestBytes !== undefined || snapshot.admissionGrantBytes !== undefined ||
+        snapshot.admissionRequestArchiveBytes !== undefined || snapshot.admissionGrantArchiveBytes !== undefined) throw new TypeError("no-reader admission branch");
+    if (recovery?.readerHandshake !== undefined && recovery.readerHandshake !== null) throw new TypeError("no-reader admission state branch");
     validateFinalityProof(proof, request, zFinality);
   } else {
-    if (!isBytes(snapshot.readerStateBytes)) throw new TypeError("bound-reader state bytes");
+    if (!isBytes(snapshot.readerStateBytes) ||
+        !isBytes(snapshot.admissionRequestArchiveBytes) ||
+        !isBytes(snapshot.admissionGrantArchiveBytes) ||
+        !isBytes(snapshot.admissionAckArchiveBytes)) throw new TypeError("bound-reader state or admission archive bytes");
     admissionRequest = parseAuthorityBytes(snapshot.admissionRequestBytes);
     admissionGrant = parseAuthorityBytes(snapshot.admissionGrantBytes);
+    admissionRequestArchive = parseAuthorityBytes(snapshot.admissionRequestArchiveBytes);
+    admissionGrantArchive = parseAuthorityBytes(snapshot.admissionGrantArchiveBytes);
+    acknowledgementArchive = parseAuthorityBytes(snapshot.admissionAckArchiveBytes);
     validateAdmissionRequest(admissionRequest);
     validateAdmissionGrant(admissionGrant, admissionRequest);
+    validateAdmissionRequest(admissionRequestArchive);
+    validateAdmissionGrant(admissionGrantArchive, admissionRequestArchive);
+    validateAdmissionAckRecord(acknowledgementArchive);
+    validateAdmissionRecordPair(admissionRequest, admissionRequestArchive, { label: "admission request" });
+    validateAdmissionRecordPair(admissionGrant, admissionGrantArchive, { label: "admission grant" });
     validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant);
     fenceBinding = parseAuthorityBytes(snapshot.fenceBindingBytes);
     readerLease = parseAuthorityBytes(snapshot.readerLeaseBytes);
     projection = parseAuthorityBytes(snapshot.readerProjectionBytes);
     readerState = parseAuthorityBytes(snapshot.readerStateBytes);
     ack = parseAuthorityBytes(snapshot.admissionAckBytes);
+    validateAdmissionAckRecord(ack);
+    validateAdmissionRecordPair(ack, acknowledgementArchive, { label: "admission acknowledgement" });
     validateFenceBinding(fenceBinding, authorityCommit, readerFloor);
     validateLeaseBinding(readerLease, fenceBinding);
     if (admissionRequest.genesisTxId !== request.genesisTxId ||

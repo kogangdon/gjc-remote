@@ -343,6 +343,61 @@ test('acknowledgement archive-only seam repairs the current B record exactly', a
   assert.deepEqual(harness.files.get(currentPath), archive);
   assert.deepEqual(harness.files.get(archivePath), archive);
 });
+test('Genesis finality, recheck, and snapshot reject deleted or substituted admission archives', async () => {
+  for (const variant of ['deleted', 'substituted']) {
+    const harness = await boundReaderRuntime({ complete: true });
+    const request = JSON.parse(fileEnding(harness.files, '/genesis-request.json'));
+    const grant = JSON.parse(fileEnding(harness.files, '/admission-grant.json'));
+    const zFinality = JSON.parse(fileEnding(harness.files, '/z-finality.json'));
+    const finalityProof = JSON.parse(fileEnding(harness.files, '/rvf.json'));
+    const receipt = JSON.parse(fileEnding(harness.files, '/receipt.json'));
+    const readerProjection = JSON.parse(fileEnding(harness.files, '/bot-state/reader-projection.json'));
+    const admissionAck = JSON.parse(fileEnding(harness.files, '/bot-state/acknowledgement.json'));
+    const archivePath = filePathEnding(harness.files, `/admission-grant-${grant.grantId}.json`);
+    if (variant === 'deleted') {
+      harness.files.delete(archivePath);
+    } else {
+      const substituted = JSON.parse(harness.files.get(archivePath));
+      substituted.nonce = 'substituted-finality-archive';
+      substituted.grantFingerprint = canonicalJsonHash(
+        Object.fromEntries(Object.entries(substituted).filter(([key]) => key !== 'grantFingerprint')),
+      );
+      harness.files.set(archivePath, Buffer.from(canonicalJson(substituted)));
+    }
+
+    harness.setPrincipal(owner);
+    const writes = harness.writes.length;
+    await assert.rejects(
+      harness.native.writeFinalityProof(finalityProof),
+      /complete bound-reader finality graph is invalid/,
+    );
+    assert.equal(harness.writes.length, writes);
+    assert.equal(
+      await harness.native.recheckAdmissionFinality({
+        request,
+        zFinality,
+        readerProjection,
+        admissionAck,
+        finalityProof,
+        receipt,
+      }),
+      false,
+    );
+    await assert.rejects(
+      harness.native.reopenAdmission({
+        txId: request.genesisTxId,
+        finalityFingerprint: finalityProof.finalityProofFingerprint,
+      }),
+      /exact committed finality proof|admission/i,
+    );
+
+    harness.setPrincipal(botPrincipal);
+    await assert.rejects(
+      harness.native.readManagedMappingSnapshot(),
+      /admission|finality|invalid/i,
+    );
+  }
+});
 test('pending bootstrap rejects mutable/archive drift before any bot writes', async () => {
   const harness = await boundReaderRuntime({ complete: false });
   const grantArchivePath = filePathEnding(harness.files, `/admission-grant-${JSON.parse(fileEnding(harness.files, '/admission-grant.json')).grantId}.json`);
@@ -1962,4 +2017,46 @@ test('no-reader finality rejects foreign authority tuples and admission records 
     /complete bound-reader finality graph is invalid|no-reader graph contains reader records/,
   );
   assert.equal(archiveHarness.writes.length, archiveWrites);
+});
+test('no-reader finality rejects reachable admission identifiers from durable state', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  const completed = await runtime.execute('genesis', genesisInput('host=no-reader-reachable-admission'));
+  assert.equal(completed.ok, true, JSON.stringify(completed));
+  const request = JSON.parse(fileEnding(harness.files, '/genesis-request.json'));
+  const candidateRequest = buildAdmissionRequest({
+    requestId: 'reachable-no-reader-request',
+    genesisTxId: request.genesisTxId,
+    generation: request.generation,
+    fenceGeneration: request.fenceGeneration,
+    readerInstanceId: 'reachable-reader',
+    readerStartNonce: 'reachable-start',
+    routeFingerprint: 'no-route',
+    nonce: 'reachable-nonce',
+    expiresAt: Date.now() + 30_000,
+  });
+  const candidateGrant = buildAdmissionGrant(candidateRequest, {
+    grantId: 'reachable-no-reader-grant',
+    expiresAt: candidateRequest.expiresAt,
+  });
+  const statePath = filePathEnding(harness.files, '/management-state.json');
+  const state = JSON.parse(harness.files.get(statePath));
+  state.recovery.readerHandshake = {
+    requestFingerprint: candidateRequest.requestFingerprint,
+    grantFingerprint: candidateGrant.grantFingerprint,
+    expiresAt: candidateGrant.expiresAt,
+    request: candidateRequest,
+    grant: candidateGrant,
+  };
+  harness.files.set(statePath, Buffer.from(canonicalJson(state)));
+  const root = filePathEnding(harness.files, '/genesis-request.json').replace('genesis-request.json', '');
+  harness.files.set(`${root}admission-request-${candidateRequest.requestId}.json`, Buffer.from(canonicalJson(candidateRequest)));
+  harness.files.set(`${root}admission-grant-${candidateGrant.grantId}.json`, Buffer.from(canonicalJson(candidateGrant)));
+  const proof = JSON.parse(fileEnding(harness.files, '/rvf.json'));
+  const writes = harness.writes.length;
+  await assert.rejects(
+    harness.native.writeFinalityProof(proof),
+    /complete bound-reader finality graph is invalid/,
+  );
+  assert.equal(harness.writes.length, writes);
 });

@@ -619,6 +619,62 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     return { current, immutable };
   };
+  const readGenesisAdmissionArchives = async ({
+    request,
+    admissionRequest,
+    admissionGrant,
+    acknowledgement,
+    managementState = null,
+    allowEmpty = false,
+  }) => {
+    const readerHandshake = managementState?.recovery?.readerHandshake ?? null;
+    if (request.requestedReaderMode === 'no-reader') {
+      if (admissionRequest !== null || admissionGrant !== null || acknowledgement !== null ||
+          readerHandshake !== null) {
+        throw new TypeError('no-reader graph contains admission identifiers or records');
+      }
+      return { request: null, grant: null, acknowledgement: null };
+    }
+    const empty = admissionRequest === null && admissionGrant === null && acknowledgement === null;
+    if (empty && allowEmpty && readerHandshake === null) {
+      return { request: null, grant: null, acknowledgement: null };
+    }
+    if (admissionRequest === null || admissionGrant === null || acknowledgement === null) {
+      throw new TypeError('bound-reader admission record pair is incomplete');
+    }
+    validateAdmissionRequest(admissionRequest);
+    validateAdmissionGrant(admissionGrant, admissionRequest);
+    validateAdmissionAckRecord(acknowledgement);
+    validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, acknowledgement);
+    const requestArchive = await read(path(`admission-request-${encodeURIComponent(admissionRequest.requestId)}`));
+    const grantArchive = await read(path(`admission-grant-${encodeURIComponent(admissionGrant.grantId)}`));
+    const acknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(admissionGrant.grantId)}`));
+    validateAdmissionRequest(requestArchive);
+    validateAdmissionGrant(grantArchive, requestArchive);
+    validateAdmissionAckRecord(acknowledgementArchive);
+    validateAdmissionRecordPair(admissionRequest, requestArchive, { label: 'admission request' });
+    validateAdmissionRecordPair(admissionGrant, grantArchive, { label: 'admission grant' });
+    validateAdmissionRecordPair(acknowledgement, acknowledgementArchive, { label: 'admission acknowledgement' });
+    if (readerHandshake !== null) {
+      validateAdmissionRequest(readerHandshake.request);
+      validateAdmissionGrant(readerHandshake.grant, readerHandshake.request);
+      validateAdmissionGenesisBinding(request, readerHandshake.request, readerHandshake.grant);
+      if (readerHandshake.requestFingerprint !== readerHandshake.request.requestFingerprint ||
+          readerHandshake.grantFingerprint !== readerHandshake.grant.grantFingerprint ||
+          readerHandshake.expiresAt !== readerHandshake.grant.expiresAt ||
+          canonical(readerHandshake.request) !== canonical(admissionRequest) ||
+          canonical(readerHandshake.grant) !== canonical(admissionGrant)) {
+        throw new TypeError('state admission handshake does not bind current admission pair');
+      }
+      const stateRequestArchive = await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
+      const stateGrantArchive = await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+      validateAdmissionRequest(stateRequestArchive);
+      validateAdmissionGrant(stateGrantArchive, stateRequestArchive);
+      validateAdmissionRecordPair(readerHandshake.request, stateRequestArchive, { label: 'state admission request' });
+      validateAdmissionRecordPair(readerHandshake.grant, stateGrantArchive, { label: 'state admission grant' });
+    }
+    return { request: requestArchive, grant: grantArchive, acknowledgement: acknowledgementArchive };
+  };
   const writeImmutableBot = async (name, value, operation, mutationParent = null) => {
     const destination = botPath(name);
     const expectedParent = mutationParent ?? await verifiedParent(targetPath);
@@ -1634,9 +1690,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const committedAuthorityEpoch = authorityEpoch && await read(path(`authority-epoch-${encodeURIComponent(authorityEpoch.epoch)}-committed`));
     const authorityEpochFloor = await read(path('authority-epoch-floor'));
     const fenceGenerationFloor = await read(path('fence-generation-floor'));
-    let admissionRequestArchive = null;
-    let admissionGrantArchive = null;
-    let acknowledgementArchive = null;
     const managementState = await read(path('management-state'));
     const persistedGenesisTuple = managementState?.genesis?.genesisSecurityTuple ?? managementState?.recovery?.genesisSecurityTuple;
     const persistedGenesisTxId = managementState?.genesis?.txId ?? managementState?.recovery?.txId;
@@ -1646,10 +1699,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         expectedTxId: persistedGenesisTxId,
       });
     }
-    const readerHandshake = managementState?.recovery?.readerHandshake;
-    let stateAdmissionRequestArchive = null;
-    let stateAdmissionGrantArchive = null;
-    let stateAcknowledgementArchive = null;
     const fence = await read(path('reader-fence-binding'));
     const lease = await read(botPath('lease'));
     const admissionRequest = await read(path('admission-request'));
@@ -1690,17 +1739,17 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           !await exactPrecommitBoundary(request, precommit)) {
         throw new TypeError('finality authority graph does not bind Genesis');
       }
+      await readGenesisAdmissionArchives({
+        request,
+        admissionRequest,
+        admissionGrant,
+        acknowledgement,
+        managementState,
+      });
       validateReaderVersionFloor(floor);
       if (request.requestedReaderMode === 'no-reader') {
         if ([fence, lease, admissionRequest, admissionGrant, projection, acknowledgement, readerState].some((value) => value !== null)) {
           throw new TypeError('no-reader graph contains reader records');
-        }
-        if ([admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((value) => value !== null)) {
-          throw new TypeError('no-reader graph contains immutable admission archives');
-        }
-        if (readerHandshake !== null && readerHandshake !== undefined ||
-            [stateAdmissionRequestArchive, stateAdmissionGrantArchive, stateAcknowledgementArchive].some((value) => value !== null && value !== undefined)) {
-          throw new TypeError('no-reader graph contains admission identifiers or immutable archives');
         }
       } else {
         validateAuthorityReservation(authorityReservation);
@@ -1728,16 +1777,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           throw new TypeError('admission request does not bind Genesis');
         }
         validateAdmissionGrant(admissionGrant, admissionRequest);
-        admissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(admissionRequest.requestId)}`));
-        admissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(admissionGrant.grantId)}`));
-        acknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(admissionGrant.grantId)}`));
-        if (readerHandshake !== null && readerHandshake !== undefined) {
-          validateAdmissionRequest(readerHandshake.request);
-          validateAdmissionGrant(readerHandshake.grant, readerHandshake.request);
-          stateAdmissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
-          stateAdmissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
-          stateAcknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
-        }
         validateReaderProjection(projection, floor, tokenFloor, zFinality.zFinalityFingerprint);
         if (projection.fenceBindingFingerprint !== fence.fenceBindingFingerprint ||
             projection.leaseBindingFingerprint !== lease.leaseBindingFingerprint) {
@@ -3185,16 +3224,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const authorityEpochArchive = epoch && await read(path(`authority-epoch-${encodeURIComponent(epoch.epoch)}-committed`));
       const authorityEpochFloor = await read(path('authority-epoch-floor'));
       const fenceGenerationFloor = await read(path('fence-generation-floor'));
-      let admissionRequestArchive = null;
-      let admissionGrantArchive = null;
-      let acknowledgementArchive = null;
       const managementState = await read(path('management-state'));
       const persistedGenesisTuple = managementState?.genesis?.genesisSecurityTuple ?? managementState?.recovery?.genesisSecurityTuple;
       const persistedGenesisTxId = managementState?.genesis?.txId ?? managementState?.recovery?.txId;
       const readerHandshake = managementState?.recovery?.readerHandshake;
-      let stateAdmissionRequestArchive = null;
-      let stateAdmissionGrantArchive = null;
-      let stateAcknowledgementArchive = null;
       const k = request && await read(path(`publication-k-${encodeURIComponent(request.genesisTxId)}`));
       const y = request && await read(path(`publication-y-${encodeURIComponent(request.genesisTxId)}`));
       const admissionRequest = await read(path('admission-request'));
@@ -3219,33 +3252,20 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           anchorFingerprint: request.anchorFingerprint,
           request,
         });
-        if (request.requestedReaderMode === 'no-reader') {
-          if ([admissionRequest, admissionGrant, acknowledgement].some((value) => value !== null)) {
-            throw new TypeError('no-reader graph contains reader records');
-          }
-          if ([admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((value) => value !== null)) {
-            throw new TypeError('no-reader graph contains immutable admission archives');
-          }
-        } else if (admissionRequest !== null || admissionGrant !== null) {
-          if (admissionRequest === null || admissionGrant === null) {
-            throw new TypeError('bound-reader admission record pair is incomplete');
-          }
-          validateAdmissionRequest(admissionRequest);
-          validateAdmissionGrant(admissionGrant, admissionRequest);
-          admissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(admissionRequest.requestId)}`));
-          admissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(admissionGrant.grantId)}`));
-          acknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(admissionGrant.grantId)}`));
-          if (readerHandshake !== null && readerHandshake !== undefined) {
-            validateAdmissionRequest(readerHandshake.request);
-            validateAdmissionGrant(readerHandshake.grant, readerHandshake.request);
-            stateAdmissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
-            stateAdmissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
-            stateAcknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
-          }
+        await readGenesisAdmissionArchives({
+          request,
+          admissionRequest,
+          admissionGrant,
+          acknowledgement,
+          managementState,
+          allowEmpty: true,
+        });
+        if (request.requestedReaderMode === 'no-reader' &&
+            [admissionRequest, admissionGrant, acknowledgement].some((value) => value !== null)) {
+          throw new TypeError('no-reader graph contains reader records');
         }
-        if (readerHandshake !== null && readerHandshake !== undefined ||
-            [stateAdmissionRequestArchive, stateAdmissionGrantArchive, stateAcknowledgementArchive].some((value) => value !== null && value !== undefined)) {
-          throw new TypeError('no-reader graph contains admission identifiers or immutable archives');
+        if (readerHandshake !== null && readerHandshake !== undefined) {
+          throw new TypeError('Genesis admission handshake is still reachable');
         }
         if (authorityEpochArchive === null ||
             canonical(authorityEpochArchive) !== canonical(epoch) ||
@@ -3544,6 +3564,13 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         validatePublicationK(publicationK);
         validatePublicationY(publicationY, publicationK['publication-kFingerprint']);
         validateZFinality(storedFinality, storedRequest, tokenFloor, precommit);
+        await readGenesisAdmissionArchives({
+          request: storedRequest,
+          admissionRequest,
+          admissionGrant,
+          acknowledgement: storedAck,
+          managementState,
+        });
         validateReaderVersionFloor(readerVersionFloor);
         validateFinalityProof(storedProof, storedRequest, storedFinality, storedAck, storedProjection?.readerProjectionFingerprint ?? null);
         validateGenesisReceipt(storedReceipt, storedRequest, storedFinality, storedProof);
@@ -4820,12 +4847,32 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async reopenAdmission({ txId, finalityFingerprint }) {
       const request = await read(path('genesis-request'));
       const zFinality = await read(path('z-finality'));
+      const precommit = await read(path('genesis-precommit-proof'));
+      const admissionRequest = await read(path('admission-request'));
+      const admissionGrant = await read(path('admission-grant'));
       const projection = await read(botPath('reader-projection'));
       const acknowledgement = await read(botPath('acknowledgement'));
       const proof = await read(path('rvf'));
       const receipt = await read(path('receipt'));
       const state = await read(path('management-state'));
       try {
+        await readGenesisAdmissionArchives({
+          request,
+          admissionRequest,
+          admissionGrant,
+          acknowledgement,
+          managementState: state,
+        });
+        validateGenesisPrecommit(precommit);
+        if (request.requestedReaderMode === 'no-reader' &&
+            precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
+              admissionClosed: true,
+              admissionDrained: true,
+              admissionGrantWrites: 0,
+              admissionAckWrites: 0,
+              outstandingAdmissionGrants: 0,
+              txId: request.genesisTxId,
+            })) throw new Error('invalid zero-grant proof');
         validateGenesisRequest(request);
         if (!zFinality || zFinality.kind !== 'genesis-finality') throw new Error('invalid finality');
         validateFinalityProof(
@@ -5098,27 +5145,16 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         refused('read_managed_mapping_snapshot', 'durable authority epoch or fence generation floor is absent or drifted');
       }
       const publication = await readPublicationGraph(requestValue.genesisTxId);
-      const admissionRequest = await lowLevel.read_verified_bytes(path('admission-request'));
-      const admissionGrant = await lowLevel.read_verified_bytes(path('admission-grant'));
-      if (admissionRequest !== null) await assertObject(path('admission-request'), Buffer.from(admissionRequest));
-      if (admissionGrant !== null) await assertObject(path('admission-grant'), Buffer.from(admissionGrant));
+      const admissionRequestBytes = await lowLevel.read_verified_bytes(path('admission-request'));
+      const admissionGrantBytes = await lowLevel.read_verified_bytes(path('admission-grant'));
+      if (admissionRequestBytes !== null) await assertObject(path('admission-request'), Buffer.from(admissionRequestBytes));
+      if (admissionGrantBytes !== null) await assertObject(path('admission-grant'), Buffer.from(admissionGrantBytes));
+      const admissionRequest = admissionRequestBytes === null ? null : parseCanonicalJsonBytes(Buffer.from(admissionRequestBytes));
+      const admissionGrant = admissionGrantBytes === null ? null : parseCanonicalJsonBytes(Buffer.from(admissionGrantBytes));
+      const managementState = await read(path('management-state'));
       let admissionRequestArchive = null;
       let admissionGrantArchive = null;
       let acknowledgementArchive = null;
-      if (requestValue.requestedReaderMode === 'no-reader') {
-        if (admissionRequest !== null || admissionGrant !== null) {
-          refused('read_managed_mapping_snapshot', 'no-reader authority contains admission records');
-        }
-      } else {
-        const admissionRequestValue = parseCanonicalJsonBytes(Buffer.from(admissionRequest ?? Buffer.alloc(0)));
-        const admissionGrantValue = parseCanonicalJsonBytes(Buffer.from(admissionGrant ?? Buffer.alloc(0)));
-        validateAdmissionRequest(admissionRequestValue);
-        validateAdmissionGrant(admissionGrantValue, admissionRequestValue);
-        admissionRequestArchive = await lowLevel.read_verified_bytes(path(`admission-request-${encodeURIComponent(admissionRequestValue.requestId)}`));
-        admissionGrantArchive = await lowLevel.read_verified_bytes(path(`admission-grant-${encodeURIComponent(admissionGrantValue.grantId)}`));
-        acknowledgementArchive = await lowLevel.read_verified_bytes(botPath(`admission-ack-${encodeURIComponent(admissionGrantValue.grantId)}`));
-      }
-      const managementState = await read(path('management-state'));
       const terminalClose = await lowLevel.read_verified_bytes(path('terminal-close'));
       if (terminalClose !== null) await assertObject(path('terminal-close'), Buffer.from(terminalClose));
       const readerVersionFloor = await verifiedBytes(path('reader-version-floor'));
@@ -5131,6 +5167,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (readerProjection !== null) await assertObject(botPath('reader-projection'), Buffer.from(readerProjection));
       const admissionAck = await lowLevel.read_verified_bytes(botPath('acknowledgement'));
       if (admissionAck !== null) await assertObject(botPath('acknowledgement'), Buffer.from(admissionAck));
+      const acknowledgement = admissionAck === null ? null : parseCanonicalJsonBytes(Buffer.from(admissionAck));
       const readerState = await lowLevel.read_verified_bytes(botPath('reader-state'));
       if (requestValue.requestedReaderMode === 'handshake') {
         if (readerState === null) refused('read_managed_mapping_snapshot', 'bound reader state is absent');
@@ -5138,6 +5175,16 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       } else if (readerState !== null) {
         refused('read_managed_mapping_snapshot', 'no-reader authority contains reader state');
       }
+      const admissionArchives = await readGenesisAdmissionArchives({
+        request: requestValue,
+        admissionRequest,
+        admissionGrant,
+        acknowledgement,
+        managementState,
+      });
+      admissionRequestArchive = admissionArchives.request;
+      admissionGrantArchive = admissionArchives.grant;
+      acknowledgementArchive = admissionArchives.acknowledgement;
       const rvfBytes = await lowLevel.read_verified_bytes(path('rvf'));
       const receiptBytes = await lowLevel.read_verified_bytes(path('receipt'));
       if (rvfBytes === null || receiptBytes === null) {
@@ -5190,13 +5237,16 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         publicationCommittedBytes: encode(publication.committed), publicationCBytes: encode(publication.c),
         publicationQBytes: encode(publication.q), publicationZpBytes: encode(publication.zp),
         publicationKBytes: encode(publication.k), publicationYBytes: encode(publication.y),
-        admissionRequestBytes: admissionRequest === null ? undefined : Buffer.from(admissionRequest),
-        admissionGrantBytes: admissionGrant === null ? undefined : Buffer.from(admissionGrant),
+        admissionRequestBytes: admissionRequest === null ? undefined : Buffer.from(admissionRequestBytes),
+        admissionGrantBytes: admissionGrant === null ? undefined : Buffer.from(admissionGrantBytes),
+        admissionRequestArchiveBytes: admissionRequestArchive === null ? undefined : encode(admissionRequestArchive),
+        admissionGrantArchiveBytes: admissionGrantArchive === null ? undefined : encode(admissionGrantArchive),
         fenceBindingBytes: fenceBinding === null ? undefined : Buffer.from(fenceBinding),
         readerLeaseBytes: readerLease === null ? undefined : Buffer.from(readerLease),
         readerProjectionBytes: readerProjection === null ? undefined : Buffer.from(readerProjection),
         readerStateBytes: readerState === null ? undefined : Buffer.from(readerState),
         admissionAckBytes: admissionAck === null ? undefined : Buffer.from(admissionAck),
+        admissionAckArchiveBytes: acknowledgementArchive === null ? undefined : encode(acknowledgementArchive),
         manualCleanupBytes: terminalClose === null ? undefined : Buffer.from(terminalClose),
         terminalCloseBytes: terminalClose === null ? null : Buffer.from(terminalClose),
         recoveryBytes: managementState?.recovery && managementState.recovery.phase !== 'terminal'
