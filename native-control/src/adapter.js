@@ -1168,8 +1168,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     return predecessors;
   };
-  const readSealAwareHistoryMarker = async (operation = 'read_managed_history_marker') => {
-    const marker = await rawRead(historyMarkerPath);
+  const readSealAwareHistoryMarker = async (operation = 'read_managed_history_marker', markerPath = historyMarkerPath) => {
+    const marker = await rawRead(markerPath);
     if (marker === null) return { marker: null, seal: null };
     const expectedAnchor = await anchorFingerprint();
     const seal = await rawRead(path(historyMarkerSealName));
@@ -1237,14 +1237,22 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     return suffix;
   };
-  const readTerminalizationLineage = async ({ suffix = null, txId: requestedTxId = null, allowMissingName = null, genesisAuthorityRequest = null, activeRequest = null } = {}) => {
+  const readTerminalizationLineage = async ({
+    suffix = null,
+    txId: requestedTxId = null,
+    allowMissingName = null,
+    genesisAuthorityRequest = null,
+    activeRequest = null,
+    headOverride = null,
+    historyMarkerPathOverride = null,
+  } = {}) => {
     const rootGenesisTxId = suffix?.request?.rootGenesisTxId ?? (await rawRead(path('genesis-authority-request')))?.genesisTxId ?? '';
     const tx = encodeURIComponent(suffix?.txId ?? requestedTxId ?? '');
-    const [
+    let [
       request, close, fence, baseline, reservation, commit, authorityEpoch,
       authorityEpochFloor, fenceGenerationFloor, attestation, tokenFloor,
       attestationHistory, tokenFloorHistory, genesisAttestation, genesisTokenFloor,
-      publicationK, publicationY, finality, lease, projection, ack, receipt, head,
+      publicationK, publicationY, finality, lease, projection, ack, receipt,
     ] = await Promise.all([
       read(path(`authority-successor-request-${tx}`)),
       read(path(`authority-close-proof-${tx}`)),
@@ -1268,9 +1276,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       read(botPath(`successor-reader-projection-${tx}`)),
       read(botPath(`successor-ack-${tx}`)),
       read(path(`authority-successor-receipt-${tx}`)),
-      read(path('authority-head')),
     ]);
-    const historyEvidence = await readSealAwareHistoryMarker('terminal_replay');
+    const head = headOverride ?? await read(path('authority-head'));
+    const historyEvidence = await readSealAwareHistoryMarker('terminal_replay', historyMarkerPathOverride ?? historyMarkerPath);
+    const historicalHead = headOverride !== null;
+    if (historicalHead) {
+      const epoch = finality?.authorityEpoch ?? request?.candidateAuthorityEpoch;
+      authorityEpoch = await read(path(`authority-epoch-${encodeURIComponent(epoch)}-committed`));
+    }
     const committedEpoch = authorityEpoch?.epoch === undefined
       ? null
       : await read(path(`authority-epoch-${authorityEpoch.epoch}-committed`));
@@ -1292,15 +1305,20 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           canonical(committedEpoch) !== canonical(authorityEpoch)) {
         throw new TypeError('terminal successor committed epoch substitution');
       }
-      validatePublishedFloors({
-        authorityEpochFloor,
-        fenceGenerationFloor,
-        authorityEpoch,
-        anchorFingerprint: request.anchorFingerprint,
-        request,
-        head,
-        activeRequest,
-      });
+      if (historicalHead) {
+        validateAuthorityEpochFloor(authorityEpochFloor);
+        validateFenceGenerationFloor(fenceGenerationFloor);
+      } else {
+        validatePublishedFloors({
+          authorityEpochFloor,
+          fenceGenerationFloor,
+          authorityEpoch,
+          anchorFingerprint: request.anchorFingerprint,
+          request,
+          head,
+          activeRequest,
+        });
+      }
       validateTokenHistory({
         anchorFingerprint: request.anchorFingerprint,
         attestationHistory,
@@ -1339,7 +1357,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         canonical(value) !== canonical([suffix.lease, suffix.projection, suffix.ack][index]))) {
         throw new TypeError('terminal successor B substitution');
       }
-      publicationGraph = await readPublicationGraph(suffix?.txId ?? requestedTxId);
+      publicationGraph = await readPublicationGraph(suffix?.txId ?? requestedTxId, { historical: historicalHead });
       if (canonical(publicationGraph.k) !== canonical(publicationK) ||
           canonical(publicationGraph.y) !== canonical(publicationY) ||
           publicationK['publication-kFingerprint'] !== head.publicationKFingerprint ||
@@ -1371,6 +1389,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         throw new TypeError('terminal successor history marker binding');
       }
       const expectedReceipt = suffix?.receipt ?? receipt;
+      if (head.phase === 'terminal' &&
+          head.receiptFingerprint !== expectedReceipt?.receiptFingerprint) {
+        throw new TypeError('terminal successor receipt head binding');
+      }
       validateAuthoritySuccessorReceipt(
         expectedReceipt,
         request,
@@ -1443,6 +1465,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       if (!lineage ||
           (canonical(lineage.head) !== canonical(suffix.pendingHead) &&
            canonical(lineage.head) !== canonical(suffix.terminalHead))) return false;
+      if (suffix.request.sequence > 1) {
+        const predecessor = await readAuthoritativeSuccessorPredecessor(
+          suffix.pendingHead,
+          genesisAuthorityRequest,
+          suffix.request,
+          { verifyLiveTarget: false },
+        );
+        validateAuthoritySuccessorPredecessor(suffix.request, predecessor, genesisAuthorityRequest);
+      }
       return true;
     } catch {
       return false;
@@ -1764,7 +1795,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const y = buildPublicationY({ ...common, kFingerprint: k['publication-kFingerprint'], publicationFingerprint, targetState: baseline.targetState, authorityCommitSnapshotFingerprint: k.authorityCommitSnapshotFingerprint, fenceBindingFingerprint: q.fenceBindingFingerprint, targetFingerprint });
     return validatePublicationGraph(records, { transaction: expectedTransaction, u, p, s, prepared: phase('prepared'), replaced: phase('replaced'), committed: phase('committed'), c, q, zp, k, y });
   };
-  const readPublicationGraph = async (txId) => {
+  const readPublicationGraph = async (txId, { historical = false } = {}) => {
     const suffix = encodeURIComponent(txId);
     const [
       transaction, u, p, s, prepared, replaced, committed,
@@ -1777,7 +1808,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const records = { transaction, u, p, s, prepared, replaced, committed, c, q, zp, k, y };
     try {
       validatePublicationGraph(records);
-      await validateLivePublicationGraph(records);
+      if (!historical) await validateLivePublicationGraph(records);
     } catch (error) {
       refused('read_publication_graph', 'persisted publication graph is incomplete, substituted, or inconsistent with live authority');
     }
@@ -2099,10 +2130,18 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       refused(operation, 'matching durable successor receipt is required for the active reader-pending authority head');
     }
   };
-  const readAuthoritativeSuccessorPredecessor = async (head, genesisAuthorityRequest, activeRequest = null) => {
+  const readAuthoritativeSuccessorPredecessor = async (
+    head,
+    genesisAuthorityRequest,
+    activeRequest = null,
+    { verifyLiveTarget = true } = {},
+  ) => {
     const state = await read(path('management-state'));
-    await assertManagementStateCounters(state);
-    const predecessorHead = head === null || head.phase === 'terminal'
+    if (verifyLiveTarget) await assertManagementStateCounters(state);
+    const predecessorIsActiveHead = head !== null &&
+      activeRequest !== null &&
+      activeRequest.sequence === head.sequence + 1;
+    const predecessorHead = head === null || predecessorIsActiveHead
       ? head
       : head.sequence === 2
         ? null
@@ -2147,7 +2186,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         acknowledgement: genesisAcknowledgement,
         managementState: state,
       });
-      const publication = genesisRequest && await readPublicationGraph(genesisRequest.genesisTxId);
+      const publication = genesisRequest && await readPublicationGraph(genesisRequest.genesisTxId, { historical: !verifyLiveTarget });
       validateGenesisRequest(genesisRequest);
       validateGenesisPrecommit(precommit);
       validateZFinality(genesisZFinality, genesisRequest, genesisTokenFloor, precommit);
@@ -2172,11 +2211,13 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           publication.transaction.generation !== genesisRequest.generation ||
           publication.k['publication-kFingerprint'] !== precommit.publicationKFingerprint ||
           publication.y['publication-yFingerprint'] !== precommit.publicationYFingerprint ||
-          fingerprint(target.bytes) !== precommit.targetFingerprint ||
-          target.targetIdentity !== precommit.targetIdentityFingerprint ||
-          target.targetAclFingerprint !== precommit.targetAclFingerprint ||
-          control.controlRootFingerprint !== precommit.controlRootFingerprint ||
-          wrapper.wrapperFingerprint !== precommit.wrapperFingerprint) {
+          (verifyLiveTarget && (
+            fingerprint(target.bytes) !== precommit.targetFingerprint ||
+            target.targetIdentity !== precommit.targetIdentityFingerprint ||
+            target.targetAclFingerprint !== precommit.targetAclFingerprint ||
+            control.controlRootFingerprint !== precommit.controlRootFingerprint ||
+            wrapper.wrapperFingerprint !== precommit.wrapperFingerprint
+          ))) {
         throw new TypeError('successor Genesis predecessor');
       }
       if (!state.genesis || state.genesis.txId !== genesisRequest.genesisTxId ||
@@ -2185,47 +2226,69 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           state.genesis.fenceGeneration !== 1) {
         throw new TypeError('successor Genesis predecessor');
       }
-      if (!await exactPrecommitBoundary(genesisRequest, precommit)) {
+      if (verifyLiveTarget && !await exactPrecommitBoundary(genesisRequest, precommit)) {
         throw new TypeError('successor Genesis precommit boundary');
       }
+      const genesisSnapshotFingerprint = activeRequest?.previousSnapshotFingerprint ?? precommit.targetFingerprint;
+      const genesisAttestationFingerprint = genesisTokenFloor?.lastAttestationFingerprint ??
+        genesisAttestation?.attestationFingerprint ??
+        activeRequest?.previousAttestationFingerprint ??
+        state.tokenAttestation?.attestationFingerprint;
       return {
         receiptFingerprint: genesisReceipt.receiptFingerprint,
-        ...liveTarget,
-        revision: state.revision,
-        authorityEpoch: state.authorityEpoch,
-        tokenConfigGeneration: state.tokenConfigGeneration,
-        attestationFingerprint: state.tokenAttestation?.attestationFingerprint,
-        mappingGeneration: state.mappingGeneration,
-        fenceGeneration: state.fenceGeneration,
+        ...(verifyLiveTarget
+          ? liveTarget
+          : {
+            targetFingerprint: precommit.targetFingerprint,
+            wrapperFingerprint: precommit.wrapperFingerprint,
+            snapshotFingerprint: genesisSnapshotFingerprint,
+          }),
+        revision: verifyLiveTarget ? state.revision : activeRequest?.previousRevision ?? state.revision,
+        authorityEpoch: verifyLiveTarget ? state.authorityEpoch : genesisEpoch?.epoch ?? activeRequest?.previousAuthorityEpoch ?? state.authorityEpoch,
+        tokenConfigGeneration: verifyLiveTarget
+          ? state.tokenConfigGeneration
+          : genesisTokenFloor?.highestCommittedGeneration ?? activeRequest?.previousTokenConfigGeneration ?? state.tokenConfigGeneration,
+        attestationFingerprint: verifyLiveTarget
+          ? state.tokenAttestation?.attestationFingerprint
+          : genesisAttestationFingerprint,
+        mappingGeneration: verifyLiveTarget ? state.mappingGeneration : activeRequest?.previousMappingGeneration ?? state.mappingGeneration,
+        fenceGeneration: verifyLiveTarget ? state.fenceGeneration : genesisRequest.fenceGeneration,
       };
     }
     if (predecessorHead.phase !== 'terminal') throw new TypeError('successor terminal predecessor');
+    const historicalPredecessor = head !== null &&
+      (predecessorHead.txId !== head.txId || predecessorHead.sequence !== head.sequence);
     const lineage = await readTerminalizationLineage({
       txId: predecessorHead.txId,
       genesisAuthorityRequest,
       activeRequest,
+      headOverride: historicalPredecessor ? predecessorHead : null,
+      historyMarkerPathOverride: historicalPredecessor
+        ? historyMarkerArchivePath(predecessorHead.sequence)
+        : null,
     });
     if (!lineage || !lineage.head || lineage.head.headFingerprint !== predecessorHead.headFingerprint ||
         lineage.head.phase !== 'terminal' || !lineage.finality || !lineage.receipt) {
       throw new TypeError('successor terminal predecessor');
     }
     const finality = lineage.finality;
-    if (liveTarget.targetFingerprint !== finality.targetFingerprint ||
-        liveTarget.wrapperFingerprint !== finality.wrapperFingerprint ||
-        (predecessorHead === head && (state.recovery?.phase !== 'terminal' || state.recovery?.txId !== predecessorHead.txId))) {
+    if (verifyLiveTarget &&
+        (liveTarget.targetFingerprint !== finality.targetFingerprint ||
+         liveTarget.wrapperFingerprint !== finality.wrapperFingerprint ||
+         (predecessorHead === head && (state.recovery?.phase !== 'terminal' || state.recovery?.txId !== predecessorHead.txId)))) {
       throw new TypeError('successor terminal predecessor tuple');
     }
     const counters = ['revision', 'authorityEpoch', 'tokenConfigGeneration', 'mappingGeneration'];
-    if (counters.some((field) => state[field] !== finality[field])) {
+    if (verifyLiveTarget && counters.some((field) => state[field] !== finality[field])) {
       throw new TypeError('successor terminal predecessor counters');
     }
-    if (state.tokenAttestation?.attestationFingerprint !== finality.attestationFingerprint) {
+    if (verifyLiveTarget && state.tokenAttestation?.attestationFingerprint !== finality.attestationFingerprint) {
       throw new TypeError('successor terminal predecessor attestation');
     }
     return {
       receiptFingerprint: lineage.receipt.receiptFingerprint,
-      targetFingerprint: liveTarget.targetFingerprint,
-      wrapperFingerprint: liveTarget.wrapperFingerprint,
+      targetFingerprint: verifyLiveTarget ? liveTarget.targetFingerprint : finality.targetFingerprint,
+      wrapperFingerprint: verifyLiveTarget ? liveTarget.wrapperFingerprint : finality.wrapperFingerprint,
       snapshotFingerprint: lineage.receipt.snapshotFingerprint,
       revision: finality.revision,
       authorityEpoch: finality.authorityEpoch,
@@ -5269,8 +5332,19 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
                (bundle.request.readerMode === 'bound-reader' && (!bundle.lease || !bundle.projection || !bundle.ack)))) {
             throw new TypeError('successor history or reader proof');
           }
+          if (bundle.request.sequence > 1) {
+            const predecessor = await readAuthoritativeSuccessorPredecessor(
+              headBefore,
+              genesisAuthorityRequest,
+              bundle.request,
+              { verifyLiveTarget: false },
+            );
+            validateAuthoritySuccessorPredecessor(bundle.request, predecessor, genesisAuthorityRequest);
+          }
           validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest);
-        } catch { refused('read_managed_mapping_snapshot', 'successor authority bundle is torn or substituted'); }
+        } catch {
+          refused('read_managed_mapping_snapshot', 'successor authority bundle is torn or substituted');
+        }
         if (headBefore.phase === 'terminal') {
           try {
             validateAuthorityEpoch(bundle.authorityEpoch);
@@ -6299,8 +6373,19 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
              (bundle.request.readerMode === 'bound-reader' && (!bundle.lease || !bundle.projection || !bundle.ack)))) {
           throw new TypeError('successor history or reader proof');
         }
+        if (bundle.request.sequence > 1) {
+          const predecessor = await readAuthoritativeSuccessorPredecessor(
+            head,
+            genesisAuthorityRequest,
+            bundle.request,
+            { verifyLiveTarget: false },
+          );
+          validateAuthoritySuccessorPredecessor(bundle.request, predecessor, genesisAuthorityRequest);
+        }
         validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest);
-      } catch { refused('read_authority_successor_bundle', 'successor bundle is torn or substituted'); }
+      } catch {
+        refused('read_authority_successor_bundle', 'successor bundle is torn or substituted');
+      }
       if (head.phase === 'terminal') {
         try {
           validateAuthorityEpoch(bundle.authorityEpoch);
@@ -6598,7 +6683,20 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     },
     async validateAuthoritySuccessorBundle(bundle) {
       const genesisAuthorityRequest = await requireSuccessorGenesisAuthority('validate_authority_successor_bundle', bundle?.request);
-      try { return validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest); } catch { refused('validate_authority_successor_bundle', 'successor authority bundle is invalid'); }
+      try {
+        if (bundle.request.sequence > 1) {
+          const predecessor = await readAuthoritativeSuccessorPredecessor(
+            bundle.head,
+            genesisAuthorityRequest,
+            bundle.request,
+            { verifyLiveTarget: false },
+          );
+          validateAuthoritySuccessorPredecessor(bundle.request, predecessor, genesisAuthorityRequest);
+        }
+        return validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest);
+      } catch {
+        refused('validate_authority_successor_bundle', 'successor authority bundle is invalid');
+      }
     },
   };
   return Object.freeze(adapter);

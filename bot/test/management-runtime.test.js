@@ -2182,6 +2182,93 @@ test('managed successor snapshot carries sequence-three history predecessors and
     JSON.parse(snapshot.historyMarkerPredecessorsBytes.toString('utf8')),
     snapshot.successorBundle.historyMarkerPredecessors,
   );
+  harness.setPrincipal(owner);
+  const replayBundle = await harness.native.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true });
+  assert.equal(replayBundle.head.sequence, 3);
+  const validatedBundle = await harness.native.validateAuthoritySuccessorBundle(replayBundle);
+  assert.equal(validatedBundle.head.sequence, 3);
+});
+test('sequence-three detached predecessor refuses snapshot and replay without writes', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=detached-predecessor'))).ok, true);
+  for (const index of [1, 2]) {
+    const state = await harness.native.readManagementState();
+    let result;
+    if (index === 1) {
+      const candidate = mappingInput(`detached-predecessor-${index}`, state.mappingGeneration + 1, state.fenceGeneration, String(123 + index));
+      result = await runtime.execute('mapping-reconcile', {
+        actorPrincipal: owner,
+        actorSecret: secret,
+        idempotencyKey: `detached-predecessor-${index}`,
+        mappingId: candidate.mapping.mappingId,
+        ...candidate,
+        expectedRevision: state.revision,
+        expectedFingerprint: null,
+      });
+    } else {
+      result = await runtime.execute('tokens-attest', {
+        actorPrincipal: owner,
+        actorSecret: secret,
+        idempotencyKey: `detached-predecessor-${index}`,
+        hostTokens: 'host=detached-predecessor-rotated',
+      });
+    }
+    assert.equal(result.ok, true, JSON.stringify({ result, state }));
+  }
+  const predecessorHead = JSON.parse(fileEnding(harness.files, '/authority-head-2-terminal.json'));
+  const predecessorReceiptPath = filePathEnding(
+    harness.files,
+    `/authority-successor-receipt-${encodeURIComponent(predecessorHead.txId)}.json`,
+  );
+  assert.ok(predecessorReceiptPath);
+  harness.files.delete(predecessorReceiptPath);
+  harness.setPrincipal(botPrincipal);
+  const writes = harness.writes.length;
+  await assert.rejects(
+    harness.native.readManagedMappingSnapshot(),
+    /predecessor|successor|bundle|snapshot/i,
+  );
+  assert.equal(harness.writes.length, writes);
+  harness.setPrincipal(owner);
+  await assert.rejects(
+    harness.native.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true }),
+    /predecessor|successor|bundle|lineage/i,
+  );
+  assert.equal(harness.writes.length, writes);
+});
+test('sequence-two detached Genesis predecessor refuses snapshot and replay without writes', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=detached-genesis'))).ok, true);
+  const state = await harness.native.readManagementState();
+  const candidate = mappingInput('detached-genesis-map', state.mappingGeneration + 1, state.fenceGeneration, '123');
+  const result = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'detached-genesis-map',
+    mappingId: candidate.mapping.mappingId,
+    ...candidate,
+    expectedRevision: state.revision,
+    expectedFingerprint: null,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const receiptPath = filePathEnding(harness.files, '/receipt.json');
+  assert.ok(receiptPath);
+  harness.files.delete(receiptPath);
+  harness.setPrincipal(botPrincipal);
+  const writes = harness.writes.length;
+  await assert.rejects(
+    harness.native.readManagedMappingSnapshot(),
+    /predecessor|Genesis|successor|bundle|snapshot/i,
+  );
+  assert.equal(harness.writes.length, writes);
+  harness.setPrincipal(owner);
+  await assert.rejects(
+    harness.native.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true }),
+    /predecessor|Genesis|successor|bundle|lineage/i,
+  );
+  assert.equal(harness.writes.length, writes);
 });
 
 test('managed successor snapshot rejects a missing committed epoch archive', async () => {
