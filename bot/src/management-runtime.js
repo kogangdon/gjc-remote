@@ -323,7 +323,7 @@ export class ManagementRuntime {
   }
 
   #assertNative() {
-    const methods = ["readManagementState", "compareAndSwapManagementState", "readManagementAuth", "compareAndSwapManagementAuth", "readManagedHistoryMarker", "commitManagedHistoryMarker", "configureManagementRoles", "currentOsPrincipal", "managementAnchorFingerprint", "withManagementLocks", "probeProspectiveCleanup", "writeGenesisAuthorityRequest", "writeGenesisAuthorityReceipt", "reserveFenceGeneration", "commitFenceGeneration", "readFenceGenerationFloor", "reserveAuthorityEpoch", "commitAuthorityEpoch", "writeAuthorityReservation", "writeAuthorityCommitSnapshot", "writeAuthorityBaseline", "writeReaderFenceBinding", "casReaderVersionFloor", "reserveTokenFloor", "writeTokenConfigAttestation", "writeAttestedTokenFloor", "writeGenesisRequest", "commitTokenFloor", "writePublicationGraph", "writeZFinality", "writeAdmissionRequest", "writeAdmissionGrant", "readBoundReaderProof", "readSuccessorTokenLineage", "readAuthoritySuccessorHeadRaw", "completePendingGenesis", "writeFinalityProof", "writeGenesisReceipt", "recheckAdmissionFinality", "publishMapping", "reopenAdmission", "revokeMapping", "writeMappingGeneration", "readMappingGeneration", "writeMappingTombstone", "writeMappingHandoffReceipt", "mappingTargetProof", "recoverGenesisSuffix", "appendAudit", "terminalCloseOrManualCleanup", "rotateTokenSidecar"];
+    const methods = ["readManagementState", "compareAndSwapManagementState", "readManagementAuth", "compareAndSwapManagementAuth", "readManagedHistoryMarker", "commitManagedHistoryMarker", "configureManagementRoles", "currentOsPrincipal", "managementAnchorFingerprint", "withManagementLocks", "probeProspectiveCleanup", "writeGenesisAuthorityRequest", "validateGenesisAuthorityBinding", "writeGenesisAuthorityReceipt", "reserveFenceGeneration", "commitFenceGeneration", "readFenceGenerationFloor", "reserveAuthorityEpoch", "commitAuthorityEpoch", "writeAuthorityReservation", "writeAuthorityCommitSnapshot", "writeAuthorityBaseline", "writeReaderFenceBinding", "casReaderVersionFloor", "reserveTokenFloor", "writeTokenConfigAttestation", "writeAttestedTokenFloor", "writeGenesisRequest", "commitTokenFloor", "writePublicationGraph", "writeZFinality", "writeAdmissionRequest", "writeAdmissionGrant", "readBoundReaderProof", "readSuccessorTokenLineage", "readAuthoritySuccessorHeadRaw", "completePendingGenesis", "writeFinalityProof", "writeGenesisReceipt", "recheckAdmissionFinality", "publishMapping", "reopenAdmission", "revokeMapping", "writeMappingGeneration", "readMappingGeneration", "writeMappingTombstone", "writeMappingHandoffReceipt", "mappingTargetProof", "recoverGenesisSuffix", "appendAudit", "terminalCloseOrManualCleanup", "rotateTokenSidecar"];
     for (const method of methods) if (typeof this.native?.[method] !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
   }
   async #configureRoles(command, input) {
@@ -747,6 +747,15 @@ export class ManagementRuntime {
         readerStartNonce: input.requestedReaderMode === "handshake" ? input.readerStartNonce : null,
       });
       const { replayFingerprint, txId } = stableGenesisProbe(securityTuple);
+      const durableGenesis = state.recovery?.phase !== "terminal" && state.recovery?.genesisSecurityTuple !== undefined
+        ? state.recovery
+        : state.genesis?.genesisSecurityTuple !== undefined ? state.genesis : null;
+      if (durableGenesis !== null) {
+        await this.native.validateGenesisAuthorityBinding({
+          genesisSecurityTuple: durableGenesis.genesisSecurityTuple,
+          genesisTxId: durableGenesis.txId,
+        });
+      }
       let auth = await this.native.readManagementAuth();
       if (state.recovery?.phase === "handshake-pending" &&
           state.recovery.replayFingerprint === replayFingerprint &&

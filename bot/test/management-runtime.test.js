@@ -1926,7 +1926,7 @@ test('post-terminal bot projection mutation is refused without writes', async ()
   assert.equal(harness.writes.length, writes);
 });
 
-test('no-reader finality rejects foreign authority tuples and immutable admission archives without writes', async () => {
+test('no-reader finality rejects foreign authority tuples and admission records without writes', async () => {
   const foreignHarness = adapter({ legacy: false });
   const foreignRuntime = new ManagementRuntime({ native: foreignHarness.native });
   const completed = await foreignRuntime.execute('genesis', genesisInput('host=no-reader-finality'));
@@ -1951,16 +1951,15 @@ test('no-reader finality rejects foreign authority tuples and immutable admissio
   const archiveRuntime = new ManagementRuntime({ native: archiveHarness.native });
   const archiveCompleted = await archiveRuntime.execute('genesis', genesisInput('host=no-reader-archive'));
   assert.equal(archiveCompleted.ok, true, JSON.stringify(archiveCompleted));
-  const archiveRequest = JSON.parse(fileEnding(archiveHarness.files, '/genesis-request.json'));
   archiveHarness.files.set(
-    `${filePathEnding(archiveHarness.files, '/genesis-request.json').replace(/genesis-request\.json$/, '')}admission-request-${archiveRequest.genesisTxId}.json`,
+    filePathEnding(archiveHarness.files, '/genesis-request.json').replace(/genesis-request\.json$/, '') + 'admission-request.json',
     Buffer.from('{}'),
   );
   const archiveProof = JSON.parse(fileEnding(archiveHarness.files, '/rvf.json'));
   const archiveWrites = archiveHarness.writes.length;
   await assert.rejects(
     archiveHarness.native.writeFinalityProof(archiveProof),
-    /complete bound-reader finality graph is invalid|no-reader graph contains immutable admission archives/,
+    /complete bound-reader finality graph is invalid|no-reader graph contains reader records/,
   );
   assert.equal(archiveHarness.writes.length, archiveWrites);
 });

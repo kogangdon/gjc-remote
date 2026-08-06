@@ -383,8 +383,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (profile !== null && !await lowLevel.verify_exact_role_acl(name, ...roleArguments(profile))) refused('verify_management_object', 'object exact role ACL changed or is unreadable');
     return { identity, acl };
   };
-  const cleanupGenericWriteTemp = async (name, bytes, parentIdentity, profile, expectedIdentity, replacementAttempted = false, mutationParent = null) => {
+  const cleanupGenericWriteTemp = async (name, bytes, parentIdentity, profile, expectedIdentity, replacementAttempted = false, mutationParent = null, destination = null) => {
     try {
+      // A replacement may have committed before post-replace verification failed.
+      // Never remove a path that could be the destination itself.
+      if (destination !== null && name === destination) return false;
       if (await lowLevel.read_verified_bytes(name) === null) {
         return replacementAttempted ? false : !(await lowLevel.path_exists_no_follow(name));
       }
@@ -491,7 +494,47 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       refused('read_management_state', 'verified state is not canonical JSON');
     }
   };
-  const requireAuthorityRequest = async (operation) => {
+  const authorityRequestMatchesSecurityTuple = (request, tuple, expectedTxId) => {
+    try {
+      if (!tuple || Object.getPrototypeOf(tuple) !== Object.prototype ||
+          tuple.version !== 1 || tuple.kind !== 'genesis-security-tuple' ||
+          expectedTxId !== undefined && request.genesisTxId !== expectedTxId ||
+          request.fenceGeneration !== 1 || request.sequence !== 1 ||
+          request.anchorFingerprint !== tuple.anchorFingerprint ||
+          request.ownerPrincipalFingerprint !== fingerprint(encode({ kind: roleKind, value: tuple.managementRole })) ||
+          request.managementPrincipalFingerprint !== fingerprint(encode({ kind: roleKind, value: tuple.managementRole })) ||
+          request.botPrincipalFingerprint !== fingerprint(encode({ kind: roleKind, value: tuple.botRole })) ||
+          request.recoveryPrincipalFingerprint !== fingerprint(encode({ kind: roleKind, value: tuple.recoveryRole })) ||
+          tuple.actorPrincipalFingerprint !== fingerprint(encode({ kind: roleKind, value: tuple.managementRole })) ||
+          tuple.ownerPrincipalFingerprint !== fingerprint(encode({ kind: roleKind, value: tuple.managementRole })) ||
+          request.ownerPrincipalFingerprint !== tuple.ownerPrincipalFingerprint ||
+          request.managementPrincipalFingerprint !== tuple.actorPrincipalFingerprint ||
+          request.targetPrincipalFingerprint !== tuple.targetPrincipalFingerprint ||
+          request.managementProvisioningFingerprint !== tuple.managementProvisioningFingerprint ||
+          request.botProvisioningFingerprint !== tuple.botProvisioningFingerprint ||
+          request.recoveryProvisioningFingerprint !== tuple.recoveryProvisioningFingerprint ||
+          request.generation !== tuple.generation ||
+          request.requestedReaderMode !== tuple.requestedReaderMode ||
+          request.readerInstanceId !== tuple.readerInstanceId ||
+          request.readerStartNonce !== tuple.readerStartNonce ||
+          request.idempotencyKey !== tuple.idempotencyKey ||
+          request.protectedInputFingerprint !== tuple.protectedHostTokensHostSetFingerprint ||
+          request.targetInputState !== tuple.targetInputState) return false;
+      const legacy = tuple.legacyTargetProof ?? null;
+      const targetFingerprint = legacy?.rawTargetByteFingerprint ?? null;
+      const targetIdentityFingerprint = legacy === null ? null : canonicalJsonHash(legacy.targetIdentity);
+      const targetAclFingerprint = legacy?.targetAclFingerprint ?? null;
+      const legacyTargetProofFingerprint = legacy === null ? null : canonicalJsonHash(legacy);
+      return request.targetFingerprint === targetFingerprint &&
+        request.targetIdentityFingerprint === targetIdentityFingerprint &&
+        request.targetAclFingerprint === targetAclFingerprint &&
+        request.legacyTargetProofFingerprint === legacyTargetProofFingerprint &&
+        tuple.targetInputIntent === null;
+    } catch {
+      return false;
+    }
+  };
+  const requireAuthorityRequest = async (operation, { securityTuple = null, expectedTxId = undefined } = {}) => {
     const request = await rawRead(path('genesis-authority-request'));
     try { validateGenesisAuthorityRequest(request); } catch {
       refused(operation, 'complete immutable genesis authority request is required before this boundary');
@@ -506,6 +549,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           request.botProvisioningFingerprint !== prospectiveProof.botProvisioningFingerprint ||
           request.recoveryProvisioningFingerprint !== prospectiveProof.recoveryProvisioningFingerprint))) {
       refused(operation, 'genesis authority request does not bind the live prospective proof');
+    }
+    if (securityTuple !== null && !authorityRequestMatchesSecurityTuple(request, securityTuple, expectedTxId)) {
+      refused(operation, 'genesis authority request does not bind the persisted Genesis security tuple');
     }
     return request;
   };
@@ -602,13 +648,22 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const bytes = encode(value); const roleArgs = roleArguments(profile); const parentIdentity = await verifiedParent(name);
     const old = await lowLevel.read_verified_bytes(name);
     if (old === null) {
-      await assertMutationParent(cleanupOperation, expectedParent);
-      await lowLevel.create_absent_exclusive(name, bytes, ...roleArgs);
-      await assertObject(name, bytes, parentIdentity);
+      try {
+        await assertMutationParent(cleanupOperation, expectedParent);
+        await lowLevel.create_absent_exclusive(name, bytes, ...roleArgs);
+        await assertObject(name, bytes, parentIdentity);
+      } catch {
+        refused(cleanupOperation, 'generic write absent-create outcome is ambiguous; manual cleanup is required');
+      }
     } else {
       const before = await assertObject(name, Buffer.from(old), parentIdentity);
       await assertMutationParent(cleanupOperation, expectedParent);
-      const temp = await lowLevel.create_exclusive_temp(dirname(name), tempPrefix, bytes, ...roleArgs);
+      let temp;
+      try {
+        temp = await lowLevel.create_exclusive_temp(dirname(name), tempPrefix, bytes, ...roleArgs);
+      } catch {
+        refused(cleanupOperation, 'generic write temporary artifact creation is ambiguous; manual cleanup is required');
+      }
       let scratch = null;
       let replacementAttempted = false;
       try {
@@ -620,14 +675,20 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         await lowLevel.replace_existing_atomic(temp, name, ...roleArgs);
         await assertObject(name, bytes, parentIdentity, scratch.acl);
       } catch (error) {
-        if (!await cleanupGenericWriteTemp(temp, bytes, parentIdentity, profile, scratch?.identity, replacementAttempted, expectedParent)) {
+        if (!await cleanupGenericWriteTemp(temp, bytes, parentIdentity, profile, scratch?.identity, replacementAttempted, expectedParent, name)) {
           refused(cleanupOperation, 'generic write temporary artifact cleanup is ambiguous; manual cleanup is required');
         }
         throw error;
       }
     }
-    await lowLevel.flush_file(name); await lowLevel.flush_directory_or_volume(dirname(name)); await assertParent(name, parentIdentity);
-    await assertMutationParent(cleanupOperation, expectedParent);
+    try {
+      await lowLevel.flush_file(name);
+      await lowLevel.flush_directory_or_volume(dirname(name));
+      await assertParent(name, parentIdentity);
+      await assertMutationParent(cleanupOperation, expectedParent);
+    } catch {
+      refused(cleanupOperation, 'generic write post-publish outcome is ambiguous; manual cleanup is required');
+    }
   };
   const writeAuthority = async (name, value, requireRequest = true, allowTerminalReplay = false, mutationParentOverride = null) => {
     const mutationParent = mutationParentOverride ?? await verifiedParent(targetPath);
@@ -664,7 +725,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (existing !== null) {
       await assertMutationParent('write_create_once_authority', mutationParent);
       await assertObject(destination, Buffer.from(existing), parentIdentity);
-      if (Buffer.from(existing).equals(bytes)) return value;
+      if (Buffer.from(existing).equals(bytes)) {
+        await assertMutationParent('write_create_once_authority', mutationParent);
+        return value;
+      }
       refused('write_create_once_authority', 'immutable authority record already exists');
     }
     await assertMutationParent('write_create_once_authority', mutationParent);
@@ -1570,17 +1634,22 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const committedAuthorityEpoch = authorityEpoch && await read(path(`authority-epoch-${encodeURIComponent(authorityEpoch.epoch)}-committed`));
     const authorityEpochFloor = await read(path('authority-epoch-floor'));
     const fenceGenerationFloor = await read(path('fence-generation-floor'));
-    const admissionRequestArchive = request && await read(path(`admission-request-${encodeURIComponent(request.genesisTxId)}`));
-    const admissionGrantArchive = request && await read(path(`admission-grant-${encodeURIComponent(request.genesisTxId)}`));
-    const acknowledgementArchive = request && await read(botPath(`admission-ack-${encodeURIComponent(request.genesisTxId)}`));
+    let admissionRequestArchive = null;
+    let admissionGrantArchive = null;
+    let acknowledgementArchive = null;
     const managementState = await read(path('management-state'));
+    const persistedGenesisTuple = managementState?.genesis?.genesisSecurityTuple ?? managementState?.recovery?.genesisSecurityTuple;
+    const persistedGenesisTxId = managementState?.genesis?.txId ?? managementState?.recovery?.txId;
+    if (persistedGenesisTuple !== undefined) {
+      await requireAuthorityRequest('validate_stored_finality_graph', {
+        securityTuple: persistedGenesisTuple,
+        expectedTxId: persistedGenesisTxId,
+      });
+    }
     const readerHandshake = managementState?.recovery?.readerHandshake;
-    const stateAdmissionRequestArchive = readerHandshake?.request?.requestId &&
-      await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
-    const stateAdmissionGrantArchive = readerHandshake?.grant?.grantId &&
-      await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
-    const stateAcknowledgementArchive = readerHandshake?.grant?.grantId &&
-      await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+    let stateAdmissionRequestArchive = null;
+    let stateAdmissionGrantArchive = null;
+    let stateAcknowledgementArchive = null;
     const fence = await read(path('reader-fence-binding'));
     const lease = await read(botPath('lease'));
     const admissionRequest = await read(path('admission-request'));
@@ -1659,6 +1728,16 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           throw new TypeError('admission request does not bind Genesis');
         }
         validateAdmissionGrant(admissionGrant, admissionRequest);
+        admissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(admissionRequest.requestId)}`));
+        admissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(admissionGrant.grantId)}`));
+        acknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(admissionGrant.grantId)}`));
+        if (readerHandshake !== null && readerHandshake !== undefined) {
+          validateAdmissionRequest(readerHandshake.request);
+          validateAdmissionGrant(readerHandshake.grant, readerHandshake.request);
+          stateAdmissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
+          stateAdmissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+          stateAcknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+        }
         validateReaderProjection(projection, floor, tokenFloor, zFinality.zFinalityFingerprint);
         if (projection.fenceBindingFingerprint !== fence.fenceBindingFingerprint ||
             projection.leaseBindingFingerprint !== lease.leaseBindingFingerprint) {
@@ -2173,6 +2252,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           if (head && ['reader-pending', 'terminal'].includes(head.phase)) {
             await requireMatchingSuccessorReceipt(head, 'commit_managed_history_marker');
           }
+          await assertMutationParent('commit_managed_history_marker', mutationParent);
           return record;
         }
         if (current.sequence === 1 && seal === null) {
@@ -2270,6 +2350,13 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       await writeImmutableAuthority('genesis-authority-request', record, true, mutationParent);
       return record;
+    },
+    async validateGenesisAuthorityBinding({ genesisSecurityTuple, genesisTxId } = {}) {
+      await requireAuthorityRequest('validate_genesis_authority_binding', {
+        securityTuple: genesisSecurityTuple,
+        expectedTxId: genesisTxId,
+      });
+      return true;
     },
     async reserveAuthorityEpoch(record) {
       try {
@@ -2460,6 +2547,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return record;
     },
     async casReaderVersionFloor({ txId, readerInstanceId, readerStartNonce, fenceGeneration }) {
+      const mutationParent = await verifiedParent(targetPath);
       const current = await readerFloor();
       if (current.readerVersionFloor === 2) {
         if (current.firstPendingTxId !== txId || current.firstReaderInstanceId !== readerInstanceId ||
@@ -2467,6 +2555,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
             current.fenceGeneration !== fenceGeneration) {
           refused('cas_reader_version_floor', 'reader floor is already bound to another reader');
         }
+        await assertMutationParent('cas_reader_version_floor', mutationParent);
         return current;
       }
       const next = advanceReaderVersionFloor(current, { txId, readerInstanceId, readerStartNonce, fenceGeneration });
@@ -2479,6 +2568,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return next;
     },
     async writeGenesisAuthorityReceipt(record) {
+      const mutationParent = await verifiedParent(targetPath);
       const request = await read(path('genesis-authority-request'));
       try {
         validateGenesisAuthorityReceipt(record, request);
@@ -2500,6 +2590,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       if (immutable === null) await writeImmutableAuthority(`genesis-authority-receipt-${encodeURIComponent(record.genesisTxId)}`, record);
       if (current === null) await writeAuthority('genesis-authority-receipt', record);
+      await assertMutationParent('write_genesis_authority_receipt', mutationParent);
       return record;
     },
     async withManagementLocks(names, callback) { await requireManagementPrincipal('with_management_locks'); const order = ['genesis', 'mapping', 'admission']; if (!Array.isArray(names) || names.some((n, i) => !order.includes(n) || names.indexOf(n) !== i || (i && order.indexOf(n) <= order.indexOf(names[i - 1])))) refused('with_management_locks', 'lock order is invalid'); const locks = []; try { for (const n of names) locks.push(await lowLevel.acquire_native_lock(lockPath(n), ...roleArguments('authority'))); return await callback(); } finally { for (const lock of locks.reverse()) await lock.release(); } },
@@ -3094,21 +3185,29 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const authorityEpochArchive = epoch && await read(path(`authority-epoch-${encodeURIComponent(epoch.epoch)}-committed`));
       const authorityEpochFloor = await read(path('authority-epoch-floor'));
       const fenceGenerationFloor = await read(path('fence-generation-floor'));
-      const admissionRequestArchive = request && await read(path(`admission-request-${encodeURIComponent(request.genesisTxId)}`));
-      const admissionGrantArchive = request && await read(path(`admission-grant-${encodeURIComponent(request.genesisTxId)}`));
-      const acknowledgementArchive = request && await read(botPath(`admission-ack-${encodeURIComponent(request.genesisTxId)}`));
+      let admissionRequestArchive = null;
+      let admissionGrantArchive = null;
+      let acknowledgementArchive = null;
       const managementState = await read(path('management-state'));
+      const persistedGenesisTuple = managementState?.genesis?.genesisSecurityTuple ?? managementState?.recovery?.genesisSecurityTuple;
+      const persistedGenesisTxId = managementState?.genesis?.txId ?? managementState?.recovery?.txId;
       const readerHandshake = managementState?.recovery?.readerHandshake;
-      const stateAdmissionRequestArchive = readerHandshake?.request?.requestId &&
-        await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
-      const stateAdmissionGrantArchive = readerHandshake?.grant?.grantId &&
-        await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
-      const stateAcknowledgementArchive = readerHandshake?.grant?.grantId &&
-        await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+      let stateAdmissionRequestArchive = null;
+      let stateAdmissionGrantArchive = null;
+      let stateAcknowledgementArchive = null;
       const k = request && await read(path(`publication-k-${encodeURIComponent(request.genesisTxId)}`));
       const y = request && await read(path(`publication-y-${encodeURIComponent(request.genesisTxId)}`));
+      const admissionRequest = await read(path('admission-request'));
+      const admissionGrant = await read(path('admission-grant'));
+      const acknowledgement = await read(botPath('acknowledgement'));
       try {
         validateZFinality(record, request, floor, precommit);
+        if (persistedGenesisTuple !== undefined) {
+          await requireAuthorityRequest('write_z_finality', {
+            securityTuple: persistedGenesisTuple,
+            expectedTxId: persistedGenesisTxId,
+          });
+        }
         validateAuthorityReservation(authorityReservation);
         validateAuthorityCommitSnapshot(authorityCommit, authorityReservation);
         validateAuthorityEpoch(epoch);
@@ -3120,9 +3219,29 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           anchorFingerprint: request.anchorFingerprint,
           request,
         });
-        if (request.requestedReaderMode === 'no-reader' &&
-            [admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((value) => value !== null)) {
-          throw new TypeError('no-reader graph contains immutable admission archives');
+        if (request.requestedReaderMode === 'no-reader') {
+          if ([admissionRequest, admissionGrant, acknowledgement].some((value) => value !== null)) {
+            throw new TypeError('no-reader graph contains reader records');
+          }
+          if ([admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((value) => value !== null)) {
+            throw new TypeError('no-reader graph contains immutable admission archives');
+          }
+        } else if (admissionRequest !== null || admissionGrant !== null) {
+          if (admissionRequest === null || admissionGrant === null) {
+            throw new TypeError('bound-reader admission record pair is incomplete');
+          }
+          validateAdmissionRequest(admissionRequest);
+          validateAdmissionGrant(admissionGrant, admissionRequest);
+          admissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(admissionRequest.requestId)}`));
+          admissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(admissionGrant.grantId)}`));
+          acknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(admissionGrant.grantId)}`));
+          if (readerHandshake !== null && readerHandshake !== undefined) {
+            validateAdmissionRequest(readerHandshake.request);
+            validateAdmissionGrant(readerHandshake.grant, readerHandshake.request);
+            stateAdmissionRequestArchive = await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
+            stateAdmissionGrantArchive = await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+            stateAcknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+          }
         }
         if (readerHandshake !== null && readerHandshake !== undefined ||
             [stateAdmissionRequestArchive, stateAdmissionGrantArchive, stateAcknowledgementArchive].some((value) => value !== null && value !== undefined)) {
@@ -3185,6 +3304,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (pair.current === null) {
         await writeAuthority('admission-request', record, true, false, mutationParent);
       }
+      await assertMutationParent('write_admission_request', mutationParent);
       return record;
     },
     async writeAdmissionGrant(record) {
@@ -3215,6 +3335,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (pair.current === null) {
         await writeAuthority('admission-grant', record, true, false, mutationParent);
       }
+      await assertMutationParent('write_admission_grant', mutationParent);
       return record;
     },
     async writeGenesisReceipt(record) {
@@ -3406,6 +3527,13 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         validateAuthorityReservation(authorityReservation);
         validateAuthorityCommitSnapshot(authorityCommit, authorityReservation);
         validateGenesisAuthorityRequest(authorityRequest);
+        const persistedGenesisTuple = managementState?.genesis?.genesisSecurityTuple ?? managementState?.recovery?.genesisSecurityTuple;
+        const persistedGenesisTxId = managementState?.genesis?.txId ?? managementState?.recovery?.txId;
+        if (persistedGenesisTuple !== undefined &&
+            (authorityRequest.anchorFingerprint !== await anchorFingerprint() ||
+             !authorityRequestMatchesSecurityTuple(authorityRequest, persistedGenesisTuple, persistedGenesisTxId))) {
+          throw new TypeError('authority request does not bind persisted Genesis security tuple');
+        }
         validateGenesisAuthorityReceipt(authorityReceipt, authorityRequest);
         validateBaselineSnapshot(authorityBaseline);
         if (storedRequest.requestedReaderMode === 'handshake') {
@@ -3766,6 +3894,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return adapter.recoverGenesisSuffix({ recovery });
     },
     async recoverGenesisSuffix({ recovery }) {
+      const mutationParent = await verifiedParent(targetPath);
       const fail = () => refused('recover_genesis_suffix', 'persisted genesis suffix is incomplete or inconsistent; manual cleanup is required');
       const recoveryRead = async (name) => {
         try { return await read(name); } catch { fail(); }
@@ -3827,10 +3956,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const preflightAdmissionGrant = await recoveryRead(path('admission-grant'));
       const preflightProjection = await recoveryRead(botPath('reader-projection'));
       const preflightAcknowledgement = await recoveryRead(botPath('acknowledgement'));
-      const preflightImmutableAdmissionRequest = await recoveryRead(path(`admission-request-${encodeURIComponent(preflightAdmissionRequest?.requestId ?? '')}`));
-      const preflightImmutableAdmissionGrant = await recoveryRead(path(`admission-grant-${encodeURIComponent(preflightAdmissionGrant?.grantId ?? '')}`));
-      const preflightImmutableAcknowledgement = preflightAcknowledgement &&
-        await recoveryRead(botPath(`admission-ack-${encodeURIComponent(preflightAcknowledgement.grantId)}`));
+      let preflightImmutableAdmissionRequest = null;
+      let preflightImmutableAdmissionGrant = null;
+      let preflightImmutableAcknowledgement = null;
       const preflightReaderState = await recoveryRead(botPath('reader-state'));
       let preflightPublication;
       let preflightExpectedEpochFloor;
@@ -3849,6 +3977,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
             preflightProjection?.readerProjectionFingerprint ?? null,
             Date.now(),
           );
+          preflightImmutableAdmissionRequest = await recoveryRead(path(`admission-request-${encodeURIComponent(preflightAdmissionRequest.requestId)}`));
+          preflightImmutableAdmissionGrant = await recoveryRead(path(`admission-grant-${encodeURIComponent(preflightAdmissionGrant.grantId)}`));
+          preflightImmutableAcknowledgement = preflightAcknowledgement === null
+            ? null
+            : await recoveryRead(botPath(`admission-ack-${encodeURIComponent(preflightAcknowledgement.grantId)}`));
           if (preflightImmutableAdmissionRequest === null ||
               preflightImmutableAdmissionGrant === null ||
               canonical(preflightImmutableAdmissionRequest) !== canonical(preflightAdmissionRequest) ||
@@ -4266,6 +4399,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         const current = await read(path(name));
         if (current !== null) {
           if (canonical(current) !== canonical(value)) fail();
+          await assertMutationParent('recover_genesis_suffix', mutationParent);
           return current;
         }
         await writeAuthority(name, value);
@@ -4276,16 +4410,22 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const admissionRequest = await read(path('admission-request'));
       const admissionGrant = await read(path('admission-grant'));
       if (request.requestedReaderMode === 'handshake') {
+        try {
+          validateAdmissionRequest(admissionRequest);
+          validateAdmissionGrant(admissionGrant, admissionRequest);
+        } catch {
+          fail();
+        }
         await admissionRecordPreflight(
           'recover_genesis_suffix',
           'admission-request',
-          `admission-request-${encodeURIComponent(admissionRequest?.requestId ?? '')}`,
+          `admission-request-${encodeURIComponent(admissionRequest.requestId)}`,
           admissionRequest,
         );
         await admissionRecordPreflight(
           'recover_genesis_suffix',
           'admission-grant',
-          `admission-grant-${encodeURIComponent(admissionGrant?.grantId ?? '')}`,
+          `admission-grant-${encodeURIComponent(admissionGrant.grantId)}`,
           admissionGrant,
         );
         projection = await read(botPath('reader-projection'));
@@ -4962,12 +5102,21 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const admissionGrant = await lowLevel.read_verified_bytes(path('admission-grant'));
       if (admissionRequest !== null) await assertObject(path('admission-request'), Buffer.from(admissionRequest));
       if (admissionGrant !== null) await assertObject(path('admission-grant'), Buffer.from(admissionGrant));
-      const admissionRequestArchive = await lowLevel.read_verified_bytes(path(`admission-request-${encodeURIComponent(requestValue.genesisTxId)}`));
-      const admissionGrantArchive = await lowLevel.read_verified_bytes(path(`admission-grant-${encodeURIComponent(requestValue.genesisTxId)}`));
-      const acknowledgementArchive = await lowLevel.read_verified_bytes(botPath(`admission-ack-${encodeURIComponent(requestValue.genesisTxId)}`));
-      if (requestValue.requestedReaderMode === 'no-reader' &&
-          [admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((bytes) => bytes !== null)) {
-        refused('read_managed_mapping_snapshot', 'no-reader authority contains immutable admission archives');
+      let admissionRequestArchive = null;
+      let admissionGrantArchive = null;
+      let acknowledgementArchive = null;
+      if (requestValue.requestedReaderMode === 'no-reader') {
+        if (admissionRequest !== null || admissionGrant !== null) {
+          refused('read_managed_mapping_snapshot', 'no-reader authority contains admission records');
+        }
+      } else {
+        const admissionRequestValue = parseCanonicalJsonBytes(Buffer.from(admissionRequest ?? Buffer.alloc(0)));
+        const admissionGrantValue = parseCanonicalJsonBytes(Buffer.from(admissionGrant ?? Buffer.alloc(0)));
+        validateAdmissionRequest(admissionRequestValue);
+        validateAdmissionGrant(admissionGrantValue, admissionRequestValue);
+        admissionRequestArchive = await lowLevel.read_verified_bytes(path(`admission-request-${encodeURIComponent(admissionRequestValue.requestId)}`));
+        admissionGrantArchive = await lowLevel.read_verified_bytes(path(`admission-grant-${encodeURIComponent(admissionGrantValue.grantId)}`));
+        acknowledgementArchive = await lowLevel.read_verified_bytes(botPath(`admission-ack-${encodeURIComponent(admissionGrantValue.grantId)}`));
       }
       const managementState = await read(path('management-state'));
       const terminalClose = await lowLevel.read_verified_bytes(path('terminal-close'));
@@ -5214,6 +5363,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (pair.current === null) {
         await write(botPath('acknowledgement'), value, 'bot-state', true, false, mutationParent);
       }
+      await assertMutationParent('write_bot_acknowledgement', mutationParent);
       return value;
     },
     async writeAuthoritySuccessorRequest(value) {
@@ -5531,6 +5681,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return record;
     },
     async writeAuthoritySuccessorHead(value) {
+      const mutationParent = await verifiedParent(targetPath);
       await requireNoTerminalClose('write_authority_successor_head', { allowTerminalReplay: true, record: value, kind: 'head' });
       await requireManagementPrincipal('write_authority_successor_head');
       const genesisAuthorityRequest = await requireSuccessorGenesisAuthority('write_authority_successor_head', value);
@@ -5540,6 +5691,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         try {
           validateAuthoritySuccessorHead(current, request, genesisAuthorityRequest);
           await this.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true });
+          await assertMutationParent('write_authority_successor_head', mutationParent);
         } catch {
           refused('write_authority_successor_head', 'current successor head is invalid');
         }

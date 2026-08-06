@@ -1768,3 +1768,38 @@ test('identical immutable authority replay rechecks the captured config parent b
   assert.equal(fixture.calls.length, writes);
   assert.deepEqual(fixture.files, before);
 });
+test('finality restart compares the immutable authority request to the full persisted security tuple', async () => {
+  const fixture = await committedGenesisFixture('full-security-tuple-restart');
+  const state = JSON.parse(fileEnding(fixture.files, '/management-state.json'));
+  const authorityPath = [...fixture.files.keys()].find((path) =>
+    normalize(path).endsWith('/genesis-authority-request.json'));
+  const authorityRequest = JSON.parse(fixture.files.get(authorityPath));
+  const tuple = state.genesis.genesisSecurityTuple;
+  await fixture.native.validateGenesisAuthorityBinding({
+    genesisSecurityTuple: tuple,
+    genesisTxId: state.genesis.txId,
+  });
+  const tampered = {
+    ...authorityRequest,
+    botProvisioningFingerprint: 'f'.repeat(64),
+    requestFingerprint: null,
+  };
+  tampered.requestFingerprint = recordHash(tampered, 'requestFingerprint');
+  fixture.files.set(authorityPath, Buffer.from(canonicalJson(tampered)));
+  const before = new Map([...fixture.files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const writes = fixture.calls.length;
+  const restarted = createManagementNativeForTest({
+    lowLevel: fixture.lowLevel,
+    configPath: 'C:/state/channels.json',
+    roles: fixture.roles,
+  });
+  await assert.rejects(
+    restarted.validateGenesisAuthorityBinding({
+      genesisSecurityTuple: tuple,
+      genesisTxId: state.genesis.txId,
+    }),
+    /does not bind the persisted Genesis security tuple/,
+  );
+  assert.equal(fixture.calls.length, writes);
+  assert.deepEqual(fixture.files, before);
+});

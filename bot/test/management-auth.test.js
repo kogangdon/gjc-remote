@@ -66,6 +66,7 @@ function fakeNative() {
     async currentOsPrincipal() { return owner; },
     async managementAnchorFingerprint() { return hex; },
     async writeGenesisAuthorityRequest() {},
+    async validateGenesisAuthorityBinding() {},
     async writeGenesisAuthorityReceipt() {},
     async reserveAuthorityEpoch() {},
     async commitAuthorityEpoch() {},
