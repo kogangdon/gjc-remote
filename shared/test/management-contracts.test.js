@@ -6,7 +6,7 @@ import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from "../st
 import { validateFinalityProof } from "../admission-envelope.js";
 import { buildGenesisPrecommit, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateZFinality } from "../genesis-envelope.js";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationU, validatePublicationY, validatePublicationZp } from "../publication-envelope.js";
-import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest, validateManagedHistoryMarkerSeal } from "../successor-envelope.js";
+import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorPredecessor, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest, validateManagedHistoryMarkerSeal } from "../successor-envelope.js";
 
 const hex = "a".repeat(64);
 const seal = (record, field) => ({ ...record, [field]: canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field))) });
@@ -252,6 +252,34 @@ test("mapping successors require exact next mapping generation", () => {
   }, "requestFingerprint");
 
   assert.doesNotThrow(() => validateAuthoritySuccessorRequest(request));
+  const predecessor = {
+    receiptFingerprint: request.previousReceiptFingerprint,
+    targetFingerprint: request.previousTargetFingerprint,
+    wrapperFingerprint: request.previousWrapperFingerprint,
+    snapshotFingerprint: request.previousSnapshotFingerprint,
+    revision: request.previousRevision,
+    authorityEpoch: request.previousAuthorityEpoch,
+    tokenConfigGeneration: request.previousTokenConfigGeneration,
+    attestationFingerprint: request.previousAttestationFingerprint,
+    mappingGeneration: request.previousMappingGeneration,
+    fenceGeneration: request.previousFenceGeneration,
+  };
+  assert.doesNotThrow(() => validateAuthoritySuccessorPredecessor(request, predecessor));
+  const reserved = buildAuthoritySuccessorRecord({
+    version: 1, kind: "authority-successor-head", anchorFingerprint: request.anchorFingerprint, sequence: request.sequence,
+    fenceGeneration: request.candidateFenceGeneration, txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
+    operation: request.operation, phase: "reserved", requestFingerprint: request.requestFingerprint,
+    closeFingerprint: null, authorityCommitSnapshotFingerprint: null, baselineFingerprint: null,
+    publicationKFingerprint: null, publicationYFingerprint: null, finalityFingerprint: null,
+    receiptFingerprint: null, historyMarkerFingerprint: null, previousHeadFingerprint: null,
+    previousReceiptFingerprint: request.previousReceiptFingerprint, routeDisposition: "no-route", headFingerprint: null,
+  }, "headFingerprint");
+  assert.doesNotThrow(() => validateAuthoritySuccessorHeadTransition(null, reserved, request, "genesis", predecessor));
+  for (const field of Object.keys(predecessor)) {
+    const forged = { ...predecessor, [field]: typeof predecessor[field] === "number" ? predecessor[field] + 1 : "b".repeat(64) };
+    assert.throws(() => validateAuthoritySuccessorPredecessor(request, forged), /SR predecessor tuple/);
+    assert.throws(() => validateAuthoritySuccessorHeadTransition(null, reserved, request, "genesis", forged), /SR predecessor tuple/);
+  }
   const foreignRoot = buildAuthoritySuccessorRecord({ ...request, rootGenesisTxId: "foreign-genesis", requestFingerprint: null }, "requestFingerprint");
   assert.throws(() => validateAuthoritySuccessorRequest(foreignRoot, "genesis"), /Genesis authority root/);
   const retainedMapping = buildAuthoritySuccessorRecord({ ...request, targetState: "legacy-retained", requestFingerprint: null }, "requestFingerprint");
