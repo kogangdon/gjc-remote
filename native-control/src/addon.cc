@@ -459,8 +459,15 @@ bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
   bool seen[4] = {};
   for (DWORD ace_index = 0; valid && ace_index < size.AceCount; ++ace_index) {
     void* raw = nullptr;
-    if (!GetAce(applied, ace_index, &raw) ||
-        static_cast<ACE_HEADER*>(raw)->AceType != ACCESS_ALLOWED_ACE_TYPE) { valid = false; break; }
+    if (!GetAce(applied, ace_index, &raw)) {
+      valid = false;
+      break;
+    }
+    ACE_HEADER* header = static_cast<ACE_HEADER*>(raw);
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || header->AceFlags != 0) {
+      valid = false;
+      break;
+    }
     ACCESS_ALLOWED_ACE* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
     bool matched = false;
     for (size_t role = 0; role < 4; ++role) {
@@ -502,10 +509,15 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
   if (valid && !ConvertStringSidToSidW(L"S-1-5-18", &configured_system_sid)) valid = false;
   for (DWORD index = 0; valid && index < size.AceCount; ++index) {
     void* raw = nullptr;
-    if (!GetAce(dacl, index, &raw)) { valid = false; break; }
+    if (!GetAce(dacl, index, &raw)) {
+      valid = false;
+      break;
+    }
     ACE_HEADER* header = static_cast<ACE_HEADER*>(raw);
-    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE ||
-        (header->AceFlags & INHERITED_ACE) != 0) { valid = false; break; }
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || header->AceFlags != 0) {
+      valid = false;
+      break;
+    }
     ACCESS_ALLOWED_ACE* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
     PSID sid = reinterpret_cast<PSID>(&ace->SidStart);
     if (!IsValidSid(sid)) { valid = false; break; }
@@ -767,7 +779,8 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   bool selected_named_user = false;
   bool seen_user_object = false, seen_group_object = false, seen_other = false, seen_mask = false;
   bool has_named_entries = false;
-  std::vector<gid_t> named_groups;
+  struct NamedGroupPermission { gid_t gid; mode_t bits; };
+  std::vector<NamedGroupPermission> named_groups;
   acl_entry_t entry;
   int state = ACL_FIRST_ENTRY;
   int entry_result = 0;
@@ -806,8 +819,9 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
       has_named_entries = true;
       gid_t* qualifier = static_cast<gid_t*>(acl_get_qualifier(entry));
       if (!qualifier) { acl_free(acl); return false; }
-      named_groups.push_back(*qualifier);
-      named_group_bits |= bits();
+      const mode_t group_bits = bits();
+      named_groups.push_back({*qualifier, group_bits});
+      named_group_bits |= group_bits;
       acl_free(qualifier);
     } else if (tag == ACL_MASK) {
       if (seen_mask) { acl_free(acl); return false; }
@@ -837,14 +851,20 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   std::vector<gid_t> principal_groups;
   if (!PrincipalGroups(principal, &principal_groups)) return false;
   bool group_match = false;
+  mode_t effective_group = 0;
   for (gid_t group : principal_groups) {
-    if (group == st.st_gid) { group_match = true; break; }
-    for (gid_t named : named_groups) {
-      if (group == named) { group_match = true; break; }
+    if (group == st.st_gid) {
+      group_match = true;
+      effective_group |= group_object_bits;
     }
-    if (group_match) break;
+    for (const NamedGroupPermission& named : named_groups) {
+      if (group == named.gid) {
+        group_match = true;
+        effective_group |= named.bits;
+      }
+    }
   }
-  const mode_t effective_group = (group_object_bits | named_group_bits) & mask;
+  effective_group &= mask;
   if (group_match) return (effective_group & requested) == requested;
   return (other_bits & requested) == requested;
 }

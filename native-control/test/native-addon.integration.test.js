@@ -203,6 +203,85 @@ test("POSIX principal access rejects writable ACL_OTHER, ACL_GROUP, and named gr
     await rm(root, { recursive: true, force: true });
   }
 });
+test("POSIX named ACL groups match only principals that belong to each GID", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("POSIX ACL probe is Linux-only");
+    return;
+  }
+  if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
+    t.skip("verified native addon is not built for this checkout");
+    return;
+  }
+  const addonBytes = readFileSync(addonUrl);
+  const manifest = JSON.parse(readFileSync(manifestUrl, "utf8"));
+  const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
+  if (!validateBuildManifest(manifest, packageJson, addonBytes, "linux", process.arch)) {
+    t.skip("native build belongs to a different platform or architecture");
+    return;
+  }
+
+  const addon = require(fileURLToPath(addonUrl));
+  const currentUid = Number(String(addon.current_os_principal().value).replace(/^uid:/, ""));
+  const users = readFileSync("/etc/passwd", "utf8").split("\n")
+    .map((line) => line.split(":"))
+    .filter((fields) => fields.length > 3 && fields[0] && /^\d+$/.test(fields[2]) && /^\d+$/.test(fields[3]));
+  let matching = null;
+  let nonMatching = null;
+  for (const fields of users) {
+    const uid = Number(fields[2]);
+    const gid = Number(fields[3]);
+    if (uid === currentUid) continue;
+    let groups;
+    try {
+      const result = await execFile("id", ["-G", fields[0]]);
+      groups = new Set(result.stdout.trim().split(/\s+/).filter(Boolean).map(Number));
+    } catch {
+      continue;
+    }
+    groups.add(gid);
+    if (matching === null) {
+      matching = { uid, gid };
+      continue;
+    }
+    if (uid !== matching.uid && !groups.has(matching.gid)) {
+      nonMatching = { uid, gid };
+      break;
+    }
+  }
+  if (!matching || !nonMatching) {
+    t.skip("no distinct local POSIX principals with separate group membership are available");
+    return;
+  }
+
+  const root = await mkdtemp(join(tmpdir(), "gjc-native-named-group-"));
+  const target = join(root, "named-group.txt");
+  try {
+    await writeFile(target, Buffer.from("named-group"));
+    await chmod(target, 0o600);
+    try {
+      await execFile("setfacl", ["-m", `g:${matching.gid}:r--`, target]);
+    } catch (error) {
+      if (error?.code === "ENOENT" || /not supported|operation not permitted/i.test(error?.stderr ?? "")) {
+        t.skip("setfacl or filesystem ACL support is unavailable");
+        return;
+      }
+      throw error;
+    }
+
+    assert.equal(
+      await addon.principal_access_check(target, "uid", `uid:${matching.uid}`, "read"),
+      true,
+      "a principal belonging to the named ACL group receives that group's read permission",
+    );
+    assert.equal(
+      await addon.principal_access_check(target, "uid", `uid:${nonMatching.uid}`, "read"),
+      false,
+      "a principal outside the named ACL group does not receive its read permission",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 test("native source contains fail-closed ACL and publication guards", () => {
   const source = readFileSync(fileURLToPath(new URL("../src/addon.cc", import.meta.url)), "utf8");
   const parentMutation = source.match(/constexpr DWORD kWindowsMutationParentAccess =([\s\S]*?);/)?.[1] ?? "";
@@ -235,4 +314,15 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /bool VerifyWindowsNamedIdentity\(HANDLE parent/);
   assert.match(source, /published_info\.nFileIndexHigh == temporary_info\.nFileIndexHigh/);
   assert.match(source, /source_absent/);
+  const exactRoleAclStart = source.indexOf("bool VerifyExactRoleAcl(HANDLE");
+  const exactRoleAclEnd = source.indexOf("bool ApplyExactRoleAcl(HANDLE", exactRoleAclStart);
+  const exactRoleAcl = source.slice(exactRoleAclStart, exactRoleAclEnd);
+  assert.match(exactRoleAcl, /header->AceType != ACCESS_ALLOWED_ACE_TYPE \|\| header->AceFlags != 0/);
+  const noGroupAclStart = source.indexOf("bool VerifyNoGroupMutationAcl(HANDLE");
+  const noGroupAclEnd = source.indexOf("HANDLE CreateProtectedFileNoFollow", noGroupAclStart);
+  const noGroupAcl = source.slice(noGroupAclStart, noGroupAclEnd);
+  assert.match(noGroupAcl, /header->AceType != ACCESS_ALLOWED_ACE_TYPE \|\| header->AceFlags != 0/);
+  assert.match(source, /struct NamedGroupPermission \{ gid_t gid; mode_t bits; \}/);
+  assert.match(source, /named_groups\.push_back\(\{\*qualifier, group_bits\}\)/);
+  assert.match(source, /effective_group \|= named\.bits/);
 });
