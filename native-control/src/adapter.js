@@ -809,6 +809,50 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         state.admission?.phase !== 'closed') {
       refused(operation, 'bound-reader writers require the handshake-pending closed lifecycle');
     }
+    const readerHandshake = state?.recovery?.readerHandshake;
+    if (!readerHandshake || Object.getPrototypeOf(readerHandshake) !== Object.prototype ||
+        Object.keys(readerHandshake).length !== 5 ||
+        !['requestFingerprint', 'grantFingerprint', 'expiresAt', 'request', 'grant'].every((key) => Object.hasOwn(readerHandshake, key))) {
+      refused(operation, 'durable reader handshake is absent or malformed');
+    }
+    const admissionRequest = await read(path('admission-request'));
+    const admissionGrant = await read(path('admission-grant'));
+    const acknowledgement = await read(botPath('acknowledgement'));
+    const immutableAcknowledgement = await read(
+      botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant?.grantId ?? '')}`),
+    );
+    try {
+      validateAdmissionRequest(readerHandshake.request);
+      validateAdmissionGrant(readerHandshake.grant, readerHandshake.request, Date.now());
+      validateAdmissionGenesisBinding(request, readerHandshake.request, readerHandshake.grant, null, null, Date.now());
+      if (readerHandshake.requestFingerprint !== readerHandshake.request.requestFingerprint ||
+          readerHandshake.grantFingerprint !== readerHandshake.grant.grantFingerprint ||
+          readerHandshake.expiresAt !== readerHandshake.grant.expiresAt ||
+          canonical(readerHandshake.request) !== canonical(admissionRequest) ||
+          canonical(readerHandshake.grant) !== canonical(admissionGrant)) {
+        throw new TypeError('durable reader handshake tuple mismatch');
+      }
+      await admissionRecordPreflight(
+        operation,
+        'admission-request',
+        `admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`,
+        readerHandshake.request,
+      );
+      await admissionRecordPreflight(
+        operation,
+        'admission-grant',
+        `admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`,
+        readerHandshake.grant,
+      );
+      if (acknowledgement !== null || immutableAcknowledgement !== null) {
+        validateAdmissionRecordPair(acknowledgement, immutableAcknowledgement, {
+          label: 'admission acknowledgement',
+        });
+        validateAdmissionGenesisBinding(request, readerHandshake.request, readerHandshake.grant, acknowledgement);
+      }
+    } catch {
+      refused(operation, 'durable reader handshake or immutable admission archives are invalid');
+    }
     const precommit = await read(path('genesis-precommit-proof'));
     const floor = await read(path('reader-version-floor'));
     const tokenFloor = await read(path('token-floor'));

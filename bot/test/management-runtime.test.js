@@ -412,6 +412,48 @@ test('pending bootstrap rejects mutable/archive drift before any bot writes', as
   await assert.rejects(harness.native.readPendingReaderBootstrap(), /pending reader authority/);
   assert.equal(harness.writes.length, writes);
 });
+test('pending bot writers require durable handshake and immutable admission archives before writes', async () => {
+  const cases = [
+    ['missing durable handshake', (harness) => {
+      const statePath = filePathEnding(harness.files, '/management-state.json');
+      const state = JSON.parse(harness.files.get(statePath));
+      delete state.recovery.readerHandshake;
+      harness.files.set(statePath, Buffer.from(canonicalJson(state)));
+    }],
+    ['substituted request archive', (harness) => {
+      const request = JSON.parse(fileEnding(harness.files, '/admission-request.json'));
+      const archivePath = filePathEnding(harness.files, `/admission-request-${request.requestId}.json`);
+      const archive = JSON.parse(harness.files.get(archivePath));
+      archive.nonce = 'foreign-pending-writer-nonce';
+      archive.requestFingerprint = canonicalJsonHash(
+        Object.fromEntries(Object.entries(archive).filter(([key]) => key !== 'requestFingerprint')),
+      );
+      harness.files.set(archivePath, Buffer.from(canonicalJson(archive)));
+    }],
+    ['substituted acknowledgement archive', (harness) => {
+      const grant = JSON.parse(fileEnding(harness.files, '/admission-grant.json'));
+      const grantPath = filePathEnding(harness.files, '/admission-grant.json');
+      const archivePath = grantPath.replace(
+        /admission-grant\.json$/,
+        `bot-state${grantPath.includes('\\') ? '\\' : '/'}admission-ack-${grant.grantId}.json`,
+      );
+      const acknowledgement = buildAdmissionAck(grant, 'a'.repeat(64));
+      harness.files.set(archivePath, Buffer.from(canonicalJson(acknowledgement)));
+    }],
+  ];
+  for (const [label, mutate] of cases) {
+    const harness = await boundReaderRuntime({ complete: false });
+    mutate(harness);
+    harness.setPrincipal(botPrincipal);
+    const writes = harness.writes.length;
+    await assert.rejects(
+      harness.native.acquireBotLease({}),
+      /durable reader handshake|immutable admission archives/,
+      label,
+    );
+    assert.equal(harness.writes.length, writes, `${label} must be write-free`);
+  }
+});
 
 function mappingInput(mappingId, generation = 1) {
   const mapping = fingerprintManagedMappingRecord({
