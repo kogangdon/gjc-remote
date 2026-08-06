@@ -640,6 +640,8 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   const authorityCommit = parseAuthorityBytes(snapshot.authorityCommitBytes);
   const authorityBaseline = parseAuthorityBytes(snapshot.authorityBaselineBytes);
   const authorityEpoch = parseAuthorityBytes(snapshot.authorityEpochBytes);
+  if (!isBytes(snapshot.authorityEpochArchiveBytes)) throw new TypeError("authority epoch archive absent");
+  const authorityEpochArchive = parseAuthorityBytes(snapshot.authorityEpochArchiveBytes);
   validatePublishedFloors({
     authorityEpochFloor,
     fenceGenerationFloor,
@@ -682,6 +684,22 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   validateAuthorityReservation(authorityReservation);
   validateAuthorityCommitSnapshot(authorityCommit, authorityReservation);
   validateAuthorityEpoch(authorityEpoch);
+  validateAuthorityEpoch(authorityEpochArchive);
+  if (canonicalJson(authorityEpochArchive) !== canonicalJson(authorityEpoch) ||
+      authorityReservation.txId !== request.genesisTxId ||
+      authorityReservation.generation !== request.generation ||
+      authorityReservation.anchorFingerprint !== request.anchorFingerprint ||
+      authorityReservation.candidateFingerprint !== request.requestFingerprint ||
+      authorityCommit.txId !== request.genesisTxId ||
+      authorityCommit.generation !== request.generation ||
+      authorityCommit.anchorFingerprint !== request.anchorFingerprint ||
+      authorityCommit.candidateFingerprint !== request.requestFingerprint ||
+      authorityReservation.epoch !== authorityEpoch.epoch ||
+      authorityCommit.epoch !== authorityEpoch.epoch ||
+      authorityEpoch.reservationTxId !== request.genesisTxId ||
+      authorityEpoch.commitTxId !== request.genesisTxId) {
+    throw new TypeError("authority finality graph binding");
+  }
   validateBaselineSnapshot(authorityBaseline);
   validateGenesisAuthorityReceipt(authorityReceipt, authorityRequest);
   const graph = validatePublicationGraph({
@@ -724,6 +742,14 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
       authorityReceipt.readerVersionFloorFingerprint !== readerFloor.floorFingerprint ||
       precommit.reservationFingerprint !== reservation.floorFingerprint ||
       precommit.attestedProofFingerprint !== attestedProof.attestedProofFingerprint ||
+      precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
+        admissionClosed: true,
+        admissionDrained: true,
+        admissionGrantWrites: 0,
+        admissionAckWrites: 0,
+        outstandingAdmissionGrants: 0,
+        txId: request.genesisTxId,
+      }) ||
       precommit.authorityReservationFingerprint !== authorityReservation.reservationFingerprint ||
       precommit.authorityCommitSnapshotFingerprint !== authorityCommit.authorityCommitSnapshotFingerprint ||
       precommit.publicationKFingerprint !== publicationK["publication-kFingerprint"] ||
@@ -905,10 +931,17 @@ export async function createManagedAuthorityReader({
       return false;
     }
     const pending = await native.readPendingReaderBootstrap();
-    const { request, floor, tokenFloor, zFinality, precommit, commit, fence, admissionRequest, admissionGrant, authorityEpoch, authorityEpochFloor, fenceGenerationFloor } = pending;
+    const {
+      request, floor, tokenFloor, zFinality, precommit, commit, fence, admissionRequest, admissionGrant,
+      authorityReservation, authorityEpoch, authorityEpochArchive, authorityEpochFloor, fenceGenerationFloor,
+    } = pending;
     validateReaderVersionFloor(floor);
     validateTokenFloor(tokenFloor);
     validateZFinality(zFinality, request, tokenFloor, precommit);
+    validateAuthorityReservation(authorityReservation);
+    validateAuthorityCommitSnapshot(commit, authorityReservation);
+    validateAuthorityEpoch(authorityEpoch);
+    validateAuthorityEpoch(authorityEpochArchive);
     validatePublishedFloors({
       authorityEpochFloor,
       fenceGenerationFloor,
@@ -916,6 +949,36 @@ export async function createManagedAuthorityReader({
       anchorFingerprint: request.anchorFingerprint,
       request,
     });
+    if (canonicalJson(authorityEpochArchive) !== canonicalJson(authorityEpoch) ||
+        authorityReservation.txId !== request.genesisTxId ||
+        authorityReservation.generation !== request.generation ||
+        authorityReservation.anchorFingerprint !== request.anchorFingerprint ||
+        authorityReservation.candidateFingerprint !== request.requestFingerprint ||
+        commit.txId !== request.genesisTxId ||
+        commit.generation !== request.generation ||
+        commit.anchorFingerprint !== request.anchorFingerprint ||
+        commit.candidateFingerprint !== request.requestFingerprint ||
+        authorityReservation.epoch !== authorityEpoch.epoch ||
+        commit.epoch !== authorityEpoch.epoch ||
+        authorityEpoch.reservationTxId !== request.genesisTxId ||
+        authorityEpoch.commitTxId !== request.genesisTxId ||
+        precommit.genesisTxId !== request.genesisTxId ||
+        precommit.generation !== request.generation ||
+        precommit.requestFingerprint !== request.requestFingerprint ||
+        precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
+          admissionClosed: true,
+          admissionDrained: true,
+          admissionGrantWrites: 0,
+          admissionAckWrites: 0,
+          outstandingAdmissionGrants: 0,
+          txId: request.genesisTxId,
+        }) ||
+        precommit.authorityReservationFingerprint !== authorityReservation.reservationFingerprint ||
+        precommit.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint ||
+        precommit.authorityEpochFingerprint !== authorityEpoch.authorityEpochFingerprint ||
+        precommit.readerVersionFloorFingerprint !== floor.floorFingerprint) {
+      throw new TypeError("pending authority graph binding");
+    }
     validateFenceBinding(fence, commit, floor);
     validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, null, null, Date.now());
 
@@ -1104,7 +1167,7 @@ export async function createManagedAuthorityReader({
           !isBytes(snapshot.genesisRequestBytes) || !isBytes(snapshot.zFinalityBytes) || !isBytes(snapshot.rvfBytes) ||
           !isBytes(snapshot.receiptBytes) || !isBytes(snapshot.authorityRequestBytes) || !isBytes(snapshot.authorityReceiptBytes) ||
           !isBytes(snapshot.authorityReservationBytes) || !isBytes(snapshot.authorityCommitBytes) || !isBytes(snapshot.authorityBaselineBytes) ||
-          !isBytes(snapshot.authorityEpochBytes) || !isBytes(snapshot.publicationTransactionBytes) ||
+          !isBytes(snapshot.authorityEpochBytes) || !isBytes(snapshot.authorityEpochArchiveBytes) || !isBytes(snapshot.publicationTransactionBytes) ||
           !isBytes(snapshot.publicationUBytes) || !isBytes(snapshot.publicationPBytes) ||
           !isBytes(snapshot.publicationSBytes) || !isBytes(snapshot.publicationPreparedBytes) ||
           !isBytes(snapshot.publicationReplacedBytes) || !isBytes(snapshot.publicationCommittedBytes) ||

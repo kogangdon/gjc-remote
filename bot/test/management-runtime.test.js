@@ -1895,3 +1895,72 @@ test('Genesis replay refuses missing finality receipt before suffix reconstructi
   assert.equal((await harness.native.readManagementState()).recovery.phase, 'manual_cleanup');
   assert.ok(fileEnding(harness.files, '/terminal-close.json'));
 });
+test('pending bootstrap rejects a foreign authority reservation without bot writes', async () => {
+  const harness = await boundReaderRuntime({ complete: false });
+  const request = JSON.parse(fileEnding(harness.files, '/genesis-request.json'));
+  const reservationPath = filePathEnding(harness.files, `/authority-reservation-${request.genesisTxId}.json`);
+  const foreign = JSON.parse(harness.files.get(reservationPath));
+  foreign.txId = 'foreign-authority-reservation';
+  foreign.reservationFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(foreign).filter(([key]) => key !== 'reservationFingerprint')),
+  );
+  harness.files.set(reservationPath, Buffer.from(canonicalJson(foreign)));
+  harness.setPrincipal(botPrincipal);
+  const writes = harness.writes.length;
+  await assert.rejects(
+    harness.native.readPendingReaderBootstrap(),
+    /pending reader authority is incomplete or inconsistent/,
+  );
+  assert.equal(harness.writes.length, writes);
+});
+
+test('post-terminal bot projection mutation is refused without writes', async () => {
+  const harness = await boundReaderRuntime({ complete: true });
+  const projection = JSON.parse(fileEnding(harness.files, '/bot-state/reader-projection.json'));
+  harness.setPrincipal(botPrincipal);
+  const writes = harness.writes.length;
+  await assert.rejects(
+    harness.native.writeBotReaderProjection(projection),
+    /handshake-pending closed lifecycle/,
+  );
+  assert.equal(harness.writes.length, writes);
+});
+
+test('no-reader finality rejects foreign authority tuples and immutable admission archives without writes', async () => {
+  const foreignHarness = adapter({ legacy: false });
+  const foreignRuntime = new ManagementRuntime({ native: foreignHarness.native });
+  const completed = await foreignRuntime.execute('genesis', genesisInput('host=no-reader-finality'));
+  assert.equal(completed.ok, true, JSON.stringify(completed));
+  const request = JSON.parse(fileEnding(foreignHarness.files, '/genesis-request.json'));
+  const reservationPath = filePathEnding(foreignHarness.files, `/authority-reservation-${request.genesisTxId}.json`);
+  const foreign = JSON.parse(foreignHarness.files.get(reservationPath));
+  foreign.txId = 'foreign-authority-reservation';
+  foreign.reservationFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(foreign).filter(([key]) => key !== 'reservationFingerprint')),
+  );
+  foreignHarness.files.set(reservationPath, Buffer.from(canonicalJson(foreign)));
+  const proof = JSON.parse(fileEnding(foreignHarness.files, '/rvf.json'));
+  const foreignWrites = foreignHarness.writes.length;
+  await assert.rejects(
+    foreignHarness.native.writeFinalityProof(proof),
+    /complete bound-reader finality graph is invalid/,
+  );
+  assert.equal(foreignHarness.writes.length, foreignWrites);
+
+  const archiveHarness = adapter({ legacy: false });
+  const archiveRuntime = new ManagementRuntime({ native: archiveHarness.native });
+  const archiveCompleted = await archiveRuntime.execute('genesis', genesisInput('host=no-reader-archive'));
+  assert.equal(archiveCompleted.ok, true, JSON.stringify(archiveCompleted));
+  const archiveRequest = JSON.parse(fileEnding(archiveHarness.files, '/genesis-request.json'));
+  archiveHarness.files.set(
+    `${filePathEnding(archiveHarness.files, '/genesis-request.json').replace(/genesis-request\.json$/, '')}admission-request-${archiveRequest.genesisTxId}.json`,
+    Buffer.from('{}'),
+  );
+  const archiveProof = JSON.parse(fileEnding(archiveHarness.files, '/rvf.json'));
+  const archiveWrites = archiveHarness.writes.length;
+  await assert.rejects(
+    archiveHarness.native.writeFinalityProof(archiveProof),
+    /complete bound-reader finality graph is invalid|no-reader graph contains immutable admission archives/,
+  );
+  assert.equal(archiveHarness.writes.length, archiveWrites);
+});

@@ -534,6 +534,12 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         (state !== null && state?.admission?.phase !== 'closed')) {
       refused(operation, 'post-terminal admission records are forbidden; route disposition is no-route');
     }
+    if (!state || state.recovery?.phase !== 'handshake-pending' ||
+        state.recovery?.txId !== request.genesisTxId ||
+        state.recovery?.requestFingerprint !== request.requestFingerprint ||
+        state.admission?.phase !== 'closed') {
+      refused(operation, 'admission writers require the handshake-pending closed lifecycle');
+    }
     return request;
   };
   const admissionRecordPreflight = async (operation, name, immutableName, value, {
@@ -569,14 +575,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   };
   const writeImmutableBot = async (name, value, operation, mutationParent = null) => {
     const destination = botPath(name);
+    const expectedParent = mutationParent ?? await verifiedParent(targetPath);
     const existing = await read(destination);
     if (existing !== null) {
       if (canonical(existing) !== canonical(value)) refused(operation, 'immutable admission acknowledgement substitution is not permitted');
+      await assertMutationParent(operation, expectedParent);
       return;
     }
     const bytes = encode(value);
     const parentIdentity = await verifiedParent(destination);
-    const expectedParent = mutationParent ?? await verifiedParent(targetPath);
     await assertMutationParent(operation, expectedParent);
     await lowLevel.create_absent_exclusive(destination, bytes, ...roleArguments('bot-state'));
     await assertObject(destination, bytes, parentIdentity, undefined, 'bot-state');
@@ -655,6 +662,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const destination = path(name); const bytes = encode(value); const parentIdentity = await verifiedParent(destination);
     const existing = await lowLevel.read_verified_bytes(destination);
     if (existing !== null) {
+      await assertMutationParent('write_create_once_authority', mutationParent);
       await assertObject(destination, Buffer.from(existing), parentIdentity);
       if (Buffer.from(existing).equals(bytes)) return value;
       refused('write_create_once_authority', 'immutable authority record already exists');
@@ -667,6 +675,69 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     await lowLevel.flush_file(destination); await lowLevel.flush_directory_or_volume(dirname(destination)); await assertParent(destination, parentIdentity);
     await assertMutationParent('write_create_once_authority', mutationParent);
     return value;
+  };
+  const pendingReaderWriterGenesis = async (operation) => {
+    await requireNoTerminalClose(operation);
+    const request = await read(path('genesis-request'));
+    if (!request || request.requestedReaderMode !== 'handshake') {
+      refused(operation, 'bound-reader handshake Genesis is required');
+    }
+    const state = await read(path('management-state'));
+    if (!state || state.recovery?.phase !== 'handshake-pending' ||
+        state.recovery?.txId !== request.genesisTxId ||
+        state.recovery?.requestFingerprint !== request.requestFingerprint ||
+        state.admission?.phase !== 'closed') {
+      refused(operation, 'bound-reader writers require the handshake-pending closed lifecycle');
+    }
+    const precommit = await read(path('genesis-precommit-proof'));
+    const floor = await read(path('reader-version-floor'));
+    const tokenFloor = await read(path('token-floor'));
+    const zFinality = await read(path('z-finality'));
+    const authorityEpochFloor = await read(path('authority-epoch-floor'));
+    const fenceGenerationFloor = await read(path('fence-generation-floor'));
+    if (!await exactPrecommitBoundary(request, precommit)) {
+      refused(operation, 'exact live precommit boundary is invalid');
+    }
+    const authorityReservation = await read(path(`authority-reservation-${encodeURIComponent(request.genesisTxId)}`));
+    const authorityCommit = await read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`));
+    const authorityEpoch = await read(path('authority-epoch'));
+    const authorityEpochArchive = authorityEpoch &&
+      await read(path(`authority-epoch-${encodeURIComponent(authorityEpoch.epoch)}-committed`));
+    try {
+      validateReaderVersionFloor(floor);
+      validateTokenFloor(tokenFloor);
+      validateZFinality(zFinality, request, tokenFloor, precommit);
+      validateAuthorityReservation(authorityReservation);
+      validateAuthorityCommitSnapshot(authorityCommit, authorityReservation);
+      validateAuthorityEpoch(authorityEpoch);
+      validateAuthorityEpoch(authorityEpochArchive);
+      validatePublishedFloors({
+        authorityEpochFloor,
+        fenceGenerationFloor,
+        authorityEpoch,
+        anchorFingerprint: request.anchorFingerprint,
+        request,
+      });
+    } catch {
+      refused(operation, 'pending authority reservation, commit, epoch, and floors are invalid');
+    }
+    if (authorityEpochArchive === null ||
+        canonical(authorityEpochArchive) !== canonical(authorityEpoch) ||
+        authorityReservation.txId !== request.genesisTxId ||
+        authorityReservation.generation !== request.generation ||
+        authorityReservation.anchorFingerprint !== request.anchorFingerprint ||
+        authorityReservation.candidateFingerprint !== request.requestFingerprint ||
+        authorityCommit.txId !== request.genesisTxId ||
+        authorityCommit.generation !== request.generation ||
+        authorityCommit.anchorFingerprint !== request.anchorFingerprint ||
+        authorityCommit.candidateFingerprint !== request.requestFingerprint ||
+        authorityReservation.epoch !== authorityEpoch.epoch ||
+        authorityCommit.epoch !== authorityEpoch.epoch ||
+        authorityEpoch.reservationTxId !== request.genesisTxId ||
+        authorityEpoch.commitTxId !== request.genesisTxId) {
+      refused(operation, 'pending authority graph does not bind Genesis');
+    }
+    return request;
   };
   const verifiedBytes = async (name) => { const bytes = await lowLevel.read_verified_bytes(name); if (bytes === null) refused('read_managed_mapping_snapshot', 'required managed record is absent'); const verified = await assertObject(name, Buffer.from(bytes)); return { bytes: Buffer.from(bytes), ...verified }; };
   const reservationValid = (r) => { try { validateTokenFloorReservation(r); return true; } catch { return false; } };
@@ -1190,6 +1261,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
   };
   const persistTerminalizationSuffix = async (suffix, genesisAuthorityRequest = null) => {
+    const mutationParent = await verifiedParent(targetPath);
     validateTerminalizationSuffix(suffix, genesisAuthorityRequest);
     const receiptName = path(`authority-successor-receipt-${encodeURIComponent(suffix.txId)}`);
     const lineage = await readTerminalizationLineage({
@@ -1200,8 +1272,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (!lineage) refused('terminal_close', 'terminalization lineage is incomplete or not bound to durable token and authority floors');
     const name = `terminalization-suffix-${encodeURIComponent(suffix.txId)}`;
     const existing = await read(path(name));
-    if (existing !== null && canonical(existing) !== canonical(suffix)) {
-      refused('terminal_close', 'immutable terminalization suffix conflicts with the durable suffix');
+    if (existing !== null) {
+      if (canonical(existing) !== canonical(suffix)) {
+        refused('terminal_close', 'immutable terminalization suffix conflicts with the durable suffix');
+      }
+      await assertMutationParent('terminal_close', mutationParent);
     }
     if (existing === null) await writeCreateOnceAuthority(name, suffix, false, true);
     return suffix;
@@ -1491,6 +1566,21 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const floor = await read(path('reader-version-floor'));
     const commit = await read(path(`authority-commit-${encodeURIComponent(request?.genesisTxId ?? '')}`));
     const authorityReservation = await read(path(`authority-reservation-${encodeURIComponent(request?.genesisTxId ?? '')}`));
+    const authorityEpoch = await read(path('authority-epoch'));
+    const committedAuthorityEpoch = authorityEpoch && await read(path(`authority-epoch-${encodeURIComponent(authorityEpoch.epoch)}-committed`));
+    const authorityEpochFloor = await read(path('authority-epoch-floor'));
+    const fenceGenerationFloor = await read(path('fence-generation-floor'));
+    const admissionRequestArchive = request && await read(path(`admission-request-${encodeURIComponent(request.genesisTxId)}`));
+    const admissionGrantArchive = request && await read(path(`admission-grant-${encodeURIComponent(request.genesisTxId)}`));
+    const acknowledgementArchive = request && await read(botPath(`admission-ack-${encodeURIComponent(request.genesisTxId)}`));
+    const managementState = await read(path('management-state'));
+    const readerHandshake = managementState?.recovery?.readerHandshake;
+    const stateAdmissionRequestArchive = readerHandshake?.request?.requestId &&
+      await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
+    const stateAdmissionGrantArchive = readerHandshake?.grant?.grantId &&
+      await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+    const stateAcknowledgementArchive = readerHandshake?.grant?.grantId &&
+      await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
     const fence = await read(path('reader-fence-binding'));
     const lease = await read(botPath('lease'));
     const admissionRequest = await read(path('admission-request'));
@@ -1504,9 +1594,44 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       validateGenesisPrecommit(precommit);
       validateZFinality(zFinality, request, tokenFloor, precommit);
       validateReaderVersionFloor(floor);
+      validateAuthorityReservation(authorityReservation);
+      validateAuthorityCommitSnapshot(commit, authorityReservation);
+      validateAuthorityEpoch(authorityEpoch);
+      validateAuthorityEpoch(committedAuthorityEpoch);
+      validatePublishedFloors({
+        authorityEpochFloor,
+        fenceGenerationFloor,
+        authorityEpoch,
+        anchorFingerprint: request.anchorFingerprint,
+        request,
+      });
+      if (committedAuthorityEpoch === null || canonical(committedAuthorityEpoch) !== canonical(authorityEpoch) ||
+          authorityReservation.txId !== request.genesisTxId ||
+          authorityReservation.generation !== request.generation ||
+          authorityReservation.anchorFingerprint !== request.anchorFingerprint ||
+          authorityReservation.candidateFingerprint !== request.requestFingerprint ||
+          commit.txId !== request.genesisTxId ||
+          commit.generation !== request.generation ||
+          commit.anchorFingerprint !== request.anchorFingerprint ||
+          commit.candidateFingerprint !== request.requestFingerprint ||
+          authorityReservation.epoch !== authorityEpoch.epoch ||
+          commit.epoch !== authorityEpoch.epoch ||
+          authorityEpoch.reservationTxId !== request.genesisTxId ||
+          authorityEpoch.commitTxId !== request.genesisTxId ||
+          !await exactPrecommitBoundary(request, precommit)) {
+        throw new TypeError('finality authority graph does not bind Genesis');
+      }
+      validateReaderVersionFloor(floor);
       if (request.requestedReaderMode === 'no-reader') {
         if ([fence, lease, admissionRequest, admissionGrant, projection, acknowledgement, readerState].some((value) => value !== null)) {
           throw new TypeError('no-reader graph contains reader records');
+        }
+        if ([admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((value) => value !== null)) {
+          throw new TypeError('no-reader graph contains immutable admission archives');
+        }
+        if (readerHandshake !== null && readerHandshake !== undefined ||
+            [stateAdmissionRequestArchive, stateAdmissionGrantArchive, stateAcknowledgementArchive].some((value) => value !== null && value !== undefined)) {
+          throw new TypeError('no-reader graph contains admission identifiers or immutable archives');
         }
       } else {
         validateAuthorityReservation(authorityReservation);
@@ -1564,13 +1689,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     try {
       validateGenesisRequest(request); validateGenesisPrecommit(precommit);
       const publication = await readPublicationGraph(request.genesisTxId);
-      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, control, persistedAuthorityEpochFloor] = await Promise.all([
+      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, archivedPrecommit, control, persistedAuthorityEpochFloor] = await Promise.all([
         read(path(`token-floor-reservation-${encodeURIComponent(request.genesisTxId)}`)),
         read(path(`token-floor-attested-${encodeURIComponent(request.genesisTxId)}`)),
         read(path('attestation')), read(path('reader-version-floor')),
         read(path(`authority-reservation-${encodeURIComponent(request.genesisTxId)}`)),
         read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`)),
-        read(path('authority-epoch')), read(path('control-root')), read(path('authority-epoch-floor')),
+        read(path('authority-epoch')),
+        read(path(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`)),
+        read(path('control-root')), read(path('authority-epoch-floor')),
       ]);
       const authorityEpochFloor = options.authorityEpochFloor === undefined
         ? persistedAuthorityEpochFloor
@@ -1581,6 +1708,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const controlProof = control && await authorityObjectProof(path('control-root'));
       const wrapperProof = wrapper && await authorityObjectProof(join(root, control.wrapperRelativeName));
       validateTokenFloorReservation(reservation); validateAttestedTokenFloorProof(attestedProof, reservation, attestation);
+      validateGenesisPrecommit(archivedPrecommit);
       validateReaderVersionFloor(readerVersionFloor); validateAuthorityReservation(authorityReservation);
       validateAuthorityCommitSnapshot(authorityCommit, authorityReservation); validateAuthorityEpoch(authorityEpoch); validateAuthorityEpoch(committedEpoch); validateAuthorityEpochFloor(authorityEpochFloor);
       const expectedAuthorityEpochFloor = buildAuthorityEpochFloor(authorityEpoch.anchorFingerprint, {
@@ -1598,10 +1726,21 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         (control.fenceGeneration === 1 ? wrapper?.previousWrapperFingerprint === null : hex(wrapper?.previousWrapperFingerprint));
       if (!envelope.ok || !controlProof || !wrapperProof || !legacyChainOriginValid ||
           request.requestFingerprint !== precommit.requestFingerprint ||
+          precommit.zeroGrantProofFingerprint !== canonicalJsonHash({
+            admissionClosed: true,
+            admissionDrained: true,
+            admissionGrantWrites: 0,
+            admissionAckWrites: 0,
+            outstandingAdmissionGrants: 0,
+            txId: request.genesisTxId,
+          }) ||
+          canonical(precommit) !== canonical(archivedPrecommit) ||
           reservation.floorFingerprint !== precommit.reservationFingerprint ||
           attestedProof.attestedProofFingerprint !== precommit.attestedProofFingerprint ||
           authorityReservation.reservationFingerprint !== precommit.authorityReservationFingerprint ||
           authorityCommit.authorityCommitSnapshotFingerprint !== precommit.authorityCommitSnapshotFingerprint ||
+          authorityReservation.epoch !== authorityEpoch.epoch ||
+          authorityCommit.epoch !== authorityEpoch.epoch ||
           canonical(authorityEpoch) !== canonical(committedEpoch) ||
           authorityEpochFloor.anchorFingerprint !== authorityEpoch.anchorFingerprint ||
           authorityEpochFloor.highestReservedAuthorityEpoch !== authorityEpoch.epoch ||
@@ -2075,6 +2214,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     async currentOsPrincipal() { return lowLevel.current_os_principal(); },
     async managementAnchorFingerprint() { return anchorFingerprint(); },
     async writeGenesisAuthorityRequest(record) {
+      const mutationParent = await verifiedParent(targetPath);
+      await assertMutationParent('write_genesis_authority_request', mutationParent);
       try {
         validateGenesisAuthorityRequest(record);
       } catch {
@@ -2124,9 +2265,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const existing = await rawRead(path('genesis-authority-request'));
       if (existing !== null) {
         if (canonical(existing) !== canonical(record)) refused('write_genesis_authority_request', 'immutable authority request replay mismatch');
+        await assertMutationParent('write_genesis_authority_request', mutationParent);
         return existing;
       }
-      await writeImmutableAuthority('genesis-authority-request', record, true);
+      await writeImmutableAuthority('genesis-authority-request', record, true, mutationParent);
       return record;
     },
     async reserveAuthorityEpoch(record) {
@@ -2190,6 +2332,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return record;
     },
     async commitAuthorityEpoch(record, precommit) {
+      const mutationParent = await verifiedParent(targetPath);
       try {
         validateAuthorityEpoch(record);
         validateGenesisPrecommit(precommit);
@@ -2240,14 +2383,18 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         const existing = await read(path(name));
         if (existing !== null) {
           if (canonical(existing) !== canonical(value)) refused('commit_authority_epoch', 'immutable authority epoch predecessor is substituted');
+          await assertMutationParent('commit_authority_epoch', mutationParent);
           return existing;
         }
-        await writeImmutableAuthority(name, value);
+        await writeImmutableAuthority(name, value, false, mutationParent);
         return value;
       };
       const writeExactCurrent = async (name, value) => {
         const existing = await read(path(name));
-        if (existing !== null && canonical(existing) === canonical(value)) return existing;
+        if (existing !== null && canonical(existing) === canonical(value)) {
+          await assertMutationParent('commit_authority_epoch', mutationParent);
+          return existing;
+        }
         if (existing !== null && name === 'genesis-precommit-proof') {
           refused('commit_authority_epoch', 'genesis precommit proof replay is invalid');
         }
@@ -2684,6 +2831,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     async reserveFenceGeneration({ fenceGeneration, txId } = {}) {
       await requireManagementPrincipal('reserve_fence_generation');
       await requireGenesisProof();
+      const mutationParent = await verifiedParent(targetPath);
       await ensure();
       if (!Number.isSafeInteger(fenceGeneration) || fenceGeneration < 1 || !isOpaque(txId)) {
         refused('reserve_fence_generation', 'positive fence generation and transaction identity are required');
@@ -2701,6 +2849,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         if (!existing || canonical(existing) !== canonical(floor)) {
           refused('reserve_fence_generation', 'fence generation reservation replay is invalid');
         }
+        await assertMutationParent('reserve_fence_generation', mutationParent);
         return floor;
       }
       const observed = await read(path('fence-generation-floor'));
@@ -2713,13 +2862,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         lastReservationTxId: txId,
         floorFingerprint: null,
       });
-      await writeCreateOnceAuthority(`fence-generation-reservation-${encodeURIComponent(txId)}`, next);
+      await writeCreateOnceAuthority(`fence-generation-reservation-${encodeURIComponent(txId)}`, next, true, false, mutationParent);
       await writeAuthority('fence-generation-floor', next);
       return next;
     },
     async commitFenceGeneration({ fenceGeneration, txId } = {}) {
       await requireManagementPrincipal('commit_fence_generation');
       await requireGenesisProof();
+      const mutationParent = await verifiedParent(targetPath);
       await ensure();
       if (!Number.isSafeInteger(fenceGeneration) || fenceGeneration < 1 || !isOpaque(txId)) {
         refused('commit_fence_generation', 'positive fence generation and transaction identity are required');
@@ -2732,7 +2882,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const replay = floor.lastCommittedTxId === txId && floor.highestCommittedFenceGeneration === fenceGeneration;
       if (replay) {
         const existing = await read(path(`fence-generation-commit-${encodeURIComponent(txId)}`));
-        if (existing && canonical(existing) === canonical(floor)) return floor;
+        if (existing && canonical(existing) === canonical(floor)) {
+          await assertMutationParent('commit_fence_generation', mutationParent);
+          return floor;
+        }
         refused('commit_fence_generation', 'fence generation commit replay is invalid');
       }
       if (floor.highestCommittedFenceGeneration !== fenceGeneration - 1) {
@@ -2748,7 +2901,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         lastCommittedTxId: txId,
         floorFingerprint: null,
       });
-      await writeCreateOnceAuthority(`fence-generation-commit-${encodeURIComponent(txId)}`, next);
+      await writeCreateOnceAuthority(`fence-generation-commit-${encodeURIComponent(txId)}`, next, true, false, mutationParent);
       await writeAuthority('fence-generation-floor', next);
       return next;
     },
@@ -2853,6 +3006,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     },
     async writePublicationGraph(records) {
       await requireNoTerminalClose('write_publication_graph');
+      const mutationParent = await verifiedParent(targetPath);
 const fail = () => refused('write_publication_graph', 'exact acyclic publication graph is required');
       if (!records || Object.getPrototypeOf(records) !== Object.prototype) fail();
       const { transaction, u, p, s, prepared, replaced, committed, c, q, zp, k, y } = records;
@@ -2921,8 +3075,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       ];
       for (const [name, record] of immutable) {
         const existing = await read(path(`${name}-${encodeURIComponent(transaction.txId)}`));
-        if (existing !== null) { if (canonical(existing) !== canonical(record)) fail(); }
-        else await writeImmutableAuthority(`${name}-${encodeURIComponent(transaction.txId)}`, record);
+        if (existing !== null) {
+          if (canonical(existing) !== canonical(record)) fail();
+          await assertMutationParent('publish_mapping', mutationParent);
+        } else {
+          await writeImmutableAuthority(`${name}-${encodeURIComponent(transaction.txId)}`, record, false, mutationParent);
+        }
       }
       return y;
     },
@@ -2931,11 +3089,62 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const floor = await read(path('token-floor'));
       const precommit = await read(path('genesis-precommit-proof'));
       const epoch = await read(path('authority-epoch'));
+      const authorityReservation = request && await read(path(`authority-reservation-${encodeURIComponent(request.genesisTxId)}`));
+      const authorityCommit = request && await read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`));
+      const authorityEpochArchive = epoch && await read(path(`authority-epoch-${encodeURIComponent(epoch.epoch)}-committed`));
+      const authorityEpochFloor = await read(path('authority-epoch-floor'));
+      const fenceGenerationFloor = await read(path('fence-generation-floor'));
+      const admissionRequestArchive = request && await read(path(`admission-request-${encodeURIComponent(request.genesisTxId)}`));
+      const admissionGrantArchive = request && await read(path(`admission-grant-${encodeURIComponent(request.genesisTxId)}`));
+      const acknowledgementArchive = request && await read(botPath(`admission-ack-${encodeURIComponent(request.genesisTxId)}`));
+      const managementState = await read(path('management-state'));
+      const readerHandshake = managementState?.recovery?.readerHandshake;
+      const stateAdmissionRequestArchive = readerHandshake?.request?.requestId &&
+        await read(path(`admission-request-${encodeURIComponent(readerHandshake.request.requestId)}`));
+      const stateAdmissionGrantArchive = readerHandshake?.grant?.grantId &&
+        await read(path(`admission-grant-${encodeURIComponent(readerHandshake.grant.grantId)}`));
+      const stateAcknowledgementArchive = readerHandshake?.grant?.grantId &&
+        await read(botPath(`admission-ack-${encodeURIComponent(readerHandshake.grant.grantId)}`));
       const k = request && await read(path(`publication-k-${encodeURIComponent(request.genesisTxId)}`));
       const y = request && await read(path(`publication-y-${encodeURIComponent(request.genesisTxId)}`));
       try {
         validateZFinality(record, request, floor, precommit);
+        validateAuthorityReservation(authorityReservation);
+        validateAuthorityCommitSnapshot(authorityCommit, authorityReservation);
         validateAuthorityEpoch(epoch);
+        validateAuthorityEpoch(authorityEpochArchive);
+        validatePublishedFloors({
+          authorityEpochFloor,
+          fenceGenerationFloor,
+          authorityEpoch: epoch,
+          anchorFingerprint: request.anchorFingerprint,
+          request,
+        });
+        if (request.requestedReaderMode === 'no-reader' &&
+            [admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((value) => value !== null)) {
+          throw new TypeError('no-reader graph contains immutable admission archives');
+        }
+        if (readerHandshake !== null && readerHandshake !== undefined ||
+            [stateAdmissionRequestArchive, stateAdmissionGrantArchive, stateAcknowledgementArchive].some((value) => value !== null && value !== undefined)) {
+          throw new TypeError('no-reader graph contains admission identifiers or immutable archives');
+        }
+        if (authorityEpochArchive === null ||
+            canonical(authorityEpochArchive) !== canonical(epoch) ||
+            authorityReservation.txId !== request.genesisTxId ||
+            authorityReservation.generation !== request.generation ||
+            authorityReservation.anchorFingerprint !== request.anchorFingerprint ||
+            authorityReservation.candidateFingerprint !== request.requestFingerprint ||
+            authorityCommit.txId !== request.genesisTxId ||
+            authorityCommit.generation !== request.generation ||
+            authorityCommit.anchorFingerprint !== request.anchorFingerprint ||
+            authorityCommit.candidateFingerprint !== request.requestFingerprint ||
+            authorityReservation.epoch !== epoch.epoch ||
+            authorityCommit.epoch !== epoch.epoch ||
+            epoch.reservationTxId !== request.genesisTxId ||
+            epoch.commitTxId !== request.genesisTxId ||
+            !await exactPrecommitBoundary(request, precommit)) {
+          throw new TypeError('Genesis authority graph is invalid');
+        }
         validatePublicationK(k);
         validatePublicationY(y, k['publication-kFingerprint']);
       } catch {
@@ -3440,7 +3649,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const zFinality = await read(path('z-finality'));
       const precommit = await read(path('genesis-precommit-proof'));
       const commit = request && await read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`));
+      const authorityReservation = request && await read(path(`authority-reservation-${encodeURIComponent(request.genesisTxId)}`));
       const authorityEpoch = await read(path('authority-epoch'));
+      const authorityEpochArchive = authorityEpoch && await read(path(`authority-epoch-${encodeURIComponent(authorityEpoch.epoch)}-committed`));
       const authorityEpochFloor = await read(path('authority-epoch-floor'));
       const fenceGenerationFloor = await read(path('fence-generation-floor'));
       const fence = await read(path('reader-fence-binding'));
@@ -3451,7 +3662,26 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         validateReaderVersionFloor(floor);
         validateTokenFloor(tokenFloor);
         validateZFinality(zFinality, request, tokenFloor, precommit);
-        validateAuthorityCommitSnapshot(commit);
+        validateAuthorityReservation(authorityReservation);
+        validateAuthorityCommitSnapshot(commit, authorityReservation);
+        validateAuthorityEpoch(authorityEpoch);
+        validateAuthorityEpoch(authorityEpochArchive);
+        if (authorityReservation.txId !== request.genesisTxId ||
+            authorityReservation.generation !== request.generation ||
+            authorityReservation.anchorFingerprint !== request.anchorFingerprint ||
+            authorityReservation.candidateFingerprint !== request.requestFingerprint ||
+            commit.txId !== request.genesisTxId ||
+            commit.generation !== request.generation ||
+            commit.anchorFingerprint !== request.anchorFingerprint ||
+            commit.candidateFingerprint !== request.requestFingerprint ||
+            authorityReservation.epoch !== authorityEpoch.epoch ||
+            commit.epoch !== authorityEpoch.epoch ||
+            authorityEpoch.reservationTxId !== request.genesisTxId ||
+            authorityEpoch.commitTxId !== request.genesisTxId ||
+            authorityEpochArchive === null ||
+            canonical(authorityEpochArchive) !== canonical(authorityEpoch)) {
+          throw new TypeError('pending authority graph does not bind Genesis');
+        }
         validateFenceBinding(fence, commit, floor);
         validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, null, null, Date.now());
         await admissionRecordPreflight(
@@ -3473,6 +3703,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           anchorFingerprint: request.anchorFingerprint,
           request,
         });
+        if (!await exactPrecommitBoundary(request, precommit)) {
+          throw new TypeError('pending Genesis precommit boundary is invalid');
+        }
       } catch {
         refused('read_pending_reader_bootstrap', 'pending reader authority is incomplete or inconsistent');
       }
@@ -3483,7 +3716,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           admissionRequest.readerStartNonce !== request.readerStartNonce) {
         refused('read_pending_reader_bootstrap', 'pending reader authority does not bind the Genesis request');
       }
-      return { request, floor, tokenFloor, zFinality, precommit, commit, fence, admissionRequest, admissionGrant, authorityEpoch, authorityEpochFloor, fenceGenerationFloor };
+      return { request, floor, tokenFloor, zFinality, precommit, commit, authorityReservation, fence, admissionRequest, admissionGrant, authorityEpoch, authorityEpochArchive, authorityEpochFloor, fenceGenerationFloor };
     },
     async readPendingGenesisAdmission() {
       await requireManagementOrBotPrincipal('read_pending_genesis_admission');
@@ -4125,6 +4358,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async publishMapping(value) {
       await requireNoTerminalClose('publish_mapping');
       await requireGenesisProof();
+      const mutationParent = await verifiedParent(targetPath);
       if (value.refreshReaderFloor === true) {
         const floor = await readerFloor();
         try { validateReaderVersionFloor(value.readerVersionFloor); } catch {
@@ -4344,6 +4578,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       await writeAuthority('token-sidecar', record);
     },
     async terminalCloseOrManualCleanup(value) {
+      const mutationParent = await verifiedParent(targetPath);
       const existing = await read(path('terminal-close'));
       if (existing !== null) {
         try { validateManualCleanup(existing); } catch { refused('terminal_close', 'durable terminal-close record is torn or invalid'); }
@@ -4367,6 +4602,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         } else if (suffix !== null && !await terminalReplayMatches({ candidateSuffix: suffix, readReplay: true })) {
           refused('terminal_close', 'terminal-close replay conflicts with the immutable terminalization suffix');
         }
+        await assertMutationParent('terminal_close', mutationParent);
         if (suffix !== null) await persistTerminalizationSuffix(suffix, genesisAuthorityRequest);
         return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: existing.manualCleanupFingerprint };
       }
@@ -4382,7 +4618,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           refused('terminal_close', 'immutable terminalization suffix conflicts with the durable suffix');
         }
       }
-      await writeCreateOnceAuthority('terminal-close', record, false);
+      await writeCreateOnceAuthority('terminal-close', record, false, false, mutationParent);
       if (suffix !== null) await persistTerminalizationSuffix(suffix, genesisAuthorityRequest);
       return { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: record.manualCleanupFingerprint };
     },
@@ -4707,6 +4943,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const authorityCommit = await verifiedBytes(path(`authority-commit-${encodeURIComponent(requestValue.genesisTxId)}`));
       const authorityBaseline = await verifiedBytes(path(`authority-baseline-${encodeURIComponent(requestValue.genesisTxId)}`));
       const authorityEpoch = await verifiedBytes(path('authority-epoch'));
+      const authorityEpochArchive = await verifiedBytes(path(`authority-epoch-${encodeURIComponent(parseCanonicalJsonBytes(authorityEpoch.bytes).epoch)}-committed`));
       const authorityEpochFloor = await verifiedBytes(path('authority-epoch-floor'));
       const fenceGenerationFloor = await verifiedBytes(path('fence-generation-floor'));
       try {
@@ -4725,6 +4962,13 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const admissionGrant = await lowLevel.read_verified_bytes(path('admission-grant'));
       if (admissionRequest !== null) await assertObject(path('admission-request'), Buffer.from(admissionRequest));
       if (admissionGrant !== null) await assertObject(path('admission-grant'), Buffer.from(admissionGrant));
+      const admissionRequestArchive = await lowLevel.read_verified_bytes(path(`admission-request-${encodeURIComponent(requestValue.genesisTxId)}`));
+      const admissionGrantArchive = await lowLevel.read_verified_bytes(path(`admission-grant-${encodeURIComponent(requestValue.genesisTxId)}`));
+      const acknowledgementArchive = await lowLevel.read_verified_bytes(botPath(`admission-ack-${encodeURIComponent(requestValue.genesisTxId)}`));
+      if (requestValue.requestedReaderMode === 'no-reader' &&
+          [admissionRequestArchive, admissionGrantArchive, acknowledgementArchive].some((bytes) => bytes !== null)) {
+        refused('read_managed_mapping_snapshot', 'no-reader authority contains immutable admission archives');
+      }
       const managementState = await read(path('management-state'));
       const terminalClose = await lowLevel.read_verified_bytes(path('terminal-close'));
       if (terminalClose !== null) await assertObject(path('terminal-close'), Buffer.from(terminalClose));
@@ -4763,6 +5007,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       } catch {
         refused('read_managed_mapping_snapshot', 'bound finality, receipt, or reader state is invalid');
       }
+      if (!await exactPrecommitBoundary(requestValue, parseCanonicalJsonBytes(precommit.bytes))) {
+        refused('read_managed_mapping_snapshot', 'exact live precommit boundary is invalid');
+      }
       const botOsIdentity = await lowLevel.current_os_principal();
       const botStateAcl = await lowLevel.read_acl(botRoot);
       if (!configuredRoles || !botOsIdentity?.value || !botStateAcl) refused('read_managed_mapping_snapshot', 'bot identity evidence is unavailable');
@@ -4785,7 +5032,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         rvfBytes: rvf.bytes, receiptBytes: receipt.bytes,
         authorityRequestBytes: authorityRequest.bytes, authorityReceiptBytes: authorityReceipt.bytes,
         authorityReservationBytes: authorityReservation.bytes, authorityCommitBytes: authorityCommit.bytes,
-        authorityBaselineBytes: authorityBaseline.bytes, authorityEpochBytes: authorityEpoch.bytes,
+        authorityBaselineBytes: authorityBaseline.bytes,
+        authorityEpochBytes: authorityEpoch.bytes,
+        authorityEpochArchiveBytes: authorityEpochArchive.bytes,
         publicationTransactionBytes: encode(publication.transaction), publicationUBytes: encode(publication.u),
         publicationPBytes: encode(publication.p), publicationSBytes: encode(publication.s),
         publicationPreparedBytes: encode(publication.prepared), publicationReplacedBytes: encode(publication.replaced),
@@ -4814,7 +5063,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const floor = await read(path('reader-version-floor'));
       const tokenFloor = await read(path('token-floor'));
       const zFinality = await read(path('z-finality'));
-      const request = await read(path('genesis-request'));
+      const request = await pendingReaderWriterGenesis('write_bot_reader_projection');
       if (!await hasPublishedAuthority() || !floor || floor.readerVersionFloor !== 2 ||
           !tokenFloor || tokenFloor.lastCommittedTxId === null || !zFinality || !request) {
         refused('write_bot_reader_projection', 'validated committed handshake is absent');
@@ -4836,9 +5085,9 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async writeBotReaderState(value) {
       const mutationParent = await verifiedParent(targetPath);
       await requireBotPrincipal('write_bot_reader_state');
+      const request = await pendingReaderWriterGenesis('write_bot_reader_state');
       const floor = await read(path('reader-version-floor'));
       const tokenFloor = await read(path('token-floor'));
-      const request = await read(path('genesis-request'));
       const attestation = await read(path('attestation'));
       const reservation = request && await read(path(`token-floor-reservation-${encodeURIComponent(request.genesisTxId)}`));
       const commit = request && await read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`));
@@ -4876,6 +5125,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async acquireBotLease(value) {
+      const request = await pendingReaderWriterGenesis('acquire_bot_lease');
       const mutationParent = await verifiedParent(targetPath);
       await requireBotPrincipal('acquire_bot_lease');
       const floor = await read(path('reader-version-floor'));
@@ -4890,6 +5140,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           value.readerStartNonce !== floor.firstReaderStartNonce) {
         refused('acquire_bot_lease', 'lease does not bind the irreversible reader floor');
       }
+      if (value.genesisTxId !== request.genesisTxId ||
+          value.readerInstanceId !== request.readerInstanceId ||
+          value.readerStartNonce !== request.readerStartNonce) {
+        refused('acquire_bot_lease', 'lease does not bind the pending request');
+      }
       await ensureBotRoot(mutationParent);
       await write(botPath('lease'), value, 'bot-state', true, false, mutationParent);
       return value;
@@ -4898,6 +5153,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const mutationParent = await verifiedParent(targetPath);
       await requireBotPrincipal('write_bot_acknowledgement');
       const genesis = await admissionWriterGenesis('write_bot_acknowledgement');
+      const precommit = await read(path('genesis-precommit-proof'));
+      if (!await exactPrecommitBoundary(genesis, precommit)) {
+        refused('write_bot_acknowledgement', 'exact live precommit boundary is invalid');
+      }
       const floor = await read(path('reader-version-floor'));
       if (!floor || floor.readerVersionFloor !== 2) {
         refused('write_bot_acknowledgement', 'validated committed handshake is absent');
@@ -4960,6 +5219,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async writeAuthoritySuccessorRequest(value) {
       await requireNoTerminalClose('write_authority_successor_request');
       await requireManagementPrincipal('write_authority_successor_request');
+      const mutationParent = await verifiedParent(targetPath);
       rejectLegacyRetainedMapping(value?.operation, value?.targetState, 'write_authority_successor_request');
       const genesisAuthorityRequest = await requireSuccessorGenesisAuthority('write_authority_successor_request', value);
       try { validateAuthoritySuccessorRequest(value, genesisAuthorityRequest); } catch { refused('write_authority_successor_request', 'exact successor request is required'); }
@@ -5013,9 +5273,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const existing = await read(path(name));
       if (existing !== null) {
         if (canonical(existing) !== canonical(value)) refused('write_authority_successor_request', 'successor request replay conflicts');
+        await assertMutationParent('write_authority_successor_request', mutationParent);
         return existing;
       }
-      await writeCreateOnceAuthority(name, value);
+      await writeCreateOnceAuthority(name, value, true, false, mutationParent);
       return value;
     },
     async readBotAuthoritySuccessorLiveProof({ txId } = {}) {
@@ -5198,6 +5459,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async commitAuthoritySuccessorEpoch(record) {
       await requireNoTerminalClose('commit_authority_successor_epoch');
       await requireManagementPrincipal('commit_authority_successor_epoch');
+      const mutationParent = await verifiedParent(targetPath);
       const tx = encodeURIComponent(record?.reservationTxId ?? record?.commitTxId ?? '');
       const [request, reservation, commit] = await Promise.all([
         read(path(`authority-successor-request-${tx}`)),
@@ -5248,13 +5510,16 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         ]);
         if (existing && current &&
             canonical(existing) === canonical(record) &&
-            canonical(current) === canonical(record)) return record;
+            canonical(current) === canonical(record)) {
+          await assertMutationParent('commit_authority_successor_epoch', mutationParent);
+          return record;
+        }
         refused('commit_authority_successor_epoch', 'successor epoch commit replay is invalid');
       }
       if (floor.highestCommittedAuthorityEpoch !== record.epoch - 1) {
         refused('commit_authority_successor_epoch', 'successor epoch commit is not contiguous with the committed floor');
       }
-      await writeCreateOnceAuthority(`authority-epoch-${record.epoch}-committed`, record);
+      await writeCreateOnceAuthority(`authority-epoch-${record.epoch}-committed`, record, true, false, mutationParent);
       await writeAuthority('authority-epoch', record);
       floor = buildAuthorityEpochFloor(record.anchorFingerprint, {
         ...floor,

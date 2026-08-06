@@ -1745,3 +1745,26 @@ test('rejects persisted management auth when principal objects and credential ke
   files.set(authPath, Buffer.from(canonicalJson(credentialPrincipalMismatch)));
   await assert.rejects(native.readManagementAuth, /management auth record is invalid/);
 });
+test('identical immutable authority replay rechecks the captured config parent before writing', async () => {
+  const fixture = await committedGenesisFixture('immutable-parent-replay');
+  const authorityRequestPath = [...fixture.files.keys()].find((path) =>
+    normalize(path).endsWith('/genesis-authority-request.json'));
+  const authorityRequest = JSON.parse(fixture.files.get(authorityRequestPath));
+  const replayStart = fixture.calls.length;
+  await fixture.native.writeGenesisAuthorityRequest(authorityRequest);
+  assert.equal(fixture.calls.length, replayStart);
+  const originalParent = fixture.lowLevel.open_verified_parent;
+  fixture.lowLevel.open_verified_parent = async (path) => {
+    const identity = await originalParent(path);
+    if (normalize(path).endsWith('/channels.json')) return { ...identity, path: 'C:/state/foreign-parent' };
+    return identity;
+  };
+  const before = new Map([...fixture.files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const writes = fixture.calls.length;
+  await assert.rejects(
+    fixture.native.writeGenesisAuthorityRequest(authorityRequest),
+    /config parent identity changed/,
+  );
+  assert.equal(fixture.calls.length, writes);
+  assert.deepEqual(fixture.files, before);
+});

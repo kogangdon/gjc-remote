@@ -313,6 +313,7 @@ function managedSnapshot(sourceKind = "managed-v1", retainedIdentityOverride = n
     authorityReceiptBytes: bytes(authorityReceipt), authorityReservationBytes: bytes(authorityReservation),
     authorityCommitBytes: bytes(authorityCommit), authorityBaselineBytes: bytes(baseline),
     authorityEpochBytes: bytes(authorityEpoch),
+    authorityEpochArchiveBytes: bytes(authorityEpoch),
     publicationTransactionBytes: bytes(transaction), publicationUBytes: bytes(u), publicationPBytes: bytes(p),
     publicationSBytes: bytes(s), publicationPreparedBytes: bytes(prepared), publicationReplacedBytes: bytes(replaced),
     publicationCommittedBytes: bytes(committed), publicationCBytes: bytes(c), publicationQBytes: bytes(q),
@@ -604,7 +605,7 @@ test("native reader fails closed for malformed, swapped, missing, or identity- a
   const baseline = await reader.readSnapshot();
   assert.equal(baseline.nativeVerified, true, JSON.stringify({ code: baseline.code }));
   assert.equal((await loadManagedChannelMapState({ current: {}, readSnapshot: async () => baseline })).ok, true);
-  for (const key of ["attestationBytes", "tokenFloorBytes", "currentAttestationBytes", "currentTokenFloorBytes", "attestationHistoryBytes", "tokenFloorHistoryBytes", "tokenFloorReservationBytes", "readerVersionFloorBytes", "historyMarkerSealBytes", "authorityEpochFloorBytes", "fenceGenerationFloorBytes", "genesisRequestBytes", "zFinalityBytes", "rvfBytes", "receiptBytes", "authorityRequestBytes", "authorityReceiptBytes", "authorityReservationBytes", "authorityCommitBytes", "authorityBaselineBytes", "authorityEpochBytes", "publicationTransactionBytes", "publicationUBytes", "publicationPBytes", "publicationSBytes", "publicationPreparedBytes", "publicationReplacedBytes", "publicationCommittedBytes", "publicationCBytes", "publicationQBytes", "publicationZpBytes", "publicationKBytes", "publicationYBytes"]) {
+  for (const key of ["attestationBytes", "tokenFloorBytes", "currentAttestationBytes", "currentTokenFloorBytes", "attestationHistoryBytes", "tokenFloorHistoryBytes", "tokenFloorReservationBytes", "readerVersionFloorBytes", "historyMarkerSealBytes", "authorityEpochFloorBytes", "fenceGenerationFloorBytes", "genesisRequestBytes", "zFinalityBytes", "rvfBytes", "receiptBytes", "authorityRequestBytes", "authorityReceiptBytes", "authorityReservationBytes", "authorityCommitBytes", "authorityBaselineBytes", "authorityEpochBytes", "authorityEpochArchiveBytes", "publicationTransactionBytes", "publicationUBytes", "publicationPBytes", "publicationSBytes", "publicationPreparedBytes", "publicationReplacedBytes", "publicationCommittedBytes", "publicationCBytes", "publicationQBytes", "publicationZpBytes", "publicationKBytes", "publicationYBytes"]) {
     native.readManagedMappingSnapshot = async () => ({
       ...source, controlRootName: "control-root.json", wrapperName: "managed-v1-wrapper.json", [key]: Buffer.from("{}"),
     });
