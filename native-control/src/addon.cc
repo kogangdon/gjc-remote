@@ -269,8 +269,10 @@ HANDLE OpenWindowsRelative(HANDLE parent, const std::wstring& name, DWORD access
 constexpr DWORD kWindowsTraversalAccess =
     FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
 constexpr DWORD kWindowsMutationParentAccess =
-    kWindowsTraversalAccess | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
+    kWindowsTraversalAccess | READ_CONTROL | WRITE_DAC | WRITE_OWNER |
+    FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
 constexpr ACCESS_MASK kWindowsDirectoryMutationAccess =
+    READ_CONTROL | WRITE_DAC | WRITE_OWNER |
     FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
 
 bool OpenWindowsParentNoFollow(const std::string& path, HANDLE* parent, std::wstring* name,
@@ -510,7 +512,8 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
     LookupAccountSidW(nullptr, sid, nullptr, &name_length, nullptr, &domain_length, &use);
     const DWORD lookup_error = GetLastError();
     if (lookup_error == ERROR_NONE_MAPPED || lookup_error == ERROR_TRUSTED_RELATIONSHIP_FAILURE) {
-      continue;
+      valid = false;
+      break;
     }
     if (lookup_error != ERROR_INSUFFICIENT_BUFFER ||
         name_length == 0 || domain_length == 0) { valid = false; break; }

@@ -185,6 +185,21 @@ test("POSIX principal access honors ACL_OTHER when no group entry matches", asyn
 });
 test("native source contains fail-closed ACL and publication guards", () => {
   const source = readFileSync(fileURLToPath(new URL("../src/addon.cc", import.meta.url)), "utf8");
+  const parentMutation = source.match(/constexpr DWORD kWindowsMutationParentAccess =([\s\S]*?);/)?.[1] ?? "";
+  const directoryMutation = source.match(/constexpr ACCESS_MASK kWindowsDirectoryMutationAccess =([\s\S]*?);/)?.[1] ?? "";
+  for (const access of [parentMutation, directoryMutation]) {
+    assert.match(access, /READ_CONTROL/);
+    assert.match(access, /WRITE_DAC/);
+    assert.match(access, /WRITE_OWNER/);
+  }
+  const unresolvedSidOffset = source.indexOf("if (lookup_error == ERROR_NONE_MAPPED");
+  assert.notEqual(unresolvedSidOffset, -1);
+  const unresolvedSidEnd = source.indexOf("}", unresolvedSidOffset);
+  const unresolvedSidBranch = source.slice(unresolvedSidOffset, unresolvedSidEnd);
+  assert.match(unresolvedSidBranch, /valid = false/);
+  assert.match(unresolvedSidBranch, /break/);
+  assert.doesNotMatch(unresolvedSidBranch, /continue/);
+  assert.match(source, /napi_create_uint32\(env, 0, &value\)/);
   assert.match(source, /bool PrincipalGroups\(uid_t principal/);
   assert.match(source, /ACL_GROUP_OBJ/);
   assert.match(source, /ACL_OTHER/);
