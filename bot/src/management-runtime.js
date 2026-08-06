@@ -2496,6 +2496,9 @@ export class ManagementRuntime {
       await this.#manualCleanup(state, "RECOVERY_INPUT_MISMATCH", recovery);
     }
     if (head.phase === "terminal") {
+      if (typeof this.native.readTerminalizationLineage !== "function") throw new Error("MANAGED_NATIVE_UNAVAILABLE");
+      const lineage = await this.native.readTerminalizationLineage({ txId: head.txId });
+      if (!lineage || lineage.head?.headFingerprint !== head.headFingerprint) throw new Error("SUCCESSOR_TERMINALIZATION_LINEAGE_INVALID");
       return { idempotent: true, txId: head.txId, phase: "terminal", routeDisposition: "no-route" };
     }
     if (head.phase === "reader-pending") {

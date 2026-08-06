@@ -37,12 +37,28 @@ export function validateManagedHistoryMarker(record, anchorFingerprint = undefin
   assertHash(record, "markerFingerprint");
   return record;
 }
-export function validateManagedHistoryMarkerSeal(marker, seal, anchorFingerprint = undefined) {
+export function validateManagedHistoryMarkerSeal(marker, seal, anchorFingerprint = undefined, predecessors = []) {
   if (marker === null || seal === null) fail("managed history marker seal");
   validateManagedHistoryMarker(marker, anchorFingerprint);
   validateManagedHistoryMarker(seal, anchorFingerprint, 1);
   if (marker.sequence === 1 && marker.markerFingerprint !== seal.markerFingerprint) fail("managed history marker seal mismatch");
   if (marker.sequence === 2 && marker.previousMarkerFingerprint !== seal.markerFingerprint) fail("managed history marker predecessor seal");
+  if (marker.sequence > 2) {
+    if (!Array.isArray(predecessors)) fail("managed history marker predecessor chain");
+    const byFingerprint = new Map();
+    for (const predecessor of predecessors) {
+      validateManagedHistoryMarker(predecessor, anchorFingerprint);
+      if (byFingerprint.has(predecessor.markerFingerprint)) fail("managed history marker duplicate predecessor");
+      byFingerprint.set(predecessor.markerFingerprint, predecessor);
+    }
+    let cursor = marker;
+    for (let sequence = marker.sequence - 1; sequence >= 2; sequence -= 1) {
+      const predecessor = byFingerprint.get(cursor.previousMarkerFingerprint);
+      if (!predecessor || predecessor.sequence !== sequence) fail("managed history marker predecessor chain");
+      cursor = predecessor;
+    }
+    if (cursor.previousMarkerFingerprint !== seal.markerFingerprint) fail("managed history marker predecessor seal");
+  }
   return seal;
 }
 const assertFence = (record, expected = undefined) => {
@@ -228,7 +244,7 @@ export function validateAuthoritySuccessorHeadTransition(previous, next, request
 export const buildAuthoritySuccessorRecord = (record, fingerprintField) => { const value = { ...record, [fingerprintField]: null }; value[fingerprintField] = fingerprint(value, fingerprintField); return value; };
 export const authoritySuccessorFingerprint = fingerprint;
 export function validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest = null) {
-  const { request, close = null, fence = null, baseline = null, commit = null, reservation = null, authorityEpoch = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, head } = bundle ?? {};
+  const { request, close = null, fence = null, baseline = null, commit = null, reservation = null, authorityEpoch = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, historyMarkerPredecessors = [], head } = bundle ?? {};
   validateAuthoritySuccessorRequest(request, genesisAuthorityRequest); validateAuthoritySuccessorHead(head, request, genesisAuthorityRequest);
   if (close !== null) validateAuthorityCloseProof(close, request, genesisAuthorityRequest);
   if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit, genesisAuthorityRequest);
@@ -260,7 +276,7 @@ export function validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest
   const expectedHistorySequence = head.phase === "terminal" ? head.sequence : head.sequence - 1;
   if (historyMarker === null || historyMarkerSeal === null) fail("AH history evidence");
   validateManagedHistoryMarker(historyMarker, head.anchorFingerprint, expectedHistorySequence);
-  validateManagedHistoryMarkerSeal(historyMarker, historyMarkerSeal, head.anchorFingerprint);
+  validateManagedHistoryMarkerSeal(historyMarker, historyMarkerSeal, head.anchorFingerprint, historyMarkerPredecessors);
   const priorHistory = historyMarker !== null &&
     exact(historyMarker, ["version", "kind", "anchorFingerprint", "sequence", "fenceGeneration", "previousMarkerFingerprint", "markerFingerprint"]) &&
     historyMarker.version === 1 && historyMarker.kind === "managed-history-marker" &&

@@ -6,7 +6,7 @@ import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from "../st
 import { validateFinalityProof } from "../admission-envelope.js";
 import { buildGenesisPrecommit, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateZFinality } from "../genesis-envelope.js";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationU, validatePublicationY, validatePublicationZp } from "../publication-envelope.js";
-import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest } from "../successor-envelope.js";
+import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest, validateManagedHistoryMarkerSeal } from "../successor-envelope.js";
 
 const hex = "a".repeat(64);
 const seal = (record, field) => ({ ...record, [field]: canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field))) });
@@ -348,6 +348,27 @@ test("successor phase recovery retains exact evidence and refuses malformed or s
   assert.equal(terminal.finalityFingerprint, pending.finalityFingerprint);
   assert.throws(() => validateAuthoritySuccessorHeadTransition(closed, pending), /SUCCESSOR_ENVELOPE_INVALID/);
   assert.throws(() => validateAuthoritySuccessorHeadTransition(reserved, { ...closed, headFingerprint: reserved.headFingerprint }), /SUCCESSOR_ENVELOPE_INVALID/);
+});
+test("managed history marker seals traverse every predecessor and reject detached sequence three ancestry", () => {
+  const marker = (sequence, fenceGeneration, previousMarkerFingerprint) => {
+    const value = {
+      version: 1,
+      kind: "managed-history-marker",
+      anchorFingerprint: hex,
+      sequence,
+      fenceGeneration,
+      previousMarkerFingerprint,
+      markerFingerprint: null,
+    };
+    return seal(value, "markerFingerprint");
+  };
+  const genesis = marker(1, 1, null);
+  const second = marker(2, 2, genesis.markerFingerprint);
+  const third = marker(3, 3, second.markerFingerprint);
+  assert.throws(() => validateManagedHistoryMarkerSeal(third, genesis, hex), /SUCCESSOR_ENVELOPE_INVALID/);
+  assert.doesNotThrow(() => validateManagedHistoryMarkerSeal(third, genesis, hex, [second]));
+  const detached = marker(2, 2, "b".repeat(64));
+  assert.throws(() => validateManagedHistoryMarkerSeal(third, genesis, hex, [detached]), /SUCCESSOR_ENVELOPE_INVALID/);
 });
 test("successor reader records reject every substituted authoritative scalar", () => {
   const request = buildAuthoritySuccessorRecord({

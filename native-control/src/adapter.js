@@ -7,7 +7,7 @@ import { buildMappingRecoveryRecords, validateManualCleanup, validateMappingReco
 import { canCleanGenesisScratch, fingerprintGenesisProbe, transitionGenesisProspectiveProbe, validateGenesisProspectiveProbe } from '@gjc-remote/shared/genesis-probe';
 import { validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGrant, validateAdmissionRequest, validateFinalityProof } from '@gjc-remote/shared/admission-envelope';
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationState, buildPublicationTransaction, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationGraph, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationState, validatePublicationTransaction, validatePublicationU, validatePublicationY, validatePublicationZp } from '@gjc-remote/shared/publication-envelope';
-import { validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorBaseline, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHead, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest } from '@gjc-remote/shared/successor-envelope';
+import { validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorBaseline, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHead, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest, validateManagedHistoryMarkerSeal as validateSharedHistoryMarkerSeal } from '@gjc-remote/shared/successor-envelope';
 import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from '@gjc-remote/shared/strict-json';
 import { capabilities } from './capabilities.js';
 
@@ -271,6 +271,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     return [configuredRoles.managementSid, configuredRoles.botSid, configuredRoles.recoverySid, configuredRoles.systemSid, profile];
   };
   const targetPath = configPath; const parent = dirname(configPath); const root = join(parent, '.gjc-remote-control'); const botRoot = join(root, 'bot-state'); const historyMarkerPath = join(parent, `.${basename(configPath)}.managed-history.json`); const path = (name) => join(root, `${name}.json`); const botPath = (name) => join(botRoot, `${name}.json`); const bootstrapBlockerPath = join(parent, `.${basename(configPath)}.genesis-bootstrap-blocker`); const lockPath = (name) => join(parent, `.${basename(configPath)}.${name}.lock`); const tempPrefix = `${basename(configPath)}.tmp`; let prospectiveProof = null; let bootstrapBlocker = null;
+  const historyMarkerArchivePath = (sequence) => path(`managed-history-marker-${sequence}`);
   const historyMarkerSealName = 'managed-history-marker-seal';
   const requireBotPrincipal = async (operation) => {
     const principal = await lowLevel.current_os_principal();
@@ -744,19 +745,26 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
     }
   };
-  const validateHistoryMarkerSeal = (seal, expectedAnchor, marker = null) => {
+  const validateHistoryMarkerSeal = (seal, expectedAnchor, marker = null, predecessors = []) => {
     if (seal === null) return;
     validateHistoryMarkerRelation(seal, { anchorFingerprint: expectedAnchor, sequence: 1 });
     if (seal.fenceGeneration !== 1) throw new TypeError('Genesis history marker seal fence');
     if (marker !== null) {
-      validateHistoryMarkerRelation(marker, { anchorFingerprint: expectedAnchor });
-      if (marker.sequence === 1 && canonical(marker) !== canonical(seal)) {
-        throw new TypeError('Genesis history marker seal mismatch');
-      }
-      if (marker.sequence === 2 && marker.previousMarkerFingerprint !== seal.markerFingerprint) {
-        throw new TypeError('managed history marker predecessor is not sealed');
+      try {
+        validateSharedHistoryMarkerSeal(marker, seal, expectedAnchor, predecessors);
+      } catch {
+        throw new TypeError('managed history marker predecessor chain');
       }
     }
+  };
+  const readHistoryMarkerPredecessors = async (marker) => {
+    if (!marker || marker.sequence < 3) return [];
+    const predecessors = [];
+    for (let sequence = marker.sequence - 1; sequence >= 2; sequence -= 1) {
+      const predecessor = await rawRead(historyMarkerArchivePath(sequence));
+      if (predecessor !== null) predecessors.push(predecessor);
+    }
+    return predecessors;
   };
   const readSealAwareHistoryMarker = async (operation = 'read_managed_history_marker') => {
     const marker = await rawRead(historyMarkerPath);
@@ -769,9 +777,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     } catch {
       refused(operation, 'managed history marker is invalid or not bound to the live authority');
     }
+    const predecessors = await readHistoryMarkerPredecessors(marker);
     if (seal !== null) {
       try {
-        validateHistoryMarkerSeal(seal, expectedAnchor, marker);
+        validateHistoryMarkerSeal(seal, expectedAnchor, marker, predecessors);
       } catch {
         refused(operation, 'durable Genesis history marker seal is invalid');
       }
@@ -779,7 +788,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         refused(operation, 'durable Genesis history marker seal mismatch');
       }
     }
-    return { marker, seal };
+    return { marker, seal, predecessors };
   };
   const terminalizationKeys = [
     'version', 'kind', 'phase', 'txId', 'requestFingerprint',
@@ -826,8 +835,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     return suffix;
   };
-  const readTerminalizationLineage = async ({ suffix, allowMissingName = null, genesisAuthorityRequest = null } = {}) => {
-    const tx = encodeURIComponent(suffix?.txId ?? '');
+  const readTerminalizationLineage = async ({ suffix = null, txId: requestedTxId = null, allowMissingName = null, genesisAuthorityRequest = null } = {}) => {
+    const rootGenesisTxId = suffix?.request?.rootGenesisTxId ?? (await rawRead(path('genesis-authority-request')))?.genesisTxId ?? '';
+    const tx = encodeURIComponent(suffix?.txId ?? requestedTxId ?? '');
     const [
       request, close, fence, baseline, reservation, commit, authorityEpoch,
       authorityEpochFloor, fenceGenerationFloor, attestation, tokenFloor,
@@ -847,8 +857,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       read(path('token-floor')),
       read(path('attestation-history')),
       read(path('token-floor-history')),
-      read(path(`attestation-${encodeURIComponent(suffix?.request?.rootGenesisTxId ?? '')}`)),
-      read(path(`token-floor-commit-${encodeURIComponent(suffix?.request?.rootGenesisTxId ?? '')}`)),
+      read(path(`attestation-${encodeURIComponent(rootGenesisTxId)}`)),
+      read(path(`token-floor-commit-${encodeURIComponent(rootGenesisTxId)}`)),
       read(path(`publication-k-${tx}`)),
       read(path(`publication-y-${tx}`)),
       read(path(`authority-successor-finality-${tx}`)),
@@ -898,17 +908,21 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         genesisTokenFloor,
       });
       validateAuthoritySuccessorHead(head, request, genesisAuthorityRequest);
-      if (canonical(request) !== canonical(suffix.request) ||
-          canonical(finality) !== canonical(suffix.finality) ||
-          head.txId !== suffix.txId ||
-          (head.headFingerprint !== suffix.pendingHead.headFingerprint &&
-           head.headFingerprint !== suffix.terminalHead.headFingerprint)) {
-        throw new TypeError('terminal successor tuple substitution');
+      if (suffix !== null) {
+        if (canonical(request) !== canonical(suffix.request) ||
+            canonical(finality) !== canonical(suffix.finality) ||
+            head.txId !== suffix.txId ||
+            (head.headFingerprint !== suffix.pendingHead.headFingerprint &&
+             head.headFingerprint !== suffix.terminalHead.headFingerprint)) {
+          throw new TypeError('terminal successor tuple substitution');
+        }
+      } else if (head.phase !== 'terminal' || head.txId !== (requestedTxId ?? head.txId)) {
+        throw new TypeError('terminal successor head phase');
       }
       if (receipt === null) {
         const receiptName = path(`authority-successor-receipt-${tx}`);
         if (allowMissingName !== receiptName) throw new TypeError('terminal successor receipt absent');
-      } else if (canonical(receipt) !== canonical(suffix.receipt)) {
+      } else if (suffix !== null && canonical(receipt) !== canonical(suffix.receipt)) {
         throw new TypeError('terminal successor receipt substitution');
       }
       if (request.readerMode === 'bound-reader') {
@@ -918,11 +932,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       } else if ([lease, projection, ack].some((value) => value !== null)) {
         throw new TypeError('no-reader successor B tuple');
       }
-      if ([lease, projection, ack].some((value, index) =>
+      if (suffix !== null && [lease, projection, ack].some((value, index) =>
         canonical(value) !== canonical([suffix.lease, suffix.projection, suffix.ack][index]))) {
         throw new TypeError('terminal successor B substitution');
       }
-      publicationGraph = await readPublicationGraph(suffix.txId);
+      publicationGraph = await readPublicationGraph(suffix?.txId ?? requestedTxId);
       if (canonical(publicationGraph.k) !== canonical(publicationK) ||
           canonical(publicationGraph.y) !== canonical(publicationY) ||
           publicationK['publication-kFingerprint'] !== head.publicationKFingerprint ||
@@ -934,28 +948,37 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         throw new TypeError('terminal successor publication substitution');
       }
       if (!historyEvidence.marker || !historyEvidence.seal) throw new TypeError('terminal successor history seal absent');
-      validateHistoryMarkerSeal(historyEvidence.seal, request.anchorFingerprint, historyEvidence.marker);
-      validateHistoryMarkerRelation(suffix.marker, {
+      validateHistoryMarkerSeal(historyEvidence.seal, request.anchorFingerprint, historyEvidence.marker, historyEvidence.predecessors);
+      const expectedMarker = suffix?.marker ?? historyEvidence.marker;
+      validateHistoryMarkerRelation(expectedMarker, {
         anchorFingerprint: request.anchorFingerprint,
         sequence: request.sequence,
       });
-      if (canonical(historyEvidence.marker) !== canonical(suffix.marker) &&
+      if (suffix !== null &&
+          canonical(historyEvidence.marker) !== canonical(suffix.marker) &&
           (historyEvidence.marker.markerFingerprint !== suffix.marker.previousMarkerFingerprint ||
            historyEvidence.marker.sequence !== suffix.marker.sequence - 1 ||
            historyEvidence.marker.anchorFingerprint !== suffix.marker.anchorFingerprint)) {
         throw new TypeError('terminal successor history marker substitution');
       }
+      if (suffix === null &&
+          (head.phase !== 'terminal' ||
+           historyEvidence.marker.markerFingerprint !== head.historyMarkerFingerprint ||
+           historyEvidence.marker.sequence !== head.sequence)) {
+        throw new TypeError('terminal successor history marker binding');
+      }
+      const expectedReceipt = suffix?.receipt ?? receipt;
       validateAuthoritySuccessorReceipt(
-        suffix.receipt,
+        expectedReceipt,
         request,
         finality,
-        suffix.lease,
-        suffix.projection,
-        suffix.ack,
+        suffix?.lease ?? lease,
+        suffix?.projection ?? projection,
+        suffix?.ack ?? ack,
         genesisAuthorityRequest,
       );
       if (request.readerMode === 'no-reader' &&
-          [suffix.lease, suffix.projection, suffix.ack].some((value) => value !== null)) {
+          [suffix?.lease ?? lease, suffix?.projection ?? projection, suffix?.ack ?? ack].some((value) => value !== null)) {
         throw new TypeError('no-reader successor B outputs');
       }
     } catch {
@@ -969,6 +992,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       reservation,
       commit,
       authorityEpoch,
+      authorityEpochArchive: committedEpoch,
       publicationK,
       publicationY,
       finality,
@@ -976,6 +1000,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       publicationGraph,
       historyMarker: historyEvidence.marker,
       historyMarkerSeal: historyEvidence.seal,
+      historyMarkerPredecessors: historyEvidence.predecessors,
       head,
     };
   };
@@ -1876,7 +1901,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           refused('commit_managed_history_marker', 'durable Genesis history marker seal is absent');
         }
         validateHistoryMarkerRelation(current, { anchorFingerprint: expectedAnchor });
-        try { validateHistoryMarkerSeal(seal, expectedAnchor, current); } catch {
+        try { validateHistoryMarkerSeal(seal, expectedAnchor, current, await readHistoryMarkerPredecessors(current)); } catch {
           refused('commit_managed_history_marker', 'durable Genesis history marker seal is invalid');
         }
         if (current.sequence === 1) validateGenesisAuthorityReceiptForMarker(genesisAuthorityReceipt, authorityRequest);
@@ -1920,6 +1945,12 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         validateGenesisAuthorityReceiptForMarker(genesisAuthorityReceipt, authorityRequest);
         await writeCreateOnceAuthority(historyMarkerSealName, record, true, true);
       }
+      const historyMarkerArchiveName = `managed-history-marker-${record.sequence}`;
+      const archived = await rawRead(historyMarkerArchivePath(record.sequence));
+      if (archived !== null && canonical(archived) !== canonical(record)) {
+        refused('commit_managed_history_marker', 'managed history marker archive conflicts');
+      }
+      if (archived === null) await writeCreateOnceAuthority(historyMarkerArchiveName, record, true, true);
       await write(historyMarkerPath, record, 'authority', true, true);
       const reopened = await rawRead(historyMarkerPath);
       if (!reopened || canonical(reopened) !== canonical(record)) refused('commit_managed_history_marker', 'managed history marker durable reopen failed');
@@ -5196,8 +5227,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         receipt: await read(path(`authority-successor-receipt-${tx}`)),
         historyMarker: historyEvidence.marker,
         historyMarkerSeal: historyEvidence.seal,
+        historyMarkerPredecessors: historyEvidence.predecessors,
         head,
       };
+      bundle.authorityEpochArchive = bundle.authorityEpoch?.epoch === undefined
+        ? null
+        : await read(path(`authority-epoch-${bundle.authorityEpoch.epoch}-committed`));
       try {
         validateReaderVersionFloor(bundle.readerFloor);
         validatePublishedFloors({
@@ -5211,7 +5246,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         if ((bundle.readerFloor.readerVersionFloor === 2) !== (bundle.request?.readerMode === 'bound-reader')) {
           throw new TypeError('successor reader floor branch');
         }
-        validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint, bundle.historyMarker);
+        validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint, bundle.historyMarker, bundle.historyMarkerPredecessors);
         if (!bundle.historyMarkerSeal ||
             (bundle.historyMarker.sequence === 1 && canonical(bundle.historyMarker) !== canonical(bundle.historyMarkerSeal))) {
           throw new TypeError('successor history marker seal');
@@ -5236,15 +5271,23 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (head.phase === 'terminal') {
         try {
           validateAuthorityEpoch(bundle.authorityEpoch);
+          validateAuthorityEpoch(bundle.authorityEpochArchive);
           if (bundle.authorityEpoch.anchorFingerprint !== bundle.request.anchorFingerprint ||
               bundle.authorityEpoch.epoch !== bundle.finality.authorityEpoch ||
               bundle.authorityEpoch.authorityEpochFingerprint !== bundle.finality.authorityEpochFingerprint ||
               bundle.authorityEpoch.reservationTxId !== bundle.request.txId ||
-              bundle.authorityEpoch.commitTxId !== bundle.request.txId) {
+              bundle.authorityEpoch.commitTxId !== bundle.request.txId ||
+              canonical(bundle.authorityEpochArchive) !== canonical(bundle.authorityEpoch)) {
             throw new TypeError('successor authority epoch drift');
           }
         } catch {
           refused('read_authority_successor_bundle', 'successor authority epoch is absent or drifted');
+        }
+      }
+      if (head.phase === 'terminal') {
+        const lineage = await readTerminalizationLineage({ txId: head.txId, genesisAuthorityRequest });
+        if (!lineage || canonical(lineage.head) !== canonical(head)) {
+          refused('read_authority_successor_bundle', 'complete terminalization lineage is absent or drifted');
         }
       }
       let publicationGraph = null;
@@ -5267,6 +5310,18 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         refused('read_authority_successor_bundle', 'successor authority head changed during read');
       }
       return publicationGraph === null ? bundle : { ...bundle, publicationGraph };
+    },
+    async readTerminalizationLineage({ txId } = {}) {
+      await requireNoTerminalClose('read_terminalization_lineage', { allowTerminalReplay: true, readReplay: true });
+      await requireManagementPrincipal('read_terminalization_lineage');
+      if (!isOpaque(txId)) refused('read_terminalization_lineage', 'exact terminalization transaction id is required');
+      const head = await read(path('authority-head'));
+      const genesisAuthorityRequest = await requireSuccessorGenesisAuthority('read_terminalization_lineage', head);
+      const lineage = await readTerminalizationLineage({ txId, genesisAuthorityRequest });
+      if (!lineage || lineage.head?.txId !== txId || lineage.head.phase !== 'terminal') {
+        refused('read_terminalization_lineage', 'complete terminalization lineage is absent or drifted');
+      }
+      return lineage;
     },
     async writeAuthoritySuccessorFence(value) {
       await requireNoTerminalClose('write_authority_successor_fence');

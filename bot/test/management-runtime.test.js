@@ -1384,6 +1384,39 @@ test('public recover exactly replays terminal and reader-pending successor heads
   assert.equal(resumed.phase, 'reader-pending');
   assert.equal(JSON.parse(fileEnding(pending.files, '/authority-head.json')).phase, 'reader-pending');
 });
+test('public terminal recover fails closed on token history, marker, and committed epoch drift', async () => {
+  for (const [name, ending, mutate] of [
+    ['token-history', '/attestation-history.json', (value) => {
+      const history = JSON.parse(value);
+      history[0].tokenConfigHostSetFingerprint = '0'.repeat(64);
+      return canonicalJson(history);
+    }],
+    ['marker-history', '.managed-history.json', (value) => {
+      const marker = JSON.parse(value);
+      marker.previousMarkerFingerprint = '0'.repeat(64);
+      return canonicalJson(marker);
+    }],
+    ['committed-epoch', '/authority-epoch-2-committed.json', (value) => {
+      const epoch = JSON.parse(value);
+      epoch.commitTxId = 'drifted-epoch';
+      return canonicalJson(epoch);
+    }],
+  ]) {
+    const fixture = await terminalSuccessorFixture();
+    const path = [...fixture.files.keys()].find((candidate) =>
+      candidate.replaceAll('\\', '/').endsWith(ending));
+    assert.ok(path, name);
+    fixture.files.set(path, Buffer.from(mutate(fixture.files.get(path).toString())));
+    const recovered = await new ManagementRuntime({ native: fixture.native }).execute('recover', {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: 'recoverable-successor-key',
+    });
+    assert.equal(recovered.ok, false, JSON.stringify({ name, recovered }));
+    assert.equal(recovered.error, 'MANUAL_CLEANUP_REQUIRED', name);
+    assert.equal(recovered.routeDisposition, 'no-route', name);
+  }
+});
 test('public recover turns missing, torn, or phase-drifted reader-pending bundles into durable cleanup', async () => {
   for (const [kind, mutate] of [
     ['missing', () => null],
