@@ -281,32 +281,78 @@ export function validateGenesisReceipt(receipt, request, zf, fp) {
 export const authorityRecordFingerprint = (record, field) => hash(record, field);
 
 const authorityEpochKeys = ["version", "kind", "anchorFingerprint", "fenceGeneration", "epoch", "reservationTxId", "commitTxId", "previousAuthorityCommitSnapshotFingerprint", "authorityEpochFingerprint"];
-export function validateAuthorityEpoch(epoch) {
+export function validateAuthorityEpoch(epoch, request = null, reservation = null, commit = null) {
   if (!exact(epoch, authorityEpochKeys) || epoch.version !== 1 || epoch.kind !== "authority-epoch" || !isHex64(epoch.anchorFingerprint) || !Number.isSafeInteger(epoch.epoch) || epoch.epoch < 1 || !isOpaqueIdentity(epoch.reservationTxId) || !nullableText(epoch.commitTxId) || !nullableHex(epoch.previousAuthorityCommitSnapshotFingerprint) || !isHex64(epoch.authorityEpochFingerprint)) fail("authority epoch schema");
   assertFence(epoch);
+  if (request !== null && (
+    epoch.anchorFingerprint !== request.anchorFingerprint ||
+    epoch.fenceGeneration !== request.candidateFenceGeneration ||
+    epoch.epoch !== request.candidateAuthorityEpoch ||
+    epoch.reservationTxId !== request.txId ||
+    epoch.commitTxId !== request.txId ||
+    epoch.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint
+  )) fail("successor authority epoch relation");
+  if (reservation !== null) {
+    validateAuthorityReservation(reservation, request);
+    if (epoch.anchorFingerprint !== reservation.anchorFingerprint ||
+        epoch.fenceGeneration !== reservation.fenceGeneration ||
+        epoch.epoch !== reservation.epoch ||
+        epoch.reservationTxId !== reservation.txId ||
+        epoch.commitTxId !== reservation.txId ||
+        epoch.previousAuthorityCommitSnapshotFingerprint !== reservation.previousAuthorityCommitSnapshotFingerprint) fail("authority epoch reservation relation");
+  }
+  if (commit !== null) {
+    validateAuthorityCommitSnapshot(commit, reservation, request);
+    if (epoch.anchorFingerprint !== commit.anchorFingerprint ||
+        epoch.fenceGeneration !== commit.fenceGeneration ||
+        epoch.epoch !== commit.epoch ||
+        epoch.reservationTxId !== commit.txId ||
+        epoch.commitTxId !== commit.txId ||
+        epoch.previousAuthorityCommitSnapshotFingerprint !== commit.previousAuthorityCommitSnapshotFingerprint) fail("authority epoch commit relation");
+  }
   if (epoch.previousAuthorityCommitSnapshotFingerprint === null && epoch.fenceGeneration !== 1) fail("genesis authority epoch fence");
   if (hash(epoch, "authorityEpochFingerprint") !== epoch.authorityEpochFingerprint) fail("authority epoch fingerprint");
   return epoch;
 }
 
 const authorityReservationKeys = ["version", "kind", "anchorFingerprint", "fenceGeneration", "txId", "epoch", "generation", "candidateFingerprint", "previousAuthorityCommitSnapshotFingerprint", "reservationFingerprint"];
-export function validateAuthorityReservation(reservation) {
+export function validateAuthorityReservation(reservation, request = null) {
   if (!exact(reservation, authorityReservationKeys) || reservation.version !== 1 || reservation.kind !== "authority-reservation" || !isHex64(reservation.anchorFingerprint) || !isOpaqueIdentity(reservation.txId) || !Number.isSafeInteger(reservation.epoch) || reservation.epoch < 1 || !Number.isSafeInteger(reservation.generation) || reservation.generation < 1 || !isHex64(reservation.candidateFingerprint) || !nullableHex(reservation.previousAuthorityCommitSnapshotFingerprint) || !isHex64(reservation.reservationFingerprint)) fail("authority reservation schema");
   assertFence(reservation);
+  if (request !== null && (
+    reservation.anchorFingerprint !== request.anchorFingerprint ||
+    reservation.fenceGeneration !== request.candidateFenceGeneration ||
+    reservation.txId !== request.txId ||
+    reservation.epoch !== request.candidateAuthorityEpoch ||
+    reservation.generation !== request.candidateTokenConfigGeneration ||
+    reservation.candidateFingerprint !== request.requestFingerprint ||
+    reservation.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint
+  )) fail("successor authority reservation relation");
   if (reservation.previousAuthorityCommitSnapshotFingerprint === null && reservation.fenceGeneration !== 1) fail("genesis authority reservation fence");
   if (hash(reservation, "reservationFingerprint") !== reservation.reservationFingerprint) fail("authority reservation fingerprint");
   return reservation;
 }
 
 const authorityCommitKeys = ["version", "kind", "anchorFingerprint", "fenceGeneration", "txId", "epoch", "generation", "candidateFingerprint", "reservationFingerprint", "previousAuthorityCommitSnapshotFingerprint", "authorityCommitSnapshotFingerprint"];
-export function validateAuthorityCommitSnapshot(commit, reservation = null) {
+export function validateAuthorityCommitSnapshot(commit, reservation = null, request = null) {
   if (!exact(commit, authorityCommitKeys) || commit.version !== 1 || commit.kind !== "authority-commit-snapshot" || !isHex64(commit.anchorFingerprint) || !isOpaqueIdentity(commit.txId) || !Number.isSafeInteger(commit.epoch) || commit.epoch < 1 || !Number.isSafeInteger(commit.generation) || commit.generation < 1 || !isHex64(commit.candidateFingerprint) || !isHex64(commit.reservationFingerprint) || !nullableHex(commit.previousAuthorityCommitSnapshotFingerprint) || !isHex64(commit.authorityCommitSnapshotFingerprint)) fail("authority commit schema");
   assertFence(commit);
   if (commit.previousAuthorityCommitSnapshotFingerprint === null && commit.fenceGeneration !== 1) fail("genesis authority commit fence");
   if (reservation !== null) {
-    validateAuthorityReservation(reservation);
+    validateAuthorityReservation(reservation, request);
     for (const key of ["anchorFingerprint", "fenceGeneration", "txId", "epoch", "generation", "candidateFingerprint", "reservationFingerprint", "previousAuthorityCommitSnapshotFingerprint"]) if (commit[key] !== reservation[key]) fail("authority commit reservation relation");
+  } else if (request !== null) {
+    fail("authority commit reservation relation");
   }
+  if (request !== null && (
+    commit.anchorFingerprint !== request.anchorFingerprint ||
+    commit.fenceGeneration !== request.candidateFenceGeneration ||
+    commit.txId !== request.txId ||
+    commit.epoch !== request.candidateAuthorityEpoch ||
+    commit.generation !== request.candidateTokenConfigGeneration ||
+    commit.candidateFingerprint !== request.requestFingerprint ||
+    commit.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint
+  )) fail("successor authority commit relation");
   if (hash(commit, "authorityCommitSnapshotFingerprint") !== commit.authorityCommitSnapshotFingerprint) fail("authority commit fingerprint");
   return commit;
 }

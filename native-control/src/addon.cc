@@ -267,6 +267,8 @@ constexpr DWORD kWindowsTraversalAccess =
     FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
 constexpr DWORD kWindowsMutationParentAccess =
     kWindowsTraversalAccess | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
+constexpr ACCESS_MASK kWindowsDirectoryMutationAccess =
+    FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
 
 bool OpenWindowsParentNoFollow(const std::string& path, HANDLE* parent, std::wstring* name,
                                DWORD directory_access = kWindowsTraversalAccess) {
@@ -1720,13 +1722,33 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
   if (kind != "sid") { Refuse(env, "principal_access_check", "Windows principal must be a SID"); return nullptr; }
   PSID sid = nullptr;
   if (!ConvertStringSidToSidW(Wide(principal).c_str(), &sid)) { Refuse(env, "principal_access_check", "principal SID is invalid"); return nullptr; }
-  HANDLE handle = OpenNoFollowObject(path, READ_CONTROL);
+  HANDLE handle = OpenNoFollowObject(path, READ_CONTROL | FILE_READ_ATTRIBUTES);
   if (handle == INVALID_HANDLE_VALUE) { LocalFree(sid); Throw(env, "ERR_NATIVE_CONTROL_PROBE", "unable to open target without following reparse points"); return nullptr; }
   PACL dacl = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor);
+  if (status != ERROR_SUCCESS) {
+    CloseHandle(handle);
+    LocalFree(sid);
+    Throw(env, "ERR_NATIVE_CONTROL_PROBE", "unable to read target DACL");
+    return nullptr;
+  }
+  ACCESS_MASK desired_access = FILE_GENERIC_READ;
+  BY_HANDLE_FILE_INFORMATION metadata{};
+  if (mode == "write") {
+    if (!GetFileInformationByHandle(handle, &metadata)) {
+      CloseHandle(handle);
+      LocalFree(descriptor);
+      LocalFree(sid);
+      napi_value result;
+      napi_get_boolean(env, false, &result);
+      return result;
+    }
+    desired_access = (metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+      ? kWindowsDirectoryMutationAccess
+      : FILE_GENERIC_WRITE;
+  }
   CloseHandle(handle);
-  if (status != ERROR_SUCCESS) { LocalFree(sid); Throw(env, "ERR_NATIVE_CONTROL_PROBE", "unable to read target DACL"); return nullptr; }
   bool allowed = false;
   AUTHZ_RESOURCE_MANAGER_HANDLE manager = nullptr;
   AUTHZ_CLIENT_CONTEXT_HANDLE context = nullptr;
@@ -1737,7 +1759,7 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
       ACCESS_MASK granted = 0;
       DWORD access_error = ERROR_ACCESS_DENIED;
       AUTHZ_ACCESS_REQUEST request{};
-      request.DesiredAccess = mode == "read" ? FILE_GENERIC_READ : FILE_GENERIC_WRITE;
+      request.DesiredAccess = desired_access;
       AUTHZ_ACCESS_REPLY reply{};
       reply.ResultListLength = 1;
       reply.GrantedAccessMask = &granted;

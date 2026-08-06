@@ -1264,9 +1264,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   };
   const exactLiveSuccessor = async ({ request, finality, lease, projection, ack, receipt }) => {
     rejectLegacyRetainedMapping(request?.operation, request?.targetState, 'validate_live_successor');
-    const [attestation, floor, attestationHistory, floorHistory, control] = await Promise.all([
+    const [attestation, floor, attestationHistory, floorHistory, control, reservation, commit] = await Promise.all([
       read(path('attestation')), read(path('token-floor')), read(path('attestation-history')),
       read(path('token-floor-history')), read(path('control-root')),
+      read(path(`authority-reservation-${encodeURIComponent(request?.txId ?? '')}`)),
+      read(path(`authority-commit-${encodeURIComponent(request?.txId ?? '')}`)),
     ]);
     const wrapper = control?.wrapperRelativeName && await read(join(root, control.wrapperRelativeName));
     const target = control && await targetProof({ sourceKind: control.sourceKind });
@@ -1276,8 +1278,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     let genesisTokenFloor = null;
     try {
       validateAuthoritySuccessorRequest(request);
-      validateAuthoritySuccessorFinality(finality, request);
-      validateAuthorityEpoch(authorityEpoch);
+      validateAuthorityReservation(reservation, request);
+      validateAuthorityCommitSnapshot(commit, reservation, request);
+      validateAuthoritySuccessorFinality(finality, request, null, reservation, commit, authorityEpoch);
+      validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
       if (authorityEpoch.anchorFingerprint !== request.anchorFingerprint ||
           authorityEpoch.epoch !== finality.authorityEpoch ||
           authorityEpoch.authorityEpochFingerprint !== finality.authorityEpochFingerprint ||
@@ -2013,6 +2017,19 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const blockerBytes = await lowLevel.read_verified_bytes(bootstrapBlockerPath);
       const parentAcl = await lowLevel.read_acl(parent);
       if (!parentAcl) refused('probe_prospective_cleanup', 'prospective cleanup parent ACL is unreadable');
+      const parentMutation = await Promise.all([
+        [targetPrincipal, false], [managementPrincipal, true], [botPrincipal, false], [recoveryPrincipal, false],
+      ].map(async ([principal, expected]) => {
+        try {
+          const result = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write');
+          return typeof result === 'boolean' && result === expected;
+        } catch {
+          return false;
+        }
+      }));
+      if (!parentMutation.every(Boolean)) {
+        refused('probe_prospective_cleanup', 'actual config parent mutation capability is not proven; prospective cleanup is ambiguous; manual cleanup is required');
+      }
       if (blockerBytes !== null) {
         let persisted;
         try { persisted = parseCanonicalJsonBytes(Buffer.from(blockerBytes)); } catch { refused('probe_prospective_cleanup', 'persisted bootstrap blocker requires manual cleanup; route remains no-route'); }
@@ -2211,13 +2228,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           } catch {}
         }
         refused('probe_prospective_cleanup', 'prospective cleanup is ambiguous; manual cleanup is required');
-      }
-      const parentMutation = await Promise.all([
-        [managementPrincipal, true], [botPrincipal, false], [recoveryPrincipal, false],
-      ].map(async ([principal, expected]) =>
-        (await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write')) === expected));
-      if (!parentMutation.every(Boolean)) {
-        refused('probe_prospective_cleanup', 'actual config parent is not M-owned or permits B/R entry mutation');
       }
       const securityTuple = genesisSecurityTuple === undefined ? null : {
         ...structuredClone(genesisSecurityTuple),
@@ -4019,13 +4029,31 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       await requireManagementPrincipal('write_authority_successor_request');
       rejectLegacyRetainedMapping(value?.operation, value?.targetState, 'write_authority_successor_request');
       try { validateAuthoritySuccessorRequest(value); } catch { refused('write_authority_successor_request', 'exact successor request is required'); }
-      const [head, marker, floor, fenceFloor] = await Promise.all([
-        read(path('authority-head')), rawRead(historyMarkerPath), read(path('reader-version-floor')), read(path('fence-generation-floor')),
+      const [head, marker, floor, fenceFloor, authorityEpochFloor, tokenFloor] = await Promise.all([
+        read(path('authority-head')), rawRead(historyMarkerPath), read(path('reader-version-floor')), read(path('fence-generation-floor')), read(path('authority-epoch-floor')), read(path('token-floor')),
       ]);
-      try { validateReaderVersionFloor(floor); validateFenceGenerationFloor(fenceFloor); } catch { refused('write_authority_successor_request', 'committed reader and fence floors are absent or invalid'); }
+      try {
+        validateReaderVersionFloor(floor);
+        validateFenceGenerationFloor(fenceFloor);
+        validateAuthorityEpochFloor(authorityEpochFloor);
+        validateTokenFloor(tokenFloor);
+      } catch {
+        refused('write_authority_successor_request', 'committed reader, token, and authority floors are absent or invalid');
+      }
+      if (authorityEpochFloor.anchorFingerprint !== value.anchorFingerprint ||
+          fenceFloor.anchorFingerprint !== value.anchorFingerprint ||
+          value.previousAuthorityEpoch !== authorityEpochFloor.highestCommittedAuthorityEpoch ||
+          value.candidateAuthorityEpoch !== authorityEpochFloor.highestCommittedAuthorityEpoch + 1) {
+        refused('write_authority_successor_request', 'successor request authority epoch is not the durable monotonic successor');
+      }
       if (value.previousFenceGeneration !== fenceFloor.highestCommittedFenceGeneration ||
           value.candidateFenceGeneration !== fenceFloor.highestCommittedFenceGeneration + 1) {
         refused('write_authority_successor_request', 'successor request fence is not the durable monotonic successor');
+      }
+      if (tokenFloor.anchorFingerprint !== value.anchorFingerprint ||
+          value.previousTokenConfigGeneration !== tokenFloor.highestCommittedGeneration ||
+          value.candidateTokenConfigGeneration !== tokenFloor.highestCommittedGeneration + (value.operation === 'tokens-attest' ? 1 : 0)) {
+        refused('write_authority_successor_request', 'successor request token generation is not the durable monotonic successor');
       }
       if ((floor.readerVersionFloor === 2) !== (value.readerMode === 'bound-reader')) {
         refused('write_authority_successor_request', 'successor reader mode does not follow the committed reader floor');
@@ -4063,6 +4091,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const head = await verifiedBytes(path('authority-head'));
       const request = await verifiedBytes(path(`authority-successor-request-${encodedTxId}`));
       const finality = await verifiedBytes(path(`authority-successor-finality-${encodedTxId}`));
+      const reservation = await verifiedBytes(path(`authority-reservation-${encodedTxId}`));
+      const commit = await verifiedBytes(path(`authority-commit-${encodedTxId}`));
       const attestation = await verifiedBytes(path('attestation'));
       const tokenFloor = await verifiedBytes(path('token-floor'));
       const authorityEpoch = await verifiedBytes(path('authority-epoch'));
@@ -4079,6 +4109,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const headValue = parseCanonicalJsonBytes(head.bytes);
       const finalityValue = parseCanonicalJsonBytes(finality.bytes);
       const requestValue = parseCanonicalJsonBytes(request.bytes);
+      const reservationValue = parseCanonicalJsonBytes(reservation.bytes);
+      const commitValue = parseCanonicalJsonBytes(commit.bytes);
       const attestationValue = parseCanonicalJsonBytes(attestation.bytes);
       const floorValue = parseCanonicalJsonBytes(tokenFloor.bytes);
       const attestationHistoryValue = parseCanonicalJsonBytes(attestationHistory.bytes);
@@ -4111,7 +4143,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       try {
         validateAuthoritySuccessorRequest(requestValue);
         validateAuthoritySuccessorHead(headValue, requestValue);
-        validateAuthoritySuccessorFinality(finalityValue, requestValue);
+        validateAuthorityReservation(reservationValue, requestValue);
+        validateAuthorityCommitSnapshot(commitValue, reservationValue, requestValue);
+        validateAuthorityEpoch(authorityEpochValue, requestValue, reservationValue, commitValue);
+        validateAuthoritySuccessorFinality(finalityValue, requestValue, null, reservationValue, commitValue, authorityEpochValue);
         validateTokenHistory({
           anchorFingerprint: requestValue.anchorFingerprint,
           attestationHistory: attestationHistoryValue,
@@ -4220,8 +4255,32 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async commitAuthoritySuccessorEpoch(record) {
       await requireNoTerminalClose('commit_authority_successor_epoch');
       await requireManagementPrincipal('commit_authority_successor_epoch');
-      try { validateAuthorityEpoch(record); } catch { refused('commit_authority_successor_epoch', 'exact committed successor epoch is required'); }
-      if (record.commitTxId !== record.reservationTxId) refused('commit_authority_successor_epoch', 'successor epoch commit transaction is invalid');
+      const tx = encodeURIComponent(record?.reservationTxId ?? record?.commitTxId ?? '');
+      const [request, reservation, commit] = await Promise.all([
+        read(path(`authority-successor-request-${tx}`)),
+        read(path(`authority-reservation-${tx}`)),
+        read(path(`authority-commit-${tx}`)),
+      ]);
+      try {
+        validateAuthoritySuccessorRequest(request);
+        validateAuthorityReservation(reservation, request);
+        validateAuthorityCommitSnapshot(commit, reservation, request);
+        validateAuthorityEpoch(record, request, reservation, commit);
+      } catch {
+        refused('commit_authority_successor_epoch', 'exact committed successor epoch is required');
+      }
+      if (record.commitTxId !== request.txId ||
+          record.reservationTxId !== request.txId ||
+          record.epoch !== request.candidateAuthorityEpoch ||
+          record.fenceGeneration !== request.candidateFenceGeneration ||
+          commit.txId !== request.txId ||
+          commit.epoch !== request.candidateAuthorityEpoch ||
+          commit.generation !== request.candidateTokenConfigGeneration ||
+          commit.fenceGeneration !== request.candidateFenceGeneration ||
+          commit.reservationFingerprint !== reservation.reservationFingerprint ||
+          record.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint) {
+        refused('commit_authority_successor_epoch', 'successor epoch is detached from the request reservation and commit');
+      }
       let floor = await read(path('authority-epoch-floor'));
       try { floor = validateAuthorityEpochFloor(floor); } catch { refused('commit_authority_successor_epoch', 'durable authority epoch floor is invalid'); }
       if (floor.anchorFingerprint !== record.anchorFingerprint ||
@@ -4269,11 +4328,13 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const tx = encodeURIComponent(value.txId);
       const close = phase >= 1 ? await read(path(`authority-close-proof-${tx}`)) : null;
       const baseline = phase >= 2 ? await read(path(`authority-successor-baseline-${tx}`)) : null;
+      const reservation = phase >= 2 ? await read(path(`authority-reservation-${tx}`)) : null;
       const commit = phase >= 2 ? await read(path(`authority-commit-${tx}`)) : null;
       const fence = phase >= 2 ? await read(path(`authority-successor-fence-${tx}`)) : null;
       const publicationK = phase >= 2 ? await read(path(`publication-k-${tx}`)) : null;
       const publicationY = phase >= 2 ? await read(path(`publication-y-${tx}`)) : null;
       const finality = phase >= 3 ? await read(path(`authority-successor-finality-${tx}`)) : null;
+      const authorityEpoch = phase >= 3 ? await read(path('authority-epoch')) : null;
       const receipt = phase >= 4 ? await read(path(`authority-successor-receipt-${tx}`)) : null;
       const lease = phase >= 4 ? await read(botPath(`successor-lease-${tx}`)) : null;
       const projection = phase >= 4 ? await read(botPath(`successor-reader-projection-${tx}`)) : null;
@@ -4292,8 +4353,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           if (value.closeFingerprint !== close.closeFingerprint) throw new TypeError('close head binding');
         }
         if (phase >= 2) {
-          if (fence !== null) validateAuthoritySuccessorFence(fence, request);
-          validateAuthoritySuccessorBaseline(baseline, request, close, fence);
+          validateAuthorityReservation(reservation, request);
+          validateAuthorityCommitSnapshot(commit, reservation, request);
+          if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit);
+          validateAuthoritySuccessorBaseline(baseline, request, close, fence, reservation, commit);
           if (!commit || !hex(commit.authorityCommitSnapshotFingerprint) ||
               !publicationK || !hex(publicationK['publication-kFingerprint']) ||
               !publicationY || !hex(publicationY['publication-yFingerprint']) ||
@@ -4303,7 +4366,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
               value.publicationYFingerprint !== publicationY['publication-yFingerprint']) throw new TypeError('replaced head binding');
         }
         if (phase >= 3) {
-          validateAuthoritySuccessorFinality(finality, request, baseline);
+          validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+          validateAuthoritySuccessorFinality(finality, request, baseline, reservation, commit, authorityEpoch);
           if (value.finalityFingerprint !== finality.finalityFingerprint) throw new TypeError('finality head binding');
         }
         if (phase >= 4) {
@@ -4533,21 +4597,49 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async writeAuthoritySuccessorFence(value) {
       await requireNoTerminalClose('write_authority_successor_fence');
       await requireManagementPrincipal('write_authority_successor_fence');
-      try { validateAuthoritySuccessorFence(value); } catch { refused('write_authority_successor_fence', 'exact successor fence is required'); }
+      const tx = encodeURIComponent(value?.txId ?? '');
+      const [request, reservation, commit] = await Promise.all([
+        read(path(`authority-successor-request-${tx}`)),
+        read(path(`authority-reservation-${tx}`)),
+        read(path(`authority-commit-${tx}`)),
+      ]);
+      try {
+        validateAuthoritySuccessorRequest(request);
+        validateAuthorityReservation(reservation, request);
+        validateAuthorityCommitSnapshot(commit, reservation, request);
+        validateAuthoritySuccessorFence(value, request, commit);
+      } catch {
+        refused('write_authority_successor_fence', 'exact successor fence is required');
+      }
       await writeCreateOnceAuthority(`authority-successor-fence-${encodeURIComponent(value.txId)}`, value);
       return value;
     },
     async writeAuthoritySuccessorReservation(value) {
       await requireNoTerminalClose('write_authority_successor_reservation');
       await requireManagementPrincipal('write_authority_successor_reservation');
-      try { validateAuthorityReservation(value); } catch { refused('write_authority_successor_reservation', 'exact successor authority reservation is required'); }
+      const tx = encodeURIComponent(value?.txId ?? '');
+      const request = await read(path(`authority-successor-request-${tx}`));
+      try {
+        validateAuthoritySuccessorRequest(request);
+        validateAuthorityReservation(value, request);
+      } catch {
+        refused('write_authority_successor_reservation', 'exact successor authority reservation is required');
+      }
       let floor = await read(path('authority-epoch-floor'));
       try { floor = validateAuthorityEpochFloor(floor); } catch { refused('write_authority_successor_reservation', 'durable authority epoch floor is invalid'); }
-      if (floor.anchorFingerprint !== value.anchorFingerprint) {
-        refused('write_authority_successor_reservation', 'successor authority reservation anchor is invalid');
-      }
       const replay = floor.highestReservedAuthorityEpoch === value.epoch && floor.lastReservationTxId === value.txId;
-      if (!replay && (value.epoch !== floor.highestReservedAuthorityEpoch + 1 || value.epoch <= floor.highestCommittedAuthorityEpoch)) {
+      if (floor.anchorFingerprint !== value.anchorFingerprint ||
+          (floor.highestCommittedAuthorityEpoch !== request.previousAuthorityEpoch && !(replay && floor.highestCommittedAuthorityEpoch === value.epoch)) ||
+          (!replay && value.epoch !== floor.highestReservedAuthorityEpoch + 1) ||
+          value.epoch !== request.candidateAuthorityEpoch ||
+          value.generation !== request.candidateTokenConfigGeneration ||
+          value.fenceGeneration !== request.candidateFenceGeneration ||
+          value.txId !== request.txId ||
+          value.candidateFingerprint !== request.requestFingerprint ||
+          value.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint) {
+        refused('write_authority_successor_reservation', 'successor authority reservation is detached from the request lineage');
+      }
+      if (!replay && value.epoch <= floor.highestCommittedAuthorityEpoch) {
         refused('write_authority_successor_reservation', 'successor authority reservation is not a durable monotonic successor');
       }
       if (!replay) {
@@ -4565,8 +4657,26 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async writeAuthoritySuccessorCommit(value) {
       await requireNoTerminalClose('write_authority_successor_commit');
       await requireManagementPrincipal('write_authority_successor_commit');
-      const reservation = await read(path(`authority-reservation-${encodeURIComponent(value.txId)}`));
-      try { validateAuthorityCommitSnapshot(value, reservation); } catch { refused('write_authority_successor_commit', 'exact successor authority commit is required'); }
+      const tx = encodeURIComponent(value?.txId ?? '');
+      const [request, reservation] = await Promise.all([
+        read(path(`authority-successor-request-${tx}`)),
+        read(path(`authority-reservation-${tx}`)),
+      ]);
+      try {
+        validateAuthoritySuccessorRequest(request);
+        validateAuthorityReservation(reservation, request);
+        validateAuthorityCommitSnapshot(value, reservation, request);
+      } catch {
+        refused('write_authority_successor_commit', 'exact successor authority commit is required');
+      }
+      if (value.txId !== request.txId ||
+          value.epoch !== request.candidateAuthorityEpoch ||
+          value.generation !== request.candidateTokenConfigGeneration ||
+          value.fenceGeneration !== request.candidateFenceGeneration ||
+          value.reservationFingerprint !== reservation.reservationFingerprint ||
+          value.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint) {
+        refused('write_authority_successor_commit', 'successor authority commit is detached from the request reservation');
+      }
       await writeCreateOnceAuthority(`authority-commit-${encodeURIComponent(value.txId)}`, value);
       return value;
     },
@@ -4581,29 +4691,49 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     async writeAuthoritySuccessorBaseline(value) {
       await requireNoTerminalClose('write_authority_successor_baseline');
       await requireManagementPrincipal('write_authority_successor_baseline');
-      const request = await read(path(`authority-successor-request-${encodeURIComponent(value.txId)}`));
-      const close = await read(path(`authority-close-proof-${encodeURIComponent(value.txId)}`));
-      const fence = await read(path(`authority-successor-fence-${encodeURIComponent(value.txId)}`));
-      try { validateAuthoritySuccessorRequest(request); validateAuthoritySuccessorBaseline(value, request, close, fence); } catch { refused('write_authority_successor_baseline', 'exact successor baseline is required'); }
+      const tx = encodeURIComponent(value?.txId ?? '');
+      const [request, close, fence, reservation, commit] = await Promise.all([
+        read(path(`authority-successor-request-${tx}`)),
+        read(path(`authority-close-proof-${tx}`)),
+        read(path(`authority-successor-fence-${tx}`)),
+        read(path(`authority-reservation-${tx}`)),
+        read(path(`authority-commit-${tx}`)),
+      ]);
+      try {
+        validateAuthoritySuccessorRequest(request);
+        validateAuthorityCloseProof(close, request);
+        if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit);
+        validateAuthorityReservation(reservation, request);
+        validateAuthorityCommitSnapshot(commit, reservation, request);
+        validateAuthoritySuccessorBaseline(value, request, close, fence, reservation, commit);
+      } catch {
+        refused('write_authority_successor_baseline', 'exact successor baseline is required');
+      }
       await writeCreateOnceAuthority(`authority-successor-baseline-${encodeURIComponent(value.txId)}`, value);
       return value;
     },
     async writeAuthoritySuccessorFinality(value) {
       await requireNoTerminalClose('write_authority_successor_finality');
       await requireManagementPrincipal('write_authority_successor_finality');
-      const tx = encodeURIComponent(value.txId);
-      const [request, baseline, close, fence] = await Promise.all([
+      const tx = encodeURIComponent(value?.txId ?? '');
+      const [request, baseline, close, fence, reservation, commit, authorityEpoch] = await Promise.all([
         read(path(`authority-successor-request-${tx}`)),
         read(path(`authority-successor-baseline-${tx}`)),
         read(path(`authority-close-proof-${tx}`)),
         read(path(`authority-successor-fence-${tx}`)),
+        read(path(`authority-reservation-${tx}`)),
+        read(path(`authority-commit-${tx}`)),
+        read(path('authority-epoch')),
       ]);
       try {
         validateAuthoritySuccessorRequest(request);
         validateAuthorityCloseProof(close, request);
-        if (fence !== null) validateAuthoritySuccessorFence(fence, request);
-        validateAuthoritySuccessorBaseline(baseline, request, close, fence);
-        validateAuthoritySuccessorFinality(value, request, baseline);
+        validateAuthorityReservation(reservation, request);
+        validateAuthorityCommitSnapshot(commit, reservation, request);
+        if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit);
+        validateAuthoritySuccessorBaseline(baseline, request, close, fence, reservation, commit);
+        validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+        validateAuthoritySuccessorFinality(value, request, baseline, reservation, commit, authorityEpoch);
       } catch {
         refused('write_authority_successor_finality', 'exact successor finality is required');
       }

@@ -441,10 +441,10 @@ function validateSuccessorPublicationEvidence({ snapshot, bundle }) {
   }
   validateSharedPublicationGraph(publication);
   validateAuthoritySuccessorRequest(request);
-  validateAuthoritySuccessorFinality(finality, request, baseline);
-  validateAuthorityReservation(reservation);
-  validateAuthorityCommitSnapshot(commit, reservation);
-  validateAuthorityEpoch(authorityEpoch);
+  validateAuthorityReservation(reservation, request);
+  validateAuthorityCommitSnapshot(commit, reservation, request);
+  validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+  validateAuthoritySuccessorFinality(finality, request, baseline, reservation, commit, authorityEpoch);
   if (!isBytes(snapshot.authorityEpochFloorBytes) || !isBytes(snapshot.fenceGenerationFloorBytes)) {
     throw new TypeError("successor authority floor absent");
   }

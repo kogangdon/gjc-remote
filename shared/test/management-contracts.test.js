@@ -4,9 +4,9 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from "../strict-json.js";
 import { validateFinalityProof } from "../admission-envelope.js";
-import { buildGenesisPrecommit, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateZFinality } from "../genesis-envelope.js";
+import { buildGenesisPrecommit, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateZFinality } from "../genesis-envelope.js";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationU, validatePublicationY, validatePublicationZp } from "../publication-envelope.js";
-import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest } from "../successor-envelope.js";
+import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorRequest } from "../successor-envelope.js";
 
 const hex = "a".repeat(64);
 const seal = (record, field) => ({ ...record, [field]: canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field))) });
@@ -416,4 +416,58 @@ test("successor reader records reject every substituted authoritative scalar", (
   for (const field of ["rootGenesisTxId", "requestFingerprint", "fenceGeneration", "anchorFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion"]) assert.throws(() => validateAuthoritySuccessorFence(sealedMutation(fence, field, "fenceBindingFingerprint"), request), /F2/);
   for (const field of ["rootGenesisTxId", "requestFingerprint", "fenceGeneration", "finalityFingerprint", "anchorFingerprint", "authorityCommitSnapshotFingerprint", "targetFingerprint", "wrapperFingerprint", "revision", "authorityEpoch", "tokenConfigGeneration", "mappingGeneration", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce", "fenceBindingFingerprint", "leaseBindingFingerprint"]) assert.throws(() => validateAuthoritySuccessorReaderProjection(sealedMutation(projection, field, "readerProjectionFingerprint"), request, finality, lease), /RP2/);
   for (const field of ["rootGenesisTxId", "requestFingerprint", "fenceGeneration", "finalityFingerprint", "readerProjectionFingerprint", "leaseBindingFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce"]) assert.throws(() => validateAuthoritySuccessorAck(sealedMutation(ack, field, "ackFingerprint"), request, finality, projection), /AK2/);
+});
+test("successor authority tuples bind request candidates, reservation/commit fingerprints, and finality epoch", () => {
+  const request = buildAuthoritySuccessorRecord({
+    version: 1, kind: "authority-successor-request", sequence: 2, txId: "successor-lineage", rootGenesisTxId: "genesis",
+    idempotencyKey: "lineage-key", operation: "tokens-attest", anchorFingerprint: hex, actorPrincipalFingerprint: hex,
+    previousReceiptFingerprint: "b".repeat(64), previousTargetFingerprint: hex, previousWrapperFingerprint: hex,
+    previousRevision: 1, candidateRevision: 2, previousAuthorityEpoch: 1, candidateAuthorityEpoch: 2,
+    previousTokenConfigGeneration: 1, candidateTokenConfigGeneration: 2, previousAttestationFingerprint: hex,
+    candidateAttestationFingerprint: "c".repeat(64), previousMappingGeneration: 0, candidateMappingGeneration: 0,
+    previousSnapshotFingerprint: hex, candidateSnapshotFingerprint: "d".repeat(64), candidateTargetFingerprint: "e".repeat(64),
+    previousFenceGeneration: 1, candidateFenceGeneration: 2, mappingRecoveryTxFingerprint: null, targetState: "managed-empty",
+    readerMode: "no-reader", readerInstanceId: null, readerStartNonce: null, readerNonce: null, requestFingerprint: null,
+  }, "requestFingerprint");
+  const reservation = seal({
+    version: 1, kind: "authority-reservation", anchorFingerprint: request.anchorFingerprint, fenceGeneration: request.candidateFenceGeneration,
+    txId: request.txId, epoch: request.candidateAuthorityEpoch, generation: request.candidateTokenConfigGeneration,
+    candidateFingerprint: request.requestFingerprint, previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
+    reservationFingerprint: null,
+  }, "reservationFingerprint");
+  const commit = seal({
+    version: 1, kind: "authority-commit-snapshot", anchorFingerprint: request.anchorFingerprint, fenceGeneration: request.candidateFenceGeneration,
+    txId: request.txId, epoch: request.candidateAuthorityEpoch, generation: request.candidateTokenConfigGeneration,
+    candidateFingerprint: request.requestFingerprint, reservationFingerprint: reservation.reservationFingerprint,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint, authorityCommitSnapshotFingerprint: null,
+  }, "authorityCommitSnapshotFingerprint");
+  const authorityEpoch = seal({
+    version: 1, kind: "authority-epoch", anchorFingerprint: request.anchorFingerprint, fenceGeneration: request.candidateFenceGeneration,
+    epoch: request.candidateAuthorityEpoch, reservationTxId: request.txId, commitTxId: request.txId,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint, authorityEpochFingerprint: null,
+  }, "authorityEpochFingerprint");
+  const finality = buildAuthoritySuccessorRecord({
+    version: 1, kind: "authority-successor-finality", sequence: request.sequence, txId: request.txId,
+    rootGenesisTxId: request.rootGenesisTxId, requestFingerprint: request.requestFingerprint,
+    fenceGeneration: request.candidateFenceGeneration, operation: request.operation, baselineFingerprint: hex,
+    closeFingerprint: hex, anchorFingerprint: request.anchorFingerprint, authorityReservationFingerprint: reservation.reservationFingerprint,
+    authorityCommitSnapshotFingerprint: commit.authorityCommitSnapshotFingerprint, authorityEpochFingerprint: authorityEpoch.authorityEpochFingerprint,
+    tokenFloorFingerprint: hex, attestationFingerprint: request.candidateAttestationFingerprint, publicationKFingerprint: hex,
+    publicationYFingerprint: hex, operationEvidenceFingerprint: hex, auditEntryFingerprint: hex, targetFingerprint: hex,
+    targetIdentityFingerprint: hex, targetAclFingerprint: hex, wrapperFingerprint: hex, controlRootFingerprint: hex,
+    revision: request.candidateRevision, authorityEpoch: request.candidateAuthorityEpoch,
+    tokenConfigGeneration: request.candidateTokenConfigGeneration, mappingGeneration: request.candidateMappingGeneration,
+    snapshotFingerprint: request.candidateSnapshotFingerprint, routeDisposition: "no-route", finalityFingerprint: null,
+  }, "finalityFingerprint");
+  assert.doesNotThrow(() => validateAuthorityReservation(reservation, request));
+  assert.doesNotThrow(() => validateAuthorityCommitSnapshot(commit, reservation, request));
+  assert.doesNotThrow(() => validateAuthorityEpoch(authorityEpoch, request, reservation, commit));
+  assert.doesNotThrow(() => validateAuthoritySuccessorFinality(finality, request, null, reservation, commit, authorityEpoch));
+  assert.throws(() => validateAuthorityReservation(seal({ ...reservation, txId: "foreign-tx", reservationFingerprint: null }, "reservationFingerprint"), request));
+  assert.throws(() => validateAuthorityCommitSnapshot(seal({ ...commit, reservationFingerprint: hex, authorityCommitSnapshotFingerprint: null }, "authorityCommitSnapshotFingerprint"), reservation, request));
+  const foreignEpoch = seal({ ...authorityEpoch, authorityEpochFingerprint: null, previousAuthorityCommitSnapshotFingerprint: hex }, "authorityEpochFingerprint");
+  assert.throws(() => validateAuthoritySuccessorFinality(finality, request, null, reservation, commit, foreignEpoch));
+  const detachedFinality = seal({ ...finality, authorityEpochFingerprint: hex }, "finalityFingerprint");
+  assert.throws(() => validateAuthoritySuccessorFinality(detachedFinality, request, null, reservation, commit, authorityEpoch));
+  assert.throws(() => validateAuthorityEpoch(seal({ ...authorityEpoch, fenceGeneration: 1, authorityEpochFingerprint: null }, "authorityEpochFingerprint"), request, reservation, commit));
 });

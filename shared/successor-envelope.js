@@ -1,5 +1,6 @@
 import { canonicalJsonHash, isHex64 } from "./strict-json.js";
 import { isOpaqueIdentity } from "./identity.js";
+import { validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation } from "./genesis-envelope.js";
 
 const plain = (value) => value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 const exact = (value, keys) => plain(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
@@ -68,15 +69,16 @@ export function validateAuthorityCloseProof(record, request = null) {
 }
 
 const F2 = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "anchorFingerprint", "authorityCommitSnapshotFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "previousFenceBindingFingerprint", "fenceBindingFingerprint"];
-export function validateAuthoritySuccessorFence(record, request = null) {
+export function validateAuthoritySuccessorFence(record, request = null, commit = null) {
   assertKeys(record, F2); assertFence(record);
   if (record.kind !== "authority-successor-fence" || ![record.txId, record.rootGenesisTxId, record.readerInstanceId, record.readerStartNonce].every(opaque) || ![record.requestFingerprint, record.anchorFingerprint, record.authorityCommitSnapshotFingerprint, record.previousFenceBindingFingerprint].every(hex) || record.readerVersion !== 2) fail("F2 fields");
-  if (request && (request.readerMode !== "bound-reader" || record.txId !== request.txId || record.rootGenesisTxId !== request.rootGenesisTxId || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.anchorFingerprint !== request.anchorFingerprint || record.readerInstanceId !== request.readerInstanceId || record.readerStartNonce !== request.readerStartNonce)) fail("F2 request relation");
+  if (request && (request.readerMode !== "bound-reader" || record.txId !== request.txId || record.rootGenesisTxId !== request.rootGenesisTxId || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.anchorFingerprint !== request.anchorFingerprint || record.readerInstanceId !== request.readerInstanceId || record.readerStartNonce !== request.readerStartNonce || record.previousFenceBindingFingerprint !== request.previousReceiptFingerprint)) fail("F2 request relation");
+  if (commit && (record.txId !== commit.txId || record.fenceGeneration !== commit.fenceGeneration || record.anchorFingerprint !== commit.anchorFingerprint || record.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint)) fail("F2 commit relation");
   assertHash(record, "fenceBindingFingerprint"); return record;
 }
 
 const SB = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "anchorFingerprint", "operation", "targetState", "revision", "authorityEpoch", "tokenConfigGeneration", "tokenConfigHostSetFingerprint", "mappingGeneration", "candidateSnapshotFingerprint", "candidateTargetFingerprint", "attestationFingerprint", "authorityReservationFingerprint", "authorityCommitSnapshotFingerprint", "closeFingerprint", "fenceBindingFingerprint", "leaseBindingFingerprint", "readerProjectionFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "baselineFingerprint"];
-export function validateAuthoritySuccessorBaseline(record, request = null, close = null, fence = null) {
+export function validateAuthoritySuccessorBaseline(record, request = null, close = null, fence = null, reservation = null, commit = null) {
   assertFence(record);
   assertKeys(record, SB); if (record.kind !== "authority-successor-baseline" || ![record.txId, record.rootGenesisTxId].every(opaque) || ![record.requestFingerprint, record.anchorFingerprint, record.tokenConfigHostSetFingerprint, record.candidateSnapshotFingerprint, record.candidateTargetFingerprint, record.attestationFingerprint, record.authorityReservationFingerprint, record.authorityCommitSnapshotFingerprint, record.closeFingerprint].every(hex) || !operations.has(record.operation) || !validTargetState(record.operation, record.targetState) || ![record.revision, record.authorityEpoch, record.tokenConfigGeneration].every(positive) || !nonNegative(record.mappingGeneration) || ![record.fenceBindingFingerprint, record.leaseBindingFingerprint, record.readerProjectionFingerprint].every(nullableHex) || ![record.readerInstanceId, record.readerStartNonce].every(nullableOpaque) || !(record.readerVersion === null || record.readerVersion === 2)) fail("SB fields");
   if (request && record.fenceGeneration !== request.candidateFenceGeneration) fail("SB fence relation");
@@ -87,16 +89,38 @@ export function validateAuthoritySuccessorBaseline(record, request = null, close
     : record.readerInstanceId !== request.readerInstanceId || record.readerStartNonce !== request.readerStartNonce || record.readerVersion !== 2)) fail("SB reader relation");
   if (close && record.closeFingerprint !== close.closeFingerprint) fail("SB close relation");
   if (fence ? record.fenceBindingFingerprint !== fence.fenceBindingFingerprint : record.fenceBindingFingerprint !== null) fail("SB fence relation");
+  if (reservation && (record.authorityReservationFingerprint !== reservation.reservationFingerprint)) fail("SB reservation relation");
+  if (commit && (record.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint)) fail("SB commit relation");
+  if (reservation !== null) {
+    if (commit === null) fail("SB commit relation");
+  }
+  if (commit !== null) {
+    if (reservation === null) fail("SB reservation relation");
+  }
   if (record.fenceBindingFingerprint === null) reader(record, false); else reader(record);
   assertHash(record, "baselineFingerprint"); return record;
 }
 
 const SF = ["version", "kind", "sequence", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "operation", "baselineFingerprint", "closeFingerprint", "anchorFingerprint", "authorityReservationFingerprint", "authorityCommitSnapshotFingerprint", "authorityEpochFingerprint", "tokenFloorFingerprint", "attestationFingerprint", "publicationKFingerprint", "publicationYFingerprint", "operationEvidenceFingerprint", "auditEntryFingerprint", "targetFingerprint", "targetIdentityFingerprint", "targetAclFingerprint", "wrapperFingerprint", "controlRootFingerprint", "revision", "authorityEpoch", "tokenConfigGeneration", "mappingGeneration", "snapshotFingerprint", "routeDisposition", "finalityFingerprint"];
-export function validateAuthoritySuccessorFinality(record, request = null, baseline = null) {
+export function validateAuthoritySuccessorFinality(record, request = null, baseline = null, reservation = null, commit = null, authorityEpoch = null) {
   assertKeys(record, SF); assertFence(record);
   if (record.kind !== "authority-successor-finality" || !positive(record.sequence) || ![record.txId, record.rootGenesisTxId].every(opaque) || !operations.has(record.operation) || ![record.requestFingerprint, record.baselineFingerprint, record.closeFingerprint, record.anchorFingerprint, record.authorityReservationFingerprint, record.authorityCommitSnapshotFingerprint, record.authorityEpochFingerprint, record.tokenFloorFingerprint, record.attestationFingerprint, record.publicationKFingerprint, record.publicationYFingerprint, record.operationEvidenceFingerprint, record.auditEntryFingerprint, record.targetFingerprint, record.targetIdentityFingerprint, record.targetAclFingerprint, record.wrapperFingerprint, record.controlRootFingerprint, record.snapshotFingerprint].every(hex) || ![record.revision, record.authorityEpoch, record.tokenConfigGeneration].every(positive) || !nonNegative(record.mappingGeneration) || record.routeDisposition !== "no-route") fail("SF fields");
   if (request && (record.txId !== request.txId || record.sequence !== request.sequence || record.rootGenesisTxId !== request.rootGenesisTxId || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.operation !== request.operation || record.anchorFingerprint !== request.anchorFingerprint || record.revision !== request.candidateRevision || record.authorityEpoch !== request.candidateAuthorityEpoch || record.tokenConfigGeneration !== request.candidateTokenConfigGeneration || record.mappingGeneration !== request.candidateMappingGeneration || record.attestationFingerprint !== request.candidateAttestationFingerprint)) fail("SF request relation");
   if (baseline && (record.baselineFingerprint !== baseline.baselineFingerprint || record.fenceGeneration !== baseline.fenceGeneration || record.closeFingerprint !== baseline.closeFingerprint || record.authorityCommitSnapshotFingerprint !== baseline.authorityCommitSnapshotFingerprint || record.revision !== baseline.revision || record.authorityEpoch !== baseline.authorityEpoch || record.tokenConfigGeneration !== baseline.tokenConfigGeneration || record.mappingGeneration !== baseline.mappingGeneration || record.attestationFingerprint !== baseline.attestationFingerprint)) fail("SF baseline relation");
+  if (reservation !== null) {
+    validateAuthorityReservation(reservation, request);
+    if (record.authorityReservationFingerprint !== reservation.reservationFingerprint) fail("SF reservation relation");
+  }
+  if (commit !== null) {
+    validateAuthorityCommitSnapshot(commit, reservation, request);
+    if (record.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint) fail("SF commit relation");
+  }
+  if ((reservation === null) !== (commit === null)) fail("SF reservation/commit relation");
+  if (authorityEpoch !== null && (reservation === null || commit === null)) fail("SF authority epoch relation");
+  if (authorityEpoch !== null) {
+    validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+    if (record.authorityEpochFingerprint !== authorityEpoch.authorityEpochFingerprint) fail("SF authority epoch relation");
+  }
   assertHash(record, "finalityFingerprint"); return record;
 }
 
@@ -187,11 +211,27 @@ export function validateAuthoritySuccessorHeadTransition(previous, next, request
 export const buildAuthoritySuccessorRecord = (record, fingerprintField) => { const value = { ...record, [fingerprintField]: null }; value[fingerprintField] = fingerprint(value, fingerprintField); return value; };
 export const authoritySuccessorFingerprint = fingerprint;
 export function validateAuthoritySuccessorBundle(bundle) {
-  const { request, close = null, fence = null, baseline = null, commit = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, head } = bundle ?? {};
+  const { request, close = null, fence = null, baseline = null, commit = null, reservation = null, authorityEpoch = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, head } = bundle ?? {};
   validateAuthoritySuccessorRequest(request); validateAuthoritySuccessorHead(head, request);
-  if (close !== null) validateAuthorityCloseProof(close, request); if (fence !== null) validateAuthoritySuccessorFence(fence, request); if (baseline !== null) validateAuthoritySuccessorBaseline(baseline, request, close, fence); if (finality !== null) validateAuthoritySuccessorFinality(finality, request, baseline); if (lease !== null) validateAuthoritySuccessorLease(lease, request, fence); if (projection !== null) validateAuthoritySuccessorReaderProjection(projection, request, finality, lease); if (ack !== null) validateAuthoritySuccessorAck(ack, request, finality, projection); if (receipt !== null) validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack);
-  const candidateRecords = [close, fence, baseline, commit, publicationK, publicationY, finality, lease, projection, ack, receipt].filter((value) => value !== null);
+  if (close !== null) validateAuthorityCloseProof(close, request);
+  if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit);
+  if (baseline !== null) validateAuthoritySuccessorBaseline(baseline, request, close, fence, reservation, commit);
+  if (finality !== null) validateAuthoritySuccessorFinality(finality, request, baseline, reservation, commit, authorityEpoch);
+  if (lease !== null) validateAuthoritySuccessorLease(lease, request, fence);
+  if (projection !== null) validateAuthoritySuccessorReaderProjection(projection, request, finality, lease);
+  if (ack !== null) validateAuthoritySuccessorAck(ack, request, finality, projection);
+  if (receipt !== null) validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack);
+  const candidateRecords = [close, fence, baseline, reservation, commit, publicationK, publicationY, finality, lease, projection, ack, receipt].filter((value) => value !== null);
   for (const record of candidateRecords) assertFence(record, request.candidateFenceGeneration);
+  if (["replaced", "reader-pending", "terminal"].includes(head.phase)) {
+    if (reservation === null || commit === null) fail("AH authority reservation/commit evidence");
+    validateAuthorityReservation(reservation, request);
+    validateAuthorityCommitSnapshot(commit, reservation, request);
+  }
+  if (finality !== null) {
+    if (authorityEpoch === null) fail("AH authority epoch evidence");
+    validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+  }
   const fields = { closeFingerprint: close?.closeFingerprint ?? null, baselineFingerprint: baseline?.baselineFingerprint ?? null, finalityFingerprint: finality?.finalityFingerprint ?? null, receiptFingerprint: receipt?.receiptFingerprint ?? null };
   for (const [field, value] of Object.entries(fields)) if (head[field] !== value) fail(`AH ${field}`);
   const expectedHistorySequence = head.phase === "terminal" ? head.sequence : head.sequence - 1;

@@ -218,6 +218,35 @@ test('refuses GP when B can mutate the actual config parent', async () => {
   await assert.rejects(native.probeProspectiveCleanup({ txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' }, managementPrincipal: { kind: 'sid', value: roles.managementSid }, botPrincipal: { kind: 'sid', value: roles.botSid }, recoveryPrincipal: { kind: 'sid', value: roles.recoverySid }, managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64) }), /actual config parent/);
   assert.equal([...files.keys()].some((path) => path.includes('.gjc-remote-control')), false);
 });
+test('refuses GP when target can mutate the actual config parent before any writes', async () => {
+  const { calls, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
+  const access = lowLevel.principal_access_check;
+  lowLevel.principal_access_check = async (path, kind, principal, mode) =>
+    path === 'C:/state' && principal === 'target' && mode === 'write' ? true : access(path, kind, principal, mode);
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  await assert.rejects(native.probeProspectiveCleanup({
+    txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid }, botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64),
+  }), /actual config parent mutation capability/);
+  assert.deepEqual(calls, []);
+});
+
+test('refuses GP when parent mutation capability is unknown before any writes', async () => {
+  const { calls, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
+  const access = lowLevel.principal_access_check;
+  lowLevel.principal_access_check = async (path, kind, principal, mode) =>
+    path === 'C:/state' && principal === roles.managementSid && mode === 'write' ? undefined : access(path, kind, principal, mode);
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  await assert.rejects(native.probeProspectiveCleanup({
+    txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid }, botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64),
+  }), /actual config parent mutation capability/);
+  assert.deepEqual(calls, []);
+});
 
 test('retained legacy target bytes and identity remain exact through publication', async () => {
   const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const original = Buffer.from('{"legacy":true}');
@@ -353,7 +382,7 @@ test('prospective cleanup requires observed B/R write denial for the retained sc
     managementPrincipal: { kind: 'sid', value: denial.roles.managementSid }, botPrincipal: { kind: 'sid', value: denial.roles.botSid },
     recoveryPrincipal: { kind: 'sid', value: denial.roles.recoverySid },
     managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64),
-  }), /prospective cleanup is ambiguous/);
+  }), /actual config parent mutation capability/);
 });
 
 test('prospective GP refuses retained-handle and pathname identity drift', async () => {
@@ -1133,7 +1162,7 @@ test('managed history marker loss is terminal and marker rewinds are write-free'
   assert.deepEqual(files, beforeTorn);
 });
 test('successor head writes are principal-confined, exact-replay idempotent, and phase-complete', async () => {
-  const { files, lowLevel, roles } = fake();
+  const { files, lowLevel, roles, calls } = fake();
   const configPath = 'C:/state/channels.json';
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   const genesis = records();
@@ -1193,7 +1222,9 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   marker.markerFingerprint = recordHash(marker, 'markerFingerprint');
   files.set('C:\\state\\.channels.json.managed-history.json', Buffer.from(canonicalJson(marker)));
   files.set('C:\\state\\.gjc-remote-control\\managed-history-marker-seal.json', Buffer.from(canonicalJson(marker)));
-  files.set('C:\\state\\.gjc-remote-control\\token-floor.json', Buffer.from(canonicalJson(genesis.committed)));
+  const successorTokenFloor = { ...genesis.committed, anchorFingerprint: request.anchorFingerprint, floorFingerprint: null };
+  successorTokenFloor.floorFingerprint = recordHash(successorTokenFloor, 'floorFingerprint');
+  files.set('C:\\state\\.gjc-remote-control\\token-floor.json', Buffer.from(canonicalJson(successorTokenFloor)));
   const readerFloor = { version: 1, kind: 'reader-version-floor', anchorFingerprint: request.anchorFingerprint, fenceGeneration: 1, readerVersionFloor: null, firstPendingTxId: null, firstReaderInstanceId: null, firstReaderStartNonce: null, lastTransitionTxId: null, previousFloorFingerprint: null, floorFingerprint: null };
   readerFloor.floorFingerprint = recordHash(readerFloor, 'floorFingerprint');
   files.set('C:\\state\\.gjc-remote-control\\reader-version-floor.json', Buffer.from(canonicalJson(readerFloor)));
@@ -1250,6 +1281,111 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   await assert.rejects(native.writeAuthoritySuccessorHead({ ...reserved, headFingerprint: '0'.repeat(64) }), /exact successor head transition is required/);
   const torn = buildAuthoritySuccessorRecord({ ...reserved, phase: 'closed', previousHeadFingerprint: reserved.headFingerprint, headFingerprint: null }, 'headFingerprint');
   await assert.rejects(native.writeAuthoritySuccessorHead(torn), /exact successor head transition is required/);
+  const authorityReservation = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-reservation', anchorFingerprint: request.anchorFingerprint, txId: request.txId,
+    epoch: request.candidateAuthorityEpoch, generation: request.candidateTokenConfigGeneration,
+    fenceGeneration: request.candidateFenceGeneration, candidateFingerprint: request.requestFingerprint,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
+  }, 'reservationFingerprint');
+  const detachedReservation = buildAuthoritySuccessorRecord({
+    ...authorityReservation, candidateFingerprint: '0'.repeat(64),
+  }, 'reservationFingerprint');
+  const beforeDetachedReservation = new Map(files);
+  const detachedReservationWrites = calls.length;
+  await assert.rejects(native.writeAuthoritySuccessorReservation(detachedReservation), /lineage|reservation/);
+  assert.deepEqual(files, beforeDetachedReservation);
+  assert.equal(calls.length, detachedReservationWrites);
+  await native.writeAuthoritySuccessorReservation(authorityReservation);
+
+  const authorityCommit = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-commit-snapshot', anchorFingerprint: request.anchorFingerprint, txId: request.txId,
+    epoch: request.candidateAuthorityEpoch, generation: request.candidateTokenConfigGeneration,
+    fenceGeneration: request.candidateFenceGeneration, candidateFingerprint: request.requestFingerprint,
+    reservationFingerprint: authorityReservation.reservationFingerprint,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
+  }, 'authorityCommitSnapshotFingerprint');
+  const detachedCommit = buildAuthoritySuccessorRecord({
+    ...authorityCommit, reservationFingerprint: '0'.repeat(64),
+  }, 'authorityCommitSnapshotFingerprint');
+  const beforeDetachedCommit = new Map(files);
+  const detachedCommitWrites = calls.length;
+  await assert.rejects(native.writeAuthoritySuccessorCommit(detachedCommit), /commit|reservation/);
+  assert.deepEqual(files, beforeDetachedCommit);
+  assert.equal(calls.length, detachedCommitWrites);
+  await native.writeAuthoritySuccessorCommit(authorityCommit);
+
+  const authorityEpochCommit = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-epoch', anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.candidateFenceGeneration, epoch: request.candidateAuthorityEpoch,
+    reservationTxId: request.txId, commitTxId: request.txId,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
+  }, 'authorityEpochFingerprint');
+  const detachedAuthorityEpoch = buildAuthoritySuccessorRecord({
+    ...authorityEpochCommit, previousAuthorityCommitSnapshotFingerprint: '0'.repeat(64),
+  }, 'authorityEpochFingerprint');
+  const beforeDetachedEpoch = new Map(files);
+  const detachedEpochWrites = calls.length;
+  await assert.rejects(native.commitAuthoritySuccessorEpoch(detachedAuthorityEpoch), /epoch|reservation|commit/);
+  assert.deepEqual(files, beforeDetachedEpoch);
+  assert.equal(calls.length, detachedEpochWrites);
+  await native.commitAuthoritySuccessorEpoch(authorityEpochCommit);
+
+  const close = {
+    version: 1, kind: 'authority-close-proof', txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
+    requestFingerprint: request.requestFingerprint, previousReceiptFingerprint: request.previousReceiptFingerprint,
+    fenceGeneration: request.candidateFenceGeneration, previousBarrierGeneration: 1, barrierGeneration: 2,
+    affectedScope: 'all', affectedMappingIds: [], affectedRouteFingerprints: [],
+    readerInstanceId: null, readerStartNonce: null, retiredGrantFingerprint: null,
+    retiredProjectionFingerprint: null, retiredAckFingerprint: null, admissionPhaseBefore: 'closed',
+    admissionPhaseAfter: 'closed-drained', admissionDrained: true, outstandingRouteGrantCount: 0,
+    routeDisposition: 'no-route', closeFingerprint: null,
+  };
+  close.closeFingerprint = recordHash(close, 'closeFingerprint');
+  await native.writeAuthoritySuccessorClose(close);
+  const baseline = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-successor-baseline', txId: request.txId, rootGenesisTxId: request.rootGenesisTxId,
+    requestFingerprint: request.requestFingerprint, fenceGeneration: request.candidateFenceGeneration,
+    anchorFingerprint: request.anchorFingerprint, operation: request.operation, targetState: request.targetState,
+    revision: request.candidateRevision, authorityEpoch: request.candidateAuthorityEpoch,
+    tokenConfigGeneration: request.candidateTokenConfigGeneration, tokenConfigHostSetFingerprint: hex,
+    mappingGeneration: request.candidateMappingGeneration, candidateSnapshotFingerprint: request.candidateSnapshotFingerprint,
+    candidateTargetFingerprint: request.candidateTargetFingerprint,
+    attestationFingerprint: request.candidateAttestationFingerprint,
+    authorityReservationFingerprint: authorityReservation.reservationFingerprint,
+    authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint,
+    closeFingerprint: close.closeFingerprint, fenceBindingFingerprint: null, leaseBindingFingerprint: null,
+    readerProjectionFingerprint: null, readerInstanceId: null, readerStartNonce: null, readerVersion: null,
+  }, 'baselineFingerprint');
+  await native.writeAuthoritySuccessorBaseline(baseline);
+
+  const finality = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-successor-finality', sequence: request.sequence, txId: request.txId,
+    rootGenesisTxId: request.rootGenesisTxId, requestFingerprint: request.requestFingerprint,
+    fenceGeneration: request.candidateFenceGeneration, operation: request.operation,
+    baselineFingerprint: baseline.baselineFingerprint, closeFingerprint: close.closeFingerprint,
+    anchorFingerprint: request.anchorFingerprint,
+    authorityReservationFingerprint: authorityReservation.reservationFingerprint,
+    authorityCommitSnapshotFingerprint: authorityCommit.authorityCommitSnapshotFingerprint,
+    authorityEpochFingerprint: authorityEpochCommit.authorityEpochFingerprint,
+    tokenFloorFingerprint: genesis.committed.floorFingerprint, attestationFingerprint: request.candidateAttestationFingerprint,
+    publicationKFingerprint: 'b'.repeat(64), publicationYFingerprint: 'c'.repeat(64),
+    operationEvidenceFingerprint: 'd'.repeat(64), auditEntryFingerprint: 'e'.repeat(64),
+    targetFingerprint: request.candidateTargetFingerprint, targetIdentityFingerprint: 'f'.repeat(64),
+    targetAclFingerprint: 'a'.repeat(64), wrapperFingerprint: 'b'.repeat(64),
+    controlRootFingerprint: 'c'.repeat(64), revision: request.candidateRevision,
+    authorityEpoch: request.candidateAuthorityEpoch, tokenConfigGeneration: request.candidateTokenConfigGeneration,
+    mappingGeneration: request.candidateMappingGeneration, snapshotFingerprint: request.candidateSnapshotFingerprint,
+    routeDisposition: 'no-route', finalityFingerprint: null,
+  }, 'finalityFingerprint');
+  const detachedFinality = buildAuthoritySuccessorRecord({
+    ...finality, authorityEpochFingerprint: '0'.repeat(64),
+  }, 'finalityFingerprint');
+  const beforeDetachedFinality = new Map(files);
+  const detachedFinalityWrites = calls.length;
+  await assert.rejects(native.writeAuthoritySuccessorFinality(detachedFinality), /finality|epoch/);
+  assert.deepEqual(files, beforeDetachedFinality);
+  assert.equal(calls.length, detachedFinalityWrites);
+  await native.writeAuthoritySuccessorFinality(finality);
 });
 test('management startup self-test confines mutations to private scratch and reports writes honestly on refusal', async () => {
   const { files, lowLevel, roles } = fake();
