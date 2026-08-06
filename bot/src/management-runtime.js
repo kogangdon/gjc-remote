@@ -532,6 +532,15 @@ export class ManagementRuntime {
         if (error?.reason !== "immutable authority record already exists") throw error;
       }
     }
+    const reopened = await this.native.readPendingGenesisAdmission();
+    if (!reopened ||
+        canonicalJsonHash(reopened.admissionRequest) !== canonicalJsonHash(pending.request) ||
+        canonicalJsonHash(reopened.admissionGrant) !== canonicalJsonHash(pending.grant) ||
+        reopened.request.genesisTxId !== recovery.txId ||
+        reopened.request.requestFingerprint !== recovery.requestFingerprint ||
+        reopened.request.generation !== recovery.generation) {
+      throw new Error("RECOVERY_PENDING_TUPLE_MISMATCH");
+    }
   }
 
   async #manualCleanup(state, reason, recovery = state.recovery) {
@@ -744,7 +753,11 @@ export class ManagementRuntime {
           state.recovery.genesisSecurityTuple !== undefined &&
           sameGenesisSecurityTuple(state.recovery.genesisSecurityTuple, securityTuple)) {
         authenticate({ auth }, actorPrincipal, input.actorSecret);
-        await this.#restorePendingGenesisAdmission(state.recovery);
+        try {
+          await this.#restorePendingGenesisAdmission(state.recovery);
+        } catch (error) {
+          await this.#genesisManualCleanup(state, safe(error).code);
+        }
         const completed = await this.native.completePendingGenesis({
           recovery: state.recovery,
           replayFingerprint,

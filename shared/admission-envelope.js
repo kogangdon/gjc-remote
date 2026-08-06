@@ -5,6 +5,19 @@ import { validateGenesisReceipt, validateGenesisRequest, validateTokenFloor, val
 const plain = (value) => value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 const exact = (value, expected) => plain(value) && Object.keys(value).length === expected.length && expected.every((key) => Object.hasOwn(value, key));
 const fail = (message) => { throw new TypeError(`ADMISSION_ENVELOPE_INVALID: ${message}`); };
+const bindGenesisTuple = (genesisRequest, record, label) => {
+  validateGenesisRequest(genesisRequest);
+  if (genesisRequest.requestedReaderMode !== "handshake" ||
+      record.genesisTxId !== genesisRequest.genesisTxId ||
+      record.generation !== genesisRequest.generation ||
+      record.fenceGeneration !== genesisRequest.fenceGeneration ||
+      record.readerInstanceId !== genesisRequest.readerInstanceId ||
+      record.readerStartNonce !== genesisRequest.readerStartNonce ||
+      record.routeFingerprint !== "no-route") {
+    fail(`${label} does not bind Genesis reader tuple`);
+  }
+  return record;
+};
 const recordHash = (record, field) => canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field)));
 const positiveFence = (value) => Number.isSafeInteger(value) && value >= 1;
 const branch = (request, rp, ak) => request.requestedReaderMode === "no-reader" ? rp === null && ak === null : isHex64(rp) && isHex64(ak);
@@ -47,6 +60,23 @@ export function validateAdmissionAck(ack, grant, projectionFingerprint) {
   if (ack.readerProjectionFingerprint !== projectionFingerprint) fail("ack projection mismatch");
   if (recordHash(ack, "ackFingerprint") !== ack.ackFingerprint) fail("ack fingerprint");
   return ack;
+}
+export function validateAdmissionGenesisBinding(genesisRequest, admissionRequest, admissionGrant = null, admissionAck = null, projectionFingerprint = null, now = null) {
+  bindGenesisTuple(genesisRequest, validateAdmissionRequest(admissionRequest), "admission request");
+  if (admissionGrant !== null) {
+    validateAdmissionGrant(admissionGrant, admissionRequest, now);
+    bindGenesisTuple(genesisRequest, admissionGrant, "admission grant");
+  }
+  if (admissionAck !== null) {
+    if (projectionFingerprint === null) validateAdmissionAckRecord(admissionAck);
+    else validateAdmissionAck(admissionAck, admissionGrant, projectionFingerprint);
+    bindGenesisTuple(genesisRequest, admissionAck, "admission acknowledgement");
+    if (admissionGrant === null || admissionAck.grantFingerprint !== admissionGrant.grantFingerprint ||
+        admissionAck.grantId !== admissionGrant.grantId || admissionAck.nonce !== admissionGrant.nonce) {
+      fail("admission acknowledgement does not bind grant");
+    }
+  }
+  return { request: admissionRequest, grant: admissionGrant, ack: admissionAck };
 }
 
 const proofKeys = ["version", "kind", "genesisTxId", "generation", "fenceGeneration", "zFinalityFingerprint", "readerProjectionFingerprint", "ackFingerprint", "routeFingerprint", "finalityProofFingerprint"];

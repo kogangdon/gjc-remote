@@ -4,7 +4,7 @@ import { ManagementRuntime } from '../src/management-runtime.js';
 import { createManagementNativeForTest } from '../../native-control/test/helpers/management-native.js';
 import { validateManagedProof } from '../src/managed-authority-reader.js';
 import { createTestManagedAuthorityReader } from './helpers/managed-authority-reader.js';
-import { buildAdmissionAck } from '../../shared/admission-envelope.js';
+import { buildAdmissionAck, buildAdmissionGrant, buildAdmissionRequest } from '../../shared/admission-envelope.js';
 import { canonicalJson, canonicalJsonHash } from '../../shared/strict-json.js';
 import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint } from '../../shared/mapping-envelope.js';
 import { buildAuthoritySuccessorRecord } from '../../shared/successor-envelope.js';
@@ -175,6 +175,80 @@ test('prepared Genesis recovery promotes durable authorized handshake to pending
     after.recovery.readerHandshake.requestFingerprint,
     JSON.parse(fileEnding(files, '/admission-request.json')).requestFingerprint,
   );
+});
+test('prepared recovery rejects a substituted admission record with transaction-bound cleanup and no admission writes', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  const input = {
+    ...genesisInput('host=prepared-substitution'),
+    requestedReaderMode: 'handshake',
+    readerInstanceId: 'prepared-reader',
+    readerStartNonce: 'prepared-start',
+  };
+  const pending = await runtime.execute('genesis', input);
+  assert.equal(pending.ok, true);
+  assert.equal(pending.pending, true);
+  const statePath = [...harness.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/management-state.json'));
+  const state = JSON.parse(harness.files.get(statePath));
+  state.recovery.phase = 'prepared';
+  delete state.recovery.readerHandshake;
+  harness.files.set(statePath, Buffer.from(canonicalJson(state)));
+  const requestPath = [...harness.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/admission-request.json'));
+  const substituted = JSON.parse(harness.files.get(requestPath));
+  substituted.nonce = 'substituted-admission-nonce';
+  substituted.requestFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(substituted).filter(([key]) => key !== 'requestFingerprint')),
+  );
+  harness.files.set(requestPath, Buffer.from(canonicalJson(substituted)));
+  const writes = harness.writes.length;
+  const recovered = await runtime.execute('genesis', input);
+  assert.equal(recovered.ok, false, JSON.stringify(recovered));
+  assert.equal(recovered.error, 'MANUAL_CLEANUP_REQUIRED');
+  assert.equal(recovered.routeDisposition, 'no-route');
+  const after = await harness.native.readManagementState();
+  assert.equal(after.recovery.phase, 'manual_cleanup');
+  assert.equal(after.recovery.routeDisposition, 'no-route');
+  assert.equal(after.recovery.txId, state.recovery.txId);
+  assert.equal(
+    harness.writes.slice(writes).some((path) => /admission-(?:request|grant)|acknowledgement/.test(path)),
+    false,
+  );
+});
+
+test('admission writers reject no-reader and post-terminal lifecycle records before writes', async () => {
+  const noReaderHarness = adapter({ legacy: false });
+  const noReaderRuntime = new ManagementRuntime({ native: noReaderHarness.native });
+  const noReaderResult = await noReaderRuntime.execute('genesis', genesisInput('host=no-reader'));
+  assert.equal(noReaderResult.ok, true, JSON.stringify(noReaderResult));
+  const noReaderRequest = JSON.parse(fileEnding(noReaderHarness.files, '/genesis-request.json'));
+  const candidateRequest = buildAdmissionRequest({
+    requestId: 'no-reader-admission-request',
+    genesisTxId: noReaderRequest.genesisTxId,
+    generation: noReaderRequest.generation,
+    fenceGeneration: noReaderRequest.fenceGeneration,
+    readerInstanceId: 'substituted-reader',
+    readerStartNonce: 'substituted-start',
+    routeFingerprint: 'no-route',
+    nonce: 'substituted-nonce',
+    expiresAt: Date.now() + 30_000,
+  });
+  const candidateGrant = buildAdmissionGrant(candidateRequest, {
+    grantId: 'no-reader-admission-grant',
+    expiresAt: candidateRequest.expiresAt,
+  });
+  const noReaderWrites = noReaderHarness.writes.length;
+  await assert.rejects(noReaderHarness.native.writeAdmissionRequest(candidateRequest), /no-reader Genesis/);
+  await assert.rejects(noReaderHarness.native.writeAdmissionGrant(candidateGrant), /no-reader Genesis/);
+  assert.equal(noReaderHarness.writes.length, noReaderWrites);
+
+  const terminalHarness = await boundReaderRuntime({ complete: true });
+  terminalHarness.setPrincipal(owner);
+  const terminalRequest = JSON.parse(fileEnding(terminalHarness.files, '/admission-request.json'));
+  const terminalGrant = JSON.parse(fileEnding(terminalHarness.files, '/admission-grant.json'));
+  const terminalWrites = terminalHarness.writes.length;
+  await assert.rejects(terminalHarness.native.writeAdmissionRequest(terminalRequest), /post-terminal admission/);
+  await assert.rejects(terminalHarness.native.writeAdmissionGrant(terminalGrant), /post-terminal admission/);
+  assert.equal(terminalHarness.writes.length, terminalWrites);
 });
 
 function mappingInput(mappingId, generation = 1) {

@@ -5,7 +5,7 @@ import { advanceReaderVersionFloor, buildAttestedTokenFloorProof, commitTokenFlo
 import { createGenesisEmptyChannels, isLegacyRetainedWrapper, isManagedV1Wrapper, validateManagedMappingRecord, validateManagedRouteRecord, validateManagedChannelsV2, validateManagementEnvelope } from '@gjc-remote/shared/mapping-envelope';
 import { buildMappingRecoveryRecords, validateManualCleanup, validateMappingRecoveryRecords } from '@gjc-remote/shared/recovery-envelope';
 import { canCleanGenesisScratch, fingerprintGenesisProbe, transitionGenesisProspectiveProbe, validateGenesisProspectiveProbe } from '@gjc-remote/shared/genesis-probe';
-import { validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGrant, validateAdmissionRequest, validateFinalityProof } from '@gjc-remote/shared/admission-envelope';
+import { validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGenesisBinding, validateAdmissionGrant, validateAdmissionRequest, validateFinalityProof } from '@gjc-remote/shared/admission-envelope';
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationState, buildPublicationTransaction, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationGraph, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationState, validatePublicationTransaction, validatePublicationU, validatePublicationY, validatePublicationZp } from '@gjc-remote/shared/publication-envelope';
 import { validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorBaseline, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHead, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest, validateManagedHistoryMarkerSeal as validateSharedHistoryMarkerSeal } from '@gjc-remote/shared/successor-envelope';
 import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from '@gjc-remote/shared/strict-json';
@@ -498,6 +498,60 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (prospectiveProof || await hasPublishedAuthority()) await requireAuthorityRequest(operation);
   };
   const read = async (name) => rawRead(name);
+  const admissionWriterGenesis = async (operation) => {
+    await requireNoTerminalClose(operation);
+    const request = await read(path('genesis-request'));
+    try { validateGenesisRequest(request); } catch {
+      refused(operation, 'validated Genesis request is required before admission writes');
+    }
+    if (request.requestedReaderMode !== 'handshake') {
+      refused(operation, 'admission records are forbidden for no-reader Genesis');
+    }
+    const state = await read(path('management-state'));
+    if (['terminal', 'terminalizing', 'manual_cleanup'].includes(state?.recovery?.phase) ||
+        (state !== null && state?.admission?.phase !== 'closed')) {
+      refused(operation, 'post-terminal admission records are forbidden; route disposition is no-route');
+    }
+    return request;
+  };
+  const admissionRecordPreflight = async (operation, name, immutableName, value) => {
+    const [current, immutable] = await Promise.all([
+      read(path(name)),
+      read(path(immutableName)),
+    ]);
+    if ((current === null) !== (immutable === null)) {
+      refused(operation, 'admission immutable/current record pair is incomplete');
+    }
+    if (current !== null && canonical(current) !== canonical(value)) {
+      refused(operation, 'admission record substitution is not permitted');
+    }
+    if (immutable !== null && canonical(immutable) !== canonical(value)) {
+      refused(operation, 'immutable admission record substitution is not permitted');
+    }
+  };
+  const writeImmutableBot = async (name, value, operation) => {
+    const destination = botPath(name);
+    const existing = await read(destination);
+    if (existing !== null) {
+      if (canonical(existing) !== canonical(value)) refused(operation, 'immutable admission acknowledgement substitution is not permitted');
+      return;
+    }
+    const bytes = encode(value);
+    const parentIdentity = await verifiedParent(destination);
+    await assertMutationParent(operation);
+    await lowLevel.create_absent_exclusive(destination, bytes, ...roleArguments('bot-state'));
+    await assertObject(destination, bytes, parentIdentity, undefined, 'bot-state');
+    await lowLevel.flush_file(destination);
+    await lowLevel.flush_directory_or_volume(dirname(destination));
+    await assertParent(destination, parentIdentity);
+  };
+  const admissionImmutableRecord = async (name, value, operation) => {
+    const immutable = await read(path(name));
+    if (immutable === null || canonical(immutable) !== canonical(value)) {
+      refused(operation, 'immutable admission record is absent or substituted');
+    }
+    return immutable;
+  };
   const write = async (name, value, profile = 'authority', requireRequest = true, allowTerminalReplay = false) => {
     const cleanupOperation = profile === 'bot-state' ? 'write_bot_state' : 'write_management_state';
     if (!allowTerminalReplay) await requireNoTerminalClose(cleanupOperation);
@@ -2840,14 +2894,41 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return record;
     },
     async writeAdmissionRequest(record) {
-      try { validateAdmissionRequest(record); } catch { refused('write_admission_request', 'exact management admission request is required'); }
+      const genesis = await admissionWriterGenesis('write_admission_request');
+      try {
+        validateAdmissionGenesisBinding(genesis, record);
+      } catch {
+        refused('write_admission_request', 'admission request is not bound to the Genesis reader tuple');
+      }
+      await admissionRecordPreflight(
+        'write_admission_request',
+        'admission-request',
+        `admission-request-${encodeURIComponent(record.requestId)}`,
+        record,
+      );
       await writeImmutableAuthority(`admission-request-${encodeURIComponent(record.requestId)}`, record);
       await writeAuthority('admission-request', record);
       return record;
     },
     async writeAdmissionGrant(record) {
+      const genesis = await admissionWriterGenesis('write_admission_grant');
       const request = await read(path('admission-request'));
-      try { validateAdmissionGrant(record, request); } catch { refused('write_admission_grant', 'exact management admission grant is required'); }
+      try {
+        validateAdmissionGenesisBinding(genesis, request, record);
+      } catch {
+        refused('write_admission_grant', 'admission grant is not bound to the Genesis reader tuple');
+      }
+      await admissionImmutableRecord(
+        `admission-request-${encodeURIComponent(request.requestId)}`,
+        request,
+        'write_admission_grant',
+      );
+      await admissionRecordPreflight(
+        'write_admission_grant',
+        'admission-grant',
+        `admission-grant-${encodeURIComponent(record.grantId)}`,
+        record,
+      );
       await writeImmutableAuthority(`admission-grant-${encodeURIComponent(record.grantId)}`, record);
       await writeAuthority('admission-grant', record);
       return record;
@@ -2883,16 +2964,19 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
                 managementState?.recovery?.phase !== 'handshake-pending') {
               // Genesis authority has not opened its reader admission yet.
             } else {
-              validateAdmissionRequest(admissionRequest);
-              validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
-              if (admissionRequest.genesisTxId !== request.genesisTxId ||
-                  admissionRequest.generation !== request.generation ||
-                  admissionRequest.fenceGeneration !== request.fenceGeneration ||
-                  admissionRequest.readerInstanceId !== request.readerInstanceId ||
-                  admissionRequest.readerStartNonce !== request.readerStartNonce ||
-                  admissionRequest.routeFingerprint !== 'no-route') {
-                throw new TypeError('pending admission tuple relation');
-              }
+              validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, null, null, Date.now());
+              await admissionRecordPreflight(
+                'read_bound_reader_proof',
+                'admission-request',
+                `admission-request-${encodeURIComponent(admissionRequest.requestId)}`,
+                admissionRequest,
+              );
+              await admissionRecordPreflight(
+                'read_bound_reader_proof',
+                'admission-grant',
+                `admission-grant-${encodeURIComponent(admissionGrant.grantId)}`,
+                admissionGrant,
+              );
             }
           } else if (admissionRequest !== null || admissionGrant !== null) {
             throw new TypeError('no-reader admission tuple');
@@ -2910,27 +2994,33 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           validateReaderVersionFloor(readerVersionFloor);
           validateTokenFloor(tokenFloor);
           validateZFinality(zFinality, request, tokenFloor, await read(path('genesis-precommit-proof')));
-          validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
-          if (admissionRequest.genesisTxId !== request.genesisTxId ||
-              admissionRequest.generation !== request.generation ||
-              admissionRequest.fenceGeneration !== request.fenceGeneration ||
-              admissionRequest.readerInstanceId !== request.readerInstanceId ||
-              admissionRequest.readerStartNonce !== request.readerStartNonce ||
-              admissionRequest.routeFingerprint !== 'no-route' ||
-              admissionGrant.genesisTxId !== request.genesisTxId ||
-              admissionGrant.generation !== request.generation ||
-              admissionGrant.fenceGeneration !== request.fenceGeneration ||
-              admissionGrant.readerInstanceId !== request.readerInstanceId ||
-              admissionGrant.readerStartNonce !== request.readerStartNonce ||
-              admissionGrant.routeFingerprint !== 'no-route' ||
-              readerProjection.readerInstanceId !== request.readerInstanceId ||
+          validateAdmissionGenesisBinding(
+            request,
+            admissionRequest,
+            admissionGrant,
+            admissionAck,
+            readerProjection.readerProjectionFingerprint,
+            Date.now(),
+          );
+          await admissionRecordPreflight(
+            'read_bound_reader_proof',
+            'admission-request',
+            `admission-request-${encodeURIComponent(admissionRequest.requestId)}`,
+            admissionRequest,
+          );
+          await admissionRecordPreflight(
+            'read_bound_reader_proof',
+            'admission-grant',
+            `admission-grant-${encodeURIComponent(admissionGrant.grantId)}`,
+            admissionGrant,
+          );
+          const immutableAcknowledgement = await read(botPath(`admission-ack-${encodeURIComponent(admissionAck.grantId)}`));
+          if (immutableAcknowledgement === null || canonical(immutableAcknowledgement) !== canonical(admissionAck)) {
+            throw new TypeError('immutable acknowledgement substitution');
+          }
+          if (readerProjection.readerInstanceId !== request.readerInstanceId ||
               readerProjection.readerStartNonce !== request.readerStartNonce ||
-              admissionAck.genesisTxId !== request.genesisTxId ||
-              admissionAck.generation !== request.generation ||
-              admissionAck.fenceGeneration !== request.fenceGeneration ||
-              admissionAck.readerInstanceId !== request.readerInstanceId ||
-              admissionAck.readerStartNonce !== request.readerStartNonce ||
-              admissionAck.routeFingerprint !== 'no-route') {
+              admissionAck.readerProjectionFingerprint !== readerProjection.readerProjectionFingerprint) {
             throw new TypeError('reader authority tuple relation');
           }
           validateReaderProjection(readerProjection, readerVersionFloor, tokenFloor, zFinality.zFinalityFingerprint);
@@ -3316,26 +3406,21 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         read(path('admission-grant')),
       ]);
       try {
-        validateGenesisRequest(request);
-        validateAdmissionRequest(admissionRequest);
-        validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
-        if (request.requestedReaderMode !== 'handshake' ||
-            admissionRequest.genesisTxId !== request.genesisTxId ||
-            admissionRequest.generation !== request.generation ||
-            admissionRequest.fenceGeneration !== request.fenceGeneration ||
-            admissionRequest.readerInstanceId !== request.readerInstanceId ||
-            admissionRequest.readerStartNonce !== request.readerStartNonce ||
-            admissionRequest.routeFingerprint !== 'no-route' ||
-            admissionGrant.genesisTxId !== request.genesisTxId ||
-            admissionGrant.generation !== request.generation ||
-            admissionGrant.fenceGeneration !== request.fenceGeneration ||
-            admissionGrant.readerInstanceId !== request.readerInstanceId ||
-            admissionGrant.readerStartNonce !== request.readerStartNonce ||
-            admissionGrant.routeFingerprint !== 'no-route') {
-          throw new TypeError('pending Genesis admission tuple');
-        }
+        validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, null, null, Date.now());
+        await admissionRecordPreflight(
+          'read_pending_genesis_admission',
+          'admission-request',
+          `admission-request-${encodeURIComponent(admissionRequest.requestId)}`,
+          admissionRequest,
+        );
+        await admissionRecordPreflight(
+          'read_pending_genesis_admission',
+          'admission-grant',
+          `admission-grant-${encodeURIComponent(admissionGrant.grantId)}`,
+          admissionGrant,
+        );
       } catch {
-        refused('read_pending_genesis_admission', 'pending Genesis admission is incomplete or not bound to its reader tuple');
+        refused('read_pending_genesis_admission', 'pending Genesis admission is incomplete, substituted, or not bound to its reader tuple');
       }
       return { request, admissionRequest, admissionGrant };
     },
@@ -3422,6 +3507,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const preflightAdmissionGrant = await recoveryRead(path('admission-grant'));
       const preflightProjection = await recoveryRead(botPath('reader-projection'));
       const preflightAcknowledgement = await recoveryRead(botPath('acknowledgement'));
+      const preflightImmutableAdmissionRequest = await recoveryRead(path(`admission-request-${encodeURIComponent(preflightAdmissionRequest?.requestId ?? '')}`));
+      const preflightImmutableAdmissionGrant = await recoveryRead(path(`admission-grant-${encodeURIComponent(preflightAdmissionGrant?.grantId ?? '')}`));
+      const preflightImmutableAcknowledgement = preflightAcknowledgement &&
+        await recoveryRead(botPath(`admission-ack-${encodeURIComponent(preflightAcknowledgement.grantId)}`));
       const preflightReaderState = await recoveryRead(botPath('reader-state'));
       let preflightPublication;
       let preflightExpectedEpochFloor;
@@ -3431,6 +3520,27 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       let preflightExpectedReceipt;
       let preflightExpectedSuffix;
       try {
+        if (request.requestedReaderMode === 'handshake') {
+          validateAdmissionGenesisBinding(
+            request,
+            preflightAdmissionRequest,
+            preflightAdmissionGrant,
+            preflightAcknowledgement,
+            preflightProjection?.readerProjectionFingerprint ?? null,
+            Date.now(),
+          );
+          if (preflightImmutableAdmissionRequest === null ||
+              preflightImmutableAdmissionGrant === null ||
+              canonical(preflightImmutableAdmissionRequest) !== canonical(preflightAdmissionRequest) ||
+              canonical(preflightImmutableAdmissionGrant) !== canonical(preflightAdmissionGrant) ||
+              (preflightAcknowledgement !== null &&
+                (preflightImmutableAcknowledgement === null ||
+                 canonical(preflightImmutableAcknowledgement) !== canonical(preflightAcknowledgement)))) {
+            throw new TypeError('Genesis admission immutable record substitution');
+          }
+        } else if ([preflightAdmissionRequest, preflightAdmissionGrant, preflightProjection, preflightAcknowledgement, preflightReaderState].some((value) => value !== null)) {
+          throw new TypeError('Genesis no-reader graph contains reader records');
+        }
         validateGenesisPrecommit(preflightImmutablePrecommit);
         validateGenesisPrecommit(preflightCurrentPrecommit);
         if (canonical(preflightImmutablePrecommit) !== canonical(preflightCurrentPrecommit) ||
@@ -3846,16 +3956,38 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const admissionRequest = await read(path('admission-request'));
       const admissionGrant = await read(path('admission-grant'));
       if (request.requestedReaderMode === 'handshake') {
+        await admissionRecordPreflight(
+          'recover_genesis_suffix',
+          'admission-request',
+          `admission-request-${encodeURIComponent(admissionRequest?.requestId ?? '')}`,
+          admissionRequest,
+        );
+        await admissionRecordPreflight(
+          'recover_genesis_suffix',
+          'admission-grant',
+          `admission-grant-${encodeURIComponent(admissionGrant?.grantId ?? '')}`,
+          admissionGrant,
+        );
         projection = await read(botPath('reader-projection'));
         acknowledgement = await read(botPath('acknowledgement'));
         readerState = await read(botPath('reader-state'));
         const readerFloor = await read(path('reader-version-floor'));
         try {
           validateReaderVersionFloor(readerFloor);
-          validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
+          validateAdmissionGenesisBinding(
+            request,
+            admissionRequest,
+            admissionGrant,
+            acknowledgement,
+            projection?.readerProjectionFingerprint ?? null,
+            Date.now(),
+          );
           validateReaderProjection(projection, readerFloor, committed, zFinality.zFinalityFingerprint);
-          validateAdmissionAck(acknowledgement, admissionGrant, projection.readerProjectionFingerprint);
           validateReaderRelations(readerState, readerFloor);
+          const immutableAcknowledgement = await read(botPath(`admission-ack-${encodeURIComponent(acknowledgement.grantId)}`));
+          if (immutableAcknowledgement === null || canonical(immutableAcknowledgement) !== canonical(acknowledgement)) {
+            throw new TypeError('immutable acknowledgement substitution');
+          }
           if (readerState.readerInstanceId !== request.readerInstanceId ||
               readerState.readerStartNonce !== request.readerStartNonce ||
               readerState.readerProjectionFingerprint !== projection.readerProjectionFingerprint) {
@@ -4674,6 +4806,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     },
     async writeBotAcknowledgement(value) {
       await requireBotPrincipal('write_bot_acknowledgement');
+      const genesis = await admissionWriterGenesis('write_bot_acknowledgement');
       const floor = await read(path('reader-version-floor'));
       if (!floor || floor.readerVersionFloor !== 2) {
         refused('write_bot_acknowledgement', 'validated committed handshake is absent');
@@ -4682,8 +4815,14 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const grant = await read(path('admission-grant'));
       const projection = await read(botPath('reader-projection'));
       try {
-        validateAdmissionGrant(grant, request, Date.now());
-        validateAdmissionAck(value, grant, projection?.readerProjectionFingerprint);
+        validateAdmissionGenesisBinding(
+          genesis,
+          request,
+          grant,
+          value,
+          projection?.readerProjectionFingerprint ?? null,
+          Date.now(),
+        );
       } catch {
         refused('write_bot_acknowledgement', 'exact bound acknowledgement is required');
       }
@@ -4692,7 +4831,18 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           value.readerProjectionFingerprint !== projection.readerProjectionFingerprint) {
         refused('write_bot_acknowledgement', 'acknowledgement does not bind the exact grant and projection');
       }
+      const immutableName = `admission-ack-${encodeURIComponent(value.grantId)}`;
+      const [current, immutable] = await Promise.all([
+        read(botPath('acknowledgement')),
+        read(botPath(immutableName)),
+      ]);
+      if ((current === null) !== (immutable === null) ||
+          (current !== null && canonical(current) !== canonical(value)) ||
+          (immutable !== null && canonical(immutable) !== canonical(value))) {
+        refused('write_bot_acknowledgement', 'admission acknowledgement substitution is not permitted');
+      }
       await ensureBotRoot();
+      await writeImmutableBot(immutableName, value, 'write_bot_acknowledgement');
       await write(botPath('acknowledgement'), value, 'bot-state');
       return value;
     },
