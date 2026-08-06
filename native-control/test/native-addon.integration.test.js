@@ -180,8 +180,10 @@ test("POSIX principal access rejects writable ACL_OTHER, ACL_GROUP, and named gr
   }
   const root = await mkdtemp(join(tmpdir(), "gjc-native-acl-"));
   const target = join(root, "acl-group-other.txt");
+  const parent = join(root, "acl-parent");
   try {
     await writeFile(target, Buffer.from("acl-group-other"));
+    await mkdir(parent);
     const principal = `uid:${candidate[2]}`;
 
     // A readable ACL_OTHER remains a valid read proof, but any broad write bit
@@ -193,15 +195,21 @@ test("POSIX principal access rejects writable ACL_OTHER, ACL_GROUP, and named gr
     assert.equal(await addon.principal_access_check(target, "uid", principal, "read"), true);
     assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
 
-    // A named ACL_GROUP is likewise rejected for mutation regardless of
-    // whether the probed principal happens to match that group.
+    // Named ACL users with write permission are not valid mutation proofs,
+    // including a foreign principal that otherwise matches the ACL entry.
     await chmod(target, 0o644);
     try {
+      await execFile("setfacl", ["-m", `u:${candidate[2]}:rw`, target]);
+      assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+
+      // A named ACL_GROUP is likewise rejected for mutation regardless of
+      // whether the probed principal happens to match that group.
       await execFile("setfacl", ["-m", `g:${currentGid ?? candidate[3]}:rw`, target]);
       assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+      await execFile("setfacl", ["-m", `u:${candidate[2]}:rwx`, parent]);
+      assert.equal(await addon.principal_access_check(parent, "uid", principal, "write"), false);
     } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      t.diagnostic("setfacl unavailable; ACL_GROUP named-entry probe skipped");
+      if (error?.code !== "ENOENT" && !/not supported|operation not permitted/i.test(error?.stderr ?? "")) throw error;
     }
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -337,6 +345,14 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /bool VerifyWindowsNamedIdentity\(HANDLE parent/);
   assert.match(source, /published_info\.nFileIndexHigh == temporary_info\.nFileIndexHigh/);
   assert.match(source, /source_absent/);
+  const noGroupSourceStart = source.indexOf("bool VerifyNoGroupMutationAcl(HANDLE");
+  const noGroupSourceEnd = source.indexOf("HANDLE CreateProtectedFileNoFollow", noGroupSourceStart);
+  const noGroupSource = source.slice(noGroupSourceStart, noGroupSourceEnd);
+  assert.match(noGroupSource, /kForeignMutationRights/);
+  assert.match(noGroupSource, /EqualSid\(owner, sid\)/);
+  assert.match(source, /foreign_named_user_mutation/);
+  assert.match(noGroupSource, /WRITE_DAC/);
+  assert.match(noGroupSource, /WRITE_OWNER/);
   const exactRoleAclStart = source.indexOf("bool VerifyExactRoleAcl(HANDLE");
   const exactRoleAclEnd = source.indexOf("bool ApplyExactRoleAcl(HANDLE", exactRoleAclStart);
   const exactRoleAcl = source.slice(exactRoleAclStart, exactRoleAclEnd);

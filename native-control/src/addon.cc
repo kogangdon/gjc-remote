@@ -495,9 +495,11 @@ bool ApplyExactRoleAcl(HANDLE handle, const std::string& manager,
 }
 bool VerifyNoGroupMutationAcl(HANDLE handle) {
   PACL dacl = nullptr;
+  PSID owner = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
-  if (GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
-                      &dacl, nullptr, &descriptor) != ERROR_SUCCESS) return false;
+  if (GetSecurityInfo(handle, SE_FILE_OBJECT,
+                      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                      &owner, nullptr, &dacl, nullptr, &descriptor) != ERROR_SUCCESS) return false;
   SECURITY_DESCRIPTOR_CONTROL control = 0;
   DWORD revision = 0;
   ACL_SIZE_INFORMATION size{};
@@ -523,6 +525,16 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
     PSID sid = reinterpret_cast<PSID>(&ace->SidStart);
     if (!IsValidSid(sid)) { valid = false; break; }
     const bool is_configured_system_sid = EqualSid(sid, configured_system_sid);
+    const bool is_owner = owner != nullptr && EqualSid(owner, sid);
+    constexpr ACCESS_MASK kForeignMutationRights =
+        FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+        DELETE | WRITE_DAC | WRITE_OWNER | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY |
+        FILE_DELETE_CHILD;
+    if (!is_owner && !is_configured_system_sid &&
+        (ace->Mask & kForeignMutationRights) != 0) {
+      valid = false;
+      break;
+    }
     DWORD name_length = 0, domain_length = 0;
     SID_NAME_USE use = SidTypeUnknown;
     LookupAccountSidW(nullptr, sid, nullptr, &name_length, nullptr, &domain_length, &use);
@@ -780,6 +792,7 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   bool selected_named_user = false;
   bool seen_user_object = false, seen_group_object = false, seen_other = false, seen_mask = false;
   bool has_named_entries = false;
+  bool foreign_named_user_mutation = false;
   struct NamedGroupPermission { gid_t gid; mode_t bits; };
   std::vector<NamedGroupPermission> named_groups;
   acl_entry_t entry;
@@ -806,9 +819,13 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
       has_named_entries = true;
       uid_t* qualifier = static_cast<uid_t*>(acl_get_qualifier(entry));
       if (!qualifier) { acl_free(acl); return false; }
+      const mode_t user_bits = bits();
+      if (*qualifier != 0 && (user_bits & S_IWUSR) != 0) {
+        foreign_named_user_mutation = true;
+      }
       if (principal != st.st_uid && *qualifier == principal) {
         if (selected_named_user) { acl_free(qualifier); acl_free(acl); return false; }
-        named_user_bits = bits();
+        named_user_bits = user_bits;
         selected_named_user = true;
       }
       acl_free(qualifier);
@@ -841,12 +858,15 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   if (entry_result != 0 || !seen_user_object || !seen_group_object || !seen_other ||
       (has_named_entries && !seen_mask)) return false;
   if (!seen_mask) mask = S_IRUSR | S_IWUSR | S_IXUSR;
+  if ((requested & S_IWUSR) != 0 && foreign_named_user_mutation) return false;
   const bool writable_group_class =
       (group_object_bits & S_IWUSR) != 0 ||
       (named_group_bits & S_IWUSR) != 0 ||
       (other_bits & S_IWUSR) != 0;
   if ((requested & S_IWUSR) != 0 && writable_group_class) return false;
   if (principal == st.st_uid) return (owner_bits & requested) == requested;
+  if (selected_named_user && (requested & S_IWUSR) != 0 &&
+      (named_user_bits & S_IWUSR) != 0) return false;
   if (selected_named_user) return ((named_user_bits & mask) & requested) == requested;
 
   std::vector<gid_t> principal_groups;

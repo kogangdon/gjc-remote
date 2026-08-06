@@ -218,6 +218,22 @@ test('refuses GP when B can mutate the actual config parent', async () => {
   await assert.rejects(native.probeProspectiveCleanup({ txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' }, managementPrincipal: { kind: 'sid', value: roles.managementSid }, botPrincipal: { kind: 'sid', value: roles.botSid }, recoveryPrincipal: { kind: 'sid', value: roles.recoverySid }, managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64) }), /actual config parent/);
   assert.equal([...files.keys()].some((path) => path.includes('.gjc-remote-control')), false);
 });
+test('refuses GP when config parent ACL is not an exact configured-role ACL', async () => {
+  const { files, roles, lowLevel } = fake();
+  const configPath = 'C:/state/channels.json';
+  const { request } = records();
+  const verify = lowLevel.verify_exact_role_acl;
+  lowLevel.verify_exact_role_acl = async (path, ...args) =>
+    path === 'C:/state' ? false : verify(path, ...args);
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  await assert.rejects(native.probeProspectiveCleanup({
+    txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid }, botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64),
+  }), /exact role ACL/);
+  assert.deepEqual(files, new Map());
+});
 test('refuses GP when target can mutate the actual config parent before any writes', async () => {
   const { calls, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
   const access = lowLevel.principal_access_check;
@@ -252,6 +268,7 @@ test('authority mutation revalidates parent owner, DACL, and capabilities write-
   for (const [drift, expected] of [
     ['owner', /owner/],
     ['DACL', /DACL/],
+    ['exact ACL', /exact role ACL/],
     ['capability', /mutation capability/],
   ]) {
     const { files, calls, roles, lowLevel } = fake();
@@ -281,6 +298,10 @@ test('authority mutation revalidates parent owner, DACL, and capabilities write-
     } else if (drift === 'DACL') {
       const readAcl = lowLevel.read_acl;
       lowLevel.read_acl = async (path) => path === 'C:/state' ? 'drifted' : readAcl(path);
+    } else if (drift === 'exact ACL') {
+      const verify = lowLevel.verify_exact_role_acl;
+      lowLevel.verify_exact_role_acl = async (path, ...args) =>
+        path === 'C:/state' ? false : verify(path, ...args);
     } else {
       const access = lowLevel.principal_access_check;
       lowLevel.principal_access_check = async (path, kind, principal, mode) =>

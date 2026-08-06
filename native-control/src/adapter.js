@@ -340,6 +340,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (acl === null || acl === undefined || acl === '') {
       refused(operation, 'actual config parent DACL is unreadable');
     }
+    let exactParentAcl = false;
+    try {
+      exactParentAcl = await lowLevel.verify_exact_role_acl(parent, ...roleArguments('authority'));
+    } catch {
+      exactParentAcl = false;
+    }
+    if (exactParentAcl !== true) {
+      refused(operation, 'actual config parent exact role ACL is not proven');
+    }
     if (mutationProof.parentAclFingerprint &&
         fingerprint(Buffer.from(String(acl))) !== mutationProof.parentAclFingerprint) {
       refused(operation, 'actual config parent DACL changed since Genesis parent proof');
@@ -3009,6 +3018,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const blockerBytes = await lowLevel.read_verified_bytes(bootstrapBlockerPath);
       const parentAcl = await lowLevel.read_acl(parent);
       if (!parentAcl) refused('probe_prospective_cleanup', 'prospective cleanup parent ACL is unreadable');
+      let exactParentAcl = false;
+      try {
+        exactParentAcl = await lowLevel.verify_exact_role_acl(parent, ...roleArguments('authority'));
+      } catch {
+        exactParentAcl = false;
+      }
+      if (exactParentAcl !== true) {
+        refused('probe_prospective_cleanup', 'prospective cleanup parent exact role ACL is not proven');
+      }
       const parentMutation = await Promise.all([
         [targetPrincipal, false], [managementPrincipal, true], [botPrincipal, false], [recoveryPrincipal, false],
       ].map(async ([principal, expected]) => {
