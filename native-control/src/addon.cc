@@ -300,7 +300,8 @@ HANDLE OpenWindowsPathNoFollow(const std::string& path, DWORD access,
                                VerifiedObjectType expected_type) {
   WindowsPathParts parts;
   if (!ParseWindowsPath(path, &parts)) return INVALID_HANDLE_VALUE;
-  HANDLE current = OpenWindowsRoot(parts.root, kWindowsTraversalAccess);
+  HANDLE current = OpenWindowsRoot(parts.root,
+      parts.components.empty() ? access : kWindowsTraversalAccess);
   if (current == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
   if (parts.components.empty()) {
     if (expected_type != VerifiedObjectType::Directory) {
@@ -900,7 +901,7 @@ napi_value OpenVerifiedParent(napi_env env, napi_callback_info info) {
   std::filesystem::path parent = std::filesystem::u8path(path).parent_path();
   if (parent.empty()) parent = ".";
 #ifdef _WIN32
-  HANDLE h = OpenNoFollowDirectory(parent.u8string(), FILE_READ_ATTRIBUTES);
+  HANDLE h = OpenNoFollowDirectory(parent.u8string(), READ_CONTROL | FILE_READ_ATTRIBUTES);
   if (h == INVALID_HANDLE_VALUE) { Throw(env, "ERR_NATIVE_CONTROL_OPEN", "unable to open verified parent"); return nullptr; }
   napi_value result; napi_create_object(env, &result); SetIdentity(env, result, h); CloseHandle(h); return result;
 #else
@@ -913,7 +914,7 @@ napi_value OpenVerifiedParent(napi_env env, napi_callback_info info) {
 napi_value OpenNoFollowMethod(napi_env env, napi_callback_info info) {
   std::string path; if (!StringArg(env, info, 0, &path)) return nullptr;
 #ifdef _WIN32
-  HANDLE h = OpenNoFollowObject(path, FILE_READ_ATTRIBUTES);
+  HANDLE h = OpenNoFollowObject(path, READ_CONTROL | FILE_READ_ATTRIBUTES);
   if (h == INVALID_HANDLE_VALUE) { Throw(env, "ERR_NATIVE_CONTROL_OPEN", "unable to open without following reparse points"); return nullptr; }
   napi_value result; napi_create_object(env, &result); SetIdentity(env, result, h); CloseHandle(h); return result;
 #else
@@ -2071,7 +2072,7 @@ napi_value OpenVerifiedParentHandle(napi_env env, napi_callback_info info) {
   std::filesystem::path parent = std::filesystem::u8path(path).parent_path(); if (parent.empty()) parent = ".";
   auto* value = new VerifiedHandle();
 #ifdef _WIN32
-  value->path = parent.u8string(); value->handle = OpenNoFollowDirectory(value->path, FILE_READ_ATTRIBUTES);
+  value->path = parent.u8string(); value->handle = OpenNoFollowDirectory(value->path, READ_CONTROL | FILE_READ_ATTRIBUTES);
   if (value->handle == INVALID_HANDLE_VALUE) { delete value; Throw(env, "ERR_NATIVE_CONTROL_OPEN", "unable to retain verified parent handle"); return nullptr; }
 #else
   value->fd = OpenDirectoryNoFollow(parent.u8string());

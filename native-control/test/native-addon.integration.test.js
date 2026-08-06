@@ -79,7 +79,8 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     await addon.flush_file(destination);
     await addon.flush_directory_or_volume(root);
     assert.deepEqual(Buffer.from(await addon.read_verified_bytes(destination)), initial);
-    assert.ok(await addon.read_identity(destination));
+    const destinationIdentity = await addon.read_identity(destination);
+    assert.equal(destinationIdentity.owner, roles[0], "native identity proves authority file ownership by M");
     assert.ok(await addon.open_no_follow(destination));
     assert.ok(await addon.read_acl(destination));
     assert.equal(await addon.verify_exact_role_acl(destination, ...roles, "authority"), true);
@@ -115,8 +116,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     const parentHandle = await addon.open_verified_parent_handle(destination);
     const objectHandle = await addon.open_verified_object_handle(parentHandle, basename(destination));
     assert.ok(objectHandle);
+    const parentHandleIdentity = await addon.read_handle_identity(parentHandle);
+    assert.equal(parentHandleIdentity.owner, roles[0], "retained parent identity proves authority parent ownership by M");
     assert.deepEqual(Buffer.from(await addon.read_handle_bytes(objectHandle)), initial);
-    assert.ok(await addon.read_handle_identity(objectHandle));
+    const objectHandleIdentity = await addon.read_handle_identity(objectHandle);
+    assert.equal(objectHandleIdentity.owner, roles[0], "retained object identity proves authority file ownership by M");
 
     const temporary = await addon.create_exclusive_temp(root, "authority", replacement, ...roles, "authority");
     await addon.flush_file(temporary);
@@ -291,6 +295,25 @@ test("native source contains fail-closed ACL and publication guards", () => {
     assert.match(access, /WRITE_DAC/);
     assert.match(access, /WRITE_OWNER/);
   }
+  assert.match(source, /HANDLE h = OpenNoFollowDirectory\(parent\.u8string\(\), READ_CONTROL \| FILE_READ_ATTRIBUTES\);/);
+  assert.match(source, /HANDLE h = OpenNoFollowObject\(path, READ_CONTROL \| FILE_READ_ATTRIBUTES\);/);
+  assert.match(source, /value->handle = OpenNoFollowDirectory\(value->path, READ_CONTROL \| FILE_READ_ATTRIBUTES\);/);
+  const identitySourceStart = source.indexOf("void SetIdentity(napi_env env, napi_value result, HANDLE handle)");
+  const identitySourceEnd = source.indexOf("#else", identitySourceStart);
+  const identitySource = source.slice(identitySourceStart, identitySourceEnd);
+  assert.match(identitySource, /GetFileInformationByHandle\(handle, &info\)/);
+  assert.match(identitySource, /GetSecurityInfo\(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION/);
+  const windowsPathStart = source.indexOf("HANDLE OpenWindowsPathNoFollow");
+  const windowsPathEnd = source.indexOf("HANDLE OpenNoFollow(", windowsPathStart);
+  const windowsPath = source.slice(windowsPathStart, windowsPathEnd);
+  assert.match(source, /FILE_FLAG_OPEN_REPARSE_POINT/);
+  assert.match(source, /VerifyWindowsHandle\(handle, expected_type\)/);
+  assert.match(windowsPath, /final \? expected_type : VerifiedObjectType::Directory/);
+  assert.match(windowsPath, /parts\.components\.empty\(\) \? access : kWindowsTraversalAccess/);
+  const retainedObjectStart = source.indexOf("napi_value OpenVerifiedObjectHandle");
+  const retainedObjectEnd = source.indexOf("napi_value ReadHandleBytes", retainedObjectStart);
+  assert.match(source.slice(retainedObjectStart, retainedObjectEnd),
+    /GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL \| DELETE/);
   const unresolvedSidOffset = source.indexOf("if (lookup_error == ERROR_NONE_MAPPED");
   assert.notEqual(unresolvedSidOffset, -1);
   const unresolvedSidEnd = source.indexOf("}", unresolvedSidOffset);

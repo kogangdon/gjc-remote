@@ -2141,11 +2141,18 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const predecessorIsActiveHead = head !== null &&
       activeRequest !== null &&
       activeRequest.sequence === head.sequence + 1;
-    const predecessorHead = head === null || predecessorIsActiveHead
-      ? head
-      : head.sequence === 2
-        ? null
-        : await read(path(`authority-head-${head.sequence - 1}-terminal`));
+    let predecessorHead;
+    if (head === null || predecessorIsActiveHead) {
+      predecessorHead = head;
+    } else if (head.sequence === 2) {
+      predecessorHead = null;
+    } else {
+      predecessorHead = await read(path(`authority-head-${head.sequence - 1}-terminal`));
+      if (predecessorHead === null) throw new TypeError('successor predecessor archive absent');
+      if (predecessorHead.sequence !== head.sequence - 1 || predecessorHead.phase !== 'terminal') {
+        throw new TypeError('successor predecessor archive sequence or phase');
+      }
+    }
     const control = await read(path('control-root'));
     if (!control?.sourceKind || !control.wrapperRelativeName) throw new TypeError('successor predecessor envelope');
     const wrapper = await read(join(root, control.wrapperRelativeName));

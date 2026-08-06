@@ -98,7 +98,7 @@ async function committedGenesisFixture(idempotencyKey) {
   });
   assert.equal(result.ok, true, JSON.stringify(result));
   const request = JSON.parse(fileEnding(fixture.files, '/.gjc-remote-control/genesis-request.json'));
-  return { ...fixture, native, request, recovery: { txId: request.genesisTxId, requestFingerprint: request.requestFingerprint } };
+  return { ...fixture, native, runtime, request, recovery: { txId: request.genesisTxId, requestFingerprint: request.requestFingerprint } };
 }
 function restoreReservedAuthorityEpoch(fixture) {
   const { files, request } = fixture;
@@ -1499,6 +1499,45 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   assert.deepEqual(files, beforeDetachedFinality);
   assert.equal(calls.length, detachedFinalityWrites);
   await native.writeAuthoritySuccessorFinality(finality);
+});
+test('successor predecessor archive loss or drift refuses reads without writes', async () => {
+  const fixture = await committedGenesisFixture('successor-predecessor-archive');
+  const { files, calls, native, roles, runtime } = fixture;
+  const owner = { kind: 'sid', value: roles.managementSid };
+  for (const [index, hostTokens] of ['host=successor-archive-2', 'host=successor-archive-3'].entries()) {
+    const result = await runtime.execute('tokens-attest', {
+      actorPrincipal: owner,
+      actorSecret: 'owner-secret-is-long-enough',
+      hostTokens,
+      idempotencyKey: `successor-predecessor-archive-${index + 2}`,
+    });
+    assert.equal(result.ok, true, JSON.stringify(result));
+  }
+  const headPath = [...files.keys()].find((name) => normalize(name).endsWith('/authority-head.json'));
+  const head = JSON.parse(files.get(headPath));
+  assert.equal(head.sequence, 3);
+  assert.equal(head.phase, 'terminal');
+  const requestPath = [...files.keys()].find((name) => normalize(name).endsWith(`/authority-successor-request-${encodeURIComponent(head.txId)}.json`));
+  assert.equal(JSON.parse(files.get(requestPath)).readerMode, 'no-reader');
+  const archivePath = [...files.keys()].find((name) => normalize(name).endsWith('/authority-head-2-terminal.json'));
+  assert.ok(archivePath);
+  const archiveBytes = Buffer.from(files.get(archivePath));
+  for (const variant of ['missing', 'sequence', 'phase']) {
+    if (variant === 'missing') {
+      files.delete(archivePath);
+    } else {
+      const archive = JSON.parse(archiveBytes);
+      if (variant === 'sequence') archive.sequence = 1;
+      if (variant === 'phase') archive.phase = 'reserved';
+      files.set(archivePath, Buffer.from(canonicalJson(archive)));
+    }
+    const before = new Map([...files.entries()].map(([name, bytes]) => [name, Buffer.from(bytes)]));
+    const writes = calls.length;
+    await assert.rejects(native.readSuccessorBundle(), /successor bundle|predecessor|torn|substituted/i);
+    assert.deepEqual(files, before);
+    assert.equal(calls.length, writes);
+    files.set(archivePath, archiveBytes);
+  }
 });
 test('rejects a skipped successor authority epoch with zero writes', async () => {
   const fixture = await committedGenesisFixture('successor-epoch-gap');
