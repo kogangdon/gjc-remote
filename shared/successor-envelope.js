@@ -244,7 +244,7 @@ export function validateAuthoritySuccessorHeadTransition(previous, next, request
 export const buildAuthoritySuccessorRecord = (record, fingerprintField) => { const value = { ...record, [fingerprintField]: null }; value[fingerprintField] = fingerprint(value, fingerprintField); return value; };
 export const authoritySuccessorFingerprint = fingerprint;
 export function validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest = null) {
-  const { request, close = null, fence = null, baseline = null, commit = null, reservation = null, authorityEpoch = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, historyMarkerPredecessors = [], head } = bundle ?? {};
+  const { request, close = null, fence = null, baseline = null, commit = null, reservation = null, authorityEpoch = null, authorityEpochArchive = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, historyMarkerPredecessors = [], head } = bundle ?? {};
   validateAuthoritySuccessorRequest(request, genesisAuthorityRequest); validateAuthoritySuccessorHead(head, request, genesisAuthorityRequest);
   if (close !== null) validateAuthorityCloseProof(close, request, genesisAuthorityRequest);
   if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit, genesisAuthorityRequest);
@@ -270,6 +270,17 @@ export function validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest
   if (finality !== null) {
     if (authorityEpoch === null) fail("AH authority epoch evidence");
     validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+  }
+  const requiresAuthorityEpochArchive = finality !== null || ["replaced", "reader-pending", "terminal"].includes(head.phase);
+  if (authorityEpoch !== null) {
+    if (authorityEpochArchive === null) {
+      if (requiresAuthorityEpochArchive) fail("AH authority epoch archive evidence");
+    } else {
+      validateAuthorityEpoch(authorityEpochArchive, request, reservation, commit);
+      if (canonicalJsonHash(authorityEpochArchive) !== canonicalJsonHash(authorityEpoch)) fail("AH authority epoch archive drift");
+    }
+  } else if (authorityEpochArchive !== null) {
+    fail("AH authority epoch archive without epoch");
   }
   const fields = { closeFingerprint: close?.closeFingerprint ?? null, baselineFingerprint: baseline?.baselineFingerprint ?? null, finalityFingerprint: finality?.finalityFingerprint ?? null, receiptFingerprint: receipt?.receiptFingerprint ?? null };
   for (const [field, value] of Object.entries(fields)) if (head[field] !== value) fail(`AH ${field}`);

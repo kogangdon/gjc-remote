@@ -65,6 +65,16 @@ transaction, lease/fence disagreement, or failed reopen is `manual_cleanup` and
 `no-route`, never an automatic retry that could publish a different authority.
 Recovery is native, idempotent, and cannot reopen a route without its complete
 proof chain.
+### Admission archive and history proof boundary
+
+Successor snapshots carry the complete managed-history predecessor chain and the
+immutable committed authority-epoch archive. No-reader finality, recheck, and
+snapshot validation require the durable Genesis zero-grant absence proof and
+reject archive paths reachable from validated transaction/index IDs. The current
+native primitive set does not enumerate arbitrary control-directory entries; an
+archive with an ID that is not reachable from that proof cannot be classified by
+the adapter and therefore remains outside the proof boundary rather than being
+silently treated as valid.
 
 ## Native boundary and exclusions
 

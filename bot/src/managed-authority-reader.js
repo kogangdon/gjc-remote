@@ -7,7 +7,7 @@ import { validateManagedChannelsV2, validateManagementEnvelope } from "@gjc-remo
 import { validateManualCleanup } from "@gjc-remote/shared/recovery-envelope";
 import { validatePublicationC, validatePublicationGraph as validateSharedPublicationGraph, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationState, validatePublicationTransaction, validatePublicationU, validatePublicationY, validatePublicationZp } from "@gjc-remote/shared/publication-envelope";
 import { canonicalJson, canonicalJsonHash, isHex64, parseCanonicalJsonBytes } from "@gjc-remote/shared/strict-json";
-import { authoritySuccessorPreviousLeaseBindingFingerprint, buildAuthoritySuccessorRecord, validateAuthoritySuccessorBundle } from "@gjc-remote/shared/successor-envelope";
+import { authoritySuccessorPreviousLeaseBindingFingerprint, buildAuthoritySuccessorRecord, validateAuthoritySuccessorBundle, validateManagedHistoryMarkerSeal as validateSharedHistoryMarkerSeal } from "@gjc-remote/shared/successor-envelope";
 
 const WRAPPER_NAMES = new Set(["managed-v1-wrapper.json", "legacy-retained.json"]);
 const CONTROL_ROOT_NAME = "control-root.json";
@@ -228,11 +228,8 @@ function validatePublishedFloors({ authorityEpochFloor, fenceGenerationFloor, au
     throw new TypeError("authority floor commit binding");
   }
 }
-function validateHistoryMarkerSeal(marker, seal, anchorFingerprint) {
-  validateHistoryMarker(seal, anchorFingerprint, 1);
-  if (marker.sequence === 1 && canonicalJson(marker) !== canonicalJson(seal)) {
-    throw new TypeError("history marker seal mismatch");
-  }
+function validateHistoryMarkerSeal(marker, seal, anchorFingerprint, predecessors = []) {
+  validateSharedHistoryMarkerSeal(marker, seal, anchorFingerprint, predecessors);
 }
 function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerprint) {
   const { request, head, finality, baseline } = bundle;
@@ -244,7 +241,9 @@ function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerpr
       !isBytes(evidence.controlRootBytes) || !isBytes(evidence.wrapperBytes) || !isBytes(evidence.targetBytes) ||
       !isHex64(evidence.targetIdentity) || !isHex64(evidence.targetAclFingerprint) ||
       !isBytes(evidence.authorityEpochFloorBytes) || !isBytes(evidence.fenceGenerationFloorBytes) ||
-      !isBytes(evidence.historyMarkerBytes) || !isBytes(evidence.historyMarkerSealBytes)) {
+      !isBytes(evidence.authorityEpochArchiveBytes) ||
+      !isBytes(evidence.historyMarkerBytes) || !isBytes(evidence.historyMarkerSealBytes) ||
+      !isBytes(evidence.historyMarkerPredecessorsBytes)) {
     throw new Error("SUCCESSOR_LIVE_PROOF_INVALID");
   }
 
@@ -262,6 +261,12 @@ function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerpr
   validateCommittedLineage(attestation, floor, request.anchorFingerprint);
   const authorityEpochFloor = parseAuthorityBytes(evidence.authorityEpochFloorBytes);
   const fenceGenerationFloor = parseAuthorityBytes(evidence.fenceGenerationFloorBytes);
+  const authorityEpochArchive = parseAuthorityBytes(evidence.authorityEpochArchiveBytes);
+  const historyMarkerPredecessors = parseAuthorityBytes(evidence.historyMarkerPredecessorsBytes);
+  validateAuthorityEpoch(authorityEpochArchive, request, bundle.reservation, bundle.commit);
+  if (canonicalJson(authorityEpochArchive) !== canonicalJson(bundle.authorityEpochArchive)) {
+    throw new Error("SUCCESSOR_LIVE_EPOCH_ARCHIVE_STALE");
+  }
   const liveHistoryMarker = parseAuthorityBytes(evidence.historyMarkerBytes);
   const historyMarkerSeal = parseAuthorityBytes(evidence.historyMarkerSealBytes);
   validatePublishedFloors({
@@ -272,7 +277,10 @@ function validateLiveSuccessorEvidence(bundle, evidence, expectedHostSetFingerpr
     request,
     head: liveHead,
   });
-  validateHistoryMarkerSeal(liveHistoryMarker, historyMarkerSeal, request.anchorFingerprint);
+  validateHistoryMarkerSeal(liveHistoryMarker, historyMarkerSeal, request.anchorFingerprint, historyMarkerPredecessors);
+  if (canonicalJson(historyMarkerPredecessors) !== canonicalJson(bundle.historyMarkerPredecessors)) {
+    throw new Error("SUCCESSOR_LIVE_HISTORY_PREDECESSORS_STALE");
+  }
   if (canonicalJson(liveHistoryMarker) !== canonicalJson(bundle.historyMarker) ||
       canonicalJson(historyMarkerSeal) !== canonicalJson(bundle.historyMarkerSeal)) {
     throw new Error("SUCCESSOR_LIVE_HISTORY_MARKER_STALE");
@@ -462,17 +470,29 @@ function validateSuccessorPublicationEvidence({ snapshot, bundle }) {
   if ((readerFloor.readerVersionFloor === 2) !== (request.readerMode === "bound-reader")) {
     throw new TypeError("successor reader floor");
   }
+  if (!isBytes(snapshot.authorityEpochArchiveBytes)) throw new TypeError("successor authority epoch archive absent");
+  const authorityEpochArchive = parseAuthorityBytes(snapshot.authorityEpochArchiveBytes);
+  validateAuthorityEpoch(authorityEpochArchive, request, reservation, commit);
+  if (canonicalJson(authorityEpochArchive) !== canonicalJson(bundle.authorityEpochArchive)) {
+    throw new TypeError("successor authority epoch archive substitution");
+  }
   if (!isBytes(snapshot.historyMarkerBytes)) throw new TypeError("successor history marker absent");
   if (!isBytes(snapshot.historyMarkerSealBytes)) throw new TypeError("successor history marker seal absent");
+  if (!isBytes(snapshot.historyMarkerPredecessorsBytes)) throw new TypeError("successor history marker predecessors absent");
   const historyMarker = parseAuthorityBytes(snapshot.historyMarkerBytes);
   const historyMarkerSeal = parseAuthorityBytes(snapshot.historyMarkerSealBytes);
+  const historyMarkerPredecessors = parseAuthorityBytes(snapshot.historyMarkerPredecessorsBytes);
   validateHistoryMarker(historyMarker, request.anchorFingerprint, head.phase === "terminal" ? request.sequence : request.sequence - 1);
-  validateHistoryMarkerSeal(historyMarker, historyMarkerSeal, request.anchorFingerprint);
+  validateHistoryMarkerSeal(historyMarker, historyMarkerSeal, request.anchorFingerprint, historyMarkerPredecessors);
   if (!bundle.historyMarker || canonicalJson(bundle.historyMarker) !== canonicalJson(historyMarker)) {
     throw new TypeError("successor history marker substitution");
   }
   if (!bundle.historyMarkerSeal || canonicalJson(bundle.historyMarkerSeal) !== canonicalJson(historyMarkerSeal)) {
     throw new TypeError("successor history marker seal substitution");
+  }
+  if (!bundle.historyMarkerPredecessors ||
+      canonicalJson(bundle.historyMarkerPredecessors) !== canonicalJson(historyMarkerPredecessors)) {
+    throw new TypeError("successor history marker predecessor substitution");
   }
   if (head.phase === "terminal" && request.readerMode === "bound-reader" && (!bundle.lease || !bundle.projection || !bundle.ack)) {
     throw new TypeError("successor bound-reader proof absent");
@@ -630,8 +650,11 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
   const fenceGenerationFloor = parseAuthorityBytes(snapshot.fenceGenerationFloorBytes);
   const historyMarker = parseAuthorityBytes(snapshot.historyMarkerBytes);
   const historyMarkerSeal = parseAuthorityBytes(snapshot.historyMarkerSealBytes);
+  const historyMarkerPredecessors = snapshot.historyMarkerPredecessorsBytes === undefined
+    ? []
+    : parseAuthorityBytes(snapshot.historyMarkerPredecessorsBytes);
   validateHistoryMarker(historyMarker, request.anchorFingerprint, 1);
-  validateHistoryMarkerSeal(historyMarker, historyMarkerSeal, request.anchorFingerprint);
+  validateHistoryMarkerSeal(historyMarker, historyMarkerSeal, request.anchorFingerprint, historyMarkerPredecessors);
   const attestedProof = parseAuthorityBytes(snapshot.attestedProofBytes);
   const precommit = parseAuthorityBytes(snapshot.precommitBytes);
   const recovery = snapshot.recoveryBytes === undefined ? null : parseAuthorityBytes(snapshot.recoveryBytes);
@@ -1151,6 +1174,7 @@ export async function createManagedAuthorityReader({
           if (head.phase !== "terminal") return unavailable("MANAGED_AUTHORITY_PENDING");
           if (!isBytes(snapshot.controlRootBytes) || !isBytes(snapshot.wrapperBytes) || !isBytes(snapshot.targetBytes) ||
               !isBytes(snapshot.historyMarkerBytes) || !isBytes(snapshot.historyMarkerSealBytes) ||
+              !isBytes(snapshot.historyMarkerPredecessorsBytes) || !isBytes(snapshot.authorityEpochArchiveBytes) ||
               !isBytes(snapshot.authorityEpochFloorBytes) || !isBytes(snapshot.fenceGenerationFloorBytes) ||
               !isHex64(snapshot.targetIdentity) || !isHex64(snapshot.targetAclFingerprint)) {
             return unavailable("MANAGED_AUTHORITY_INVALID");
@@ -1162,7 +1186,9 @@ export async function createManagedAuthorityReader({
             targetBytes: Buffer.from(snapshot.targetBytes),
             historyMarkerBytes: Buffer.from(snapshot.historyMarkerBytes),
             historyMarkerSealBytes: Buffer.from(snapshot.historyMarkerSealBytes),
+            historyMarkerPredecessorsBytes: Buffer.from(snapshot.historyMarkerPredecessorsBytes),
             authorityEpochFloorBytes: Buffer.from(snapshot.authorityEpochFloorBytes),
+            authorityEpochArchiveBytes: Buffer.from(snapshot.authorityEpochArchiveBytes),
             fenceGenerationFloorBytes: Buffer.from(snapshot.fenceGenerationFloorBytes),
             targetIdentity: snapshot.targetIdentity,
             targetAclFingerprint: snapshot.targetAclFingerprint,
@@ -1182,7 +1208,8 @@ export async function createManagedAuthorityReader({
           !isBytes(snapshot.attestationHistoryBytes) || !isBytes(snapshot.tokenFloorHistoryBytes) ||
           !isBytes(snapshot.tokenFloorReservationBytes) || !isBytes(snapshot.readerVersionFloorBytes) ||
           !isBytes(snapshot.historyMarkerBytes) || !isBytes(snapshot.historyMarkerSealBytes) ||
-          !isBytes(snapshot.authorityEpochFloorBytes) || !isBytes(snapshot.fenceGenerationFloorBytes) ||
+          !isBytes(snapshot.historyMarkerPredecessorsBytes) || !isBytes(snapshot.authorityEpochFloorBytes) ||
+          !isBytes(snapshot.fenceGenerationFloorBytes) ||
           !isBytes(snapshot.genesisRequestBytes) || !isBytes(snapshot.zFinalityBytes) || !isBytes(snapshot.rvfBytes) ||
           !isBytes(snapshot.receiptBytes) || !isBytes(snapshot.authorityRequestBytes) || !isBytes(snapshot.authorityReceiptBytes) ||
           !isBytes(snapshot.authorityReservationBytes) || !isBytes(snapshot.authorityCommitBytes) || !isBytes(snapshot.authorityBaselineBytes) ||

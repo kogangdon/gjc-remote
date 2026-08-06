@@ -455,15 +455,15 @@ test('pending bot writers require durable handshake and immutable admission arch
   }
 });
 
-function mappingInput(mappingId, generation = 1) {
+function mappingInput(mappingId, generation = 1, fenceGeneration = 1, channelId = '123') {
   const mapping = fingerprintManagedMappingRecord({
-    mappingId, hostId: 'host', fenceGeneration: 1, mappingGeneration: generation, mappingVersion: 1,
+    mappingId, hostId: 'host', fenceGeneration, mappingGeneration: generation, mappingVersion: 1,
     sourcePlatform: 'posix', workspaceId: 'workspace-a', workDir: null,
     sourceRoot: '/source', containerRoot: '/workspace', volumeIdentity: 'volume-a',
     casePolicy: 'sensitive', immutableDefault: false, mappingFingerprint: null,
   });
   const route = fingerprintManagedRouteRecord({
-    channelId: '123', hostId: mapping.hostId, mappingId: mapping.mappingId,
+    channelId, hostId: mapping.hostId, mappingId: mapping.mappingId,
     fenceGeneration: mapping.fenceGeneration,
     mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion,
     sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId,
@@ -2101,4 +2101,100 @@ test('no-reader finality rejects reachable admission identifiers from durable st
     /complete bound-reader finality graph is invalid/,
   );
   assert.equal(harness.writes.length, writes);
+});
+test('managed successor snapshot carries sequence-three history predecessors and committed epoch archive', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=sequence-three'))).ok, true);
+  for (const index of [1, 2]) {
+    const state = await harness.native.readManagementState();
+    let result;
+    if (index === 1) {
+      const candidate = mappingInput(`sequence-three-${index}`, state.mappingGeneration + 1, state.fenceGeneration, String(123 + index));
+      result = await runtime.execute('mapping-reconcile', {
+        actorPrincipal: owner,
+        actorSecret: secret,
+        idempotencyKey: `sequence-three-${index}`,
+        mappingId: candidate.mapping.mappingId,
+        ...candidate,
+        expectedRevision: state.revision,
+        expectedFingerprint: null,
+      });
+    } else {
+      result = await runtime.execute('tokens-attest', {
+        actorPrincipal: owner,
+        actorSecret: secret,
+        idempotencyKey: `sequence-three-${index}`,
+        hostTokens: 'host=sequence-three-rotated',
+      });
+    }
+    assert.equal(result.ok, true, JSON.stringify({ result, state }));
+  }
+  harness.setPrincipal(botPrincipal);
+  const snapshot = await harness.native.readManagedMappingSnapshot();
+  assert.equal(snapshot.successorBundle.head.sequence, 3);
+  assert.equal(snapshot.successorBundle.historyMarkerPredecessors.length, 1);
+  assert.equal(snapshot.successorBundle.historyMarkerPredecessors[0].sequence, 2);
+  assert.ok(snapshot.successorBundle.authorityEpochArchive);
+  assert.deepEqual(
+    JSON.parse(snapshot.historyMarkerPredecessorsBytes.toString('utf8')),
+    snapshot.successorBundle.historyMarkerPredecessors,
+  );
+});
+
+test('managed successor snapshot rejects a missing committed epoch archive', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=missing-epoch-archive'))).ok, true);
+  const state = await harness.native.readManagementState();
+  const candidate = mappingInput('missing-epoch-archive-map', state.mappingGeneration + 1);
+  const result = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'missing-epoch-archive',
+    mappingId: candidate.mapping.mappingId,
+    ...candidate,
+    expectedRevision: state.revision,
+    expectedFingerprint: null,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const head = JSON.parse(fileEnding(harness.files, '/authority-head.json'));
+  const epoch = JSON.parse(fileEnding(harness.files, '/authority-epoch.json'));
+  const archivePath = filePathEnding(harness.files, `/authority-epoch-${epoch.epoch}-committed.json`);
+  assert.ok(archivePath);
+  harness.files.delete(archivePath);
+  harness.setPrincipal(botPrincipal);
+  await assert.rejects(harness.native.readManagedMappingSnapshot(), /epoch|successor|bundle/i);
+  assert.equal(head.phase, 'terminal');
+});
+
+test('no-reader finality, recheck, and snapshot reject reachable immutable admission archives', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=no-reader-archive-proof'))).ok, true);
+  const request = JSON.parse(fileEnding(harness.files, '/genesis-request.json'));
+  const root = filePathEnding(harness.files, '/genesis-request.json').replace(/genesis-request\.json$/, '');
+  const reachableArchive = `${root}admission-request-${request.genesisTxId}.json`;
+  harness.files.set(reachableArchive, Buffer.from(canonicalJson({ orphan: true })));
+  const proof = JSON.parse(fileEnding(harness.files, '/rvf.json'));
+  const zFinality = JSON.parse(fileEnding(harness.files, '/z-finality.json'));
+  const receipt = JSON.parse(fileEnding(harness.files, '/receipt.json'));
+  harness.setPrincipal(owner);
+  await assert.rejects(
+    harness.native.writeFinalityProof(proof),
+    /reachable immutable admission archives|complete bound-reader finality graph/i,
+  );
+  assert.equal(
+    await harness.native.recheckAdmissionFinality({
+      request,
+      zFinality,
+      readerProjection: null,
+      admissionAck: null,
+      finalityProof: proof,
+      receipt,
+    }),
+    false,
+  );
+  harness.setPrincipal(botPrincipal);
+  await assert.rejects(harness.native.readManagedMappingSnapshot(), /reachable immutable admission archives|finality/i);
 });

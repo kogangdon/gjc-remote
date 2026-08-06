@@ -629,6 +629,45 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   }) => {
     const readerHandshake = managementState?.recovery?.readerHandshake ?? null;
     if (request.requestedReaderMode === 'no-reader') {
+      const precommit = await read(path(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`));
+      const zeroGrantProofFingerprint = canonicalJsonHash({
+        admissionClosed: true,
+        admissionDrained: true,
+        admissionGrantWrites: 0,
+        admissionAckWrites: 0,
+        outstandingAdmissionGrants: 0,
+        txId: request.genesisTxId,
+      });
+      try {
+        validateGenesisPrecommit(precommit);
+        if (precommit.genesisTxId !== request.genesisTxId ||
+            precommit.zeroGrantProofFingerprint !== zeroGrantProofFingerprint) {
+          throw new TypeError('no-reader admission absence proof mismatch');
+        }
+      } catch {
+        throw new TypeError('no-reader admission absence proof is absent or invalid');
+      }
+      // The native primitive set has no directory enumeration. The immutable
+      // Genesis zero-grant proof is the durable absence/index boundary; only
+      // archive names reachable from validated graph IDs can be checked here.
+      const reachableArchiveIds = new Set([request.genesisTxId]);
+      const indexedArchiveIds = managementState?.admissionArchiveIds;
+      if (indexedArchiveIds !== undefined) {
+        if (!Array.isArray(indexedArchiveIds) || !indexedArchiveIds.every(isOpaque)) {
+          throw new TypeError('no-reader admission archive index is invalid');
+        }
+        for (const id of indexedArchiveIds) reachableArchiveIds.add(id);
+      }
+      for (const id of reachableArchiveIds) {
+        const names = [
+          path(`admission-request-${encodeURIComponent(id)}`),
+          path(`admission-grant-${encodeURIComponent(id)}`),
+          botPath(`admission-ack-${encodeURIComponent(id)}`),
+        ];
+        if ((await Promise.all(names.map((name) => lowLevel.read_verified_bytes(name)))).some((bytes) => bytes !== null)) {
+          throw new TypeError('no-reader graph contains reachable immutable admission archives');
+        }
+      }
       if (admissionRequest !== null || admissionGrant !== null || acknowledgement !== null ||
           readerHandshake !== null) {
         throw new TypeError('no-reader graph contains admission identifiers or records');
@@ -5001,6 +5040,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       }
       if (headBefore !== null) {
         try { validateAuthoritySuccessorHead(headBefore, null, genesisAuthorityRequest); } catch { refused('read_managed_mapping_snapshot', 'successor authority head is invalid'); }
+        const successorAuthorityEpoch = await read(path('authority-epoch'));
         const tx = encodeURIComponent(headBefore.txId);
         const bundle = {
           request: await read(path(`authority-successor-request-${tx}`)),
@@ -5009,7 +5049,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           baseline: await read(path(`authority-successor-baseline-${tx}`)),
           commit: await read(path(`authority-commit-${tx}`)),
           reservation: await read(path(`authority-reservation-${tx}`)),
-          authorityEpoch: await read(path('authority-epoch')),
+          authorityEpoch: successorAuthorityEpoch,
+          authorityEpochArchive: successorAuthorityEpoch?.epoch === undefined
+            ? null
+            : await read(path(`authority-epoch-${encodeURIComponent(successorAuthorityEpoch.epoch)}-committed`)),
           authorityEpochFloor: await read(path('authority-epoch-floor')),
           fenceGenerationFloor: await read(path('fence-generation-floor')),
           readerFloor: await read(path('reader-version-floor')),
@@ -5021,6 +5064,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           ack: await read(botPath(`successor-ack-${tx}`)),
           receipt: await read(path(`authority-successor-receipt-${tx}`)),
           historyMarker,
+          historyMarkerPredecessors: historyEvidence.predecessors,
           historyMarkerSeal,
           head: headBefore,
         };
@@ -5037,7 +5081,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           if ((bundle.readerFloor.readerVersionFloor === 2) !== (bundle.request?.readerMode === 'bound-reader')) {
             throw new TypeError('successor reader floor branch');
           }
-          validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint, bundle.historyMarker);
+          validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint, bundle.historyMarker, bundle.historyMarkerPredecessors);
           if (!bundle.historyMarkerSeal ||
               (bundle.historyMarker.sequence === 1 && canonical(bundle.historyMarker) !== canonical(bundle.historyMarkerSeal))) {
             throw new TypeError('successor history marker seal');
@@ -5138,8 +5182,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           successorBundle: liveBundle,
           historyMarkerBytes: encode(historyMarker),
           historyMarkerSealBytes: historyMarkerSeal === null ? undefined : encode(historyMarkerSeal),
+          historyMarkerPredecessorsBytes: encode(historyEvidence.predecessors),
           authorityEpochFloorBytes: encode(bundle.authorityEpochFloor),
           fenceGenerationFloorBytes: encode(bundle.fenceGenerationFloor),
+          authorityEpochArchiveBytes: encode(bundle.authorityEpochArchive),
           nativeVerified: true,
         };
       }
@@ -5265,6 +5311,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         attestedProofBytes: attestedProof.bytes, precommitBytes: precommit.bytes,
         tokenFloorReservationBytes: reservation.bytes, readerVersionFloorBytes: readerVersionFloor.bytes,
         historyMarkerBytes: encode(historyMarker),
+        historyMarkerPredecessorsBytes: encode(historyEvidence.predecessors),
         historyMarkerSealBytes: historyMarkerSeal === null ? undefined : encode(historyMarkerSeal),
         authorityEpochFloorBytes: authorityEpochFloor.bytes,
         fenceGenerationFloorBytes: fenceGenerationFloor.bytes,
@@ -5557,9 +5604,13 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const attestationHistoryValue = parseCanonicalJsonBytes(attestationHistory.bytes);
       const floorHistoryValue = parseCanonicalJsonBytes(tokenFloorHistory.bytes);
       const authorityEpochValue = parseCanonicalJsonBytes(authorityEpoch.bytes);
+      const authorityEpochArchive = await verifiedBytes(path(`authority-epoch-${encodeURIComponent(authorityEpochValue.epoch)}-committed`));
+      const authorityEpochArchiveValue = parseCanonicalJsonBytes(authorityEpochArchive.bytes);
       const authorityEpochFloorValue = parseCanonicalJsonBytes(authorityEpochFloor.bytes);
       const fenceGenerationFloorValue = parseCanonicalJsonBytes(fenceGenerationFloor.bytes);
       try {
+        validateAuthorityEpoch(authorityEpochArchiveValue, requestValue, reservationValue, commitValue);
+        if (canonical(authorityEpochArchiveValue) !== canonical(authorityEpochValue)) throw new TypeError('authority epoch archive drift');
         validatePublishedFloors({
           authorityEpochFloor: authorityEpochFloorValue,
           fenceGenerationFloor: fenceGenerationFloorValue,
@@ -5568,7 +5619,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           request: requestValue,
           head: headValue,
         });
-        validateHistoryMarkerSeal(historyEvidence.seal, requestValue.anchorFingerprint);
+        validateHistoryMarkerSeal(historyEvidence.seal, requestValue.anchorFingerprint, historyEvidence.marker, historyEvidence.predecessors);
         if (!historyEvidence.marker || !historyEvidence.seal) throw new TypeError('history marker seal');
         validateHistoryMarkerRelation(historyEvidence.marker, {
           anchorFingerprint: requestValue.anchorFingerprint,
@@ -5645,8 +5696,10 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         tokenFloorBytes: tokenFloor.bytes,
         authorityEpochFloorBytes: authorityEpochFloor.bytes,
         fenceGenerationFloorBytes: fenceGenerationFloor.bytes,
+        authorityEpochArchiveBytes: authorityEpochArchive.bytes,
         historyMarkerBytes: encode(historyEvidence.marker),
         historyMarkerSealBytes: encode(historyEvidence.seal),
+        historyMarkerPredecessorsBytes: encode(historyEvidence.predecessors),
         attestationHistoryBytes: attestationHistory.bytes,
         tokenFloorHistoryBytes: tokenFloorHistory.bytes,
         controlRootBytes: controlRoot.bytes,
