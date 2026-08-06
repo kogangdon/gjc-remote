@@ -206,6 +206,9 @@ test("successor heads require exact one-step and terminal rolling lineage", () =
   const next = buildAuthoritySuccessorRecord({ ...base, sequence: 3, fenceGeneration: 3, txId: "successor-3", previousHeadFingerprint: terminal.headFingerprint, previousReceiptFingerprint: terminal.receiptFingerprint, headFingerprint: null }, "headFingerprint");
   assert.doesNotThrow(() => validateAuthoritySuccessorHeadTransition(terminal, next));
   assert.throws(() => validateAuthoritySuccessorHeadTransition(terminal, buildAuthoritySuccessorRecord({ ...next, sequence: 4, headFingerprint: null }, "headFingerprint")), /SUCCESSOR_ENVELOPE_INVALID/);
+  assert.doesNotThrow(() => validateAuthoritySuccessorHeadTransition(null, reserved, null, "genesis"));
+  const foreign = buildAuthoritySuccessorRecord({ ...reserved, rootGenesisTxId: "foreign-genesis", headFingerprint: null }, "headFingerprint");
+  assert.throws(() => validateAuthoritySuccessorHeadTransition(null, foreign, null, "genesis"), /Genesis authority root/);
 });
 test("mapping successors require exact next mapping generation", () => {
   const request = buildAuthoritySuccessorRecord({
@@ -246,6 +249,8 @@ test("mapping successors require exact next mapping generation", () => {
   }, "requestFingerprint");
 
   assert.doesNotThrow(() => validateAuthoritySuccessorRequest(request));
+  const foreignRoot = buildAuthoritySuccessorRecord({ ...request, rootGenesisTxId: "foreign-genesis", requestFingerprint: null }, "requestFingerprint");
+  assert.throws(() => validateAuthoritySuccessorRequest(foreignRoot, "genesis"), /Genesis authority root/);
   const retainedMapping = buildAuthoritySuccessorRecord({ ...request, targetState: "legacy-retained", requestFingerprint: null }, "requestFingerprint");
   assert.throws(() => validateAuthoritySuccessorRequest(retainedMapping), /SR fields/);
   const retainedAttestation = buildAuthoritySuccessorRecord({

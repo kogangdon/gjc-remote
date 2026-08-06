@@ -25,8 +25,8 @@ test('production package surface excludes the low-level test adapter', () => {
 function fake() {
   const files = new Map(); const calls = []; const roleCalls = []; const roles = { managementSid: 'S-1-5-21-100', botSid: 'S-1-5-21-101', recoverySid: 'S-1-5-21-102', systemSid: 'S-1-5-18' };
   const lowLevel = {
-    open_verified_parent: async (path) => ({ path: parentOf(path) }), open_no_follow: async () => {}, read_identity: async (path) => path.endsWith('.genesis-bootstrap-blocker') && !files.has(path) ? null : ({ path, owner: roles.managementSid }), read_acl: async () => 'protected:M,B,R,SYSTEM', path_exists_no_follow: async (path) => { const normalized = path.replaceAll('\\', '/'); return [...files.keys()].some((name) => { const candidate = name.replaceAll('\\', '/'); return candidate === normalized || candidate.startsWith(`${normalized}/`); }); }, verify_exact_role_acl: async () => true, set_exact_role_acl: async () => {}, remove_verified_file: async (path, expected) => { assert.deepEqual(files.get(path), Buffer.from(expected)); files.delete(path); }, flush_file: async () => {}, flush_directory_or_volume: async () => {},
-    open_verified_parent_handle: async (path) => ({ path: parentOf(path) }), open_verified_object_handle: async (parent, name) => {
+    open_verified_parent: async (path) => ({ path: parentOf(path), owner: roles.managementSid }), open_no_follow: async () => {}, read_identity: async (path) => path.endsWith('.genesis-bootstrap-blocker') && !files.has(path) ? null : ({ path, owner: roles.managementSid }), read_acl: async () => 'protected:M,B,R,SYSTEM', path_exists_no_follow: async (path) => { const normalized = path.replaceAll('\\', '/'); return [...files.keys()].some((name) => { const candidate = name.replaceAll('\\', '/'); return candidate === normalized || candidate.startsWith(`${normalized}/`); }); }, verify_exact_role_acl: async () => true, set_exact_role_acl: async () => {}, remove_verified_file: async (path, expected) => { assert.deepEqual(files.get(path), Buffer.from(expected)); files.delete(path); }, flush_file: async () => {}, flush_directory_or_volume: async () => {},
+    open_verified_parent_handle: async (path) => ({ path: parentOf(path), owner: roles.managementSid }), open_verified_object_handle: async (parent, name) => {
       const normalized = `${parent.path}/${name}`;
       const path = [...files.keys()].find((candidate) => candidate.replaceAll('\\', '/') === normalized);
       return path ? { path } : null;
@@ -248,6 +248,51 @@ test('refuses GP when parent mutation capability is unknown before any writes', 
   assert.deepEqual(calls, []);
 });
 
+test('authority mutation revalidates parent owner, DACL, and capabilities write-free after GP', async () => {
+  for (const [drift, expected] of [
+    ['owner', /owner/],
+    ['DACL', /DACL/],
+    ['capability', /mutation capability/],
+  ]) {
+    const { files, calls, roles, lowLevel } = fake();
+    const configPath = 'C:/state/channels.json';
+    const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+    const { request } = records();
+    await native.probeProspectiveCleanup({
+      txId: request.genesisTxId,
+      targetPrincipal: { kind: 'sid', value: 'target' },
+      managementPrincipal: { kind: 'sid', value: roles.managementSid },
+      botPrincipal: { kind: 'sid', value: roles.botSid },
+      recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+      managementProvisioningFingerprint: 'b'.repeat(64),
+      botProvisioningFingerprint: 'c'.repeat(64),
+      recoveryProvisioningFingerprint: 'd'.repeat(64),
+    });
+    const authorityRequest = await writeAuthorityRequest(native, configPath, request, roles, Buffer.from('{"legacy":true}'));
+    const authorityPath = [...files.keys()].find((path) => normalize(path).endsWith('/genesis-authority-request.json'));
+    files.delete(authorityPath);
+    const before = new Map([...files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+    const writes = calls.length;
+    if (drift === 'owner') {
+      const readIdentity = lowLevel.read_identity;
+      lowLevel.read_identity = async (path) => path === 'C:/state'
+        ? { path, owner: roles.botSid }
+        : readIdentity(path);
+    } else if (drift === 'DACL') {
+      const readAcl = lowLevel.read_acl;
+      lowLevel.read_acl = async (path) => path === 'C:/state' ? 'drifted' : readAcl(path);
+    } else {
+      const access = lowLevel.principal_access_check;
+      lowLevel.principal_access_check = async (path, kind, principal, mode) =>
+        path === 'C:/state' && principal === roles.managementSid && mode === 'write'
+          ? false
+          : access(path, kind, principal, mode);
+    }
+    await assert.rejects(native.writeGenesisAuthorityRequest(authorityRequest), expected);
+    assert.deepEqual(files, before, `${drift} drift must not mutate authority files`);
+    assert.equal(calls.length, writes, `${drift} drift must not invoke a native write`);
+  }
+});
 test('retained legacy target bytes and identity remain exact through publication', async () => {
   const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const original = Buffer.from('{"legacy":true}');
   files.set(configPath, original); const native = createManagementNativeForTest({ lowLevel, configPath, roles }); const { floor, attestation, request } = records();
@@ -1267,6 +1312,12 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   };
   authorityEpoch.authorityEpochFingerprint = recordHash(authorityEpoch, 'authorityEpochFingerprint');
   files.set('C:\\state\\.gjc-remote-control\\authority-epoch.json', Buffer.from(canonicalJson(authorityEpoch)));
+  const foreignRootRequest = buildAuthoritySuccessorRecord({ ...request, rootGenesisTxId: 'foreign-genesis', requestFingerprint: null }, 'requestFingerprint');
+  const beforeForeignRoot = new Map([...files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const foreignRootWrites = calls.length;
+  await assert.rejects(native.writeAuthoritySuccessorRequest(foreignRootRequest), /immutable Genesis authority request/);
+  assert.deepEqual(files, beforeForeignRoot);
+  assert.equal(calls.length, foreignRootWrites);
   await native.writeAuthoritySuccessorRequest(request);
   assert.deepEqual(await native.writeAuthoritySuccessorRequest(request), request);
   await assert.rejects(native.writeAuthoritySuccessorRequest(buildAuthoritySuccessorRecord({ ...request, idempotencyKey: 'conflict', requestFingerprint: null }, 'requestFingerprint')), /replay conflicts/);

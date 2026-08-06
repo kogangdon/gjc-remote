@@ -9,6 +9,12 @@ const fingerprint = (record, field) => canonicalJsonHash(Object.fromEntries(Obje
 const hex = (value) => isHex64(value);
 const nullableHex = (value) => value === null || hex(value);
 const opaque = (value) => isOpaqueIdentity(value);
+const rootGenesisTxId = (authority) => typeof authority === "string" ? authority : authority?.genesisTxId;
+const assertGenesisRoot = (record, authority = null) => {
+  if (authority !== null && (!plain(record) || !opaque(rootGenesisTxId(authority)) || record.rootGenesisTxId !== rootGenesisTxId(authority))) {
+    fail("Genesis authority root relation");
+  }
+};
 const nullableOpaque = (value) => value === null || opaque(value);
 const nonNegative = (value) => Number.isSafeInteger(value) && value >= 0;
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
@@ -51,7 +57,8 @@ const reader = (record, required = true) => {
 };
 
 const SR = ["version", "kind", "sequence", "txId", "rootGenesisTxId", "idempotencyKey", "operation", "anchorFingerprint", "actorPrincipalFingerprint", "previousReceiptFingerprint", "previousTargetFingerprint", "previousWrapperFingerprint", "previousRevision", "candidateRevision", "previousAuthorityEpoch", "candidateAuthorityEpoch", "previousTokenConfigGeneration", "candidateTokenConfigGeneration", "previousAttestationFingerprint", "candidateAttestationFingerprint", "previousMappingGeneration", "candidateMappingGeneration", "previousSnapshotFingerprint", "candidateSnapshotFingerprint", "candidateTargetFingerprint", "previousFenceGeneration", "candidateFenceGeneration", "mappingRecoveryTxFingerprint", "targetState", "readerMode", "readerInstanceId", "readerStartNonce", "readerNonce", "requestFingerprint"];
-export function validateAuthoritySuccessorRequest(record) {
+export function validateAuthoritySuccessorRequest(record, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, SR); if (record.kind !== "authority-successor-request" || !positive(record.sequence) || ![record.txId, record.rootGenesisTxId, record.idempotencyKey].every(opaque) || !operations.has(record.operation) || ![record.anchorFingerprint, record.actorPrincipalFingerprint, record.previousReceiptFingerprint, record.previousTargetFingerprint, record.previousWrapperFingerprint, record.previousAttestationFingerprint, record.candidateAttestationFingerprint, record.previousSnapshotFingerprint, record.candidateSnapshotFingerprint, record.candidateTargetFingerprint].every(hex) || ![record.previousRevision, record.previousAuthorityEpoch, record.previousTokenConfigGeneration, record.previousMappingGeneration, record.candidateMappingGeneration].every(nonNegative) || ![record.candidateRevision, record.candidateAuthorityEpoch, record.candidateTokenConfigGeneration].every(positive) || record.candidateRevision !== record.previousRevision + 1 || record.candidateAuthorityEpoch !== record.previousAuthorityEpoch + 1 || !nullableHex(record.mappingRecoveryTxFingerprint) || !validTargetState(record.operation, record.targetState) || !readerModes.has(record.readerMode)) fail("SR fields");
   if (!positive(record.previousFenceGeneration) || !positive(record.candidateFenceGeneration) || record.candidateFenceGeneration !== record.previousFenceGeneration + 1) fail("SR fence CAS");
   if (record.operation === "tokens-attest") { if (record.candidateTokenConfigGeneration !== record.previousTokenConfigGeneration + 1 || record.candidateMappingGeneration !== record.previousMappingGeneration || record.mappingRecoveryTxFingerprint !== null) fail("SR token lineage"); } else if (record.candidateTokenConfigGeneration !== record.previousTokenConfigGeneration || record.candidateAttestationFingerprint !== record.previousAttestationFingerprint || record.candidateMappingGeneration !== record.previousMappingGeneration + 1 || !hex(record.mappingRecoveryTxFingerprint)) fail("SR mapping lineage");
@@ -60,7 +67,8 @@ export function validateAuthoritySuccessorRequest(record) {
 }
 
 const CL = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "previousReceiptFingerprint", "fenceGeneration", "previousBarrierGeneration", "barrierGeneration", "affectedScope", "affectedMappingIds", "affectedRouteFingerprints", "readerInstanceId", "readerStartNonce", "retiredGrantFingerprint", "retiredProjectionFingerprint", "retiredAckFingerprint", "admissionPhaseBefore", "admissionPhaseAfter", "admissionDrained", "outstandingRouteGrantCount", "routeDisposition", "closeFingerprint"];
-export function validateAuthorityCloseProof(record, request = null) {
+export function validateAuthorityCloseProof(record, request = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertFence(record);
   assertKeys(record, CL); if (record.kind !== "authority-close-proof" || ![record.txId, record.rootGenesisTxId].every(opaque) || ![record.requestFingerprint, record.previousReceiptFingerprint].every(hex) || !nonNegative(record.previousBarrierGeneration) || record.barrierGeneration !== record.previousBarrierGeneration + 1 || !["all", "mapping"].includes(record.affectedScope) || !sortedUnique(record.affectedMappingIds, opaque) || !sortedUnique(record.affectedRouteFingerprints, hex) || ![record.readerInstanceId, record.readerStartNonce].every(nullableOpaque) || (record.readerInstanceId === null) !== (record.readerStartNonce === null) || ![record.retiredGrantFingerprint, record.retiredProjectionFingerprint, record.retiredAckFingerprint].every(nullableHex) || record.admissionPhaseBefore !== "closed" || record.admissionPhaseAfter !== "closed-drained" || record.admissionDrained !== true || record.outstandingRouteGrantCount !== 0 || record.routeDisposition !== "no-route") fail("CL fields");
   if (request && record.fenceGeneration !== request.candidateFenceGeneration) fail("CL fence relation");
@@ -69,7 +77,8 @@ export function validateAuthorityCloseProof(record, request = null) {
 }
 
 const F2 = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "anchorFingerprint", "authorityCommitSnapshotFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "previousFenceBindingFingerprint", "fenceBindingFingerprint"];
-export function validateAuthoritySuccessorFence(record, request = null, commit = null) {
+export function validateAuthoritySuccessorFence(record, request = null, commit = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, F2); assertFence(record);
   if (record.kind !== "authority-successor-fence" || ![record.txId, record.rootGenesisTxId, record.readerInstanceId, record.readerStartNonce].every(opaque) || ![record.requestFingerprint, record.anchorFingerprint, record.authorityCommitSnapshotFingerprint, record.previousFenceBindingFingerprint].every(hex) || record.readerVersion !== 2) fail("F2 fields");
   if (request && (request.readerMode !== "bound-reader" || record.txId !== request.txId || record.rootGenesisTxId !== request.rootGenesisTxId || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.anchorFingerprint !== request.anchorFingerprint || record.readerInstanceId !== request.readerInstanceId || record.readerStartNonce !== request.readerStartNonce || record.previousFenceBindingFingerprint !== request.previousReceiptFingerprint)) fail("F2 request relation");
@@ -78,7 +87,8 @@ export function validateAuthoritySuccessorFence(record, request = null, commit =
 }
 
 const SB = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "anchorFingerprint", "operation", "targetState", "revision", "authorityEpoch", "tokenConfigGeneration", "tokenConfigHostSetFingerprint", "mappingGeneration", "candidateSnapshotFingerprint", "candidateTargetFingerprint", "attestationFingerprint", "authorityReservationFingerprint", "authorityCommitSnapshotFingerprint", "closeFingerprint", "fenceBindingFingerprint", "leaseBindingFingerprint", "readerProjectionFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "baselineFingerprint"];
-export function validateAuthoritySuccessorBaseline(record, request = null, close = null, fence = null, reservation = null, commit = null) {
+export function validateAuthoritySuccessorBaseline(record, request = null, close = null, fence = null, reservation = null, commit = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertFence(record);
   assertKeys(record, SB); if (record.kind !== "authority-successor-baseline" || ![record.txId, record.rootGenesisTxId].every(opaque) || ![record.requestFingerprint, record.anchorFingerprint, record.tokenConfigHostSetFingerprint, record.candidateSnapshotFingerprint, record.candidateTargetFingerprint, record.attestationFingerprint, record.authorityReservationFingerprint, record.authorityCommitSnapshotFingerprint, record.closeFingerprint].every(hex) || !operations.has(record.operation) || !validTargetState(record.operation, record.targetState) || ![record.revision, record.authorityEpoch, record.tokenConfigGeneration].every(positive) || !nonNegative(record.mappingGeneration) || ![record.fenceBindingFingerprint, record.leaseBindingFingerprint, record.readerProjectionFingerprint].every(nullableHex) || ![record.readerInstanceId, record.readerStartNonce].every(nullableOpaque) || !(record.readerVersion === null || record.readerVersion === 2)) fail("SB fields");
   if (request && record.fenceGeneration !== request.candidateFenceGeneration) fail("SB fence relation");
@@ -102,7 +112,8 @@ export function validateAuthoritySuccessorBaseline(record, request = null, close
 }
 
 const SF = ["version", "kind", "sequence", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "operation", "baselineFingerprint", "closeFingerprint", "anchorFingerprint", "authorityReservationFingerprint", "authorityCommitSnapshotFingerprint", "authorityEpochFingerprint", "tokenFloorFingerprint", "attestationFingerprint", "publicationKFingerprint", "publicationYFingerprint", "operationEvidenceFingerprint", "auditEntryFingerprint", "targetFingerprint", "targetIdentityFingerprint", "targetAclFingerprint", "wrapperFingerprint", "controlRootFingerprint", "revision", "authorityEpoch", "tokenConfigGeneration", "mappingGeneration", "snapshotFingerprint", "routeDisposition", "finalityFingerprint"];
-export function validateAuthoritySuccessorFinality(record, request = null, baseline = null, reservation = null, commit = null, authorityEpoch = null) {
+export function validateAuthoritySuccessorFinality(record, request = null, baseline = null, reservation = null, commit = null, authorityEpoch = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, SF); assertFence(record);
   if (record.kind !== "authority-successor-finality" || !positive(record.sequence) || ![record.txId, record.rootGenesisTxId].every(opaque) || !operations.has(record.operation) || ![record.requestFingerprint, record.baselineFingerprint, record.closeFingerprint, record.anchorFingerprint, record.authorityReservationFingerprint, record.authorityCommitSnapshotFingerprint, record.authorityEpochFingerprint, record.tokenFloorFingerprint, record.attestationFingerprint, record.publicationKFingerprint, record.publicationYFingerprint, record.operationEvidenceFingerprint, record.auditEntryFingerprint, record.targetFingerprint, record.targetIdentityFingerprint, record.targetAclFingerprint, record.wrapperFingerprint, record.controlRootFingerprint, record.snapshotFingerprint].every(hex) || ![record.revision, record.authorityEpoch, record.tokenConfigGeneration].every(positive) || !nonNegative(record.mappingGeneration) || record.routeDisposition !== "no-route") fail("SF fields");
   if (request && (record.txId !== request.txId || record.sequence !== request.sequence || record.rootGenesisTxId !== request.rootGenesisTxId || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.operation !== request.operation || record.anchorFingerprint !== request.anchorFingerprint || record.revision !== request.candidateRevision || record.authorityEpoch !== request.candidateAuthorityEpoch || record.tokenConfigGeneration !== request.candidateTokenConfigGeneration || record.mappingGeneration !== request.candidateMappingGeneration || record.attestationFingerprint !== request.candidateAttestationFingerprint)) fail("SF request relation");
@@ -129,7 +140,8 @@ export function authoritySuccessorPreviousLeaseBindingFingerprint(request) {
   return request.previousReceiptFingerprint;
 }
 const L2 = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "readerInstanceId", "readerStartNonce", "readerVersion", "fenceBindingFingerprint", "previousLeaseBindingFingerprint", "leaseBindingFingerprint"];
-export function validateAuthoritySuccessorLease(record, request = null, fence = null) {
+export function validateAuthoritySuccessorLease(record, request = null, fence = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, L2); assertFence(record);
   if (record.kind !== "authority-successor-lease" || ![record.txId, record.rootGenesisTxId, record.readerInstanceId, record.readerStartNonce].every(opaque) || ![record.requestFingerprint, record.fenceBindingFingerprint, record.previousLeaseBindingFingerprint].every(hex) || record.readerVersion !== 2) fail("L2 fields");
   if (!request || record.previousLeaseBindingFingerprint !== authoritySuccessorPreviousLeaseBindingFingerprint(request)) fail("L2 predecessor relation");
@@ -138,7 +150,8 @@ export function validateAuthoritySuccessorLease(record, request = null, fence = 
   assertHash(record, "leaseBindingFingerprint"); return record;
 }
 const RP2 = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "finalityFingerprint", "anchorFingerprint", "authorityCommitSnapshotFingerprint", "targetFingerprint", "wrapperFingerprint", "revision", "authorityEpoch", "tokenConfigGeneration", "mappingGeneration", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce", "fenceBindingFingerprint", "leaseBindingFingerprint", "readerProjectionFingerprint"];
-export function validateAuthoritySuccessorReaderProjection(record, request = null, finality = null, lease = null) {
+export function validateAuthoritySuccessorReaderProjection(record, request = null, finality = null, lease = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, RP2); assertFence(record);
   if (record.kind !== "authority-successor-reader-projection" || ![record.txId, record.rootGenesisTxId, record.readerInstanceId, record.readerStartNonce, record.readerNonce].every(opaque) || ![record.requestFingerprint, record.finalityFingerprint, record.anchorFingerprint, record.authorityCommitSnapshotFingerprint, record.targetFingerprint, record.wrapperFingerprint, record.fenceBindingFingerprint, record.leaseBindingFingerprint].every(hex) || ![record.revision, record.authorityEpoch, record.tokenConfigGeneration].every(positive) || !nonNegative(record.mappingGeneration) || record.readerVersion !== 2) fail("RP2 fields");
   if (request && (request.readerMode !== "bound-reader" || record.txId !== request.txId || record.rootGenesisTxId !== request.rootGenesisTxId || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.anchorFingerprint !== request.anchorFingerprint || record.readerInstanceId !== request.readerInstanceId || record.readerStartNonce !== request.readerStartNonce || record.readerNonce !== request.readerNonce)) fail("RP2 request relation");
@@ -147,7 +160,8 @@ export function validateAuthoritySuccessorReaderProjection(record, request = nul
   assertHash(record, "readerProjectionFingerprint"); return record;
 }
 const AK2 = ["version", "kind", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "finalityFingerprint", "readerProjectionFingerprint", "leaseBindingFingerprint", "readerInstanceId", "readerStartNonce", "readerVersion", "readerNonce", "ackDisposition", "ackFingerprint"];
-export function validateAuthoritySuccessorAck(record, request = null, finality = null, projection = null) {
+export function validateAuthoritySuccessorAck(record, request = null, finality = null, projection = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, AK2); assertFence(record);
   if (record.kind !== "authority-successor-ack" || ![record.txId, record.rootGenesisTxId, record.readerInstanceId, record.readerStartNonce, record.readerNonce].every(opaque) || ![record.requestFingerprint, record.finalityFingerprint, record.readerProjectionFingerprint, record.leaseBindingFingerprint].every(hex) || record.readerVersion !== 2 || record.ackDisposition !== "verified-no-route") fail("AK2 fields");
   if (request && (request.readerMode !== "bound-reader" || record.txId !== request.txId || record.rootGenesisTxId !== request.rootGenesisTxId || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.readerInstanceId !== request.readerInstanceId || record.readerStartNonce !== request.readerStartNonce || record.readerNonce !== request.readerNonce)) fail("AK2 request relation");
@@ -157,7 +171,8 @@ export function validateAuthoritySuccessorAck(record, request = null, finality =
 }
 
 const SRC = ["version", "kind", "sequence", "txId", "rootGenesisTxId", "requestFingerprint", "fenceGeneration", "operation", "previousReceiptFingerprint", "finalityFingerprint", "readerMode", "leaseBindingFingerprint", "readerProjectionFingerprint", "ackFingerprint", "snapshotFingerprint", "revision", "authorityEpoch", "tokenConfigGeneration", "mappingGeneration", "phase", "routeDisposition", "receiptFingerprint"];
-export function validateAuthoritySuccessorReceipt(record, request = null, finality = null, lease = null, projection = null, ack = null) {
+export function validateAuthoritySuccessorReceipt(record, request = null, finality = null, lease = null, projection = null, ack = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, SRC); assertFence(record);
   if (record.kind !== "authority-successor-receipt" || !positive(record.sequence) || ![record.txId, record.rootGenesisTxId].every(opaque) || !operations.has(record.operation) || ![record.requestFingerprint, record.previousReceiptFingerprint, record.finalityFingerprint, record.snapshotFingerprint].every(hex) || !readerModes.has(record.readerMode) || ![record.leaseBindingFingerprint, record.readerProjectionFingerprint, record.ackFingerprint].every(nullableHex) || ![record.revision, record.authorityEpoch, record.tokenConfigGeneration].every(positive) || !nonNegative(record.mappingGeneration) || record.phase !== "terminal" || record.routeDisposition !== "no-route") fail("SRC fields");
   if (request && (record.txId !== request.txId || record.rootGenesisTxId !== request.rootGenesisTxId || record.sequence !== request.sequence || record.fenceGeneration !== request.candidateFenceGeneration || record.operation !== request.operation || record.requestFingerprint !== request.requestFingerprint || record.previousReceiptFingerprint !== request.previousReceiptFingerprint || record.readerMode !== request.readerMode || record.revision !== request.candidateRevision || record.authorityEpoch !== request.candidateAuthorityEpoch || record.tokenConfigGeneration !== request.candidateTokenConfigGeneration || record.mappingGeneration !== request.candidateMappingGeneration)) fail("SRC request relation");
@@ -167,7 +182,8 @@ export function validateAuthoritySuccessorReceipt(record, request = null, finali
 }
 
 const AH = ["version", "kind", "anchorFingerprint", "sequence", "txId", "rootGenesisTxId", "fenceGeneration", "operation", "phase", "requestFingerprint", "closeFingerprint", "authorityCommitSnapshotFingerprint", "baselineFingerprint", "publicationKFingerprint", "publicationYFingerprint", "finalityFingerprint", "receiptFingerprint", "historyMarkerFingerprint", "previousHeadFingerprint", "previousReceiptFingerprint", "routeDisposition", "headFingerprint"];
-export function validateAuthoritySuccessorHead(record, request = null) {
+export function validateAuthoritySuccessorHead(record, request = null, genesisAuthorityRequest = null) {
+  assertGenesisRoot(record, genesisAuthorityRequest);
   assertKeys(record, AH); assertFence(record);
   if (record.kind !== "authority-successor-head" || !hex(record.anchorFingerprint) || !positive(record.sequence) || ![record.txId, record.rootGenesisTxId].every(opaque) || !operations.has(record.operation) || !phases.has(record.phase) || !hex(record.requestFingerprint) || ![record.closeFingerprint, record.authorityCommitSnapshotFingerprint, record.baselineFingerprint, record.publicationKFingerprint, record.publicationYFingerprint, record.finalityFingerprint, record.receiptFingerprint, record.historyMarkerFingerprint, record.previousHeadFingerprint].every(nullableHex) || !hex(record.previousReceiptFingerprint) || record.routeDisposition !== "no-route") fail("AH fields");
   const level = ["reserved", "closed", "replaced", "reader-pending", "terminal"].indexOf(record.phase);
@@ -177,15 +193,16 @@ export function validateAuthoritySuccessorHead(record, request = null) {
   if (request && (record.txId !== request.txId || record.rootGenesisTxId !== request.rootGenesisTxId || record.anchorFingerprint !== request.anchorFingerprint || record.sequence !== request.sequence || record.requestFingerprint !== request.requestFingerprint || record.fenceGeneration !== request.candidateFenceGeneration || record.operation !== request.operation)) fail("AH request relation");
   assertHash(record, "headFingerprint"); return record;
 }
-export function validateAuthoritySuccessorHeadTransition(previous, next, request = null) {
-  validateAuthoritySuccessorHead(next, request);
+export function validateAuthoritySuccessorHeadTransition(previous, next, request = null, genesisAuthorityRequest = null) {
+  validateAuthoritySuccessorHead(next, request, genesisAuthorityRequest);
+  if (previous !== null) assertGenesisRoot(previous, genesisAuthorityRequest);
   const order = ["reserved", "closed", "replaced", "reader-pending", "terminal"];
   if (previous === null) {
     if (next.phase !== "reserved" || next.previousHeadFingerprint !== null) fail("AH genesis transition");
     if (request && (request.previousFenceGeneration !== 1 || next.fenceGeneration !== request.candidateFenceGeneration)) fail("AH genesis fence relation");
     return next;
   }
-  validateAuthoritySuccessorHead(previous);
+  validateAuthoritySuccessorHead(previous, null, genesisAuthorityRequest);
   const previousLevel = order.indexOf(previous.phase);
   const nextLevel = order.indexOf(next.phase);
   if (previous.txId === next.txId && previous.sequence === next.sequence) {
@@ -210,17 +227,23 @@ export function validateAuthoritySuccessorHeadTransition(previous, next, request
 
 export const buildAuthoritySuccessorRecord = (record, fingerprintField) => { const value = { ...record, [fingerprintField]: null }; value[fingerprintField] = fingerprint(value, fingerprintField); return value; };
 export const authoritySuccessorFingerprint = fingerprint;
-export function validateAuthoritySuccessorBundle(bundle) {
+export function validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest = null) {
   const { request, close = null, fence = null, baseline = null, commit = null, reservation = null, authorityEpoch = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, head } = bundle ?? {};
-  validateAuthoritySuccessorRequest(request); validateAuthoritySuccessorHead(head, request);
-  if (close !== null) validateAuthorityCloseProof(close, request);
-  if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit);
-  if (baseline !== null) validateAuthoritySuccessorBaseline(baseline, request, close, fence, reservation, commit);
-  if (finality !== null) validateAuthoritySuccessorFinality(finality, request, baseline, reservation, commit, authorityEpoch);
-  if (lease !== null) validateAuthoritySuccessorLease(lease, request, fence);
-  if (projection !== null) validateAuthoritySuccessorReaderProjection(projection, request, finality, lease);
-  if (ack !== null) validateAuthoritySuccessorAck(ack, request, finality, projection);
-  if (receipt !== null) validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack);
+  validateAuthoritySuccessorRequest(request, genesisAuthorityRequest); validateAuthoritySuccessorHead(head, request, genesisAuthorityRequest);
+  if (close !== null) validateAuthorityCloseProof(close, request, genesisAuthorityRequest);
+  if (fence !== null) validateAuthoritySuccessorFence(fence, request, commit, genesisAuthorityRequest);
+  if (baseline !== null) validateAuthoritySuccessorBaseline(baseline, request, close, fence, reservation, commit, genesisAuthorityRequest);
+  if (finality !== null) validateAuthoritySuccessorFinality(finality, request, baseline, reservation, commit, authorityEpoch, genesisAuthorityRequest);
+  if (lease !== null) validateAuthoritySuccessorLease(lease, request, fence, genesisAuthorityRequest);
+  if (projection !== null) validateAuthoritySuccessorReaderProjection(projection, request, finality, lease, genesisAuthorityRequest);
+  if (ack !== null) validateAuthoritySuccessorAck(ack, request, finality, projection, genesisAuthorityRequest);
+  if (genesisAuthorityRequest !== null) {
+    const root = rootGenesisTxId(genesisAuthorityRequest);
+    for (const publication of [publicationK, publicationY]) {
+      if (publication !== null && publication?.genesisTxId !== root) fail("publication Genesis authority root");
+    }
+  }
+  if (receipt !== null) validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack, genesisAuthorityRequest);
   const candidateRecords = [close, fence, baseline, reservation, commit, publicationK, publicationY, finality, lease, projection, ack, receipt].filter((value) => value !== null);
   for (const record of candidateRecords) assertFence(record, request.candidateFenceGeneration);
   if (["replaced", "reader-pending", "terminal"].includes(head.phase)) {
