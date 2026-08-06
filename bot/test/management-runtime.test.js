@@ -21,6 +21,7 @@ const provisioning = {
 };
 const secret = 'owner-secret-is-long-enough';
 const fileEnding = (files, ending) => [...files.entries()].find(([path]) => path.replaceAll("\\", "/").endsWith(ending))?.[1];
+const filePathEnding = (files, ending) => [...files.keys()].find((path) => path.replaceAll("\\", "/").endsWith(ending));
 const genesisInput = (hostTokens) => ({
   actorPrincipal: owner, targetPrincipal: target, botPrincipal, recoveryPrincipal,
   managementProvisioningFingerprint: provisioning.management,
@@ -249,6 +250,112 @@ test('admission writers reject no-reader and post-terminal lifecycle records bef
   await assert.rejects(terminalHarness.native.writeAdmissionRequest(terminalRequest), /post-terminal admission/);
   await assert.rejects(terminalHarness.native.writeAdmissionGrant(terminalGrant), /post-terminal admission/);
   assert.equal(terminalHarness.writes.length, terminalWrites);
+});
+test('admission archive-only seams repair their missing current records and reject foreign pairs without writes', async () => {
+  const harness = await boundReaderRuntime({ complete: false });
+  const request = JSON.parse(fileEnding(harness.files, '/admission-request.json'));
+  const grant = JSON.parse(fileEnding(harness.files, '/admission-grant.json'));
+  harness.setPrincipal(owner);
+
+  const requestPath = filePathEnding(harness.files, '/admission-request.json');
+  const requestArchivePath = filePathEnding(harness.files, `/admission-request-${request.requestId}.json`);
+  const requestArchive = Buffer.from(harness.files.get(requestArchivePath));
+  harness.files.delete(requestPath);
+  const requestWrites = harness.writes.length;
+  await harness.native.writeAdmissionRequest(request);
+  assert.equal(harness.writes.length, requestWrites + 1);
+  assert.deepEqual(harness.files.get(requestPath), requestArchive);
+  assert.deepEqual(harness.files.get(requestArchivePath), requestArchive);
+
+  const grantPath = filePathEnding(harness.files, '/admission-grant.json');
+  const grantArchivePath = filePathEnding(harness.files, `/admission-grant-${grant.grantId}.json`);
+  const grantArchive = Buffer.from(harness.files.get(grantArchivePath));
+  harness.files.delete(grantPath);
+  const grantWrites = harness.writes.length;
+  await harness.native.writeAdmissionGrant(grant);
+  assert.equal(harness.writes.length, grantWrites + 1);
+  assert.deepEqual(harness.files.get(grantPath), grantArchive);
+  assert.deepEqual(harness.files.get(grantArchivePath), grantArchive);
+
+  const foreign = { ...grant, nonce: 'foreign-grant-nonce' };
+  foreign.grantFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(foreign).filter(([key]) => key !== 'grantFingerprint')),
+  );
+  harness.files.set(grantPath, Buffer.from(canonicalJson(foreign)));
+  const foreignWrites = harness.writes.length;
+  await assert.rejects(harness.native.writeAdmissionGrant(grant), /substitution/);
+  assert.equal(harness.writes.length, foreignWrites);
+  assert.deepEqual(harness.files.get(grantPath), Buffer.from(canonicalJson(foreign)));
+});
+
+test('acknowledgement archive-only seam repairs the current B record exactly', async () => {
+  const harness = await boundReaderRuntime({ complete: false });
+  const request = JSON.parse(fileEnding(harness.files, '/genesis-request.json'));
+  const floor = JSON.parse(fileEnding(harness.files, '/reader-version-floor.json'));
+  const zFinality = JSON.parse(fileEnding(harness.files, '/z-finality.json'));
+  const grant = JSON.parse(fileEnding(harness.files, '/admission-grant.json'));
+  const fence = JSON.parse(fileEnding(harness.files, '/reader-fence-binding.json'));
+  const lease = {
+    version: 1,
+    kind: 'reader-lease-binding',
+    anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.fenceGeneration,
+    genesisTxId: request.genesisTxId,
+    readerInstanceId: floor.firstReaderInstanceId,
+    readerStartNonce: floor.firstReaderStartNonce,
+    readerVersion: 2,
+    fenceBindingFingerprint: fence.fenceBindingFingerprint,
+    leaseBindingFingerprint: null,
+  };
+  lease.leaseBindingFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(lease).filter(([key]) => key !== 'leaseBindingFingerprint')),
+  );
+  const projection = {
+    version: 1,
+    kind: 'reader-projection',
+    anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.fenceGeneration,
+    genesisTxId: request.genesisTxId,
+    generation: request.generation,
+    readerInstanceId: floor.firstReaderInstanceId,
+    readerStartNonce: floor.firstReaderStartNonce,
+    readerVersion: 2,
+    fenceBindingFingerprint: fence.fenceBindingFingerprint,
+    leaseBindingFingerprint: lease.leaseBindingFingerprint,
+    zFinalityFingerprint: zFinality.zFinalityFingerprint,
+    readerProjectionFingerprint: null,
+  };
+  projection.readerProjectionFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(projection).filter(([key]) => key !== 'readerProjectionFingerprint')),
+  );
+  harness.setPrincipal(botPrincipal);
+  await harness.native.writeBotReaderProjection(projection);
+  const ack = buildAdmissionAck(grant, projection.readerProjectionFingerprint);
+  await harness.native.writeBotAcknowledgement(ack);
+
+  const currentPath = filePathEnding(harness.files, '/bot-state/acknowledgement.json');
+  const archivePath = filePathEnding(harness.files, `/bot-state/admission-ack-${grant.grantId}.json`);
+  const archive = Buffer.from(harness.files.get(archivePath));
+  harness.files.delete(currentPath);
+  const writes = harness.writes.length;
+  await harness.native.writeBotAcknowledgement(ack);
+  assert.equal(harness.writes.length, writes + 1);
+  assert.deepEqual(harness.files.get(currentPath), archive);
+  assert.deepEqual(harness.files.get(archivePath), archive);
+});
+test('pending bootstrap rejects mutable/archive drift before any bot writes', async () => {
+  const harness = await boundReaderRuntime({ complete: false });
+  const grantArchivePath = filePathEnding(harness.files, `/admission-grant-${JSON.parse(fileEnding(harness.files, '/admission-grant.json')).grantId}.json`);
+  const grantArchive = JSON.parse(harness.files.get(grantArchivePath));
+  grantArchive.nonce = 'foreign-bootstrap-nonce';
+  grantArchive.grantFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(grantArchive).filter(([key]) => key !== 'grantFingerprint')),
+  );
+  harness.files.set(grantArchivePath, Buffer.from(canonicalJson(grantArchive)));
+  harness.setPrincipal(botPrincipal);
+  const writes = harness.writes.length;
+  await assert.rejects(harness.native.readPendingReaderBootstrap(), /pending reader authority/);
+  assert.equal(harness.writes.length, writes);
 });
 
 function mappingInput(mappingId, generation = 1) {

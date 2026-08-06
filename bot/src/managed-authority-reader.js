@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createManagementNative } from "@gjc-remote/native-control";
-import { buildAdmissionAck, validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGrant, validateAdmissionRequest, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
+import { buildAdmissionAck, validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGenesisBinding, validateAdmissionGrant, validateAdmissionRequest, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
 import { authorityRecordFingerprint, validateAttestedTokenFloorProof, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisPrecommit, validateGenesisReceipt, validateGenesisRequest, validateLeaseBinding, validateReaderProjection, validateReaderRelations, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
 import { isOpaqueIdentity } from "@gjc-remote/shared/identity";
 import { validateManagedChannelsV2, validateManagementEnvelope } from "@gjc-remote/shared/mapping-envelope";
@@ -785,6 +785,7 @@ export function validateManagedProof(snapshot, expectedHostSetFingerprint = null
     admissionGrant = parseAuthorityBytes(snapshot.admissionGrantBytes);
     validateAdmissionRequest(admissionRequest);
     validateAdmissionGrant(admissionGrant, admissionRequest);
+    validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant);
     fenceBinding = parseAuthorityBytes(snapshot.fenceBindingBytes);
     readerLease = parseAuthorityBytes(snapshot.readerLeaseBytes);
     projection = parseAuthorityBytes(snapshot.readerProjectionBytes);
@@ -916,7 +917,7 @@ export async function createManagedAuthorityReader({
       request,
     });
     validateFenceBinding(fence, commit, floor);
-    validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
+    validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, null, null, Date.now());
 
     const lease = {
       version: 1,

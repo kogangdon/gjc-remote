@@ -1,4 +1,4 @@
-import { canonicalJsonHash, isHex64 } from "./strict-json.js";
+import { canonicalJson, canonicalJsonHash, isHex64 } from "./strict-json.js";
 import { isOpaqueIdentity } from "./identity.js";
 import { validateGenesisReceipt, validateGenesisRequest, validateTokenFloor, validateZFinality } from "./genesis-envelope.js";
 
@@ -77,6 +77,17 @@ export function validateAdmissionGenesisBinding(genesisRequest, admissionRequest
     }
   }
   return { request: admissionRequest, grant: admissionGrant, ack: admissionAck };
+}
+export function validateAdmissionRecordPair(current, immutable, { allowMissingCurrent = false, label = "admission record" } = {}) {
+  if (current === undefined || immutable === undefined) fail(`${label} presence is ambiguous`);
+  if (current === null && immutable === null) return null;
+  if (current !== null && immutable === null) fail(`${label} archive is absent`);
+  if (immutable !== null && current === null) {
+    if (!allowMissingCurrent) fail(`${label} current record is absent`);
+    return immutable;
+  }
+  if (canonicalJson(current) !== canonicalJson(immutable)) fail(`${label} current/archive mismatch`);
+  return current;
 }
 
 const proofKeys = ["version", "kind", "genesisTxId", "generation", "fenceGeneration", "zFinalityFingerprint", "readerProjectionFingerprint", "ackFingerprint", "routeFingerprint", "finalityProofFingerprint"];

@@ -4,7 +4,7 @@ import { isPrincipal } from "@gjc-remote/shared/identity";
 import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord } from "@gjc-remote/shared/mapping-envelope";
 import { attestTokenFloor, authorityRecordFingerprint, advanceReaderVersionFloor, buildAttestedTokenFloorProof, buildGenesisPrecommit, commitTokenFloor, reserveTokenGeneration, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisRequest, validateGenesisReceipt, validateReaderProjection, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
 import { addCredential, authenticate, bootstrapOwner, revokeCredential, rotateCredential, requireOwner } from "./management-auth.js";
-import { buildAdmissionGrant, buildAdmissionRequest, validateAdmissionAck, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
+import { buildAdmissionGrant, buildAdmissionRequest, validateAdmissionAck, validateAdmissionGenesisBinding, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
 import { validateGenesisSuffixRecovery } from "@gjc-remote/shared/recovery-envelope";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationState, buildPublicationTransaction, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationY, validatePublicationZp } from "@gjc-remote/shared/publication-envelope";
 import { buildAuthoritySuccessorRecord, validateAuthorityCloseProof, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest } from "@gjc-remote/shared/successor-envelope";
@@ -1266,6 +1266,7 @@ export class ManagementRuntime {
             expiresAt: Date.now() + 30_000,
           });
           admissionGrant = buildAdmissionGrant(admissionRequest, { grantId: randomUUID(), expiresAt: admissionRequest.expiresAt });
+          validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, null, null, Date.now());
           await this.#persistGenesisHandshakePending(state, {
             replayFingerprint,
             generation,
