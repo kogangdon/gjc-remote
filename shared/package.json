@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "main": "protocol.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "exports": {
     ".": "./protocol.js",
     "./admission-envelope": "./admission-envelope.js",
