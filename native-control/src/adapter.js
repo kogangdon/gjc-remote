@@ -628,14 +628,23 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     allowEmpty = false,
   }) => {
     const readerHandshake = managementState?.recovery?.readerHandshake ?? null;
+    const precommit = await read(path('genesis-precommit-proof'));
+    const archivedPrecommit = await read(path(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`));
+    try {
+      validateGenesisPrecommit(precommit);
+      validateGenesisPrecommit(archivedPrecommit);
+      if (canonical(precommit) !== canonical(archivedPrecommit)) {
+        throw new TypeError('mutable and immutable Genesis precommit proofs differ');
+      }
+    } catch {
+      throw new TypeError('Genesis precommit mutable/archive pair is invalid');
+    }
     if (request.requestedReaderMode === 'no-reader') {
-      const precommit = await read(path(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`));
       try {
-        validateGenesisPrecommit(precommit);
-        if (precommit.genesisTxId !== request.genesisTxId ||
-            precommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
+        if (archivedPrecommit.genesisTxId !== request.genesisTxId ||
+            archivedPrecommit.zeroGrantProofFingerprint !== buildGenesisZeroGrantProofFingerprint({
               genesisTxId: request.genesisTxId,
-              admissionArchiveIds: precommit.admissionArchiveIds,
+              admissionArchiveIds: archivedPrecommit.admissionArchiveIds,
             })) {
           throw new TypeError('no-reader admission absence proof mismatch');
         }
@@ -645,14 +654,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       if (managementState?.admissionArchiveIds !== undefined &&
           (!Array.isArray(managementState.admissionArchiveIds) ||
            !managementState.admissionArchiveIds.every(isOpaque) ||
-           canonical(managementState.admissionArchiveIds) !== canonical(precommit.admissionArchiveIds))) {
+           canonical(managementState.admissionArchiveIds) !== canonical(archivedPrecommit.admissionArchiveIds))) {
         throw new TypeError('no-reader admission archive index is not bound to Genesis proof');
       }
       // The native primitive set has no directory enumeration. The immutable
       // Genesis zero-grant proof is the durable absence/index boundary; only
       // archive names reachable from its cryptographically bound inventory can
       // be checked here.
-      const reachableArchiveIds = new Set([request.genesisTxId, ...precommit.admissionArchiveIds]);
+      const reachableArchiveIds = new Set([request.genesisTxId, ...archivedPrecommit.admissionArchiveIds]);
       for (const id of reachableArchiveIds) {
         const names = [
           path(`admission-request-${encodeURIComponent(id)}`),
@@ -669,26 +678,37 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       return { request: null, grant: null, acknowledgement: null };
     }
+    const pending = readerHandshake !== null && managementState?.recovery?.phase === 'handshake-pending';
     const empty = admissionRequest === null && admissionGrant === null && acknowledgement === null;
-    if (empty && allowEmpty && readerHandshake === null) {
+    if (empty && allowEmpty && !pending) {
       return { request: null, grant: null, acknowledgement: null };
     }
-    if (admissionRequest === null || admissionGrant === null || acknowledgement === null) {
+    if (admissionRequest === null || admissionGrant === null || (!pending && acknowledgement === null)) {
       throw new TypeError('bound-reader admission record pair is incomplete');
     }
     validateAdmissionRequest(admissionRequest);
     validateAdmissionGrant(admissionGrant, admissionRequest);
-    validateAdmissionAckRecord(acknowledgement);
-    validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, acknowledgement);
+    if (acknowledgement !== null) {
+      validateAdmissionAckRecord(acknowledgement);
+      validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant, acknowledgement);
+    } else {
+      validateAdmissionGenesisBinding(request, admissionRequest, admissionGrant);
+    }
     const requestArchive = await read(path(`admission-request-${encodeURIComponent(admissionRequest.requestId)}`));
     const grantArchive = await read(path(`admission-grant-${encodeURIComponent(admissionGrant.grantId)}`));
     const acknowledgementArchive = await read(botPath(`admission-ack-${encodeURIComponent(admissionGrant.grantId)}`));
     validateAdmissionRequest(requestArchive);
     validateAdmissionGrant(grantArchive, requestArchive);
-    validateAdmissionAckRecord(acknowledgementArchive);
     validateAdmissionRecordPair(admissionRequest, requestArchive, { label: 'admission request' });
     validateAdmissionRecordPair(admissionGrant, grantArchive, { label: 'admission grant' });
-    validateAdmissionRecordPair(acknowledgement, acknowledgementArchive, { label: 'admission acknowledgement' });
+    if (acknowledgement === null) {
+      if (acknowledgementArchive !== null) {
+        throw new TypeError('pending admission acknowledgement current record is absent');
+      }
+    } else {
+      validateAdmissionAckRecord(acknowledgementArchive);
+      validateAdmissionRecordPair(acknowledgement, acknowledgementArchive, { label: 'admission acknowledgement' });
+    }
     if (readerHandshake !== null) {
       validateAdmissionRequest(readerHandshake.request);
       validateAdmissionGrant(readerHandshake.grant, readerHandshake.request);
@@ -1767,7 +1787,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const request = await read(path('genesis-request'));
     const zFinality = await read(path('z-finality'));
     const tokenFloor = request && await read(path(`token-floor-commit-${encodeURIComponent(request.genesisTxId)}`));
-    const precommit = await read(path(`genesis-precommit-proof-${encodeURIComponent(request?.genesisTxId ?? '')}`));
+    const precommit = await read(path('genesis-precommit-proof'));
     const floor = await read(path('reader-version-floor'));
     const commit = await read(path(`authority-commit-${encodeURIComponent(request?.genesisTxId ?? '')}`));
     const authorityReservation = await read(path(`authority-reservation-${encodeURIComponent(request?.genesisTxId ?? '')}`));
@@ -1892,13 +1912,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     try {
       validateGenesisRequest(request); validateGenesisPrecommit(precommit);
       const publication = await readPublicationGraph(request.genesisTxId);
-      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, archivedPrecommit, control, persistedAuthorityEpochFloor] = await Promise.all([
+      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, currentPrecommit, archivedPrecommit, control, persistedAuthorityEpochFloor] = await Promise.all([
         read(path(`token-floor-reservation-${encodeURIComponent(request.genesisTxId)}`)),
         read(path(`token-floor-attested-${encodeURIComponent(request.genesisTxId)}`)),
         read(path('attestation')), read(path('reader-version-floor')),
         read(path(`authority-reservation-${encodeURIComponent(request.genesisTxId)}`)),
         read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`)),
         read(path('authority-epoch')),
+        read(path('genesis-precommit-proof')),
         read(path(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`)),
         read(path('control-root')), read(path('authority-epoch-floor')),
       ]);
@@ -1911,7 +1932,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const controlProof = control && await authorityObjectProof(path('control-root'));
       const wrapperProof = wrapper && await authorityObjectProof(join(root, control.wrapperRelativeName));
       validateTokenFloorReservation(reservation); validateAttestedTokenFloorProof(attestedProof, reservation, attestation);
-      validateGenesisPrecommit(archivedPrecommit);
+      validateGenesisPrecommit(currentPrecommit); validateGenesisPrecommit(archivedPrecommit);
       validateReaderVersionFloor(readerVersionFloor); validateAuthorityReservation(authorityReservation);
       validateAuthorityCommitSnapshot(authorityCommit, authorityReservation); validateAuthorityEpoch(authorityEpoch); validateAuthorityEpoch(committedEpoch); validateAuthorityEpochFloor(authorityEpochFloor);
       const expectedAuthorityEpochFloor = buildAuthorityEpochFloor(authorityEpoch.anchorFingerprint, {
@@ -1933,6 +1954,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
             genesisTxId: request.genesisTxId,
             admissionArchiveIds: precommit.admissionArchiveIds,
           }) ||
+          canonical(precommit) !== canonical(currentPrecommit) ||
           canonical(precommit) !== canonical(archivedPrecommit) ||
           reservation.floorFingerprint !== precommit.reservationFingerprint ||
           attestedProof.attestedProofFingerprint !== precommit.attestedProofFingerprint ||
@@ -5359,7 +5381,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       }
       const reservation = await verifiedBytes(path(`token-floor-reservation-${encodeURIComponent(requestValue.genesisTxId)}`));
       const attestedProof = await verifiedBytes(path(`token-floor-attested-${encodeURIComponent(requestValue.genesisTxId)}`));
-      const precommit = await verifiedBytes(path(`genesis-precommit-proof-${encodeURIComponent(requestValue.genesisTxId)}`));
+      const precommit = await verifiedBytes(path('genesis-precommit-proof'));
+      const precommitArchive = await verifiedBytes(path(`genesis-precommit-proof-${encodeURIComponent(requestValue.genesisTxId)}`));
       const authorityRequest = await verifiedBytes(path('genesis-authority-request'));
       const authorityReceipt = await verifiedBytes(path('genesis-authority-receipt'));
       const authorityReservation = await verifiedBytes(path(`authority-reservation-${encodeURIComponent(requestValue.genesisTxId)}`));
@@ -5381,6 +5404,17 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         refused('read_managed_mapping_snapshot', 'durable authority epoch or fence generation floor is absent or drifted');
       }
       const publication = await readPublicationGraph(requestValue.genesisTxId);
+      let mutablePrecommit;
+      let immutablePrecommit;
+      try {
+        mutablePrecommit = parseCanonicalJsonBytes(precommit.bytes);
+        immutablePrecommit = parseCanonicalJsonBytes(precommitArchive.bytes);
+      } catch {
+        refused('read_managed_mapping_snapshot', 'mutable or immutable Genesis precommit proof is invalid');
+      }
+      if (canonical(mutablePrecommit) !== canonical(immutablePrecommit)) {
+        refused('read_managed_mapping_snapshot', 'mutable and immutable Genesis precommit proofs differ');
+      }
       const admissionRequestBytes = await lowLevel.read_verified_bytes(path('admission-request'));
       const admissionGrantBytes = await lowLevel.read_verified_bytes(path('admission-grant'));
       if (admissionRequestBytes !== null) await assertObject(path('admission-request'), Buffer.from(admissionRequestBytes));
@@ -5388,6 +5422,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const admissionRequest = admissionRequestBytes === null ? null : parseCanonicalJsonBytes(Buffer.from(admissionRequestBytes));
       const admissionGrant = admissionGrantBytes === null ? null : parseCanonicalJsonBytes(Buffer.from(admissionGrantBytes));
       const managementState = await read(path('management-state'));
+      const pendingLifecycle = requestValue.requestedReaderMode === 'handshake' &&
+        managementState?.recovery?.phase === 'handshake-pending' &&
+        managementState.recovery.txId === requestValue.genesisTxId &&
+        managementState.recovery.requestFingerprint === requestValue.requestFingerprint &&
+        managementState.recovery.readerHandshake !== null;
       let admissionRequestArchive = null;
       let admissionGrantArchive = null;
       let acknowledgementArchive = null;
@@ -5405,12 +5444,6 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       if (admissionAck !== null) await assertObject(botPath('acknowledgement'), Buffer.from(admissionAck));
       const acknowledgement = admissionAck === null ? null : parseCanonicalJsonBytes(Buffer.from(admissionAck));
       const readerState = await lowLevel.read_verified_bytes(botPath('reader-state'));
-      if (requestValue.requestedReaderMode === 'handshake') {
-        if (readerState === null) refused('read_managed_mapping_snapshot', 'bound reader state is absent');
-        await assertObject(botPath('reader-state'), Buffer.from(readerState));
-      } else if (readerState !== null) {
-        refused('read_managed_mapping_snapshot', 'no-reader authority contains reader state');
-      }
       const admissionArchives = await readGenesisAdmissionArchives({
         request: requestValue,
         admissionRequest,
@@ -5421,6 +5454,16 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       admissionRequestArchive = admissionArchives.request;
       admissionGrantArchive = admissionArchives.grant;
       acknowledgementArchive = admissionArchives.acknowledgement;
+      if (!await exactPrecommitBoundary(requestValue, parseCanonicalJsonBytes(precommit.bytes))) {
+        refused('read_managed_mapping_snapshot', 'exact live precommit boundary is invalid');
+      }
+      if (pendingLifecycle) pendingHandshake();
+      if (requestValue.requestedReaderMode === 'handshake') {
+        if (readerState === null) refused('read_managed_mapping_snapshot', 'bound reader state is absent');
+        await assertObject(botPath('reader-state'), Buffer.from(readerState));
+      } else if (readerState !== null) {
+        refused('read_managed_mapping_snapshot', 'no-reader authority contains reader state');
+      }
       const rvfBytes = await lowLevel.read_verified_bytes(path('rvf'));
       const receiptBytes = await lowLevel.read_verified_bytes(path('receipt'));
       if (rvfBytes === null || receiptBytes === null) {
@@ -5438,9 +5481,6 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         validateGenesisReceipt(parseCanonicalJsonBytes(receipt.bytes), finalityGraph.request, finalityGraph.zFinality, finalityGraph.proof);
       } catch {
         refused('read_managed_mapping_snapshot', 'bound finality, receipt, or reader state is invalid');
-      }
-      if (!await exactPrecommitBoundary(requestValue, parseCanonicalJsonBytes(precommit.bytes))) {
-        refused('read_managed_mapping_snapshot', 'exact live precommit boundary is invalid');
       }
       const botOsIdentity = await lowLevel.current_os_principal();
       const botStateAcl = await lowLevel.read_acl(botRoot);

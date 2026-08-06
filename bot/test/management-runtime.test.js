@@ -412,6 +412,30 @@ test('pending bootstrap rejects mutable/archive drift before any bot writes', as
   await assert.rejects(harness.native.readPendingReaderBootstrap(), /pending reader authority/);
   assert.equal(harness.writes.length, writes);
 });
+test('pending managed snapshot recognizes durable handshake before completed reader state', async () => {
+  const harness = await boundReaderRuntime({ complete: false });
+  harness.setPrincipal(botPrincipal);
+  await assert.rejects(
+    harness.native.readManagedMappingSnapshot(),
+    (error) => error?.code === 'MANAGED_HANDSHAKE_PENDING',
+  );
+});
+
+test('managed snapshot rejects mutable Genesis precommit drift against immutable archive', async () => {
+  const harness = await boundReaderRuntime({ complete: true });
+  const currentPath = filePathEnding(harness.files, '/genesis-precommit-proof.json');
+  const current = JSON.parse(harness.files.get(currentPath));
+  current.genesisProbeFingerprint = 'f'.repeat(64);
+  current.precommitFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(current).filter(([key]) => key !== 'precommitFingerprint')),
+  );
+  harness.files.set(currentPath, Buffer.from(canonicalJson(current)));
+  harness.setPrincipal(botPrincipal);
+  await assert.rejects(
+    harness.native.readManagedMappingSnapshot(),
+    /precommit|Genesis/i,
+  );
+});
 test('pending bot writers require durable handshake and immutable admission archives before writes', async () => {
   const cases = [
     ['missing durable handshake', (harness) => {

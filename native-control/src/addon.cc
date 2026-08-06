@@ -826,6 +826,11 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   if (entry_result != 0 || !seen_user_object || !seen_group_object || !seen_other ||
       (has_named_entries && !seen_mask)) return false;
   if (!seen_mask) mask = S_IRUSR | S_IWUSR | S_IXUSR;
+  const bool writable_group_class =
+      (group_object_bits & S_IWUSR) != 0 ||
+      (named_group_bits & S_IWUSR) != 0 ||
+      (other_bits & S_IWUSR) != 0;
+  if ((requested & S_IWUSR) != 0 && writable_group_class) return false;
   if (principal == st.st_uid) return (owner_bits & requested) == requested;
   if (selected_named_user) return ((named_user_bits & mask) & requested) == requested;
 

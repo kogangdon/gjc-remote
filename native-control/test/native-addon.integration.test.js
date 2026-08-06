@@ -1,6 +1,8 @@
+import { execFile as execFileCallback } from "node:child_process";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, symlinkSync } from "node:fs";
+import { promisify } from "node:util";
 import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -9,6 +11,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { capabilities, capabilitySignatures, validateBuildManifest } from "../src/index.js";
+const execFile = promisify(execFileCallback);
 
 const require = createRequire(import.meta.url);
 const packageRoot = new URL("..", import.meta.url);
@@ -144,7 +147,7 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     await rm(root, { recursive: true, force: true });
   }
 });
-test("POSIX principal access honors ACL_OTHER when no group entry matches", async (t) => {
+test("POSIX principal access rejects writable ACL_OTHER, ACL_GROUP, and named groups", async (t) => {
   if (process.platform !== "linux") {
     t.skip("POSIX ACL probe is Linux-only");
     return;
@@ -172,13 +175,30 @@ test("POSIX principal access honors ACL_OTHER when no group entry matches", asyn
     return;
   }
   const root = await mkdtemp(join(tmpdir(), "gjc-native-acl-"));
-  const target = join(root, "acl-other.txt");
+  const target = join(root, "acl-group-other.txt");
   try {
-    await writeFile(target, Buffer.from("acl-other"));
-    await chmod(target, 0o644);
+    await writeFile(target, Buffer.from("acl-group-other"));
     const principal = `uid:${candidate[2]}`;
+
+    // A readable ACL_OTHER remains a valid read proof, but any broad write bit
+    // invalidates the mutation proof even when this principal is not in the group.
+    await chmod(target, 0o644);
     assert.equal(await addon.principal_access_check(target, "uid", principal, "read"), true);
     assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+    await chmod(target, 0o666);
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "read"), true);
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+
+    // A named ACL_GROUP is likewise rejected for mutation regardless of
+    // whether the probed principal happens to match that group.
+    await chmod(target, 0o644);
+    try {
+      await execFile("setfacl", ["-m", `g:${currentGid ?? candidate[3]}:rw`, target]);
+      assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      t.diagnostic("setfacl unavailable; ACL_GROUP named-entry probe skipped");
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -203,6 +223,10 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /bool PrincipalGroups\(uid_t principal/);
   assert.match(source, /ACL_GROUP_OBJ/);
   assert.match(source, /ACL_OTHER/);
+  assert.match(source, /writable_group_class/);
+  assert.match(source, /group_object_bits & S_IWUSR/);
+  assert.match(source, /named_group_bits & S_IWUSR/);
+  assert.match(source, /other_bits & S_IWUSR/);
   assert.match(source, /AT_EMPTY_PATH/);
   assert.match(source, /bool VerifyNoGroupMutationAcl\(HANDLE handle\)/);
   assert.match(source, /ConvertStringSidToSidW\(L"S-1-5-18", &configured_system_sid\)/);
