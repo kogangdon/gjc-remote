@@ -409,6 +409,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       if (!currentHead ||
           (canonical(currentHead) !== canonical(suffix.pendingHead) &&
            canonical(currentHead) !== canonical(suffix.terminalHead))) return false;
+      const stateAfter = await rawRead(path('management-state'));
+      if (!stateAfter || canonical(stateAfter) !== canonical(state)) return false;
       if (record !== null) {
         if (kind === 'receipt' && canonical(record) !== canonical(suffix.receipt)) return false;
         if (kind === 'marker' && canonical(record) !== canonical(suffix.marker)) return false;
@@ -771,7 +773,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       throw new TypeError('terminalization suffix schema');
     }
     validateAuthoritySuccessorRequest(suffix.request, genesisAuthorityRequest);
-    validateAuthoritySuccessorFinality(suffix.finality, suffix.request, null, null, null, null, genesisAuthorityRequest);
     validateAuthoritySuccessorReceipt(suffix.receipt, suffix.request, suffix.finality, suffix.lease, suffix.projection, suffix.ack, genesisAuthorityRequest);
     validateHistoryMarkerRelation(suffix.marker, {
       anchorFingerprint: suffix.request.anchorFingerprint,
@@ -801,6 +802,132 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       throw new TypeError('terminalization immutable record binding');
     }
     return suffix;
+  };
+  const readTerminalizationLineage = async ({ suffix, allowMissingName = null, genesisAuthorityRequest = null } = {}) => {
+    const tx = encodeURIComponent(suffix?.txId ?? '');
+    const [
+      request, close, fence, baseline, reservation, commit, authorityEpoch,
+      publicationK, publicationY, finality, lease, projection, ack, receipt, head,
+    ] = await Promise.all([
+      read(path(`authority-successor-request-${tx}`)),
+      read(path(`authority-close-proof-${tx}`)),
+      read(path(`authority-successor-fence-${tx}`)),
+      read(path(`authority-successor-baseline-${tx}`)),
+      read(path(`authority-reservation-${tx}`)),
+      read(path(`authority-commit-${tx}`)),
+      read(path('authority-epoch')),
+      read(path(`publication-k-${tx}`)),
+      read(path(`publication-y-${tx}`)),
+      read(path(`authority-successor-finality-${tx}`)),
+      read(botPath(`successor-lease-${tx}`)),
+      read(botPath(`successor-reader-projection-${tx}`)),
+      read(botPath(`successor-ack-${tx}`)),
+      read(path(`authority-successor-receipt-${tx}`)),
+      read(path('authority-head')),
+    ]);
+    const historyEvidence = await readSealAwareHistoryMarker('terminal_replay');
+    const committedEpoch = authorityEpoch?.epoch === undefined
+      ? null
+      : await read(path(`authority-epoch-${authorityEpoch.epoch}-committed`));
+    let publicationGraph;
+    try {
+      validateAuthoritySuccessorRequest(request, genesisAuthorityRequest);
+      validateAuthorityCloseProof(close, request, genesisAuthorityRequest);
+      validateAuthorityReservation(reservation, request);
+      validateAuthorityCommitSnapshot(commit, reservation, request);
+      if (request.readerMode === 'bound-reader') {
+        validateAuthoritySuccessorFence(fence, request, commit, genesisAuthorityRequest);
+      } else if (fence !== null) {
+        throw new TypeError('no-reader successor fence');
+      }
+      validateAuthoritySuccessorBaseline(baseline, request, close, fence, reservation, commit, genesisAuthorityRequest);
+      validateAuthorityEpoch(authorityEpoch, request, reservation, commit);
+      validateAuthoritySuccessorFinality(finality, request, baseline, reservation, commit, authorityEpoch, genesisAuthorityRequest);
+      if (committedEpoch === null ||
+          canonical(committedEpoch) !== canonical(authorityEpoch)) {
+        throw new TypeError('terminal successor committed epoch substitution');
+      }
+      validateAuthoritySuccessorHead(head, request, genesisAuthorityRequest);
+      if (canonical(request) !== canonical(suffix.request) ||
+          canonical(finality) !== canonical(suffix.finality) ||
+          head.txId !== suffix.txId ||
+          (head.headFingerprint !== suffix.pendingHead.headFingerprint &&
+           head.headFingerprint !== suffix.terminalHead.headFingerprint)) {
+        throw new TypeError('terminal successor tuple substitution');
+      }
+      if (receipt === null) {
+        const receiptName = path(`authority-successor-receipt-${tx}`);
+        if (allowMissingName !== receiptName) throw new TypeError('terminal successor receipt absent');
+      } else if (canonical(receipt) !== canonical(suffix.receipt)) {
+        throw new TypeError('terminal successor receipt substitution');
+      }
+      if (request.readerMode === 'bound-reader') {
+        validateAuthoritySuccessorLease(lease, request, fence, genesisAuthorityRequest);
+        validateAuthoritySuccessorReaderProjection(projection, request, finality, lease, genesisAuthorityRequest);
+        validateAuthoritySuccessorAck(ack, request, finality, projection, genesisAuthorityRequest);
+      } else if ([lease, projection, ack].some((value) => value !== null)) {
+        throw new TypeError('no-reader successor B tuple');
+      }
+      if ([lease, projection, ack].some((value, index) =>
+        canonical(value) !== canonical([suffix.lease, suffix.projection, suffix.ack][index]))) {
+        throw new TypeError('terminal successor B substitution');
+      }
+      publicationGraph = await readPublicationGraph(suffix.txId);
+      if (canonical(publicationGraph.k) !== canonical(publicationK) ||
+          canonical(publicationGraph.y) !== canonical(publicationY) ||
+          publicationK['publication-kFingerprint'] !== head.publicationKFingerprint ||
+          publicationY['publication-yFingerprint'] !== head.publicationYFingerprint ||
+          publicationK['publication-kFingerprint'] !== finality.publicationKFingerprint ||
+          publicationY['publication-yFingerprint'] !== finality.publicationYFingerprint ||
+          publicationK.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint ||
+          publicationY.authorityCommitSnapshotFingerprint !== commit.authorityCommitSnapshotFingerprint) {
+        throw new TypeError('terminal successor publication substitution');
+      }
+      if (!historyEvidence.marker || !historyEvidence.seal) throw new TypeError('terminal successor history seal absent');
+      validateHistoryMarkerSeal(historyEvidence.seal, request.anchorFingerprint, historyEvidence.marker);
+      validateHistoryMarkerRelation(suffix.marker, {
+        anchorFingerprint: request.anchorFingerprint,
+        sequence: request.sequence,
+      });
+      if (canonical(historyEvidence.marker) !== canonical(suffix.marker) &&
+          (historyEvidence.marker.markerFingerprint !== suffix.marker.previousMarkerFingerprint ||
+           historyEvidence.marker.sequence !== suffix.marker.sequence - 1 ||
+           historyEvidence.marker.anchorFingerprint !== suffix.marker.anchorFingerprint)) {
+        throw new TypeError('terminal successor history marker substitution');
+      }
+      validateAuthoritySuccessorReceipt(
+        suffix.receipt,
+        request,
+        finality,
+        suffix.lease,
+        suffix.projection,
+        suffix.ack,
+        genesisAuthorityRequest,
+      );
+      if (request.readerMode === 'no-reader' &&
+          [suffix.lease, suffix.projection, suffix.ack].some((value) => value !== null)) {
+        throw new TypeError('no-reader successor B outputs');
+      }
+    } catch {
+      return false;
+    }
+    return {
+      request,
+      close,
+      fence,
+      baseline,
+      reservation,
+      commit,
+      authorityEpoch,
+      publicationK,
+      publicationY,
+      finality,
+      receipt,
+      publicationGraph,
+      historyMarker: historyEvidence.marker,
+      historyMarkerSeal: historyEvidence.seal,
+      head,
+    };
   };
   const managementStateTerminalReplayMatches = (state, suffix, genesisAuthorityRequest = null) => {
     const withoutRecovery = (value) => {
@@ -834,27 +961,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       if (!managementStateTerminalReplayMatches(state, suffix, genesisAuthorityRequest)) return false;
       if (state?.recovery?.manualCleanupFingerprint !== undefined &&
           terminal.manualCleanupFingerprint !== state.recovery.manualCleanupFingerprint) return false;
-      const tx = encodeURIComponent(suffix.txId);
-      const expected = [
-        [`authority-successor-request-${tx}`, suffix.request],
-        [`authority-successor-finality-${tx}`, suffix.finality],
-        [`authority-successor-receipt-${tx}`, suffix.receipt],
-      ];
-      if (suffix.lease !== null) expected.push([`bot-state/successor-lease-${tx}`, suffix.lease]);
-      if (suffix.projection !== null) expected.push([`bot-state/successor-reader-projection-${tx}`, suffix.projection]);
-      if (suffix.ack !== null) expected.push([`bot-state/successor-ack-${tx}`, suffix.ack]);
-      for (const [name, value] of expected) {
-        const durableName = path(name);
-        const durable = await read(durableName);
-        if (durable === null && durableName !== allowMissingName) return false;
-        if (durable !== null && canonical(durable) !== canonical(value)) return false;
-      }
-      const currentMarker = (await readSealAwareHistoryMarker()).marker;
-      if (currentMarker === null) return false;
-      if (canonical(currentMarker) !== canonical(suffix.marker) &&
-          (currentMarker.markerFingerprint !== suffix.marker.previousMarkerFingerprint ||
-           currentMarker.sequence !== suffix.marker.sequence - 1 ||
-           currentMarker.anchorFingerprint !== suffix.marker.anchorFingerprint)) return false;
+      const lineage = await readTerminalizationLineage({ suffix, allowMissingName, genesisAuthorityRequest });
+      if (!lineage ||
+          (canonical(lineage.head) !== canonical(suffix.pendingHead) &&
+           canonical(lineage.head) !== canonical(suffix.terminalHead))) return false;
       return true;
     } catch {
       return false;
@@ -1255,11 +1365,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     return { request, zFinality, proof, projection, acknowledgement, readerState };
   };
-  const exactPrecommitBoundary = async (request, precommit) => {
+  const exactPrecommitBoundary = async (request, precommit, options = {}) => {
     try {
       validateGenesisRequest(request); validateGenesisPrecommit(precommit);
       const publication = await readPublicationGraph(request.genesisTxId);
-      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, control, authorityEpochFloor] = await Promise.all([
+      const [reservation, attestedProof, attestation, readerVersionFloor, authorityReservation, authorityCommit, authorityEpoch, control, persistedAuthorityEpochFloor] = await Promise.all([
         read(path(`token-floor-reservation-${encodeURIComponent(request.genesisTxId)}`)),
         read(path(`token-floor-attested-${encodeURIComponent(request.genesisTxId)}`)),
         read(path('attestation')), read(path('reader-version-floor')),
@@ -1267,6 +1377,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         read(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`)),
         read(path('authority-epoch')), read(path('control-root')), read(path('authority-epoch-floor')),
       ]);
+      const authorityEpochFloor = options.authorityEpochFloor === undefined
+        ? persistedAuthorityEpochFloor
+        : options.authorityEpochFloor;
       const committedEpoch = authorityEpoch && await read(path(`authority-epoch-${authorityEpoch.epoch}-committed`));
       const wrapper = control?.wrapperRelativeName ? await read(join(root, control.wrapperRelativeName)) : null;
       const target = await targetProof({ sourceKind: control?.sourceKind });
@@ -3050,11 +3163,14 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
     },
     async recoverGenesisSuffix({ recovery }) {
       const fail = () => refused('recover_genesis_suffix', 'persisted genesis suffix is incomplete or inconsistent; manual cleanup is required');
-      const request = await read(path('genesis-request'));
-      const reservation = request && await read(path(`token-floor-reservation-${encodeURIComponent(request.genesisTxId)}`));
-      const attestation = await read(path('attestation'));
-      const controlRoot = await read(path('control-root'));
-      const authorityRequest = await read(path('genesis-authority-request'));
+      const recoveryRead = async (name) => {
+        try { return await read(name); } catch { fail(); }
+      };
+      const request = await recoveryRead(path('genesis-request'));
+      const reservation = request && await recoveryRead(path(`token-floor-reservation-${encodeURIComponent(request.genesisTxId)}`));
+      const attestation = await recoveryRead(path('attestation'));
+      const controlRoot = await recoveryRead(path('control-root'));
+      const authorityRequest = await recoveryRead(path('genesis-authority-request'));
       try {
         validateGenesisRequest(request); validateTokenFloorReservation(reservation); validateTokenConfigAttestation(attestation); validateGenesisAuthorityRequest(authorityRequest);
       } catch { fail(); }
@@ -3062,10 +3178,17 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           request.tokenFloorFingerprint !== reservation.floorFingerprint || request.attestationFingerprint !== attestation.attestationFingerprint ||
           reservation.lastReservationTxId !== request.genesisTxId || reservation.highestReservedGeneration !== request.generation ||
           attestation.txId !== request.genesisTxId || attestation.tokenConfigGeneration !== request.generation ||
+          authorityRequest.genesisTxId !== request.genesisTxId ||
+          authorityRequest.fenceGeneration !== request.fenceGeneration ||
+          authorityRequest.anchorFingerprint !== request.anchorFingerprint ||
+          authorityRequest.generation !== request.generation ||
+          authorityRequest.requestedReaderMode !== request.requestedReaderMode ||
+          authorityRequest.readerInstanceId !== request.readerInstanceId ||
+          authorityRequest.readerStartNonce !== request.readerStartNonce ||
           !controlRoot) fail();
       if (request.requestedReaderMode === 'handshake' && controlRoot.sourceKind === 'legacy-retained') fail();
-      const preflightEpoch = await read(path('authority-epoch'));
-      const preflightAuthorityEpochFloor = await read(path('authority-epoch-floor'));
+      const preflightEpoch = await recoveryRead(path('authority-epoch'));
+      const preflightAuthorityEpochFloor = await recoveryRead(path('authority-epoch-floor'));
       try {
         validateAuthorityEpoch(preflightEpoch);
         if (preflightEpoch.commitTxId !== request.genesisTxId) throw new TypeError('Genesis authority epoch is not committed');
@@ -3082,6 +3205,272 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           }
         }
       } catch { fail(); }
+      const preflightImmutablePrecommit = await recoveryRead(path(`genesis-precommit-proof-${encodeURIComponent(request.genesisTxId)}`));
+      const preflightCurrentPrecommit = await recoveryRead(path('genesis-precommit-proof'));
+      const preflightCommitted = await recoveryRead(path('token-floor'));
+      const preflightZFinality = await recoveryRead(path('z-finality'));
+      const preflightAttestedProof = await recoveryRead(path(`token-floor-attested-${encodeURIComponent(request.genesisTxId)}`));
+      const preflightGraphEpoch = await recoveryRead(path('authority-epoch'));
+      const preflightCommittedEpoch = preflightGraphEpoch && await recoveryRead(path(`authority-epoch-${preflightGraphEpoch.epoch}-committed`));
+      const preflightAuthorityReservation = await recoveryRead(path(`authority-reservation-${encodeURIComponent(request.genesisTxId)}`));
+      const preflightAuthorityCommit = await recoveryRead(path(`authority-commit-${encodeURIComponent(request.genesisTxId)}`));
+      const preflightReaderFloor = await recoveryRead(path('reader-version-floor'));
+      const preflightFenceFloor = await recoveryRead(path('fence-generation-floor'));
+      const preflightEpochFloor = await recoveryRead(path('authority-epoch-floor'));
+      const preflightAuthorityReceipt = await recoveryRead(path('genesis-authority-receipt'));
+      const preflightImmutableAuthorityReceipt = await recoveryRead(path(`genesis-authority-receipt-${encodeURIComponent(request.genesisTxId)}`));
+      const preflightAdmissionRequest = await recoveryRead(path('admission-request'));
+      const preflightAdmissionGrant = await recoveryRead(path('admission-grant'));
+      const preflightProjection = await recoveryRead(botPath('reader-projection'));
+      const preflightAcknowledgement = await recoveryRead(botPath('acknowledgement'));
+      const preflightReaderState = await recoveryRead(botPath('reader-state'));
+      let preflightPublication;
+      let preflightExpectedEpochFloor;
+      let preflightCommittedFloor;
+      let preflightExpectedFinality;
+      let preflightExpectedProof;
+      let preflightExpectedReceipt;
+      let preflightExpectedSuffix;
+      try {
+        validateGenesisPrecommit(preflightImmutablePrecommit);
+        validateGenesisPrecommit(preflightCurrentPrecommit);
+        if (canonical(preflightImmutablePrecommit) !== canonical(preflightCurrentPrecommit) ||
+            preflightImmutablePrecommit.genesisTxId !== request.genesisTxId ||
+            preflightCurrentPrecommit.genesisTxId !== request.genesisTxId ||
+            preflightImmutablePrecommit.generation !== request.generation ||
+            preflightCurrentPrecommit.generation !== request.generation ||
+            preflightImmutablePrecommit.fenceGeneration !== request.fenceGeneration ||
+            preflightCurrentPrecommit.fenceGeneration !== request.fenceGeneration) {
+          throw new TypeError('Genesis immutable/current precommit binding is invalid');
+        }
+        validateAuthorityReservation(preflightAuthorityReservation);
+        validateAuthorityCommitSnapshot(preflightAuthorityCommit, preflightAuthorityReservation);
+        validateAuthorityEpoch(preflightGraphEpoch);
+        validateAuthorityEpoch(preflightCommittedEpoch);
+        if (canonical(preflightGraphEpoch) !== canonical(preflightCommittedEpoch) ||
+            preflightAuthorityReservation.anchorFingerprint !== request.anchorFingerprint ||
+            preflightAuthorityReservation.fenceGeneration !== request.fenceGeneration ||
+            preflightAuthorityReservation.txId !== request.genesisTxId ||
+            preflightAuthorityReservation.epoch !== preflightGraphEpoch.epoch ||
+            preflightAuthorityReservation.generation !== request.generation ||
+            preflightAuthorityReservation.candidateFingerprint !== request.requestFingerprint ||
+            preflightAuthorityCommit.anchorFingerprint !== request.anchorFingerprint ||
+            preflightAuthorityCommit.fenceGeneration !== request.fenceGeneration ||
+            preflightAuthorityCommit.txId !== request.genesisTxId ||
+            preflightAuthorityCommit.epoch !== preflightGraphEpoch.epoch ||
+            preflightAuthorityCommit.generation !== request.generation ||
+            preflightAuthorityCommit.candidateFingerprint !== request.requestFingerprint ||
+            preflightGraphEpoch.anchorFingerprint !== request.anchorFingerprint ||
+            preflightGraphEpoch.fenceGeneration !== request.fenceGeneration ||
+            preflightGraphEpoch.reservationTxId !== request.genesisTxId ||
+            preflightGraphEpoch.commitTxId !== request.genesisTxId) {
+          throw new TypeError('Genesis authority reservation, commit, or epoch binding is invalid');
+        }
+        if (preflightEpochFloor === null) {
+          if (preflightGraphEpoch.epoch !== 1) throw new TypeError('Genesis authority epoch floor predecessor is absent');
+          preflightExpectedEpochFloor = buildAuthorityEpochFloor(preflightGraphEpoch.anchorFingerprint, {
+            ...buildAuthorityEpochFloor(preflightGraphEpoch.anchorFingerprint),
+            highestReservedAuthorityEpoch: preflightGraphEpoch.epoch,
+            lastReservationTxId: preflightGraphEpoch.reservationTxId,
+            floorFingerprint: null,
+          });
+        } else {
+          validateAuthorityEpochFloor(preflightEpochFloor);
+          if (preflightEpochFloor.anchorFingerprint !== preflightGraphEpoch.anchorFingerprint ||
+              preflightEpochFloor.highestReservedAuthorityEpoch !== preflightGraphEpoch.epoch ||
+              preflightEpochFloor.lastReservationTxId !== preflightGraphEpoch.reservationTxId ||
+              preflightEpochFloor.highestCommittedAuthorityEpoch > preflightGraphEpoch.epoch ||
+              preflightEpochFloor.highestCommittedAuthorityEpoch < preflightGraphEpoch.epoch - 1 ||
+              (preflightEpochFloor.highestCommittedAuthorityEpoch === preflightGraphEpoch.epoch &&
+                preflightEpochFloor.lastCommittedTxId !== preflightGraphEpoch.commitTxId)) {
+            throw new TypeError('Genesis authority epoch floor binding is invalid');
+          }
+          preflightExpectedEpochFloor = preflightEpochFloor;
+        }
+        preflightExpectedEpochFloor = buildAuthorityEpochFloor(preflightGraphEpoch.anchorFingerprint, {
+          ...preflightExpectedEpochFloor,
+          highestCommittedAuthorityEpoch: preflightGraphEpoch.epoch,
+          lastCommittedTxId: preflightGraphEpoch.commitTxId,
+          floorFingerprint: null,
+        });
+        validateFenceGenerationFloor(preflightFenceFloor);
+        if (preflightFenceFloor.anchorFingerprint !== request.anchorFingerprint ||
+            preflightFenceFloor.highestReservedFenceGeneration !== request.fenceGeneration ||
+            preflightFenceFloor.lastReservationTxId !== request.genesisTxId ||
+            (preflightFenceFloor.highestCommittedFenceGeneration !== request.fenceGeneration &&
+             preflightFenceFloor.highestCommittedFenceGeneration !== request.fenceGeneration - 1) ||
+            (preflightFenceFloor.highestCommittedFenceGeneration === request.fenceGeneration &&
+             preflightFenceFloor.lastCommittedTxId !== request.genesisTxId)) {
+          throw new TypeError('Genesis fence generation floor binding is invalid');
+        }
+        validateAttestedTokenFloorProof(preflightAttestedProof, reservation, attestation);
+        validateTokenFloor(preflightCommitted);
+        if (preflightCommitted.anchorFingerprint !== request.anchorFingerprint ||
+            preflightCommitted.fenceGeneration !== request.fenceGeneration ||
+            preflightCommitted.highestReservedGeneration !== request.generation ||
+            preflightCommitted.lastReservationTxId !== request.genesisTxId ||
+            (preflightCommitted.floorPhase === 'committed' &&
+             (preflightCommitted.highestCommittedGeneration !== request.generation ||
+              preflightCommitted.lastCommittedTxId !== request.genesisTxId ||
+              preflightCommitted.lastAttestationFingerprint !== request.attestationFingerprint)) ||
+            !['attested', 'committed'].includes(preflightCommitted.floorPhase)) {
+          throw new TypeError('Genesis token floor binding is invalid');
+        }
+        preflightCommittedFloor = preflightCommitted.floorPhase === 'attested'
+          ? commitTokenFloor(preflightCommitted, {
+            generation: request.generation,
+            fenceGeneration: request.fenceGeneration,
+            txId: request.genesisTxId,
+            attestationFingerprint: attestation.attestationFingerprint,
+          })
+          : preflightCommitted;
+        validateTokenFloor(preflightCommittedFloor);
+        if (preflightCurrentPrecommit.requestFingerprint !== request.requestFingerprint ||
+            preflightCurrentPrecommit.reservationFingerprint !== reservation.floorFingerprint ||
+            preflightCurrentPrecommit.attestedProofFingerprint !== preflightAttestedProof.attestedProofFingerprint ||
+            preflightCurrentPrecommit.authorityReservationFingerprint !== preflightAuthorityReservation.reservationFingerprint ||
+            preflightCurrentPrecommit.authorityCommitSnapshotFingerprint !== preflightAuthorityCommit.authorityCommitSnapshotFingerprint ||
+            preflightCurrentPrecommit.authorityEpochFingerprint !== preflightGraphEpoch.authorityEpochFingerprint ||
+            preflightCurrentPrecommit.publicationKFingerprint === null ||
+            preflightCurrentPrecommit.publicationYFingerprint === null) {
+          throw new TypeError('Genesis precommit relation is invalid');
+        }
+        preflightPublication = await readPublicationGraph(request.genesisTxId);
+        const publicationRecords = Object.values(preflightPublication);
+        if (publicationRecords.some((record) =>
+          record.txId !== request.genesisTxId ||
+          record.genesisTxId !== request.genesisTxId ||
+          record.generation !== request.generation ||
+          record.fenceGeneration !== request.fenceGeneration)) {
+          throw new TypeError('Genesis publication identity is invalid');
+        }
+        if (preflightPublication.k['publication-kFingerprint'] !== preflightCurrentPrecommit.publicationKFingerprint ||
+            preflightPublication.y['publication-yFingerprint'] !== preflightCurrentPrecommit.publicationYFingerprint) {
+          throw new TypeError('Genesis publication precommit binding is invalid');
+        }
+        if (!await exactPrecommitBoundary(request, preflightCurrentPrecommit, {
+          authorityEpochFloor: preflightExpectedEpochFloor,
+        })) {
+          throw new TypeError('Genesis precommit boundary is invalid');
+        }
+        validateReaderVersionFloor(preflightReaderFloor);
+        if (preflightReaderFloor.anchorFingerprint !== request.anchorFingerprint ||
+            preflightReaderFloor.fenceGeneration !== request.fenceGeneration ||
+            (request.requestedReaderMode === 'no-reader'
+              ? preflightReaderFloor.readerVersionFloor !== null
+              : preflightReaderFloor.readerVersionFloor !== 2)) {
+          throw new TypeError('Genesis reader version floor binding is invalid');
+        }
+        preflightExpectedFinality = {
+          version: 1,
+          kind: 'genesis-finality',
+          genesisTxId: request.genesisTxId,
+          generation: request.generation,
+          fenceGeneration: request.fenceGeneration,
+          anchorFingerprint: request.anchorFingerprint,
+          attestationFingerprint: attestation.attestationFingerprint,
+          tokenFloorFingerprint: preflightCommittedFloor.floorFingerprint,
+          checkpointFingerprint: canonicalJsonHash(request),
+          publicationKFingerprint: preflightPublication.k['publication-kFingerprint'],
+          publicationYFingerprint: preflightPublication.y['publication-yFingerprint'],
+          authorityEpochFingerprint: preflightGraphEpoch.authorityEpochFingerprint,
+          precommitFingerprint: preflightCurrentPrecommit.precommitFingerprint,
+          finalityFingerprint: preflightCommittedFloor.floorFingerprint,
+          zFinalityFingerprint: null,
+        };
+        preflightExpectedFinality.zFinalityFingerprint = recordFingerprint(preflightExpectedFinality, 'zFinalityFingerprint');
+        validateZFinality(preflightExpectedFinality, request, preflightCommittedFloor, preflightCurrentPrecommit);
+        if (preflightZFinality !== null &&
+            (canonical(preflightZFinality) !== canonical(preflightExpectedFinality) ||
+             canonical(validateZFinality(preflightZFinality, request, preflightCommittedFloor, preflightCurrentPrecommit)) !== canonical(preflightExpectedFinality))) {
+          throw new TypeError('Genesis finality is substituted');
+        }
+        const authorityReceipt = {
+          version: 1, kind: 'genesis-authority-receipt', genesisTxId: request.genesisTxId,
+          requestFingerprint: authorityRequest.requestFingerprint, sequence: 2, anchorFingerprint: request.anchorFingerprint,
+          fenceGeneration: request.fenceGeneration, generation: request.generation,
+          readerVersionFloorFingerprint: preflightReaderFloor.floorFingerprint,
+          authorityCommitSnapshotFingerprint: preflightAuthorityCommit.authorityCommitSnapshotFingerprint,
+          receiptFingerprint: null,
+        };
+        authorityReceipt.receiptFingerprint = recordFingerprint(authorityReceipt, 'receiptFingerprint');
+        validateGenesisAuthorityReceipt(authorityReceipt, authorityRequest);
+        if ((preflightAuthorityReceipt !== null && canonical(preflightAuthorityReceipt) !== canonical(authorityReceipt)) ||
+            (preflightImmutableAuthorityReceipt !== null && canonical(preflightImmutableAuthorityReceipt) !== canonical(authorityReceipt))) {
+          throw new TypeError('Genesis authority receipt is substituted');
+        }
+        if (request.requestedReaderMode === 'handshake') {
+          validateAdmissionRequest(preflightAdmissionRequest);
+          validateAdmissionGrant(preflightAdmissionGrant, preflightAdmissionRequest, Date.now());
+          validateReaderProjection(preflightProjection, preflightReaderFloor, preflightCommittedFloor, preflightExpectedFinality.zFinalityFingerprint);
+          validateAdmissionAck(preflightAcknowledgement, preflightAdmissionGrant, preflightProjection.readerProjectionFingerprint);
+          validateReaderRelations(preflightReaderState, preflightReaderFloor);
+          if (preflightProjection.genesisTxId !== request.genesisTxId ||
+              preflightProjection.generation !== request.generation ||
+              preflightProjection.fenceGeneration !== request.fenceGeneration ||
+              preflightAdmissionRequest.genesisTxId !== request.genesisTxId ||
+              preflightAdmissionRequest.generation !== request.generation ||
+              preflightAcknowledgement.genesisTxId !== request.genesisTxId ||
+              preflightAcknowledgement.generation !== request.generation ||
+              preflightAcknowledgement.fenceGeneration !== request.fenceGeneration ||
+              preflightReaderState.readerInstanceId !== request.readerInstanceId ||
+              preflightReaderState.readerStartNonce !== request.readerStartNonce ||
+              preflightReaderState.readerProjectionFingerprint !== preflightProjection.readerProjectionFingerprint) {
+            throw new TypeError('Genesis reader authority binding is invalid');
+          }
+        } else if ([preflightAdmissionRequest, preflightAdmissionGrant, preflightProjection, preflightAcknowledgement, preflightReaderState].some((value) => value !== null)) {
+          throw new TypeError('Genesis no-reader graph contains reader records');
+        }
+        preflightExpectedProof = {
+          version: 1, kind: 'finality-proof', genesisTxId: request.genesisTxId,
+          fenceGeneration: request.fenceGeneration, generation: request.generation,
+          zFinalityFingerprint: preflightExpectedFinality.zFinalityFingerprint,
+          readerProjectionFingerprint: preflightProjection?.readerProjectionFingerprint ?? null,
+          ackFingerprint: preflightAcknowledgement?.ackFingerprint ?? null,
+          routeFingerprint: preflightAcknowledgement?.routeFingerprint ?? 'no-route',
+          finalityProofFingerprint: null,
+        };
+        preflightExpectedProof.finalityProofFingerprint = recordFingerprint(preflightExpectedProof, 'finalityProofFingerprint');
+        validateFinalityProof(preflightExpectedProof, request, preflightExpectedFinality, preflightAcknowledgement, preflightProjection?.readerProjectionFingerprint ?? null);
+        const preflightRvf = await read(path('rvf'));
+        if (preflightRvf !== null &&
+            (canonical(preflightRvf) !== canonical(preflightExpectedProof) ||
+             canonical(validateFinalityProof(preflightRvf, request, preflightExpectedFinality, preflightAcknowledgement, preflightProjection?.readerProjectionFingerprint ?? null)) !== canonical(preflightExpectedProof))) {
+          throw new TypeError('Genesis finality proof is substituted');
+        }
+        preflightExpectedReceipt = {
+          version: 1, kind: 'genesis-receipt', genesisTxId: request.genesisTxId,
+          fenceGeneration: request.fenceGeneration, generation: request.generation,
+          requestedReaderMode: request.requestedReaderMode, readerInstanceId: request.readerInstanceId,
+          readerStartNonce: request.readerStartNonce,
+          readerProjectionFingerprint: preflightProjection?.readerProjectionFingerprint ?? null,
+          ackFingerprint: preflightAcknowledgement?.ackFingerprint ?? null,
+          finalityProofFingerprint: preflightExpectedProof.finalityProofFingerprint,
+          phase: 'terminal', receiptFingerprint: null,
+        };
+        preflightExpectedReceipt.receiptFingerprint = recordFingerprint(preflightExpectedReceipt, 'receiptFingerprint');
+        validateGenesisReceipt(preflightExpectedReceipt, request, preflightExpectedFinality, preflightExpectedProof);
+        const preflightReceipt = await read(path('receipt'));
+        if (preflightReceipt !== null &&
+            (canonical(preflightReceipt) !== canonical(preflightExpectedReceipt) ||
+             canonical(validateGenesisReceipt(preflightReceipt, request, preflightExpectedFinality, preflightExpectedProof)) !== canonical(preflightExpectedReceipt))) {
+          throw new TypeError('Genesis receipt is substituted');
+        }
+        preflightExpectedSuffix = {
+          version: 1, kind: 'genesis-suffix-recovery', txId: request.genesisTxId,
+          fenceGeneration: request.fenceGeneration, requestFingerprint: request.requestFingerprint,
+          finalityFingerprint: preflightExpectedProof.finalityProofFingerprint,
+          receiptFingerprint: preflightExpectedReceipt.receiptFingerprint,
+          admissionOpen: false, phase: 'terminal', suffixFingerprint: null,
+        };
+        preflightExpectedSuffix.suffixFingerprint = recordFingerprint(preflightExpectedSuffix, 'suffixFingerprint');
+        const preflightSuffix = await read(path('genesis-suffix-recovery'));
+        if (preflightSuffix !== null && canonical(preflightSuffix) !== canonical(preflightExpectedSuffix)) {
+          throw new TypeError('Genesis suffix recovery is substituted');
+        }
+      } catch {
+        fail();
+      }
       let fenceFloor = await read(path('fence-generation-floor'));
       try { validateFenceGenerationFloor(fenceFloor); } catch { fail(); }
       if (fenceFloor.highestCommittedFenceGeneration !== request.fenceGeneration ||
@@ -4352,11 +4741,18 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           record.reservationTxId !== request.txId ||
           record.epoch !== request.candidateAuthorityEpoch ||
           record.fenceGeneration !== request.candidateFenceGeneration ||
+          reservation.txId !== request.txId ||
+          reservation.epoch !== request.candidateAuthorityEpoch ||
+          reservation.generation !== request.candidateTokenConfigGeneration ||
+          reservation.fenceGeneration !== request.candidateFenceGeneration ||
+          reservation.candidateFingerprint !== request.requestFingerprint ||
+          reservation.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint ||
           commit.txId !== request.txId ||
           commit.epoch !== request.candidateAuthorityEpoch ||
           commit.generation !== request.candidateTokenConfigGeneration ||
           commit.fenceGeneration !== request.candidateFenceGeneration ||
           commit.reservationFingerprint !== reservation.reservationFingerprint ||
+          commit.previousAuthorityCommitSnapshotFingerprint !== reservation.previousAuthorityCommitSnapshotFingerprint ||
           record.previousAuthorityCommitSnapshotFingerprint !== request.previousReceiptFingerprint) {
         refused('commit_authority_successor_epoch', 'successor epoch is detached from the request reservation and commit');
       }
@@ -4367,14 +4763,20 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           floor.lastReservationTxId !== record.reservationTxId) {
         refused('commit_authority_successor_epoch', 'successor epoch commit is not bound to the reserved floor');
       }
-      if (floor.highestCommittedAuthorityEpoch === record.epoch &&
-          floor.lastCommittedTxId === record.commitTxId) {
-        const existing = await read(path(`authority-epoch-${record.epoch}-committed`));
-        if (existing && canonical(existing) === canonical(record)) return record;
+      const replay = floor.highestCommittedAuthorityEpoch === record.epoch &&
+        floor.lastCommittedTxId === record.commitTxId;
+      if (replay) {
+        const [existing, current] = await Promise.all([
+          read(path(`authority-epoch-${record.epoch}-committed`)),
+          read(path('authority-epoch')),
+        ]);
+        if (existing && current &&
+            canonical(existing) === canonical(record) &&
+            canonical(current) === canonical(record)) return record;
         refused('commit_authority_successor_epoch', 'successor epoch commit replay is invalid');
       }
-      if (floor.highestCommittedAuthorityEpoch > record.epoch) {
-        refused('commit_authority_successor_epoch', 'successor epoch commit rewinds the durable floor');
+      if (floor.highestCommittedAuthorityEpoch !== record.epoch - 1) {
+        refused('commit_authority_successor_epoch', 'successor epoch commit is not contiguous with the committed floor');
       }
       await writeCreateOnceAuthority(`authority-epoch-${record.epoch}-committed`, record);
       await writeAuthority('authority-epoch', record);

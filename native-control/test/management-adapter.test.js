@@ -813,6 +813,36 @@ test('recovers the exact no-reader Genesis suffix idempotently and rejects a tor
   await assert.rejects(native.recoverGenesisSuffix({ recovery }), /manual cleanup/);
 });
 
+test('Genesis recovery rejects missing or substituted immutable precommit proof before any writes', async () => {
+  for (const variant of ['missing', 'substituted', 'malformed']) {
+    const fixture = await committedGenesisFixture(`immutable-precommit-${variant}`);
+    const { files, native, recovery, request, calls } = fixture;
+    for (const ending of ['/rvf.json', '/receipt.json', '/genesis-suffix-recovery.json']) {
+      const key = [...files.keys()].find((path) => normalize(path).endsWith(`/.gjc-remote-control${ending}`));
+      files.delete(key);
+    }
+    const immutablePath = [...files.keys()].find((path) =>
+      normalize(path).endsWith(`/genesis-precommit-proof-${request.genesisTxId}.json`));
+    if (variant === 'missing') {
+      files.delete(immutablePath);
+    } else if (variant === 'malformed') {
+      files.set(immutablePath, Buffer.from('{}'));
+    } else {
+      const currentPath = [...files.keys()].find((path) =>
+        normalize(path).endsWith('/.gjc-remote-control/genesis-precommit-proof.json'));
+      const substituted = JSON.parse(files.get(currentPath));
+      substituted.targetFingerprint = '0'.repeat(64);
+      substituted.precommitFingerprint = null;
+      substituted.precommitFingerprint = recordHash(substituted, 'precommitFingerprint');
+      files.set(immutablePath, Buffer.from(canonicalJson(substituted)));
+    }
+    const before = new Map([...files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+    const writes = calls.length;
+    await assert.rejects(native.recoverGenesisSuffix({ recovery }), /manual cleanup/);
+    assert.deepEqual(files, before, `${variant} immutable precommit refusal must be write-free`);
+    assert.equal(calls.length, writes, `${variant} immutable precommit refusal must not write`);
+  }
+});
 test('finality and receipt writers reject malformed replacement records without mutation', async () => {
   const { files, roles, lowLevel } = fake();
   const configPath = 'C:/state/channels.json';
@@ -1437,6 +1467,68 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   assert.deepEqual(files, beforeDetachedFinality);
   assert.equal(calls.length, detachedFinalityWrites);
   await native.writeAuthoritySuccessorFinality(finality);
+});
+test('rejects a skipped successor authority epoch with zero writes', async () => {
+  const fixture = await committedGenesisFixture('successor-epoch-gap');
+  const { files, calls, native, request: genesisRequest } = fixture;
+  const state = await native.readManagementState();
+  const retained = await native.readRetainedTargetProof();
+  const genesisReceipt = JSON.parse(fileEnding(files, '/receipt.json'));
+  const hex = 'f'.repeat(64);
+  const request = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-successor-request', sequence: 2, txId: 'successor-epoch-gap',
+    rootGenesisTxId: genesisRequest.genesisTxId, idempotencyKey: 'successor-epoch-gap-key',
+    operation: 'tokens-attest', anchorFingerprint: genesisRequest.anchorFingerprint,
+    actorPrincipalFingerprint: hex, previousReceiptFingerprint: genesisReceipt.receiptFingerprint,
+    previousTargetFingerprint: retained.targetFingerprint, previousWrapperFingerprint: retained.wrapperFingerprint,
+    previousRevision: state.revision, candidateRevision: state.revision + 1,
+    previousAuthorityEpoch: state.authorityEpoch, candidateAuthorityEpoch: state.authorityEpoch + 1,
+    previousTokenConfigGeneration: state.tokenConfigGeneration, candidateTokenConfigGeneration: state.tokenConfigGeneration + 1,
+    previousAttestationFingerprint: state.tokenAttestation.attestationFingerprint, candidateAttestationFingerprint: hex,
+    previousMappingGeneration: state.mappingGeneration, candidateMappingGeneration: state.mappingGeneration,
+    previousSnapshotFingerprint: retained.snapshotFingerprint, candidateSnapshotFingerprint: hex,
+    candidateTargetFingerprint: hex, previousFenceGeneration: state.fenceGeneration,
+    candidateFenceGeneration: state.fenceGeneration + 1, mappingRecoveryTxFingerprint: null,
+    targetState: retained.snapshot?.targetState ?? 'managed-empty', readerMode: 'no-reader',
+    readerInstanceId: null, readerStartNonce: null, readerNonce: null, requestFingerprint: null,
+  }, 'requestFingerprint');
+  await native.writeAuthoritySuccessorRequest(request);
+  const reservation = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-reservation', anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.candidateFenceGeneration, txId: request.txId,
+    epoch: request.candidateAuthorityEpoch, generation: request.candidateTokenConfigGeneration,
+    candidateFingerprint: request.requestFingerprint,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
+    reservationFingerprint: null,
+  }, 'reservationFingerprint');
+  await native.writeAuthoritySuccessorReservation(reservation);
+  const commit = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-commit-snapshot', anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.candidateFenceGeneration, txId: request.txId,
+    epoch: request.candidateAuthorityEpoch, generation: request.candidateTokenConfigGeneration,
+    candidateFingerprint: request.requestFingerprint, reservationFingerprint: reservation.reservationFingerprint,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
+    authorityCommitSnapshotFingerprint: null,
+  }, 'authorityCommitSnapshotFingerprint');
+  await native.writeAuthoritySuccessorCommit(commit);
+  const epoch = buildAuthoritySuccessorRecord({
+    version: 1, kind: 'authority-epoch', anchorFingerprint: request.anchorFingerprint,
+    fenceGeneration: request.candidateFenceGeneration, epoch: request.candidateAuthorityEpoch,
+    reservationTxId: request.txId, commitTxId: request.txId,
+    previousAuthorityCommitSnapshotFingerprint: request.previousReceiptFingerprint,
+    authorityEpochFingerprint: null,
+  }, 'authorityEpochFingerprint');
+  const floorPath = [...files.keys()].find((path) => normalize(path).endsWith('/.gjc-remote-control/authority-epoch-floor.json'));
+  const floor = JSON.parse(files.get(floorPath));
+  floor.highestCommittedAuthorityEpoch = request.previousAuthorityEpoch - 1;
+  floor.lastCommittedTxId = null;
+  floor.floorFingerprint = recordHash(floor, 'floorFingerprint');
+  files.set(floorPath, Buffer.from(canonicalJson(floor)));
+  const before = new Map([...files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const writes = calls.length;
+  await assert.rejects(native.commitAuthoritySuccessorEpoch(epoch), /contiguous|committed floor/);
+  assert.deepEqual(files, before);
+  assert.equal(calls.length, writes);
 });
 test('management startup self-test confines mutations to private scratch and reports writes honestly on refusal', async () => {
   const { files, lowLevel, roles } = fake();
