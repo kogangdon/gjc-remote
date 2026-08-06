@@ -1287,6 +1287,21 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   await assert.rejects(native.writeAuthoritySuccessorRequest(request), /not the configured management SID/);
   await assert.rejects(native.writeAuthoritySuccessorHead(reserved), /not the configured management SID/);
   lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.managementSid });
+  const precommitPath = 'C:\\state\\.gjc-remote-control\\genesis-precommit-proof.json';
+  const originalPrecommit = JSON.parse(files.get(precommitPath));
+  const substitutedCurrentPrecommit = {
+    ...originalPrecommit,
+    wrapperIdentityFingerprint: '0'.repeat(64),
+    precommitFingerprint: null,
+  };
+  substitutedCurrentPrecommit.precommitFingerprint = recordHash(substitutedCurrentPrecommit, 'precommitFingerprint');
+  files.set(precommitPath, Buffer.from(canonicalJson(substitutedCurrentPrecommit)));
+  const beforeSubstitutedCurrentPrecommit = new Map([...files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const substitutedCurrentPrecommitWrites = calls.length;
+  await assert.rejects(native.writeAuthoritySuccessorRequest(request), /authoritative successor predecessor tuple/);
+  assert.deepEqual(files, beforeSubstitutedCurrentPrecommit);
+  assert.equal(calls.length, substitutedCurrentPrecommitWrites);
+  files.set(precommitPath, Buffer.from(canonicalJson(originalPrecommit)));
   const forgedPredecessorRequest = buildAuthoritySuccessorRecord({
     ...request,
     previousTargetFingerprint: 'b'.repeat(64),
@@ -1316,6 +1331,17 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   };
   fenceFloor.floorFingerprint = recordHash(fenceFloor, 'floorFingerprint');
   files.set('C:\\state\\.gjc-remote-control\\fence-generation-floor.json', Buffer.from(canonicalJson(fenceFloor)));
+  const forgedPredecessorHead = buildAuthoritySuccessorRecord({
+    ...reserved,
+    previousReceiptFingerprint: 'b'.repeat(64),
+    headFingerprint: null,
+  }, 'headFingerprint');
+  const beforeForgedPredecessorHead = new Map([...files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const forgedPredecessorHeadWrites = calls.length;
+  await assert.rejects(native.writeAuthoritySuccessorHead(forgedPredecessorHead), /exact successor predecessor and head transition are required/);
+  assert.deepEqual(files, beforeForgedPredecessorHead);
+  assert.equal(calls.length, forgedPredecessorHeadWrites);
+  await native.writeAuthoritySuccessorHead(reserved);
   const authorityEpoch = {
     version: 1,
     kind: 'authority-epoch',
@@ -1349,19 +1375,7 @@ test('successor head writes are principal-confined, exact-replay idempotent, and
   await assert.rejects(native.writeAuthoritySuccessorRequest(foreignRootRequest), /immutable Genesis authority request/);
   assert.deepEqual(files, beforeForeignRoot);
   assert.equal(calls.length, foreignRootWrites);
-  const forgedPredecessorHead = buildAuthoritySuccessorRecord({
-    ...reserved,
-    previousReceiptFingerprint: 'b'.repeat(64),
-    headFingerprint: null,
-  }, 'headFingerprint');
-  const beforeForgedPredecessorHead = new Map([...files.entries()].map(([path, bytes]) => [path, Buffer.from(bytes)]));
-  const forgedPredecessorHeadWrites = calls.length;
-  await assert.rejects(native.writeAuthoritySuccessorHead(forgedPredecessorHead), /exact successor predecessor and head transition are required/);
-  assert.deepEqual(files, beforeForgedPredecessorHead);
-  assert.equal(calls.length, forgedPredecessorHeadWrites);
-  await native.writeAuthoritySuccessorHead(reserved);
   files.set(authorityEpochPath, Buffer.from(canonicalJson(authorityEpoch)));
-  assert.deepEqual(await native.writeAuthoritySuccessorHead(reserved), reserved);
   const skipped = buildAuthoritySuccessorRecord({
     ...reserved, phase: 'replaced', closeFingerprint: 'b'.repeat(64), authorityCommitSnapshotFingerprint: 'c'.repeat(64),
     baselineFingerprint: 'd'.repeat(64), publicationKFingerprint: 'e'.repeat(64), publicationYFingerprint: 'f'.repeat(64),

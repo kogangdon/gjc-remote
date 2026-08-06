@@ -400,6 +400,9 @@ test("managed history marker seals traverse every predecessor and reject detache
   assert.doesNotThrow(() => validateManagedHistoryMarkerSeal(third, genesis, hex, [second]));
   const detached = marker(2, 2, "b".repeat(64));
   assert.throws(() => validateManagedHistoryMarkerSeal(third, genesis, hex, [detached]), /SUCCESSOR_ENVELOPE_INVALID/);
+  const detachedFenceSecond = marker(2, 4, genesis.markerFingerprint);
+  const detachedFenceThird = marker(3, 3, detachedFenceSecond.markerFingerprint);
+  assert.throws(() => validateManagedHistoryMarkerSeal(detachedFenceThird, genesis, hex, [detachedFenceSecond]), /SUCCESSOR_ENVELOPE_INVALID/);
 });
 test("successor reader records reject every substituted authoritative scalar", () => {
   const request = buildAuthoritySuccessorRecord({

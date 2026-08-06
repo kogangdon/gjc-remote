@@ -2163,6 +2163,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           state.genesis.fenceGeneration !== 1) {
         throw new TypeError('successor Genesis predecessor');
       }
+      if (!await exactPrecommitBoundary(genesisRequest, precommit)) {
+        throw new TypeError('successor Genesis precommit boundary');
+      }
       return {
         receiptFingerprint: genesisReceipt.receiptFingerprint,
         ...liveTarget,

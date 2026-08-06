@@ -41,23 +41,30 @@ export function validateManagedHistoryMarkerSeal(marker, seal, anchorFingerprint
   if (marker === null || seal === null) fail("managed history marker seal");
   validateManagedHistoryMarker(marker, anchorFingerprint);
   validateManagedHistoryMarker(seal, anchorFingerprint, 1);
-  if (marker.sequence === 1 && marker.markerFingerprint !== seal.markerFingerprint) fail("managed history marker seal mismatch");
-  if (marker.sequence === 2 && marker.previousMarkerFingerprint !== seal.markerFingerprint) fail("managed history marker predecessor seal");
-  if (marker.sequence > 2) {
-    if (!Array.isArray(predecessors)) fail("managed history marker predecessor chain");
-    const byFingerprint = new Map();
-    for (const predecessor of predecessors) {
-      validateManagedHistoryMarker(predecessor, anchorFingerprint);
-      if (byFingerprint.has(predecessor.markerFingerprint)) fail("managed history marker duplicate predecessor");
-      byFingerprint.set(predecessor.markerFingerprint, predecessor);
+  if (marker.sequence === 1) {
+    if (marker.markerFingerprint !== seal.markerFingerprint || marker.fenceGeneration !== seal.fenceGeneration) {
+      fail("managed history marker seal mismatch");
     }
-    let cursor = marker;
-    for (let sequence = marker.sequence - 1; sequence >= 2; sequence -= 1) {
-      const predecessor = byFingerprint.get(cursor.previousMarkerFingerprint);
-      if (!predecessor || predecessor.sequence !== sequence) fail("managed history marker predecessor chain");
-      cursor = predecessor;
+    return seal;
+  }
+  if (!Array.isArray(predecessors)) fail("managed history marker predecessor chain");
+  const byFingerprint = new Map();
+  for (const predecessor of predecessors) {
+    validateManagedHistoryMarker(predecessor, anchorFingerprint);
+    if (byFingerprint.has(predecessor.markerFingerprint)) fail("managed history marker duplicate predecessor");
+    byFingerprint.set(predecessor.markerFingerprint, predecessor);
+  }
+  let cursor = marker;
+  for (let sequence = marker.sequence - 1; sequence >= 1; sequence -= 1) {
+    const predecessor = sequence === 1
+      ? seal
+      : byFingerprint.get(cursor.previousMarkerFingerprint);
+    if (!predecessor || predecessor.sequence !== sequence ||
+        cursor.previousMarkerFingerprint !== predecessor.markerFingerprint ||
+        cursor.fenceGeneration !== predecessor.fenceGeneration + 1) {
+      fail("managed history marker predecessor chain");
     }
-    if (cursor.previousMarkerFingerprint !== seal.markerFingerprint) fail("managed history marker predecessor seal");
+    cursor = predecessor;
   }
   return seal;
 }
