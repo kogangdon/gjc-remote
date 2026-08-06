@@ -1454,17 +1454,33 @@ function setSuccessorHeadPhase(fixture, phase) {
     'reader-pending': ['closeFingerprint', 'authorityCommitSnapshotFingerprint', 'baselineFingerprint', 'publicationKFingerprint', 'publicationYFingerprint', 'finalityFingerprint'],
   }[phase];
   const fields = ['closeFingerprint', 'authorityCommitSnapshotFingerprint', 'baselineFingerprint', 'publicationKFingerprint', 'publicationYFingerprint', 'finalityFingerprint', 'receiptFingerprint', 'historyMarkerFingerprint'];
+  const predecessorPhase = {
+    closed: 'reserved',
+    replaced: 'closed',
+    'reader-pending': 'replaced',
+    terminal: 'reader-pending',
+  }[phase];
+  const predecessorPath = predecessorPhase === undefined && phase === 'reserved' && terminal.sequence > 2
+    ? [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith(`/authority-head-${terminal.sequence - 1}-terminal.json`))
+    : predecessorPhase === undefined
+      ? null
+      : [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith(`/authority-head-${terminal.sequence}-${predecessorPhase}.json`));
+  const predecessor = predecessorPath ? JSON.parse(fixture.files.get(predecessorPath)) : null;
   const head = buildAuthoritySuccessorRecord({
     ...terminal,
     phase,
     ...Object.fromEntries(fields.map((field) => [field, keep.includes(field) ? terminal[field] : null])),
-    previousHeadFingerprint: null,
+    previousHeadFingerprint: predecessor?.headFingerprint ?? null,
     headFingerprint: null,
   }, 'headFingerprint');
-  fixture.files.set(headPath, Buffer.from(canonicalJson(head)));
+  const headBytes = Buffer.from(canonicalJson(head));
+  fixture.files.set(headPath, headBytes);
   fixture.files.set(markerPath, Buffer.from(canonicalJson(fixture.genesisMarker)));
+  const historicalPath = headPath.replace(/authority-head\.json$/, `authority-head-${terminal.sequence}-${phase}.json`);
+  fixture.files.set(historicalPath, Buffer.from(headBytes));
   for (const path of [...fixture.files.keys()]) {
-    if (typeof path === 'string' && [`/authority-head-${terminal.sequence}-${phase}.json`, `/authority-head-${terminal.sequence}-terminal.json`].some((suffix) => path.replaceAll('\\', '/').endsWith(suffix))) {
+    if (typeof path === 'string' && phase !== 'terminal' &&
+        path.replaceAll('\\', '/').endsWith('/authority-head-' + terminal.sequence + '-terminal.json')) {
       fixture.files.delete(path);
     }
   }
@@ -2267,6 +2283,52 @@ test('sequence-two detached Genesis predecessor refuses snapshot and replay with
   await assert.rejects(
     harness.native.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true }),
     /predecessor|Genesis|successor|bundle|lineage/i,
+  );
+  assert.equal(harness.writes.length, writes);
+});
+test('self-hashed detached successor head refuses managed snapshot, replay, and public bundle validation', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=detached-head'))).ok, true);
+  for (const [index, hostTokens] of ['host=detached-head-map', 'host=detached-head-rotated'].entries()) {
+    const state = await harness.native.readManagementState();
+    const candidate = mappingInput(`detached-head-${index}`, state.mappingGeneration + 1, state.fenceGeneration, String(123 + index));
+    const result = index === 0
+      ? await runtime.execute('mapping-reconcile', {
+        actorPrincipal: owner,
+        actorSecret: secret,
+        idempotencyKey: `detached-head-${index}`,
+        mappingId: candidate.mapping.mappingId,
+        ...candidate,
+        expectedRevision: state.revision,
+        expectedFingerprint: null,
+      })
+      : await runtime.execute('tokens-attest', {
+        actorPrincipal: owner,
+        actorSecret: secret,
+        idempotencyKey: `detached-head-${index}`,
+        hostTokens,
+      });
+    assert.equal(result.ok, true, JSON.stringify(result));
+  }
+  const validBundle = await harness.native.readSuccessorBundle();
+  const headPath = filePathEnding(harness.files, '/authority-head.json');
+  const current = JSON.parse(harness.files.get(headPath));
+  const detached = buildAuthoritySuccessorRecord({
+    ...current,
+    previousHeadFingerprint: '0'.repeat(64),
+    headFingerprint: null,
+  }, 'headFingerprint');
+  harness.files.set(headPath, Buffer.from(canonicalJson(detached)));
+  const writes = harness.writes.length;
+  harness.setPrincipal(botPrincipal);
+  await assert.rejects(harness.native.readManagedMappingSnapshot(), /successor|bundle|snapshot/i);
+  harness.setPrincipal(owner);
+  await assert.rejects(harness.native.readSuccessorBundle({ allowTerminalReplay: true, readReplay: true }), /successor|bundle|lineage/i);
+  await assert.rejects(harness.native.readTerminalizationLineage({ txId: detached.txId }), /successor|lineage|terminal/i);
+  await assert.rejects(
+    harness.native.validateAuthoritySuccessorBundle({ ...validBundle, head: detached }),
+    /successor|bundle|invalid/i,
   );
   assert.equal(harness.writes.length, writes);
 });

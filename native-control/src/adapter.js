@@ -1338,6 +1338,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         genesisTokenFloor,
       });
       validateAuthoritySuccessorHead(head, request, genesisAuthorityRequest);
+      const predecessorHead = await readSuccessorHeadPredecessor(head);
+      validateAuthoritySuccessorHeadTransition(predecessorHead, head, request, genesisAuthorityRequest);
       if (suffix !== null) {
         if (canonical(request) !== canonical(suffix.request) ||
             canonical(finality) !== canonical(suffix.finality) ||
@@ -2138,6 +2140,28 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     } catch {
       refused(operation, 'matching durable successor receipt is required for the active reader-pending authority head');
     }
+  };
+  const readSuccessorHeadPredecessor = async (head) => {
+    if (head === null) return null;
+    const previousPhase = {
+      closed: 'reserved',
+      replaced: 'closed',
+      'reader-pending': 'replaced',
+      terminal: 'reader-pending',
+    }[head.phase];
+    if (previousPhase !== undefined) {
+      const predecessor = await read(path(`authority-head-${head.sequence}-${previousPhase}`));
+      if (predecessor === null) throw new TypeError('successor head predecessor archive absent');
+      return predecessor;
+    }
+    if (head.phase !== 'reserved') throw new TypeError('successor head predecessor phase');
+    if (head.sequence === 2) return null;
+    if (!Number.isSafeInteger(head.sequence) || head.sequence < 2) {
+      throw new TypeError('successor head predecessor sequence');
+    }
+    const predecessor = await read(path(`authority-head-${head.sequence - 1}-terminal`));
+    if (predecessor === null) throw new TypeError('successor head predecessor archive absent');
+    return predecessor;
   };
   const readAuthoritativeSuccessorPredecessor = async (
     head,
@@ -5366,6 +5390,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
             );
             validateAuthoritySuccessorPredecessor(bundle.request, predecessor, genesisAuthorityRequest);
           }
+          const predecessorHead = await readSuccessorHeadPredecessor(headBefore);
+          validateAuthoritySuccessorHeadTransition(predecessorHead, headBefore, bundle.request, genesisAuthorityRequest);
           validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest);
         } catch {
           refused('read_managed_mapping_snapshot', 'successor authority bundle is torn or substituted');
@@ -6407,6 +6433,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           );
           validateAuthoritySuccessorPredecessor(bundle.request, predecessor, genesisAuthorityRequest);
         }
+        const predecessorHead = await readSuccessorHeadPredecessor(head);
+        validateAuthoritySuccessorHeadTransition(predecessorHead, head, bundle.request, genesisAuthorityRequest);
         validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest);
       } catch {
         refused('read_authority_successor_bundle', 'successor bundle is torn or substituted');
@@ -6718,6 +6746,8 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           );
           validateAuthoritySuccessorPredecessor(bundle.request, predecessor, genesisAuthorityRequest);
         }
+        const predecessorHead = await readSuccessorHeadPredecessor(bundle.head);
+        validateAuthoritySuccessorHeadTransition(predecessorHead, bundle.head, bundle.request, genesisAuthorityRequest);
         return validateAuthoritySuccessorBundle(bundle, genesisAuthorityRequest);
       } catch {
         refused('validate_authority_successor_bundle', 'successor authority bundle is invalid');
