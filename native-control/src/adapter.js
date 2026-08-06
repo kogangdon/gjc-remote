@@ -318,10 +318,10 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (profile !== null && !await lowLevel.verify_exact_role_acl(name, ...roleArguments(profile))) refused('verify_management_object', 'object exact role ACL changed or is unreadable');
     return { identity, acl };
   };
-  const cleanupGenericWriteTemp = async (name, bytes, parentIdentity, profile, expectedIdentity) => {
+  const cleanupGenericWriteTemp = async (name, bytes, parentIdentity, profile, expectedIdentity, replacementAttempted = false) => {
     try {
       if (await lowLevel.read_verified_bytes(name) === null) {
-        return !(await lowLevel.path_exists_no_follow(name));
+        return replacementAttempted ? false : !(await lowLevel.path_exists_no_follow(name));
       }
       if (!expectedIdentity) return false;
       const verified = await assertObject(name, bytes, parentIdentity, undefined, profile);
@@ -340,22 +340,28 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
   const hasPublishedAuthority = async () => (await lowLevel.read_verified_bytes(path('control-root'))) !== null;
   const terminalReplayMatches = async ({ record = null, kind = null, readReplay = false, candidateSuffix = null } = {}) => {
     try {
+      if (record !== null) {
+        if (!['receipt', 'marker', 'head', 'state'].includes(kind)) return false;
+      } else if (!readReplay) {
+        return false;
+      }
       const state = await rawRead(path('management-state'));
       const terminal = await rawRead(path('terminal-close'));
       if (!state || !terminal) return false;
+      validateManualCleanup(terminal);
+      if (!['terminal', 'terminalizing', 'manual_cleanup'].includes(state.recovery?.phase)) return false;
       const persistedSuffix = state.recovery?.txId
         ? await rawRead(path(`terminalization-suffix-${encodeURIComponent(state.recovery.txId)}`))
         : null;
-      const suffix = candidateSuffix ?? state.recovery?.terminalization ?? persistedSuffix;
-      if (state.recovery?.phase === 'manual_cleanup' && suffix !== null && persistedSuffix !== null) {
-        validateTerminalizationSuffix(suffix);
-        if (canonical(persistedSuffix) !== canonical(suffix)) return false;
-        return true;
-      }
-      if (!suffix || !['terminal', 'terminalizing', 'manual_cleanup'].includes(state.recovery?.phase)) return false;
-      validateManualCleanup(terminal);
-      if (persistedSuffix === null || canonical(persistedSuffix) !== canonical(suffix)) return false;
-      if (!await validateTerminalizationBinding({ state, terminal, suffix })) return false;
+      if (persistedSuffix === null) return false;
+      const embeddedSuffix = state.recovery?.terminalization;
+      if (embeddedSuffix !== undefined && canonical(embeddedSuffix) !== canonical(persistedSuffix)) return false;
+      const suffix = candidateSuffix ?? embeddedSuffix ?? persistedSuffix;
+      if (!suffix || canonical(persistedSuffix) !== canonical(suffix)) return false;
+      const allowMissingName = (record === null || (kind === 'receipt' && readReplay))
+        ? path(`authority-successor-receipt-${encodeURIComponent(suffix.txId)}`)
+        : null;
+      if (!await validateTerminalizationBinding({ state, terminal, suffix, allowMissingName })) return false;
       const currentHead = await rawRead(path('authority-head'));
       if (!currentHead ||
           (canonical(currentHead) !== canonical(suffix.pendingHead) &&
@@ -365,9 +371,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         if (kind === 'marker' && canonical(record) !== canonical(suffix.marker)) return false;
         if (kind === 'head' && canonical(record) !== canonical(suffix.terminalHead)) return false;
         if (kind === 'state' && !managementStateTerminalReplayMatches(record, suffix)) return false;
-        if (!['receipt', 'marker', 'head', 'state'].includes(kind)) return false;
-      } else if (!readReplay) {
-        return false;
       }
       return true;
     } catch {
@@ -384,15 +387,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       refused(operation, 'durable terminal-close record is unreadable; route disposition is no-route');
     }
     if (allowTerminalReplay && await terminalReplayMatches({ record, kind, readReplay })) return;
-    if (allowTerminalReplay && readReplay && record === null) {
-      try {
-        const state = await rawRead(path('management-state'));
-        if (state?.recovery?.phase === 'manual_cleanup' && state.recovery.terminalization !== undefined) {
-          validateTerminalizationSuffix(state.recovery.terminalization);
-          return;
-        }
-      } catch {}
-    }
     refused(operation, 'terminal cleanup state is active; route disposition is no-route');
   };
   const requireGenesisProof = async () => { if (!prospectiveProof && !await hasPublishedAuthority()) refused('management_authority', 'prospective cleanup must complete before authority publication'); };
@@ -443,14 +437,16 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       const before = await assertObject(name, Buffer.from(old), parentIdentity);
       const temp = await lowLevel.create_exclusive_temp(dirname(name), tempPrefix, bytes, ...roleArgs);
       let scratch = null;
+      let replacementAttempted = false;
       try {
         scratch = await assertObject(temp, bytes, parentIdentity, undefined, profile);
         await lowLevel.flush_file(temp);
         await assertObject(name, Buffer.from(old), parentIdentity, before.acl);
+        replacementAttempted = true;
         await lowLevel.replace_existing_atomic(temp, name, ...roleArgs);
         await assertObject(name, bytes, parentIdentity, scratch.acl);
       } catch (error) {
-        if (!await cleanupGenericWriteTemp(temp, bytes, parentIdentity, profile, scratch?.identity)) {
+        if (!await cleanupGenericWriteTemp(temp, bytes, parentIdentity, profile, scratch?.identity, replacementAttempted)) {
           refused(cleanupOperation, 'generic write temporary artifact cleanup is ambiguous; manual cleanup is required');
         }
         throw error;
@@ -668,10 +664,19 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
     }
   };
-  const validateHistoryMarkerSeal = (seal, expectedAnchor) => {
+  const validateHistoryMarkerSeal = (seal, expectedAnchor, marker = null) => {
     if (seal === null) return;
     validateHistoryMarkerRelation(seal, { anchorFingerprint: expectedAnchor, sequence: 1 });
     if (seal.fenceGeneration !== 1) throw new TypeError('Genesis history marker seal fence');
+    if (marker !== null) {
+      validateHistoryMarkerRelation(marker, { anchorFingerprint: expectedAnchor });
+      if (marker.sequence === 1 && canonical(marker) !== canonical(seal)) {
+        throw new TypeError('Genesis history marker seal mismatch');
+      }
+      if (marker.sequence === 2 && marker.previousMarkerFingerprint !== seal.markerFingerprint) {
+        throw new TypeError('managed history marker predecessor is not sealed');
+      }
+    }
   };
   const readSealAwareHistoryMarker = async (operation = 'read_managed_history_marker') => {
     const marker = await rawRead(historyMarkerPath);
@@ -679,20 +684,20 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const expectedAnchor = await anchorFingerprint();
     const seal = await rawRead(path(historyMarkerSealName));
     if (seal === null && await hasPublishedAuthority()) refused(operation, 'durable Genesis history marker seal is absent');
+    try {
+      validateHistoryMarkerRelation(marker, { anchorFingerprint: expectedAnchor });
+    } catch {
+      refused(operation, 'managed history marker is invalid or not bound to the live authority');
+    }
     if (seal !== null) {
       try {
-        validateHistoryMarkerSeal(seal, expectedAnchor);
+        validateHistoryMarkerSeal(seal, expectedAnchor, marker);
       } catch {
         refused(operation, 'durable Genesis history marker seal is invalid');
       }
       if (marker.sequence === 1 && canonical(marker) !== canonical(seal)) {
         refused(operation, 'durable Genesis history marker seal mismatch');
       }
-    }
-    try {
-      validateHistoryMarkerRelation(marker, { anchorFingerprint: expectedAnchor });
-    } catch {
-      refused(operation, 'managed history marker is invalid or not bound to the live authority');
     }
     return { marker, seal };
   };
@@ -743,11 +748,6 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     return suffix;
   };
   const managementStateTerminalReplayMatches = (state, suffix) => {
-    const recovery = state?.recovery;
-    if (recovery?.phase === 'manual_cleanup' && recovery?.terminalization !== undefined) {
-      try { validateTerminalizationSuffix(recovery.terminalization); } catch { return false; }
-      return canonical(recovery.terminalization) === canonical(suffix);
-    }
     const withoutRecovery = (value) => {
       const clone = structuredClone(value);
       delete clone.recovery;
@@ -755,18 +755,20 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     };
     if (canonical(withoutRecovery(state)) !== canonical(withoutRecovery(suffix.finalState))) return false;
     if (canonical(state?.recovery) === canonical(suffix.finalState.recovery)) return true;
+    const recovery = state?.recovery;
     if (!recovery || !['terminalizing', 'manual_cleanup'].includes(recovery.phase) ||
         recovery.routeDisposition !== 'no-route' ||
         recovery.txId !== suffix.txId ||
         recovery.requestFingerprint !== suffix.request.requestFingerprint ||
-        recovery.successorHeadFingerprint !== suffix.terminalHead.headFingerprint ||
-        recovery.fenceGeneration !== suffix.finality.fenceGeneration ||
-        recovery.finalityFingerprint !== suffix.finality.finalityFingerprint ||
+        (recovery.successorHeadFingerprint !== suffix.pendingHead.headFingerprint &&
+         recovery.successorHeadFingerprint !== suffix.terminalHead.headFingerprint) ||
+        (recovery.fenceGeneration !== undefined && recovery.fenceGeneration !== suffix.finality.fenceGeneration) ||
+        (recovery.finalityFingerprint !== undefined && recovery.finalityFingerprint !== suffix.finality.finalityFingerprint) ||
         recovery.terminalization === undefined) return false;
     try { validateTerminalizationSuffix(recovery.terminalization); } catch { return false; }
     return canonical(recovery.terminalization) === canonical(suffix);
   };
-  const validateTerminalizationBinding = async ({ state, terminal, suffix }) => {
+  const validateTerminalizationBinding = async ({ state, terminal, suffix, allowMissingName = null }) => {
     try {
       validateManualCleanup(terminal);
       validateTerminalizationSuffix(suffix);
@@ -775,6 +777,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           terminal.fenceGeneration !== suffix.finality.fenceGeneration ||
           terminal.expectedFingerprint !== suffix.request.requestFingerprint) return false;
       if (!managementStateTerminalReplayMatches(state, suffix)) return false;
+      if (state?.recovery?.manualCleanupFingerprint !== undefined &&
+          terminal.manualCleanupFingerprint !== state.recovery.manualCleanupFingerprint) return false;
       const tx = encodeURIComponent(suffix.txId);
       const expected = [
         [`authority-successor-request-${tx}`, suffix.request],
@@ -785,12 +789,14 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       if (suffix.projection !== null) expected.push([`bot-state/successor-reader-projection-${tx}`, suffix.projection]);
       if (suffix.ack !== null) expected.push([`bot-state/successor-ack-${tx}`, suffix.ack]);
       for (const [name, value] of expected) {
-        const durable = await read(path(name));
-        if (durable === null || canonical(durable) !== canonical(value)) return false;
+        const durableName = path(name);
+        const durable = await read(durableName);
+        if (durable === null && durableName !== allowMissingName) return false;
+        if (durable !== null && canonical(durable) !== canonical(value)) return false;
       }
       const currentMarker = (await readSealAwareHistoryMarker()).marker;
-      if (currentMarker !== null &&
-          canonical(currentMarker) !== canonical(suffix.marker) &&
+      if (currentMarker === null) return false;
+      if (canonical(currentMarker) !== canonical(suffix.marker) &&
           (currentMarker.markerFingerprint !== suffix.marker.previousMarkerFingerprint ||
            currentMarker.sequence !== suffix.marker.sequence - 1 ||
            currentMarker.anchorFingerprint !== suffix.marker.anchorFingerprint)) return false;
@@ -817,13 +823,8 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         } catch {
           return false;
         }
-        if (state.recovery.phase === 'manual_cleanup') {
-          if (terminal.txId !== suffix.txId ||
-              terminal.fenceGeneration !== suffix.finality.fenceGeneration ||
-              terminal.expectedFingerprint !== suffix.request.requestFingerprint) return false;
-          return true;
-        }
-        if (!await validateTerminalizationBinding({ state, terminal, suffix })) return false;
+        const allowMissingName = path(`authority-successor-receipt-${encodeURIComponent(suffix.txId)}`);
+        if (!await validateTerminalizationBinding({ state, terminal, suffix, allowMissingName })) return false;
         const currentHead = await rawRead(path('authority-head'));
         if (!currentHead ||
             (canonical(currentHead) !== canonical(suffix.pendingHead) &&
@@ -1623,7 +1624,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       return marker;
     },
     async commitManagedHistoryMarker(record) {
-      await requireNoTerminalClose('commit_managed_history_marker', { allowTerminalReplay: true, record, kind: 'marker' });
+      await requireNoTerminalClose('commit_managed_history_marker', { allowTerminalReplay: true, readReplay: true, record, kind: 'marker' });
       const expectedAnchor = await anchorFingerprint();
       validateHistoryMarkerRelation(record, { anchorFingerprint: expectedAnchor });
       const authorityRequest = await requireAuthorityRequest('commit_managed_history_marker');
@@ -1635,7 +1636,13 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       ]);
       try { validateHistoryMarkerSeal(seal, expectedAnchor); } catch { refused('commit_managed_history_marker', 'durable Genesis history marker seal is invalid'); }
       if (current !== null) {
+        if (seal === null) {
+          refused('commit_managed_history_marker', 'durable Genesis history marker seal is absent');
+        }
         validateHistoryMarkerRelation(current, { anchorFingerprint: expectedAnchor });
+        try { validateHistoryMarkerSeal(seal, expectedAnchor, current); } catch {
+          refused('commit_managed_history_marker', 'durable Genesis history marker seal is invalid');
+        }
         if (current.sequence === 1) validateGenesisAuthorityReceiptForMarker(genesisAuthorityReceipt, authorityRequest);
         if (current.sequence === 1 && seal !== null && canonical(seal) !== canonical(current)) {
           refused('commit_managed_history_marker', 'durable Genesis history marker seal does not match the live marker');
@@ -3662,7 +3669,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           if ((bundle.readerFloor.readerVersionFloor === 2) !== (bundle.request?.readerMode === 'bound-reader')) {
             throw new TypeError('successor reader floor branch');
           }
-          validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint);
+          validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint, bundle.historyMarker);
           if (!bundle.historyMarkerSeal ||
               (bundle.historyMarker.sequence === 1 && canonical(bundle.historyMarker) !== canonical(bundle.historyMarkerSeal))) {
             throw new TypeError('successor history marker seal');
@@ -4300,7 +4307,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           if (value.finalityFingerprint !== finality.finalityFingerprint) throw new TypeError('finality head binding');
         }
         if (phase >= 4) {
-          const marker = await rawRead(historyMarkerPath);
+          const marker = (await readSealAwareHistoryMarker('write_authority_successor_head')).marker;
           validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack);
           validateHistoryMarkerRelation(marker, {
             anchorFingerprint: request.anchorFingerprint,
@@ -4469,7 +4476,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         if ((bundle.readerFloor.readerVersionFloor === 2) !== (bundle.request?.readerMode === 'bound-reader')) {
           throw new TypeError('successor reader floor branch');
         }
-        validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint);
+        validateHistoryMarkerSeal(bundle.historyMarkerSeal, bundle.request.anchorFingerprint, bundle.historyMarker);
         if (!bundle.historyMarkerSeal ||
             (bundle.historyMarker.sequence === 1 && canonical(bundle.historyMarker) !== canonical(bundle.historyMarkerSeal))) {
           throw new TypeError('successor history marker seal');
@@ -4604,7 +4611,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       return value;
     },
     async writeAuthoritySuccessorReceipt(value) {
-      await requireNoTerminalClose('write_authority_successor_receipt', { allowTerminalReplay: true, record: value, kind: 'receipt' });
+      await requireNoTerminalClose('write_authority_successor_receipt', { allowTerminalReplay: true, readReplay: true, record: value, kind: 'receipt' });
       await requireManagementPrincipal('write_authority_successor_receipt');
       const tx = encodeURIComponent(value.txId);
       const [request, finality, lease, projection, ack] = await Promise.all([
@@ -4615,6 +4622,12 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
       const head = await read(path('authority-head'));
       try {
         validateAuthoritySuccessorHead(head, request);
+        if (head.phase === 'terminal') {
+          const historyEvidence = await readSealAwareHistoryMarker('write_authority_successor_receipt');
+          if (!historyEvidence.marker || historyEvidence.marker.markerFingerprint !== head.historyMarkerFingerprint) {
+            throw new TypeError('terminal successor history marker');
+          }
+        }
         if (head.phase === 'reader-pending') {
           if (head.txId !== value.txId || head.finalityFingerprint !== finality.finalityFingerprint) throw new TypeError('matching reader-pending authority head');
         } else if (head.phase === 'terminal' && head.receiptFingerprint === value.receiptFingerprint) {

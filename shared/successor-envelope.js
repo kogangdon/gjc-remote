@@ -18,6 +18,26 @@ const readerModes = new Set(["no-reader", "bound-reader"]);
 const phases = new Set(["reserved", "closed", "replaced", "reader-pending", "terminal"]);
 const assertHash = (record, field) => { if (!hex(record[field]) || record[field] !== fingerprint(record, field)) fail(`${record.kind} fingerprint`); };
 const assertKeys = (record, keys) => { if (!exact(record, keys) || record.version !== 1) fail("exact schema"); };
+const managedHistoryMarkerKeys = ["version", "kind", "anchorFingerprint", "sequence", "fenceGeneration", "previousMarkerFingerprint", "markerFingerprint"];
+export function validateManagedHistoryMarker(record, anchorFingerprint = undefined, expectedSequence = undefined) {
+  assertKeys(record, managedHistoryMarkerKeys);
+  if (record.kind !== "managed-history-marker" || !hex(record.anchorFingerprint) || !positive(record.sequence) ||
+      !positive(record.fenceGeneration) || (record.sequence === 1 ? record.previousMarkerFingerprint !== null : !hex(record.previousMarkerFingerprint))) {
+    fail("managed history marker fields");
+  }
+  if (anchorFingerprint !== undefined && record.anchorFingerprint !== anchorFingerprint) fail("managed history marker anchor");
+  if (expectedSequence !== undefined && record.sequence !== expectedSequence) fail("managed history marker sequence");
+  assertHash(record, "markerFingerprint");
+  return record;
+}
+export function validateManagedHistoryMarkerSeal(marker, seal, anchorFingerprint = undefined) {
+  if (marker === null || seal === null) fail("managed history marker seal");
+  validateManagedHistoryMarker(marker, anchorFingerprint);
+  validateManagedHistoryMarker(seal, anchorFingerprint, 1);
+  if (marker.sequence === 1 && marker.markerFingerprint !== seal.markerFingerprint) fail("managed history marker seal mismatch");
+  if (marker.sequence === 2 && marker.previousMarkerFingerprint !== seal.markerFingerprint) fail("managed history marker predecessor seal");
+  return seal;
+}
 const assertFence = (record, expected = undefined) => {
   if (!positive(record.fenceGeneration) || (expected !== undefined && record.fenceGeneration !== expected)) fail("fence generation");
 };
@@ -167,13 +187,17 @@ export function validateAuthoritySuccessorHeadTransition(previous, next, request
 export const buildAuthoritySuccessorRecord = (record, fingerprintField) => { const value = { ...record, [fingerprintField]: null }; value[fingerprintField] = fingerprint(value, fingerprintField); return value; };
 export const authoritySuccessorFingerprint = fingerprint;
 export function validateAuthoritySuccessorBundle(bundle) {
-  const { request, close = null, fence = null, baseline = null, commit = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, head } = bundle ?? {};
+  const { request, close = null, fence = null, baseline = null, commit = null, publicationK = null, publicationY = null, finality = null, lease = null, projection = null, ack = null, receipt = null, historyMarker = null, historyMarkerSeal = null, head } = bundle ?? {};
   validateAuthoritySuccessorRequest(request); validateAuthoritySuccessorHead(head, request);
   if (close !== null) validateAuthorityCloseProof(close, request); if (fence !== null) validateAuthoritySuccessorFence(fence, request); if (baseline !== null) validateAuthoritySuccessorBaseline(baseline, request, close, fence); if (finality !== null) validateAuthoritySuccessorFinality(finality, request, baseline); if (lease !== null) validateAuthoritySuccessorLease(lease, request, fence); if (projection !== null) validateAuthoritySuccessorReaderProjection(projection, request, finality, lease); if (ack !== null) validateAuthoritySuccessorAck(ack, request, finality, projection); if (receipt !== null) validateAuthoritySuccessorReceipt(receipt, request, finality, lease, projection, ack);
   const candidateRecords = [close, fence, baseline, commit, publicationK, publicationY, finality, lease, projection, ack, receipt].filter((value) => value !== null);
   for (const record of candidateRecords) assertFence(record, request.candidateFenceGeneration);
   const fields = { closeFingerprint: close?.closeFingerprint ?? null, baselineFingerprint: baseline?.baselineFingerprint ?? null, finalityFingerprint: finality?.finalityFingerprint ?? null, receiptFingerprint: receipt?.receiptFingerprint ?? null };
   for (const [field, value] of Object.entries(fields)) if (head[field] !== value) fail(`AH ${field}`);
+  const expectedHistorySequence = head.phase === "terminal" ? head.sequence : head.sequence - 1;
+  if (historyMarker === null || historyMarkerSeal === null) fail("AH history evidence");
+  validateManagedHistoryMarker(historyMarker, head.anchorFingerprint, expectedHistorySequence);
+  validateManagedHistoryMarkerSeal(historyMarker, historyMarkerSeal, head.anchorFingerprint);
   const priorHistory = historyMarker !== null &&
     exact(historyMarker, ["version", "kind", "anchorFingerprint", "sequence", "fenceGeneration", "previousMarkerFingerprint", "markerFingerprint"]) &&
     historyMarker.version === 1 && historyMarker.kind === "managed-history-marker" &&

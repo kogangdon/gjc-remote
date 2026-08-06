@@ -420,57 +420,37 @@ export class ManagementRuntime {
       if (!evidence.request || !evidence.zFinality ||
           !evidence.finalityProof || !evidence.receipt ||
           evidence.request.genesisTxId !== expectedTxId ||
+          evidence.request.anchorFingerprint !== anchorFingerprint ||
+          evidence.request.generation !== expectedGeneration ||
           evidence.receipt.genesisTxId !== expectedTxId ||
           evidence.receipt.receiptFingerprint !== expectedReceiptFingerprint ||
           evidence.finalityProof.finalityProofFingerprint !== finalityFingerprint ||
           await this.native.recheckAdmissionFinality(evidence) !== true) {
         throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
       }
+      if (expectedAuthorityEpochFingerprint !== null &&
+          evidence.zFinality.authorityEpochFingerprint !== expectedAuthorityEpochFingerprint) {
+        throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+      }
+    }
+    const marker = await this.native.readManagedHistoryMarker();
+    try {
+      validateManagedHistoryMarker(marker, anchorFingerprint);
+    } catch {
+      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
     }
     await this.native.reopenAdmission({
       txId: expectedTxId,
       finalityFingerprint,
     });
-    const marker = await this.#commitGenesisHistory(anchorFingerprint);
-    if (!marker ||
-        marker.anchorFingerprint !== anchorFingerprint ||
-        marker.fenceGeneration !== 1 ||
-        marker.sequence !== 1 ||
-        marker.previousMarkerFingerprint !== null) {
-      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
-    }
-    const lineage = await this.native.readSuccessorTokenLineage();
-    validateTokenFloor(lineage?.floor);
-    validateTokenConfigAttestation(lineage?.attestation);
-    if (lineage.floor.anchorFingerprint !== anchorFingerprint ||
-        lineage.floor.fenceGeneration !== 1 ||
-        lineage.floor.lastCommittedTxId !== expectedTxId ||
-        lineage.floor.highestCommittedGeneration !== expectedGeneration ||
-        (evidence && lineage.floor.floorFingerprint !== evidence.zFinality.tokenFloorFingerprint)) {
-      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
-    }
-    if (typeof this.native.readAuthorityEpoch !== "function" ||
-        typeof this.native.readAuthorityEpochFloor !== "function") {
-      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
-    }
-    const epoch = await this.native.readAuthorityEpoch();
-    const epochFloor = await this.native.readAuthorityEpochFloor();
-    validateAuthorityEpoch(epoch);
-    if (!epochFloor ||
-        epoch.anchorFingerprint !== anchorFingerprint ||
-        epoch.commitTxId !== expectedTxId ||
-        epochFloor.anchorFingerprint !== anchorFingerprint ||
-        epochFloor.highestReservedAuthorityEpoch !== epoch.epoch ||
-        epochFloor.highestCommittedAuthorityEpoch !== epoch.epoch ||
-        epochFloor.lastReservationTxId !== epoch.reservationTxId ||
-        epochFloor.lastCommittedTxId !== epoch.commitTxId ||
-        epochFloor.floorFingerprint !== recordHash(epochFloor, "floorFingerprint") ||
-        (expectedAuthorityEpochFingerprint !== null &&
-          epoch.authorityEpochFingerprint !== expectedAuthorityEpochFingerprint) ||
-        (evidence && epoch.authorityEpochFingerprint !== evidence.zFinality.authorityEpochFingerprint)) {
-      throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
-    }
-    return { evidence, marker, lineage, epoch, finalityFingerprint };
+    return {
+      evidence,
+      marker,
+      epoch: evidence?.zFinality
+        ? { authorityEpochFingerprint: evidence.zFinality.authorityEpochFingerprint }
+        : null,
+      finalityFingerprint,
+    };
   }
   async #persistGenesisHandshakePending(state, { replayFingerprint, generation, hostSetFingerprint, admissionRequest, admissionGrant }) {
     const before = state.revision;
@@ -501,9 +481,18 @@ export class ManagementRuntime {
         completed?.receiptFingerprint,
         completed?.finalityFingerprint,
         state?.recovery?.generation ?? state?.tokenConfigGeneration,
-        state?.genesis?.authorityEpochFingerprint ?? null,
+        state?.genesis?.authorityEpochFingerprint ?? state?.recovery?.authorityEpochFingerprint ?? null,
         completed,
       );
+      let authorityEpochFingerprint = proof.epoch?.authorityEpochFingerprint ?? null;
+      if (!authorityEpochFingerprint) {
+        if (typeof this.native.readAuthorityEpoch !== "function") {
+          throw new Error("GENESIS_PROOF_REOPEN_REQUIRED");
+        }
+        const epoch = await this.native.readAuthorityEpoch();
+        validateAuthorityEpoch(epoch);
+        authorityEpochFingerprint = epoch.authorityEpochFingerprint;
+      }
       const reopened = await this.native.reopenAdmission({
         txId: completed.txId,
         finalityFingerprint: proof.finalityFingerprint,
@@ -511,7 +500,7 @@ export class ManagementRuntime {
       return {
         reopened,
         finalityFingerprint: proof.finalityFingerprint,
-        authorityEpochFingerprint: proof.epoch.authorityEpochFingerprint,
+        authorityEpochFingerprint,
       };
     } catch (error) {
       if (state) await this.#genesisManualCleanup(state, safe(error).code);
@@ -568,6 +557,12 @@ export class ManagementRuntime {
              (current.tokenAttestation && current.tokenAttestation.attestationFingerprint !== lineage.attestation.attestationFingerprint))))) {
         lineage = null;
         lineageReadFailure = "TOKEN_LINEAGE_HIGH_WATER_REGRESSION";
+      }
+      const terminalizationState = durableRecovery.terminalization?.finalState;
+      if (terminalizationState && typeof terminalizationState === "object") {
+        for (const [key, value] of Object.entries(terminalizationState)) {
+          if (key !== "recovery") current[key] = structuredClone(value);
+        }
       }
       current.recovery = {
         ...durableRecovery,

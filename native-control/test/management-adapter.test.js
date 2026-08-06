@@ -573,6 +573,45 @@ test('terminal replay requires an immutable terminalization suffix, not phase an
   });
   assert.equal(calls.length, writes);
 });
+test('terminal replay rejects torn terminal-close and embedded suffix hints without writes', async () => {
+  const { files, roles, lowLevel, calls } = fake();
+  const native = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles });
+  const request = records().request;
+  await native.probeProspectiveCleanup({
+    txId: request.genesisTxId,
+    targetPrincipal: { kind: 'sid', value: 'target' },
+    managementPrincipal: { kind: 'sid', value: roles.managementSid },
+    botPrincipal: { kind: 'sid', value: roles.botSid },
+    recoveryPrincipal: { kind: 'sid', value: roles.recoverySid },
+    managementProvisioningFingerprint: 'b'.repeat(64),
+    botProvisioningFingerprint: 'c'.repeat(64),
+    recoveryProvisioningFingerprint: 'd'.repeat(64),
+  });
+  await native.terminalCloseOrManualCleanup({ reason: 'embedded-suffix' });
+  const terminalPath = 'C:\\state\\.gjc-remote-control\\terminal-close.json';
+  const statePath = 'C:\\state\\.gjc-remote-control\\management-state.json';
+  const suffixPath = 'C:\\state\\.gjc-remote-control\\terminalization-suffix-embedded-suffix.json';
+  files.set(statePath, Buffer.from(canonicalJson({
+    recovery: {
+      phase: 'manual_cleanup',
+      txId: 'embedded-suffix',
+      terminalization: {},
+    },
+  })));
+  files.set(suffixPath, Buffer.from(canonicalJson({})));
+  const validTerminal = Buffer.from(files.get(terminalPath));
+  const writes = calls.length;
+  files.set(terminalPath, Buffer.from('{}'));
+  const malformedTerminal = new Map([...files].map(([name, bytes]) => [name, Buffer.from(bytes)]));
+  await assert.rejects(native.readManagedHistoryMarker(), /durable terminal-close record is unreadable|no-route/);
+  assert.deepEqual(files, malformedTerminal);
+  assert.equal(calls.length, writes);
+  files.set(terminalPath, validTerminal);
+  const beforeEmbeddedSuffix = new Map([...files].map(([name, bytes]) => [name, Buffer.from(bytes)]));
+  await assert.rejects(native.readManagedHistoryMarker(), /no-route/);
+  assert.deepEqual(files, beforeEmbeddedSuffix);
+  assert.equal(calls.length, writes);
+});
 test('terminal replay CAS rejects a complete-state mismatch without writes', async () => {
   const { files, roles, lowLevel, calls } = fake();
   const configPath = 'C:/state/channels.json';
@@ -917,7 +956,7 @@ test('successor recovery keeps retained proof source-aware for B and management-
   await assert.rejects(native.readSuccessorRecovery({ predecessorReceiptFingerprint: 'a'.repeat(64) }), /exact pending successor recovery is absent/);
 });
 test('managed history marker loss is terminal and marker rewinds are write-free', async () => {
-  const { files, roles, lowLevel } = fake();
+  const { files, roles, lowLevel, calls } = fake();
   const configPath = 'C:/state/channels.json';
   const targetBytes = Buffer.from('{"legacy":true}');
   files.set(configPath, targetBytes);
@@ -1046,6 +1085,48 @@ test('managed history marker loss is terminal and marker rewinds are write-free'
   await assert.rejects(native.commitManagedHistoryMarker(rewind), /monotonic replay successor/);
   assert.deepEqual(files, beforeRewind);
 
+  const pendingTailHead = buildAuthoritySuccessorRecord({
+    ...pendingHead,
+    sequence: 3,
+    fenceGeneration: 3,
+    txId: 'successor-3',
+    requestFingerprint: '4'.repeat(64),
+    phase: 'reader-pending',
+    finalityFingerprint: '9'.repeat(64),
+    previousHeadFingerprint: pendingHead.headFingerprint,
+    previousReceiptFingerprint: 'a'.repeat(64),
+    headFingerprint: null,
+  }, 'headFingerprint');
+  const successorTail = {
+    ...successorMarker,
+    sequence: 3,
+    fenceGeneration: 3,
+    previousMarkerFingerprint: successorMarker.markerFingerprint,
+    markerFingerprint: null,
+  };
+  successorTail.markerFingerprint = recordHash(successorTail, 'markerFingerprint');
+  files.set(markerPath, Buffer.from(canonicalJson(successorMarker)));
+  files.set('C:\\state\\.gjc-remote-control\\authority-head.json', Buffer.from(canonicalJson(pendingTailHead)));
+  files.delete(sealPath);
+  const missingSealWrites = calls.length;
+  const beforeSuccessorMissingSeal = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(successorTail), /seal is absent/);
+  assert.deepEqual(files, beforeSuccessorMissingSeal);
+  assert.equal(calls.length, missingSealWrites);
+  const substitutedSeal = { ...marker, anchorFingerprint: '0'.repeat(64), markerFingerprint: null };
+  substitutedSeal.markerFingerprint = recordHash(substitutedSeal, 'markerFingerprint');
+  files.set(sealPath, Buffer.from(canonicalJson(substitutedSeal)));
+  const substitutedSealWrites = calls.length;
+  const beforeSuccessorSubstitutedSeal = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(successorTail), /seal is invalid/);
+  assert.deepEqual(files, beforeSuccessorSubstitutedSeal);
+  assert.equal(calls.length, substitutedSealWrites);
+  files.set(sealPath, Buffer.from(canonicalJson(marker)));
+  const missingReceiptWrites = calls.length;
+  const beforeSuccessorMissingReceipt = new Map(files);
+  await assert.rejects(native.commitManagedHistoryMarker(successorTail), /matching durable successor receipt/);
+  assert.deepEqual(files, beforeSuccessorMissingReceipt);
+  assert.equal(calls.length, missingReceiptWrites);
   files.set(markerPath, Buffer.from('{}'));
   const beforeTorn = new Map(files);
   await assert.rejects(native.commitManagedHistoryMarker(marker), /exact canonical managed history marker/);
@@ -1229,7 +1310,7 @@ test('MST cleans retained artifacts after temp create, verification, flush, and 
   }
 });
 test('generic writes clean verified replacement temps or refuse ambiguous cleanup', async () => {
-  const phases = ['temp-verify', 'temp-flush', 'replace'];
+  const phases = ['temp-verify', 'temp-flush', 'replace', 'post-replace'];
   for (const phase of phases) {
     const { files, lowLevel, roles } = fake();
     const configPath = 'C:/state/channels.json';
@@ -1281,17 +1362,28 @@ test('generic writes clean verified replacement temps or refuse ambiguous cleanu
         if (path.includes('channels.json.tmp')) throw new Error('injected temp flush failure');
         return originalFlush(path);
       };
-    } else {
+    } else if (phase === 'replace') {
       lowLevel.replace_existing_atomic = async () => { throw new Error('injected replace failure'); };
+    } else {
+      lowLevel.replace_existing_atomic = async (from, to) => {
+        files.set(to, Buffer.from(files.get(from)));
+        files.delete(from);
+        throw new Error('injected post-rename replace failure');
+      };
     }
     try {
       const expectedFingerprint = canonicalJsonHash(auth);
       await assert.rejects(
         native.compareAndSwapManagementAuth(expectedFingerprint, replacement),
-        phase === 'temp-verify' ? /temporary artifact cleanup is ambiguous/ : /injected/,
+        phase === 'temp-verify' || phase === 'post-replace'
+          ? /temporary artifact cleanup is ambiguous/
+          : /injected/,
       );
       const temporary = [...files.keys()].filter((path) => path.includes('channels.json.tmp'));
       assert.equal(temporary.length, phase === 'temp-verify' ? 1 : 0, phase);
+      if (phase === 'post-replace') {
+        assert.deepEqual(files.get(authPath), Buffer.from(canonicalJson(replacement)));
+      }
     } finally {
       lowLevel.read_identity = originalIdentity;
       lowLevel.flush_file = originalFlush;

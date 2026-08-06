@@ -1573,6 +1573,29 @@ test('an interrupted reserved successor becomes durable manual cleanup and block
   assert.equal(replay.routeDisposition, 'no-route');
   assert.equal((await harness.native.readManagementState()).recovery.phase, 'manual_cleanup');
 });
+test('Genesis replay survives successor token and authority tail mutations', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  const input = genesisInput('host=secret');
+  assert.equal((await runtime.execute('genesis', input)).ok, true);
+  const genesisState = await harness.native.readManagementState();
+
+  const successor = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    hostTokens: 'host=rotated-secret',
+    idempotencyKey: 'genesis-replay-successor',
+  });
+  assert.equal(successor.ok, true, JSON.stringify(successor));
+  const successorState = await harness.native.readManagementState();
+  assert.ok(successorState.tokenConfigGeneration > genesisState.tokenConfigGeneration);
+  assert.ok(successorState.authorityEpoch > genesisState.authorityEpoch);
+
+  const replay = await runtime.execute('genesis', input);
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.genesisTxId, genesisState.genesis.txId);
+});
 test('Genesis terminal replay reopens the exact durable proof graph and fails closed on proof drift', async () => {
   const valid = adapter({ legacy: false });
   const validRuntime = new ManagementRuntime({ native: valid.native });
@@ -1586,23 +1609,16 @@ test('Genesis terminal replay reopens the exact durable proof graph and fails cl
   for (const tamper of [
     (harness) => harness.files.delete(filePath(harness.files, '/receipt.json')),
     (harness) => harness.files.set(filePath(harness.files, '/rvf.json'), Buffer.from('{}')),
+    (harness) => harness.files.set(filePath(harness.files, '/z-finality.json'), Buffer.from('{}')),
+    (harness) => {
+      const path = filePath(harness.files, '.managed-history.json');
+      harness.files.delete(path);
+    },
     (harness) => {
       const path = filePath(harness.files, '.managed-history.json');
       const marker = JSON.parse(harness.files.get(path));
       marker.markerFingerprint = '0'.repeat(64);
       harness.files.set(path, Buffer.from(canonicalJson(marker)));
-    },
-    (harness) => {
-      const path = filePath(harness.files, '/token-floor.json');
-      const floor = JSON.parse(harness.files.get(path));
-      floor.floorFingerprint = '0'.repeat(64);
-      harness.files.set(path, Buffer.from(canonicalJson(floor)));
-    },
-    (harness) => {
-      const path = filePath(harness.files, '/authority-epoch.json');
-      const epoch = JSON.parse(harness.files.get(path));
-      epoch.authorityEpochFingerprint = '0'.repeat(64);
-      harness.files.set(path, Buffer.from(canonicalJson(epoch)));
     },
   ]) {
     const harness = adapter({ legacy: false });
