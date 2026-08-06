@@ -205,6 +205,9 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /ACL_OTHER/);
   assert.match(source, /AT_EMPTY_PATH/);
   assert.match(source, /bool VerifyNoGroupMutationAcl\(HANDLE handle\)/);
+  assert.match(source, /ConvertStringSidToSidW\(L"S-1-5-18", &configured_system_sid\)/);
+  assert.match(source, /const bool is_configured_system_sid = EqualSid\(sid, configured_system_sid\)/);
+  assert.match(source, /!is_configured_system_sid &&/);
   assert.match(source, /bool VerifyWindowsNamedIdentity\(HANDLE parent/);
   assert.match(source, /published_info\.nFileIndexHigh == temporary_info\.nFileIndexHigh/);
   assert.match(source, /source_absent/);

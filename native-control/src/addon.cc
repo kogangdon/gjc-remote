@@ -498,6 +498,8 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
       (control & SE_DACL_PROTECTED) != 0 && dacl != nullptr &&
       GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation) &&
       size.AceCount == 4;
+  PSID configured_system_sid = nullptr;
+  if (valid && !ConvertStringSidToSidW(L"S-1-5-18", &configured_system_sid)) valid = false;
   for (DWORD index = 0; valid && index < size.AceCount; ++index) {
     void* raw = nullptr;
     if (!GetAce(dacl, index, &raw)) { valid = false; break; }
@@ -507,6 +509,7 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
     ACCESS_ALLOWED_ACE* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
     PSID sid = reinterpret_cast<PSID>(&ace->SidStart);
     if (!IsValidSid(sid)) { valid = false; break; }
+    const bool is_configured_system_sid = EqualSid(sid, configured_system_sid);
     DWORD name_length = 0, domain_length = 0;
     SID_NAME_USE use = SidTypeUnknown;
     LookupAccountSidW(nullptr, sid, nullptr, &name_length, nullptr, &domain_length, &use);
@@ -521,11 +524,13 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
     std::vector<wchar_t> domain(domain_length);
     if (!LookupAccountSidW(nullptr, sid, account.data(), &name_length, domain.data(),
                            &domain_length, &use) ||
-        use == SidTypeGroup || use == SidTypeAlias || use == SidTypeWellKnownGroup) {
+        (!is_configured_system_sid &&
+         (use == SidTypeGroup || use == SidTypeAlias || use == SidTypeWellKnownGroup))) {
       valid = false;
       break;
     }
   }
+  LocalFree(configured_system_sid);
   LocalFree(descriptor);
   return valid;
 }
