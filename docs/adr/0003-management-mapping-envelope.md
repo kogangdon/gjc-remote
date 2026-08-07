@@ -91,27 +91,33 @@ create/rename/unlink in that directory durable across a crash — this is the
 same guarantee POSIX callers get from `fsync()` on a directory file
 descriptor, which this codepath mirrors.
 
-A full volume-wide flush (every dirty page across the volume, not just this
-directory's metadata) is strictly stronger and remains an **optional,
-best-effort elevated extra**: after the directory-handle flush succeeds, the
-addon attempts to open the containing volume and flush it too, but never
-surfaces or depends on that attempt's outcome. If the process happens to run
-elevated, callers get the stronger guarantee for free; if not, they still get
-the directory-durability guarantee that was actually achieved.
+This directory-handle flush is the addon's **only** durability primitive on
+Windows: no volume-level flush is attempted, elevated or otherwise, so the
+process never needs (and never requests) `SeManageVolumePrivilege`. Before
+flushing, `flush_directory_or_volume` confirms via
+`GetVolumeInformationByHandleW` on the open directory handle that the
+directory's volume reports the `NTFS` filesystem name. This codepath's
+durability semantics — a directory-handle `FlushFileBuffers` making prior
+create/rename/unlink in that directory durable across a crash — are proven
+only for NTFS; any other filesystem reported for the handle's volume (FAT32,
+exFAT, ReFS, a network share, etc.) fails closed rather than returning a
+durability guarantee the addon cannot back up.
 
 This function fails closed, not silently: if the verified no-follow open of
-the directory fails, or the directory-handle `FlushFileBuffers` call itself
-fails, `flush_directory_or_volume` refuses with `ERR_NATIVE_CONTROL_REFUSED`
-and reports zero writes. It never claims volume-wide durability it did not
-achieve, and never downgrades a failed directory flush into a silent no-op.
+the directory fails, the filesystem cannot be confirmed as NTFS, or the
+directory-handle `FlushFileBuffers` call itself fails, `flush_directory_or_volume`
+refuses with `ERR_NATIVE_CONTROL_REFUSED` and reports zero writes. It never
+claims durability it did not achieve, and never downgrades a failed
+directory flush into a silent no-op.
 
 ## Windows replace-rename POSIX semantics
 `replace_existing_atomic`'s handle-relative, retained-parent rename uses
 `FileRenameInformationEx` (info class 65) with `FILE_RENAME_REPLACE_IF_EXISTS
 | FILE_RENAME_POSIX_SEMANTICS` first, falling back to the legacy
 `FileRenameInformation` (info class 10, `ReplaceIfExists = TRUE`) only when
-the running kernel reports `STATUS_NOT_SUPPORTED`,
-`STATUS_INVALID_INFO_CLASS`, or `STATUS_INVALID_PARAMETER` for the `Ex` info
+the running kernel or filesystem reports `STATUS_NOT_SUPPORTED`,
+`STATUS_INVALID_INFO_CLASS`, `STATUS_INVALID_PARAMETER`,
+`STATUS_NOT_IMPLEMENTED`, or `STATUS_INVALID_DEVICE_REQUEST` for the `Ex` info
 class. POSIX semantics let the filesystem replace a target that still has
 other open, properly-shared (`FILE_SHARE_DELETE`) handles — for example a
 caller-retained read/write handle obtained via `open_verified_object_handle`

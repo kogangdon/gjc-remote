@@ -387,12 +387,16 @@ bool RenameWindowsRelative(HANDLE object, HANDLE parent, const std::wstring& nam
         static_cast<ULONG>(ex_buffer.size()), kFileRenameInformationEx);
     if (ex_result >= 0) return true;
     // STATUS_NOT_SUPPORTED / STATUS_INVALID_INFO_CLASS / STATUS_INVALID_PARAMETER
-    // mean the running kernel predates FileRenameInformationEx; fall back to
-    // the legacy info class below. Any other failure (e.g. a genuine ACL
-    // denial) is authoritative and must not be masked by a silent retry.
+    // / STATUS_NOT_IMPLEMENTED / STATUS_INVALID_DEVICE_REQUEST mean the
+    // running kernel or filesystem predates or otherwise cannot service
+    // FileRenameInformationEx; fall back to the legacy info class below. Any
+    // other failure (e.g. a genuine ACL denial) is authoritative and must
+    // not be masked by a silent retry.
     if (ex_result != static_cast<LONG>(0xC00000BBu) &&
         ex_result != static_cast<LONG>(0xC0000003u) &&
-        ex_result != static_cast<LONG>(0xC000000Du)) {
+        ex_result != static_cast<LONG>(0xC000000Du) &&
+        ex_result != static_cast<LONG>(0xC0000002u) &&
+        ex_result != static_cast<LONG>(0xC0000010u)) {
       SetNtError(ex_result);
       return false;
     }
@@ -578,11 +582,35 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
       break;
     }
     if (foreign) {
-      // Foreign (non-owner, non-system) role ACEs that grant no mutation
-      // rights (already proven above) cannot expose a group-mutation or
-      // foreign-mutation risk regardless of whether their SID resolves to a
-      // locally or trust-known identity, so they are exempt from the
-      // resolvability requirement enforced below for owner/system ACEs.
+      // Foreign (non-owner, non-system) ACEs are already proven above to
+      // grant no mutation rights. An unresolvable SID here (no local or
+      // trusted-domain identity can be found for it) carries no
+      // group-mutation risk and is permitted regardless of resolvability.
+      // But if the SID *does* resolve, it must not name a group/alias
+      // identity, exactly like the owner/system checks below.
+      DWORD foreign_name_length = 0, foreign_domain_length = 0;
+      SID_NAME_USE foreign_use = SidTypeUnknown;
+      LookupAccountSidW(nullptr, sid, nullptr, &foreign_name_length, nullptr,
+                         &foreign_domain_length, &foreign_use);
+      const DWORD foreign_lookup_error = GetLastError();
+      if (foreign_lookup_error == ERROR_NONE_MAPPED ||
+          foreign_lookup_error == ERROR_TRUSTED_RELATIONSHIP_FAILURE) {
+        continue;
+      }
+      if (foreign_lookup_error != ERROR_INSUFFICIENT_BUFFER ||
+          foreign_name_length == 0 || foreign_domain_length == 0) {
+        valid = false;
+        break;
+      }
+      std::vector<wchar_t> foreign_account(foreign_name_length);
+      std::vector<wchar_t> foreign_domain(foreign_domain_length);
+      if (!LookupAccountSidW(nullptr, sid, foreign_account.data(), &foreign_name_length,
+                              foreign_domain.data(), &foreign_domain_length, &foreign_use) ||
+          foreign_use == SidTypeGroup || foreign_use == SidTypeAlias ||
+          foreign_use == SidTypeWellKnownGroup) {
+        valid = false;
+        break;
+      }
       continue;
     }
     DWORD name_length = 0, domain_length = 0;
@@ -1249,29 +1277,27 @@ HANDLE OpenDurableDirectoryNoFollow(const std::string& directory_path) {
 // OpenDurableDirectoryNoFollow) with at least FILE_GENERIC_WRITE access; that
 // does not require SeManageVolumePrivilege and is sufficient to make prior
 // create/rename/unlink operations in this directory durable across a crash
-// (see docs/adr/0003-management-mapping-envelope.md). A best-effort,
-// non-fatal volume-level flush is attempted afterward for extra durability
-// margin when the process happens to hold elevated privilege.
-bool FlushDurableDirectoryHandle(HANDLE dir, const std::string& directory_path) {
-  if (!FlushFileBuffers(dir)) return false;
-  const std::wstring wdirectory = Wide(directory_path);
-  wchar_t mount[MAX_PATH + 1]{};
-  wchar_t volume[MAX_PATH + 1]{};
-  if (!wdirectory.empty() && GetVolumePathNameW(wdirectory.c_str(), mount, MAX_PATH) &&
-      GetVolumeNameForVolumeMountPointW(mount, volume, MAX_PATH)) {
-    HANDLE vol = CreateFileW(volume, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (vol != INVALID_HANDLE_VALUE) {
-      FlushFileBuffers(vol);
-      CloseHandle(vol);
-    }
+// on NTFS (see docs/adr/0003-management-mapping-envelope.md). This is the
+// addon's only durability primitive: no volume-level flush is attempted, so
+// the process never needs SeManageVolumePrivilege. NTFS is the only
+// filesystem this codepath's durability semantics are proven for; any other
+// filesystem reported for the handle's volume fails closed instead of
+// claiming a guarantee that cannot be backed up.
+bool FlushDurableDirectoryHandle(HANDLE dir) {
+  wchar_t filesystem_name[MAX_PATH + 1]{};
+  if (!GetVolumeInformationByHandleW(dir, nullptr, 0, nullptr, nullptr, nullptr,
+                                      filesystem_name, MAX_PATH)) {
+    return false;
   }
-  return true;
+  if (wcscmp(filesystem_name, L"NTFS") != 0) {
+    return false;
+  }
+  return FlushFileBuffers(dir) != 0;
 }
 bool FlushWindowsDirectoryNoFollow(const std::string& directory_path) {
   HANDLE dir = OpenDurableDirectoryNoFollow(directory_path);
   if (dir == INVALID_HANDLE_VALUE) return false;
-  const bool ok = FlushDurableDirectoryHandle(dir, directory_path);
+  const bool ok = FlushDurableDirectoryHandle(dir);
   CloseHandle(dir);
   return ok;
 }
@@ -1712,11 +1738,9 @@ napi_value FlushDirectoryOrVolume(napi_env env, napi_callback_info info) {
     Refuse(env, "flush_directory_or_volume", "directory cannot be opened through a verified no-follow path");
     return nullptr;
   }
-  // FlushDurableDirectoryHandle also attempts a best-effort, optional
-  // elevated volume-level flush; its failure never overrides the
-  // already-achieved directory durability (fail-closed only applies to the
-  // primary directory-handle flush below).
-  const bool directory_flushed = FlushDurableDirectoryHandle(dir, path);
+  // Fails closed if the volume cannot be confirmed as NTFS, not just if the
+  // flush itself fails (see FlushDurableDirectoryHandle).
+  const bool directory_flushed = FlushDurableDirectoryHandle(dir);
   CloseHandle(dir);
   if (!directory_flushed) {
     // Fail closed: never claim durability that was not actually achieved.
@@ -2112,19 +2136,31 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
   }
   CloseHandle(handle);
   bool allowed = false;
+  bool authoritative = true;
   AUTHZ_RESOURCE_MANAGER_HANDLE manager = nullptr;
   AUTHZ_CLIENT_CONTEXT_HANDLE context = nullptr;
   if (dacl != nullptr && AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT, nullptr, nullptr, nullptr,
       L"native-control", &manager)) {
     LUID identifier{};
-    // AUTHZ_SKIP_TOKEN_GROUPS avoids LSA-based group-membership expansion for
-    // the principal SID, which would otherwise require the SID to resolve to
-    // a real, queryable local/domain security principal. principal_access_check
-    // must be able to evaluate hypothetical/remote role principals (e.g. other
-    // fleet members) that are never expected to exist as local accounts; the
-    // access check is still evaluated strictly against the target's actual
-    // DACL using only the exact SID supplied.
-    if (AuthzInitializeContextFromSid(AUTHZ_SKIP_TOKEN_GROUPS, sid, manager, nullptr, identifier, nullptr, &context)) {
+    // Try full group-membership expansion first so that role access granted
+    // through a group ACE (rather than an explicit per-principal ACE) is
+    // actually honoured. Only fall back to AUTHZ_SKIP_TOKEN_GROUPS when the
+    // principal SID itself cannot be resolved to a real, queryable
+    // local/domain security principal (ERROR_NONE_MAPPED /
+    // ERROR_TRUSTED_RELATIONSHIP_FAILURE) — principal_access_check must
+    // still be able to evaluate hypothetical/remote role principals (e.g.
+    // other fleet members) that are never expected to exist as local
+    // accounts.
+    bool skipped_groups = false;
+    bool initialized = AuthzInitializeContextFromSid(0, sid, manager, nullptr, identifier, nullptr, &context);
+    if (!initialized) {
+      const DWORD init_error = GetLastError();
+      if (init_error == ERROR_NONE_MAPPED || init_error == ERROR_TRUSTED_RELATIONSHIP_FAILURE) {
+        skipped_groups = true;
+        initialized = AuthzInitializeContextFromSid(AUTHZ_SKIP_TOKEN_GROUPS, sid, manager, nullptr, identifier, nullptr, &context);
+      }
+    }
+    if (initialized) {
       ACCESS_MASK granted = 0;
       DWORD access_error = ERROR_ACCESS_DENIED;
       AUTHZ_ACCESS_REQUEST request{};
@@ -2133,14 +2169,31 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
       reply.ResultListLength = 1;
       reply.GrantedAccessMask = &granted;
       reply.Error = &access_error;
-      allowed = no_group_acl &&
+      const bool access_check_ok =
           AuthzAccessCheck(0, context, &request, nullptr, descriptor, nullptr, 0, &reply, nullptr) &&
           access_error == ERROR_SUCCESS && (granted & request.DesiredAccess) == request.DesiredAccess;
+      allowed = no_group_acl && access_check_ok;
+      if (!allowed && skipped_groups && mode == "read") {
+        // Write/mutation denials stay authoritative even with an unexpanded
+        // context: VerifyNoGroupMutationAcl already proves no non-owner,
+        // non-SYSTEM ACE on this DACL carries mutation rights, so no group
+        // could ever grant write access here regardless of expansion. Read
+        // access, however, can legitimately be granted through a group ACE
+        // that an unresolvable principal's unexpanded context cannot prove
+        // or disprove membership in, so a read DENY here is not proof of
+        // denial. An ALLOW remains authoritative in both modes because it
+        // came from an explicit ACE evaluated against the real DACL.
+        authoritative = false;
+      }
     }
   }
   if (context) AuthzFreeContext(context);
   if (manager) AuthzFreeResourceManager(manager);
   LocalFree(descriptor); LocalFree(sid);
+  if (!authoritative) {
+    Refuse(env, "principal_access_check", "read denial cannot be proven without group expansion for an unresolvable principal");
+    return nullptr;
+  }
   napi_value result;
   napi_get_boolean(env, allowed, &result);
   return result;
