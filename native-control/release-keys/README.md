@@ -63,6 +63,62 @@ zero pinned keys means "cannot check", not "check disabled by trusting
 anything presented." As soon as the operator adds a key here, signature
 enforcement turns on automatically; no code change or flag is required.
 
+## Backup, restore, and rotation runbook
+
+Losing this key is recoverable (pin a new `keyId`, re-sign); disclosing it is
+not (every release signed under the leaked `keyId` must be invalidated). So
+keep the number of plaintext copies at ONE and encrypt every backup.
+
+### Identity of the provisioned key
+
+| Field | Value |
+| --- | --- |
+| `keyId` | `prod-2026-08` |
+| Algorithm | ed25519 |
+| Public SPKI SHA-256 | `62789ce90d683922d0f66037c05b87c6842d50683c2a28883617a0939cb2dfa7` |
+
+A restored key is the right one when its public SPKI SHA-256 matches the row
+above and the pinned `publicKeyPem` in `trusted.json`:
+
+```bash
+node -e "const{createPrivateKey,createPublicKey,createHash}=require('crypto'),fs=require('fs');\
+  const pub=createPublicKey(createPrivateKey(fs.readFileSync(process.argv[1])));\
+  console.log(createHash('sha256').update(pub.export({type:'spki',format:'der'})).digest('hex'))" <key-path>
+```
+
+### Backup
+
+```bash
+# Encrypted backup for offline media / a password manager. Keep the working
+# copy unencrypted and ACL-restricted; only backups carry a passphrase.
+openssl pkcs8 -topk8 -v2 aes-256-cbc \
+  -in ~/.gjc/release-keys/gjc-remote-native-control-prod.ed25519.key \
+  -out prod-2026-08.key.enc.pem
+```
+
+Store two encrypted copies on separate offline media (or one offline plus a
+password-manager attachment). Never place a plaintext copy in cloud sync, in
+this repository, in `build/`, or in CI secrets.
+
+### Restore drill (run after every backup change)
+
+```bash
+openssl pkcs8 -in prod-2026-08.key.enc.pem -out restored.key           # decrypt
+# confirm the fingerprint matches the table above, then prove it still signs:
+cd native-control
+node scripts/verify-build.mjs --write-manifest --sign-key ../restored.key --key-id prod-2026-08
+node scripts/verify-build.mjs --require-signature
+rm ../restored.key                                                     # discard the copy
+```
+
+### Rotation (also the recovery path after loss or disclosure)
+
+1. Generate a new key and add its `{ keyId, algorithm, publicKeyPem }` entry to
+   `trusted.json` ALONGSIDE the current one.
+2. Sign new releases with the new `keyId`.
+3. Remove the old entry once no artifact that must still verify was signed with
+   it. After a suspected disclosure, remove it immediately and re-sign every
+   artifact that must remain loadable.
 ## Rotation
 
 To rotate: add a new `{ keyId, algorithm, publicKeyPem }` entry alongside
