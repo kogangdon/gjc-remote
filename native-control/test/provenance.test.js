@@ -241,6 +241,22 @@ test('loadVerifiedAddon: a pinned trusted key loads without any dev-key warning'
 const execFile = promisify(execFileCallback);
 const realManifestPath = join(packageRoot, 'build', 'Release', 'native-control.manifest.json');
 const realSidecarPath = `${realManifestPath}.sig`;
+// Regenerating the manifest (--write-manifest) rewrites native-control.manifest.json and, per the
+// stale-sidecar-deletion contract under test below, deletes native-control.manifest.json.sig. Both
+// files are real, gitignored build outputs signed with a production key held outside this repo, so
+// tests must never leave the workspace with a missing/altered sidecar: capture the exact bytes that
+// were on disk before the case runs and restore them via t.after, which fires even on assertion
+// failure. Restoring bytes (never re-signing) means these tests need no access to the private key.
+function backupRealManifestAndSidecar(t) {
+  const manifestBackup = existsSync(realManifestPath) ? readFileSync(realManifestPath) : null;
+  const sidecarBackup = existsSync(realSidecarPath) ? readFileSync(realSidecarPath) : null;
+  t.after(() => {
+    if (manifestBackup === null) rmSync(realManifestPath, { force: true });
+    else writeFileSync(realManifestPath, manifestBackup, { mode: 0o600 });
+    if (sidecarBackup === null) rmSync(realSidecarPath, { force: true });
+    else writeFileSync(realSidecarPath, sidecarBackup, { mode: 0o600 });
+  });
+}
 
 // --- Dev keys are honoured only in the trusted.json zero-key bootstrap state ---------------
 
@@ -372,6 +388,7 @@ test('evaluateRequiredSignature: a signature from a pinned trusted.json key veri
 
 test('verify-build.mjs --write-manifest deletes a stale sidecar so it can never appear valid or linger', async (t) => {
   if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  backupRealManifestAndSidecar(t);
   writeFileSync(realSidecarPath, JSON.stringify({ keyId: 'stale', algorithm: 'ed25519', signature: 'not-a-real-signature' }));
   assert.ok(existsSync(realSidecarPath), 'fixture setup: stale sidecar must exist before regeneration');
   try {
@@ -385,6 +402,7 @@ test('verify-build.mjs --write-manifest deletes a stale sidecar so it can never 
 
 test('verify-build.mjs invoked through a junctioned/symlinked script path still runs --require-signature and fails closed', async (t) => {
   if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  backupRealManifestAndSidecar(t);
   const parentDir = mkdtempSync(join(tmpdir(), 'native-control-alias-'));
   const aliasDir = join(parentDir, 'alias');
   try {
@@ -420,6 +438,7 @@ test('verify-build.mjs invoked through a junctioned/symlinked script path still 
 
 test('verify-build.mjs treats an unresolvable script entry as ambiguous and runs the checks instead of skipping them', async (t) => {
   if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  backupRealManifestAndSidecar(t);
   // Regenerate a fresh, matching manifest with no sidecar so this test does not depend on
   // whatever state the junction test above left behind (including if it was UNPROVEN/skipped).
   await execFile(process.execPath, [join(packageRoot, 'scripts', 'verify-build.mjs'), '--write-manifest'], { cwd: packageRoot });

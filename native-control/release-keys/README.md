@@ -28,6 +28,29 @@ source control and is reviewed like any other change.
   detached signature over the exact bytes of `native-control.manifest.json`
   using whatever process fits that custody model.
 
+## Provisioned key (this repository)
+
+- `keyId`: `prod-2026-08`, algorithm `ed25519`. Signature enforcement is
+  therefore LIVE: `loadVerifiedAddon()` refuses a missing, malformed, or
+  invalid sidecar and refuses an unknown `keyId`.
+- The private key is held OUTSIDE this repository by the operator at
+  `~/.gjc/release-keys/gjc-remote-native-control-prod.ed25519.key` with the
+  file ACL restricted to that account. It is never committed, never copied
+  into `build/`, and never needed to run the test suite.
+- Re-sign after every rebuild, because `--write-manifest` regenerates the
+  manifest and deletes the stale sidecar:
+
+  ```bash
+  cd native-control
+  node scripts/verify-build.mjs --write-manifest \
+    --sign-key ~/.gjc/release-keys/gjc-remote-native-control-prod.ed25519.key \
+    --key-id prod-2026-08
+  node scripts/verify-build.mjs --require-signature   # release gate
+  ```
+
+- For cloud KMS or a hardware/PIV token instead of a local file, produce the
+  detached signature over the exact manifest bytes with that custody tool and
+  pass it in: `--signature <file> --key-id <id> --algorithm <alg>`.
 ## Bootstrap state
 
 This file currently ships with an **empty `keys` array** because the
