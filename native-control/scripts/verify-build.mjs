@@ -2,7 +2,7 @@ import { createHash, createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { verifyManifestSignature } from '../src/index.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -149,7 +149,10 @@ const isMainModule = (() => {
   try {
     return realpathSync(entry) === realpathSync(selfPath);
   } catch {
-    return entry === selfPath || import.meta.url === pathToFileURL(entry).href;
+    // Ambiguity must run the checks, never skip them: an in-process test import
+    // always has a resolvable argv[1] that differs from this file, so the only
+    // callers reaching this branch are unusual invocations we refuse to trust.
+    return true;
   }
 })();
 if (isMainModule) {

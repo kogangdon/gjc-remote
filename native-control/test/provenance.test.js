@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback } from 'node:child_process';
 import { createHash, generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 import { evaluateRequiredSignature } from '../scripts/verify-build.mjs';
@@ -379,4 +379,63 @@ test('verify-build.mjs --write-manifest deletes a stale sidecar so it can never 
   } finally {
     assert.equal(existsSync(realSidecarPath), false, 'manifest regeneration must delete the stale sidecar');
   }
+});
+
+// --- The aliased-path guard fails safe: ambiguity runs the checks, never skips them -------
+
+test('verify-build.mjs invoked through a junctioned/symlinked script path still runs --require-signature and fails closed', async (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  const parentDir = mkdtempSync(join(tmpdir(), 'native-control-alias-'));
+  const aliasDir = join(parentDir, 'alias');
+  try {
+    // Directory junctions need no elevated privilege on Windows, unlike file/directory symlinks.
+    symlinkSync(packageRoot, aliasDir, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    if (error?.code === 'EPERM' || error?.code === 'EACCES') {
+      t.diagnostic(
+        'Aliased-path guard for verify-build.mjs is UNPROVEN in this run: creating a directory ' +
+          `junction/symlink at ${aliasDir} failed with ${error.code}, so the aliased invocation could not ` +
+          'be exercised. All other provenance assertions in this suite still ran and passed.',
+      );
+      rmSync(parentDir, { recursive: true, force: true });
+      return;
+    }
+    throw error;
+  }
+  try {
+    const aliasedScript = join(aliasDir, 'scripts', 'verify-build.mjs');
+    await assert.rejects(
+      execFile(process.execPath, [aliasedScript, '--write-manifest', '--require-signature'], { cwd: packageRoot }),
+      (error) => {
+        assert.notEqual(error.code, 0, 'an aliased invocation must fail closed, never exit 0');
+        assert.match(error.stderr, /--require-signature was set but the signature sidecar is missing/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(aliasDir, { recursive: true, force: true });
+    rmSync(parentDir, { recursive: true, force: true });
+  }
+});
+
+test('verify-build.mjs treats an unresolvable script entry as ambiguous and runs the checks instead of skipping them', async (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  // Regenerate a fresh, matching manifest with no sidecar so this test does not depend on
+  // whatever state the junction test above left behind (including if it was UNPROVEN/skipped).
+  await execFile(process.execPath, [join(packageRoot, 'scripts', 'verify-build.mjs'), '--write-manifest'], { cwd: packageRoot });
+  assert.equal(existsSync(realSidecarPath), false, 'fixture setup: no sidecar must be present before the ambiguous-entry check');
+  const verifyBuildUrl = pathToFileURL(join(packageRoot, 'scripts', 'verify-build.mjs')).href;
+  // argv[1] is set to a path that does not exist anywhere on disk, so realpathSync(entry) throws
+  // inside verify-build.mjs's isMainModule check: this is the "no resolvable script entry" case,
+  // which must fail safe by running the checks, not by silently treating the module as imported.
+  const evalCode = `import(${JSON.stringify(verifyBuildUrl)}).catch((e) => { console.error(e); process.exitCode = 3; });`;
+  await assert.rejects(
+    execFile(process.execPath, ['-e', evalCode, 'this-entry-path-does-not-resolve.js', '--require-signature'], { cwd: packageRoot }),
+    (error) => {
+      assert.notEqual(error.code, 0, 'an unresolvable entry must fail closed, never exit 0');
+      assert.notEqual(error.code, 3, 'the dynamic import itself must not throw; only the enforced signature check should fail');
+      assert.match(error.stderr, /--require-signature was set but the signature sidecar is missing/);
+      return true;
+    },
+  );
 });
