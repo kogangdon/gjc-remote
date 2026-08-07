@@ -272,6 +272,18 @@ constexpr DWORD kWindowsTraversalAccess =
 constexpr DWORD kWindowsMutationParentAccess =
     kWindowsTraversalAccess | READ_CONTROL | WRITE_DAC | WRITE_OWNER |
     FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
+// Narrower parent-directory access for primitives that only ever create,
+// replace, or delete their own child object at create time (the child's own
+// DACL is supplied to NtCreateFile directly, see CreateProtectedFileNoFollow
+// below) and never touch the parent's own DACL/owner. Kept distinct from
+// kWindowsMutationParentAccess (which still WRITE_DAC/WRITE_OWNER-provisions
+// directories via CreateProtectedDirectoryNoFollow) so that a non-owner role
+// granted only this narrower mask on a directory object can use the
+// create/rename primitives without ever being able to re-DACL or take
+// ownership of that directory.
+constexpr DWORD kWindowsChildMutationParentAccess =
+    kWindowsTraversalAccess | READ_CONTROL |
+    FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
 constexpr ACCESS_MASK kWindowsDirectoryMutationAccess =
     READ_CONTROL | WRITE_DAC | WRITE_OWNER |
     FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD;
@@ -453,12 +465,33 @@ struct RoleAcl {
 DWORD RoleRights(RoleProfile profile, size_t role, bool directory) {
   if (role == 3) return FILE_ALL_ACCESS;
   if (profile == RoleProfile::ManagementAuth) return role == 0 || role == 3 ? FILE_ALL_ACCESS : 0;
-  if (profile == RoleProfile::Authority) return role == 0 ? FILE_ALL_ACCESS : FILE_GENERIC_READ;
-  if (profile == RoleProfile::BotState) {
-    if (directory) return role == 0 ? FILE_ALL_ACCESS : role == 1 ? (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE) : FILE_GENERIC_READ;
-    return role == 1 ? FILE_GENERIC_READ | FILE_GENERIC_WRITE : FILE_GENERIC_READ;
+  if (profile == RoleProfile::Authority) {
+    if (role == 0) return FILE_ALL_ACCESS;
+    return directory ? (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) : FILE_GENERIC_READ;
   }
-  return role == 0 ? FILE_ALL_ACCESS : FILE_GENERIC_READ;
+  if (profile == RoleProfile::BotState) {
+    if (directory) {
+      if (role == 0) return FILE_ALL_ACCESS;
+      // Role 1 (bot) is the child-mutation writer for this directory: it
+      // needs FILE_ADD_FILE/FILE_ADD_SUBDIRECTORY (aliased into
+      // FILE_GENERIC_WRITE's data bits on a directory object) plus
+      // FILE_DELETE_CHILD so it can open the directory as a mutation parent
+      // for the create/replace/rename primitives (see
+      // kWindowsChildMutationParentAccess) without ever holding
+      // WRITE_DAC/WRITE_OWNER on the M-owned directory.
+      if (role == 1) {
+        return FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD;
+      }
+      return FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    }
+    // Role 1 (bot) owns bot-state record files and needs DELETE on its own
+    // handle: replace_existing_atomic/remove_verified_file/
+    // RenameWindowsRelative all require DELETE on the source/target handle,
+    // which Windows implicit owner rights never grant on their own.
+    return role == 1 ? (FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE) : FILE_GENERIC_READ;
+  }
+  if (role == 0) return FILE_ALL_ACCESS;
+  return directory ? (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) : FILE_GENERIC_READ;
 }
 
 bool BuildExactRoleAcl(const std::string& manager, const std::string& bot,
@@ -657,7 +690,7 @@ HANDLE CreateProtectedFileNoFollow(const std::string& path, DWORD access, PACL a
   }
   HANDLE parent = INVALID_HANDLE_VALUE;
   std::wstring name;
-  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsMutationParentAccess)) {
+  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsChildMutationParentAccess)) {
     return INVALID_HANDLE_VALUE;
   }
   HANDLE handle = OpenWindowsRelative(parent, name, access, kFileCreate,
@@ -1380,7 +1413,7 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   HANDLE verified_parent = OpenWindowsPathNoFollow(
-      parent, kWindowsMutationParentAccess, VerifiedObjectType::Directory);
+      parent, kWindowsChildMutationParentAccess, VerifiedObjectType::Directory);
   if (verified_parent == INVALID_HANDLE_VALUE) {
     Refuse(env, "create_exclusive_temp", "parent is not a supported absolute handle-relative Windows directory");
     return nullptr;
@@ -1788,8 +1821,8 @@ napi_value ReplaceExistingAtomic(napi_env env, napi_callback_info info) {
   HANDLE destination_parent = INVALID_HANDLE_VALUE;
   std::wstring source_name, destination_name;
   const bool parents_open =
-      OpenWindowsParentNoFollow(source, &source_parent, &source_name, kWindowsMutationParentAccess) &&
-      OpenWindowsParentNoFollow(destination, &destination_parent, &destination_name, kWindowsMutationParentAccess);
+      OpenWindowsParentNoFollow(source, &source_parent, &source_name, kWindowsChildMutationParentAccess) &&
+      OpenWindowsParentNoFollow(destination, &destination_parent, &destination_name, kWindowsChildMutationParentAccess);
   auto close_parents = [&]() {
     if (source_parent != INVALID_HANDLE_VALUE) CloseHandle(source_parent);
     if (destination_parent != INVALID_HANDLE_VALUE) CloseHandle(destination_parent);
@@ -2106,8 +2139,8 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
   std::string path, kind, principal, mode;
   if (!StringArg(env, info, 0, &path, 4) || !StringArg(env, info, 1, &kind, 4) ||
       !StringArg(env, info, 2, &principal, 4) || !StringArg(env, info, 3, &mode, 4)) return nullptr;
-  if (mode != "read" && mode != "write") {
-    Refuse(env, "principal_access_check", "access mode must be read or write");
+  if (mode != "read" && mode != "write" && mode != "mutate-children" && mode != "traverse") {
+    Refuse(env, "principal_access_check", "access mode must be read, write, mutate-children, or traverse");
     return nullptr;
   }
 #ifdef _WIN32
@@ -2130,7 +2163,7 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
   const bool no_group_acl = VerifyNoGroupMutationAcl(handle);
   ACCESS_MASK desired_access = FILE_GENERIC_READ;
   BY_HANDLE_FILE_INFORMATION metadata{};
-  if (mode == "write") {
+  if (mode == "write" || mode == "mutate-children" || mode == "traverse") {
     if (!GetFileInformationByHandle(handle, &metadata)) {
       CloseHandle(handle);
       LocalFree(descriptor);
@@ -2139,9 +2172,29 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
       napi_get_boolean(env, false, &result);
       return result;
     }
-    desired_access = (metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
-      ? kWindowsDirectoryMutationAccess
-      : FILE_GENERIC_WRITE;
+    const bool is_directory = (metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (mode == "mutate-children" || mode == "traverse") {
+      if (!is_directory) {
+        CloseHandle(handle);
+        LocalFree(descriptor);
+        LocalFree(sid);
+        Refuse(env, "principal_access_check", "mutate-children/traverse modes apply only to directory targets");
+        return nullptr;
+      }
+      // "traverse" proves the plain kWindowsTraversalAccess bits (FILE_TRAVERSE
+      // among them) that every intermediate path component along the way to a
+      // record inside this directory must be granted for the open to succeed
+      // at all. "mutate-children" additionally proves exactly the narrowed
+      // parent-directory mask that CreateProtectedFileNoFollow /
+      // CreateExclusiveTemp / ReplaceExistingAtomic request when opening this
+      // directory as a create/replace/rename mutation parent
+      // (kWindowsChildMutationParentAccess), as distinct from the full
+      // destructive kWindowsDirectoryMutationAccess class (WRITE_DAC/
+      // WRITE_OWNER) that "write" mode proves/denies below.
+      desired_access = mode == "traverse" ? kWindowsTraversalAccess : kWindowsChildMutationParentAccess;
+    } else {
+      desired_access = is_directory ? kWindowsDirectoryMutationAccess : FILE_GENERIC_WRITE;
+    }
   }
   CloseHandle(handle);
   bool allowed = false;

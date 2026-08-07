@@ -100,6 +100,26 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
       assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "write"), false,
         "B/R lack directory mutation permission, denying rename and unlink of authority entries");
     }
+    // "traverse" proves the plain kWindowsTraversalAccess bits (FILE_TRAVERSE among them) that every
+    // intermediate path component walking down to a record beneath this M-owned control-root directory
+    // must be granted for the open to succeed at all (the CRITICAL defect: an authority-profile
+    // directory's FILE_GENERIC_READ grant alone does not include FILE_TRAVERSE/FILE_EXECUTE). This is an
+    // authoritative AuthzAccessCheck ALLOW/DENY proof against the real on-disk DACL, not a mock: ALLOW
+    // results never depend on group-membership expansion for an unresolvable synthetic role SID.
+    for (const principal of roles.slice(1, 3)) {
+      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "traverse"), true,
+        "B/R must be able to traverse the M-owned control-root directory to reach every record beneath it");
+      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "mutate-children"), false,
+        "B/R still cannot use the create/replace/rename primitives against the M-owned authority root, " +
+          "even under the narrowed mutation-parent class");
+    }
+    const authorityChildRecord = join(authorityParent, "nested-record.json");
+    await addon.create_absent_exclusive(authorityChildRecord, Buffer.from('{"nested":true}'), ...roles, "authority");
+    assert.equal(await addon.principal_access_check(authorityChildRecord, kind, roles[0], "read"), true);
+    for (const principal of roles.slice(1, 3)) {
+      assert.equal(await addon.principal_access_check(authorityChildRecord, kind, principal, "read"), true,
+        "B/R can read a record nested inside the M-owned control-root directory now that traversal is granted");
+    }
     const botStateDir = join(root, "bot-state");
     await addon.ensure_control_directory(botStateDir, ...roles, "bot-state");
     assert.equal(await addon.verify_exact_role_acl(botStateDir, ...roles, "bot-state"), true);
@@ -123,15 +143,43 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
         throw error;
       }
     }
-    // principal_access_check's directory "write" mode proves destructive directory-mutation
-    // capability (delete-child/rename/take-ownership via kWindowsDirectoryMutationAccess), not
-    // plain create/replace. B's bot-state grant (FILE_GENERIC_READ | FILE_GENERIC_WRITE |
-    // FILE_GENERIC_EXECUTE, proven exact via verify_exact_role_acl above) intentionally excludes
-    // WRITE_DAC/WRITE_OWNER/FILE_DELETE_CHILD, so B is denied here exactly like R: B may create and
-    // replace its own bot-state records but may not delete/rename arbitrary entries or take
-    // ownership of the M-owned directory.
+    // principal_access_check's "traverse"/"mutate-children" ALLOW checks cannot be used against the
+    // bot-state directory itself: VerifyNoGroupMutationAcl (the same no-group-ACE safety net that backs
+    // "write" mode below) is evaluated over the *whole* DACL, and this profile intentionally grants B
+    // (a non-owner of the M-owned directory) FILE_GENERIC_WRITE/FILE_DELETE_CHILD on its own directory
+    // by design, which VerifyNoGroupMutationAcl always treats as a "foreign mutation" ACE regardless of
+    // which principal or mode is being probed — so every non-"read" principal_access_check on this
+    // directory is unconditionally false for every principal, proving nothing either way about B's
+    // grant specifically. That is an orthogonal, pre-existing, intentionally strict safety net, not a
+    // defect in this fix. The real, non-mock proof for B's directory-level grant is
+    // verify_exact_role_acl above (already asserted true): it reads the live on-disk DACL back through
+    // GetSecurityInfo and compares each ACE's mask byte-for-byte against RoleRights(), so B's ACE is
+    // proven to be exactly FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE |
+    // FILE_DELETE_CHILD (the CRITICAL #1 traversal/execute grant plus the narrowed #2 child-mutation
+    // grant) and never WRITE_DAC/WRITE_OWNER.
+    t.diagnostic(
+      "B's ability to literally create and replace a bot-state record end-to-end under its own OS " +
+        "token (temp+rename path, then remove its own temp) is UNPROVEN by this test: the test process " +
+        "runs as the M principal and B is a synthetic, non-resolvable SID on this host, so there is no " +
+        "way to obtain a real B-token handle to exercise create_exclusive_temp/replace_existing_atomic/" +
+        "remove_verified_file as B without a second real Windows account and interactive logon or " +
+        "impersonation. The strongest available real (non-mock) proof is the exact per-role ACE " +
+        "equality proof from verify_exact_role_acl above (B's ACE now carries FILE_DELETE_CHILD and " +
+        "FILE_GENERIC_EXECUTE in addition to FILE_GENERIC_READ | FILE_GENERIC_WRITE), together with the " +
+        "authoritative AuthzAccessCheck 'traverse'/'mutate-children' ALLOW proofs on the control-root " +
+        "directory below, which is not subject to the same blanket no-group-ACE gate because that " +
+        "profile grants no non-owner mutation rights at all.");
+    // principal_access_check's directory "write" mode proves the full destructive directory-mutation
+    // class (WRITE_DAC | WRITE_OWNER | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD via
+    // kWindowsDirectoryMutationAccess), not plain create/replace. B's bot-state directory grant is
+    // FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD (proven exact
+    // via verify_exact_role_acl above), which lets B open this directory as a create/replace/rename
+    // mutation parent for its own records, but never includes WRITE_DAC/WRITE_OWNER: this "write" check
+    // must still deny B (and R) here, proving B may create and replace its own bot-state records
+    // without ever being able to delete/rename arbitrary entries or take ownership of the M-owned
+    // directory.
     assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "write"), false,
-      "B lacks destructive directory-mutation capability on the M-owned bot-state directory");
+      "B lacks destructive directory-mutation capability (WRITE_DAC/WRITE_OWNER) on the M-owned bot-state directory");
     assert.equal(await addon.principal_access_check(botStateDir, kind, roles[2], "write"), false,
       "R keeps today's read-only bot-state semantics");
     assert.equal(await addon.principal_access_check(authorityParent, kind, roles[1], "write"), false,
@@ -170,7 +218,7 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
       assert.equal(await addon.principal_access_check(authDestination, kind, principal, "write"), false);
     }
     assert.throws(() => addon.principal_access_check(destination, kind, roles[0]), /missing string argument/);
-    assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "execute"), /access mode must be read or write/);
+    assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "execute"), /access mode must be read, write, mutate-children, or traverse/);
 
     const parentHandle = await addon.open_verified_parent_handle(destination);
     const objectHandle = await addon.open_verified_object_handle(parentHandle, basename(destination));
