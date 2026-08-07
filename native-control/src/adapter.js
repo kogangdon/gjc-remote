@@ -375,7 +375,16 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     const mutation = await Promise.all(principals.map(async ([principal, expected]) => {
       try {
         const result = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write', ...roleArguments('authority'));
-        return typeof result === 'boolean' && result === expected;
+        if (typeof result !== 'boolean' || result !== expected) return false;
+        if (expected === false) {
+          // 'write' proves only the wide WRITE_DAC/WRITE_OWNER class is denied; the
+          // create/replace primitives need only the narrower child-mutation class, so
+          // 'write' === false alone no longer independently proves this principal
+          // cannot create children under the authority parent. Assert both.
+          const mutateChildren = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'mutate-children', ...roleArguments('authority'));
+          if (typeof mutateChildren !== 'boolean' || mutateChildren !== false) return false;
+        }
+        return true;
       } catch {
         return false;
       }
@@ -1001,7 +1010,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       ? [[configuredRoles.managementSid, 'read', true], [configuredRoles.managementSid, 'write', true], [configuredRoles.botSid, 'read', true], [configuredRoles.botSid, 'write', false], [configuredRoles.recoverySid, 'read', true], [configuredRoles.recoverySid, 'write', false]]
       : [[configuredRoles.managementSid, 'read', true], [configuredRoles.botSid, 'read', true]];
     const access = await Promise.all(principals.map(async ([principal, mode, expected]) =>
-      (await lowLevel.principal_access_check(targetPath, roleKind, principal, mode, ...roleArguments('authority'))) === expected));
+      (await lowLevel.principal_access_check(targetPath, roleKind, principal, mode, ...roleArguments(managed ? 'authority' : 'legacy-retained'))) === expected));
     if (!access.every(Boolean)) refused('read_managed_mapping_snapshot', managed ? 'managed target M/B/R access proof failed' : 'retained target M/B read equality proof failed');
     const control = await read(path('control-root'));
     const parsed = managed ? parseCanonicalJsonBytes(Buffer.from(bytes)) : null;
@@ -2539,7 +2548,9 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         [targetPath, 'read', true],
         [targetPath, 'write', false],
         [parent, 'write', false],
+        [parent, 'mutate-children', false],
         [root, 'write', false],
+        [root, 'mutate-children', false],
         [lockPath('genesis'), 'write', false],
         [lockPath('mapping'), 'write', false],
         [lockPath('admission'), 'write', false],
@@ -3082,7 +3093,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       ].map(async ([principal, expected]) => {
         try {
           const result = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write', ...roleArguments('authority'));
-          return typeof result === 'boolean' && result === expected;
+          if (typeof result !== 'boolean' || result !== expected) return false;
+          if (expected === false) {
+            // Same narrowing as assertMutationParent: 'write' === false alone no longer
+            // independently proves this principal cannot create children under the
+            // authority parent, since create/replace need only the child-mutation class.
+            const mutateChildren = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'mutate-children', ...roleArguments('authority'));
+            if (typeof mutateChildren !== 'boolean' || mutateChildren !== false) return false;
+          }
+          return true;
         } catch {
           return false;
         }
@@ -3144,7 +3163,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         const verifiedTarget = await assertObject(targetPath, Buffer.from(targetBytes), parentIdentity, undefined, null);
         const targetReaders = [managementPrincipal, botPrincipal];
         const targetAccess = await Promise.all(targetReaders.map((principal) =>
-          lowLevel.principal_access_check(targetPath, principal.kind, principal.value, 'read', ...roleArguments(profileFor(targetPath)))));
+          lowLevel.principal_access_check(targetPath, principal.kind, principal.value, 'read', ...roleArguments('legacy-retained'))));
         if (!targetAccess.every((result) => result === true)) {
           refused('probe_prospective_cleanup', 'legacy target is not readable by the required principals');
         }

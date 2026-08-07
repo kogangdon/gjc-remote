@@ -35,7 +35,7 @@ function fake() {
     remove_verified_handle: async (handle, expected) => { assert.deepEqual(files.get(handle.path), Buffer.from(expected)); files.delete(handle.path); },
     read_verified_bytes: async (path) => files.has(path) ? Buffer.from(files.get(path)) : null, ensure_control_directory: async (path, managementSid, botSid, recoverySid, systemSid, profile) => { roleCalls.push([path, managementSid, botSid, recoverySid, systemSid, profile]); if (directories.has(path)) return; const principal = await lowLevel.current_os_principal(); if (principal?.value !== managementSid) { const error = new Error('ensure_control_directory refused: creator is not the directory-owning principal'); error.code = 'ERR_NATIVE_CONTROL_REFUSED'; error.operation = 'ensure_control_directory'; error.writes = 0; throw error; } directories.add(path); },
     create_absent_exclusive: async (path, bytes, ...args) => { files.set(path, Buffer.from(bytes)); calls.push(path); roleCalls.push([path, ...args]); }, create_exclusive_temp: async (_dir, prefix, bytes, ...args) => { const path = `${_dir}/${prefix}.tmp`; files.set(path, Buffer.from(bytes)); roleCalls.push([_dir, ...args]); return path; }, replace_existing_atomic: async (from, to, ...args) => { files.set(to, files.get(from)); files.delete(from); calls.push(to); roleCalls.push([from, to, ...args]); },
-    acquire_native_lock: async (path, ...args) => { calls.push(path); roleCalls.push([path, ...args]); return { release: async () => {} }; }, current_os_principal: async () => ({ kind: 'sid', value: roles.managementSid }), principal_access_check: async (_path, _kind, principal, mode, ..._role) => mode !== 'write' || principal === roles.managementSid,
+    acquire_native_lock: async (path, ...args) => { calls.push(path); roleCalls.push([path, ...args]); return { release: async () => {} }; }, current_os_principal: async () => ({ kind: 'sid', value: roles.managementSid }), principal_access_check: async (_path, _kind, principal, mode, ..._role) => !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid,
   };
   return { files, directories, calls, roleCalls, roles, lowLevel };
 }
@@ -1628,7 +1628,7 @@ test('management startup self-test confines mutations to private scratch and rep
   files.set(configPath, Buffer.from('{"legacy":true}'));
   lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.managementSid });
   lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) =>
-    path.includes('.mst-') ? principal === roles.managementSid : mode !== 'write' || principal === roles.managementSid;
+    path.includes('.mst-') ? principal === roles.managementSid : !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid;
   lowLevel.create_absent_exclusive = async (path, bytes) => {
     if (files.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
     files.set(path, Buffer.from(bytes));

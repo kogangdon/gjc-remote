@@ -443,13 +443,20 @@ bool VerifyWindowsNamedIdentity(HANDLE parent, const std::wstring& name,
   CloseHandle(handle);
   return same;
 }
-enum class RoleProfile { Authority, ManagementAuth, BotState, ProspectiveCleanup };
+enum class RoleProfile { Authority, ManagementAuth, BotState, ProspectiveCleanup, LegacyRetained };
 
 bool ParseRoleProfile(const std::string& value, RoleProfile* result) {
   if (value == "authority") { *result = RoleProfile::Authority; return true; }
   if (value == "management-auth") { *result = RoleProfile::ManagementAuth; return true; }
   if (value == "bot-state") { *result = RoleProfile::BotState; return true; }
   if (value == "prospective-cleanup") { *result = RoleProfile::ProspectiveCleanup; return true; }
+  // "legacy-retained" is deliberately not carried by this function's exact-role-ACL
+  // gate: it identifies objects (pre-existing legacy targets) that the contract
+  // never requires to hold an exact role ACL, because they retain their original
+  // foreign ACL. It must never be accepted for authority/bot-state/management-auth
+  // or any object this process creates or mutates; PrincipalAccessCheck rejects
+  // write/mutate-children modes for it fail-closed before either platform branch runs.
+  if (value == "legacy-retained") { *result = RoleProfile::LegacyRetained; return true; }
   return false;
 }
 
@@ -661,12 +668,13 @@ void SetIdentity(napi_env env, napi_value result, HANDLE handle) {
   if (descriptor) LocalFree(descriptor);
 }
 #else
-enum class RoleProfile { Authority, ManagementAuth, BotState, ProspectiveCleanup };
+enum class RoleProfile { Authority, ManagementAuth, BotState, ProspectiveCleanup, LegacyRetained };
 bool ParseRoleProfile(const std::string& value, RoleProfile* result) {
   if (value == "authority") { *result = RoleProfile::Authority; return true; }
   if (value == "management-auth") { *result = RoleProfile::ManagementAuth; return true; }
   if (value == "bot-state") { *result = RoleProfile::BotState; return true; }
   if (value == "prospective-cleanup") { *result = RoleProfile::ProspectiveCleanup; return true; }
+  if (value == "legacy-retained") { *result = RoleProfile::LegacyRetained; return true; }
   return false;
 }
 bool ParseUid(const std::string& value, uid_t* result) {
@@ -2084,6 +2092,13 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
     Refuse(env, "principal_access_check", "role profile is invalid");
     return nullptr;
   }
+  // "legacy-retained" objects deliberately never carry an exact role ACL (they retain
+  // their original foreign ACL), so this profile must never be trusted for a mutation
+  // proof: reject write/mutate-children fail-closed before either platform branch runs.
+  if (profile == RoleProfile::LegacyRetained && (mode == "write" || mode == "mutate-children")) {
+    Refuse(env, "principal_access_check", "legacy-retained profile does not support write or mutate-children modes");
+    return nullptr;
+  }
 #ifdef _WIN32
   if (kind != "sid") { Refuse(env, "principal_access_check", "Windows principal must be a SID"); return nullptr; }
   PSID sid = nullptr;
@@ -2175,7 +2190,13 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
       const bool access_check_ok =
           AuthzAccessCheck(0, context, &request, nullptr, descriptor, nullptr, 0, &reply, nullptr) &&
           access_error == ERROR_SUCCESS && (granted & request.DesiredAccess) == request.DesiredAccess;
-      allowed = exact_role_acl && access_check_ok;
+      // "legacy-retained" targets never carry an exact role ACL by design (they
+      // retain their original foreign ACL), so the exact-ACL gate would make every
+      // read/traverse probe on them false regardless of the real DACL. Skip it only
+      // for that profile; write/mutate-children were already rejected fail-closed
+      // above, so this never weakens a mutation proof.
+      const bool require_exact_acl = profile != RoleProfile::LegacyRetained;
+      allowed = (!require_exact_acl || exact_role_acl) && access_check_ok;
       if (!allowed && skipped_groups && mode == "read") {
         // Write/mutation denials stay authoritative even with an unexpanded
         // context: VerifyExactRoleAcl already proves the DACL is exactly the

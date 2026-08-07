@@ -223,6 +223,33 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "read"), /missing string argument/);
     assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "execute", ...roles, "authority"), /access mode must be read, write, mutate-children, or traverse/);
     assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "read", ...roles, "bogus-profile"), /role profile is invalid/);
+    // "legacy-retained" identifies objects the contract deliberately never requires to carry an exact
+    // role ACL (they retain their original foreign ACL): the exact-role-ACL gate must be skipped for
+    // read/traverse probes against them, while write/mutate-children stay rejected fail-closed so this
+    // profile can never be repurposed as a mutation proof.
+    const legacyRetainedTarget = join(root, "legacy-channels.json");
+    await writeFile(legacyRetainedTarget, Buffer.from('{"legacy":true}'));
+    assert.equal(await addon.verify_exact_role_acl(legacyRetainedTarget, ...roles, "authority"), false,
+      "a freshly-written plain non-role ACL must not satisfy the exact-role-ACL gate, proving this fixture " +
+        "is a genuine legacy-retained target and not accidentally an exact-role object");
+    assert.equal(await addon.principal_access_check(legacyRetainedTarget, kind, roles[0], "read", ...roles, "legacy-retained"), true,
+      "legacy-retained read probes must be authoritative (ALLOW) even though the target never carries an " +
+        "exact role ACL; the old profile='authority' AND-gate on VerifyExactRoleAcl would have made this false " +
+        "on Windows regardless of the real DACL");
+    assert.throws(() => addon.principal_access_check(legacyRetainedTarget, kind, roles[0], "write", ...roles, "legacy-retained"),
+      /legacy-retained profile does not support write or mutate-children modes/,
+      "legacy-retained must fail closed for write, even for the owning M principal");
+    assert.throws(() => addon.principal_access_check(legacyRetainedTarget, kind, roles[1], "mutate-children", ...roles, "legacy-retained"),
+      /legacy-retained profile does not support write or mutate-children modes/,
+      "legacy-retained must fail closed for mutate-children, never usable as a mutation proof");
+    // The authority control root itself keeps its existing exact-role-ACL semantics: B/R stay denied
+    // both the wide write class and the narrower child-mutation class the create/replace primitives use.
+    for (const principal of roles.slice(1, 3)) {
+      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "write", ...roles, "authority"), false,
+        "B/R remain denied the wide WRITE_DAC/WRITE_OWNER class on the authority control root");
+      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "mutate-children", ...roles, "authority"), false,
+        "B/R remain denied the narrower child-mutation class on the authority control root");
+    }
 
     const parentHandle = await addon.open_verified_parent_handle(destination);
     const objectHandle = await addon.open_verified_object_handle(parentHandle, basename(destination));
