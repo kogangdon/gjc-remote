@@ -173,6 +173,50 @@ identity, ACL, lock-order, or atomic-write conditions before a write. A missing
 or unverifiable addon fails closed; this ADR makes no claim that the current
 workstation's native build passed.
 
+### Release signing and provenance
+
+Manifest/hash self-consistency alone proves only that the `.node` file and its
+manifest were produced together; it does not prove either came from a trusted
+release process, since both live side by side in the same locally produced
+`build/Release` output directory. Provenance is closed by a second, independent
+trust root: `native-control/release-keys/trusted.json`, a git-committed file
+(`{ version: 1, keys: [{ keyId, algorithm: "ed25519" | "p256", publicKeyPem }] }`)
+reviewed like any other source change, distinct from the gitignored build
+output it verifies. A detached signature sidecar,
+`build/Release/native-control.manifest.json.sig`
+(`{ keyId, algorithm, signature: <base64> }`), is computed over the exact bytes
+of the manifest — never a re-serialization — using `crypto.sign`/`crypto.verify`
+(`null` digest for ed25519, `sha256` for P-256/ECDSA). `verifyManifestSignature`
+in `native-control/src/index.js` is a pure function of `(manifestBytes, sidecar,
+trustStore)` and is called from `loadVerifiedAddon()` strictly after the
+existing hash and package-contract checks, before the addon is ever `require`d.
+
+The private key is never held or produced by this repository or its tooling —
+the operator's custody model (a local file, a cloud KMS key, or a hardware/PIV
+token) is out of scope for the verifier, which only ever consumes a public key
+and a signature. `native-control/scripts/verify-build.mjs` supports both
+`--sign-key <pem path>` for local-file signing and `--signature <raw sig file>
+--key-id <id> --algorithm <ed25519|p256>` for a signature produced externally
+(KMS, hardware token); `--require-signature` fails the build outright when the
+resulting sidecar is absent or does not verify.
+
+Enforcement is opt-in and keyed off `trusted.json` contents rather than an
+environment variable: with at least one key pinned (in `trusted.json`, or in
+the gitignored `native-control/release-keys/local-dev.json` used for local
+development signing), `loadVerifiedAddon()` requires a valid sidecar signed by
+a pinned key and refuses fail-closed (`ERR_NATIVE_CONTROL_REFUSED`) on a
+missing, malformed, unknown-`keyId`, algorithm-mismatched, or cryptographically
+invalid signature. With zero keys pinned anywhere — the state this repository
+ships in, since the operator has not yet provisioned the release key — loading
+proceeds as before hash/contract verification existed, but emits one explicit
+warning that addon provenance is UNVERIFIED; an invalid or malformed sidecar is
+never silently treated as verified in this state either. Loading with a
+`local-dev.json`-pinned key instead of a `trusted.json`-pinned one succeeds but
+warns that a development key was used, so a locally signed build is never
+confused for a release-signed one. Key rotation adds a new `{ keyId, algorithm,
+publicKeyPem }` entry to `trusted.json` alongside the old one — old manifests
+stay verifiable under their original `keyId` until it is deliberately removed.
+
 #44 does not authorize daemon serving or readiness, OAuth/provider setup,
 network deployment, container rollout, or changes under `ops/`. Native serving
 and readiness remain blocked pending their separately required native-applicable

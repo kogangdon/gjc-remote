@@ -1,8 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyManifestSignature } from '../src/index.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
@@ -10,6 +11,9 @@ const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const release = join(root, 'build', 'Release');
 const addon = join(release, 'native_control.node');
 const manifestPath = join(release, 'native-control.manifest.json');
+const sidecarPath = `${manifestPath}.sig`;
+const trustedKeysPath = join(root, 'release-keys', 'trusted.json');
+const devKeysPath = join(root, 'release-keys', 'local-dev.json');
 const capabilities = [
   'open_verified_parent', 'open_no_follow', 'read_identity', 'read_acl', 'path_exists_no_follow',
   'set_exact_role_acl', 'verify_exact_role_acl', 'read_verified_bytes', 'create_exclusive_temp', 'flush_file',
@@ -40,6 +44,82 @@ function fail(message) {
   process.stderr.write(`native-control verification failed: ${message}\n`);
   process.exitCode = 1;
 }
+
+function flagValue(name) {
+  const index = process.argv.indexOf(name);
+  return index === -1 ? undefined : process.argv[index + 1];
+}
+
+// Produces build/Release/native-control.manifest.json.sig next to the freshly written manifest.
+// Two custody models are supported so the private key never has to touch this tooling:
+//   --sign-key <pem path>            sign locally with a PEM-encoded ed25519 or P-256 private key
+//   --signature <raw sig file> --key-id <id> --algorithm <ed25519|p256>
+//                                     accept a signature produced elsewhere (cloud KMS, PIV/hardware
+//                                     token, ...): this script only base64-wraps the given bytes.
+function writeSignatureSidecar(manifestBytes) {
+  const signKeyPath = flagValue('--sign-key');
+  const externalSignaturePath = flagValue('--signature');
+  if (!signKeyPath && !externalSignaturePath) return;
+  if (signKeyPath && externalSignaturePath) {
+    fail('--sign-key and --signature are mutually exclusive');
+    return;
+  }
+  if (signKeyPath) {
+    const keyId = flagValue('--key-id');
+    if (!keyId) { fail('--sign-key requires --key-id'); return; }
+    let privateKey;
+    try { privateKey = createPrivateKey(readFileSync(signKeyPath)); } catch { fail(`--sign-key file is not a readable private key: ${signKeyPath}`); return; }
+    let algorithm; let signature;
+    try {
+      if (privateKey.asymmetricKeyType === 'ed25519') {
+        algorithm = 'ed25519';
+        signature = cryptoSign(null, manifestBytes, privateKey);
+      } else if (privateKey.asymmetricKeyType === 'ec' && privateKey.asymmetricKeyDetails?.namedCurve === 'prime256v1') {
+        algorithm = 'p256';
+        signature = cryptoSign('sha256', manifestBytes, privateKey);
+      } else {
+        fail(`--sign-key must be an ed25519 or P-256 private key, got: ${privateKey.asymmetricKeyType}`);
+        return;
+      }
+    } catch { fail('signing the manifest with --sign-key failed'); return; }
+    writeFileSync(sidecarPath, `${JSON.stringify({ keyId, algorithm, signature: signature.toString('base64') }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    return;
+  }
+  const keyId = flagValue('--key-id');
+  const algorithm = flagValue('--algorithm');
+  if (!keyId || !algorithm) { fail('--signature requires both --key-id and --algorithm'); return; }
+  if (algorithm !== 'ed25519' && algorithm !== 'p256') { fail(`--algorithm must be "ed25519" or "p256", got: ${algorithm}`); return; }
+  let signature;
+  try { signature = readFileSync(externalSignaturePath); } catch { fail(`--signature file is not readable: ${externalSignaturePath}`); return; }
+  writeFileSync(sidecarPath, `${JSON.stringify({ keyId, algorithm, signature: signature.toString('base64') }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+function readJsonFileSafe(path) {
+  let raw;
+  try { raw = readFileSync(path, 'utf8'); } catch { return { present: false, value: undefined }; }
+  try { return { present: true, value: JSON.parse(raw) }; } catch { return { present: true, value: undefined }; }
+}
+
+function normalizeTrustStore(value) {
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype || value.version !== 1 || !Array.isArray(value.keys)) return [];
+  return value.keys.filter((key) => key && typeof key.keyId === 'string' && key.keyId &&
+    (key.algorithm === 'ed25519' || key.algorithm === 'p256') && typeof key.publicKeyPem === 'string' && key.publicKeyPem);
+}
+
+// --require-signature fails the build when the sidecar ends up absent, malformed, or does not
+// verify against the committed + local-dev trust stores, independent of how it was produced.
+function enforceRequiredSignature(manifestBytes) {
+  if (!process.argv.includes('--require-signature')) return;
+  const sidecarFile = readJsonFileSafe(sidecarPath);
+  if (!sidecarFile.present) { fail('--require-signature was set but the signature sidecar is missing'); return; }
+  if (sidecarFile.value === undefined) { fail('--require-signature was set but the signature sidecar is malformed'); return; }
+  const trustedKeys = normalizeTrustStore(readJsonFileSafe(trustedKeysPath).value);
+  const devFile = readJsonFileSafe(devKeysPath);
+  const devKeys = devFile.present ? normalizeTrustStore(devFile.value) : [];
+  const result = verifyManifestSignature(manifestBytes, sidecarFile.value, { version: 1, keys: [...trustedKeys, ...devKeys] });
+  if (!result.ok) fail(`--require-signature was set but signature verification failed: ${result.reason}`);
+}
+
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
   version: 3, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
 })) fail('package native capability contract is invalid');
@@ -71,14 +151,22 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
   }
   if (process.argv.includes('--write-manifest')) {
     if (!loaded || process.exitCode) process.exitCode = 1;
-    else writeFileSync(manifestPath, `${JSON.stringify(expected, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    else {
+      const manifestBytes = Buffer.from(`${JSON.stringify(expected, null, 2)}\n`, 'utf8');
+      writeFileSync(manifestPath, manifestBytes, { encoding: 'utf8', mode: 0o600 });
+      writeSignatureSidecar(manifestBytes);
+      if (!process.exitCode) enforceRequiredSignature(manifestBytes);
+    }
   } else if (!existsSync(manifestPath)) {
     fail('native-control.manifest.json is missing');
   } else {
     let actual;
-    try { actual = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { fail('manifest is not valid JSON'); process.exit(); }
+    let manifestBytes;
+    try { manifestBytes = readFileSync(manifestPath); actual = JSON.parse(manifestBytes.toString('utf8')); } catch { fail('manifest is not valid JSON'); process.exit(); }
     for (const [key, value] of Object.entries(expected)) {
       if (JSON.stringify(actual[key]) !== JSON.stringify(value)) fail(`manifest ${key} does not match the local addon`);
     }
+    writeSignatureSidecar(manifestBytes);
+    if (!process.exitCode) enforceRequiredSignature(manifestBytes);
   }
 }

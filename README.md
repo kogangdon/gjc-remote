@@ -74,6 +74,17 @@ bun install   # installs all workspaces (bot, daemon, shared, native-control) fr
 # platform ACL dependencies. The verified addon manifest and platform-specific
 # retained-handle/ACL/no-follow/durability probes must pass before any write;
 # there is no portable filesystem fallback.
+#
+# Addon provenance: at load time, native-control checks the built .node file
+# and its signed manifest against native-control/release-keys/trusted.json,
+# a git-pinned public-key trust store separate from the gitignored build output.
+# It ships with zero keys until the operator provisions a release signing key
+# (file, cloud KMS, or hardware/PIV token — verify-build.mjs --sign-key /
+# --signature support all three), so loading currently warns that provenance
+# is UNVERIFIED rather than silently trusting the local build. Once a key is
+# pinned, an invalid/missing/unknown-key signature refuses to load. See
+# docs/adr/0003-management-mapping-envelope.md ("Release signing and provenance")
+# and native-control/release-keys/README.md for the full contract and rotation.
 
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
