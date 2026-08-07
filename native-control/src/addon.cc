@@ -821,7 +821,7 @@ bool PrincipalGroups(uid_t principal, std::vector<gid_t>* groups) {
   }
 }
 
-bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
+bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested, bool exact_role_acl) {
   struct stat st{};
   if (fstat(fd, &st) != 0 || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) return false;
   acl_t acl = acl_get_fd(fd);
@@ -900,14 +900,14 @@ bool PrincipalCanAccess(int fd, uid_t principal, mode_t requested) {
   if (entry_result != 0 || !seen_user_object || !seen_group_object || !seen_other ||
       (has_named_entries && !seen_mask)) return false;
   if (!seen_mask) mask = S_IRUSR | S_IWUSR | S_IXUSR;
-  if ((requested & S_IWUSR) != 0 && foreign_named_user_mutation) return false;
+  if (!exact_role_acl && (requested & S_IWUSR) != 0 && foreign_named_user_mutation) return false;
   const bool writable_group_class =
       (group_object_bits & S_IWUSR) != 0 ||
       (named_group_bits & S_IWUSR) != 0 ||
       (other_bits & S_IWUSR) != 0;
   if ((requested & S_IWUSR) != 0 && writable_group_class) return false;
   if (principal == st.st_uid) return (owner_bits & requested) == requested;
-  if (selected_named_user && (requested & S_IWUSR) != 0 &&
+  if (!exact_role_acl && selected_named_user && (requested & S_IWUSR) != 0 &&
       (named_user_bits & S_IWUSR) != 0) return false;
   if (selected_named_user) return ((named_user_bits & mask) & requested) == requested;
 
@@ -2215,8 +2215,46 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   int fd = OpenObjectNoFollow(parent_fd, name, O_RDONLY);
-  const bool allowed = fd >= 0 && PrincipalCanAccess(fd, parsed, mode == "read" ? S_IRUSR : S_IWUSR);
-  if (fd >= 0) close(fd);
+  if (fd < 0) {
+    close(parent_fd);
+    napi_value result;
+    napi_get_boolean(env, false, &result);
+    return result;
+  }
+  struct stat probe_stat{};
+  if (fstat(fd, &probe_stat) != 0) {
+    close(fd);
+    close(parent_fd);
+    napi_value result;
+    napi_get_boolean(env, false, &result);
+    return result;
+  }
+  if ((mode == "mutate-children" || mode == "traverse") && !S_ISDIR(probe_stat.st_mode)) {
+    close(fd);
+    close(parent_fd);
+    Refuse(env, "principal_access_check", "mutate-children/traverse modes apply only to directory targets");
+    return nullptr;
+  }
+  const mode_t requested = mode == "read" ? S_IRUSR
+      : mode == "traverse" ? S_IXUSR
+      : mode == "mutate-children" ? (S_IWUSR | S_IXUSR)
+      : S_IWUSR;
+  const bool exact_role_acl = VerifyExactRoleAcl(fd, management_sid, bot_sid, reader_sid, system_sid, profile);
+  bool allowed;
+  if (mode == "write" && S_ISDIR(probe_stat.st_mode)) {
+    // POSIX rwx bits cannot express Windows' owner-only WRITE_DAC/WRITE_OWNER
+    // distinction (kWindowsDirectoryMutationAccess): every RoleMode entry for
+    // a directory, including non-owner roles such as bot-state's B, can
+    // legitimately carry the same S_IWUSR bit as the owner. So "write" mode
+    // on a directory is proven only by literal fstat ownership under a
+    // verified exact-role ACL, mirroring the fact that only the FILE_ALL_ACCESS
+    // owner ACE (never a non-owner role's narrower mutation-parent mask)
+    // carries WRITE_DAC/WRITE_OWNER on Windows.
+    allowed = exact_role_acl && parsed == probe_stat.st_uid;
+  } else {
+    allowed = PrincipalCanAccess(fd, parsed, requested, exact_role_acl);
+  }
+  close(fd);
   close(parent_fd);
   napi_value result;
   napi_get_boolean(env, allowed, &result);
