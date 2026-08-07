@@ -40,7 +40,7 @@ function adapter({ legacy = true, failAudit = false, roleBindings = roles, initi
     open_verified_parent: async (path) => ({ path: path.replaceAll("\\", "/").slice(0, path.replaceAll("\\", "/").lastIndexOf('/')) }), open_no_follow: async () => {},
     read_identity: async (path) => path.endsWith('.genesis-bootstrap-blocker') && !files.has(path) ? null : ({ path: path.replaceAll("\\", "/"), owner: roleBindings.managementSid }), read_acl: async () => 'protected:M,B,R,SYSTEM',
     path_exists_no_follow: async (path) => files.has(path) || directories.has(path) || [...files.keys()].some((name) => name.replaceAll("\\", "/").startsWith(`${path.replaceAll("\\", "/")}/`)),
-    verify_exact_role_acl: async () => true, set_exact_role_acl: async () => {}, remove_verified_file: async (path) => { files.delete(path); },
+    verify_exact_role_acl: async () => true, verify_role_sid_not_group: () => true, set_exact_role_acl: async () => {}, remove_verified_file: async (path) => { files.delete(path); },
     open_verified_parent_handle: async (path) => ({ path: path.replaceAll("\\", "/").slice(0, path.replaceAll("\\", "/").lastIndexOf('/')) }),
     open_verified_object_handle: async (parent, name) => {
       const normalized = `${parent.path}/${name}`;

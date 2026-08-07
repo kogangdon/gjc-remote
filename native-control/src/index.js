@@ -20,7 +20,7 @@ const same = (left, right) => canonicalJson(left) === canonicalJson(right);
 export function validateBuildManifest(manifest, packageJson, addonBytes, platform = process.platform, arch = process.arch) {
   if (!manifest || Object.getPrototypeOf(manifest) !== Object.prototype || !packageJson || Object.getPrototypeOf(packageJson) !== Object.prototype || !Buffer.isBuffer(addonBytes)) return false;
   const expected = {
-    contractVersion: 2, package: packageJson.name, version: packageJson.version, napi: 8,
+    contractVersion: 3, package: packageJson.name, version: packageJson.version, napi: 8,
     platform, arch, addon: 'native_control.node', sha256: fingerprint(addonBytes),
     capabilities, capabilitySignatures,
   };
@@ -38,12 +38,12 @@ function loadVerifiedAddon() {
     addonBytes = readFileSync(addonPath);
   } catch { refused('load_native_control', 'verified build manifest or native addon is missing, invalid, or unreadable'); }
   try {
-    if (!same(packageJson.nativeControlContract, { version: 2, napi: 8, platforms: approvedPlatforms })) {
+    if (!same(packageJson.nativeControlContract, { version: 3, napi: 8, platforms: approvedPlatforms })) {
       refused('load_native_control', 'package native capability contract is invalid');
     }
   } catch { refused('load_native_control', 'package native capability contract is invalid'); }
   const expected = {
-    contractVersion: 2, package: packageJson.name, version: packageJson.version, napi: 8,
+    contractVersion: 3, package: packageJson.name, version: packageJson.version, napi: 8,
     platform: process.platform, arch: process.arch, addon: 'native_control.node', sha256: fingerprint(addonBytes),
     capabilities, capabilitySignatures,
   };
@@ -63,6 +63,6 @@ function loadVerifiedAddon() {
   if (!validContract) refused('load_native_control', 'native capability contract verification failed');
   return addon;
 }
-export const buildManifest = Object.freeze({ contractVersion: 2, napi: 8, capabilities, capabilitySignatures });
+export const buildManifest = Object.freeze({ contractVersion: 3, napi: 8, capabilities, capabilitySignatures });
 
 export async function createManagementNative({ configPath, roles } = {}) { return createAdapter({ lowLevel: loadVerifiedAddon(), configPath, arbitraryPrincipalProbe: true, roles }); }

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, symlinkSync } from "node:fs";
 import { promisify } from "node:util";
-import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { basename, join } from "node:path";
@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { capabilities, capabilitySignatures, validateBuildManifest } from "../src/index.js";
+import { createManagementNativeForTest } from "./helpers/management-native.js";
 const execFile = promisify(execFileCallback);
 
 const require = createRequire(import.meta.url);
@@ -55,7 +56,7 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
 
   const addon = require(fileURLToPath(addonUrl));
   const contract = addon.native_control_contract();
-  assert.equal(contract.contractVersion, 2);
+  assert.equal(contract.contractVersion, 3);
   assert.equal(contract.napi, 8);
   assert.deepEqual(contract.capabilities, capabilities);
   assert.deepEqual(contract.capabilitySignatures, capabilitySignatures);
@@ -68,6 +69,20 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   if (roles === null) {
     t.skip("native authority integration requires a supported OS principal");
     return;
+  }
+  if (process.platform === "win32") {
+    // principal_access_check's gate (VerifyExactRoleAcl) matches configured role SIDs by value only,
+    // never by resolved principal kind, so a group-valued role SID would be silently accepted and
+    // granted the matching per-role rights. verify_role_sid_not_group is the real, authoritative LSA
+    // lookup that closes that gap: it must prove BUILTIN\Administrators (a real, always-resolvable
+    // alias on any Windows host) is a group, while leaving an unresolvable synthetic role SID and the
+    // real current OS principal (a user) permitted.
+    assert.equal(addon.verify_role_sid_not_group("S-1-5-32-544"), false,
+      "the built-in Administrators alias must be proven a group and therefore refused as a role SID");
+    assert.equal(addon.verify_role_sid_not_group(roles[0]), true,
+      "the current OS principal resolves to a real user, not a group");
+    assert.equal(addon.verify_role_sid_not_group(roles[1]), true,
+      "an unresolvable synthetic role SID stays permitted because it is never proven to be a group");
   }
 
   const root = await mkdtemp(join(tmpdir(), "gjc-native-control-"));
@@ -266,6 +281,53 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     await rm(root, { recursive: true, force: true });
   }
 });
+test("a group-valued role principal is refused at role-configuration time with zero writes", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows role-SID group verification is Windows-only");
+    return;
+  }
+  if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
+    t.skip("verified native addon is not built for this checkout");
+    return;
+  }
+  const addonBytes = readFileSync(addonUrl);
+  const manifest = JSON.parse(readFileSync(manifestUrl, "utf8"));
+  const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
+  if (!validateBuildManifest(manifest, packageJson, addonBytes)) {
+    t.skip("native build belongs to a different platform or architecture");
+    return;
+  }
+  const addon = require(fileURLToPath(addonUrl));
+  const roles = platformRoles(addon.current_os_principal());
+  if (roles === null) {
+    t.skip("native authority integration requires a supported OS principal");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "gjc-native-control-group-sid-"));
+  const configPath = join(root, "channels.json");
+  await writeFile(configPath, "{}");
+  const before = (await readdir(root)).sort();
+  try {
+    // BUILTIN\Administrators (S-1-5-32-544) is a real, always-resolvable Windows alias on every
+    // Windows host. principal_access_check's VerifyExactRoleAcl gate matches configured role SIDs by
+    // value only, never by resolved principal kind, so configuring it as B here would previously have
+    // been silently accepted and granted B's per-role rights. Role configuration must fail closed
+    // before any native mutation is attempted.
+    assert.throws(
+      () => createManagementNativeForTest({
+        lowLevel: addon,
+        configPath,
+        roles: { managementSid: roles[0], botSid: "S-1-5-32-544", recoverySid: roles[2], systemSid: "S-1-5-18" },
+      }),
+      (error) => error.code === "ERR_NATIVE_CONTROL_REFUSED" && error.writes === 0,
+      "a group-valued role SID must be refused at configuration time with zero writes",
+    );
+    const after = (await readdir(root)).sort();
+    assert.deepEqual(after, before, "role-configuration refusal must not create, modify, or remove any file");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 test("POSIX principal access rejects writable ACL_OTHER, ACL_GROUP, and named groups", async (t) => {
   if (process.platform !== "linux") {
     t.skip("POSIX ACL probe is Linux-only");
@@ -437,13 +499,20 @@ test("native source contains fail-closed ACL and publication guards", () => {
   const retainedObjectEnd = source.indexOf("napi_value ReadHandleBytes", retainedObjectStart);
   assert.match(source.slice(retainedObjectStart, retainedObjectEnd),
     /GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL \| DELETE/);
-  const unresolvedSidOffset = source.indexOf("if (lookup_error == ERROR_NONE_MAPPED");
-  assert.notEqual(unresolvedSidOffset, -1);
-  const unresolvedSidEnd = source.indexOf("}", unresolvedSidOffset);
-  const unresolvedSidBranch = source.slice(unresolvedSidOffset, unresolvedSidEnd);
-  assert.match(unresolvedSidBranch, /valid = false/);
-  assert.match(unresolvedSidBranch, /break/);
-  assert.doesNotMatch(unresolvedSidBranch, /continue/);
+  // principal_access_check's VerifyExactRoleAcl gate matches configured role SIDs by value, not by
+  // resolved principal kind, so role configuration independently proves a configured M/B/R SID is not
+  // a group/alias/well-known-group before it is ever accepted (WindowsRoleSidIsGroup). A SID that
+  // cannot be resolved at all must stay permitted rather than fail closed, because remote/domain role
+  // principals are legitimately unresolvable on this host: is_group defaults to false and is set true
+  // only on the branch that actually resolved the SID to a group-shaped principal.
+  const roleSidGroupStart = source.indexOf("bool WindowsRoleSidIsGroup(const std::string& sid_text)");
+  assert.notEqual(roleSidGroupStart, -1);
+  const roleSidGroupEnd = source.indexOf("HANDLE CreateProtectedFileNoFollow", roleSidGroupStart);
+  const roleSidGroupSource = source.slice(roleSidGroupStart, roleSidGroupEnd);
+  assert.match(roleSidGroupSource, /bool is_group = false;/);
+  assert.match(roleSidGroupSource, /is_group = use == SidTypeGroup \|\| use == SidTypeAlias \|\| use == SidTypeWellKnownGroup;/);
+  assert.match(roleSidGroupSource, /return is_group;/);
+  assert.match(roleSidGroupSource, /it is never proven to be a group, so it stays permitted here/);
   assert.match(source, /napi_create_uint32\(env, 0, &value\)/);
   assert.match(source, /bool PrincipalGroups\(uid_t principal/);
   assert.match(source, /ACL_GROUP_OBJ/);
@@ -453,29 +522,18 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /named_group_bits & S_IWUSR/);
   assert.match(source, /other_bits & S_IWUSR/);
   assert.match(source, /AT_EMPTY_PATH/);
-  assert.match(source, /bool VerifyNoGroupMutationAcl\(HANDLE handle\)/);
-  assert.match(source, /ConvertStringSidToSidW\(L"S-1-5-18", &configured_system_sid\)/);
-  assert.match(source, /const bool is_configured_system_sid = EqualSid\(sid, configured_system_sid\)/);
-  assert.match(source, /!is_configured_system_sid &&/);
+  assert.match(source, /SID_NAME_USE use = SidTypeUnknown;/);
+  assert.match(source, /SidTypeGroup \|\| use == SidTypeAlias \|\| use == SidTypeWellKnownGroup/);
+  assert.match(source, /napi_value VerifyRoleSidNotGroupMethod\(napi_env env, napi_callback_info info\)/);
+  assert.match(source, /permitted = !WindowsRoleSidIsGroup\(sid_text\);/);
   assert.match(source, /bool VerifyWindowsNamedIdentity\(HANDLE parent/);
   assert.match(source, /published_info\.nFileIndexHigh == temporary_info\.nFileIndexHigh/);
   assert.match(source, /source_absent/);
-  const noGroupSourceStart = source.indexOf("bool VerifyNoGroupMutationAcl(HANDLE");
-  const noGroupSourceEnd = source.indexOf("HANDLE CreateProtectedFileNoFollow", noGroupSourceStart);
-  const noGroupSource = source.slice(noGroupSourceStart, noGroupSourceEnd);
-  assert.match(noGroupSource, /kForeignMutationRights/);
-  assert.match(noGroupSource, /EqualSid\(owner, sid\)/);
   assert.match(source, /foreign_named_user_mutation/);
-  assert.match(noGroupSource, /WRITE_DAC/);
-  assert.match(noGroupSource, /WRITE_OWNER/);
   const exactRoleAclStart = source.indexOf("bool VerifyExactRoleAcl(HANDLE");
   const exactRoleAclEnd = source.indexOf("bool ApplyExactRoleAcl(HANDLE", exactRoleAclStart);
   const exactRoleAcl = source.slice(exactRoleAclStart, exactRoleAclEnd);
   assert.match(exactRoleAcl, /header->AceType != ACCESS_ALLOWED_ACE_TYPE \|\| header->AceFlags != 0/);
-  const noGroupAclStart = source.indexOf("bool VerifyNoGroupMutationAcl(HANDLE");
-  const noGroupAclEnd = source.indexOf("HANDLE CreateProtectedFileNoFollow", noGroupAclStart);
-  const noGroupAcl = source.slice(noGroupAclStart, noGroupAclEnd);
-  assert.match(noGroupAcl, /header->AceType != ACCESS_ALLOWED_ACE_TYPE \|\| header->AceFlags != 0/);
   assert.match(source, /struct NamedGroupPermission \{ gid_t gid; mode_t bits; \}/);
   assert.match(source, /named_groups\.push_back\(\{\*qualifier, group_bits\}\)/);
   assert.match(source, /effective_group \|= named\.bits/);

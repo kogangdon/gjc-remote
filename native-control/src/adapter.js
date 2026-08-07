@@ -263,6 +263,15 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         (roleKind === 'sid' ? normalized[3] !== 'S-1-5-18' : normalized[3] !== 'uid:0')) {
       refused('create_management_native', `exact M/B/R/${roleKind === 'sid' ? 'SYSTEM SID' : 'root UID'} role configuration is required`);
     }
+    // The exact-role-ACL gate (VerifyExactRoleAcl) matches configured role SIDs by value, not by
+    // resolved principal kind, so a group/alias/well-known-group SID configured here would be silently
+    // accepted as a role principal and granted the matching per-role rights. Fail closed at
+    // configuration time instead: reject any of M/B/R that resolves to a group-shaped principal.
+    // Unresolvable SIDs (legitimately remote/domain role principals) stay permitted. SYSTEM is exempt
+    // because it is already pinned to the literal S-1-5-18 above.
+    if (roleKind === 'sid' && normalized.slice(0, 3).some((sid) => !lowLevel.verify_role_sid_not_group(sid))) {
+      refused('create_management_native', 'M/B/R role SIDs must not resolve to a group, alias, or well-known group principal');
+    }
     return Object.freeze(Object.fromEntries(['managementSid', 'botSid', 'recoverySid', 'systemSid'].map((key, index) => [key, normalized[index]])));
   };
   let configuredRoles = roles === undefined ? null : normalizeRoles(roles);

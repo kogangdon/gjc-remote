@@ -580,104 +580,26 @@ bool ApplyExactRoleAcl(HANDLE handle, const std::string& manager,
       nullptr, nullptr, roles.acl, nullptr) != ERROR_SUCCESS) return false;
   return VerifyExactRoleAcl(handle, manager, bot, reader, system, profile);
 }
-bool VerifyNoGroupMutationAcl(HANDLE handle) {
-  PACL dacl = nullptr;
-  PSID owner = nullptr;
-  PSECURITY_DESCRIPTOR descriptor = nullptr;
-  if (GetSecurityInfo(handle, SE_FILE_OBJECT,
-                      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                      &owner, nullptr, &dacl, nullptr, &descriptor) != ERROR_SUCCESS) return false;
-  SECURITY_DESCRIPTOR_CONTROL control = 0;
-  DWORD revision = 0;
-  ACL_SIZE_INFORMATION size{};
-  bool valid = descriptor != nullptr &&
-      GetSecurityDescriptorControl(descriptor, &control, &revision) &&
-      (control & SE_DACL_PROTECTED) != 0 && dacl != nullptr &&
-      GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation) &&
-      size.AceCount == 4;
-  PSID configured_system_sid = nullptr;
-  if (valid && !ConvertStringSidToSidW(L"S-1-5-18", &configured_system_sid)) valid = false;
-  for (DWORD index = 0; valid && index < size.AceCount; ++index) {
-    void* raw = nullptr;
-    if (!GetAce(dacl, index, &raw)) {
-      valid = false;
-      break;
-    }
-    ACE_HEADER* header = static_cast<ACE_HEADER*>(raw);
-    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || header->AceFlags != 0) {
-      valid = false;
-      break;
-    }
-    ACCESS_ALLOWED_ACE* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
-    PSID sid = reinterpret_cast<PSID>(&ace->SidStart);
-    if (!IsValidSid(sid)) { valid = false; break; }
-    const bool is_configured_system_sid = EqualSid(sid, configured_system_sid);
-    const bool is_owner = owner != nullptr && EqualSid(owner, sid);
-    constexpr ACCESS_MASK kForeignMutationRights =
-        FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
-        DELETE | WRITE_DAC | WRITE_OWNER | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY |
-        FILE_DELETE_CHILD;
-    const bool foreign = !is_owner && !is_configured_system_sid;
-    const bool foreign_mutation_capable = foreign && (ace->Mask & kForeignMutationRights) != 0;
-    if (foreign_mutation_capable) {
-      valid = false;
-      break;
-    }
-    if (foreign) {
-      // Foreign (non-owner, non-system) ACEs are already proven above to
-      // grant no mutation rights. An unresolvable SID here (no local or
-      // trusted-domain identity can be found for it) carries no
-      // group-mutation risk and is permitted regardless of resolvability.
-      // But if the SID *does* resolve, it must not name a group/alias
-      // identity, exactly like the owner/system checks below.
-      DWORD foreign_name_length = 0, foreign_domain_length = 0;
-      SID_NAME_USE foreign_use = SidTypeUnknown;
-      LookupAccountSidW(nullptr, sid, nullptr, &foreign_name_length, nullptr,
-                         &foreign_domain_length, &foreign_use);
-      const DWORD foreign_lookup_error = GetLastError();
-      if (foreign_lookup_error == ERROR_NONE_MAPPED ||
-          foreign_lookup_error == ERROR_TRUSTED_RELATIONSHIP_FAILURE) {
-        continue;
-      }
-      if (foreign_lookup_error != ERROR_INSUFFICIENT_BUFFER ||
-          foreign_name_length == 0 || foreign_domain_length == 0) {
-        valid = false;
-        break;
-      }
-      std::vector<wchar_t> foreign_account(foreign_name_length);
-      std::vector<wchar_t> foreign_domain(foreign_domain_length);
-      if (!LookupAccountSidW(nullptr, sid, foreign_account.data(), &foreign_name_length,
-                              foreign_domain.data(), &foreign_domain_length, &foreign_use) ||
-          foreign_use == SidTypeGroup || foreign_use == SidTypeAlias ||
-          foreign_use == SidTypeWellKnownGroup) {
-        valid = false;
-        break;
-      }
-      continue;
-    }
-    DWORD name_length = 0, domain_length = 0;
-    SID_NAME_USE use = SidTypeUnknown;
-    LookupAccountSidW(nullptr, sid, nullptr, &name_length, nullptr, &domain_length, &use);
-    const DWORD lookup_error = GetLastError();
-    if (lookup_error == ERROR_NONE_MAPPED || lookup_error == ERROR_TRUSTED_RELATIONSHIP_FAILURE) {
-      valid = false;
-      break;
-    }
-    if (lookup_error != ERROR_INSUFFICIENT_BUFFER ||
-        name_length == 0 || domain_length == 0) { valid = false; break; }
+bool WindowsRoleSidIsGroup(const std::string& sid_text) {
+  PSID sid = nullptr;
+  if (!ConvertStringSidToSidW(Wide(sid_text).c_str(), &sid)) return false;
+  DWORD name_length = 0, domain_length = 0;
+  SID_NAME_USE use = SidTypeUnknown;
+  LookupAccountSidW(nullptr, sid, nullptr, &name_length, nullptr, &domain_length, &use);
+  const DWORD lookup_error = GetLastError();
+  bool is_group = false;
+  if (lookup_error == ERROR_INSUFFICIENT_BUFFER && name_length > 0 && domain_length > 0) {
     std::vector<wchar_t> account(name_length);
     std::vector<wchar_t> domain(domain_length);
-    if (!LookupAccountSidW(nullptr, sid, account.data(), &name_length, domain.data(),
-                           &domain_length, &use) ||
-        (!is_configured_system_sid &&
-         (use == SidTypeGroup || use == SidTypeAlias || use == SidTypeWellKnownGroup))) {
-      valid = false;
-      break;
+    if (LookupAccountSidW(nullptr, sid, account.data(), &name_length, domain.data(), &domain_length, &use)) {
+      is_group = use == SidTypeGroup || use == SidTypeAlias || use == SidTypeWellKnownGroup;
     }
   }
-  LocalFree(configured_system_sid);
-  LocalFree(descriptor);
-  return valid;
+  // Any other outcome (ERROR_NONE_MAPPED, ERROR_TRUSTED_RELATIONSHIP_FAILURE, or any other lookup
+  // failure) leaves the SID unresolved: it is never proven to be a group, so it stays permitted here.
+  // Remote/domain role principals are legitimately unresolvable on this host and must not be rejected.
+  LocalFree(sid);
+  return is_group;
 }
 
 HANDLE CreateProtectedFileNoFollow(const std::string& path, DWORD access, PACL acl) {
@@ -1386,6 +1308,17 @@ napi_value CurrentOsPrincipal(napi_env env, napi_callback_info) {
   napi_create_object(env, &result);
   napi_set_named_property(env, result, "kind", kind);
   napi_set_named_property(env, result, "value", value);
+  return result;
+}
+napi_value VerifyRoleSidNotGroupMethod(napi_env env, napi_callback_info info) {
+  std::string sid_text;
+  if (!StringArg(env, info, 0, &sid_text)) return nullptr;
+  bool permitted = true;
+#ifdef _WIN32
+  permitted = !WindowsRoleSidIsGroup(sid_text);
+#endif
+  napi_value result;
+  napi_get_boolean(env, permitted, &result);
   return result;
 }
 
@@ -2408,11 +2341,11 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
     "replace_existing_atomic", "create_absent_exclusive", "ensure_control_directory",
     "acquire_native_lock", "current_os_principal", "principal_access_check", "remove_verified_file",
     "open_verified_parent_handle", "open_verified_object_handle", "read_handle_identity",
-    "read_handle_bytes", "write_handle_bytes", "remove_verified_handle",
+    "read_handle_bytes", "write_handle_bytes", "remove_verified_handle", "verify_role_sid_not_group",
   };
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
-  napi_create_uint32(env, 2, &value); napi_set_named_property(env, result, "contractVersion", value);
+  napi_create_uint32(env, 3, &value); napi_set_named_property(env, result, "contractVersion", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
@@ -2450,6 +2383,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("open_verified_object_handle", {"parentHandle", "name"});
   signature("read_handle_identity", {"handle"}); signature("read_handle_bytes", {"handle"});
   signature("write_handle_bytes", {"handle", "bytes"}); signature("remove_verified_handle", {"handle", "expectedBytes"});
+  signature("verify_role_sid_not_group", {"sid"});
   napi_set_named_property(env, result, "capabilitySignatures", signatures);
   return result;
 }
@@ -2468,7 +2402,8 @@ napi_value Init(napi_env env, napi_value exports) {
     {"open_verified_parent_handle", nullptr, OpenVerifiedParentHandle, nullptr, nullptr, nullptr, napi_default, nullptr}, {"open_verified_object_handle", nullptr, OpenVerifiedObjectHandle, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"read_handle_identity", nullptr, ReadHandleIdentity, nullptr, nullptr, nullptr, napi_default, nullptr}, {"read_handle_bytes", nullptr, ReadHandleBytes, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"write_handle_bytes", nullptr, WriteHandleBytesMethod, nullptr, nullptr, nullptr, napi_default, nullptr}, {"remove_verified_handle", nullptr, RemoveVerifiedHandle, nullptr, nullptr, nullptr, napi_default, nullptr},
-    {"native_control_contract", nullptr, NativeControlContract, nullptr, nullptr, nullptr, napi_default, nullptr}
+    {"native_control_contract", nullptr, NativeControlContract, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"verify_role_sid_not_group", nullptr, VerifyRoleSidNotGroupMethod, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
   napi_define_properties(env, exports, sizeof(methods) / sizeof(methods[0]), methods);
   return exports;
