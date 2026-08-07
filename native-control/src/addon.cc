@@ -1511,7 +1511,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
   }
   HANDLE parent = INVALID_HANDLE_VALUE;
   std::wstring name;
-  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsMutationParentAccess)) {
+  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsChildMutationParentAccess)) {
     Refuse(env, "create_absent_exclusive", "path is not a supported absolute handle-relative Windows path");
     return nullptr;
   }
