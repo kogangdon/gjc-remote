@@ -3057,8 +3057,13 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       await assertConfigParentOwner('probe_prospective_cleanup');
       const principals = [targetPrincipal, managementPrincipal, botPrincipal, recoveryPrincipal];
+      // The parent carries the protected exact authority ACL, so only the configured roles can
+      // read it. A pre-existing target may be owned by a foreign principal; its read access is
+      // proven on the target object itself, never on the management parent. The negative
+      // no-write expectation for that principal is still asserted below.
+      const readProvenPrincipals = [managementPrincipal, botPrincipal, recoveryPrincipal];
       if (!principals.every((principal) => principal?.kind && principal?.value) ||
-          !(await Promise.all(principals.map((principal) => lowLevel.principal_access_check(parent, principal.kind, principal.value, 'read', ...roleArguments('authority'))))).every((result) => result === true)) refused('probe_prospective_cleanup', 'prospective cleanup is not proven');
+          !(await Promise.all(readProvenPrincipals.map((principal) => lowLevel.principal_access_check(parent, principal.kind, principal.value, 'read', ...roleArguments('authority'))))).every((result) => result === true)) refused('probe_prospective_cleanup', 'prospective cleanup is not proven');
       const parentIdentity = await verifiedParent(targetPath);
       const blockerBytes = await lowLevel.read_verified_bytes(bootstrapBlockerPath);
       const parentAcl = await lowLevel.read_acl(parent);
