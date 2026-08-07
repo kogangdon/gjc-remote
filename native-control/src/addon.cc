@@ -1121,8 +1121,8 @@ napi_value ReadVerifiedBytes(napi_env env, napi_callback_info info) {
     if (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND) { napi_value absent; napi_get_null(env, &absent); return absent; }
     Throw(env, "ERR_NATIVE_CONTROL_READ", "unable to read verified bytes"); return nullptr;
   }
-  BY_HANDLE_FILE_INFORMATION info;
-  if (!GetFileInformationByHandle(h, &info)) { CloseHandle(h); Throw(env, "ERR_NATIVE_CONTROL_READ", "unable to read verified identity"); return nullptr; }
+  BY_HANDLE_FILE_INFORMATION before;
+  if (!GetFileInformationByHandle(h, &before)) { CloseHandle(h); Throw(env, "ERR_NATIVE_CONTROL_READ", "unable to read verified identity"); return nullptr; }
   LARGE_INTEGER size;
   if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > 16 * 1024 * 1024) { CloseHandle(h); Refuse(env, "read_verified_bytes", "file size is invalid or exceeds limit"); return nullptr; }
   std::vector<uint8_t> bytes(static_cast<size_t>(size.QuadPart)); DWORD read = 0;
@@ -1130,8 +1130,8 @@ napi_value ReadVerifiedBytes(napi_env env, napi_callback_info info) {
   BY_HANDLE_FILE_INFORMATION after;
   LARGE_INTEGER after_size;
   if (!GetFileInformationByHandle(h, &after) || !GetFileSizeEx(h, &after_size) ||
-      after.dwVolumeSerialNumber != info.dwVolumeSerialNumber ||
-      after.nFileIndexHigh != info.nFileIndexHigh || after.nFileIndexLow != info.nFileIndexLow ||
+      after.dwVolumeSerialNumber != before.dwVolumeSerialNumber ||
+      after.nFileIndexHigh != before.nFileIndexHigh || after.nFileIndexLow != before.nFileIndexLow ||
       after_size.QuadPart != size.QuadPart) {
     CloseHandle(h); Refuse(env, "read_verified_bytes", "file identity changed while reading"); return nullptr;
   }
@@ -1215,7 +1215,9 @@ bool WriteHandleBytes(
 napi_value CurrentOsPrincipal(napi_env env, napi_callback_info) {
 #ifdef _WIN32
   HANDLE token = nullptr; DWORD size = 0;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) || !GetTokenInformation(token, TokenUser, nullptr, 0, &size) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) { if (token) CloseHandle(token); Throw(env, "ERR_NATIVE_CONTROL_PRINCIPAL", "unable to read current OS principal"); return nullptr; }
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) { Throw(env, "ERR_NATIVE_CONTROL_PRINCIPAL", "unable to read current OS principal"); return nullptr; }
+  if (!GetTokenInformation(token, TokenUser, nullptr, 0, &size) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) { CloseHandle(token); Throw(env, "ERR_NATIVE_CONTROL_PRINCIPAL", "unable to read current OS principal"); return nullptr; }
+  if (size == 0) { CloseHandle(token); Throw(env, "ERR_NATIVE_CONTROL_PRINCIPAL", "unable to read current OS principal"); return nullptr; }
   std::vector<uint8_t> buffer(size);
   if (!GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) { CloseHandle(token); Throw(env, "ERR_NATIVE_CONTROL_PRINCIPAL", "unable to read current OS principal"); return nullptr; }
   CloseHandle(token); LPWSTR sid = nullptr;
