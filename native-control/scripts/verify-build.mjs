@@ -1,5 +1,5 @@
 import { createHash, createPrivateKey, sign as cryptoSign } from 'node:crypto';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -137,7 +137,21 @@ function enforceRequiredSignature(manifestBytes) {
   if (!result.ok) fail(`--require-signature was set but ${result.reason}`);
 }
 
-const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Resolve both sides through realpath so a symlinked or junctioned script path cannot
+// make this file look like an imported module and silently skip the entire
+// verification pipeline (including --require-signature). Ambiguity fails safe by
+// RUNNING the checks: the only caller that must skip them is an in-process test
+// importing this module, whose argv[1] is a different real path.
+const isMainModule = (() => {
+  const entry = process.argv[1];
+  if (!entry) return true;
+  const selfPath = fileURLToPath(import.meta.url);
+  try {
+    return realpathSync(entry) === realpathSync(selfPath);
+  } catch {
+    return entry === selfPath || import.meta.url === pathToFileURL(entry).href;
+  }
+})();
 if (isMainModule) {
 
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
