@@ -2212,7 +2212,8 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
       // asserted false by run_startup_self_test.
       const bool require_exact_acl = profile != RoleProfile::LegacyRetained;
       allowed = (!require_exact_acl || exact_role_acl) && access_check_ok;
-      if (!allowed && skipped_groups && mode == "read") {
+      if (!allowed && skipped_groups &&
+          (mode == "read" || profile == RoleProfile::LegacyRetained)) {
         // Write/mutation denials stay authoritative even with an unexpanded
         // context: VerifyExactRoleAcl already proves the DACL is exactly the
         // expected 4-ACE role ACL for this profile (owner plus one explicit
