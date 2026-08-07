@@ -76,6 +76,50 @@ The native primitive set does not enumerate arbitrary control-directory entries;
 an archive with an ID not present in the bound inventory remains outside the
 proof boundary rather than being silently treated as valid.
 
+## Windows durability contract (non-elevated)
+`flush_directory_or_volume` on Windows never opens a raw volume device for
+`FlushFileBuffers`, because that call requires `SeManageVolumePrivilege`
+(effectively administrator) and fails closed for the non-elevated management
+principal this addon is designed to run as. The achievable, non-elevated
+durability primitive is a **directory-handle flush**: the target directory is
+opened through the same verified no-follow, handle-relative path used
+elsewhere (`FILE_OPEN_REPARSE_POINT` intact) with `FILE_GENERIC_READ |
+FILE_GENERIC_WRITE`, and `FlushFileBuffers` is called on that directory
+handle. NTFS supports flushing a directory handle's own metadata this way
+without any special privilege, and it is sufficient to make a prior
+create/rename/unlink in that directory durable across a crash — this is the
+same guarantee POSIX callers get from `fsync()` on a directory file
+descriptor, which this codepath mirrors.
+
+A full volume-wide flush (every dirty page across the volume, not just this
+directory's metadata) is strictly stronger and remains an **optional,
+best-effort elevated extra**: after the directory-handle flush succeeds, the
+addon attempts to open the containing volume and flush it too, but never
+surfaces or depends on that attempt's outcome. If the process happens to run
+elevated, callers get the stronger guarantee for free; if not, they still get
+the directory-durability guarantee that was actually achieved.
+
+This function fails closed, not silently: if the verified no-follow open of
+the directory fails, or the directory-handle `FlushFileBuffers` call itself
+fails, `flush_directory_or_volume` refuses with `ERR_NATIVE_CONTROL_REFUSED`
+and reports zero writes. It never claims volume-wide durability it did not
+achieve, and never downgrades a failed directory flush into a silent no-op.
+
+## Windows replace-rename POSIX semantics
+`replace_existing_atomic`'s handle-relative, retained-parent rename uses
+`FileRenameInformationEx` (info class 65) with `FILE_RENAME_REPLACE_IF_EXISTS
+| FILE_RENAME_POSIX_SEMANTICS` first, falling back to the legacy
+`FileRenameInformation` (info class 10, `ReplaceIfExists = TRUE`) only when
+the running kernel reports `STATUS_NOT_SUPPORTED`,
+`STATUS_INVALID_INFO_CLASS`, or `STATUS_INVALID_PARAMETER` for the `Ex` info
+class. POSIX semantics let the filesystem replace a target that still has
+other open, properly-shared (`FILE_SHARE_DELETE`) handles — for example a
+caller-retained read/write handle obtained via `open_verified_object_handle`
+— without weakening any ACL, no-follow, or identity check performed before
+the rename is attempted. Any other failure from the `Ex` attempt (for
+example a genuine access denial) is authoritative and is never masked by the
+legacy-class fallback.
+
 ## Native boundary and exclusions
 
 The JavaScript CLI accepts management only through a verified native addon. The

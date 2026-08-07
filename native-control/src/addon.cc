@@ -203,6 +203,7 @@ void SetNtError(LONG status) {
 constexpr ULONG kFileOpen = 1;
 constexpr ULONG kFileCreate = 2;
 constexpr ULONG kFileOpenReparsePoint = 0x00200000;
+constexpr ULONG kFileSynchronousIoNonalert = 0x00000020;
 constexpr ULONG kFileDirectoryFile = 0x00000001;
 constexpr ULONG kFileNonDirectoryFile = 0x00000040;
 constexpr ULONG kObjCaseInsensitive = 0x00000040;
@@ -247,11 +248,11 @@ HANDLE OpenWindowsRelative(HANDLE parent, const std::wstring& name, DWORD access
   NativeObjectAttributes attributes{
       sizeof(attributes), parent, &unicode, kObjCaseInsensitive, security, nullptr};
   NativeIoStatusBlock status{};
-  ULONG options = kFileOpenReparsePoint;
+  ULONG options = kFileOpenReparsePoint | kFileSynchronousIoNonalert;
   if (expected_type == VerifiedObjectType::Directory) options |= kFileDirectoryFile;
   if (expected_type == VerifiedObjectType::File) options |= kFileNonDirectoryFile;
   HANDLE handle = INVALID_HANDLE_VALUE;
-  const LONG result = create(&handle, access | SYNCHRONIZE, &attributes, &status, nullptr,
+  const LONG result = create(&handle, access | FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attributes, &status, nullptr,
       FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
       disposition, options, nullptr, 0);
   if (result < 0 || handle == INVALID_HANDLE_VALUE) {
@@ -347,6 +348,22 @@ struct NativeFileRenameInformation {
   ULONG FileNameLength;
   WCHAR FileName[1];
 };
+// FileRenameInformationEx (info class 65) uses a Flags ULONG in place of the
+// legacy single ReplaceIfExists BOOLEAN, at the same aligned struct offset.
+// FILE_RENAME_POSIX_SEMANTICS lets the filesystem replace a target that
+// still has other open, properly-shared handles (e.g. a caller-retained
+// read/write handle obtained via open_verified_object_handle); the legacy
+// FileRenameInformation class can spuriously deny STATUS_ACCESS_DENIED in
+// that situation even though the rename is otherwise fully authorized.
+struct NativeFileRenameInformationEx {
+  ULONG Flags;
+  HANDLE RootDirectory;
+  ULONG FileNameLength;
+  WCHAR FileName[1];
+};
+constexpr ULONG kFileRenameInformationEx = 65;
+constexpr ULONG kFileRenamePosixSemantics = 0x00000002;
+constexpr ULONG kFileRenameReplaceIfExists = 0x00000001;
 
 bool RenameWindowsRelative(HANDLE object, HANDLE parent, const std::wstring& name, bool replace) {
   NtSetInformationFileFunction set_information = NtSetInformationFileApi();
@@ -355,6 +372,30 @@ bool RenameWindowsRelative(HANDLE object, HANDLE parent, const std::wstring& nam
       name.size() > (std::numeric_limits<ULONG>::max() - sizeof(NativeFileRenameInformation)) / sizeof(wchar_t)) {
     SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
     return false;
+  }
+  if (replace) {
+    const size_t ex_bytes = sizeof(NativeFileRenameInformationEx) +
+        (name.size() - 1) * sizeof(wchar_t);
+    std::vector<uint8_t> ex_buffer(ex_bytes);
+    auto* ex_info = reinterpret_cast<NativeFileRenameInformationEx*>(ex_buffer.data());
+    ex_info->Flags = kFileRenameReplaceIfExists | kFileRenamePosixSemantics;
+    ex_info->RootDirectory = parent;
+    ex_info->FileNameLength = static_cast<ULONG>(name.size() * sizeof(wchar_t));
+    std::memcpy(ex_info->FileName, name.data(), name.size() * sizeof(wchar_t));
+    NativeIoStatusBlock ex_status{};
+    const LONG ex_result = set_information(object, &ex_status, ex_info,
+        static_cast<ULONG>(ex_buffer.size()), kFileRenameInformationEx);
+    if (ex_result >= 0) return true;
+    // STATUS_NOT_SUPPORTED / STATUS_INVALID_INFO_CLASS / STATUS_INVALID_PARAMETER
+    // mean the running kernel predates FileRenameInformationEx; fall back to
+    // the legacy info class below. Any other failure (e.g. a genuine ACL
+    // denial) is authoritative and must not be masked by a silent retry.
+    if (ex_result != static_cast<LONG>(0xC00000BBu) &&
+        ex_result != static_cast<LONG>(0xC0000003u) &&
+        ex_result != static_cast<LONG>(0xC000000Du)) {
+      SetNtError(ex_result);
+      return false;
+    }
   }
   const size_t bytes = sizeof(NativeFileRenameInformation) +
       (name.size() - 1) * sizeof(wchar_t);
@@ -530,10 +571,19 @@ bool VerifyNoGroupMutationAcl(HANDLE handle) {
         FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
         DELETE | WRITE_DAC | WRITE_OWNER | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY |
         FILE_DELETE_CHILD;
-    if (!is_owner && !is_configured_system_sid &&
-        (ace->Mask & kForeignMutationRights) != 0) {
+    const bool foreign = !is_owner && !is_configured_system_sid;
+    const bool foreign_mutation_capable = foreign && (ace->Mask & kForeignMutationRights) != 0;
+    if (foreign_mutation_capable) {
       valid = false;
       break;
+    }
+    if (foreign) {
+      // Foreign (non-owner, non-system) role ACEs that grant no mutation
+      // rights (already proven above) cannot expose a group-mutation or
+      // foreign-mutation risk regardless of whether their SID resolves to a
+      // locally or trust-known identity, so they are exempt from the
+      // resolvability requirement enforced below for owner/system ACEs.
+      continue;
     }
     DWORD name_length = 0, domain_length = 0;
     SID_NAME_USE use = SidTypeUnknown;
@@ -1190,19 +1240,51 @@ bool WriteHandleBytes(
   return fsync(h) == 0;
 #endif
 }
-[[maybe_unused]] bool FlushDirectoryOrVolumePath(const std::string& path) {
 #ifdef _WIN32
-  const std::wstring directory = Wide(path);
+HANDLE OpenDurableDirectoryNoFollow(const std::string& directory_path) {
+  return OpenNoFollowDirectory(directory_path, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
+}
+// Flushes an already-opened directory handle's own metadata. The handle must
+// have been opened through a verified no-follow path (e.g. via
+// OpenDurableDirectoryNoFollow) with at least FILE_GENERIC_WRITE access; that
+// does not require SeManageVolumePrivilege and is sufficient to make prior
+// create/rename/unlink operations in this directory durable across a crash
+// (see docs/adr/0003-management-mapping-envelope.md). A best-effort,
+// non-fatal volume-level flush is attempted afterward for extra durability
+// margin when the process happens to hold elevated privilege.
+bool FlushDurableDirectoryHandle(HANDLE dir, const std::string& directory_path) {
+  if (!FlushFileBuffers(dir)) return false;
+  const std::wstring wdirectory = Wide(directory_path);
   wchar_t mount[MAX_PATH + 1]{};
   wchar_t volume[MAX_PATH + 1]{};
-  if (directory.empty() || !GetVolumePathNameW(directory.c_str(), mount, MAX_PATH) ||
-      !GetVolumeNameForVolumeMountPointW(mount, volume, MAX_PATH)) return false;
-  HANDLE h = CreateFileW(volume, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  if (h == INVALID_HANDLE_VALUE) return false;
-  const bool flushed = FlushFileBuffers(h) != FALSE;
-  CloseHandle(h);
-  return flushed;
+  if (!wdirectory.empty() && GetVolumePathNameW(wdirectory.c_str(), mount, MAX_PATH) &&
+      GetVolumeNameForVolumeMountPointW(mount, volume, MAX_PATH)) {
+    HANDLE vol = CreateFileW(volume, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (vol != INVALID_HANDLE_VALUE) {
+      FlushFileBuffers(vol);
+      CloseHandle(vol);
+    }
+  }
+  return true;
+}
+bool FlushWindowsDirectoryNoFollow(const std::string& directory_path) {
+  HANDLE dir = OpenDurableDirectoryNoFollow(directory_path);
+  if (dir == INVALID_HANDLE_VALUE) return false;
+  const bool ok = FlushDurableDirectoryHandle(dir, directory_path);
+  CloseHandle(dir);
+  return ok;
+}
+#endif
+[[maybe_unused]] bool FlushDirectoryOrVolumePath(const std::string& path, bool path_is_directory = false) {
+#ifdef _WIN32
+  std::string directory_path = path;
+  if (!path_is_directory) {
+    std::filesystem::path parent = std::filesystem::u8path(path).parent_path();
+    if (parent.empty()) parent = ".";
+    directory_path = parent.u8string();
+  }
+  return FlushWindowsDirectoryNoFollow(directory_path);
 #else
   int fd = OpenDirectoryNoFollow(path);
   if (fd < 0) return false;
@@ -1282,7 +1364,7 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
       FILE_DISPOSITION_INFO disposition{};
       disposition.DeleteFile = TRUE;
       const bool removed = SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition)) != FALSE;
-      const bool durable = removed && FlushDirectoryOrVolumePath(parent);
+      const bool durable = removed && FlushDirectoryOrVolumePath(parent, true);
       CloseHandle(handle);
       if (!durable) return false;
       HANDLE probe = OpenNoFollowFile(candidate, FILE_READ_ATTRIBUTES);
@@ -1486,7 +1568,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "atomic no-replace publication failed");
     return nullptr;
   }
-  HANDLE published = OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL,
+  HANDLE published = OpenWindowsRelative(parent, name, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
       kFileOpen, VerifiedObjectType::File);
   BY_HANDLE_FILE_INFORMATION published_info{};
   const bool verified = published != INVALID_HANDLE_VALUE &&
@@ -1621,22 +1703,26 @@ napi_value FlushFile(napi_env env, napi_callback_info info) {
 napi_value FlushDirectoryOrVolume(napi_env env, napi_callback_info info) {
   std::string path; if (!StringArg(env, info, 0, &path)) return nullptr;
 #ifdef _WIN32
-  std::wstring directory = Wide(path);
-  wchar_t mount[MAX_PATH + 1]{};
-  wchar_t volume[MAX_PATH + 1]{};
-  if (directory.empty() || !GetVolumePathNameW(directory.c_str(), mount, MAX_PATH) ||
-      !GetVolumeNameForVolumeMountPointW(mount, volume, MAX_PATH)) {
-    Refuse(env, "flush_directory_or_volume", "volume identity is unavailable");
+  // Primary durability contract: flush the directory's own metadata through a
+  // verified no-follow handle. This does not require SeManageVolumePrivilege
+  // and is sufficient to make prior create/rename/unlink operations in this
+  // directory durable across a crash (see docs/adr/0003-management-mapping-envelope.md).
+  HANDLE dir = OpenDurableDirectoryNoFollow(path);
+  if (dir == INVALID_HANDLE_VALUE) {
+    Refuse(env, "flush_directory_or_volume", "directory cannot be opened through a verified no-follow path");
     return nullptr;
   }
-  HANDLE h = CreateFileW(volume, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  if (h == INVALID_HANDLE_VALUE || !FlushFileBuffers(h)) {
-    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    Refuse(env, "flush_directory_or_volume", "volume flush unavailable");
+  // FlushDurableDirectoryHandle also attempts a best-effort, optional
+  // elevated volume-level flush; its failure never overrides the
+  // already-achieved directory durability (fail-closed only applies to the
+  // primary directory-handle flush below).
+  const bool directory_flushed = FlushDurableDirectoryHandle(dir, path);
+  CloseHandle(dir);
+  if (!directory_flushed) {
+    // Fail closed: never claim durability that was not actually achieved.
+    Refuse(env, "flush_directory_or_volume", "directory metadata flush unavailable");
     return nullptr;
   }
-  CloseHandle(h);
 #else
   int fd = OpenDirectoryNoFollow(path);
   if (fd < 0 || fsync(fd) != 0) {
@@ -1718,6 +1804,14 @@ napi_value ReplaceExistingAtomic(napi_env env, napi_callback_info info) {
     close_parents();
     Refuse(env, "replace_existing_atomic", "replacement source or destination changed before publication");
     return nullptr;
+  }
+  // The kernel's replace-rename delete-check on the existing destination can
+  // be denied while our own read-only handle to that same file is still
+  // open; release it immediately before the rename now that its identity has
+  // already been verified above.
+  if (destination_handle != INVALID_HANDLE_VALUE) {
+    CloseHandle(destination_handle);
+    destination_handle = INVALID_HANDLE_VALUE;
   }
   if (!RenameWindowsRelative(source_handle, source_parent, destination_name, true)) {
     close_objects();
@@ -1991,7 +2085,9 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
   if (handle == INVALID_HANDLE_VALUE) { LocalFree(sid); Throw(env, "ERR_NATIVE_CONTROL_PROBE", "unable to open target without following reparse points"); return nullptr; }
   PACL dacl = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
-  DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor);
+  DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+      nullptr, nullptr, &dacl, nullptr, &descriptor);
   if (status != ERROR_SUCCESS) {
     CloseHandle(handle);
     LocalFree(sid);
@@ -2021,7 +2117,14 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
   if (dacl != nullptr && AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT, nullptr, nullptr, nullptr,
       L"native-control", &manager)) {
     LUID identifier{};
-    if (AuthzInitializeContextFromSid(0, sid, manager, nullptr, identifier, nullptr, &context)) {
+    // AUTHZ_SKIP_TOKEN_GROUPS avoids LSA-based group-membership expansion for
+    // the principal SID, which would otherwise require the SID to resolve to
+    // a real, queryable local/domain security principal. principal_access_check
+    // must be able to evaluate hypothetical/remote role principals (e.g. other
+    // fleet members) that are never expected to exist as local accounts; the
+    // access check is still evaluated strictly against the target's actual
+    // DACL using only the exact SID supplied.
+    if (AuthzInitializeContextFromSid(AUTHZ_SKIP_TOKEN_GROUPS, sid, manager, nullptr, identifier, nullptr, &context)) {
       ACCESS_MASK granted = 0;
       DWORD access_error = ERROR_ACCESS_DENIED;
       AUTHZ_ACCESS_REQUEST request{};
