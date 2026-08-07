@@ -454,8 +454,12 @@ bool ParseRoleProfile(const std::string& value, RoleProfile* result) {
   // gate: it identifies objects (pre-existing legacy targets) that the contract
   // never requires to hold an exact role ACL, because they retain their original
   // foreign ACL. It must never be accepted for authority/bot-state/management-auth
-  // or any object this process creates or mutates; PrincipalAccessCheck rejects
-  // write/mutate-children modes for it fail-closed before either platform branch runs.
+  // or any object this process creates or mutates; PrincipalAccessCheck rejects the
+  // "mutate-children" mode for it fail-closed before either platform branch runs,
+  // because that mode would authorize mutating an immutable retained object. "write"
+  // is evaluated for real (through the object's actual DACL) so callers can prove a
+  // retained target is NOT bot-writable; a true "write" result for this profile must
+  // never be used as authorization to mutate the retained object.
   if (value == "legacy-retained") { *result = RoleProfile::LegacyRetained; return true; }
   return false;
 }
@@ -2093,10 +2097,17 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   // "legacy-retained" objects deliberately never carry an exact role ACL (they retain
-  // their original foreign ACL), so this profile must never be trusted for a mutation
-  // proof: reject write/mutate-children fail-closed before either platform branch runs.
-  if (profile == RoleProfile::LegacyRetained && (mode == "write" || mode == "mutate-children")) {
-    Refuse(env, "principal_access_check", "legacy-retained profile does not support write or mutate-children modes");
+  // their original foreign ACL). "mutate-children" would authorize creating/replacing
+  // files under a retained object, which would violate the contract that retained
+  // targets stay byte-, identity-, and ACL-immutable, so it is rejected fail-closed
+  // before either platform branch runs regardless of the real DACL. "write" is instead
+  // evaluated normally below, through the object's real ACL via the same
+  // full-group-expansion-then-fallback path used for every other profile, so a
+  // retained-profile write probe reflects the actual DACL. Callers MUST NEVER treat a
+  // true "write" result for this profile as authorization to mutate a retained object
+  // — it may only ever be asserted false.
+  if (profile == RoleProfile::LegacyRetained && mode == "mutate-children") {
+    Refuse(env, "principal_access_check", "legacy-retained profile does not support the mutate-children mode");
     return nullptr;
   }
 #ifdef _WIN32
@@ -2192,9 +2203,13 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
           access_error == ERROR_SUCCESS && (granted & request.DesiredAccess) == request.DesiredAccess;
       // "legacy-retained" targets never carry an exact role ACL by design (they
       // retain their original foreign ACL), so the exact-ACL gate would make every
-      // read/traverse probe on them false regardless of the real DACL. Skip it only
-      // for that profile; write/mutate-children were already rejected fail-closed
-      // above, so this never weakens a mutation proof.
+      // read/write/traverse probe on them false regardless of the real DACL. Skip it
+      // only for that profile; "mutate-children" was already rejected fail-closed
+      // above (it would authorize mutating an immutable retained object), so this
+      // never weakens a mutation-authorization proof. A retained-profile "write"
+      // result below reflects the object's real DACL and MUST NEVER be treated by a
+      // caller as authorization to mutate the retained object — it is only ever
+      // asserted false by run_startup_self_test.
       const bool require_exact_acl = profile != RoleProfile::LegacyRetained;
       allowed = (!require_exact_acl || exact_role_acl) && access_check_ok;
       if (!allowed && skipped_groups && mode == "read") {

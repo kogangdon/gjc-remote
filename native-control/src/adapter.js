@@ -2542,20 +2542,29 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       const targetBytes = await lowLevel.read_verified_bytes(targetPath);
       if (targetBytes === null) refuseAfterCleanup('bot readable management target is absent');
-      await assertObject(targetPath, Buffer.from(targetBytes), undefined, undefined, (await hasPublishedAuthority()) ? 'authority' : null);
+      const managed = await hasPublishedAuthority();
+      await assertObject(targetPath, Buffer.from(targetBytes), undefined, undefined, managed ? 'authority' : null);
       const before = Buffer.from(targetBytes);
+      // The target read/write probes below must use the target's real profile, not
+      // always 'authority': a retained (non-migrated) target never carries the exact
+      // role ACL that 'authority' requires, so gating its read probe on 'authority'
+      // would always fail it. 'write' is proven false through the retained profile's
+      // real-ACL evaluation in the native layer; that false result is a negative
+      // proof only — it must never be read elsewhere as authorization to mutate a
+      // retained object, which stays byte-, identity- and ACL-immutable by contract.
+      const targetProfile = managed ? 'authority' : 'legacy-retained';
       const permissions = await Promise.all([
-        [targetPath, 'read', true],
-        [targetPath, 'write', false],
-        [parent, 'write', false],
-        [parent, 'mutate-children', false],
-        [root, 'write', false],
-        [root, 'mutate-children', false],
-        [lockPath('genesis'), 'write', false],
-        [lockPath('mapping'), 'write', false],
-        [lockPath('admission'), 'write', false],
-      ].map(async ([name, mode, expected]) =>
-        (await lowLevel.principal_access_check(name, roleKind, bot, mode, ...roleArguments(profileFor(name)))) === expected));
+        [targetPath, 'read', true, targetProfile],
+        [targetPath, 'write', false, targetProfile],
+        [parent, 'write', false, profileFor(parent)],
+        [parent, 'mutate-children', false, profileFor(parent)],
+        [root, 'write', false, profileFor(root)],
+        [root, 'mutate-children', false, profileFor(root)],
+        [lockPath('genesis'), 'write', false, profileFor(lockPath('genesis'))],
+        [lockPath('mapping'), 'write', false, profileFor(lockPath('mapping'))],
+        [lockPath('admission'), 'write', false, profileFor(lockPath('admission'))],
+      ].map(async ([name, mode, expected, profile]) =>
+        (await lowLevel.principal_access_check(name, roleKind, bot, mode, ...roleArguments(profile))) === expected));
       if (!permissions.every(Boolean)) refuseAfterCleanup('bot management-record permissions are ambiguous');
       if (!Buffer.from(await lowLevel.read_verified_bytes(targetPath) ?? []).equals(before)) {
         refuseAfterCleanup('bot self-test changed a management record');

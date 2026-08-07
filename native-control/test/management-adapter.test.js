@@ -1779,6 +1779,66 @@ test('bot startup self-test is read-only and refuses ambiguous management-record
     error.reason === 'bot management-record permissions are ambiguous' && error.writes === 0);
   assert.deepEqual(files, new Map([[configPath, original]]));
 });
+test('bot startup self-test resolves the retained profile for a non-migrated target and still succeeds', async () => {
+  const { files, lowLevel, roles } = fake();
+  const configPath = 'C:/state/channels.json';
+  const original = Buffer.from('{"legacy":true}');
+  files.set(configPath, original);
+  lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.botSid });
+  const profileCalls = [];
+  // A retained target never carries the exact role ACL that the 'authority' profile's
+  // native VerifyExactRoleAcl gate requires, so this mock fails the target read/write
+  // probes when (and only when) they are wrongly routed through 'authority' — exactly
+  // reproducing the real native behaviour the previous bug hit on Windows.
+  lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) => {
+    const profile = _role[_role.length - 1];
+    if (path === configPath) profileCalls.push({ mode, profile });
+    if (path === configPath && profile === 'authority') return false;
+    if (path === configPath && profile === 'legacy-retained') {
+      if (mode === 'mutate-children') throw new Error('legacy-retained profile does not support the mutate-children mode');
+      return mode !== 'write';
+    }
+    return !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid;
+  };
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  assert.deepEqual(await native.runStartupSelfTest(), { role: 'bot', mst: false, bst: true, writes: 0 });
+  assert.deepEqual(files, new Map([[configPath, original]]));
+  assert.deepEqual(profileCalls, [{ mode: 'read', profile: 'legacy-retained' }, { mode: 'write', profile: 'legacy-retained' }]);
+});
+test('bot startup self-test refuses a retained target that is writable by the bot', async () => {
+  const { files, lowLevel, roles } = fake();
+  const configPath = 'C:/state/channels.json';
+  const original = Buffer.from('{"legacy":true}');
+  files.set(configPath, original);
+  lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.botSid });
+  lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) => {
+    const profile = _role[_role.length - 1];
+    if (path === configPath && profile === 'legacy-retained') return true;
+    return !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid;
+  };
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  await assert.rejects(native.runStartupSelfTest(), (error) =>
+    error.code === 'ERR_NATIVE_CONTROL_REFUSED' && error.operation === 'run_startup_self_test' &&
+    error.reason === 'bot management-record permissions are ambiguous' && error.writes === 0);
+  assert.deepEqual(files, new Map([[configPath, original]]));
+});
+test('bot startup self-test keeps resolving the authority profile for a managed target', async () => {
+  const { files, lowLevel, roles } = fake();
+  const configPath = 'C:/state/channels.json';
+  const original = Buffer.from('{"managed":true}');
+  files.set(configPath, original);
+  files.set('C:\\state\\.gjc-remote-control\\control-root.json', Buffer.from('{"managed":true}'));
+  lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.botSid });
+  const profileCalls = [];
+  lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) => {
+    const profile = _role[_role.length - 1];
+    if (path === configPath) profileCalls.push({ mode, profile });
+    return !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid;
+  };
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  assert.deepEqual(await native.runStartupSelfTest(), { role: 'bot', mst: false, bst: true, writes: 0 });
+  assert.deepEqual(profileCalls, [{ mode: 'read', profile: 'authority' }, { mode: 'write', profile: 'authority' }]);
+});
 test('M-owned locks reject bot and recovery principals before native mutation', async () => {
   const { calls, lowLevel, roles } = fake();
   const native = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles });
