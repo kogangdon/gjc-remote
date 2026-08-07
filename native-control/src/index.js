@@ -29,12 +29,20 @@ function readJsonFileSafe(path) {
   try { return { present: true, value: JSON.parse(raw) }; } catch { return { present: true, value: undefined }; }
 }
 
+class DuplicateTrustKeyError extends Error {}
+
 function normalizeTrustStore(value) {
   if (!value || Object.getPrototypeOf(value) !== Object.prototype || value.version !== 1 || !Array.isArray(value.keys)) return [];
-  return value.keys.filter((key) => key && Object.getPrototypeOf(key) === Object.prototype &&
+  const keys = value.keys.filter((key) => key && Object.getPrototypeOf(key) === Object.prototype &&
     typeof key.keyId === 'string' && key.keyId.length > 0 &&
     supportedSignatureAlgorithms.has(key.algorithm) &&
     typeof key.publicKeyPem === 'string' && key.publicKeyPem.length > 0);
+  const seenKeyIds = new Set();
+  for (const key of keys) {
+    if (seenKeyIds.has(key.keyId)) throw new DuplicateTrustKeyError(`duplicate keyId in trust store: ${key.keyId}`);
+    seenKeyIds.add(key.keyId);
+  }
+  return keys;
 }
 
 // Pure and independently testable: given the exact manifest bytes that were signed, the parsed
@@ -117,14 +125,25 @@ export function loadVerifiedAddon({
     refused('load_native_control', 'build manifest verification failed');
   }
   {
-    const trustedKeys = normalizeTrustStore(readJsonFileSafe(trustedKeysFilePath).value);
-    const devFile = readJsonFileSafe(devKeysFilePath);
-    const devKeys = devFile.present ? normalizeTrustStore(devFile.value) : [];
-    if (trustedKeys.length + devKeys.length > 0) {
+    let trustedKeys; let devKeys;
+    try {
+      trustedKeys = normalizeTrustStore(readJsonFileSafe(trustedKeysFilePath).value);
+      const devFile = readJsonFileSafe(devKeysFilePath);
+      devKeys = devFile.present ? normalizeTrustStore(devFile.value) : [];
+    } catch (error) {
+      if (error instanceof DuplicateTrustKeyError) refused('load_native_control', `trust store is invalid: ${error.message}`);
+      throw error;
+    }
+    // A dev key from the gitignored local-dev.json trust file is honoured only in the bootstrap
+    // state where zero production keys are pinned in trusted.json. As soon as one production key is
+    // pinned, dev keys are dropped entirely — never merged, never used to shadow, never a fallback —
+    // so a dev-signed artifact fails closed with "unknown signing keyId" instead of loading.
+    const effectiveKeys = trustedKeys.length > 0 ? trustedKeys : devKeys;
+    if (effectiveKeys.length > 0) {
       const sidecarFile = readJsonFileSafe(sidecarFilePath);
       if (!sidecarFile.present) refused('load_native_control', 'addon provenance signature sidecar is missing');
       if (sidecarFile.value === undefined) refused('load_native_control', 'addon provenance signature sidecar is malformed');
-      const result = verifyManifestSignature(manifestBytes, sidecarFile.value, { version: 1, keys: [...trustedKeys, ...devKeys] });
+      const result = verifyManifestSignature(manifestBytes, sidecarFile.value, { version: 1, keys: effectiveKeys });
       if (!result.ok) refused('load_native_control', `addon provenance verification failed: ${result.reason}`);
       const usedTrusted = trustedKeys.some((key) => key.keyId === result.keyId);
       if (!usedTrusted) {

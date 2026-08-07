@@ -48,11 +48,27 @@ the old entry once no manifest that must still verify was signed with it.
 
 ## Local development
 
-`local-dev.json` (same shape, **gitignored**, see `../../.gitignore`) may
-hold additional keys accepted only on the machine that created it. Signing a
-local build with a development key still turns on enforcement (a missing or
+`local-dev.json` (same shape, **gitignored**, see `../../.gitignore`) may hold
+additional keys accepted only on the machine that created it, and only while
+`trusted.json` is still in its bootstrap, zero-key state. Signing a local
+build with a development key still turns on enforcement (a missing or
 invalid sidecar still refuses to load) but `loadVerifiedAddon()` warns that a
 development key was used. This is not an env-var bypass: it requires
 deliberately creating a local, untracked trust file, and it never accepts an
-unsigned or invalid signature even when production keys are pinned in
-`trusted.json`.
+unsigned or invalid signature.
+
+As soon as the operator pins even one production key in `trusted.json`, keys
+in `local-dev.json` are dropped entirely — not merged, not consulted as a
+fallback, not eligible to shadow a production `keyId`. A dev-signed artifact
+then fails closed with "unknown signing keyId" exactly like any other
+untrusted signature. This is a deliberate one-way transition: dev keys exist
+to unblock local iteration before a production key is provisioned, never as
+a standing downgrade path once one is. The release gate
+(`node scripts/verify-build.mjs --require-signature`) goes further and never
+consults `local-dev.json` at all, at any trust-store state, so a release
+build can never be satisfied by a development key.
+
+A trust store (`trusted.json` or `local-dev.json`) containing two entries
+with the same `keyId` is rejected outright — loading refuses fail-closed
+instead of silently using whichever entry `Array.prototype.find` reaches
+first and shadowing the other.

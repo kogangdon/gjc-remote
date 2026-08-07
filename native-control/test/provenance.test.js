@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
+import { execFile as execFileCallback } from 'node:child_process';
 import { createHash, generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
+import { evaluateRequiredSignature } from '../scripts/verify-build.mjs';
 import { capabilities, capabilitySignatures, loadVerifiedAddon, verifyManifestSignature } from '../src/index.js';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -233,4 +236,147 @@ test('loadVerifiedAddon: a pinned trusted key loads without any dev-key warning'
     assert.equal(typeof addon.native_control_contract, 'function');
     assert.equal(warnings.length, 0);
   });
+});
+
+const execFile = promisify(execFileCallback);
+const realManifestPath = join(packageRoot, 'build', 'Release', 'native-control.manifest.json');
+const realSidecarPath = `${realManifestPath}.sig`;
+
+// --- Dev keys are honoured only in the trusted.json zero-key bootstrap state ---------------
+
+test('loadVerifiedAddon: a dev-signed manifest is ignored (fails closed) once a production key is pinned', (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  withFixtureDir((dir) => {
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes: readFileSync(realAddonPath), packageJson });
+    const prodKey = generateP256();
+    const devKey = generateEd25519();
+    writeFileSync(fixture.trustedKeysPath, JSON.stringify({ version: 1, keys: [{ keyId: 'prod-1', algorithm: 'p256', publicKeyPem: prodKey.publicKeyPem }] }));
+    writeFileSync(fixture.devKeysPath, JSON.stringify({ version: 1, keys: [{ keyId: 'dev-1', algorithm: 'ed25519', publicKeyPem: devKey.publicKeyPem }] }));
+    // sidecar is signed only by the dev key — never by the pinned production key
+    writeFileSync(fixture.sidecarPath, JSON.stringify(sidecarFor(devKey, 'ed25519', 'dev-1', fixture.manifestBytes)));
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /unknown signing keyId/);
+      return true;
+    });
+  });
+});
+
+test('loadVerifiedAddon: the same dev key is honoured while trusted.json is still zero-key, then refused the instant a production key is pinned', (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  withFixtureDir((dir) => {
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes: readFileSync(realAddonPath), packageJson });
+    const devKey = generateEd25519();
+    writeFileSync(fixture.trustedKeysPath, JSON.stringify({ version: 1, keys: [] }));
+    writeFileSync(fixture.devKeysPath, JSON.stringify({ version: 1, keys: [{ keyId: 'dev-1', algorithm: 'ed25519', publicKeyPem: devKey.publicKeyPem }] }));
+    writeFileSync(fixture.sidecarPath, JSON.stringify(sidecarFor(devKey, 'ed25519', 'dev-1', fixture.manifestBytes)));
+
+    // zero-key bootstrap state: the dev key is honoured
+    const addon = loadVerifiedAddon(loadOptions(fixture));
+    assert.equal(typeof addon.native_control_contract, 'function');
+
+    // pin a production key: the same dev-signed sidecar now fails closed, no downgrade path remains
+    const prodKey = generateP256();
+    writeFileSync(fixture.trustedKeysPath, JSON.stringify({ version: 1, keys: [{ keyId: 'prod-1', algorithm: 'p256', publicKeyPem: prodKey.publicKeyPem }] }));
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /unknown signing keyId/);
+      return true;
+    });
+  });
+});
+
+// --- Duplicate keyId entries are rejected fail-closed, never silently shadowed -------------
+
+test('loadVerifiedAddon: a trusted.json with duplicate keyIds refuses to load instead of silently shadowing', (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  withFixtureDir((dir) => {
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes: readFileSync(realAddonPath), packageJson });
+    const first = generateEd25519();
+    const second = generateP256();
+    writeFileSync(fixture.trustedKeysPath, JSON.stringify({
+      version: 1,
+      keys: [
+        { keyId: 'dup-1', algorithm: 'ed25519', publicKeyPem: first.publicKeyPem },
+        { keyId: 'dup-1', algorithm: 'p256', publicKeyPem: second.publicKeyPem },
+      ],
+    }));
+    writeFileSync(fixture.sidecarPath, JSON.stringify(sidecarFor(second, 'p256', 'dup-1', fixture.manifestBytes)));
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /trust store is invalid/);
+      assert.match(error.reason, /duplicate keyId/);
+      return true;
+    });
+  });
+});
+
+test('loadVerifiedAddon: a local-dev.json with duplicate keyIds refuses to load instead of silently shadowing', (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  withFixtureDir((dir) => {
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes: readFileSync(realAddonPath), packageJson });
+    writeFileSync(fixture.trustedKeysPath, JSON.stringify({ version: 1, keys: [] }));
+    const first = generateEd25519();
+    const second = generateEd25519();
+    writeFileSync(fixture.devKeysPath, JSON.stringify({
+      version: 1,
+      keys: [
+        { keyId: 'dup-dev', algorithm: 'ed25519', publicKeyPem: first.publicKeyPem },
+        { keyId: 'dup-dev', algorithm: 'ed25519', publicKeyPem: second.publicKeyPem },
+      ],
+    }));
+    writeFileSync(fixture.sidecarPath, JSON.stringify(sidecarFor(second, 'ed25519', 'dup-dev', fixture.manifestBytes)));
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /trust store is invalid/);
+      assert.match(error.reason, /duplicate keyId/);
+      return true;
+    });
+  });
+});
+
+// --- verify-build.mjs --require-signature verifies strictly against trusted.json only ------
+
+test('evaluateRequiredSignature: a dev-key-only signature is rejected even when the dev key is otherwise valid', () => {
+  const devKey = generateEd25519();
+  const manifestBytes = Buffer.from('{"a":1}');
+  withFixtureDir((dir) => {
+    const trustedKeysPath = join(dir, 'trusted.json');
+    const sidecarPath = join(dir, 'manifest.json.sig');
+    writeFileSync(trustedKeysPath, JSON.stringify({ version: 1, keys: [] }));
+    writeFileSync(sidecarPath, JSON.stringify(sidecarFor(devKey, 'ed25519', 'dev-1', manifestBytes)));
+    const result = evaluateRequiredSignature(manifestBytes, { sidecarPath, trustedKeysPath });
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /unknown signing keyId/);
+  });
+});
+
+test('evaluateRequiredSignature: a signature from a pinned trusted.json key verifies', () => {
+  const prodKey = generateP256();
+  const manifestBytes = Buffer.from('{"a":1}');
+  withFixtureDir((dir) => {
+    const trustedKeysPath = join(dir, 'trusted.json');
+    const sidecarPath = join(dir, 'manifest.json.sig');
+    writeFileSync(trustedKeysPath, JSON.stringify({ version: 1, keys: [{ keyId: 'prod-1', algorithm: 'p256', publicKeyPem: prodKey.publicKeyPem }] }));
+    writeFileSync(sidecarPath, JSON.stringify(sidecarFor(prodKey, 'p256', 'prod-1', manifestBytes)));
+    const result = evaluateRequiredSignature(manifestBytes, { sidecarPath, trustedKeysPath });
+    assert.deepEqual(result, { ok: true, keyId: 'prod-1', algorithm: 'p256' });
+  });
+});
+
+// --- Regenerating the manifest deletes any stale sidecar left over from a prior build ------
+
+test('verify-build.mjs --write-manifest deletes a stale sidecar so it can never appear valid or linger', async (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  writeFileSync(realSidecarPath, JSON.stringify({ keyId: 'stale', algorithm: 'ed25519', signature: 'not-a-real-signature' }));
+  assert.ok(existsSync(realSidecarPath), 'fixture setup: stale sidecar must exist before regeneration');
+  try {
+    await execFile(process.execPath, [join(packageRoot, 'scripts', 'verify-build.mjs'), '--write-manifest'], { cwd: packageRoot });
+  } finally {
+    assert.equal(existsSync(realSidecarPath), false, 'manifest regeneration must delete the stale sidecar');
+  }
 });

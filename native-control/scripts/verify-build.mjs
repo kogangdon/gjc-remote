@@ -1,8 +1,8 @@
 import { createHash, createPrivateKey, sign as cryptoSign } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { verifyManifestSignature } from '../src/index.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -13,7 +13,6 @@ const addon = join(release, 'native_control.node');
 const manifestPath = join(release, 'native-control.manifest.json');
 const sidecarPath = `${manifestPath}.sig`;
 const trustedKeysPath = join(root, 'release-keys', 'trusted.json');
-const devKeysPath = join(root, 'release-keys', 'local-dev.json');
 const capabilities = [
   'open_verified_parent', 'open_no_follow', 'read_identity', 'read_acl', 'path_exists_no_follow',
   'set_exact_role_acl', 'verify_exact_role_acl', 'read_verified_bytes', 'create_exclusive_temp', 'flush_file',
@@ -100,25 +99,46 @@ function readJsonFileSafe(path) {
   try { return { present: true, value: JSON.parse(raw) }; } catch { return { present: true, value: undefined }; }
 }
 
+class DuplicateTrustKeyError extends Error {}
+
 function normalizeTrustStore(value) {
   if (!value || Object.getPrototypeOf(value) !== Object.prototype || value.version !== 1 || !Array.isArray(value.keys)) return [];
-  return value.keys.filter((key) => key && typeof key.keyId === 'string' && key.keyId &&
+  const keys = value.keys.filter((key) => key && typeof key.keyId === 'string' && key.keyId &&
     (key.algorithm === 'ed25519' || key.algorithm === 'p256') && typeof key.publicKeyPem === 'string' && key.publicKeyPem);
+  const seenKeyIds = new Set();
+  for (const key of keys) {
+    if (seenKeyIds.has(key.keyId)) throw new DuplicateTrustKeyError(`duplicate keyId in trust store: ${key.keyId}`);
+    seenKeyIds.add(key.keyId);
+  }
+  return keys;
 }
 
-// --require-signature fails the build when the sidecar ends up absent, malformed, or does not
-// verify against the committed + local-dev trust stores, independent of how it was produced.
+// --require-signature fails the build when the sidecar ends up absent, malformed, or does not verify
+// strictly against the committed trusted.json trust root. A development key from local-dev.json is
+// deliberately never consulted here: --require-signature is the release gate, so it must never be
+// satisfiable by a key that only proves a local development build.
+// Exported (with injectable paths) so tests can exercise this decision directly without running the
+// whole build pipeline as a subprocess, the same pattern loadVerifiedAddon uses in src/index.js.
+export function evaluateRequiredSignature(manifestBytes, { sidecarPath: sidecarFilePath = sidecarPath, trustedKeysPath: trustedKeysFilePath = trustedKeysPath } = {}) {
+  const sidecarFile = readJsonFileSafe(sidecarFilePath);
+  if (!sidecarFile.present) return { ok: false, reason: 'the signature sidecar is missing' };
+  if (sidecarFile.value === undefined) return { ok: false, reason: 'the signature sidecar is malformed' };
+  let trustedKeys;
+  try { trustedKeys = normalizeTrustStore(readJsonFileSafe(trustedKeysFilePath).value); }
+  catch (error) { return { ok: false, reason: `the trust store is invalid: ${error.message}` }; }
+  const result = verifyManifestSignature(manifestBytes, sidecarFile.value, { version: 1, keys: trustedKeys });
+  if (!result.ok) return { ok: false, reason: `signature verification failed: ${result.reason}` };
+  return { ok: true, keyId: result.keyId, algorithm: result.algorithm };
+}
+
 function enforceRequiredSignature(manifestBytes) {
   if (!process.argv.includes('--require-signature')) return;
-  const sidecarFile = readJsonFileSafe(sidecarPath);
-  if (!sidecarFile.present) { fail('--require-signature was set but the signature sidecar is missing'); return; }
-  if (sidecarFile.value === undefined) { fail('--require-signature was set but the signature sidecar is malformed'); return; }
-  const trustedKeys = normalizeTrustStore(readJsonFileSafe(trustedKeysPath).value);
-  const devFile = readJsonFileSafe(devKeysPath);
-  const devKeys = devFile.present ? normalizeTrustStore(devFile.value) : [];
-  const result = verifyManifestSignature(manifestBytes, sidecarFile.value, { version: 1, keys: [...trustedKeys, ...devKeys] });
-  if (!result.ok) fail(`--require-signature was set but signature verification failed: ${result.reason}`);
+  const result = evaluateRequiredSignature(manifestBytes);
+  if (!result.ok) fail(`--require-signature was set but ${result.reason}`);
 }
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
 
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
   version: 3, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
@@ -153,6 +173,15 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     if (!loaded || process.exitCode) process.exitCode = 1;
     else {
       const manifestBytes = Buffer.from(`${JSON.stringify(expected, null, 2)}\n`, 'utf8');
+      // Regenerating the manifest invalidates any existing sidecar: a signature is over the exact
+      // prior manifest bytes, so once those bytes change the old sidecar is stale and must never be
+      // left on disk where it could be mistaken for still valid. Delete it before writing the new
+      // manifest so a rebuild that is not immediately re-signed fails closed (missing sidecar) rather
+      // than silently keeping a signature for a manifest that no longer exists. Rebuild-then-resign
+      // order: run `--write-manifest` to regenerate the manifest and drop the stale sidecar, then
+      // re-run with `--sign-key`/`--signature` (optionally `--require-signature`) to produce a fresh
+      // sidecar over the new manifest bytes.
+      try { rmSync(sidecarPath, { force: true }); } catch {}
       writeFileSync(manifestPath, manifestBytes, { encoding: 'utf8', mode: 0o600 });
       writeSignatureSidecar(manifestBytes);
       if (!process.exitCode) enforceRequiredSignature(manifestBytes);
@@ -169,4 +198,5 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     writeSignatureSidecar(manifestBytes);
     if (!process.exitCode) enforceRequiredSignature(manifestBytes);
   }
+}
 }

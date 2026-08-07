@@ -198,24 +198,60 @@ and a signature. `native-control/scripts/verify-build.mjs` supports both
 `--sign-key <pem path>` for local-file signing and `--signature <raw sig file>
 --key-id <id> --algorithm <ed25519|p256>` for a signature produced externally
 (KMS, hardware token); `--require-signature` fails the build outright when the
-resulting sidecar is absent or does not verify.
+resulting sidecar is absent or does not verify. `--require-signature` verifies
+strictly against `trusted.json` alone — a `local-dev.json` key can never
+satisfy the release gate, even if one happens to be pinned locally.
+Regenerating the manifest (`--write-manifest`) deletes any existing
+`.sig` sidecar before writing the new manifest, so a stale signature
+computed over the previous manifest bytes can never linger on disk and be
+mistaken for valid; the workflow is rebuild (`--write-manifest`) then
+re-sign (`--sign-key`/`--signature`, optionally with `--require-signature`).
 
+A trust store (`trusted.json` or `local-dev.json`) with two entries sharing a
+`keyId` is rejected fail-closed rather than silently using whichever entry
+`Array.prototype.find` reaches first and shadowing the other.
 Enforcement is opt-in and keyed off `trusted.json` contents rather than an
-environment variable: with at least one key pinned (in `trusted.json`, or in
-the gitignored `native-control/release-keys/local-dev.json` used for local
-development signing), `loadVerifiedAddon()` requires a valid sidecar signed by
-a pinned key and refuses fail-closed (`ERR_NATIVE_CONTROL_REFUSED`) on a
-missing, malformed, unknown-`keyId`, algorithm-mismatched, or cryptographically
-invalid signature. With zero keys pinned anywhere — the state this repository
-ships in, since the operator has not yet provisioned the release key — loading
-proceeds as before hash/contract verification existed, but emits one explicit
-warning that addon provenance is UNVERIFIED; an invalid or malformed sidecar is
-never silently treated as verified in this state either. Loading with a
-`local-dev.json`-pinned key instead of a `trusted.json`-pinned one succeeds but
-warns that a development key was used, so a locally signed build is never
-confused for a release-signed one. Key rotation adds a new `{ keyId, algorithm,
-publicKeyPem }` entry to `trusted.json` alongside the old one — old manifests
-stay verifiable under their original `keyId` until it is deliberately removed.
+environment variable: with at least one key pinned in `trusted.json`,
+`loadVerifiedAddon()` requires a valid sidecar signed by a pinned key and
+refuses fail-closed (`ERR_NATIVE_CONTROL_REFUSED`) on a missing, malformed,
+unknown-`keyId`, algorithm-mismatched, or cryptographically invalid
+signature. With zero keys pinned in `trusted.json` and none in the gitignored
+`native-control/release-keys/local-dev.json` either — the state this
+repository ships in, since the operator has not yet provisioned the release
+key — loading proceeds as before hash/contract verification existed, but
+emits one explicit warning that addon provenance is UNVERIFIED; an invalid or
+malformed sidecar is never silently treated as verified in this state
+either. While `trusted.json` is still in that zero-key bootstrap state,
+`local-dev.json` may be used to unblock local iteration: loading with a
+`local-dev.json`-pinned key succeeds but warns that a development key was
+used. As soon as one production key is pinned in `trusted.json`, keys in
+`local-dev.json` are ignored entirely — never merged, never consulted, never
+a fallback — so a dev-signed artifact fails closed with an unknown-`keyId`
+refusal instead of loading; this is a one-way transition with no downgrade
+path back to trusting development keys. Key rotation adds a new
+`{ keyId, algorithm, publicKeyPem }` entry to `trusted.json` alongside the
+old one — old manifests stay verifiable under their original `keyId` until
+it is deliberately removed.
+
+#### Residual assumption: in-tree verification requires a protected deployment
+
+This provenance chain proves the `.node` file matches a manifest signed by a
+pinned key; it cannot prove the verifier itself has not been tampered with.
+Both `src/index.js` (the code that performs the check) and `trusted.json`
+(the trust root it checks against) are ordinary files inside the deployed
+`native-control/` tree. An attacker who already has write access to that
+tree can edit `src/index.js` to skip or weaken the check, or edit
+`trusted.json` to pin their own key, defeating verification entirely —
+in-tree signature verification cannot defend against an attacker who can
+modify the verifier's own source or trust root. A protected installation
+with write access restricted to the release/deployment process (so a
+compromised runtime principal cannot edit `native-control/` in place)
+therefore remains a deployment requirement, not something this ADR's
+in-process check can substitute for. CI-side attestation (verifying the
+signature and provenance of `native-control/` as it is built and packaged,
+before it ever reaches a host) is the complementary control that closes
+this gap; it is out of scope for this change and tracked separately from
+the in-tree runtime check documented above.
 
 #44 does not authorize daemon serving or readiness, OAuth/provider setup,
 network deployment, container rollout, or changes under `ops/`. Native serving
