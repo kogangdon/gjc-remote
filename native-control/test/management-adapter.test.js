@@ -1839,6 +1839,80 @@ test('bot startup self-test keeps resolving the authority profile for a managed 
   assert.deepEqual(await native.runStartupSelfTest(), { role: 'bot', mst: false, bst: true, writes: 0 });
   assert.deepEqual(profileCalls, [{ mode: 'read', profile: 'authority' }, { mode: 'write', profile: 'authority' }]);
 });
+test('bot startup self-test resolves the legacy-retained profile from a published legacy-retained control root', async () => {
+  const { files, lowLevel, roles } = fake();
+  const configPath = 'C:/state/channels.json';
+  const original = Buffer.from('{"legacy":true}');
+  files.set(configPath, original);
+  files.set('C:\\state\\.gjc-remote-control\\control-root.json', Buffer.from(canonicalJson({ sourceKind: 'legacy-retained' })));
+  lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.botSid });
+  const profileCalls = [];
+  // A published control root with sourceKind 'legacy-retained' is a distinct branch from an
+  // absent control root: both resolve retainedTarget to true, but only this fixture proves the
+  // read path that actually parses a durable control-root record rather than treating a missing
+  // one as the default. The mock fails the target read/write probes when (and only when) they
+  // are wrongly routed through 'authority', reproducing the real native ACL mismatch.
+  lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) => {
+    const profile = _role[_role.length - 1];
+    if (path === configPath) profileCalls.push({ mode, profile });
+    if (path === configPath && profile === 'authority') return false;
+    if (path === configPath && profile === 'legacy-retained') {
+      if (mode === 'mutate-children') throw new Error('legacy-retained profile does not support the mutate-children mode');
+      return mode !== 'write';
+    }
+    return !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid;
+  };
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  assert.deepEqual(await native.runStartupSelfTest(), { role: 'bot', mst: false, bst: true, writes: 0 });
+  assert.deepEqual(files, new Map([
+    [configPath, original],
+    ['C:\\state\\.gjc-remote-control\\control-root.json', Buffer.from(canonicalJson({ sourceKind: 'legacy-retained' }))],
+  ]));
+  assert.deepEqual(profileCalls, [{ mode: 'read', profile: 'legacy-retained' }, { mode: 'write', profile: 'legacy-retained' }]);
+});
+test('bot startup self-test resolves the authority profile from a published managed-v1 control root', async () => {
+  const { files, lowLevel, roles } = fake();
+  const configPath = 'C:/state/channels.json';
+  const original = Buffer.from('{"managed":true}');
+  files.set(configPath, original);
+  files.set('C:\\state\\.gjc-remote-control\\control-root.json', Buffer.from(canonicalJson({ sourceKind: 'managed-v1' })));
+  lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.botSid });
+  const profileCalls = [];
+  lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) => {
+    const profile = _role[_role.length - 1];
+    if (path === configPath) profileCalls.push({ mode, profile });
+    return !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid;
+  };
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  assert.deepEqual(await native.runStartupSelfTest(), { role: 'bot', mst: false, bst: true, writes: 0 });
+  assert.deepEqual(profileCalls, [{ mode: 'read', profile: 'authority' }, { mode: 'write', profile: 'authority' }]);
+});
+test('bot startup self-test resolves the legacy-retained profile when the control root is absent', async () => {
+  const { files, lowLevel, roles } = fake();
+  const configPath = 'C:/state/channels.json';
+  const original = Buffer.from('{"legacy":true}');
+  files.set(configPath, original);
+  lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.botSid });
+  const profileCalls = [];
+  // No control-root.json is ever written: rawRead('control-root') returns null, and the adapter's
+  // absent-control-root default treats the target as retained, exercising the other arm of the
+  // `selfTestControlRoot === null ? true : selfTestControlRoot.sourceKind === 'legacy-retained'`
+  // branch than the published-legacy-retained fixture above.
+  lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) => {
+    const profile = _role[_role.length - 1];
+    if (path === configPath) profileCalls.push({ mode, profile });
+    if (path === configPath && profile === 'authority') return false;
+    if (path === configPath && profile === 'legacy-retained') {
+      if (mode === 'mutate-children') throw new Error('legacy-retained profile does not support the mutate-children mode');
+      return mode !== 'write';
+    }
+    return !['write', 'mutate-children'].includes(mode) || principal === roles.managementSid;
+  };
+  const native = createManagementNativeForTest({ lowLevel, configPath, roles });
+  assert.deepEqual(await native.runStartupSelfTest(), { role: 'bot', mst: false, bst: true, writes: 0 });
+  assert.deepEqual(files, new Map([[configPath, original]]));
+  assert.deepEqual(profileCalls, [{ mode: 'read', profile: 'legacy-retained' }, { mode: 'write', profile: 'legacy-retained' }]);
+});
 test('M-owned locks reject bot and recovery principals before native mutation', async () => {
   const { calls, lowLevel, roles } = fake();
   const native = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles });

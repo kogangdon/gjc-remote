@@ -249,7 +249,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
           "write probe correctly denies it — this is the exact real-addon proof run_startup_self_test's bot " +
           "branch relies on to refuse writability of a retained management target");
     } catch (error) {
-      if (error?.code !== "ERR_NATIVE_CONTROL_REFUSED") throw error;
+      if (!(kind === "sid" && error?.code === "ERR_NATIVE_CONTROL_REFUSED" &&
+          error?.operation === "principal_access_check" &&
+          error?.reason === "read denial cannot be proven without group expansion for an unresolvable principal")) {
+        throw error;
+      }
       t.diagnostic(
         "Legacy-retained write denial for the bot principal is UNPROVEN in this run: the synthetic bot SID " +
           "cannot be resolved on this host, so group membership cannot be expanded and the addon refuses " +
