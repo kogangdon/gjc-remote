@@ -152,7 +152,7 @@ current transport lives in `daemon/src/sdk-session.js`.
 
 ## Runtime: Bun vs Node
 
-`@gajae-code/coding-agent` 0.12.5 requires Bun 1.3.14 or newer, so the daemon
+`@gajae-code/coding-agent` 0.12.7 requires Bun 1.3.14 or newer, so the daemon
 starts with Bun and embeds GJC in-process. The bot and Node built-in test runner
 remain Node-compatible. `bun.lock` is the committed dependency lockfile;
 `package-lock.json` is gitignored.
