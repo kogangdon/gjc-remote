@@ -2136,11 +2136,19 @@ napi_value EnsureControlDirectory(napi_env env, napi_callback_info info) {
 }
 
 napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
-  std::string path, kind, principal, mode;
-  if (!StringArg(env, info, 0, &path, 4) || !StringArg(env, info, 1, &kind, 4) ||
-      !StringArg(env, info, 2, &principal, 4) || !StringArg(env, info, 3, &mode, 4)) return nullptr;
+  std::string path, kind, principal, mode, management_sid, bot_sid, reader_sid, system_sid, profile_text;
+  if (!StringArg(env, info, 0, &path, 9) || !StringArg(env, info, 1, &kind, 9) ||
+      !StringArg(env, info, 2, &principal, 9) || !StringArg(env, info, 3, &mode, 9) ||
+      !StringArg(env, info, 4, &management_sid, 9) || !StringArg(env, info, 5, &bot_sid, 9) ||
+      !StringArg(env, info, 6, &reader_sid, 9) || !StringArg(env, info, 7, &system_sid, 9) ||
+      !StringArg(env, info, 8, &profile_text, 9)) return nullptr;
   if (mode != "read" && mode != "write" && mode != "mutate-children" && mode != "traverse") {
     Refuse(env, "principal_access_check", "access mode must be read, write, mutate-children, or traverse");
+    return nullptr;
+  }
+  RoleProfile profile;
+  if (!ParseRoleProfile(profile_text, &profile)) {
+    Refuse(env, "principal_access_check", "role profile is invalid");
     return nullptr;
   }
 #ifdef _WIN32
@@ -2160,7 +2168,7 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
     Throw(env, "ERR_NATIVE_CONTROL_PROBE", "unable to read target DACL");
     return nullptr;
   }
-  const bool no_group_acl = VerifyNoGroupMutationAcl(handle);
+  const bool exact_role_acl = VerifyExactRoleAcl(handle, management_sid, bot_sid, reader_sid, system_sid, profile);
   ACCESS_MASK desired_access = FILE_GENERIC_READ;
   BY_HANDLE_FILE_INFORMATION metadata{};
   if (mode == "write" || mode == "mutate-children" || mode == "traverse") {
@@ -2234,17 +2242,19 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
       const bool access_check_ok =
           AuthzAccessCheck(0, context, &request, nullptr, descriptor, nullptr, 0, &reply, nullptr) &&
           access_error == ERROR_SUCCESS && (granted & request.DesiredAccess) == request.DesiredAccess;
-      allowed = no_group_acl && access_check_ok;
+      allowed = exact_role_acl && access_check_ok;
       if (!allowed && skipped_groups && mode == "read") {
         // Write/mutation denials stay authoritative even with an unexpanded
-        // context: VerifyNoGroupMutationAcl already proves no non-owner,
-        // non-SYSTEM ACE on this DACL carries mutation rights, so no group
-        // could ever grant write access here regardless of expansion. Read
-        // access, however, can legitimately be granted through a group ACE
-        // that an unresolvable principal's unexpanded context cannot prove
-        // or disprove membership in, so a read DENY here is not proof of
-        // denial. An ALLOW remains authoritative in both modes because it
-        // came from an explicit ACE evaluated against the real DACL.
+        // context: VerifyExactRoleAcl already proves the DACL is exactly the
+        // expected 4-ACE role ACL for this profile (owner plus one explicit
+        // per-role allow ACE with the exact expected mask), so no group ACE
+        // could ever grant additional write access here regardless of
+        // expansion. Read access, however, can legitimately be granted
+        // through a group ACE that an unresolvable principal's unexpanded
+        // context cannot prove or disprove membership in, so a read DENY
+        // here is not proof of denial. An ALLOW remains authoritative in
+        // both modes because it came from an explicit ACE evaluated against
+        // the real DACL.
         authoritative = false;
       }
     }
@@ -2402,7 +2412,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   };
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
-  napi_create_uint32(env, 1, &value); napi_set_named_property(env, result, "contractVersion", value);
+  napi_create_uint32(env, 2, &value); napi_set_named_property(env, result, "contractVersion", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
@@ -2434,7 +2444,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("ensure_control_directory", {"path", "managementSid", "botSid", "recoverySid", "systemSid", "profile"});
   signature("acquire_native_lock", {"path", "managementSid", "botSid", "recoverySid", "systemSid", "profile"});
   signature("current_os_principal", {});
-  signature("principal_access_check", {"path", "kind", "principal", "mode"});
+  signature("principal_access_check", {"path", "kind", "principal", "mode", "managementSid", "botSid", "recoverySid", "systemSid", "profile"});
   signature("remove_verified_file", {"path", "expectedBytes"});
   signature("open_verified_parent_handle", {"path"});
   signature("open_verified_object_handle", {"parentHandle", "name"});

@@ -9,7 +9,7 @@ export const capabilitySignatures = Object.freeze({
   create_absent_exclusive: ['path', 'bytes', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'],
   ensure_control_directory: ['path', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'],
   acquire_native_lock: ['path', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'],
-  current_os_principal: [], principal_access_check: ['path', 'kind', 'principal', 'mode'], remove_verified_file: ['path', 'expectedBytes'],
+  current_os_principal: [], principal_access_check: ['path', 'kind', 'principal', 'mode', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'], remove_verified_file: ['path', 'expectedBytes'],
   open_verified_parent_handle: ['path'], open_verified_object_handle: ['parentHandle', 'name'],
   read_handle_identity: ['handle'], read_handle_bytes: ['handle'], write_handle_bytes: ['handle', 'bytes'],
   remove_verified_handle: ['handle', 'expectedBytes'],

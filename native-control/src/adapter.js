@@ -365,7 +365,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     }
     const mutation = await Promise.all(principals.map(async ([principal, expected]) => {
       try {
-        const result = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write');
+        const result = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write', ...roleArguments('authority'));
         return typeof result === 'boolean' && result === expected;
       } catch {
         return false;
@@ -992,7 +992,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       ? [[configuredRoles.managementSid, 'read', true], [configuredRoles.managementSid, 'write', true], [configuredRoles.botSid, 'read', true], [configuredRoles.botSid, 'write', false], [configuredRoles.recoverySid, 'read', true], [configuredRoles.recoverySid, 'write', false]]
       : [[configuredRoles.managementSid, 'read', true], [configuredRoles.botSid, 'read', true]];
     const access = await Promise.all(principals.map(async ([principal, mode, expected]) =>
-      (await lowLevel.principal_access_check(targetPath, roleKind, principal, mode)) === expected));
+      (await lowLevel.principal_access_check(targetPath, roleKind, principal, mode, ...roleArguments('authority'))) === expected));
     if (!access.every(Boolean)) refused('read_managed_mapping_snapshot', managed ? 'managed target M/B/R access proof failed' : 'retained target M/B read equality proof failed');
     const control = await read(path('control-root'));
     const parsed = managed ? parseCanonicalJsonBytes(Buffer.from(bytes)) : null;
@@ -2425,7 +2425,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           const access = await Promise.all([
             [management, 'read', true], [management, 'write', true], [bot, 'read', false], [bot, 'write', false],
             [configuredRoles.recoverySid, 'read', false], [configuredRoles.recoverySid, 'write', false],
-          ].map(async ([role, mode, expected]) => (await lowLevel.principal_access_check(scratch, roleKind, role, mode)) === expected));
+          ].map(async ([role, mode, expected]) => (await lowLevel.principal_access_check(scratch, roleKind, role, mode, ...roleArguments('management-auth'))) === expected));
           if (!access.every(Boolean)) refuseAfterCleanup('management private scratch ACL is ambiguous');
           await lowLevel.open_no_follow(scratch);
           await lowLevel.write_handle_bytes(scratchHandle, initial);
@@ -2535,7 +2535,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         [lockPath('mapping'), 'write', false],
         [lockPath('admission'), 'write', false],
       ].map(async ([name, mode, expected]) =>
-        (await lowLevel.principal_access_check(name, roleKind, bot, mode)) === expected));
+        (await lowLevel.principal_access_check(name, roleKind, bot, mode, ...roleArguments(profileFor(name)))) === expected));
       if (!permissions.every(Boolean)) refuseAfterCleanup('bot management-record permissions are ambiguous');
       if (!Buffer.from(await lowLevel.read_verified_bytes(targetPath) ?? []).equals(before)) {
         refuseAfterCleanup('bot self-test changed a management record');
@@ -3049,7 +3049,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       await assertConfigParentOwner('probe_prospective_cleanup');
       const principals = [targetPrincipal, managementPrincipal, botPrincipal, recoveryPrincipal];
       if (!principals.every((principal) => principal?.kind && principal?.value) ||
-          !(await Promise.all(principals.map((principal) => lowLevel.principal_access_check(parent, principal.kind, principal.value, 'read')))).every((result) => result === true)) refused('probe_prospective_cleanup', 'prospective cleanup is not proven');
+          !(await Promise.all(principals.map((principal) => lowLevel.principal_access_check(parent, principal.kind, principal.value, 'read', ...roleArguments('authority'))))).every((result) => result === true)) refused('probe_prospective_cleanup', 'prospective cleanup is not proven');
       const parentIdentity = await verifiedParent(targetPath);
       const blockerBytes = await lowLevel.read_verified_bytes(bootstrapBlockerPath);
       const parentAcl = await lowLevel.read_acl(parent);
@@ -3067,7 +3067,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         [targetPrincipal, false], [managementPrincipal, true], [botPrincipal, false], [recoveryPrincipal, false],
       ].map(async ([principal, expected]) => {
         try {
-          const result = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write');
+          const result = await lowLevel.principal_access_check(parent, principal.kind, principal.value, 'write', ...roleArguments('authority'));
           return typeof result === 'boolean' && result === expected;
         } catch {
           return false;
@@ -3130,7 +3130,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         const verifiedTarget = await assertObject(targetPath, Buffer.from(targetBytes), parentIdentity, undefined, null);
         const targetReaders = [managementPrincipal, botPrincipal];
         const targetAccess = await Promise.all(targetReaders.map((principal) =>
-          lowLevel.principal_access_check(targetPath, principal.kind, principal.value, 'read')));
+          lowLevel.principal_access_check(targetPath, principal.kind, principal.value, 'read', ...roleArguments(profileFor(targetPath)))));
         if (!targetAccess.every((result) => result === true)) {
           refused('probe_prospective_cleanup', 'legacy target is not readable by the required principals');
         }
@@ -3192,7 +3192,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
         ].map(async ([principal, mode]) => ({
           principal,
           mode,
-          result: await lowLevel.principal_access_check(scratch, principal.kind, principal.value, mode),
+          result: await lowLevel.principal_access_check(scratch, principal.kind, principal.value, mode, ...roleArguments('authority')),
         })));
         const [managementRead, managementWrite, botRead, botWrite, recoveryRead, recoveryWrite] = scratchAccess;
         if (managementRead.result !== true || managementWrite.result !== true ||
@@ -3211,7 +3211,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
           principal,
           mode,
           expected,
-          result: await lowLevel.principal_access_check(template, principal.kind, principal.value, mode),
+          result: await lowLevel.principal_access_check(template, principal.kind, principal.value, mode, ...roleArguments('authority')),
         }))));
         if (finalTemplateAccess.some(({ expected, result }) => result !== expected)) {
           refused('probe_prospective_cleanup', 'prospective final-profile template access is not proven');
@@ -4960,7 +4960,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
             configuredRoles.managementSid,
             configuredRoles.botSid,
             configuredRoles.recoverySid,
-          ].map((principal) => lowLevel.principal_access_check(targetPath, roleKind, principal, 'read')))).every((result) => result === true)) {
+          ].map((principal) => lowLevel.principal_access_check(targetPath, roleKind, principal, 'read', ...roleArguments(profileFor(targetPath)))))).every((result) => result === true)) {
             refused('publish_mapping', 'new managed target is not readable by M/B/R');
           }
           const target = await targetProof();

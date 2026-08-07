@@ -74,7 +74,7 @@ function adapter({ legacy = true, failAudit = false, roleBindings = roles, initi
     replace_existing_atomic: async (from, to) => { files.set(to, files.get(from)); files.delete(from); writes.push(to); payloads.push([to, Buffer.from(files.get(to))]); },
     acquire_native_lock: async () => ({ release: async () => {} }),
     current_os_principal: async () => currentPrincipal,
-    principal_access_check: async (_path, _kind, principal, mode) =>
+    principal_access_check: async (_path, _kind, principal, mode, ..._role) =>
       mode === 'read' || (mode === 'write' && principal === roleBindings.managementSid),
   };
   const baseNative = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles: roleBindings, platform });

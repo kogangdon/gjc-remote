@@ -35,7 +35,7 @@ function fake() {
     remove_verified_handle: async (handle, expected) => { assert.deepEqual(files.get(handle.path), Buffer.from(expected)); files.delete(handle.path); },
     read_verified_bytes: async (path) => files.has(path) ? Buffer.from(files.get(path)) : null, ensure_control_directory: async (path, managementSid, botSid, recoverySid, systemSid, profile) => { roleCalls.push([path, managementSid, botSid, recoverySid, systemSid, profile]); if (directories.has(path)) return; const principal = await lowLevel.current_os_principal(); if (principal?.value !== managementSid) { const error = new Error('ensure_control_directory refused: creator is not the directory-owning principal'); error.code = 'ERR_NATIVE_CONTROL_REFUSED'; error.operation = 'ensure_control_directory'; error.writes = 0; throw error; } directories.add(path); },
     create_absent_exclusive: async (path, bytes, ...args) => { files.set(path, Buffer.from(bytes)); calls.push(path); roleCalls.push([path, ...args]); }, create_exclusive_temp: async (_dir, prefix, bytes, ...args) => { const path = `${_dir}/${prefix}.tmp`; files.set(path, Buffer.from(bytes)); roleCalls.push([_dir, ...args]); return path; }, replace_existing_atomic: async (from, to, ...args) => { files.set(to, files.get(from)); files.delete(from); calls.push(to); roleCalls.push([from, to, ...args]); },
-    acquire_native_lock: async (path, ...args) => { calls.push(path); roleCalls.push([path, ...args]); return { release: async () => {} }; }, current_os_principal: async () => ({ kind: 'sid', value: roles.managementSid }), principal_access_check: async (_path, _kind, principal, mode) => mode !== 'write' || principal === roles.managementSid,
+    acquire_native_lock: async (path, ...args) => { calls.push(path); roleCalls.push([path, ...args]); return { release: async () => {} }; }, current_os_principal: async () => ({ kind: 'sid', value: roles.managementSid }), principal_access_check: async (_path, _kind, principal, mode, ..._role) => mode !== 'write' || principal === roles.managementSid,
   };
   return { files, directories, calls, roleCalls, roles, lowLevel };
 }
@@ -212,8 +212,8 @@ test('rejects missing immutable genesis authority request before reserve and att
 test('refuses GP when B can mutate the actual config parent', async () => {
   const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
   const access = lowLevel.principal_access_check;
-  lowLevel.principal_access_check = async (path, kind, principal, mode) =>
-    path === 'C:/state' && principal === roles.botSid && mode === 'write' ? true : access(path, kind, principal, mode);
+  lowLevel.principal_access_check = async (path, kind, principal, mode, ...role) =>
+    path === 'C:/state' && principal === roles.botSid && mode === 'write' ? true : access(path, kind, principal, mode, ...role);
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   await assert.rejects(native.probeProspectiveCleanup({ txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' }, managementPrincipal: { kind: 'sid', value: roles.managementSid }, botPrincipal: { kind: 'sid', value: roles.botSid }, recoveryPrincipal: { kind: 'sid', value: roles.recoverySid }, managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64) }), /actual config parent/);
   assert.equal([...files.keys()].some((path) => path.includes('.gjc-remote-control')), false);
@@ -237,8 +237,8 @@ test('refuses GP when config parent ACL is not an exact configured-role ACL', as
 test('refuses GP when target can mutate the actual config parent before any writes', async () => {
   const { calls, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
   const access = lowLevel.principal_access_check;
-  lowLevel.principal_access_check = async (path, kind, principal, mode) =>
-    path === 'C:/state' && principal === 'target' && mode === 'write' ? true : access(path, kind, principal, mode);
+  lowLevel.principal_access_check = async (path, kind, principal, mode, ...role) =>
+    path === 'C:/state' && principal === 'target' && mode === 'write' ? true : access(path, kind, principal, mode, ...role);
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   await assert.rejects(native.probeProspectiveCleanup({
     txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' },
@@ -252,8 +252,8 @@ test('refuses GP when target can mutate the actual config parent before any writ
 test('refuses GP when parent mutation capability is unknown before any writes', async () => {
   const { calls, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
   const access = lowLevel.principal_access_check;
-  lowLevel.principal_access_check = async (path, kind, principal, mode) =>
-    path === 'C:/state' && principal === roles.managementSid && mode === 'write' ? undefined : access(path, kind, principal, mode);
+  lowLevel.principal_access_check = async (path, kind, principal, mode, ...role) =>
+    path === 'C:/state' && principal === roles.managementSid && mode === 'write' ? undefined : access(path, kind, principal, mode, ...role);
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   await assert.rejects(native.probeProspectiveCleanup({
     txId: request.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' },
@@ -304,10 +304,10 @@ test('authority mutation revalidates parent owner, DACL, and capabilities write-
         path === 'C:/state' ? false : verify(path, ...args);
     } else {
       const access = lowLevel.principal_access_check;
-      lowLevel.principal_access_check = async (path, kind, principal, mode) =>
+      lowLevel.principal_access_check = async (path, kind, principal, mode, ...role) =>
         path === 'C:/state' && principal === roles.managementSid && mode === 'write'
           ? false
-          : access(path, kind, principal, mode);
+          : access(path, kind, principal, mode, ...role);
     }
     await assert.rejects(native.writeGenesisAuthorityRequest(authorityRequest), expected);
     assert.deepEqual(files, before, `${drift} drift must not mutate authority files`);
@@ -412,9 +412,9 @@ test('prospective cleanup requires observed B/R write denial for the retained sc
   const { files, roles, lowLevel } = fake(); const configPath = 'C:/state/channels.json'; const { request } = records();
   const accessCalls = [];
   const originalAccessCheck = lowLevel.principal_access_check;
-  lowLevel.principal_access_check = async (path, kind, principal, mode) => {
+  lowLevel.principal_access_check = async (path, kind, principal, mode, ...role) => {
     accessCalls.push({ path, kind, principal, mode });
-    return originalAccessCheck(path, kind, principal, mode);
+    return originalAccessCheck(path, kind, principal, mode, ...role);
   };
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   const prospective = await native.probeProspectiveCleanup({
@@ -441,7 +441,7 @@ test('prospective cleanup requires observed B/R write denial for the retained sc
     managementProvisioningFingerprint: 'b'.repeat(64), botProvisioningFingerprint: 'c'.repeat(64), recoveryProvisioningFingerprint: 'd'.repeat(64),
   });
   const denial = fake(); const denialRequest = records().request;
-  denial.lowLevel.principal_access_check = async (_path, _kind, _principal, mode) => mode === 'read';
+  denial.lowLevel.principal_access_check = async (_path, _kind, _principal, mode, ..._role) => mode === 'read';
   const denied = createManagementNativeForTest({ lowLevel: denial.lowLevel, configPath, roles: denial.roles });
   await assert.rejects(denied.probeProspectiveCleanup({
     txId: denialRequest.genesisTxId, targetPrincipal: { kind: 'sid', value: 'target' },
@@ -1627,7 +1627,7 @@ test('management startup self-test confines mutations to private scratch and rep
   const configPath = 'C:/state/channels.json';
   files.set(configPath, Buffer.from('{"legacy":true}'));
   lowLevel.current_os_principal = async () => ({ kind: 'sid', value: roles.managementSid });
-  lowLevel.principal_access_check = async (path, _kind, principal, mode) =>
+  lowLevel.principal_access_check = async (path, _kind, principal, mode, ..._role) =>
     path.includes('.mst-') ? principal === roles.managementSid : mode !== 'write' || principal === roles.managementSid;
   lowLevel.create_absent_exclusive = async (path, bytes) => {
     if (files.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
@@ -1772,7 +1772,7 @@ test('bot startup self-test is read-only and refuses ambiguous management-record
   const native = createManagementNativeForTest({ lowLevel, configPath, roles });
   assert.deepEqual(await native.runStartupSelfTest(), { role: 'bot', mst: false, bst: true, writes: 0 });
   assert.deepEqual(files, new Map([[configPath, original]]));
-  lowLevel.principal_access_check = async (path, _kind, _principal, mode) =>
+  lowLevel.principal_access_check = async (path, _kind, _principal, mode, ..._role) =>
     mode === 'read' || (path === configPath && mode === 'write');
   await assert.rejects(native.runStartupSelfTest(), (error) =>
     error.code === 'ERR_NATIVE_CONTROL_REFUSED' && error.operation === 'run_startup_self_test' &&

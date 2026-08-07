@@ -29,7 +29,7 @@ const capabilitySignatures = {
   create_absent_exclusive: ['path', 'bytes', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'],
   ensure_control_directory: ['path', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'],
   acquire_native_lock: ['path', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'],
-  current_os_principal: [], principal_access_check: ['path', 'kind', 'principal', 'mode'], remove_verified_file: ['path', 'expectedBytes'],
+  current_os_principal: [], principal_access_check: ['path', 'kind', 'principal', 'mode', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'], remove_verified_file: ['path', 'expectedBytes'],
   open_verified_parent_handle: ['path'], open_verified_object_handle: ['parentHandle', 'name'],
   read_handle_identity: ['handle'], read_handle_bytes: ['handle'],
   write_handle_bytes: ['handle', 'bytes'], remove_verified_handle: ['handle', 'expectedBytes'],
@@ -40,7 +40,7 @@ function fail(message) {
   process.exitCode = 1;
 }
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
-  version: 1, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+  version: 2, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
 })) fail('package native capability contract is invalid');
 
 if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${process.arch}`)) {
@@ -49,7 +49,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
   fail('native_control.node is missing');
 } else {
   const expected = {
-    contractVersion: 1,
+    contractVersion: 2,
     package: packageJson.name,
     version: packageJson.version,
     napi: 8,
@@ -66,7 +66,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     for (const name of capabilities) if (typeof loaded[name] !== 'function') fail(`native capability ${name} is missing`);
     let contract;
     try { contract = loaded.native_control_contract(); } catch { fail('native capability contract is missing or unreadable'); }
-    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 1, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
+    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 2, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
   }
   if (process.argv.includes('--write-manifest')) {
     if (!loaded || process.exitCode) process.exitCode = 1;

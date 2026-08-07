@@ -55,7 +55,7 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
 
   const addon = require(fileURLToPath(addonUrl));
   const contract = addon.native_control_contract();
-  assert.equal(contract.contractVersion, 1);
+  assert.equal(contract.contractVersion, 2);
   assert.equal(contract.napi, 8);
   assert.deepEqual(contract.capabilities, capabilities);
   assert.deepEqual(contract.capabilitySignatures, capabilitySignatures);
@@ -85,11 +85,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     assert.ok(await addon.read_acl(destination));
     assert.equal(await addon.verify_exact_role_acl(destination, ...roles, "authority"), true);
     const kind = process.platform === "win32" ? "sid" : "uid";
-    assert.equal(await addon.principal_access_check(destination, kind, roles[0], "read"), true);
-    assert.equal(await addon.principal_access_check(destination, kind, roles[0], "write"), true);
+    assert.equal(await addon.principal_access_check(destination, kind, roles[0], "read", ...roles, "authority"), true);
+    assert.equal(await addon.principal_access_check(destination, kind, roles[0], "write", ...roles, "authority"), true);
     for (const principal of roles.slice(1, 3)) {
-      assert.equal(await addon.principal_access_check(destination, kind, principal, "read"), true);
-      assert.equal(await addon.principal_access_check(destination, kind, principal, "write"), false);
+      assert.equal(await addon.principal_access_check(destination, kind, principal, "read", ...roles, "authority"), true);
+      assert.equal(await addon.principal_access_check(destination, kind, principal, "write", ...roles, "authority"), false);
     }
     const authorityParent = join(root, "authority-parent");
     await addon.ensure_control_directory(authorityParent, ...roles, "authority");
@@ -97,7 +97,7 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     const authorityParentIdentity = await addon.read_identity(authorityParent);
     assert.equal(authorityParentIdentity.owner, roles[0], "native identity proves authority parent ownership by M");
     for (const principal of roles.slice(1, 3)) {
-      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "write"), false,
+      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "write", ...roles, "authority"), false,
         "B/R lack directory mutation permission, denying rename and unlink of authority entries");
     }
     // "traverse" proves the plain kWindowsTraversalAccess bits (FILE_TRAVERSE among them) that every
@@ -107,17 +107,17 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     // authoritative AuthzAccessCheck ALLOW/DENY proof against the real on-disk DACL, not a mock: ALLOW
     // results never depend on group-membership expansion for an unresolvable synthetic role SID.
     for (const principal of roles.slice(1, 3)) {
-      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "traverse"), true,
+      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "traverse", ...roles, "authority"), true,
         "B/R must be able to traverse the M-owned control-root directory to reach every record beneath it");
-      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "mutate-children"), false,
+      assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "mutate-children", ...roles, "authority"), false,
         "B/R still cannot use the create/replace/rename primitives against the M-owned authority root, " +
           "even under the narrowed mutation-parent class");
     }
     const authorityChildRecord = join(authorityParent, "nested-record.json");
     await addon.create_absent_exclusive(authorityChildRecord, Buffer.from('{"nested":true}'), ...roles, "authority");
-    assert.equal(await addon.principal_access_check(authorityChildRecord, kind, roles[0], "read"), true);
+    assert.equal(await addon.principal_access_check(authorityChildRecord, kind, roles[0], "read", ...roles, "authority"), true);
     for (const principal of roles.slice(1, 3)) {
-      assert.equal(await addon.principal_access_check(authorityChildRecord, kind, principal, "read"), true,
+      assert.equal(await addon.principal_access_check(authorityChildRecord, kind, principal, "read", ...roles, "authority"), true,
         "B/R can read a record nested inside the M-owned control-root directory now that traversal is granted");
     }
     const botStateDir = join(root, "bot-state");
@@ -126,63 +126,50 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     const botStateDirIdentity = await addon.read_identity(botStateDir);
     assert.equal(botStateDirIdentity.owner, roles[0],
       "bot-state directory is M-owned, so M can provision it during Genesis bootstrap without SeRestorePrivilege/chown");
-    try {
-      assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "read"), true);
-    } catch (error) {
-      if (kind === "sid" && error?.code === "ERR_NATIVE_CONTROL_REFUSED" &&
-          error?.operation === "principal_access_check") {
-        t.diagnostic(
-          "Windows read-mode B allow proof for the bot-state directory is UNPROVEN in this run: " +
-            "the synthetic role SID cannot be resolved to a real local/domain principal on this " +
-            "non-elevated host, so full group-membership expansion cannot run and the native addon " +
-            "correctly refuses rather than asserting an unproven grant. The exact-ACL proof above " +
-            "(read+write+execute for B) and every other principal_access_check assertion in this " +
-            "test still ran and passed.",
-        );
-      } else {
-        throw error;
-      }
-    }
-    // principal_access_check's "traverse"/"mutate-children" ALLOW checks cannot be used against the
-    // bot-state directory itself: VerifyNoGroupMutationAcl (the same no-group-ACE safety net that backs
-    // "write" mode below) is evaluated over the *whole* DACL, and this profile intentionally grants B
-    // (a non-owner of the M-owned directory) FILE_GENERIC_WRITE/FILE_DELETE_CHILD on its own directory
-    // by design, which VerifyNoGroupMutationAcl always treats as a "foreign mutation" ACE regardless of
-    // which principal or mode is being probed — so every non-"read" principal_access_check on this
-    // directory is unconditionally false for every principal, proving nothing either way about B's
-    // grant specifically. That is an orthogonal, pre-existing, intentionally strict safety net, not a
-    // defect in this fix. The real, non-mock proof for B's directory-level grant is
-    // verify_exact_role_acl above (already asserted true): it reads the live on-disk DACL back through
-    // GetSecurityInfo and compares each ACE's mask byte-for-byte against RoleRights(), so B's ACE is
-    // proven to be exactly FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE |
-    // FILE_DELETE_CHILD (the CRITICAL #1 traversal/execute grant plus the narrowed #2 child-mutation
-    // grant) and never WRITE_DAC/WRITE_OWNER.
+    // The bot-state directory is M-owned but grants B (a non-owner) FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+    // FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD by design (proven exact via verify_exact_role_acl above), so
+    // B can open it as a create/replace/rename mutation parent for its own bot-state records. The old
+    // principal_access_check gate (VerifyNoGroupMutationAcl) rejected this DACL outright — any non-owner,
+    // non-SYSTEM ACE with mutation rights unconditionally failed the whole-DACL heuristic, so every mode
+    // returned false for every principal on this directory regardless of the real, legitimate grant.
+    // Replacing that profile-blind heuristic with VerifyExactRoleAcl (bound to the bot-state RoleProfile and
+    // the real M/B/R/SYSTEM SIDs) makes every mode below an authoritative AuthzAccessCheck ALLOW/DENY proof
+    // against the live on-disk DACL — no try/catch fallback is needed for B's read/traverse/mutate-children
+    // ALLOW proofs: they come from B's own explicit per-principal ACE, which AuthzAccessCheck matches
+    // directly even when the synthetic role SID cannot be expanded into real group memberships.
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[0], "read", ...roles, "bot-state"), true);
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "read", ...roles, "bot-state"), true,
+      "B can read the bot-state directory now that the exact-role-ACL gate authoritatively evaluates B's own grant");
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[2], "read", ...roles, "bot-state"), true);
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "traverse", ...roles, "bot-state"), true,
+      "B's traverse capability on the bot-state directory now evaluates authoritatively (ALLOW)");
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "mutate-children", ...roles, "bot-state"), true,
+      "B's child-mutation capability (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD) on the bot-state " +
+        "directory now evaluates authoritatively (ALLOW)");
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[2], "traverse", ...roles, "bot-state"), true,
+      "R keeps today's read/traverse semantics on the bot-state directory");
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[2], "mutate-children", ...roles, "bot-state"), false,
+      "R keeps today's semantics: no child-mutation capability on the bot-state directory");
     t.diagnostic(
       "B's ability to literally create and replace a bot-state record end-to-end under its own OS " +
         "token (temp+rename path, then remove its own temp) is UNPROVEN by this test: the test process " +
         "runs as the M principal and B is a synthetic, non-resolvable SID on this host, so there is no " +
         "way to obtain a real B-token handle to exercise create_exclusive_temp/replace_existing_atomic/" +
         "remove_verified_file as B without a second real Windows account and interactive logon or " +
-        "impersonation. The strongest available real (non-mock) proof is the exact per-role ACE " +
-        "equality proof from verify_exact_role_acl above (B's ACE now carries FILE_DELETE_CHILD and " +
-        "FILE_GENERIC_EXECUTE in addition to FILE_GENERIC_READ | FILE_GENERIC_WRITE), together with the " +
-        "authoritative AuthzAccessCheck 'traverse'/'mutate-children' ALLOW proofs on the control-root " +
-        "directory below, which is not subject to the same blanket no-group-ACE gate because that " +
-        "profile grants no non-owner mutation rights at all.");
-    // principal_access_check's directory "write" mode proves the full destructive directory-mutation
-    // class (WRITE_DAC | WRITE_OWNER | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD via
-    // kWindowsDirectoryMutationAccess), not plain create/replace. B's bot-state directory grant is
-    // FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD (proven exact
-    // via verify_exact_role_acl above), which lets B open this directory as a create/replace/rename
-    // mutation parent for its own records, but never includes WRITE_DAC/WRITE_OWNER: this "write" check
-    // must still deny B (and R) here, proving B may create and replace its own bot-state records
-    // without ever being able to delete/rename arbitrary entries or take ownership of the M-owned
-    // directory.
-    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "write"), false,
+        "impersonation. The strongest available real (non-mock) proof is the exact per-role ACE equality " +
+        "proof from verify_exact_role_acl above together with the authoritative principal_access_check " +
+        "traverse/mutate-children ALLOW proofs directly above, which are now evaluated against the exact " +
+        "bot-state role profile instead of the old profile-blind heuristic.");
+    // "write" mode proves the full destructive directory-mutation class (WRITE_DAC | WRITE_OWNER |
+    // FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD via kWindowsDirectoryMutationAccess), not
+    // plain create/replace. B's bot-state directory grant never includes WRITE_DAC/WRITE_OWNER: this "write"
+    // check must still deny B (and R) here, proving B may create and replace its own bot-state records
+    // without ever being able to delete/rename arbitrary entries or take ownership of the M-owned directory.
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "write", ...roles, "bot-state"), false,
       "B lacks destructive directory-mutation capability (WRITE_DAC/WRITE_OWNER) on the M-owned bot-state directory");
-    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[2], "write"), false,
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[2], "write", ...roles, "bot-state"), false,
       "R keeps today's read-only bot-state semantics");
-    assert.equal(await addon.principal_access_check(authorityParent, kind, roles[1], "write"), false,
+    assert.equal(await addon.principal_access_check(authorityParent, kind, roles[1], "write", ...roles, "authority"), false,
       "B still cannot mutate the authority root");
     try {
       await addon.create_absent_exclusive(join(botStateDir, "reader-projection.json"), Buffer.from("{}"), ...roles, "bot-state");
@@ -194,11 +181,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     const authDestination = join(root, "management-auth.json");
     const authBytes = Buffer.from('{"verifier":"redacted"}');
     await addon.create_absent_exclusive(authDestination, authBytes, ...roles, "management-auth");
-    assert.equal(await addon.principal_access_check(authDestination, kind, roles[0], "read"), true);
-    assert.equal(await addon.principal_access_check(authDestination, kind, roles[0], "write"), true);
+    assert.equal(await addon.principal_access_check(authDestination, kind, roles[0], "read", ...roles, "management-auth"), true);
+    assert.equal(await addon.principal_access_check(authDestination, kind, roles[0], "write", ...roles, "management-auth"), true);
     for (const principal of roles.slice(1, 3)) {
       try {
-        assert.equal(await addon.principal_access_check(authDestination, kind, principal, "read"), false);
+        assert.equal(await addon.principal_access_check(authDestination, kind, principal, "read", ...roles, "management-auth"), false);
       } catch (error) {
         if (kind === "sid" && error?.code === "ERR_NATIVE_CONTROL_REFUSED" &&
             error?.operation === "principal_access_check") {
@@ -215,10 +202,12 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
           throw error;
         }
       }
-      assert.equal(await addon.principal_access_check(authDestination, kind, principal, "write"), false);
+      assert.equal(await addon.principal_access_check(authDestination, kind, principal, "write", ...roles, "management-auth"), false);
     }
     assert.throws(() => addon.principal_access_check(destination, kind, roles[0]), /missing string argument/);
-    assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "execute"), /access mode must be read, write, mutate-children, or traverse/);
+    assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "read"), /missing string argument/);
+    assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "execute", ...roles, "authority"), /access mode must be read, write, mutate-children, or traverse/);
+    assert.throws(() => addon.principal_access_check(destination, kind, roles[0], "read", ...roles, "bogus-profile"), /role profile is invalid/);
 
     const parentHandle = await addon.open_verified_parent_handle(destination);
     const objectHandle = await addon.open_verified_object_handle(parentHandle, basename(destination));
@@ -315,25 +304,25 @@ test("POSIX principal access rejects writable ACL_OTHER, ACL_GROUP, and named gr
     // A readable ACL_OTHER remains a valid read proof, but any broad write bit
     // invalidates the mutation proof even when this principal is not in the group.
     await chmod(target, 0o644);
-    assert.equal(await addon.principal_access_check(target, "uid", principal, "read"), true);
-    assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "read", "uid:0", "uid:0", "uid:0", "uid:0", "authority"), true);
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "write", "uid:0", "uid:0", "uid:0", "uid:0", "authority"), false);
     await chmod(target, 0o666);
-    assert.equal(await addon.principal_access_check(target, "uid", principal, "read"), true);
-    assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "read", "uid:0", "uid:0", "uid:0", "uid:0", "authority"), true);
+    assert.equal(await addon.principal_access_check(target, "uid", principal, "write", "uid:0", "uid:0", "uid:0", "uid:0", "authority"), false);
 
     // Named ACL users with write permission are not valid mutation proofs,
     // including a foreign principal that otherwise matches the ACL entry.
     await chmod(target, 0o644);
     try {
       await execFile("setfacl", ["-m", `u:${candidate[2]}:rw`, target]);
-      assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+      assert.equal(await addon.principal_access_check(target, "uid", principal, "write", "uid:0", "uid:0", "uid:0", "uid:0", "authority"), false);
 
       // A named ACL_GROUP is likewise rejected for mutation regardless of
       // whether the probed principal happens to match that group.
       await execFile("setfacl", ["-m", `g:${currentGid ?? candidate[3]}:rw`, target]);
-      assert.equal(await addon.principal_access_check(target, "uid", principal, "write"), false);
+      assert.equal(await addon.principal_access_check(target, "uid", principal, "write", "uid:0", "uid:0", "uid:0", "uid:0", "authority"), false);
       await execFile("setfacl", ["-m", `u:${candidate[2]}:rwx`, parent]);
-      assert.equal(await addon.principal_access_check(parent, "uid", principal, "write"), false);
+      assert.equal(await addon.principal_access_check(parent, "uid", principal, "write", "uid:0", "uid:0", "uid:0", "uid:0", "authority"), false);
     } catch (error) {
       if (error?.code !== "ENOENT" && !/not supported|operation not permitted/i.test(error?.stderr ?? "")) throw error;
     }
@@ -407,12 +396,12 @@ test("POSIX named ACL groups match only principals that belong to each GID", asy
     }
 
     assert.equal(
-      await addon.principal_access_check(target, "uid", `uid:${matching.uid}`, "read"),
+      await addon.principal_access_check(target, "uid", `uid:${matching.uid}`, "read", "uid:0", "uid:0", "uid:0", "uid:0", "authority"),
       true,
       "a principal belonging to the named ACL group receives that group's read permission",
     );
     assert.equal(
-      await addon.principal_access_check(target, "uid", `uid:${nonMatching.uid}`, "read"),
+      await addon.principal_access_check(target, "uid", `uid:${nonMatching.uid}`, "read", "uid:0", "uid:0", "uid:0", "uid:0", "authority"),
       false,
       "a principal outside the named ACL group does not receive its read permission",
     );
