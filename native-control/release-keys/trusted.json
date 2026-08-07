@@ -2,9 +2,9 @@
   "version": 1,
   "keys": [
     {
-      "keyId": "prod-2026-08",
+      "keyId": "prod-2026-08-r2",
       "algorithm": "ed25519",
-      "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAkBdvf/mpwO4GnNagPQvj/L1IGQkrdwBT16qrJIIhmKc=\n-----END PUBLIC KEY-----\n"
+      "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAKu6vrYbExrjJ/nL5Jwr05PmtYtHF+xNwQYwRZuTP81w=\n-----END PUBLIC KEY-----\n"
     }
   ]
 }

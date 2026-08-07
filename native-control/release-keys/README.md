@@ -30,11 +30,11 @@ source control and is reviewed like any other change.
 
 ## Provisioned key (this repository)
 
-- `keyId`: `prod-2026-08`, algorithm `ed25519`. Signature enforcement is
+- `keyId`: `prod-2026-08-r2`, algorithm `ed25519`. Signature enforcement is
   therefore LIVE: `loadVerifiedAddon()` refuses a missing, malformed, or
   invalid sidecar and refuses an unknown `keyId`.
 - The private key is held OUTSIDE this repository by the operator at
-  `~/.gjc/release-keys/gjc-remote-native-control-prod.ed25519.key` with the
+  `~/.gjc/release-keys/gjc-remote-native-control-prod-r2.ed25519.key` with the
   file ACL restricted to that account. It is never committed, never copied
   into `build/`, and never needed to run the test suite.
 - Re-sign after every rebuild, because `--write-manifest` regenerates the
@@ -43,8 +43,8 @@ source control and is reviewed like any other change.
   ```bash
   cd native-control
   node scripts/verify-build.mjs --write-manifest \
-    --sign-key ~/.gjc/release-keys/gjc-remote-native-control-prod.ed25519.key \
-    --key-id prod-2026-08
+    --sign-key ~/.gjc/release-keys/gjc-remote-native-control-prod-r2.ed25519.key \
+    --key-id prod-2026-08-r2
   node scripts/verify-build.mjs --require-signature   # release gate
   ```
 
@@ -73,9 +73,9 @@ keep the number of plaintext copies at ONE and encrypt every backup.
 
 | Field | Value |
 | --- | --- |
-| `keyId` | `prod-2026-08` |
+| `keyId` | `prod-2026-08-r2` |
 | Algorithm | ed25519 |
-| Public SPKI SHA-256 | `62789ce90d683922d0f66037c05b87c6842d50683c2a28883617a0939cb2dfa7` |
+| Public SPKI SHA-256 | `05d9038586b48dad08e5daad043bc455d471a4622744c1e5cfd21f34a45b560a` |
 
 A restored key is the right one when its public SPKI SHA-256 matches the row
 above and the pinned `publicKeyPem` in `trusted.json`:
@@ -86,14 +86,24 @@ node -e "const{createPrivateKey,createPublicKey,createHash}=require('crypto'),fs
   console.log(createHash('sha256').update(pub.export({type:'spki',format:'der'})).digest('hex'))" <key-path>
 ```
 
+### Incident log
+
+The first provisioned key (`prod-2026-08`) was destroyed and replaced by
+`prod-2026-08-r2` before any release shipped: its private seed was printed
+into an operator session transcript during provisioning, so it was treated as
+disclosed. No artifact was ever published under the old `keyId`, the old entry
+was removed from `trusted.json` rather than kept for compatibility, and the old
+private key file was deleted. Never print private key material — verify a key
+only through its PUBLIC fingerprint.
+
 ### Backup
 
 ```bash
 # Encrypted backup for offline media / a password manager. Keep the working
 # copy unencrypted and ACL-restricted; only backups carry a passphrase.
 openssl pkcs8 -topk8 -v2 aes-256-cbc \
-  -in ~/.gjc/release-keys/gjc-remote-native-control-prod.ed25519.key \
-  -out prod-2026-08.key.enc.pem
+  -in ~/.gjc/release-keys/gjc-remote-native-control-prod-r2.ed25519.key \
+  -out prod-2026-08-r2.key.enc.pem
 ```
 
 Store two encrypted copies on separate offline media (or one offline plus a
@@ -103,10 +113,10 @@ this repository, in `build/`, or in CI secrets.
 ### Restore drill (run after every backup change)
 
 ```bash
-openssl pkcs8 -in prod-2026-08.key.enc.pem -out restored.key           # decrypt
+openssl pkcs8 -in prod-2026-08-r2.key.enc.pem -out restored.key           # decrypt
 # confirm the fingerprint matches the table above, then prove it still signs:
 cd native-control
-node scripts/verify-build.mjs --write-manifest --sign-key ../restored.key --key-id prod-2026-08
+node scripts/verify-build.mjs --write-manifest --sign-key ../restored.key --key-id prod-2026-08-r2
 node scripts/verify-build.mjs --require-signature
 rm ../restored.key                                                     # discard the copy
 ```
