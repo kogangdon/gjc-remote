@@ -2542,7 +2542,11 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
       }
       const targetBytes = await lowLevel.read_verified_bytes(targetPath);
       if (targetBytes === null) refuseAfterCleanup('bot readable management target is absent');
-      const managed = await hasPublishedAuthority();
+      const selfTestControlRoot = await read(path('control-root'));
+      const retainedTarget = selfTestControlRoot === null
+        ? true
+        : selfTestControlRoot.sourceKind === 'legacy-retained';
+      const managed = !retainedTarget;
       await assertObject(targetPath, Buffer.from(targetBytes), undefined, undefined, managed ? 'authority' : null);
       const before = Buffer.from(targetBytes);
       // The target read/write probes below must use the target's real profile, not
