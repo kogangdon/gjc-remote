@@ -23,9 +23,9 @@ test('production package surface excludes the low-level test adapter', () => {
 });
 
 function fake() {
-  const files = new Map(); const calls = []; const roleCalls = []; const roles = { managementSid: 'S-1-5-21-100', botSid: 'S-1-5-21-101', recoverySid: 'S-1-5-21-102', systemSid: 'S-1-5-18' };
+  const files = new Map(); const directories = new Set(); const calls = []; const roleCalls = []; const roles = { managementSid: 'S-1-5-21-100', botSid: 'S-1-5-21-101', recoverySid: 'S-1-5-21-102', systemSid: 'S-1-5-18' };
   const lowLevel = {
-    open_verified_parent: async (path) => ({ path: parentOf(path), owner: roles.managementSid }), open_no_follow: async () => {}, read_identity: async (path) => path.endsWith('.genesis-bootstrap-blocker') && !files.has(path) ? null : ({ path, owner: roles.managementSid }), read_acl: async () => 'protected:M,B,R,SYSTEM', path_exists_no_follow: async (path) => { const normalized = path.replaceAll('\\', '/'); return [...files.keys()].some((name) => { const candidate = name.replaceAll('\\', '/'); return candidate === normalized || candidate.startsWith(`${normalized}/`); }); }, verify_exact_role_acl: async () => true, set_exact_role_acl: async () => {}, remove_verified_file: async (path, expected) => { assert.deepEqual(files.get(path), Buffer.from(expected)); files.delete(path); }, flush_file: async () => {}, flush_directory_or_volume: async () => {},
+    open_verified_parent: async (path) => ({ path: parentOf(path), owner: roles.managementSid }), open_no_follow: async () => {}, read_identity: async (path) => path.endsWith('.genesis-bootstrap-blocker') && !files.has(path) ? null : ({ path, owner: roles.managementSid }), read_acl: async () => 'protected:M,B,R,SYSTEM', path_exists_no_follow: async (path) => { const normalized = path.replaceAll('\\', '/'); return directories.has(path) || [...files.keys(), ...directories].some((name) => { const candidate = name.replaceAll('\\', '/'); return candidate === normalized || candidate.startsWith(`${normalized}/`); }); }, verify_exact_role_acl: async () => true, set_exact_role_acl: async () => {}, remove_verified_file: async (path, expected) => { assert.deepEqual(files.get(path), Buffer.from(expected)); files.delete(path); }, flush_file: async () => {}, flush_directory_or_volume: async () => {},
     open_verified_parent_handle: async (path) => ({ path: parentOf(path), owner: roles.managementSid }), open_verified_object_handle: async (parent, name) => {
       const normalized = `${parent.path}/${name}`;
       const path = [...files.keys()].find((candidate) => candidate.replaceAll('\\', '/') === normalized);
@@ -33,11 +33,11 @@ function fake() {
     }, read_handle_identity: async (handle) => ({ path: handle.path, owner: roles.managementSid }), read_handle_bytes: async (handle) => Buffer.from(files.get(handle.path)),
     write_handle_bytes: async (handle, bytes) => { if (!files.has(handle.path)) throw new Error('missing handle'); files.set(handle.path, Buffer.from(bytes)); },
     remove_verified_handle: async (handle, expected) => { assert.deepEqual(files.get(handle.path), Buffer.from(expected)); files.delete(handle.path); },
-    read_verified_bytes: async (path) => files.has(path) ? Buffer.from(files.get(path)) : null, ensure_control_directory: async (...args) => { roleCalls.push(args); },
+    read_verified_bytes: async (path) => files.has(path) ? Buffer.from(files.get(path)) : null, ensure_control_directory: async (path, managementSid, botSid, recoverySid, systemSid, profile) => { roleCalls.push([path, managementSid, botSid, recoverySid, systemSid, profile]); if (directories.has(path)) return; const principal = await lowLevel.current_os_principal(); if (principal?.value !== managementSid) { const error = new Error('ensure_control_directory refused: creator is not the directory-owning principal'); error.code = 'ERR_NATIVE_CONTROL_REFUSED'; error.operation = 'ensure_control_directory'; error.writes = 0; throw error; } directories.add(path); },
     create_absent_exclusive: async (path, bytes, ...args) => { files.set(path, Buffer.from(bytes)); calls.push(path); roleCalls.push([path, ...args]); }, create_exclusive_temp: async (_dir, prefix, bytes, ...args) => { const path = `${_dir}/${prefix}.tmp`; files.set(path, Buffer.from(bytes)); roleCalls.push([_dir, ...args]); return path; }, replace_existing_atomic: async (from, to, ...args) => { files.set(to, files.get(from)); files.delete(from); calls.push(to); roleCalls.push([from, to, ...args]); },
     acquire_native_lock: async (path, ...args) => { calls.push(path); roleCalls.push([path, ...args]); return { release: async () => {} }; }, current_os_principal: async () => ({ kind: 'sid', value: roles.managementSid }), principal_access_check: async (_path, _kind, principal, mode) => mode !== 'write' || principal === roles.managementSid,
   };
-  return { files, calls, roleCalls, roles, lowLevel };
+  return { files, directories, calls, roleCalls, roles, lowLevel };
 }
 function records(managementSid = 'S-1-5-21-100') {
   const h = 'a'.repeat(64); const tx = '123e4567-e89b-42d3-a456-426614174000';

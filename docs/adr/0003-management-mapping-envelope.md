@@ -18,6 +18,44 @@ wrapper, target, state, locks, and audit chain. `B` consumes authority read-only
 B owns its reader state, lease, and acknowledgement and cannot repair, publish,
 or infer authority. Discord authorization is not management authority.
 
+## Bot-state directory provisioning and ownership
+
+`bot-state` is a subdirectory of the control root that holds B's reader
+projection, reader state, lease, acknowledgement, and successor handshake
+records. Its role profile is **M-owned**: `BuildExactRoleAcl`/`RoleRights`
+(Windows) and `RoleMode`/`required_owner_role` (POSIX) grant the directory
+object itself `FILE_ALL_ACCESS` to M and `FILE_GENERIC_READ | FILE_GENERIC_WRITE
+| FILE_GENERIC_EXECUTE` to B (POSIX: rwx to both M and B, mirroring the
+existing per-directory execute grant), while individual bot-state *records*
+(files) under it keep the prior file-level semantics — B-owned, B has
+read+write, M and R have read-only. R and SYSTEM keep today's semantics at
+both levels. The native primitive layer distinguishes the two cases from the
+object's own kind (a real directory vs. a regular file) rather than from a
+second role-profile name, so `verify_exact_role_acl`/`ensure_control_directory`
+continue to take the single `"bot-state"` profile string for both the
+directory and its records.
+
+M provisions `bot-state` during Genesis bootstrap, in the same step that
+provisions the control root: `ensure()` (the internal helper backing every
+M-only authority write) creates and exact-ACL-verifies the control root and
+then, immediately after, creates and exact-ACL-verifies `bot-state` alongside
+it. Because M is the OS principal actually creating both directories, and
+the bot-state role profile requires the *directory* owner to be M, this
+creation succeeds without `SeRestorePrivilege` or `chown` — no elevated
+right is needed to set the owner of an object you are yourself creating.
+
+A bot-principal writer never attempts to create `bot-state`: `ensureBotRoot()`
+only verifies that it exists with the exact bot-state role ACL and refuses
+fail-closed (`ERR_NATIVE_CONTROL_REFUSED`, `writes: 0`) if it is absent,
+rather than lazily creating it. This closes the real-platform bootstrap
+blocker where a bound-reader handshake, reached only through a bot-principal
+writer, could never create `bot-state` under the authority role's read+execute
+ACL — every bot projection/state/lease/ack write would otherwise fail closed
+on a real Windows/POSIX host, even though the fake-native test double (which
+ignores ACLs) never observed it. B still cannot mutate the authority root or
+any object under it; only `bot-state`, and only in the ways described above,
+are open to B.
+
 A managed-v1 wrapper admits only workspace routes. A retained legacy wrapper
 preserves the target byte-for-byte and has `legacy-unmigrated`, exact retention,
 and `no-route`; it is deliberately not converted or routed. Legacy direct-map

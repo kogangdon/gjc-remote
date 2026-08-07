@@ -450,17 +450,20 @@ struct RoleAcl {
   }
 };
 
-DWORD RoleRights(RoleProfile profile, size_t role) {
+DWORD RoleRights(RoleProfile profile, size_t role, bool directory) {
   if (role == 3) return FILE_ALL_ACCESS;
   if (profile == RoleProfile::ManagementAuth) return role == 0 || role == 3 ? FILE_ALL_ACCESS : 0;
   if (profile == RoleProfile::Authority) return role == 0 ? FILE_ALL_ACCESS : FILE_GENERIC_READ;
-  if (profile == RoleProfile::BotState) return role == 1 ? FILE_GENERIC_READ | FILE_GENERIC_WRITE : FILE_GENERIC_READ;
+  if (profile == RoleProfile::BotState) {
+    if (directory) return role == 0 ? FILE_ALL_ACCESS : role == 1 ? (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE) : FILE_GENERIC_READ;
+    return role == 1 ? FILE_GENERIC_READ | FILE_GENERIC_WRITE : FILE_GENERIC_READ;
+  }
   return role == 0 ? FILE_ALL_ACCESS : FILE_GENERIC_READ;
 }
 
 bool BuildExactRoleAcl(const std::string& manager, const std::string& bot,
                        const std::string& reader, const std::string& system,
-                       RoleProfile profile, RoleAcl* result) {
+                       RoleProfile profile, bool directory, RoleAcl* result) {
   const std::string values[] = {manager, bot, reader, system};
   for (const std::string& value : values) {
     std::wstring wide = Wide(value);
@@ -473,7 +476,7 @@ bool BuildExactRoleAcl(const std::string& manager, const std::string& bot,
   }
   EXPLICIT_ACCESSW entries[4]{};
   for (size_t i = 0; i < 4; ++i) {
-    entries[i].grfAccessPermissions = RoleRights(profile, i);
+    entries[i].grfAccessPermissions = RoleRights(profile, i, directory);
     entries[i].grfAccessMode = SET_ACCESS;
     entries[i].grfInheritance = NO_INHERITANCE;
     entries[i].Trustee.TrusteeForm = TRUSTEE_IS_SID;
@@ -486,14 +489,17 @@ bool BuildExactRoleAcl(const std::string& manager, const std::string& bot,
 bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
                         const std::string& bot, const std::string& reader,
                         const std::string& system, RoleProfile profile) {
+  BY_HANDLE_FILE_INFORMATION metadata{};
+  if (!GetFileInformationByHandle(handle, &metadata)) return false;
+  const bool directory = (metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
   RoleAcl roles;
-  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) return false;
+  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, directory, &roles)) return false;
   PACL applied = nullptr;
   PSID owner = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   if (GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr,
                       &applied, nullptr, &descriptor) != ERROR_SUCCESS) return false;
-  const size_t required_owner_role = profile == RoleProfile::BotState ? 1 : 0;
+  const size_t required_owner_role = (profile == RoleProfile::BotState && !directory) ? 1 : 0;
   SECURITY_DESCRIPTOR_CONTROL control = 0;
   DWORD revision = 0;
   ACL_SIZE_INFORMATION size{};
@@ -517,7 +523,7 @@ bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
     ACCESS_ALLOWED_ACE* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
     bool matched = false;
     for (size_t role = 0; role < 4; ++role) {
-      if (!seen[role] && ace->Mask == RoleRights(profile, role) &&
+      if (!seen[role] && ace->Mask == RoleRights(profile, role, directory) &&
           EqualSid(reinterpret_cast<PSID>(&ace->SidStart), roles.sids[role])) {
         seen[role] = true; matched = true; break;
       }
@@ -531,8 +537,11 @@ bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
 bool ApplyExactRoleAcl(HANDLE handle, const std::string& manager,
                        const std::string& bot, const std::string& reader,
                        const std::string& system, RoleProfile profile) {
+  BY_HANDLE_FILE_INFORMATION metadata{};
+  if (!GetFileInformationByHandle(handle, &metadata)) return false;
+  const bool directory = (metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
   RoleAcl roles;
-  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) return false;
+  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, directory, &roles)) return false;
   if (SetSecurityInfo(handle, SE_FILE_OBJECT,
       DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
       nullptr, nullptr, roles.acl, nullptr) != ERROR_SUCCESS) return false;
@@ -757,7 +766,7 @@ mode_t RoleMode(RoleProfile profile, size_t role, bool directory) {
   if (role == 3) mode = S_IRUSR | S_IWUSR;
   else if (profile == RoleProfile::ManagementAuth) mode = role == 0 || role == 3 ? S_IRUSR | S_IWUSR : 0;
   else if (profile == RoleProfile::Authority) mode = role == 0 ? S_IRUSR | S_IWUSR : S_IRUSR;
-  else if (profile == RoleProfile::BotState) mode = role == 1 ? S_IRUSR | S_IWUSR : S_IRUSR;
+  else if (profile == RoleProfile::BotState) mode = directory ? ((role == 0 || role == 1) ? S_IRUSR | S_IWUSR : S_IRUSR) : (role == 1 ? S_IRUSR | S_IWUSR : S_IRUSR);
   else mode = role == 0 ? S_IRUSR | S_IWUSR : S_IRUSR;
   if (directory) mode |= S_IXUSR;
   return mode;
@@ -786,7 +795,7 @@ bool ApplyExactRoleAcl(int fd, const std::string& manager, const std::string& bo
         (uid && acl_set_qualifier(entry, uid) != 0) || acl_get_permset(entry, &perms) != 0 ||
         !SetPerms(perms, mode)) ok = false;
   };
-  const ssize_t required_owner_role = profile == RoleProfile::BotState ? 1 : 0;
+  const ssize_t required_owner_role = (profile == RoleProfile::BotState && !directory) ? 1 : 0;
   ssize_t owner_role = -1;
   for (size_t i = 0; i < 4; ++i) if (roles[i] == st.st_uid) owner_role = static_cast<ssize_t>(i);
   if (owner_role != required_owner_role) { acl_free(acl); return false; }
@@ -806,7 +815,7 @@ bool VerifyExactRoleAcl(int fd, const std::string& manager, const std::string& b
       !ParseUid(system, &roles[3]) || roles[3] != 0 || fstat(fd, &st) != 0 ||
       (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) return false;
   const bool directory = S_ISDIR(st.st_mode);
-  const ssize_t required_owner_role = profile == RoleProfile::BotState ? 1 : 0;
+  const ssize_t required_owner_role = (profile == RoleProfile::BotState && !directory) ? 1 : 0;
   ssize_t owner_role = -1; for (size_t i = 0; i < 4; ++i) if (roles[i] == st.st_uid) owner_role = static_cast<ssize_t>(i);
   if (owner_role != required_owner_role) return false;
   acl_t acl = acl_get_fd(fd); if (!acl) return false;
@@ -1362,7 +1371,7 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
   RoleProfile profile;
   if (!ParseRoleProfile(profile_text, &profile)) { Refuse(env, "create_exclusive_temp", "role profile is invalid"); return nullptr; }
   RoleAcl roles;
-  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) {
+  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, false, &roles)) {
     Refuse(env, "create_exclusive_temp", "protected exact role DACL cannot be constructed");
     return nullptr;
   }
@@ -1526,7 +1535,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
   RoleProfile profile;
   if (!ParseRoleProfile(profile_text, &profile)) { Refuse(env, "create_absent_exclusive", "role profile is invalid"); return nullptr; }
   RoleAcl roles;
-  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) {
+  if (!BuildExactRoleAcl(manager, bot, reader, system, profile, false, &roles)) {
     Refuse(env, "create_absent_exclusive", "protected exact role DACL cannot be constructed");
     return nullptr;
   }
@@ -1975,7 +1984,7 @@ napi_value AcquireNativeLock(napi_env env, napi_callback_info info) {
   }
   RoleProfile profile;
   RoleAcl roles;
-  if (!ParseRoleProfile(profile_text, &profile) || !BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) {
+  if (!ParseRoleProfile(profile_text, &profile) || !BuildExactRoleAcl(manager, bot, reader, system, profile, false, &roles)) {
     delete lock; Refuse(env, "acquire_native_lock", "protected exact role DACL cannot be constructed"); return nullptr;
   }
   lock->handle = OpenNoFollowFile(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL);
@@ -2044,7 +2053,7 @@ napi_value EnsureControlDirectory(napi_env env, napi_callback_info info) {
   }
   RoleProfile profile;
   RoleAcl roles;
-  if (!ParseRoleProfile(profile_text, &profile) || !BuildExactRoleAcl(manager, bot, reader, system, profile, &roles)) {
+  if (!ParseRoleProfile(profile_text, &profile) || !BuildExactRoleAcl(manager, bot, reader, system, profile, true, &roles)) {
     Refuse(env, "ensure_control_directory", "protected exact role DACL cannot be constructed"); return nullptr;
   }
   HANDLE h = OpenNoFollowDirectory(path, READ_CONTROL);

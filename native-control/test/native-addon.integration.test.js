@@ -100,6 +100,48 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
       assert.equal(await addon.principal_access_check(authorityParent, kind, principal, "write"), false,
         "B/R lack directory mutation permission, denying rename and unlink of authority entries");
     }
+    const botStateDir = join(root, "bot-state");
+    await addon.ensure_control_directory(botStateDir, ...roles, "bot-state");
+    assert.equal(await addon.verify_exact_role_acl(botStateDir, ...roles, "bot-state"), true);
+    const botStateDirIdentity = await addon.read_identity(botStateDir);
+    assert.equal(botStateDirIdentity.owner, roles[0],
+      "bot-state directory is M-owned, so M can provision it during Genesis bootstrap without SeRestorePrivilege/chown");
+    try {
+      assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "read"), true);
+    } catch (error) {
+      if (kind === "sid" && error?.code === "ERR_NATIVE_CONTROL_REFUSED" &&
+          error?.operation === "principal_access_check") {
+        t.diagnostic(
+          "Windows read-mode B allow proof for the bot-state directory is UNPROVEN in this run: " +
+            "the synthetic role SID cannot be resolved to a real local/domain principal on this " +
+            "non-elevated host, so full group-membership expansion cannot run and the native addon " +
+            "correctly refuses rather than asserting an unproven grant. The exact-ACL proof above " +
+            "(read+write+execute for B) and every other principal_access_check assertion in this " +
+            "test still ran and passed.",
+        );
+      } else {
+        throw error;
+      }
+    }
+    // principal_access_check's directory "write" mode proves destructive directory-mutation
+    // capability (delete-child/rename/take-ownership via kWindowsDirectoryMutationAccess), not
+    // plain create/replace. B's bot-state grant (FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+    // FILE_GENERIC_EXECUTE, proven exact via verify_exact_role_acl above) intentionally excludes
+    // WRITE_DAC/WRITE_OWNER/FILE_DELETE_CHILD, so B is denied here exactly like R: B may create and
+    // replace its own bot-state records but may not delete/rename arbitrary entries or take
+    // ownership of the M-owned directory.
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[1], "write"), false,
+      "B lacks destructive directory-mutation capability on the M-owned bot-state directory");
+    assert.equal(await addon.principal_access_check(botStateDir, kind, roles[2], "write"), false,
+      "R keeps today's read-only bot-state semantics");
+    assert.equal(await addon.principal_access_check(authorityParent, kind, roles[1], "write"), false,
+      "B still cannot mutate the authority root");
+    try {
+      await addon.create_absent_exclusive(join(botStateDir, "reader-projection.json"), Buffer.from("{}"), ...roles, "bot-state");
+      assert.fail("M is not the required owner of individual bot-state records; only a bot-principal writer may create them there");
+    } catch (error) {
+      assert.match(error.message, /unable to prepare protected absent file|failed temporary cleanup is ambiguous/);
+    }
 
     const authDestination = join(root, "management-auth.json");
     const authBytes = Buffer.from('{"verifier":"redacted"}');

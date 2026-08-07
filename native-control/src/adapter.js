@@ -423,14 +423,26 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     if (!await lowLevel.read_acl(root) || !await lowLevel.verify_exact_role_acl(root, ...roleArguments('authority'))) refused('ensure_control_directory', 'control-root exact role ACL is unreadable');
     await assertParent(root, parentIdentity);
     await assertMutationParent('ensure_control_directory', expectedParent);
+    // M provisions bot-state alongside the control root: the bot-state role profile is
+    // M-owned (B holds read+write), so only M can create it. A bot-principal writer never
+    // attempts creation; see ensureBotRoot, which verifies and refuses fail-closed if absent.
+    const botParentIdentity = await verifiedParent(botRoot);
+    await lowLevel.ensure_control_directory(botRoot, ...roleArguments('bot-state'));
+    await lowLevel.open_no_follow(botRoot);
+    if (!await lowLevel.read_acl(botRoot) || !await lowLevel.verify_exact_role_acl(botRoot, ...roleArguments('bot-state'))) refused('ensure_control_directory', 'bot-state exact role ACL is unreadable');
+    await assertParent(botRoot, botParentIdentity);
+    await assertMutationParent('ensure_control_directory', expectedParent);
     return expectedParent;
   };
   const ensureBotRoot = async (mutationParent = null) => {
     const expectedParent = mutationParent ?? await verifiedParent(targetPath);
     await assertMutationParent('ensure_bot_directory', expectedParent);
-    await ensure(expectedParent);
+    const rootParentIdentity = await verifiedParent(root);
+    await lowLevel.open_no_follow(root);
+    if (!await lowLevel.read_acl(root) || !await lowLevel.verify_exact_role_acl(root, ...roleArguments('authority'))) refused('ensure_bot_directory', 'control-root exact role ACL is unreadable');
+    await assertParent(root, rootParentIdentity);
+    if (!await lowLevel.path_exists_no_follow(botRoot)) refused('ensure_bot_directory', 'bot-state directory is absent; management provisioning during Genesis bootstrap is required');
     const parentIdentity = await verifiedParent(botRoot);
-    await lowLevel.ensure_control_directory(botRoot, ...roleArguments('bot-state'));
     await lowLevel.open_no_follow(botRoot);
     if (!await lowLevel.read_acl(botRoot) || !await lowLevel.verify_exact_role_acl(botRoot, ...roleArguments('bot-state'))) refused('ensure_bot_directory', 'bot-state exact role ACL is unreadable');
     await assertParent(botRoot, parentIdentity);

@@ -31,6 +31,7 @@ const genesisInput = (hostTokens) => ({
 });
 function adapter({ legacy = true, failAudit = false, roleBindings = roles, initialPrincipal = owner, platform } = {}) {
   const files = new Map();
+  const directories = new Set();
   if (legacy) files.set('C:/state/channels.json', Buffer.from('{"legacy":true}'));
   const writes = [];
   const payloads = [];
@@ -38,7 +39,7 @@ function adapter({ legacy = true, failAudit = false, roleBindings = roles, initi
   const lowLevel = {
     open_verified_parent: async (path) => ({ path: path.replaceAll("\\", "/").slice(0, path.replaceAll("\\", "/").lastIndexOf('/')) }), open_no_follow: async () => {},
     read_identity: async (path) => path.endsWith('.genesis-bootstrap-blocker') && !files.has(path) ? null : ({ path: path.replaceAll("\\", "/"), owner: roleBindings.managementSid }), read_acl: async () => 'protected:M,B,R,SYSTEM',
-    path_exists_no_follow: async (path) => files.has(path) || [...files.keys()].some((name) => name.replaceAll("\\", "/").startsWith(`${path.replaceAll("\\", "/")}/`)),
+    path_exists_no_follow: async (path) => files.has(path) || directories.has(path) || [...files.keys()].some((name) => name.replaceAll("\\", "/").startsWith(`${path.replaceAll("\\", "/")}/`)),
     verify_exact_role_acl: async () => true, set_exact_role_acl: async () => {}, remove_verified_file: async (path) => { files.delete(path); },
     open_verified_parent_handle: async (path) => ({ path: path.replaceAll("\\", "/").slice(0, path.replaceAll("\\", "/").lastIndexOf('/')) }),
     open_verified_object_handle: async (parent, name) => {
@@ -59,7 +60,7 @@ function adapter({ legacy = true, failAudit = false, roleBindings = roles, initi
       files.delete(storagePath);
     },
     flush_file: async () => {}, flush_directory_or_volume: async () => {},
-    ensure_control_directory: async () => {},
+    ensure_control_directory: async (path) => { directories.add(path); },
     read_verified_bytes: async (path) => files.has(path) ? Buffer.from(files.get(path)) : null,
     create_absent_exclusive: async (path, bytes) => {
       if (failAudit && path.replaceAll("\\", "/").endsWith('/audit.json')) throw new Error('AUDIT_WRITE_FAILED');
@@ -78,7 +79,7 @@ function adapter({ legacy = true, failAudit = false, roleBindings = roles, initi
   };
   const baseNative = createManagementNativeForTest({ lowLevel, configPath: 'C:/state/channels.json', roles: roleBindings, platform });
   const native = { ...baseNative };
-  return { files, writes, payloads, setPrincipal: (value) => { currentPrincipal = value; }, native };
+  return { files, directories, writes, payloads, setPrincipal: (value) => { currentPrincipal = value; }, native };
 }
 async function boundReaderRuntime({ complete = true } = {}) {
   const harness = adapter({ legacy: false });
@@ -154,8 +155,26 @@ async function boundReaderRuntime({ complete = true } = {}) {
     harness.setPrincipal(owner);
     assert.equal((await harness.native.readBoundReaderProof({ allowPending: true })).readerProjection, null);
   }
-  return { ...harness, runtime, input };
+  return { ...harness, runtime, input, request, floor, zFinality, grant, fence, lease, projection, readerState };
 }
+test('bot write refuses fail-closed with zero writes when bot-state is absent after Genesis provisioning', async () => {
+  const { native, setPrincipal, directories, writes, lease } = await boundReaderRuntime({ complete: false });
+  // Genesis already provisioned bot-state as M (the control-root-adjacent directory). Simulate it
+  // having been removed or never durably provisioned: a bot writer must refuse fail-closed rather
+  // than silently (re)creating the M-owned directory itself.
+  for (const dir of [...directories]) {
+    if (dir.replaceAll('\\', '/').endsWith('/bot-state')) directories.delete(dir);
+  }
+  setPrincipal(botPrincipal);
+  const before = writes.length;
+  await assert.rejects(native.acquireBotLease(lease), (error) => {
+    assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+    assert.equal(error.operation, 'ensure_bot_directory');
+    assert.equal(error.writes, 0);
+    return true;
+  });
+  assert.equal(writes.length, before);
+});
 test('prepared Genesis recovery promotes durable authorized handshake to pending', async () => {
   const { native, runtime, input, setPrincipal, files } = await boundReaderRuntime({ complete: false });
   const before = await native.readManagementState();
