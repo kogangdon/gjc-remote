@@ -321,25 +321,29 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     const realParent = join(root, "real-parent");
     const linkedParent = join(root, "linked-parent");
     await mkdir(realParent);
-    let symlinkUnavailable = false;
-    try {
-      symlinkSync(realParent, linkedParent);
-    } catch (error) {
-      if (error?.code === "EPERM" || error?.code === "EACCES") {
-        symlinkUnavailable = true;
-      } else {
-        throw error;
+    // A directory symlink needs SeCreateSymbolicLinkPrivilege, but a junction is
+    // also a reparse point (IO_REPARSE_TAG_MOUNT_POINT) and needs no privilege, so
+    // the no-follow traversal rejection can still be proven on a normal account.
+    let reparseKind = null;
+    for (const type of ["dir", "junction"]) {
+      try {
+        symlinkSync(realParent, linkedParent, type);
+        reparseKind = type;
+        break;
+      } catch (error) {
+        if (error?.code !== "EPERM" && error?.code !== "EACCES") throw error;
       }
     }
-    if (symlinkUnavailable) {
+    if (reparseKind === null) {
       t.diagnostic(
         "Windows reparse/symlink traversal rejection is UNPROVEN in this run: " +
-          "the current non-elevated principal lacks SeCreateSymbolicLinkPrivilege " +
-          "and Developer Mode is not enabled, so symlinkSync(EPERM/EACCES) could not " +
-          "create the linked-parent fixture. All other no-follow, ACL, replacement, " +
+          "neither a directory symlink (needs SeCreateSymbolicLinkPrivilege or " +
+          "Developer Mode) nor a junction could be created, so the linked-parent " +
+          "fixture does not exist. All other no-follow, ACL, replacement, " +
           "and durability assertions in this test still ran and passed.",
       );
     } else {
+      t.diagnostic(`reparse traversal rejection proven with a ${reparseKind} reparse point`);
       const substituted = join(linkedParent, "nested", "authority.json");
       assert.throws(() => addon.open_verified_parent(substituted), /verified parent/);
       assert.throws(() => addon.open_verified_parent_handle(substituted), /verified parent handle/);
