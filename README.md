@@ -241,20 +241,28 @@ The phased implementation gates, readiness decisions, interim development bounda
 evidence checklist are documented in
 [`docs/daemon-workspace-implementation-phases.md`](docs/daemon-workspace-implementation-phases.md).
 
-The current Windows evaluation path is Shawl: one `GJCRemoteBot` service and one
+Shawl is the selected primary Windows supervisor: one `GJCRemoteBot` service and one
 `GJCRemoteDaemon-<instance-key>` per exact valid `HOST_ID`. Shawl v1.9.0 has
 passed local Windows checks for daemon and bot child replacement, daemon
 reconnect/registration after bot recovery, and graceful stop without an
-unwanted restart. Shawl is not yet the production primary because its
-distributed binary is unsigned; hash pinning, artifact provenance,
-service-account configuration, and production Windows evidence remain required.
+unwanted restart. Shawl is not yet a full production approval because its
+distributed binary is unsigned; signed provenance remains a required, still-open
+release-owner item, along with hash pinning, artifact provenance,
+service-account configuration, and production Windows evidence.
 
-The production-primary design remains a future first-party signed Windows
-service wrapper registered through the Windows SCM. Directly registering Bun or
-Node with `sc.exe` is unsupported because those processes do not implement the
-Windows Service Control API. NSSM remains a legacy fallback candidate only; its
-current installer contract is not the recommended Windows path. Linux uses a bot
-unit plus a true `gjc-remote-daemon@.service` template. The documents define
+Direct `sc.exe` service registration is the documented Windows fallback when
+Shawl is unsuitable, with a known cost: Bun/Node do not implement the Windows
+Service Control API, so a directly registered service cannot acknowledge a stop
+request, and automatic restart is limited to bare `sc failure` recovery actions
+(no jitter/backoff shaping). The production-primary design remains open to a
+future first-party signed Windows service wrapper registered through the
+Windows SCM. **NSSM is discarded: it was never merged into this repository —
+its scripts lived only in an untracked, now-deleted `ops/` tree — and the
+operator selected Shawl/`sc.exe` instead.** No NSSM implementation exists in
+this repository. Linux systemd units (a bot unit plus a true
+`gjc-remote-daemon@.service` template) are documented as the Linux service
+path, but those `.service.in` templates are likewise not currently checked
+into this repository. The documents define
 account/profile/env/ACL boundaries, current-run readiness, restart/rotation,
 rollback, transaction proofs, and honest best-effort stop/manual-cleanup
 semantics. Host-policy journald is consumed by default; global changes need
@@ -297,8 +305,9 @@ fails, while fatal shutdown exits non-zero.
   1 hour. Delete that directory to reset a project's remote history.
 - **Process logs**: both components log to stdout/stderr. Retention is
   supervisor-specific: Shawl's retention/rotation must be explicitly configured
-  and verified; Linux uses host-policy journald defaults. NSSM's bounded
-  current/`.old` policy applies only to its legacy fallback. See
+  and verified; the `sc.exe` fallback and Linux host-policy journald provide no
+  bounded rotation of their own beyond OS defaults. NSSM is discarded; its
+  bounded current/`.old` log policy no longer applies to this repository. See
   [`docs/process-supervision.md`](docs/process-supervision.md).
 
 ## Security notes
