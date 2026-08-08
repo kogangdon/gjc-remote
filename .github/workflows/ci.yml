@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  suite:
     # The native-control addon is built on every supported platform so the
     # retained-handle / ACL / no-follow / replacement / durability probes run for
     # real instead of skipping. Without a build the whole native integration test
@@ -43,3 +43,17 @@ jobs:
         run: npm run build --workspace @gjc-remote/native-control
 
       - run: npm test
+
+  # Aggregate gate. `test` is the required status check on main, so it must stay a
+  # single stable context name even though the suite now fans out across a matrix.
+  # It fails unless every matrix leg succeeded, so a skipped or failed leg cannot
+  # be merged past.
+  test:
+    if: always()
+    needs: [suite]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every matrix leg to succeed
+        run: |
+          echo "suite result: ${{ needs.suite.result }}"
+          test "${{ needs.suite.result }}" = "success"
