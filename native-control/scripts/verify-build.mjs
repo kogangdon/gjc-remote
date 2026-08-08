@@ -100,12 +100,31 @@ function readJsonFileSafe(path) {
   try { return { present: true, value: JSON.parse(raw) }; } catch { return { present: true, value: undefined }; }
 }
 
-class DuplicateTrustKeyError extends Error {}
+class TrustStoreError extends Error {}
+class DuplicateTrustKeyError extends TrustStoreError {}
+class MalformedTrustStoreError extends TrustStoreError {}
 
-function normalizeTrustStore(value) {
-  if (!value || Object.getPrototypeOf(value) !== Object.prototype || value.version !== 1 || !Array.isArray(value.keys)) return [];
-  const keys = value.keys.filter((key) => key && typeof key.keyId === 'string' && key.keyId &&
-    (key.algorithm === 'ed25519' || key.algorithm === 'p256') && typeof key.publicKeyPem === 'string' && key.publicKeyPem);
+// Takes the raw { present, value } shape from readJsonFileSafe so an unreadable file (ENOENT,
+// permission denied) and an unparseable/wrong-shaped one both fail closed instead of silently
+// collapsing into the same result as the legitimate zero-key bootstrap state. Only a file that is
+// actually present, valid JSON, and shaped exactly like { version: 1, keys: [] } is bootstrap; a
+// keys entry that is missing a required field is a malformed trust store too, not a silently
+// dropped key, so it throws instead of being filtered out.
+function normalizeTrustStore({ present, value }) {
+  if (!present) throw new MalformedTrustStoreError('trust store file is unreadable');
+  if (value === undefined) throw new MalformedTrustStoreError('trust store is not valid JSON');
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype || value.version !== 1 || !Array.isArray(value.keys)) {
+    throw new MalformedTrustStoreError('trust store has an unexpected shape (expected { version: 1, keys: [] })');
+  }
+  const keys = value.keys.map((key, index) => {
+    if (!key || Object.getPrototypeOf(key) !== Object.prototype ||
+      typeof key.keyId !== 'string' || key.keyId.length === 0 ||
+      (key.algorithm !== 'ed25519' && key.algorithm !== 'p256') ||
+      typeof key.publicKeyPem !== 'string' || key.publicKeyPem.length === 0) {
+      throw new MalformedTrustStoreError(`trust store keys[${index}] is missing required fields`);
+    }
+    return key;
+  });
   const seenKeyIds = new Set();
   for (const key of keys) {
     if (seenKeyIds.has(key.keyId)) throw new DuplicateTrustKeyError(`duplicate keyId in trust store: ${key.keyId}`);
@@ -125,7 +144,7 @@ export function evaluateRequiredSignature(manifestBytes, { sidecarPath: sidecarF
   if (!sidecarFile.present) return { ok: false, reason: 'the signature sidecar is missing' };
   if (sidecarFile.value === undefined) return { ok: false, reason: 'the signature sidecar is malformed' };
   let trustedKeys;
-  try { trustedKeys = normalizeTrustStore(readJsonFileSafe(trustedKeysFilePath).value); }
+  try { trustedKeys = normalizeTrustStore(readJsonFileSafe(trustedKeysFilePath)); }
   catch (error) { return { ok: false, reason: `the trust store is invalid: ${error.message}` }; }
   const result = verifyManifestSignature(manifestBytes, sidecarFile.value, { version: 1, keys: trustedKeys });
   if (!result.ok) return { ok: false, reason: `signature verification failed: ${result.reason}` };
@@ -152,7 +171,7 @@ function describeSignatureOutcome(signInfo, verifyInfo) {
   if (verifyInfo) return `verified against pinned keyId "${verifyInfo.keyId}" (${verifyInfo.algorithm})`;
   if (signInfo) return `signed sidecar with keyId "${signInfo.keyId}" (${signInfo.algorithm}); not verified this run (no --require-signature)`;
   let pinnedCount = 0;
-  try { pinnedCount = normalizeTrustStore(readJsonFileSafe(trustedKeysPath).value).length; } catch { pinnedCount = 0; }
+  try { pinnedCount = normalizeTrustStore(readJsonFileSafe(trustedKeysPath)).length; } catch { pinnedCount = 0; }
   if (pinnedCount === 0) return 'addon provenance UNVERIFIED \u2014 zero keys are pinned in trusted.json';
   return `not verified this run (no --require-signature); ${pinnedCount} key${pinnedCount === 1 ? '' : 's'} pinned in trusted.json`;
 }

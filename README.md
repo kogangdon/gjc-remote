@@ -125,9 +125,14 @@ daemon runs on Bun (>=1.3.14) and embeds the
 [`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.7**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
-should match it. The bot, `register`, and the smoke harness run on Node via their
-package scripts, so keep Node available on the bot host — or add `--bun` to
-`bun run` to execute those Node scripts under Bun instead.
+should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
+and the smoke harness require Node.js >=26 and always run under real Node via
+their package scripts (`node src/...`); the daemon is the only piece that runs
+on Bun. Do not run those Node scripts with `bun run --bun` — Bun does not
+report a Node 26 major to `process.versions.node`, so `bot/src/node-version-guard.js`
+(loaded first by `bot.js` and `management-entrypoint.js`) refuses to start under
+it. `bun run --filter '@gjc-remote/bot' start` (no `--bun`) is fine: Bun just
+shells out to the `node src/bot.js` package script on PATH.
 
 > **SDK update:** `@gajae-code/coding-agent` is pinned to **0.12.7**.
 > The 0.12.6 hold is closed for this repository after the 0.12.7 package

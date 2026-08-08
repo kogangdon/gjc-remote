@@ -355,6 +355,79 @@ test('loadVerifiedAddon: a local-dev.json with duplicate keyIds refuses to load 
   });
 });
 
+// --- A malformed or unreadable trust store fails closed, distinct from the legitimate --------
+// --- zero-key bootstrap state (a well-formed file with an empty keys array) ------------------
+
+test('loadVerifiedAddon: malformed JSON in trusted.json refuses to load instead of bootstrapping', (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  withFixtureDir((dir) => {
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes: readFileSync(realAddonPath), packageJson });
+    writeFileSync(fixture.trustedKeysPath, 'not even json');
+    writeFileSync(fixture.sidecarPath, JSON.stringify({ keyId: 'k1', algorithm: 'ed25519', signature: 'x' }));
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /trust store is invalid/);
+      assert.match(error.reason, /not valid JSON/);
+      return true;
+    });
+  });
+});
+
+test('loadVerifiedAddon: a wrong-shaped trusted.json refuses to load instead of bootstrapping', (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  withFixtureDir((dir) => {
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes: readFileSync(realAddonPath), packageJson });
+    // Missing the required "keys" array entirely — not the same as a well-formed empty array.
+    writeFileSync(fixture.trustedKeysPath, JSON.stringify({ version: 1 }));
+    writeFileSync(fixture.sidecarPath, JSON.stringify({ keyId: 'k1', algorithm: 'ed25519', signature: 'x' }));
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /trust store is invalid/);
+      assert.match(error.reason, /unexpected shape/);
+      return true;
+    });
+  });
+});
+
+test('loadVerifiedAddon: a trusted.json keys entry missing required fields refuses to load', (t) => {
+  if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
+  withFixtureDir((dir) => {
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes: readFileSync(realAddonPath), packageJson });
+    // Missing publicKeyPem on the only entry — must refuse rather than silently drop the key
+    // and fall through to the zero-pinned-keys bootstrap path.
+    writeFileSync(fixture.trustedKeysPath, JSON.stringify({ version: 1, keys: [{ keyId: 'k1', algorithm: 'ed25519' }] }));
+    writeFileSync(fixture.sidecarPath, JSON.stringify({ keyId: 'k1', algorithm: 'ed25519', signature: 'x' }));
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.match(error.reason, /trust store is invalid/);
+      assert.match(error.reason, /missing required fields/);
+      return true;
+    });
+  });
+});
+
+// The legitimate empty-keys bootstrap state (a well-formed { version: 1, keys: [] } file) still
+// warns rather than refusing: see 'loadVerifiedAddon: zero-pinned-keys path warns exactly once
+// and does not accept a malformed sidecar' above, which asserts exactly this.
+
+test('evaluateRequiredSignature: a malformed trusted.json refuses the release gate instead of bootstrapping', () => {
+  const key = generateEd25519();
+  const manifestBytes = Buffer.from('{"a":1}');
+  withFixtureDir((dir) => {
+    const trustedKeysPath = join(dir, 'trusted.json');
+    const sidecarPath = join(dir, 'manifest.json.sig');
+    writeFileSync(trustedKeysPath, '{ this is not json');
+    writeFileSync(sidecarPath, JSON.stringify(sidecarFor(key, 'ed25519', 'k1', manifestBytes)));
+    const result = evaluateRequiredSignature(manifestBytes, { sidecarPath, trustedKeysPath });
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /trust store is invalid/);
+    assert.match(result.reason, /not valid JSON/);
+  });
+});
+
 // --- verify-build.mjs --require-signature verifies strictly against trusted.json only ------
 
 test('evaluateRequiredSignature: a dev-key-only signature is rejected even when the dev key is otherwise valid', () => {
