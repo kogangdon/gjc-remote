@@ -89,6 +89,16 @@ bun install   # installs all workspaces (bot, daemon, shared, native-control) fr
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
+# Windows only, management-mapping writes (issue #44): native-control's
+# assertConfigParentOwner refuses to write unless the directory holding
+# channels.json (bot/, or the CHANNELS_CONFIG target's directory) is owned by
+# the OS account the bot/management CLI runs as. If that directory was created
+# by an elevated (Administrator-group) process, Windows owns it as
+# BUILTIN\Administrators by default, not that account, and management writes
+# fail closed (ERR_NATIVE_CONTROL_REFUSED) until you fix it once:
+#   icacls <dir> /setowner <management-principal>
+# See docs/adr/0003-management-mapping-envelope.md ("Config-parent ownership")
+# for why this is fail-closed and cannot be relaxed.
 # Fill GJC_BOT_ALLOWED_USERS with your Discord user ID(s): the bot ships
 # fail-closed (GJC_REMOTE_REQUIRE_ALLOWLIST=1) and refuses to start otherwise.
 # Set GJC_REMOTE_REQUIRE_ALLOWLIST=0 ONLY for isolated local testing.

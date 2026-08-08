@@ -86,6 +86,18 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   }
 
   const root = await mkdtemp(join(tmpdir(), "gjc-native-control-"));
+  if (process.platform === "win32") {
+    // Windows assigns BUILTIN\Administrators (not the invoking user) as the default owner of any
+    // object created by a member of the Administrators group while running elevated, so a plain
+    // mkdtemp() root does not reproduce the product's actual contract on an elevated host: the real
+    // adapter's assertConfigParentOwner requires the configured control parent to be owned by the
+    // management principal and fails closed otherwise (see docs/adr/0003-management-mapping-envelope.md
+    // and README.md). Simulate the documented operator remediation step
+    // (`icacls <dir> /setowner <management-principal>`) so this fixture proves the same M-owned-parent
+    // property whether the test host is elevated (owner defaults to Administrators) or a normal user
+    // (owner already defaults to the invoking user, making this a harmless no-op).
+    await execFile("icacls", [root, "/setowner", `*${roles[0]}`]);
+  }
   const destination = join(root, "authority.json");
   const initial = Buffer.from('{"phase":"prepared"}');
   const replacement = Buffer.from('{"phase":"committed"}');

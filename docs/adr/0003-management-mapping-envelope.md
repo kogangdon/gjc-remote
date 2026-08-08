@@ -61,6 +61,51 @@ preserves the target byte-for-byte and has `legacy-unmigrated`, exact retention,
 and `no-route`; it is deliberately not converted or routed. Legacy direct-map
 input is migration-only and never a second authority.
 
+## Config-parent ownership: an operator prerequisite on Windows
+
+The adapter's `assertConfigParentOwner` refuses (`ERR_NATIVE_CONTROL_REFUSED`,
+`writes: 0`) any operation whose actual configured control parent — the
+directory holding the configured `channels.json` (`configPath`, overridable
+via `CHANNELS_CONFIG`) — is not owned by the management principal (`M`, the OS
+user the management CLI/bot runs as). This is fail-closed by design: unlike
+`.gjc-remote-control` and `bot-state`, which M itself creates via
+`ensure_control_directory` and so always ends up M-owned (see above), the
+config-parent directory is never created by native-control. It is whatever
+directory already holds `channels.json` when the process starts, so its owner
+is whatever the OS assigned when that directory was created — native-control
+only ever verifies it, and correctly refuses to proceed if it is wrong.
+
+On Windows, this bites operators specifically when the config-parent directory
+was created by a process running with an elevated (Administrator-group)
+token: Windows assigns newly created objects to the `BUILTIN\Administrators`
+group as owner by default in that case, not to the invoking user's own SID.
+A directory created this way is never usable as a management control parent,
+even though the same account owns every file inside it, because group
+ownership is not user ownership and the contract requires the latter. This is
+correct fail-closed behavior, not a bug: a group-owned parent means any other
+member of that group can take ownership and thereby rewrite the DACL, which
+defeats the exact-role-ACL guarantee the rest of this document depends on.
+
+**Operator prerequisite:** before first run, the directory holding
+`channels.json` (typically `bot/`, or the directory pointed at by
+`CHANNELS_CONFIG`) must be owned by the OS principal that will run as `M`.
+On a host where an elevated operator created that directory (so it ended up
+owned by `BUILTIN\Administrators`), fix ownership once with:
+
+```powershell
+icacls <dir> /setowner <management-principal>
+```
+
+`<management-principal>` may be an account name (`DOMAIN\user` or `.\user`)
+or a raw SID prefixed with `*` (for example `*S-1-5-21-...-500`). Re-run as
+the account that will actually own and run the management process; a plain
+member of Administrators generally holds the "Take ownership" privilege
+needed to do this even though it does not already own the directory. Hosts
+whose local policy makes `BUILTIN\Administrators` the default owner for
+elevated processes must run this command once per config-parent directory
+before management writes will succeed — native-control will never silently
+accept a group-owned parent as a substitute.
+
 ## Identity and token attestation
 
 The bootstrap actor and target are distinct OS principals, encoded as `uid:<id>`
