@@ -23,7 +23,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '26'
+
+      - name: Install native ACL headers
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
 
       - run: bun install --frozen-lockfile
 
@@ -35,6 +38,12 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
             exit 1
           fi
+
+      # Builds native_control.node and writes the build manifest so the tag gate runs the real
+      # native-control suite (retained-handle / ACL / no-follow / replacement / durability probes)
+      # instead of every native primitive test self-skipping, matching the CI addon build step.
+      - name: Build native-control addon
+        run: npm run build --workspace @gjc-remote/native-control
 
       - run: npm test
 

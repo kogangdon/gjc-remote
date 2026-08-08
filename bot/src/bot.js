@@ -1,21 +1,30 @@
+import "./node-version-guard.js";
 import "dotenv/config";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, lstatSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
 import { V0_LIMITS, isModelName } from "@gjc-remote/shared";
+import { createManagementNative } from "@gjc-remote/native-control";
+import { managedHostSetFingerprint } from "@gjc-remote/shared/mapping-envelope";
 import {
-  loadChannelMapState,
+  createManagedAuthoritySelection,
+  loadManagedChannelMapState,
   parseAllowedUsers,
-  parseHostTokens,
+  parseHostTokensForAuthority,
+  parseProvisionedManagementRoleBindings,
+  readLegacyV0SourceSnapshot,
   validateChannelHosts,
+  verifyLegacyV0SourceFence,
 } from "./config.js";
 import { createAuthorizationPolicy, parseRequireAllowlist } from "./authorization.js";
 import {
   dispatchAuthorizedInteraction,
   dispatchAuthorizedMessage,
 } from "./authorized-dispatch.js";
-import { watchConfigFile } from "./config-watcher.js";
+import { watchConfigHints } from "./config-watcher.js";
+import { dispatchGate } from "./managed-dispatch.js";
+import { createManagedAuthorityReader } from "./managed-authority-reader.js";
 import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
@@ -40,6 +49,7 @@ const {
   HOST_TOKENS,
   GJC_INVOKE_IDLE_TIMEOUT_MS,
   GJC_INVOKE_HARD_CAP_MS,
+  GJC_MANAGEMENT_ROLE_BINDINGS,
 } = process.env;
 const DEBUG_REMOTE = process.env.GJC_REMOTE_DEBUG === "1";
 
@@ -48,10 +58,66 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
+// Presence of a management marker selects the strict managed token grammar.
+// A malformed managed authority never falls back to the legacy parser.
+const channelsPath = resolve(CHANNELS_CONFIG || fileURLToPath(new URL("../channels.json", import.meta.url)));
+const controlDirectoryPath = resolve(dirname(channelsPath), ".gjc-remote-control");
+const controlRootPath = resolve(controlDirectoryPath, "control-root.json");
+const bootstrapBlockerPath = resolve(dirname(channelsPath), `.${basename(channelsPath)}.genesis-bootstrap-blocker`);
+const managedHistoryMarkerPath = resolve(dirname(channelsPath), `.${basename(channelsPath)}.managed-history.json`);
+const managedAuthoritySelection = createManagedAuthoritySelection();
+
+function managedHistoryMarkerPresent() {
+  try {
+    lstatSync(managedHistoryMarkerPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    // Inability to inspect the durable discriminator is itself fail-closed.
+    return true;
+  }
+}
+function bootstrapBlockerPresent() {
+  try {
+    lstatSync(bootstrapBlockerPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    // Inability to inspect the bootstrap blocker is itself fail-closed.
+    return true;
+  }
+}
+
+function observeManagementAuthority() {
+  managedAuthoritySelection.observe({
+    managementMarkerPresent: existsSync(controlDirectoryPath) || existsSync(controlRootPath) || bootstrapBlockerPresent(),
+    managedHistoryMarkerPresent: managedHistoryMarkerPresent(),
+  });
+  return managedAuthoritySelection.observed;
+}
+
+let provisionedManagementRoleBindings = null;
 let tokensByHostId;
 let authorization;
 try {
-  tokensByHostId = parseHostTokens(HOST_TOKENS || "");
+  observeManagementAuthority();
+  if (GJC_MANAGEMENT_ROLE_BINDINGS?.trim()) {
+    provisionedManagementRoleBindings = parseProvisionedManagementRoleBindings(GJC_MANAGEMENT_ROLE_BINDINGS);
+    try {
+      const native = await createManagementNative({
+        configPath: channelsPath,
+        roles: provisionedManagementRoleBindings,
+      });
+      managedAuthoritySelection.observe({
+        managedHistoryMarkerPresent: (await native.readManagedHistoryMarker()) !== null,
+      });
+    } catch {
+      // A configured management authority whose durable marker cannot be read
+      // must not use legacy parsing.
+      managedAuthoritySelection.observe({ managedHistoryMarkerPresent: true });
+    }
+  }
+  tokensByHostId = parseHostTokensForAuthority(HOST_TOKENS || "", managedAuthoritySelection.observed);
   const allowedUsers = parseAllowedUsers(GJC_BOT_ALLOWED_USERS || "");
   const requireAllowlist = parseRequireAllowlist(GJC_REMOTE_REQUIRE_ALLOWLIST);
   authorization = createAuthorizationPolicy(allowedUsers, { required: requireAllowlist });
@@ -66,11 +132,30 @@ if (authorization.unrestricted) {
   );
 }
 
-// channels.json: { "<discordChannelId>": { "hostId": "...", "workDir": "..." } }
-const channelsPath = resolve(CHANNELS_CONFIG || fileURLToPath(new URL("../channels.json", import.meta.url)));
+// channels.json is legacy-v0 only when every management marker is absent.
+const managedAuthorityReader = await createManagedAuthorityReader({
+  configPath: channelsPath,
+  expectedHostSetFingerprint: managedHostSetFingerprint(tokensByHostId),
+  roleBindings: provisionedManagementRoleBindings,
+});
 let channelMap;
-channelMap = loadChannelMap({ fatal: true });
-watchConfigFile(channelsPath, () => loadChannelMap({ fatal: false }));
+let channelMapping;
+channelMap = await loadChannelMap({ fatal: true });
+watchConfigHints(
+  [channelsPath, managedHistoryMarkerPath, bootstrapBlockerPath],
+  () => {
+    const authorityWasObserved = managedAuthoritySelection.observed;
+    observeManagementAuthority();
+    if (!authorityWasObserved && managedAuthoritySelection.observed) {
+      console.error("Managed authority appeared; restarting to activate strict HOST_TOKENS parsing.");
+      fatalExitCode = 78;
+      requestShutdown("managed-authority-emerged");
+      return;
+    }
+    void loadChannelMap({ fatal: false });
+  },
+  { directoryPaths: [controlDirectoryPath], existsSyncFn: existsSync }
+);
 
 const skillNames = new Set(GJC_SKILLS.map((s) => s.name));
 const invokeTimeoutOptions = {};
@@ -182,8 +267,10 @@ client.on("interactionCreate", async (interaction) => {
 
 async function handleChatInputInteraction(interaction) {
   const { commandName } = interaction;
+  if (!dispatchGate(channelMapping, (content) => interaction.reply({ content, ephemeral: true }), verifyLegacyFence)) return;
 
   if (commandName === "hosts") {
+    if (!dispatchGate(channelMapping, (content) => interaction.reply({ content, ephemeral: true }), verifyLegacyFence)) return;
     const online = registry.listOnline();
     await interaction.reply(online.length ? `Online: ${online.join(", ")}` : "No hosts connected.");
     return;
@@ -198,6 +285,7 @@ async function handleChatInputInteraction(interaction) {
     return;
   }
 
+  if (!dispatchGate(channelMapping, (content) => interaction.reply({ content, ephemeral: true }), verifyLegacyFence)) return;
   if (!registry.isOnline(route.hostId)) {
     await interaction.reply({ content: `Host '${route.hostId}' is not connected right now.`, ephemeral: true });
     return;
@@ -254,6 +342,7 @@ client.on("messageCreate", async (message) => {
 async function handleAuthorizedMessage(message) {
   const prompt = message.content.trim();
   if (!prompt) return;
+  if (!dispatchGate(channelMapping, (content) => message.reply(content), verifyLegacyFence)) return;
 
   const route = channelMap[message.channelId];
   if (!route) return;
@@ -281,6 +370,7 @@ async function handleAuthorizedMessage(message) {
     );
   }
 
+  if (!dispatchGate(channelMapping, (content) => message.reply(content), verifyLegacyFence)) return;
   if (!registry.isOnline(route.hostId)) {
     await message.reply(`Host '${route.hostId}' is not connected right now.`).catch(() => {});
     return;
@@ -353,7 +443,9 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
       }
     : undefined;
   try {
+    if (!dispatchGate(channelMapping, edit, verifyLegacyFence)) return;
     editProgress(true);
+    if (!dispatchGate(channelMapping, edit, verifyLegacyFence)) return;
     result = await registry.invoke(
       route.hostId,
       route.workDir,
@@ -498,17 +590,28 @@ function extractTextFromContent(content) {
     .join("");
 }
 
-function loadChannelMap({ fatal }) {
-  const result = loadChannelMapState({
+async function loadChannelMap({ fatal }) {
+  const result = await loadManagedChannelMapState({
     current: channelMap,
-    readText: () => readFileSync(channelsPath, "utf8"),
+    readSnapshot: readChannelMappingSnapshot,
     validate: (next) => validateChannelHosts(next, tokensByHostId),
+    authoritySelection: managedAuthoritySelection,
   });
 
+  channelMap = result.map;
+  channelMapping = result.classification ?? { sourceKind: "unavailable", dispatchClass: "workspace-only", routeDisposition: "no-route" };
   if (result.ok) {
-    channelMap = result.map;
     const count = Object.keys(result.map).length;
     console.log(`Loaded channel map from ${channelsPath}: ${count} channel${count === 1 ? "" : "s"}`);
+    return result.map;
+  }
+
+  if (channelMapping.sourceKind === "unavailable") {
+    console.error(JSON.stringify({
+      level: "error",
+      event: fatal ? "workspace_mapping_startup_unavailable" : "workspace_mapping_reload_unavailable",
+      code: channelMapping.code,
+    }));
     return result.map;
   }
 
@@ -523,6 +626,47 @@ function loadChannelMap({ fatal }) {
   );
   if (fatal) process.exit(1);
   return result.map;
+}
+
+function readChannelMappingSnapshot() {
+  let legacySnapshot;
+  try {
+    legacySnapshot = readLegacyV0SourceSnapshot({
+      targetPath: channelsPath,
+      controlDirectoryPath,
+      controlRootPath,
+      managedHistoryMarkerPath,
+      bootstrapBlockerPath,
+    });
+  } catch {
+    // A source or marker inspection failure must not reopen legacy-v0.
+    managedAuthoritySelection.observe({ managedHistoryMarkerPresent: true });
+  }
+
+  if (legacySnapshot) {
+    managedAuthoritySelection.observe(legacySnapshot);
+    if (legacySnapshot.legacyV0Verified === true && !managedAuthoritySelection.observed) {
+      return legacySnapshot;
+    }
+  }
+
+  return managedAuthorityReader.readSnapshot().then((snapshot) => {
+    managedAuthoritySelection.observe(snapshot);
+    return {
+      ...snapshot,
+      managementMarkerPresent: managedAuthoritySelection.observed,
+    };
+  });
+}
+
+function verifyLegacyFence(fence) {
+  return verifyLegacyV0SourceFence({
+    targetPath: channelsPath,
+    controlDirectoryPath,
+    controlRootPath,
+    managedHistoryMarkerPath,
+    bootstrapBlockerPath,
+  }, fence);
 }
 
 function debugRemote(label, data) {

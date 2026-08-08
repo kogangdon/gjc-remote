@@ -9,6 +9,11 @@ Discord-controlled remote GJC sessions.
 > bot ships fail-closed (`GJC_REMOTE_REQUIRE_ALLOWLIST=1`) and refuses to start
 > with an empty allowlist. See [SECURITY.md](SECURITY.md) before exposing it to
 > anyone else.
+>
+> Management mapping control-plane operations are documented in
+> [`docs/management-mapping-envelope.md`](docs/management-mapping-envelope.md).
+> They require a verified native capability; native serving and readiness remain
+> blocked and are outside #44.
 
 ## Architecture
 
@@ -59,14 +64,50 @@ can briefly stall the others. See `CONTEXT.md` → "Concurrency model: single ev
 loop, and the subprocess alternative" for the full model and the subprocess
 option (tracked in #33).
 
+> **Node requirement:** the root package and `bot/` declare `"engines": {
+> "node": ">=26.0.0" }`. Node 24 on Windows has been observed in CI to crash
+> the bot process (`STATUS_STACK_BUFFER_OVERRUN`, exit `3221226505`) instead
+> of the contracted single fatal line + exit 1 — CI is pinned to Node 26
+> (`.github/workflows/ci.yml`) and `bot/src/bot.js` /
+> `bot/src/management-entrypoint.js` refuse to start on an unsupported Node
+> major with a structured `unsupported_node_version` fatal instead of risking
+> that crash. Install Node 26+ before running the bot outside Bun.
+
 ## Setup
 
 ```bash
-bun install   # installs all workspaces (bot, daemon, shared) from bun.lock
+bun install   # installs all workspaces (bot, daemon, shared, native-control) from bun.lock
+
+# The management authority CLI (not native serving) requires native-control.
+# Issue #44 management writes require a C++ toolchain, Node headers, and the
+# platform ACL dependencies. The verified addon manifest and platform-specific
+# retained-handle/ACL/no-follow/durability probes must pass before any write;
+# there is no portable filesystem fallback.
+#
+# Addon provenance: at load time, native-control checks the built .node file
+# and its signed manifest against native-control/release-keys/trusted.json,
+# a git-pinned public-key trust store separate from the gitignored build output.
+# It ships with zero keys until the operator provisions a release signing key
+# (file, cloud KMS, or hardware/PIV token — verify-build.mjs --sign-key /
+# --signature support all three), so loading currently warns that provenance
+# is UNVERIFIED rather than silently trusting the local build. Once a key is
+# pinned, an invalid/missing/unknown-key signature refuses to load. See
+# docs/adr/0003-management-mapping-envelope.md ("Release signing and provenance")
+# and native-control/release-keys/README.md for the full contract and rotation.
 
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
+# Windows only, management-mapping writes (issue #44): native-control's
+# assertConfigParentOwner refuses to write unless the directory holding
+# channels.json (bot/, or the CHANNELS_CONFIG target's directory) is owned by
+# the OS account the bot/management CLI runs as. If that directory was created
+# by an elevated (Administrator-group) process, Windows owns it as
+# BUILTIN\Administrators by default, not that account, and management writes
+# fail closed (ERR_NATIVE_CONTROL_REFUSED) until you fix it once:
+#   icacls <dir> /setowner <management-principal>
+# See docs/adr/0003-management-mapping-envelope.md ("Config-parent ownership")
+# for why this is fail-closed and cannot be relaxed.
 # Fill GJC_BOT_ALLOWED_USERS with your Discord user ID(s): the bot ships
 # fail-closed (GJC_REMOTE_REQUIRE_ALLOWLIST=1) and refuses to start otherwise.
 # Set GJC_REMOTE_REQUIRE_ALLOWLIST=0 ONLY for isolated local testing.
@@ -84,9 +125,14 @@ daemon runs on Bun (>=1.3.14) and embeds the
 [`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.7**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
-should match it. The bot, `register`, and the smoke harness run on Node via their
-package scripts, so keep Node available on the bot host — or add `--bun` to
-`bun run` to execute those Node scripts under Bun instead.
+should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
+and the smoke harness require Node.js >=26 and always run under real Node via
+their package scripts (`node src/...`); the daemon is the only piece that runs
+on Bun. Do not run those Node scripts with `bun run --bun` — Bun does not
+report a Node 26 major to `process.versions.node`, so `bot/src/node-version-guard.js`
+(loaded first by `bot.js` and `management-entrypoint.js`) refuses to start under
+it. `bun run --filter '@gjc-remote/bot' start` (no `--bun`) is fine: Bun just
+shells out to the `node src/bot.js` package script on PATH.
 
 > **SDK update:** `@gajae-code/coding-agent` is pinned to **0.12.7**.
 > The 0.12.6 hold is closed for this repository after the 0.12.7 package

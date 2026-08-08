@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "keys": [
+    {
+      "keyId": "prod-2026-08-r2",
+      "algorithm": "ed25519",
+      "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAKu6vrYbExrjJ/nL5Jwr05PmtYtHF+xNwQYwRZuTP81w=\n-----END PUBLIC KEY-----\n"
+    }
+  ]
+}

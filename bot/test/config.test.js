@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createManagedAuthoritySelection,
   loadChannelMapState,
+  loadManagedChannelMapState,
   parseAllowedUsers,
   parseChannelMap,
   parseHostTokens,
+  readLegacyV0SourceSnapshot,
+  verifyLegacyV0SourceFence,
+  parseHostTokensForAuthority,
   validateChannelHosts,
 } from "../src/config.js";
 
@@ -147,6 +152,21 @@ test("parseHostTokens rejects duplicate hosts without exposing token values", ()
   });
 });
 
+test("managed authority selects strict LF hostId=token grammar without legacy fallback", () => {
+  assert.deepEqual(
+    parseHostTokensForAuthority("host-one=token:one\nhost-two=token,two\n", true),
+    new Map([["host-one", "token:one"], ["host-two", "token,two"]]),
+  );
+  assert.throws(
+    () => parseHostTokensForAuthority(" host-one : token ", true),
+    /hostId=token/,
+  );
+  assert.deepEqual(
+    parseHostTokensForAuthority(" host-one : token ", false),
+    new Map([["host-one", "token"]]),
+  );
+});
+
 test("parseAllowedUsers returns an empty array for empty input", () => {
   assert.deepEqual(parseAllowedUsers(""), []);
   assert.deepEqual(parseAllowedUsers("  \t\n  "), []);
@@ -228,4 +248,246 @@ test("loadChannelMapState reports startup failure without inventing a map", () =
   assert.equal(result.ok, false);
   assert.equal(result.map, undefined);
   assert.match(result.error.message, /CHANNEL_MAP.*plain object/);
+});
+test("durable managed history prevents legacy-v0 fallback after complete sidecar loss", async () => {
+  const selection = createManagedAuthoritySelection();
+  const current = { "1": { hostId: "host", workDir: "/workspace" } };
+  const result = await loadManagedChannelMapState({
+    current,
+    authoritySelection: selection,
+    readSnapshot: async () => ({
+      controlRootAbsent: true,
+      managedHistoryMarkerPresent: true,
+      targetBytes: Buffer.from(JSON.stringify({ "2": { hostId: "host", workDir: "/legacy" } })),
+    }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.classification.routeDisposition, "no-route");
+
+  const restarted = await loadManagedChannelMapState({
+    current,
+    authoritySelection: createManagedAuthoritySelection(),
+    readSnapshot: async () => ({
+      controlRootAbsent: true,
+      managedHistoryMarkerPresent: true,
+      targetBytes: Buffer.from(JSON.stringify({ "2": { hostId: "host", workDir: "/legacy" } })),
+    }),
+  });
+
+  assert.equal(restarted.ok, false);
+  assert.equal(restarted.classification.sourceKind, "unavailable");
+  assert.equal(restarted.classification.routeDisposition, "no-route");
+});
+test("managed-history sidecar presence and inspection failure fail closed before legacy parsing", () => {
+  const targetPath = "/state/channels.json";
+  const markerPath = "/state/.channels.json.managed-history.json";
+  const targetStat = { dev: 1, ino: 2, size: 2, mtimeMs: 3, ctimeMs: 4, isFile: () => true, isSymbolicLink: () => false };
+  const markerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  const absent = (path) => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+  const present = readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    managedHistoryMarkerPath: markerPath,
+    fs: {
+      lstatSync: (path) => path === targetPath ? targetStat : path === markerPath ? markerStat : absent(path),
+      readFileSync: () => { throw new Error("legacy target must not be read"); },
+    },
+  });
+  assert.equal(present.legacyV0Verified, false);
+  assert.equal(present.managedHistoryMarkerPresent, true);
+
+  assert.throws(() => readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    managedHistoryMarkerPath: markerPath,
+    fs: {
+      lstatSync: (path) => {
+        if (path === markerPath) {
+          const error = new Error("access denied");
+          error.code = "EACCES";
+          throw error;
+        }
+        return path === targetPath ? targetStat : absent(path);
+      },
+      readFileSync: () => Buffer.from("{}"),
+    },
+  }), /access denied/);
+});
+
+test("managed-history creation during legacy load cannot be accepted as legacy-v0", () => {
+  const targetPath = "/state/channels.json";
+  const markerPath = "/state/.channels.json.managed-history.json";
+  const targetStat = { dev: 1, ino: 2, size: 2, mtimeMs: 3, ctimeMs: 4, isFile: () => true, isSymbolicLink: () => false };
+  const markerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  let reads = 0;
+  const absent = () => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+  assert.throws(() => readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    managedHistoryMarkerPath: markerPath,
+    fs: {
+      lstatSync: (path) => {
+        if (path === targetPath) return targetStat;
+        if (path === markerPath && reads > 0) return markerStat;
+        return absent();
+      },
+      readFileSync: () => {
+        reads += 1;
+        return Buffer.from("{}");
+      },
+    },
+  }), /changed while loading/);
+});
+test("bootstrap blocker present before a legacy read fails closed", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const blockerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  const absent = () => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+  let targetRead = false;
+
+  const snapshot = readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs: {
+      lstatSync: (path) => path === blockerPath ? blockerStat : absent(),
+      readFileSync: () => {
+        targetRead = true;
+        return Buffer.from("{}");
+      },
+    },
+  });
+
+  assert.equal(snapshot.legacyV0Verified, false);
+  assert.equal(snapshot.bootstrapBlockerPresent, true);
+  assert.equal(targetRead, false);
+});
+
+test("bootstrap blocker appearance during a legacy read fails closed", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const targetStat = { dev: 1, ino: 2, size: 2, mtimeMs: 3, ctimeMs: 4, isFile: () => true, isSymbolicLink: () => false };
+  const blockerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  let blockerPresent = false;
+  const absent = () => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+
+  assert.throws(() => readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs: {
+      lstatSync: (path) => {
+        if (path === blockerPath) return blockerPresent ? blockerStat : absent();
+        if (path === targetPath) return targetStat;
+        return absent();
+      },
+      readFileSync: () => {
+        blockerPresent = true;
+        return Buffer.from("{}");
+      },
+    },
+  }), /changed while loading/);
+});
+
+test("bootstrap blocker appearance after a legacy read invalidates its fence", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const targetStat = { dev: 1, ino: 2, size: 2, mtimeMs: 3, ctimeMs: 4, isFile: () => true, isSymbolicLink: () => false };
+  const blockerStat = { dev: 1, ino: 3, size: 2, mtimeMs: 3, ctimeMs: 4 };
+  let blockerPresent = false;
+  const absent = () => {
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  };
+  const fs = {
+    lstatSync: (path) => {
+      if (path === blockerPath) return blockerPresent ? blockerStat : absent();
+      if (path === targetPath) return targetStat;
+      return absent();
+    },
+    readFileSync: () => Buffer.from("{}"),
+  };
+  const options = {
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs,
+  };
+  const snapshot = readLegacyV0SourceSnapshot(options);
+  blockerPresent = true;
+
+  assert.equal(verifyLegacyV0SourceFence(options, snapshot.legacyFence), false);
+});
+
+test("bootstrap blocker inspection errors fail closed", () => {
+  const targetPath = "/state/channels.json";
+  const blockerPath = "/state/.channels.json.genesis-bootstrap-blocker";
+  const denied = () => {
+    const error = new Error("access denied");
+    error.code = "EACCES";
+    throw error;
+  };
+
+  assert.throws(() => readLegacyV0SourceSnapshot({
+    targetPath,
+    controlDirectoryPath: "/state/.gjc-remote-control",
+    controlRootPath: "/state/.gjc-remote-control/control-root.json",
+    bootstrapBlockerPath: blockerPath,
+    fs: {
+      lstatSync: (path) => path === blockerPath ? denied() : denied(),
+      readFileSync: () => Buffer.from("{}"),
+    },
+  }), /access denied/);
+});
+
+test("managed selection remains latched after its marker is deleted", async () => {
+  const selection = createManagedAuthoritySelection();
+  const current = { "1": { hostId: "host", workDir: "/workspace" } };
+  const managed = await loadManagedChannelMapState({
+    current,
+    authoritySelection: selection,
+    readSnapshot: async () => ({
+      controlRootAbsent: true,
+      managedHistoryMarkerPresent: true,
+      targetBytes: Buffer.from("{}"),
+    }),
+  });
+  assert.equal(managed.ok, false);
+
+  const afterDeletion = await loadManagedChannelMapState({
+    current,
+    authoritySelection: selection,
+    readSnapshot: async () => ({
+      controlRootAbsent: true,
+      legacyV0Verified: true,
+      legacyFence: { generation: "legacy" },
+      targetBytes: Buffer.from(JSON.stringify({ "2": { hostId: "host", workDir: "/legacy" } })),
+    }),
+  });
+  assert.equal(afterDeletion.ok, false);
+  assert.equal(afterDeletion.classification.routeDisposition, "no-route");
 });

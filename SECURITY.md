@@ -21,6 +21,14 @@ hosts. This is the intended capability, not a bug; secure it accordingly.
 - **Authorization** is enforced by `GJC_BOT_ALLOWED_USERS` (Discord user IDs).
   The bot ships fail-closed: `GJC_REMOTE_REQUIRE_ALLOWLIST=1` refuses to start
   with an empty allowlist.
+## Management mapping control plane
+
+#44 management mapping is a separate, native-gated control plane. Its sole
+writer uses protected stdin for secrets and stores only a secret-free host-ID
+fingerprint; ordinary Discord authorization does not grant management authority.
+See [`docs/management-mapping-envelope.md`](docs/management-mapping-envelope.md)
+for bootstrap, rotation, recovery, audit, and fail-closed native-addon rules.
+Native serving and readiness remain blocked and outside this contract.
 
 ## Built-in guardrails
 
@@ -67,5 +75,5 @@ disclosure. There is no bug-bounty program; this is a community project.
 ## Supported versions
 
 This project tracks a specific embedded `@gajae-code/coding-agent` release
-(currently `0.12.5`, pinned in `daemon/package.json` and `bun.lock`). Security
+(currently `0.12.7`, pinned in `daemon/package.json` and `bun.lock`). Security
 fixes land on `main`; there are no long-term support branches.

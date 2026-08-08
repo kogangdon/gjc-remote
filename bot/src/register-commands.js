@@ -1,3 +1,4 @@
+import "./node-version-guard.js";
 import "dotenv/config";
 import { REST, Routes, SlashCommandBuilder } from "discord.js";
 import { V0_LIMITS } from "@gjc-remote/shared";

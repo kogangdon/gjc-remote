@@ -7,8 +7,16 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  suite:
+    # The native-control addon is built on every supported platform so the
+    # retained-handle / ACL / no-follow / replacement / durability probes run for
+    # real instead of skipping. Without a build the whole native integration test
+    # self-skips, which is why Windows behaviour used to be unproven in CI.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,10 +26,34 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '26'
+
+      - name: Install native ACL headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libacl1-dev
 
       # bun.lock is the committed lockfile (package-lock.json is gitignored),
       # so install with bun rather than `npm ci`.
       - run: bun install --frozen-lockfile
 
+      # Builds native_control.node and writes the build manifest. No signature is
+      # produced here: the release signing key is held by the operator outside
+      # this repository, so CI proves capability and behaviour, never provenance.
+      - name: Build native-control addon
+        run: npm run build --workspace @gjc-remote/native-control
+
       - run: npm test
+
+  # Aggregate gate. `test` is the required status check on main, so it must stay a
+  # single stable context name even though the suite now fans out across a matrix.
+  # It fails unless every matrix leg succeeded, so a skipped or failed leg cannot
+  # be merged past.
+  test:
+    if: always()
+    needs: [suite]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every matrix leg to succeed
+        run: |
+          echo "suite result: ${{ needs.suite.result }}"
+          test "${{ needs.suite.result }}" = "success"
