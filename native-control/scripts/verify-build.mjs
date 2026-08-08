@@ -170,9 +170,15 @@ function describeSignatureOutcome(signInfo, verifyInfo) {
   }
   if (verifyInfo) return `verified against pinned keyId "${verifyInfo.keyId}" (${verifyInfo.algorithm})`;
   if (signInfo) return `signed sidecar with keyId "${signInfo.keyId}" (${signInfo.algorithm}); not verified this run (no --require-signature)`;
+  // A corrupt trust store must never be reported as the benign zero-key bootstrap
+  // state: the load path refuses it, so the receipt says so too.
   let pinnedCount = 0;
-  try { pinnedCount = normalizeTrustStore(readJsonFileSafe(trustedKeysPath)).length; } catch { pinnedCount = 0; }
-  if (pinnedCount === 0) return 'addon provenance UNVERIFIED \u2014 zero keys are pinned in trusted.json';
+  try {
+    pinnedCount = normalizeTrustStore(readJsonFileSafe(trustedKeysPath)).length;
+  } catch (error) {
+    return `addon provenance UNVERIFIABLE — ${error.message}`;
+  }
+  if (pinnedCount === 0) return 'addon provenance UNVERIFIED — zero keys are pinned in trusted.json';
   return `not verified this run (no --require-signature); ${pinnedCount} key${pinnedCount === 1 ? '' : 's'} pinned in trusted.json`;
 }
 
