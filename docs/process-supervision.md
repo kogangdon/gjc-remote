@@ -1,9 +1,8 @@
 # Process supervision runbook
 
-Linux systemd is the approved production-oriented service path. Windows is currently
-documented as a Shawl v1.9.0 evaluation/interim path; it is not a production
-approval because the distributed binary is unsigned. This runbook does not install
-either supervisor. See [ADR 0001](adr/0001-process-supervision.md) for the decision
+Linux systemd is the approved production-oriented service path (contract below; the unit templates are not yet checked into this repository — see "Linux (systemd)"). Windows uses Shawl v1.9.0 as the selected primary supervisor; it is not a full production
+approval because the distributed binary is unsigned, and signed provenance remains a required, still-open release-owner item. Direct `sc.exe` service registration is the documented Windows fallback when Shawl is unsuitable; it provides no restart/backoff supervision semantics beyond `sc failure` recovery actions. The NSSM-based approach previously evaluated for this decision is discarded — no NSSM implementation exists in this repository (see [ADR 0001](adr/0001-process-supervision.md)). This runbook does not install
+any supervisor. See [ADR 0001](adr/0001-process-supervision.md) for the decision
 and [the pre-mortem](pre-mortem-process-supervision.md) for failure scenarios.
 Platform evidence remains scoped to the checks explicitly recorded below.
 
@@ -40,9 +39,9 @@ cd daemon && bun src/daemon.js   # Bun >= 1.3.14
 A foreground process is intentionally not boot-managed. Use it when a supervisor cannot satisfy ownership, stop, readiness, or evidence gates.
 
 ## Windows supervision
-### Shawl v1.9.0 evaluation path
+### Shawl v1.9.0 (selected primary)
 
-Shawl is the current Windows evaluation adapter. Stage the operator-supplied
+Shawl is the selected primary Windows supervisor. Stage the operator-supplied
 binary at `C:\ProgramData\gjc-remote\shawl\shawl.exe`, protect the directory
 from inherited user access, and record the actual executable SHA-256 before
 registration. The binary tested locally was v1.9.0, SHA-256
@@ -82,50 +81,25 @@ artifact provenance, production ACL/account behavior, boot/readiness evidence,
 or transaction ownership/recovery. A failed security or provenance gate falls
 back to the foreground commands below.
 
-### Legacy NSSM fallback (not primary)
+### Windows: NSSM (discarded)
 
-#### Provenance gate
+**Decision (2026-08-08):** The NSSM-based Windows supervision path is discarded. It was never merged into this repository — its install/update/remove/recovery scripts and supervision-contract test lived only in an untracked `ops/` tree that has since been archived outside the repository and deleted. No NSSM implementation, script, or test exists anywhere in this repository. The operator selected Shawl as the primary Windows supervisor, with direct `sc.exe` service registration as the documented fallback (see [ADR 0001](adr/0001-process-supervision.md)) instead of resuming NSSM work.
 
-Obtain NSSM yourself from the approved URL; do not download it from an installer, bundle it, or commit the binary:
+### Windows: `sc.exe` fallback (not yet implemented)
 
-`https://nssm.cc/ci/nssm-2.24-101-g897c7ad.zip`
-
-Verify the actual bytes before any service mutation:
-
-```powershell
-Get-FileHash -LiteralPath .\nssm-2.24-101-g897c7ad.zip -Algorithm SHA256
-Get-FileHash -LiteralPath .\win64\nssm.exe -Algorithm SHA256
-```
-
-Compare the observations with this receipt and retain sanitized URL/version/path/tool/result evidence:
-
-```text
-archive SHA-256       99f5045fffbffb745d67fe3a065a953c4a3d9c253b868892d9b685b0ee7d07b8
-official build SHA-1  ca2f6782a05af85facf9b620e047b01271edd11d
-win64\nssm.exe SHA-256  eee9c44c29c2be011f1f1e43bb8c3fca888cb81053022ec5a0060035de16d848
-```
-
-A receipt string without matching authoritative byte observations fails the release gate. The archive and executable hashes are exactly 64 lower-case hex characters; the build hash is exactly 40.
+Use this path only when Shawl is unsuitable. Nothing below is implemented yet; there is no install/update/remove script for it in this repository — treat it as the contract a future script must satisfy.
 
 #### Service contract
 
-Install exactly `GJCRemoteBot` or one `GJCRemoteDaemon-<instance-key>` under the component directory with absolute Node/Bun and application paths, delayed automatic start, own-process type, and an explicit service account. Configure the existing component-local `.env`; `AppEnvironmentExtra` is limited to non-secret profile paths and `GJC_REMOTE_DEBUG=0`. Query settings with `nssm get` after writing them:
+Register exactly `GJCRemoteBot` or one `GJCRemoteDaemon-<instance-key>` with `sc.exe create`, using absolute Node/Bun and application paths, the component directory as the working directory, and an explicit least-privilege service account (`gjc-bot-svc` or `gjc-daemon-svc`; never `LocalSystem` for the daemon). Configure the existing component-local `.env`; extra environment values are limited to non-secret profile paths and `GJC_REMOTE_DEBUG=0`. The service description contains only secret-free owner/role/operation/fingerprint/nonce/proof metadata.
 
-- `AppStopMethodConsole`, `AppStopMethodWindow`, and `AppStopMethodThreads`: `10000` each. They are independent method waits, not a 30-second graceful window.
-- `AppStopMethodSkip=0`, `AppNoConsole=0`, `AppExit 0 Exit`, and `AppExit Default Exit`.
-- `AppRestartDelay=0`, `AppThrottle=5000`, delayed start, and SCM recovery reset `3600` seconds.
-- First nonzero restart after `10000` ms, second after `30000` ms, then no subsequent restart; `FailureFlag=1`.
+#### Restart contract — the fallback's real cost
 
-NSSM appends stdout/stderr to protected files, keeping current plus one `.old` file at 10 MiB per stream (20 MiB per stream pair). This is a size bound, not an age-retention promise. The service description contains only secret-free owner/role/operation/fingerprint/nonce/proof metadata.
+Configure `sc failure <service> reset= <seconds> actions= restart/<delay>/restart/<delay>/.../""`. This is the entire automatic-restart contract this fallback provides: a fixed action list, no jitter, no distinction between a clean exit and a crash, and no coordination with the daemon's own reconnect jitter or the bot's teardown steps. There is no NSSM-style throttle/backoff schedule and no Shawl-style `--restart-if-not`/`--kill-process-tree` behavior available through `sc.exe` alone. Either implement a thin wrapper that shapes restart behavior, or explicitly accept bare `sc failure` behavior (or none) as the production contract before relying on this fallback.
 
 #### Stop and readiness
 
-`sc.exe stop <owned-service>` requests a signal. It does not promise a graceful service-wide wall or a drain. Observe existing bot signal/registry-close/Discord-destroy evidence; for the daemon use supervisor, process-tree, exit-code, and pool evidence—do not invent a daemon marker.
-The existing child behavior remains unchanged: the bot closes the host WebSocket
-registry first (in-flight invokes settle and daemons observe a clean close), then
-destroys the Discord client; each step is bounded by 10 seconds. The daemon
-disposes its SDK session pool before exit, with the pool's existing timeouts.
-These are application observations, not a supervisor drain promise.
+`sc.exe stop <owned-service>` requests a control code; it does not promise a graceful wall or a drain. Because Bun and Node do not implement the Windows Service Control API, a directly registered service cannot acknowledge `SERVICE_CONTROL_STOP` — the SCM force-ends the process tree once its own stop timeout elapses. Observe existing bot signal/registry-close/Discord-destroy evidence; for the daemon use process-tree, exit-code, and pool evidence — do not invent a daemon marker. These are application observations, not a supervisor drain promise.
 
 1. Suppress automatic restart and verify the service owner, fingerprint/proof metadata, root PID/start time, executable, and descendants.
 2. Record the empirical no-child signal result and then poll the owned tree for 35,000 ms as an observation deadline only.
@@ -133,11 +107,11 @@ These are application observations, not a supervisor drain promise.
 4. If force is required, revalidate the root and run only `taskkill.exe /PID <verified-root-pid> /T /F`. Never kill by image name. Re-enumerate PID/start-time pairs.
 5. A failed force leaves the service disabled and a durable `manual-cleanup` state; use foreground/manual rollback.
 
-For a start, record the UTC boundary, boot identity, stdout/stderr offsets, service fingerprint, and complete pre-start PID/start-time tree. After start, correlate the NSSM wrapper and actual child PID/start time. A marker counts only when appended after the boundary at or beyond the old offset and while the current lineage exists. Require bot listening/login plus matching host-connected evidence, or daemon registration-accepted evidence, within 60 seconds. Stale output, reused PID without start time, or service status alone is not readiness.
+For a start, record the UTC boundary, boot identity, stdout/stderr offsets, service fingerprint, and complete pre-start PID/start-time tree. After start, correlate the registered service and actual child PID/start time. A marker counts only when appended after the boundary at or beyond the old offset and while the current lineage exists. Require bot listening/login plus matching host-connected evidence, or daemon registration-accepted evidence, within 60 seconds. Stale output, reused PID without start time, or service status alone is not readiness.
 
 ## Linux (systemd)
 
-Render a bot unit and a true `gjc-remote-daemon@.service` template. The bot uses `User=gjc-bot`, an absolute Node entrypoint, component working directory, and `/etc/gjc-remote/bot.env`. The daemon uses `User=gjc-daemon`, an absolute Bun entrypoint, `/etc/gjc-remote/daemon-%i.env`, a per-instance `HOME`, and `SyslogIdentifier=gjc-remote-daemon-%i`. Render concrete instances and reject placeholders before installation.
+**The unit templates below are not currently checked into this repository.** They previously lived only in an untracked `ops/` tree (render script plus `.service.in` templates) that has been archived outside the repository and deleted, alongside the discarded NSSM scripts. This section is the contract they must satisfy once they are added and checked in: render a bot unit and a true `gjc-remote-daemon@.service` template. The bot uses `User=gjc-bot`, an absolute Node entrypoint, component working directory, and `/etc/gjc-remote/bot.env`. The daemon uses `User=gjc-daemon`, an absolute Bun entrypoint, `/etc/gjc-remote/daemon-%i.env`, a per-instance `HOME`, and `SyslogIdentifier=gjc-remote-daemon-%i`. Render concrete instances and reject placeholders before installation.
 
 Both units use:
 
@@ -154,7 +128,7 @@ TimeoutStopSec=35s
 UMask=0077
 ```
 
-These are systemd values, not NSSM semantics. `EnvironmentFile` is a separate adapter from dotenv: use `KEY=value`, no `export`, shell expansion, or command substitution, and quote spaces, quotes, backslashes, and `#` correctly. Keep env files mode 0600. Verify the template and each concrete unit with `systemd-analyze verify`; current invocation, boot ID, cgroup, `MainPID`, start timestamp, and exact host registration/connection evidence are required within a 60-second boundary. `active (running)` alone fails.
+These are systemd values, not Shawl or `sc.exe` semantics. `EnvironmentFile` is a separate adapter from dotenv: use `KEY=value`, no `export`, shell expansion, or command substitution, and quote spaces, quotes, backslashes, and `#` correctly. Keep env files mode 0600. Verify the template and each concrete unit with `systemd-analyze verify`; current invocation, boot ID, cgroup, `MainPID`, start timestamp, and exact host registration/connection evidence are required within a 60-second boundary. `active (running)` alone fails.
 
 The normal install consumes host-policy journald. Query unit-scoped records and retain the host policy; do not create or edit a global drop-in. Any host-global journald change needs separate written approval, baseline/diff, owned rollback, and evidence, and must not be implied by this runbook.
 
@@ -188,19 +162,19 @@ For startup-only host-token rotation:
 ## Evidence and escalation
 
 The required evidence set is static contract coverage, pinned Shawl source/release
-and executable-hash evidence for the Windows evaluation path, disposable Windows
+and executable-hash evidence for the Windows primary path, disposable Windows
 stop/readiness/restart/account/ACL tests, pinned Ubuntu systemd
 template/readiness/journald tests, relay registration evidence,
-rotation/rollback, transaction fault injection, and sentinel scans. NSSM
-archive/executable hashes apply only to the legacy fallback. Redact secrets,
-prompts, local credential paths, and private tokens from every artifact.
+rotation/rollback, transaction fault injection, and sentinel scans. NSSM is
+discarded; no NSSM archive/executable hash evidence applies to this repository.
+Redact secrets, prompts, local credential paths, and private tokens from every artifact.
 
 Platform evidence is pending. Escalate rather than waive any provenance mismatch, active-child survival, ambiguous ownership, missing manual-cleanup record, stale readiness marker, journald global mutation, secret hit, or missing fault boundary. Option A foreground commands remain the safe rollback.
 
 ## References
 
-- [NSSM usage](https://nssm.cc/usage) and [NSSM commands](https://nssm.cc/commands)
 - [Shawl repository and releases](https://github.com/mtkennerly/shawl/releases)
+- [`sc.exe` create](https://learn.microsoft.com/windows-server/administration/windows-commands/sc-create) and [`sc.exe` failure](https://learn.microsoft.com/windows-server/administration/windows-commands/sc-failure)
 - [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html) and [systemd.unit](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)
 - [journald.conf](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)
 - [Node signal events](https://nodejs.org/api/process.html#signal-events)

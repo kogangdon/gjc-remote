@@ -1,7 +1,8 @@
 # Pre-mortem: process supervision
 
-This review covers the Linux systemd path and the Windows Shawl evaluation path,
-with NSSM retained only as a legacy fallback. **Production Windows provenance
+This review covers the Linux systemd path (contract not yet checked into this repository) and the Windows Shawl primary path,
+with direct `sc.exe` service registration as the documented fallback. The NSSM-based approach evaluated for an earlier
+draft of this decision is discarded — no NSSM implementation exists in this repository (see [ADR 0001](adr/0001-process-supervision.md)). **Production Windows provenance
 and platform evidence remain pending.** A scenario is not closed by documentation
 or a green service status; the named evidence must exist.
 
@@ -14,7 +15,7 @@ or a green service status; the named evidence must exist.
 | 5 | PowerShell and Linux compute different ownership fingerprints for Unicode, paths, or newlines. | Operations contract owner | Use the published canonical byte algorithm, exact UTF-8 `HOST_ID` bytes, path-rule version, and shared fixture. Hash/byte mismatch stops release. | Cross-platform fixture bytes, no BOM/trailing byte, identical lower-case SHA-256. |
 | 6 | First install strands a service, or an interrupted update removes data. | Transaction owner | Journal and staged manifest precede mutation; old/new proofs are retained; recovery is idempotent and proof-bound. Never delete env, provider stores, logs, or `.gjc-remote-session`. | Fault injection at every install/update boundary, before/after envelopes, recovery state, preservation sentinels. |
 | 7 | A stale journal meets same-name service recreation and recovery takes it over. | Recovery owner | Require exact three-way journal/manifest/resource match for owner, role, operation, fingerprint, nonce, and proof. Any new/missing/malformed marker becomes durable `manual-cleanup`; leave resource untouched and block the key. | Recreated-service race fixture (same owner/fingerprint), unchanged resource/data, manual-cleanup record and operator action. |
-| 8 | NSSM provenance is accepted from a copied or tampered receipt. | Release/provenance owner | Require exact pinned URL/version and exact 64/40-hex shape/value. Hash actual operator ZIP and extracted `win64\\nssm.exe` with an authoritative tool; no auto-download/bundling. Mismatch stops release. | Sanitized `Get-FileHash -Algorithm SHA256` outputs, source/path/tool metadata, archive and executable byte comparisons. |
+| 8 | The `sc.exe` fallback is used in production without accepting or replacing its bare restart contract. | Release/provenance owner | `sc.exe`-registered Bun/Node cannot acknowledge service control codes and gets only `sc failure` recovery actions (fixed list, no jitter, no clean/crash distinction). Require an explicit sign-off that this bare contract is acceptable, or a thin wrapper, before production use. NSSM — which previously specified a receipted-download contract for this row — is discarded; it was never merged into this repository and no NSSM implementation exists here. | Signed-off restart-contract decision (bare `sc failure` or wrapper), `sc failure` configuration evidence, crash-loop observation with configured recovery actions. |
 | 9 | Two hosts collide, or controls/newlines spoof a service or log correlation. | Identity owner | Validate exact protocol `HOST_ID`, derive slug plus full exact-UTF-8 hash, reject controls/surrogates, and escape correlation output. Never normalize or name by slug alone. | Boundary IDs (128 code units, astral, collisions), exact-ID mismatch refusal, sanitized names/logs. |
 | 10 | A service runs with the wrong cwd, env, account, HOME, or provider profile. | Account/environment owner | Use absolute paths and component-local env loading; dedicated account/profile, protected `.gjc`, mode/ACL checks, provider login as service identity, URL credential rejection, debug off. | Startup environment/path/account evidence, path-with-spaces case, profile/provider readiness, ACL and secret scan. |
 | 11 | Token rotation causes a restart storm or leaves an opaque offline bot. | Release operator | Stop daemon first, update/restart bot and prove readiness, update/restart daemon and registration, use protected backup and reverse rollback within 120 s. Keep supervisor restart and daemon reconnect evidence separate. | Old-token rejection, two 60-s readiness windows, registration/host-connected evidence, numeric restart/start-limit records, no token output. |
@@ -29,6 +30,7 @@ Close a row only with the required artifact and an owner sign-off. Missing Windo
 ## References
 
 - [ADR 0001: Process supervision](adr/0001-process-supervision.md)
-- [NSSM usage](https://nssm.cc/usage) and [commands](https://nssm.cc/commands)
+- [Shawl repository and releases](https://github.com/mtkennerly/shawl/releases)
+- [`sc.exe` create](https://learn.microsoft.com/windows-server/administration/windows-commands/sc-create) and [`sc.exe` failure](https://learn.microsoft.com/windows-server/administration/windows-commands/sc-failure)
 - [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html), [systemd.unit](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html), and [journald.conf](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)
 - [Node signal events](https://nodejs.org/api/process.html#signal-events)
