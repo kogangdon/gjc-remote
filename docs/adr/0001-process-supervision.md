@@ -2,7 +2,7 @@
 
 - **Status:** Revised design; Linux approved; Windows Shawl selected as the primary supervisor with `sc.exe` documented as the fallback; NSSM discarded
 - **Date:** 2026-08-01
-- **Amendment (2026-08-08):** The NSSM-based Windows supervision path recorded in the original decision is discarded. It was never merged into this repository — its install/update/remove/recovery scripts and supervision-contract test lived only in an untracked `ops/` tree that has since been archived outside the repository and deleted — and the operator selected a different Windows mechanism. No NSSM implementation exists anywhere in this repository. See "Windows: NSSM (discarded)" below.
+- **Amendment (2026-08-08):** The NSSM-based Windows supervision path recorded in the original decision is discarded. It was never merged into this repository — its install/update/remove/recovery scripts and supervision-contract test lived only in an untracked `ops/` tree that has since been archived outside the repository and deleted — and the operator selected a different Windows mechanism. No NSSM implementation exists anywhere in this repository. See "Windows: NSSM (discarded)" below. This amendment also supersedes this ADR's original prohibition on registering Bun or Node directly with `sc.exe` (they do not implement the Windows Service Control API); the Decision section below now names `sc.exe` as the documented Windows fallback and accepts, as the named cost of that reversal, that a directly registered service cannot acknowledge `SERVICE_CONTROL_STOP` and that its automatic restart is limited to the fixed, jitter-free `sc failure` recovery-action contract.
 - **Scope:** This ADR records the supervision decision and its operational documentation. The coordinated SDK pin update is separately verified in this PR; it does not authorize product-source, protocol, or lockfile changes beyond that dependency update.
 
 ## Context
@@ -44,9 +44,7 @@ tree, propagate stop, enforce a bounded force-kill deadline, and preserve
 exit-code/restart semantics. The wrapper and its signing/provenance policy need
 their own implementation plan and review.
 
-### Windows: NSSM (discarded)
-
-**Decision (2026-08-08):** The NSSM-based Windows supervision path is discarded. It was evaluated and documented in earlier drafts of this ADR, but the implementation (NSSM install/update/remove/recovery PowerShell scripts and the accompanying supervision-contract test) was never merged into this repository — it lived only in an untracked `ops/` tree that has since been archived outside the repository and deleted. No NSSM implementation, script, or test exists anywhere in this repository. The operator selected Shawl as the primary Windows supervisor with `sc.exe` as the documented fallback (see "Decision" above, "Windows: Shawl evaluation adapter", and "Windows: sc.exe fallback" below) instead of resuming NSSM work. Do not reintroduce NSSM without a new ADR.
+### Windows: target topology and instance identity
 
 The target topology below is mechanism-neutral and applies to whichever Windows supervisor (Shawl or `sc.exe`) is actually configured.
 
@@ -56,6 +54,10 @@ The target topology is exactly:
 - one `GJCRemoteDaemon-<instance-key>` service per exact valid `HOST_ID`.
 
 Channels, work directories, Discord servers, and provider profiles do not create services. The instance key is a display slug (ASCII, lower-case, at most 32 characters) plus the lower-case SHA-256 of the exact `HOST_ID` UTF-8 bytes. The exact, case-sensitive `HOST_ID` remains in protected configuration only. Validation follows `shared/protocol.js`: non-empty, at most 128 UTF-16 code units, and no unpaired surrogates, Unicode controls, bidi/format controls, U+2028, or U+2029. Do not trim, normalize, or case-fold the wire ID.
+
+### Windows: NSSM (discarded)
+
+**Decision (2026-08-08):** The NSSM-based Windows supervision path is discarded. It was evaluated and documented in earlier drafts of this ADR, but the implementation (NSSM install/update/remove/recovery PowerShell scripts and the accompanying supervision-contract test) was never merged into this repository — it lived only in an untracked `ops/` tree that has since been archived outside the repository and deleted. No NSSM implementation, script, or test exists anywhere in this repository. The operator selected Shawl as the primary Windows supervisor with `sc.exe` as the documented fallback (see "Decision" above, "Windows: Shawl (selected primary; unsigned-binary evaluation evidence)", and "Windows: sc.exe fallback" below) instead of resuming NSSM work. Do not reintroduce NSSM without a new ADR.
 
 ### Windows: sc.exe fallback (not yet implemented)
 
@@ -87,13 +89,15 @@ Readiness is a current-run property, not `active (running)` or a stale log line.
 
 ### Transaction ownership and recovery
 
-Install, update, and remove use an ACL/mode-protected per-service transaction store (`C:\ProgramData\\gjc-remote\\transactions` on Windows; `/var/lib/gjc-remote/transactions` mode 0700 on Linux). Before mutation, acquire the per-key lock, generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters), and compute a versioned SHA-256 `resourceProof` over canonical, secret-free transaction/resource fields. Never reuse a nonce.
+**No implementation of this transaction/journal/fault-injection protocol exists anywhere in this repository.** What follows is the contract a future implementation must satisfy before it may be used in production.
 
-The journal, staged/owned manifest (or remove tombstone), and service/unit metadata all carry the transaction envelope: transaction ID, operation, role, owner, configuration fingerprint, nonce, and proof. Resource metadata contains no host ID, env, credential, prompt, token, or log content. Recovery mutates a resource only after independently recomputed, exact agreement among all three copies. Name, owner, role, fingerprint, PID, timestamp, or service state alone is insufficient.
+Install, update, and remove must use an ACL/mode-protected per-service transaction store (`C:\ProgramData\\gjc-remote\\transactions` on Windows; `/var/lib/gjc-remote/transactions` mode 0700 on Linux). Before mutation, it must acquire the per-key lock, generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters), and compute a versioned SHA-256 `resourceProof` over canonical, secret-free transaction/resource fields. It must never reuse a nonce.
 
-Any missing, malformed, stale, mismatched, or hybrid copy enters durable `manual-cleanup`, records only sanitized metadata and the exact operator action, blocks new mutation for that key, and refuses automatic stop/remove/restore. A stale journal followed by same-name recreation—even with the same owner and fingerprint but a new or missing marker—must leave the recreated resource untouched. Recovery and all rollback paths preserve env files, provider credentials, logs, and `.gjc-remote-session` data.
+The journal, staged/owned manifest (or remove tombstone), and service/unit metadata must all carry the transaction envelope: transaction ID, operation, role, owner, configuration fingerprint, nonce, and proof. Resource metadata must contain no host ID, env, credential, prompt, token, or log content. Recovery must mutate a resource only after independently recomputed, exact agreement among all three copies. Name, owner, role, fingerprint, PID, timestamp, or service state alone must not be sufficient.
 
-Install publishes prepared journal and staged manifest before service creation, verifies resource metadata before committing the manifest, and marks committed only after current-run readiness. Update retains old and new proofs and restores old settings only on an exact old-proof match. Remove writes a tombstone, disables recovery, stops/quiesces, and removes the resource only after proof and no-process checks. Every mutation boundary is fault-injected, including marker publication and stale/recreated-service races; missing evidence is a release stop.
+Any missing, malformed, stale, mismatched, or hybrid copy must enter durable `manual-cleanup`, record only sanitized metadata and the exact operator action, block new mutation for that key, and refuse automatic stop/remove/restore. A stale journal followed by same-name recreation—even with the same owner and fingerprint but a new or missing marker—must leave the recreated resource untouched. Recovery and all rollback paths must preserve env files, provider credentials, logs, and `.gjc-remote-session` data.
+
+Install must publish prepared journal and staged manifest before service creation, verify resource metadata before committing the manifest, and mark committed only after current-run readiness. Update must retain old and new proofs and restore old settings only on an exact old-proof match. Remove must write a tombstone, disable recovery, stop/quiesce, and remove the resource only after proof and no-process checks. Every mutation boundary must be fault-injected, including marker publication and stale/recreated-service races; missing evidence must be treated as a release stop.
 
 ### Rotation, rollback, and loss
 
@@ -108,7 +112,7 @@ bot/:    node src/bot.js
 daemon/: bun src/daemon.js   # Bun >= 1.3.14
 ```
 
-Platform evidence is **pending**. This documentation-only change does not prove Shawl byte provenance, Windows stop/readiness, Linux boot/readiness, relay behavior, transaction fault injection, rotation, or secret scans. Release requires static contracts, authoritative archive/executable hashes, disposable Windows and pinned Ubuntu systemd evidence, current-run relay evidence, fault-injection matrices, and sanitized artifacts. Missing evidence escalates; it is not waived.
+Platform evidence is **pending**. This documentation-only change does not prove Shawl byte provenance, Windows stop/readiness, Linux boot/readiness, relay behavior, transaction fault injection, rotation, or secret scans. Release requires pinned Shawl source/release and executable-hash evidence for the Windows primary path, disposable Windows and pinned Ubuntu systemd evidence, current-run relay evidence, fault-injection matrices, and sanitized artifacts. Missing evidence escalates; it is not waived.
 
 ## References
 

@@ -134,18 +134,20 @@ The normal install consumes host-policy journald. Query unit-scoped records and 
 
 ## Transactions, recovery, and manual cleanup
 
-Use per-service ACL/mode-protected storage (`C:\ProgramData\\gjc-remote\\transactions` or `/var/lib/gjc-remote/transactions`, mode 0700). Before every install/update/remove mutation:
+**No implementation of this transaction/journal/fault-injection protocol exists anywhere in this repository.** What follows is the contract a future implementation must satisfy before it may be used in production.
 
-1. Acquire the per-key lock and generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters). Never reuse it.
+Use per-service ACL/mode-protected storage (`C:\ProgramData\\gjc-remote\\transactions` or `/var/lib/gjc-remote/transactions`, mode 0700). Before every install/update/remove mutation, it must:
+
+1. Acquire the per-key lock and generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters). It must never reuse it.
 2. Compute a versioned, canonical SHA-256 `resourceProof` over secret-free transaction/resource fields.
 3. Persist the envelope in the journal and staged manifest/tombstone before mutation, and in service/unit metadata after publication.
 4. Recompute and compare all copies after every mutation. Only an exact three-way match (journal, manifest/tombstone, queried resource) proves ownership.
 
-Recovery is symmetric and idempotent: install commits only after metadata, manifest, and current-run readiness; update retains old/new proofs and restores old settings only with an exact old proof; remove uses a proof-bound tombstone and removes only after no-process evidence. Env files, provider credentials, logs, and `.gjc-remote-session` are never cleanup targets.
+Recovery must be symmetric and idempotent: install must commit only after metadata, manifest, and current-run readiness; update must retain old/new proofs and restore old settings only with an exact old proof; remove must use a proof-bound tombstone and remove only after no-process evidence. Env files, provider credentials, logs, and `.gjc-remote-session` must never be cleanup targets.
 
-Any missing, malformed, stale, mismatched, hybrid, foreign, or recreated resource is **`manual-cleanup`**. This includes a stale journal followed by same-name recreation with the same owner/fingerprint but a different, missing, or malformed nonce/proof. Write a sanitized record with transaction key, phase, expected/observed non-secret metadata, reason, timestamp, and exact operator action; block new mutation for that key and leave the resource untouched until an operator resolves it. Never recover by service name alone.
+Any missing, malformed, stale, mismatched, hybrid, foreign, or recreated resource must be treated as **`manual-cleanup`**. This includes a stale journal followed by same-name recreation with the same owner/fingerprint but a different, missing, or malformed nonce/proof. It must write a sanitized record with transaction key, phase, expected/observed non-secret metadata, reason, timestamp, and exact operator action; block new mutation for that key and leave the resource untouched until an operator resolves it. It must never recover by service name alone.
 
-Fault-injection evidence is mandatory after every install/update/remove boundary, including prepared/staged state, service creation, metadata publication, settings verification, manifest rename, start/readiness, commit, disable/stop/quiescence, removal, and marker publication. Repeat malformed, foreign, and stale/recreated-service fixtures. Seed sentinel env, provider-store, log, and `.gjc-remote-session` files and prove byte-preserving survival. Missing evidence stops release.
+Fault-injection evidence is mandatory after every install/update/remove boundary, including prepared/staged state, service creation, metadata publication, settings verification, manifest rename, start/readiness, commit, disable/stop/quiescence, removal, and marker publication. It must repeat malformed, foreign, and stale/recreated-service fixtures. It must seed sentinel env, provider-store, log, and `.gjc-remote-session` files and prove byte-preserving survival. Missing evidence must stop release.
 
 ## Rotation, rollback, and loss
 
