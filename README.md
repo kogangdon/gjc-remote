@@ -64,6 +64,15 @@ can briefly stall the others. See `CONTEXT.md` → "Concurrency model: single ev
 loop, and the subprocess alternative" for the full model and the subprocess
 option (tracked in #33).
 
+> **Node requirement:** the root package and `bot/` declare `"engines": {
+> "node": ">=26.0.0" }`. Node 24 on Windows has been observed in CI to crash
+> the bot process (`STATUS_STACK_BUFFER_OVERRUN`, exit `3221226505`) instead
+> of the contracted single fatal line + exit 1 — CI is pinned to Node 26
+> (`.github/workflows/ci.yml`) and `bot/src/bot.js` /
+> `bot/src/management-entrypoint.js` refuse to start on an unsupported Node
+> major with a structured `unsupported_node_version` fatal instead of risking
+> that crash. Install Node 26+ before running the bot outside Bun.
+
 ## Setup
 
 ```bash

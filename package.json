@@ -4,6 +4,9 @@
   "private": true,
   "description": "Discord-controlled remote GJC sessions: bot (Discord + WS relay server) + daemon (per-host WebSocket bridge with pooled GJC SDK sessions)",
   "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
   "scripts": {
     "smoke:local": "node scripts/local-smoke.js",
     "release": "node scripts/release.js",

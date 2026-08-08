@@ -1,3 +1,4 @@
+import "./node-version-guard.js";
 import "dotenv/config";
 import { existsSync, lstatSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";

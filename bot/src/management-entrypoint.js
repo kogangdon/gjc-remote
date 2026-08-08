@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./node-version-guard.js";
 import { runManagementCli } from "./management-cli.js";
 import { parseProvisionedManagementRoleBindings } from "./config.js";
 import { resolve } from "node:path";

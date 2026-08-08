@@ -3,6 +3,9 @@
   "version": "0.2.4",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
   "main": "src/bot.js",
   "bin": {
     "gjc-remote-admin": "./src/management-entrypoint.js"
