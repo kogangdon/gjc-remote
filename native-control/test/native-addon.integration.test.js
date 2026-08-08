@@ -190,7 +190,16 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
       await addon.create_absent_exclusive(join(botStateDir, "reader-projection.json"), Buffer.from("{}"), ...roles, "bot-state");
       assert.fail("M is not the required owner of individual bot-state records; only a bot-principal writer may create them there");
     } catch (error) {
-      assert.match(error.message, /unable to prepare protected absent file|failed temporary cleanup is ambiguous/);
+      // Creation now sets the SECURITY_DESCRIPTOR owner explicitly to the profile's
+      // required owner role (B for a bot-state record) instead of leaving it to the
+      // OS-assigned default. M's non-elevated token does not hold B's (synthetic,
+      // unresolvable) SID as an assignable owner and lacks SeRestorePrivilege, so the
+      // OS itself now refuses the owner assignment at same-parent temp-file creation
+      // time — fail-closed, deterministically, before any VerifyExactRoleAcl check
+      // ever runs. If the temp create instead raced past that (e.g. a differently
+      // privileged token), the later verify/cleanup paths still catch a mismatch.
+      assert.match(error.message,
+        /unable to create same-parent temporary file|unable to prepare protected absent file|failed temporary cleanup is ambiguous/);
     }
 
     const authDestination = join(root, "management-auth.json");

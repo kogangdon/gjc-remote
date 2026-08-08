@@ -505,6 +505,16 @@ DWORD RoleRights(RoleProfile profile, size_t role, bool directory) {
   return directory ? (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) : FILE_GENERIC_READ;
 }
 
+// The profile's required owner: BotState's non-directory (record) objects are
+// owned by the bot role (index 1) so the bot can mutate its own state files
+// without holding WRITE_OWNER on objects it did not create; every other
+// protected object (directories, and all non-BotState-record files) is owned
+// by the management role (index 0). This must match VerifyExactRoleAcl's
+// owner binding exactly, since creation is only useful if it is provably
+// verifiable afterward.
+size_t RequiredOwnerRole(RoleProfile profile, bool directory) {
+  return (profile == RoleProfile::BotState && !directory) ? 1 : 0;
+}
 bool BuildExactRoleAcl(const std::string& manager, const std::string& bot,
                        const std::string& reader, const std::string& system,
                        RoleProfile profile, bool directory, RoleAcl* result) {
@@ -543,7 +553,7 @@ bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   if (GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr,
                       &applied, nullptr, &descriptor) != ERROR_SUCCESS) return false;
-  const size_t required_owner_role = (profile == RoleProfile::BotState && !directory) ? 1 : 0;
+  const size_t required_owner_role = RequiredOwnerRole(profile, directory);
   SECURITY_DESCRIPTOR_CONTROL control = 0;
   DWORD revision = 0;
   ACL_SIZE_INFORMATION size{};
@@ -586,9 +596,10 @@ bool ApplyExactRoleAcl(HANDLE handle, const std::string& manager,
   const bool directory = (metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
   RoleAcl roles;
   if (!BuildExactRoleAcl(manager, bot, reader, system, profile, directory, &roles)) return false;
+  const PSID owner = roles.sids[RequiredOwnerRole(profile, directory)];
   if (SetSecurityInfo(handle, SE_FILE_OBJECT,
-      DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-      nullptr, nullptr, roles.acl, nullptr) != ERROR_SUCCESS) return false;
+      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+      owner, nullptr, roles.acl, nullptr) != ERROR_SUCCESS) return false;
   return VerifyExactRoleAcl(handle, manager, bot, reader, system, profile);
 }
 bool WindowsRoleSidIsGroup(const std::string& sid_text) {
@@ -613,10 +624,11 @@ bool WindowsRoleSidIsGroup(const std::string& sid_text) {
   return is_group;
 }
 
-HANDLE CreateProtectedFileNoFollow(const std::string& path, DWORD access, PACL acl) {
+HANDLE CreateProtectedFileNoFollow(const std::string& path, DWORD access, PACL acl, PSID owner) {
   SECURITY_DESCRIPTOR descriptor{};
   if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
       !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) ||
+      !SetSecurityDescriptorOwner(&descriptor, owner, FALSE) ||
       !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
     SetLastError(ERROR_INVALID_SECURITY_DESCR);
     return INVALID_HANDLE_VALUE;
@@ -632,10 +644,11 @@ HANDLE CreateProtectedFileNoFollow(const std::string& path, DWORD access, PACL a
   return handle;
 }
 
-bool CreateProtectedDirectoryNoFollow(const std::string& path, PACL acl) {
+bool CreateProtectedDirectoryNoFollow(const std::string& path, PACL acl, PSID owner) {
   SECURITY_DESCRIPTOR descriptor{};
   if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
       !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) ||
+      !SetSecurityDescriptorOwner(&descriptor, owner, FALSE) ||
       !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
     SetLastError(ERROR_INVALID_SECURITY_DESCR);
     return false;
@@ -1141,7 +1154,7 @@ napi_value SetExactRoleAcl(napi_env env, napi_callback_info info) {
   }
   RoleProfile profile;
   if (!ParseRoleProfile(profile_text, &profile)) { Refuse(env, "set_exact_role_acl", "role profile is invalid"); return nullptr; }
-  HANDLE handle = OpenNoFollowObject(path, READ_CONTROL | WRITE_DAC);
+  HANDLE handle = OpenNoFollowObject(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER);
   if (handle == INVALID_HANDLE_VALUE) {
     Refuse(env, "set_exact_role_acl", "target cannot be opened through a verified no-follow path");
     return nullptr;
@@ -1366,7 +1379,8 @@ napi_value CreateExclusiveTemp(napi_env env, napi_callback_info info) {
   CloseHandle(verified_parent);
   for (unsigned i = 0; i < 128; ++i) {
     std::string candidate = (std::filesystem::u8path(parent) / (prefix + "." + std::to_string(i))).u8string();
-    HANDLE h = CreateProtectedFileNoFollow(candidate, GENERIC_READ | GENERIC_WRITE | WRITE_DAC | DELETE, roles.acl);
+    HANDLE h = CreateProtectedFileNoFollow(candidate, GENERIC_READ | GENERIC_WRITE | WRITE_DAC | DELETE, roles.acl,
+        roles.sids[RequiredOwnerRole(profile, false)]);
     if (h == INVALID_HANDLE_VALUE) {
       const DWORD error = GetLastError();
       if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) continue;
@@ -1530,6 +1544,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
   SECURITY_DESCRIPTOR descriptor{};
   if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
       !SetSecurityDescriptorDacl(&descriptor, TRUE, roles.acl, FALSE) ||
+      !SetSecurityDescriptorOwner(&descriptor, roles.sids[RequiredOwnerRole(profile, false)], FALSE) ||
       !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
     CloseHandle(parent);
     Refuse(env, "create_absent_exclusive", "protected exact role DACL cannot be constructed");
@@ -1967,7 +1982,8 @@ napi_value AcquireNativeLock(napi_env env, napi_callback_info info) {
   }
   lock->handle = OpenNoFollowFile(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL);
   if (lock->handle == INVALID_HANDLE_VALUE && (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND)) {
-    lock->handle = CreateProtectedFileNoFollow(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL, roles.acl);
+    lock->handle = CreateProtectedFileNoFollow(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL, roles.acl,
+        roles.sids[RequiredOwnerRole(profile, false)]);
     if (lock->handle == INVALID_HANDLE_VALUE &&
         (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS)) {
       lock->handle = OpenNoFollowFile(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL);
@@ -2036,7 +2052,7 @@ napi_value EnsureControlDirectory(napi_env env, napi_callback_info info) {
   }
   HANDLE h = OpenNoFollowDirectory(path, READ_CONTROL);
   if (h == INVALID_HANDLE_VALUE && (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND)) {
-    if (!CreateProtectedDirectoryNoFollow(path, roles.acl) && GetLastError() != ERROR_ALREADY_EXISTS) {
+    if (!CreateProtectedDirectoryNoFollow(path, roles.acl, roles.sids[RequiredOwnerRole(profile, true)]) && GetLastError() != ERROR_ALREADY_EXISTS) {
       Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to securely create control directory"); return nullptr;
     }
     h = OpenNoFollowDirectory(path, READ_CONTROL);
