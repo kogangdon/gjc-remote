@@ -82,7 +82,7 @@ function writeSignatureSidecar(manifestBytes) {
       }
     } catch { fail('signing the manifest with --sign-key failed'); return; }
     writeFileSync(sidecarPath, `${JSON.stringify({ keyId, algorithm, signature: signature.toString('base64') }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    return;
+    return { keyId, algorithm };
   }
   const keyId = flagValue('--key-id');
   const algorithm = flagValue('--algorithm');
@@ -91,6 +91,7 @@ function writeSignatureSidecar(manifestBytes) {
   let signature;
   try { signature = readFileSync(externalSignaturePath); } catch { fail(`--signature file is not readable: ${externalSignaturePath}`); return; }
   writeFileSync(sidecarPath, `${JSON.stringify({ keyId, algorithm, signature: signature.toString('base64') }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  return { keyId, algorithm };
 }
 
 function readJsonFileSafe(path) {
@@ -132,9 +133,41 @@ export function evaluateRequiredSignature(manifestBytes, { sidecarPath: sidecarF
 }
 
 function enforceRequiredSignature(manifestBytes) {
-  if (!process.argv.includes('--require-signature')) return;
+  if (!process.argv.includes('--require-signature')) return undefined;
   const result = evaluateRequiredSignature(manifestBytes);
-  if (!result.ok) fail(`--require-signature was set but ${result.reason}`);
+  if (!result.ok) { fail(`--require-signature was set but ${result.reason}`); return undefined; }
+  return { keyId: result.keyId, algorithm: result.algorithm };
+}
+
+// Success receipt helpers: printed only from the very end of the isMainModule block, and only
+// when process.exitCode is still unset, so a receipt can never appear alongside (or instead of)
+// a fail() message. Signature phrasing must stay strictly honest about what actually ran this
+// invocation: "signed" only when a sidecar was just written, "verified" only when
+// --require-signature actually checked it against trusted.json, and an explicit zero-keys-pinned
+// line when no production key exists to verify against at all.
+function describeSignatureOutcome(signInfo, verifyInfo) {
+  if (signInfo && verifyInfo) {
+    return `signed sidecar with keyId "${signInfo.keyId}" (${signInfo.algorithm}); verified against pinned keyId "${verifyInfo.keyId}" (${verifyInfo.algorithm})`;
+  }
+  if (verifyInfo) return `verified against pinned keyId "${verifyInfo.keyId}" (${verifyInfo.algorithm})`;
+  if (signInfo) return `signed sidecar with keyId "${signInfo.keyId}" (${signInfo.algorithm}); not verified this run (no --require-signature)`;
+  let pinnedCount = 0;
+  try { pinnedCount = normalizeTrustStore(readJsonFileSafe(trustedKeysPath).value).length; } catch { pinnedCount = 0; }
+  if (pinnedCount === 0) return 'addon provenance UNVERIFIED \u2014 zero keys are pinned in trusted.json';
+  return `not verified this run (no --require-signature); ${pinnedCount} key${pinnedCount === 1 ? '' : 's'} pinned in trusted.json`;
+}
+
+function printSuccessReceipt({ manifestRewritten, addonSha256, signInfo, verifyInfo }) {
+  if (process.exitCode) return;
+  const lines = [
+    'native-control build verified',
+    `  platform: ${process.platform}-${process.arch}`,
+    `  addon sha256: ${addonSha256.slice(0, 12)}\u2026`,
+    '  contract: v3',
+    `  manifest rewritten: ${manifestRewritten ? 'yes' : 'no'}`,
+    `  signature: ${describeSignatureOutcome(signInfo, verifyInfo)}`,
+  ];
+  process.stdout.write(`${lines.join('\n')}\n`);
 }
 
 // Resolve both sides through realpath so a symlinked or junctioned script path cannot
@@ -200,8 +233,9 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
       // sidecar over the new manifest bytes.
       try { rmSync(sidecarPath, { force: true }); } catch {}
       writeFileSync(manifestPath, manifestBytes, { encoding: 'utf8', mode: 0o600 });
-      writeSignatureSidecar(manifestBytes);
-      if (!process.exitCode) enforceRequiredSignature(manifestBytes);
+      const signInfo = writeSignatureSidecar(manifestBytes);
+      const verifyInfo = process.exitCode ? undefined : enforceRequiredSignature(manifestBytes);
+      printSuccessReceipt({ manifestRewritten: true, addonSha256: expected.sha256, signInfo, verifyInfo });
     }
   } else if (!existsSync(manifestPath)) {
     fail('native-control.manifest.json is missing');
@@ -212,8 +246,9 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     for (const [key, value] of Object.entries(expected)) {
       if (JSON.stringify(actual[key]) !== JSON.stringify(value)) fail(`manifest ${key} does not match the local addon`);
     }
-    writeSignatureSidecar(manifestBytes);
-    if (!process.exitCode) enforceRequiredSignature(manifestBytes);
+    const signInfo = writeSignatureSidecar(manifestBytes);
+    const verifyInfo = process.exitCode ? undefined : enforceRequiredSignature(manifestBytes);
+    printSuccessReceipt({ manifestRewritten: false, addonSha256: expected.sha256, signInfo, verifyInfo });
   }
 }
 }
