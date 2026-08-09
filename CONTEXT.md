@@ -11,7 +11,7 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `team`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (GJC 0.11 SDK; implemented and real-smoke tested)
+## Architecture (GJC 0.12.21 SDK; implemented and real-smoke tested)
 
 ```
 [host machine, per project]                    [always-on bot host, private network]
@@ -100,7 +100,7 @@ current transport lives in `daemon/src/sdk-session.js`.
    ambiguity instead of selecting by list order. `model-command.js` sends the
    resolved exact pair and emits a bounded `model_resolved` receipt only after
    success; the bot formats that receipt so `/model` never succeeds with
-   `(no text output)`. Verified against real GJC: `sol` resolved to
+   `(no text output)`. Verified against real GJC using the exact selector
    `openai-codex:gpt-5.6-sol` (`GPT-5.6 Sol`). Startup model selection remains
    unchanged.
 4. **Historical daemon-wide crash on spawn failure.** In the removed subprocess
@@ -152,7 +152,7 @@ current transport lives in `daemon/src/sdk-session.js`.
 
 ## Runtime: Bun vs Node
 
-`@gajae-code/coding-agent` 0.12.7 requires Bun 1.3.14 or newer, so the daemon
+`@gajae-code/coding-agent` 0.12.21 requires Bun 1.3.14 or newer, so the daemon
 starts with Bun and embeds GJC in-process. The bot and Node built-in test runner
 remain Node-compatible. `bun.lock` is the committed dependency lockfile;
 `package-lock.json` is gitignored.
@@ -188,10 +188,13 @@ Constraint that follows:
   I/O-bound; degrades under CPU-bound load.
 - **Per-session FIFO** serialization is intentional (prompt/model ops; see
   Architecture §2). Cross-session there is no scheduling lock — independent.
-- **Cross-session state bleed** is the two documented process-globals, not the
-  scheduler: Settings singleton (mitigated by `cloneForCwd`, see that section)
-  and the capability module-global (NOT mitigated; last-created wins;
-  upstream #2774 / gajae-code#2865, still reproduces on 0.11.10).
+- **Cross-session state bleed** has two distinct sources: the per-workDir
+  Settings clone isolates model roles, but capability and model/provider
+  registries retain process-global state. SDK 0.12.21 threads active settings
+  through some capability-load paths only; divergent provider/model policy can
+  still observe last-created-session behavior. The old 0.11.4/0.11.10 probe is
+  historical evidence, not proof of full isolation. Re-run the focused
+  divergent-session probe after each SDK bump.
 
 **Subprocess alternative — feasible, and the SDK already ships the transport.**
 Confirmed against installed `@gajae-code/coding-agent` (asked 2026-07-28):
@@ -227,9 +230,9 @@ the in-process migration deliberately removed:
 - **Lifecycle**: idle reap becomes process-kill not object-dispose; child
   crash/zombie reaping; re-apply payload cap + backpressure at the stdio edge.
 - **Version drift**: a `GJC_BIN`-spawned child uses the on-PATH gjc, which can
-  differ from the daemon's imported SDK (note the existing pin-0.11.10 vs
-  installed-0.11.4 gap) — independent upgrades (pro) but two versions to track
-  (con).
+  differ from the daemon's imported SDK (current daemon pin: 0.12.21; an
+  independently installed child can still differ) — independent upgrades (pro)
+  but two versions to track (con).
 
 **Status: feasibility only.** No route chosen, nothing implemented. The real
 question is not "can we" (yes) but "is parallelism + full isolation worth
@@ -420,32 +423,16 @@ console.log(events.find(e => e.type === "agent_end"));
 await pool.shutdown();
 ```
 
-## Capability layer is a process-global NOT isolated by the per-session Settings clone (upstream)
+## Capability layer and per-session Settings isolation (SDK 0.12.21)
 
-The per-workDir `Settings` clone (above) isolates model roles, but the SDK's
-`capability/index.ts` keeps `disabledProviders` (module-global `Set`, src line
-40) and its `settings` ref (line 43) as **process-global** state. Every
-`createAgentSession` runs `initializeWithSettings(settings)`
-(`sdk/session.ts:1060-1062`) which `disabledProviders.clear()` + repopulates
-from that session's settings — **last-created session wins process-wide**.
-`filterProviders` (line 210-211) reads this global to filter which
-skills/rules/tools/MCP/hooks/context-files load, so an earlier live session can
-resolve capabilities under a later session's disable-set. Probe confirmed
-(0.11.4, re-confirmed 0.11.10): create A(`disabledProviders:["prov-A-only"]`)
-then B(`["prov-B-only"]`) → `getDisabledProviders()` returns B's set and
-`isProviderEnabled("prov-A-only")===true` (A's intent lost), while
-`a.settings.get("disabledProviders")` stays correct — only the capability
-module-global diverges. **Cannot be fixed by `cloneForCwd`** (clone isolates
-Settings, not the SDK's separate capability global). Impact is LOW for typical
-gjc-remote hosts where `disabledProviders` is global-only (every writer writes
-the same value); it only bites with divergent per-workDir project overrides +
-concurrent sessions. Decision: no local mitigation (any per-prompt
-re-`initializeWithSettings` would be racy and reach below `/sdk`); tracked
-upstream at **Yeachan-Heo/gajae-code#2774** with repro + suggested fix (thread
-active `Settings` through capability load instead of a module global).
-Upstream status: closed 2026-07-22 via their PR #2865 merged into `dev`
-(`c2ca200`), but the fix is NOT in the 0.11.10 npm release — the probe above
-still reproduces on 0.11.10. Re-probe on the next version bump.
+The per-workDir `Settings` clone isolates model roles, but SDK 0.12.21 only
+threads active settings through some capability-load paths. The capability and
+model/provider registry still retain process-global state, so concurrent pooled
+sessions with divergent `disabledProviders` or model policy can still observe
+last-created-session behavior. The old 0.11.4/0.11.10 probe therefore remains
+relevant as historical evidence; a focused divergent-session probe must pass
+before this caveat can be removed. Upstream fix reference:
+**Yeachan-Heo/gajae-code#2774**, merged through PR #2865.
 
 ## Windows owner-only session storage constraint (found during 0.11.10 bump)
 
