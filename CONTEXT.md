@@ -188,13 +188,13 @@ Constraint that follows:
   I/O-bound; degrades under CPU-bound load.
 - **Per-session FIFO** serialization is intentional (prompt/model ops; see
   Architecture §2). Cross-session there is no scheduling lock — independent.
-- **Cross-session state bleed** is the two documented process-globals, not the
-  scheduler: Settings singleton (mitigated by `cloneForCwd`, see that section)
-- **Cross-session state bleed** is the two documented process-globals, not the
-  scheduler: Settings singleton is mitigated by `cloneForCwd`, and SDK 0.12.21
-  passes active settings through capability resolution. The old module-global
-  probe from 0.11.10 is historical evidence only; re-run the multi-session
-  probe after each future SDK bump.
+- **Cross-session state bleed** has two distinct sources: the per-workDir
+  Settings clone isolates model roles, but capability and model/provider
+  registries retain process-global state. SDK 0.12.21 threads active settings
+  through some capability-load paths only; divergent provider/model policy can
+  still observe last-created-session behavior. The old 0.11.4/0.11.10 probe is
+  historical evidence, not proof of full isolation. Re-run the focused
+  divergent-session probe after each SDK bump.
 
 **Subprocess alternative — feasible, and the SDK already ships the transport.**
 Confirmed against installed `@gajae-code/coding-agent` (asked 2026-07-28):
