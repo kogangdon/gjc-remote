@@ -425,13 +425,14 @@ await pool.shutdown();
 
 ## Capability layer and per-session Settings isolation (SDK 0.12.21)
 
-The per-workDir `Settings` clone isolates model roles. In SDK 0.12.21,
-capability resolution accepts the active session settings, so the old
-0.11.x module-global probe is no longer current behavior. The historical
-0.11.4/0.11.10 result remains retained as upgrade provenance; re-run the
-multi-session divergent-`disabledProviders` probe after each future SDK bump.
-Upstream fix reference: **Yeachan-Heo/gajae-code#2774**, merged through PR
-#2865.
+The per-workDir `Settings` clone isolates model roles, but SDK 0.12.21 only
+threads active settings through some capability-load paths. The capability and
+model/provider registry still retain process-global state, so concurrent pooled
+sessions with divergent `disabledProviders` or model policy can still observe
+last-created-session behavior. The old 0.11.4/0.11.10 probe therefore remains
+relevant as historical evidence; a focused divergent-session probe must pass
+before this caveat can be removed. Upstream fix reference:
+**Yeachan-Heo/gajae-code#2774**, merged through PR #2865.
 
 ## Windows owner-only session storage constraint (found during 0.11.10 bump)
 
