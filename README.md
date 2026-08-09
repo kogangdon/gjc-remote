@@ -215,8 +215,8 @@ GJC output reaches the channel as follows (`bot/src/delivery.js`):
 ```bash
 bun run smoke:local
 # Also verify model resolution and its structured success receipt:
-SMOKE_MODEL_QUERY=sol bun run smoke:local   # POSIX shell
-# PowerShell: $env:SMOKE_MODEL_QUERY="sol"; bun run smoke:local
+SMOKE_MODEL_QUERY=openai-codex:gpt-5.6-sol bun run smoke:local   # POSIX shell
+# PowerShell: $env:SMOKE_MODEL_QUERY="openai-codex:gpt-5.6-sol"; bun run smoke:local
 ```
 
 `smoke:local` starts a local `HostRegistry`, starts a real Bun daemon, routes one

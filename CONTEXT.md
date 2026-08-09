@@ -100,7 +100,7 @@ current transport lives in `daemon/src/sdk-session.js`.
    ambiguity instead of selecting by list order. `model-command.js` sends the
    resolved exact pair and emits a bounded `model_resolved` receipt only after
    success; the bot formats that receipt so `/model` never succeeds with
-   `(no text output)`. Verified against real GJC: `sol` resolved to
+   `(no text output)`. Verified against real GJC using the exact selector
    `openai-codex:gpt-5.6-sol` (`GPT-5.6 Sol`). Startup model selection remains
    unchanged.
 4. **Historical daemon-wide crash on spawn failure.** In the removed subprocess

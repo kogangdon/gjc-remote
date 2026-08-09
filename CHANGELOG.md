@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+
+- Upgraded the embedded `@gajae-code/coding-agent` SDK from 0.12.7 to
+  0.12.21, including the committed Bun lockfile and current security/provenance
+  documentation. Regression suites, canonical import checks, local smoke, and
+  manual bot/daemon execution passed on 2026-08-09.
 
 ## [0.3.0] - 2026-08-09
 
