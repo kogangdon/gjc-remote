@@ -268,6 +268,13 @@ rollback, transaction proofs, and honest best-effort stop/manual-cleanup
 semantics. Host-policy journald is consumed by default; global changes need
 separate approval.
 
+**Windows support boundary:** the documented Windows deployment assumes a dedicated
+operator-controlled host. Multi-user workstation isolation is not a supported
+security boundary, and this repository does not claim protection from unrelated local
+users or local administrators. Cross-account read/write isolation for unrelated local
+users is therefore outside the dedicated-host release gate, while service-account
+separation and protected secret/profile storage remain required for supervised deployment.
+
 **Platform evidence is pending.** These links describe the current contract and
 evaluation results; they do not claim that a signed Windows primary wrapper,
 production Windows account/ACL behavior, Linux boot/readiness, relay behavior,

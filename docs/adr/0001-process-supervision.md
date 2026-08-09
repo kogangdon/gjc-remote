@@ -112,7 +112,20 @@ bot/:    node src/bot.js
 daemon/: bun src/daemon.js   # Bun >= 1.3.14
 ```
 
+### Supported Windows host boundary
+
+The selected Windows supervision decision assumes a dedicated operator-controlled host.
+Multi-user workstation isolation is outside the supported security boundary; this ADR
+does not claim that unrelated local users, or a local administrator, cannot inspect or
+interfere with the deployment. Cross-account read/write isolation for unrelated local
+users is therefore not a release gate for the dedicated-host model. Service-account
+separation and protected credential/profile/session storage remain mandatory for any
+supervised deployment.
+
 Platform evidence is **pending**. This documentation-only change does not prove Shawl byte provenance, Windows stop/readiness, Linux boot/readiness, relay behavior, transaction fault injection, rotation, or secret scans. Release requires pinned Shawl source/release and executable-hash evidence for the Windows primary path, disposable Windows and pinned Ubuntu systemd evidence, current-run relay evidence, fault-injection matrices, and sanitized artifacts. Missing evidence escalates; it is not waived.
+The dedicated-host boundary above is an explicit scope decision, not a waiver of
+service-account or secret-storage controls. Re-open the multi-user evidence requirement
+before supporting a shared workstation or claiming Windows account/ACL isolation.
 
 ## References
 
