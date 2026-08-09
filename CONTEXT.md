@@ -195,6 +195,8 @@ Constraint that follows:
   still observe last-created-session behavior. The old 0.11.4/0.11.10 probe is
   historical evidence, not proof of full isolation. Re-run the focused
   divergent-session probe after each SDK bump.
+  Evidence and the exact artifact/read-redaction boundary are recorded in
+  [docs/verification/issue62-evidence.md](docs/verification/issue62-evidence.md).
 
 **Subprocess alternative — feasible, and the SDK already ships the transport.**
 Confirmed against installed `@gajae-code/coding-agent` (asked 2026-07-28):
@@ -433,6 +435,16 @@ last-created-session behavior. The old 0.11.4/0.11.10 probe therefore remains
 relevant as historical evidence; a focused divergent-session probe must pass
 before this caveat can be removed. Upstream fix reference:
 **Yeachan-Heo/gajae-code#2774**, merged through PR #2865.
+For the issue #62 boundary review, the source-controlled evidence now requires
+both A→B and B→A sanitized matrices, concrete canonical resolver provider/selector
+values (an `UNKNOWN` result is a failed oracle), exact unknown-capability rejection
+(`Unknown capability: "issue62-unknown-capability"` with the requested id), and
+actual cleanup outcomes. Receipts bind the ordered four-file change-set digest to
+separate `approvedBaseCommit` and `sourceCommit` fields; the source commit may
+advance beyond the approved base. The fixture records exact Bun argv/order
+arguments and redacts direct secret, credential, token, URL, and user-path text.
+Auth is limited to empty fixture-owned stores and broker/profile activation are
+not exercised; neither may be inferred from this probe.
 
 ## Windows owner-only session storage constraint (found during 0.11.10 bump)
 
