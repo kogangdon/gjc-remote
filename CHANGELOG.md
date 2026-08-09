@@ -29,9 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `gjc-remote-admin` management CLI: both refuse to start on an older
   Node major with a structured `unsupported_node_version` fatal instead of
   risking an unreported native crash later in startup.
-- Windows process supervision now defaults to Shawl with an `sc.exe`
-  fallback; the NSSM-based supervision approach was evaluated and discarded
-  (see `docs/adr/0001-process-supervision.md`).
+- Windows process supervision decision: the previously evaluated NSSM-based
+  approach is discarded. The documented decision records Shawl as the
+  intended primary Windows supervisor with an `sc.exe` fallback; neither is
+  implemented in this repository yet (see
+  `docs/adr/0001-process-supervision.md` and `docs/process-supervision.md`).
 
 ### Prior releases
 

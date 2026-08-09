@@ -50,10 +50,13 @@ jobs:
 
       # Guards released CHANGELOG.md history against silent deletion. Runs
       # once (Linux only) since it doesn't depend on the native addon build
-      # and would otherwise duplicate work across the matrix.
+      # and would otherwise duplicate work across the matrix. On a direct
+      # push to main (the release commit path) origin/main already equals
+      # HEAD, so a merge-base against it is a no-op; --mode push instead
+      # compares against the previous commit/tag so that path stays guarded.
       - name: Guard changelog history
         if: runner.os == 'Linux'
-        run: node scripts/changelog-history-guard.mjs
+        run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
 
   # Aggregate gate. `test` is the required status check on main, so it must stay a
   # single stable context name even though the suite now fans out across a matrix.
