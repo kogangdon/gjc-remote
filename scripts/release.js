@@ -348,8 +348,11 @@ function main() {
     console.log(
       `\nDry run: --no-verify skipped the local test gate, so no v${version} tag was created.`
     );
+    // The release commit already exists locally, so a bare re-run would fail the
+    // monotonic-version precondition. Name the undo step instead of implying the
+    // re-run works from here.
     console.log(
-      `Re-run without --no-verify to run the test suite and create the release tag for real.`
+      `The release commit was made locally on ${branch}. Undo it with \`git reset --hard HEAD~1\`, then re-run without --no-verify to run the test suite and tag for real.`
     );
     return;
   }
