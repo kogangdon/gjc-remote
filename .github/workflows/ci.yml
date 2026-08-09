@@ -19,6 +19,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # changelog-history-guard needs full history to compute a merge-base
+          # against origin/main; a shallow (depth-1) checkout can't do that.
+          fetch-depth: 0
 
       # daemon/test/protocol-validation.test.js spawns a real `bun` child,
       # so bun must be on PATH even though the test files run under node --test.
@@ -43,6 +47,13 @@ jobs:
         run: npm run build --workspace @gjc-remote/native-control
 
       - run: npm test
+
+      # Guards released CHANGELOG.md history against silent deletion. Runs
+      # once (Linux only) since it doesn't depend on the native addon build
+      # and would otherwise duplicate work across the matrix.
+      - name: Guard changelog history
+        if: runner.os == 'Linux'
+        run: node scripts/changelog-history-guard.mjs
 
   # Aggregate gate. `test` is the required status check on main, so it must stay a
   # single stable context name even though the suite now fans out across a matrix.

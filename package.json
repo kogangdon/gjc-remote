@@ -10,7 +10,8 @@
   "scripts": {
     "smoke:local": "node scripts/local-smoke.js",
     "release": "node scripts/release.js",
-    "test": "npm run test --workspaces --if-present"
+    "test:scripts": "node --test scripts/test/*.test.js",
+    "test": "npm run test:scripts && npm run test --workspaces --if-present"
   },
   "workspaces": [
     "bot",
