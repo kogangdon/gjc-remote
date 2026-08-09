@@ -5,6 +5,20 @@ approval because the distributed binary is unsigned, and signed provenance remai
 any supervisor. See [ADR 0001](adr/0001-process-supervision.md) for the decision
 and [the pre-mortem](pre-mortem-process-supervision.md) for failure scenarios.
 Platform evidence remains scoped to the checks explicitly recorded below.
+## Windows host support boundary
+
+The supported Windows deployment model is a dedicated host owned by the operator, with
+the bot and daemon running under their explicitly configured service identities. This
+repository does **not** claim multi-user workstation isolation: protecting credentials
+or workspaces from unrelated local users, or from a local administrator, is outside the
+supported security boundary. Cross-account read/write isolation for unrelated local
+users is therefore outside the dedicated-host release gate and must not be reported as
+production evidence.
+
+Service-account separation, protected `.env`/`.gjc`/session storage, and removal of
+inherited `Users`/`Everyone` access remain required whenever Windows supervision is
+deployed. Re-open the multi-user test scope before using a shared workstation or
+supporting that deployment model.
 
 
 ## Topology and identity
@@ -165,10 +179,12 @@ For startup-only host-token rotation:
 
 The required evidence set is static contract coverage, pinned Shawl source/release
 and executable-hash evidence for the Windows primary path, disposable Windows
-stop/readiness/restart/account/ACL tests, pinned Ubuntu systemd
-template/readiness/journald tests, relay registration evidence,
-rotation/rollback, transaction fault injection, and sentinel scans. NSSM is
-discarded; no NSSM archive/executable hash evidence applies to this repository.
+stop/readiness/restart/account/ACL tests for the service identity's protected
+secret/profile/session paths and inherited-access controls, pinned Ubuntu systemd
+template/readiness/journald tests, relay registration evidence, rotation/rollback,
+transaction fault injection, and sentinel scans. Cross-account workstation isolation
+is not included. NSSM is discarded; no NSSM archive/executable hash evidence applies
+to this repository.
 Redact secrets, prompts, local credential paths, and private tokens from every artifact.
 
 Platform evidence is pending. Escalate rather than waive any provenance mismatch, active-child survival, ambiguous ownership, missing manual-cleanup record, stale readiness marker, journald global mutation, secret hit, or missing fault boundary. Option A foreground commands remain the safe rollback.
