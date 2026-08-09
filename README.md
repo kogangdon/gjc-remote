@@ -122,7 +122,7 @@ bun run --filter '@gjc-remote/daemon' start
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
 daemon runs on Bun (>=1.3.14) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.7**
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.21**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
@@ -134,11 +134,11 @@ report a Node 26 major to `process.versions.node`, so `bot/src/node-version-guar
 it. `bun run --filter '@gjc-remote/bot' start` (no `--bun`) is fine: Bun just
 shells out to the `node src/bot.js` package script on PATH.
 
-> **SDK update:** `@gajae-code/coding-agent` is pinned to **0.12.7**.
-> The 0.12.6 hold is closed for this repository after the 0.12.7 package
-> availability check and local regression evidence: daemon regression (44 tests),
-> workspace suite (118 tests), and local smoke (`SMOKE_OK`) passed. Provider/model
-> switch coverage remains environment-dependent.
+> **SDK update:** `@gajae-code/coding-agent` is pinned to **0.12.21**.
+> This supersedes the previous 0.12.7 pin. Verification passed on 2026-08-09:
+> package/lock reconciliation, canonical SDK imports, root/workspace regression
+> suites, local smoke (`SMOKE_OK`), and manual bot/daemon runtime execution.
+> Provider/model switch coverage remains environment-dependent.
 
 **Optional environment variables** — beyond the required keys above:
 

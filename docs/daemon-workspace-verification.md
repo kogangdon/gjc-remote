@@ -48,7 +48,7 @@ key version, and restart count. Release evidence includes path/secret/control se
 | Git refs, remote allowlist, dirty policy, cadence, and storage budget | #43/#44 | Complete-graph and destructive-operation fixtures | `GIT_GRAPH_INCOMPLETE` and preserve prior generation |
 | Lease TTL, fence recovery, resource budgets, backup RPO/RTO | #43/#33 | Numeric boundary and crash/recovery fixtures | `LEASE_CONFLICT`/`RESOURCE_EXHAUSTED` or manual cleanup |
 | Provider backup key ownership, escrow, rotation, and restore | #42/#43 | Independent key recovery and restore rehearsal | Preserve data and require manual cleanup |
-| SDK/package/lock reconciliation at 0.12.7 and evidence schedule | #42/#45 | Source/lock/version/provenance packet | Stop image/release work |
+| SDK/package/lock reconciliation at 0.12.21 and evidence schedule | #42/#45 | Source/lock/version/provenance packet | Stop image/release work |
 | Docker production target and Windows-host primitive support | #42/#43 | Linux-engine matrix and Windows/UNC containment fixtures | Unsupported target refuses startup |
 | Singleton legacy fallback fence | #43/#44 | Live remap/invalidation and re-registration fixture | Invalidate socket; never silently remap |
 | Protocol v2 retirement and fallback timing | #43/#44 | Deprecation/version migration decision | Keep v0/v1 fallback or reject clearly; no implicit upgrade |
