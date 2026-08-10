@@ -10,7 +10,7 @@ import { closeModelCache } from "@gajae-code/ai/core";
 
 import { Settings } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/coding-agent/session/auth-storage";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resolveAllowedModels } from "@gajae-code/coding-agent/config/model-resolver";
 import {
@@ -534,7 +534,9 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
   };
   registries[label] = record;
   try {
-    record.authStorage = await AuthStorage.create(join(fixture.authDir, `auth-${label}.db`));
+    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
+    record.authStorage = new AuthStorage(authStore);
+    await record.authStorage.reload();
     record.modelRegistry = new ModelRegistry(record.authStorage, fixture.modelsPath);
     requireCondition(record.modelRegistry.getCanonicalVariants(CANONICAL, { availableOnly: false }).length === 2, "API_CONTRACT_MISMATCH", "canonical equivalence did not produce two variants");
     for (const selector of [MODEL_A, MODEL_B]) {
@@ -636,7 +638,9 @@ async function runOrder(order, fixture, provenance) {
     const reads = await Promise.all(order.map(label => readSession(registries[label], fixture)));
     const finalRegistry = registries[order[1]].modelRegistry;
     const finalSnapshot = registrySnapshot(finalRegistry, "global-final");
-    cResources.authStorage = await AuthStorage.create(join(fixture.authDir, "auth-C.db"));
+    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, "auth-C.db"));
+    cResources.authStorage = new AuthStorage(authStore);
+    await cResources.authStorage.reload();
     const cSettings = await fixture.globalSettings.cloneForCwd(fixture.workDirs.C);
     requireCondition(cSettings.get("startup.networkPrewarm") === false, "API_CONTRACT_MISMATCH", "C startup.networkPrewarm is not false");
     cResources.modelRegistry = new ModelRegistry(cResources.authStorage, fixture.modelsPath);
