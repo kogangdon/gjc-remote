@@ -234,10 +234,15 @@ If a subprocess route is separately approved, the options are bounded as follows
   enabled by this documentation.
 
 Both options would buy **true parallelism** (N OS processes, N event loops) and
-full state isolation, at the cost of one full runtime per session, spawn/ACP
-handshake and model-profile cold start, child crash/zombie reaping, stdio
-backpressure, and possible version drift between an on-PATH `gjc` child and
-the daemon's imported SDK.
+isolate process-local SDK/module state per worker, including the capability and
+model/provider registries. That is not end-to-end state isolation: provider
+credentials and model profiles remain in host/user configuration (for example
+`~/.gjc/agent`), session history remains under each configured
+`<workDir>/.gjc-remote-session`, and route/workDir ownership plus filesystem ACL
+boundaries remain on the daemon host. Costs include one full runtime per
+session, spawn/ACP handshake and model-profile cold start, child crash/zombie
+reaping, stdio backpressure, and possible version drift between an on-PATH
+`gjc` child and the daemon's imported SDK.
 
 **Ownership and status:** the current code has no ACP adapter, worker, or
 subprocess route. No route is selected or implemented; the existing in-process

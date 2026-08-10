@@ -61,8 +61,8 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
 JS event loop: concurrent prompts on different workDirs interleave cooperatively
 but do not run in true parallel, and a long synchronous stretch in one session
 can briefly stall the others. See `CONTEXT.md` → "Concurrency model: single event
-loop, and the subprocess alternative" for the full model and the subprocess
-option (tracked in #33).
+loop (current SDK 0.12.21)" for the full model and the subprocess option
+(tracked in #33).
 
 > **Node requirement:** the root package and `bot/` declare `"engines": {
 > "node": ">=26.0.0" }`. Node 24 on Windows has been observed in CI to crash

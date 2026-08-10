@@ -3,6 +3,10 @@
 This record accompanies the approved documentation-only reconciliation. It is
 intentionally evidence-scoped: it records repository source truth and static
 checks, not a new runtime, native, release, provider, or ACP execution.
+**Revision pass 1 anchor (2026-08-10):** dedicated branch
+`issue63-docs-reconciliation`, base commit `main`/`6d4dd52`, prior source
+commit `e70321b`. The corrections below are a docs-only revision of that source;
+the resulting fix commit is the new source for integration review.
 
 ## Scope and source truth
 

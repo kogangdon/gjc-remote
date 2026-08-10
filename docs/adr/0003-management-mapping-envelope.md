@@ -269,7 +269,8 @@ Historical (pre-provisioning) state: older revisions had zero keys pinned in
 `trusted.json` and no local development key. In that bootstrap state loading
 could proceed after hash/contract verification while emitting one explicit
 warning that addon provenance was `UNVERIFIED`; malformed and invalid sidecars
-were still refused, and zero keys meant "cannot check", not "trust anything."
+were not treated as verified. They were not silently trusted just because the
+trust store could not check them.
 While that historical zero-key state held, a deliberately created
 `local-dev.json` key could unblock local iteration with a development-key
 warning. Once a production key was pinned, local development keys were ignored
