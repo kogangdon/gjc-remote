@@ -524,6 +524,7 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
     label,
     workDir,
     settings,
+    authStore: null,
     authStorage: null,
     modelRegistry: null,
     rawSession: null,
@@ -534,8 +535,8 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
   };
   registries[label] = record;
   try {
-    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
-    record.authStorage = new AuthStorage(authStore);
+    record.authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
+    record.authStorage = new AuthStorage(record.authStore);
     await record.authStorage.reload();
     record.modelRegistry = new ModelRegistry(record.authStorage, fixture.modelsPath);
     requireCondition(record.modelRegistry.getCanonicalVariants(CANONICAL, { availableOnly: false }).length === 2, "API_CONTRACT_MISMATCH", "canonical equivalence did not produce two variants");
@@ -616,7 +617,7 @@ async function runOrder(order, fixture, provenance) {
   const startedAt = new Date().toISOString();
   const runnerArgv = [...process.argv];
   const runnerOrderCommand = runnerArgv.find(item => item.startsWith("--order=")) ?? `--order=${order.join(",")}`;
-  const cResources = { label: "C", authStorage: null, modelRegistry: null };
+  const cResources = { label: "C", authStore: null, authStorage: null, modelRegistry: null };
   registries.C = cResources;
   let receipt;
   try {
@@ -638,8 +639,8 @@ async function runOrder(order, fixture, provenance) {
     const reads = await Promise.all(order.map(label => readSession(registries[label], fixture)));
     const finalRegistry = registries[order[1]].modelRegistry;
     const finalSnapshot = registrySnapshot(finalRegistry, "global-final");
-    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, "auth-C.db"));
-    cResources.authStorage = new AuthStorage(authStore);
+    cResources.authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, "auth-C.db"));
+    cResources.authStorage = new AuthStorage(cResources.authStore);
     await cResources.authStorage.reload();
     const cSettings = await fixture.globalSettings.cloneForCwd(fixture.workDirs.C);
     requireCondition(cSettings.get("startup.networkPrewarm") === false, "API_CONTRACT_MISMATCH", "C startup.networkPrewarm is not false");
@@ -779,9 +780,9 @@ async function runOrder(order, fixture, provenance) {
     cleanup.poolShutdown = poolShutdownResolved &&
       cleanup.sessionDisposals.every(outcome => outcome.closed);
     const stores = [
-      ["auth-A", registries.A?.authStorage],
-      ["auth-B", registries.B?.authStorage],
-      ["auth-C", registries.C?.authStorage],
+      ["auth-A", registries.A?.authStore],
+      ["auth-B", registries.B?.authStore],
+      ["auth-C", registries.C?.authStore],
       ["settings", fixture.globalSettings?.getStorage?.()],
       ["model-cache", { close: () => closeModelCache(join(dirname(fixture.modelsPath), "models.db")) }],
     ];
