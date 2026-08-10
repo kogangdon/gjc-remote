@@ -273,8 +273,7 @@ const connections = new Set();
 let shuttingDown = false;
 let shutdownPromise = null;
 let shutdownExitCode = null;
-let readinessSocketGeneration =
-  Date.now() * 1000 + Math.floor(Math.random() * 1000);
+let readinessSocketGeneration = 0;
 const readinessByConnection = new WeakMap();
 
 function nextReadinessSocketGeneration() {
