@@ -126,6 +126,21 @@ function policyFingerprint(policy) {
   });
 }
 
+function redactPathLikeText(text) {
+  text = text.replace(
+    /(^|[\s"'([{=:])((?:\\\\|\/\/)[^\\/\s"'<>]+(?:[\\/][^\\/\s"'<>]+)+)/g,
+    "$1<path-redacted>",
+  );
+  text = text.replace(
+    /(^|[\s"'([{=:])([A-Za-z]:[\\/](?:[^\\/\s"'<>]+[\\/])*[^\\/\s"'<>]+)/g,
+    "$1<path-redacted>",
+  );
+  return text.replace(
+    /(^|[\s"'([{=:])((?:\/[^\/\s"'<>]+)+)/g,
+    "$1<path-redacted>",
+  );
+}
+
 function redactedText(value, root, fixture) {
   let text = String(value ?? "");
   for (const [path, token] of [
@@ -144,7 +159,7 @@ function redactedText(value, root, fixture) {
     if (path) text = text.split(path).join(token);
   }
   text = text.replace(/(?:https?|wss?):\/\/[^\s"']+/gi, "<url-redacted>");
-  text = text.replace(/[A-Za-z]:\\Users\\[^\s"']+/g, "<path-redacted>");
+  text = redactPathLikeText(text);
   text = text.replace(/\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b/gi, "<secret-redacted>");
   text = text.replace(
     /\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b\s*[:=]\s*["']?[^\s"',;}]+/gi,
@@ -341,7 +356,7 @@ async function createHermeticFixture() {
       modelProviderOrder: [PROVIDER_B, PROVIDER_A],
     },
     C: {
-      disabledProviders: [PROVIDER_A, PROVIDER_B, CAP_A, CAP_B, ...LOCAL_PROVIDERS],
+      disabledProviders: [...LOCAL_PROVIDERS],
       default: "issue62-no-such-provider/issue62-no-such-model",
       planner: "issue62-no-such-provider/issue62-no-such-model",
       modelProviderOrder: [PROVIDER_A, PROVIDER_B],
@@ -532,7 +547,21 @@ async function disposeRawSessionBounded(rawSession, label) {
   }
 }
 
-async function createPooledSession(fixture, globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources) {
+function observeCSessionPrompt(session, label, cAttempts) {
+  if (label !== "C") return session;
+  return new Proxy(session, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property !== "prompt" || typeof value !== "function") return value;
+      return (...args) => {
+        cAttempts.promptAttempts += 1;
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+}
+
+async function createPooledSession(fixture, globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources, cAttempts) {
   const settings = await globalSettings.cloneForCwd(workDir);
   settings.override("modelProviderOrder", label === "A" ? [PROVIDER_A, PROVIDER_B] : [PROVIDER_B, PROVIDER_A]);
   settings.override("startup.networkPrewarm", false);
@@ -558,6 +587,10 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
   };
   registries[label] = record;
   try {
+    if (label === "C") {
+      cAttempts.sessionConstructionAttempts += 1;
+      fail("MODEL_FALLBACK", "C session construction was attempted");
+    }
     const rawStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
     ownedAuthResources.push({ name: `auth-${label}`, close: () => rawStore.close(), diagnosticStore: rawStore });
     record.authStoreClose = () => rawStore.close();
@@ -593,7 +626,7 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
       enableMCP: false,
       hasUI: false,
     });
-    record.rawSession = created.session;
+    record.rawSession = observeCSessionPrompt(created.session, label, cAttempts);
     record.sdkSession = new SdkSession(record.rawSession);
     const active = record.rawSession.model;
     requireCondition(active && ALLOW_LIST.includes(modelSelector(active)), "MODEL_FALLBACK", "session selected no fixture model", { label, active: modelSelector(active) });
@@ -629,12 +662,14 @@ async function readSession(record, fixture) {
 
 async function runOrder(order, fixture, provenance) {
   const guard = armNetworkGuard();
+  const cAttempts = { sessionConstructionAttempts: 0, promptAttempts: 0 };
   const registries = {};
   const settingsByLabel = {};
   const ownedAuthResources = [];
   const canonicalFixtureWorkDirs = {
     A: await canonicalWorkDir(fixture.workDirs.A),
     B: await canonicalWorkDir(fixture.workDirs.B),
+    C: await canonicalWorkDir(fixture.workDirs.C),
   };
   const pool = new SessionPool({
     sessionFactory: async workDir => {
@@ -642,13 +677,19 @@ async function runOrder(order, fixture, provenance) {
       const comparable = comparableWorkDir(canonicalIncomingPath);
       const canonicalAPath = canonicalFixtureWorkDirs.A;
       const canonicalBPath = canonicalFixtureWorkDirs.B;
+      const canonicalCPath = canonicalFixtureWorkDirs.C;
       const normalizedAPath = comparableWorkDir(canonicalAPath);
       const normalizedBPath = comparableWorkDir(canonicalBPath);
+      const normalizedCPath = comparableWorkDir(canonicalCPath);
       const label = comparable === normalizedAPath
         ? "A"
         : comparable === normalizedBPath
           ? "B"
           : undefined;
+      if (comparable === normalizedCPath) {
+        cAttempts.sessionConstructionAttempts += 1;
+        fail("MODEL_FALLBACK", "pool attempted to construct a C session");
+      }
       requireCondition(
         label,
         "API_CONTRACT_MISMATCH",
@@ -667,7 +708,7 @@ async function runOrder(order, fixture, provenance) {
           },
         },
       );
-      return createPooledSession(fixture, fixture.globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources);
+      return createPooledSession(fixture, fixture.globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources, cAttempts);
     },
     sessionCreateTimeoutMs: 30_000,
     sessionDisposeTimeoutMs: 5_000,
@@ -707,7 +748,50 @@ async function runOrder(order, fixture, provenance) {
     requireCondition(cSettings.get("startup.networkPrewarm") === false, "API_CONTRACT_MISMATCH", "C startup.networkPrewarm is not false");
     cResources.modelRegistry = new ModelRegistry(cResources.authStorage, fixture.modelsPath);
     const cCandidates = await resolveAllowedModels(cResources.modelRegistry, cSettings);
-    requireCondition(cCandidates.length === 0, "MODEL_FALLBACK", "C has an allowed model before session construction", { candidates: cCandidates.map(modelSelector) });
+    const cPolicy = policySnapshot(cSettings);
+    const cSyntheticModels = cResources.modelRegistry.getAvailable()
+      .filter(model => [PROVIDER_A, PROVIDER_B].includes(model.provider));
+    const cSyntheticSelectors = cSyntheticModels.map(modelSelector);
+    const cEnabledModels = [...cPolicy.enabledModels];
+    requireCondition(
+      cSyntheticModels.length === 2 &&
+        cSyntheticModels.every(model => !cPolicy.disabledProviders.includes(model.provider)),
+      "MODEL_FALLBACK",
+      "C synthetic providers were not available to the allow-list oracle",
+      {
+        available: cSyntheticSelectors,
+        disabledProviders: cPolicy.disabledProviders,
+      },
+    );
+    requireCondition(
+      cEnabledModels.length > 0 &&
+        cEnabledModels.every(selector => !cSyntheticSelectors.includes(selector)),
+      "MODEL_FALLBACK",
+      "C enabledModels unexpectedly matched a synthetic model",
+      { enabledModels: cEnabledModels, available: cSyntheticSelectors },
+    );
+    const cWithoutAllowList = await cSettings.cloneForCwd(fixture.workDirs.C);
+    cWithoutAllowList.override("enabledModels", []);
+    const cUnrestrictedCandidates = await resolveAllowedModels(cResources.modelRegistry, cWithoutAllowList);
+    requireCondition(
+      cCandidates.length === 0 &&
+        cUnrestrictedCandidates.some(model => [MODEL_A, MODEL_B].includes(modelSelector(model))),
+      "MODEL_FALLBACK",
+      "C zero candidates was not caused by its nonmatching enabledModels allow-list",
+      {
+        candidates: cCandidates.map(modelSelector),
+        unrestrictedCandidates: cUnrestrictedCandidates.map(modelSelector),
+        enabledModels: cEnabledModels,
+        disabledProviders: cPolicy.disabledProviders,
+      },
+    );
+    const noPrompt = cAttempts.sessionConstructionAttempts === 0 && cAttempts.promptAttempts === 0;
+    requireCondition(
+      noPrompt,
+      "MODEL_FALLBACK",
+      "C session construction or prompt was attempted",
+      { ...cAttempts },
+    );
     const unknownCapability = {
       requestedId: UNKNOWN_CAPABILITY_ID,
       rejected: false,
@@ -785,7 +869,9 @@ async function runOrder(order, fixture, provenance) {
         unknownCapability,
         controlledThrowWarning: true,
         disabledLoaderNonInvocation: true,
-        noPrompt: true,
+        noPrompt,
+        cSessionConstructionAttempts: cAttempts.sessionConstructionAttempts,
+        cPromptAttempts: cAttempts.promptAttempts,
         cRegistryBoundary: "nonmatching-enabledModels",
       },
       cPreSessionCandidates: cCandidates.length,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { readFile, mkdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -24,6 +24,25 @@ const SDK_VERSION = "0.12.21";
 const MAX_RECEIPT_BYTES = 100_000;
 const MAX_TIMEOUT_MS = 90_000;
 const secretKey = /(?:api.?key|access.?token|refresh.?token|password|authorization|cookie|credential|broker|secret|oauth|token)/i;
+const WINDOWS_ABSOLUTE_PATH = /(^|[\s"'([{=:])([A-Za-z]:[\\/](?:[^\\/\s"'<>]+[\\/])*[^\\/\s"'<>]+)/;
+const UNC_PATH = /(^|[\s"'([{=:])((?:\\\\|\/\/)[^\\/\s"'<>]+(?:[\\/][^\\/\s"'<>]+)+)/;
+const POSIX_ABSOLUTE_PATH = /(^|[\s"'([{=:])((?:\/[^\/\s"'<>]+)+)/;
+
+function redactPathLikeText(text) {
+  text = text.replace(
+    /(^|[\s"'([{=:])((?:\\\\|\/\/)[^\\/\s"'<>]+(?:[\\/][^\\/\s"'<>]+)+)/g,
+    "$1<path-redacted>",
+  );
+  text = text.replace(
+    /(^|[\s"'([{=:])([A-Za-z]:[\\/](?:[^\\/\s"'<>]+[\\/])*[^\\/\s"'<>]+)/g,
+    "$1<path-redacted>",
+  );
+  return text.replace(
+    /(^|[\s"'([{=:])((?:\/[^\/\s"'<>]+)+)/g,
+    "$1<path-redacted>",
+  );
+}
+
 
 function stableEnv(order) {
   const allowed = new Set([
@@ -39,7 +58,7 @@ function stableEnv(order) {
   env.USERPROFILE = root;
   env.TEMP = join(root, "tmp");
   env.TMP = join(root, "tmp");
-  return env;
+  return { env, roots: [root, join(root, "tmp")] };
 }
 async function orderedChangeDigest() {
   const digest = createHash("sha256");
@@ -52,11 +71,14 @@ async function orderedChangeDigest() {
   return digest.digest("hex");
 }
 
-function sanitize(value) {
+function sanitize(value, roots = []) {
   if (typeof value === "string") {
-    return value
-      .replace(/(?:https?|wss?):\/\/[^\s"']+/gi, "<url-redacted>")
-      .replace(/[A-Za-z]:\\[^\s"']+/g, "<path-redacted>")
+    let text = value;
+    for (const root of [...roots].filter(Boolean).sort((a, b) => b.length - a.length)) {
+      text = text.split(root).join("<wrapper-root>");
+    }
+    text = text.replace(/(?:https?|wss?):\/\/[^\s"']+/gi, "<url-redacted>");
+    return redactPathLikeText(text)
       .replace(/\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b/gi, "<secret-redacted>")
       .replace(/\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b\s*[:=]\s*["']?[^\s"',;}]+/gi, "<secret-redacted>")
       .replace(/\b(?:api.?key|access.?token|refresh.?token|password|authorization|cookie|credential|broker|secret|oauth|token)\b\s*[:=]\s*["']?[^\s"',;}]+/gi, "<secret-redacted>")
@@ -65,19 +87,32 @@ function sanitize(value) {
       .replace(/<+secret-redacted>(?:-redacted>)*/g, "<secret-redacted>")
       .slice(0, 512);
   }
-  if (Array.isArray(value)) return value.slice(0, 32).map(sanitize);
+  if (Array.isArray(value)) return value.slice(0, 32).map(item => sanitize(item, roots));
   if (value && typeof value === "object") {
     const output = {};
     for (const [key, item] of Object.entries(value)) {
       if (secretKey.test(key)) continue;
-      output[key] = sanitize(item);
+      output[key] = sanitize(item, roots);
     }
     return output;
   }
   return value;
 }
 
-function parseReceipt(stdout) {
+function assertNoRawPaths(value, roots = []) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  for (const root of roots.filter(Boolean)) {
+    assert.equal(text.includes(root), false, `raw fixture root leaked: ${root}`);
+    if (root.includes("\\")) {
+      assert.equal(text.includes(root.replaceAll("\\", "\\\\")), false, "escaped fixture root leaked");
+    }
+  }
+  assert.doesNotMatch(text, WINDOWS_ABSOLUTE_PATH, "raw Windows path leaked");
+  assert.doesNotMatch(text, UNC_PATH, "raw UNC path leaked");
+  assert.doesNotMatch(text, POSIX_ABSOLUTE_PATH, "raw POSIX path leaked");
+}
+
+function parseReceipt(stdout, roots = []) {
   const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
   assert.ok(lines.length > 0, "Bun fixture emitted no JSON receipt");
   for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -88,11 +123,13 @@ function parseReceipt(stdout) {
       // Bun diagnostics may precede the final structured line; raw output is never persisted.
     }
   }
-  assert.fail(`Bun fixture emitted no structured receipt: ${sanitize(lines.at(-1))}`);
+  const diagnostic = sanitize(lines.at(-1), roots);
+  assertNoRawPaths(diagnostic, roots);
+  assert.fail(`Bun fixture emitted no structured receipt: ${diagnostic}`);
 }
 
-async function spawnFixture(order) {
-  const env = stableEnv(order);
+async function spawnFixture(order, envInfo) {
+  const { env } = envInfo;
   await mkdir(env.HOME, { recursive: true });
   await mkdir(env.TMP, { recursive: true });
   return new Promise((resolveResult, reject) => {
@@ -128,7 +165,22 @@ async function spawnFixture(order) {
   });
 }
 
-async function validateReceipt(receipt, order) {
+async function removeWrapperRoot(root) {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await rm(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== "EBUSY" && error?.code !== "EPERM") throw error;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  throw lastError;
+}
+
+async function validateReceipt(receipt, order, roots = []) {
   assert.equal(receipt.issue, 62);
   assert.equal(receipt.approvedBaseCommit, BASE_COMMIT);
   assert.match(receipt.sourceCommit, /^[0-9a-f]{40}$/);
@@ -174,7 +226,12 @@ async function validateReceipt(receipt, order) {
     },
   });
   assert.equal(receipt.negativeCases.noPrompt, true);
+  assert.equal(receipt.negativeCases.cSessionConstructionAttempts, 0);
+  assert.equal(receipt.negativeCases.cPromptAttempts, 0);
   assert.equal(receipt.negativeCases.cRegistryBoundary, "nonmatching-enabledModels");
+  assert.deepEqual(new Set(receipt.fixturePolicy.C.disabledProviders), new Set(["ollama", "llama.cpp", "lm-studio"]));
+  assert.equal(receipt.fixturePolicy.C.disabledProviders.includes("issue62-provider-a"), false);
+  assert.equal(receipt.fixturePolicy.C.disabledProviders.includes("issue62-provider-b"), false);
   assert.equal(receipt.canonicalVariants.variants.length, 2);
   assert.deepEqual(new Set(receipt.canonicalVariants.variants), new Set(["issue62-provider-a/issue62-model-a", "issue62-provider-b/issue62-model-b"]));
   assert.equal(receipt.capability.sessionReads.length, 2);
@@ -211,10 +268,11 @@ async function validateReceipt(receipt, order) {
   const serialized = JSON.stringify(receipt);
   assert.doesNotMatch(serialized, /OPENROUTER_API_KEY|access_token|refresh_token|Authorization|credential|secret|token/i);
   assert.doesNotMatch(serialized, /[A-Za-z]:\\Users\\/i);
+  assertNoRawPaths(receipt, roots);
 }
 
-async function writeReceiptArtifact(name, receipt) {
-  const sanitized = sanitize({ ...receipt, artifactName: name });
+async function writeReceiptArtifact(name, receipt, roots = []) {
+  const sanitized = sanitize({ ...receipt, artifactName: name }, roots);
   const output = JSON.stringify(sanitized, null, 2) + "\n";
   assert.ok(Buffer.byteLength(output, "utf8") < MAX_RECEIPT_BYTES);
   const target = join(artifactsDir, name);
@@ -226,19 +284,27 @@ async function writeReceiptArtifact(name, receipt) {
 async function runOrder(order) {
   const name = order === "A,B" ? "issue62-A-B.json" : "issue62-B-A.json";
   const target = join(artifactsDir, name);
-  await unlink(target).catch(() => {});
-  await mkdir(artifactsDir, { recursive: true });
-  const result = await spawnFixture(order);
-  const receipt = parseReceipt(result.stdout);
-  const failureReceipt = sanitize({
-    error: receipt.error ?? null,
-    details: receipt.details ?? {},
-    cleanup: receipt.cleanup ?? {},
-  });
-  assert.equal(result.code, 0, `${order} fixture failed (${result.signal}): ${sanitize(result.stderr)}\nSanitized receipt diagnostics: ${JSON.stringify(failureReceipt)}`);
-  await validateReceipt(receipt, order);
-  await writeReceiptArtifact(name, { ...receipt, nodeWrapperVersion: process.version });
-  return receipt;
+  const envInfo = stableEnv(order);
+  try {
+    await unlink(target).catch(() => {});
+    await mkdir(artifactsDir, { recursive: true });
+    const result = await spawnFixture(order, envInfo);
+    const receipt = parseReceipt(result.stdout, envInfo.roots);
+    const failureReceipt = sanitize({
+      error: receipt.error ?? null,
+      details: receipt.details ?? {},
+      cleanup: receipt.cleanup ?? {},
+    }, envInfo.roots);
+    const sanitizedStderr = sanitize(result.stderr, envInfo.roots);
+    assertNoRawPaths(failureReceipt, envInfo.roots);
+    assertNoRawPaths(sanitizedStderr, envInfo.roots);
+    assert.equal(result.code, 0, `${order} fixture failed (${result.signal}): ${sanitizedStderr}\nSanitized receipt diagnostics: ${JSON.stringify(failureReceipt)}`);
+    await validateReceipt(receipt, order, envInfo.roots);
+    await writeReceiptArtifact(name, { ...receipt, nodeWrapperVersion: process.version }, envInfo.roots);
+    return receipt;
+  } finally {
+    await removeWrapperRoot(envInfo.roots[0]);
+  }
 }
 
 test("issue #62 real SDK divergent-session probe", async () => {
