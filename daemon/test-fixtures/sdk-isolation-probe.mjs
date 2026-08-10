@@ -771,6 +771,10 @@ async function runOrder(order, fixture, provenance) {
       canonicalVariants: { id: CANONICAL, variants: registries["A"].modelRegistry.getCanonicalVariants(CANONICAL, { availableOnly: false }).map(item => modelSelector(item.model)), equivalentIds: [MODEL_A, MODEL_B].map(selector => ({ selector, canonicalId: CANONICAL })) },
       liveSessionCount: pool.sessions.size,
       liveWorkDirs: [...pool.sessions.keys()],
+      liveWorkDirLabels: Object.values(registries)
+        .filter(record => record?.label === "A" || record?.label === "B")
+        .map(record => record.label)
+        .sort(),
       capability: { counters: { ...counters }, invocations: capabilityInvocations, sessionReads: reads.map(item => ({ label: item.label, explicit: item.capability.explicit, cwdFallback: item.capability.cwdFallback })), expectedDisabled: { A: CAP_B, B: CAP_A }, globalIntrospection: fixture.globalIntrospectionSeed },
       model: { sessions: reads.map(item => ({ label: item.label, activeModel: item.activeModel, activeProvider: item.activeProvider, settings: item.settings })), modelFallback: false },
       registrySnapshots: { seed: registries.seed, afterFirst, afterSecond, final: finalSnapshot, perSession: reads.map(item => ({ label: item.label, registry: item.registry })) },

@@ -152,7 +152,7 @@ async function validateReceipt(receipt, order) {
   assert.equal(receipt.globalSettingsBootstrap.networkPrewarm, false);
   assert.equal(receipt.liveSessionCount, 2);
   assert.equal(receipt.liveWorkDirs.length, 2);
-  assert.notEqual(receipt.liveWorkDirs[0], receipt.liveWorkDirs[1]);
+  assert.deepEqual(receipt.liveWorkDirLabels, ["A", "B"]);
   assert.equal(receipt.cPreSessionCandidates, 0);
   assert.equal(receipt.modelFallback, false);
   assert.deepEqual(receipt.failureCodes, []);
