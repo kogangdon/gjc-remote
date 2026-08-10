@@ -52,6 +52,8 @@ const CHANGE_FILES = [
 const UNKNOWN_CAPABILITY_ID = "issue62-unknown-capability";
 const UNKNOWN_CAPABILITY_MESSAGE = `Unknown capability: "${UNKNOWN_CAPABILITY_ID}"`;
 const RAW_SESSION_DISPOSE_TIMEOUT_MS = 5_000;
+const AUTH_STORE_DIAGNOSTIC_MAX_METHODS = 32;
+const AUTH_STORE_DIAGNOSTIC_MAX_TEXT = 128;
 
 class ProbeFailure extends Error {
   constructor(code, message, details = {}) {
@@ -152,6 +154,60 @@ function redactValue(value, root) {
     return output;
   }
   return value;
+}
+
+function boundedDiagnosticText(value, root) {
+  const text = redactedText(value, root, root.root);
+  return text.length > AUTH_STORE_DIAGNOSTIC_MAX_TEXT
+    ? `${text.slice(0, AUTH_STORE_DIAGNOSTIC_MAX_TEXT - 3)}...`
+    : text;
+}
+
+function nonOwnedAuthStoreDiagnostic(store, root) {
+  const runtimeType = typeof store;
+  let prototype = null;
+  if (store !== null && store !== undefined) {
+    try {
+      prototype = Object.getPrototypeOf(store);
+    } catch {
+      // A diagnostic must not change fail-closed cleanup behavior.
+    }
+  }
+
+  let constructorName = null;
+  const prototypeMethods = [];
+  if (prototype !== null) {
+    try {
+      const constructorDescriptor = Object.getOwnPropertyDescriptor(prototype, "constructor");
+      if (typeof constructorDescriptor?.value?.name === "string") {
+        constructorName = constructorDescriptor.value.name;
+      }
+    } catch {
+      // A diagnostic must not change fail-closed cleanup behavior.
+    }
+    try {
+      for (const name of Object.getOwnPropertyNames(prototype)) {
+        if (name === "constructor" || prototypeMethods.length >= AUTH_STORE_DIAGNOSTIC_MAX_METHODS) continue;
+        let descriptor;
+        try {
+          descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+        } catch {
+          continue;
+        }
+        if (typeof descriptor?.value === "function") {
+          prototypeMethods.push(boundedDiagnosticText(name, root));
+        }
+      }
+    } catch {
+      // A diagnostic must not change fail-closed cleanup behavior.
+    }
+  }
+
+  return {
+    runtimeType: boundedDiagnosticText(runtimeType, root),
+    constructorName: constructorName === null ? null : boundedDiagnosticText(constructorName, root),
+    prototypeMethods,
+  };
 }
 
 function parseOrder() {
@@ -727,7 +783,11 @@ async function runOrder(order, fixture, provenance) {
     ];
     for (const [name, store] of stores) {
       if (!store || typeof store.close !== "function") {
-        cleanup.storeOutcomes.push({ name, closed: false, error: "store was not owned" });
+        const outcome = { name, closed: false, error: "store was not owned" };
+        if (name === "auth-A" || name === "auth-B" || name === "auth-C") {
+          outcome.diagnostic = nonOwnedAuthStoreDiagnostic(store, fixture);
+        }
+        cleanup.storeOutcomes.push(outcome);
         cleanupErrors.push({ operation: `close-${name}`, error: "store was not owned" });
         continue;
       }
