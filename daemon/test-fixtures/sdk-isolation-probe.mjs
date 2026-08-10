@@ -525,6 +525,7 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
     workDir,
     settings,
     authStore: null,
+    authStoreClose: null,
     authStorage: null,
     modelRegistry: null,
     rawSession: null,
@@ -535,8 +536,10 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
   };
   registries[label] = record;
   try {
-    record.authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
-    record.authStorage = new AuthStorage(record.authStore);
+    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
+    record.authStoreClose = () => authStore.close();
+    record.authStore = authStore;
+    record.authStorage = new AuthStorage(authStore);
     await record.authStorage.reload();
     record.modelRegistry = new ModelRegistry(record.authStorage, fixture.modelsPath);
     requireCondition(record.modelRegistry.getCanonicalVariants(CANONICAL, { availableOnly: false }).length === 2, "API_CONTRACT_MISMATCH", "canonical equivalence did not produce two variants");
@@ -617,7 +620,7 @@ async function runOrder(order, fixture, provenance) {
   const startedAt = new Date().toISOString();
   const runnerArgv = [...process.argv];
   const runnerOrderCommand = runnerArgv.find(item => item.startsWith("--order=")) ?? `--order=${order.join(",")}`;
-  const cResources = { label: "C", authStore: null, authStorage: null, modelRegistry: null };
+  const cResources = { label: "C", authStore: null, authStoreClose: null, authStorage: null, modelRegistry: null };
   registries.C = cResources;
   let receipt;
   try {
@@ -639,8 +642,10 @@ async function runOrder(order, fixture, provenance) {
     const reads = await Promise.all(order.map(label => readSession(registries[label], fixture)));
     const finalRegistry = registries[order[1]].modelRegistry;
     const finalSnapshot = registrySnapshot(finalRegistry, "global-final");
-    cResources.authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, "auth-C.db"));
-    cResources.authStorage = new AuthStorage(cResources.authStore);
+    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, "auth-C.db"));
+    cResources.authStoreClose = () => authStore.close();
+    cResources.authStore = authStore;
+    cResources.authStorage = new AuthStorage(authStore);
     await cResources.authStorage.reload();
     const cSettings = await fixture.globalSettings.cloneForCwd(fixture.workDirs.C);
     requireCondition(cSettings.get("startup.networkPrewarm") === false, "API_CONTRACT_MISMATCH", "C startup.networkPrewarm is not false");
@@ -780,24 +785,26 @@ async function runOrder(order, fixture, provenance) {
     cleanup.poolShutdown = poolShutdownResolved &&
       cleanup.sessionDisposals.every(outcome => outcome.closed);
     const stores = [
-      ["auth-A", registries.A?.authStore],
-      ["auth-B", registries.B?.authStore],
-      ["auth-C", registries.C?.authStore],
+      ["auth-A", registries.A?.authStoreClose, registries.A?.authStore],
+      ["auth-B", registries.B?.authStoreClose, registries.B?.authStore],
+      ["auth-C", registries.C?.authStoreClose, registries.C?.authStore],
       ["settings", fixture.globalSettings?.getStorage?.()],
       ["model-cache", { close: () => closeModelCache(join(dirname(fixture.modelsPath), "models.db")) }],
     ];
-    for (const [name, store] of stores) {
-      if (!store || typeof store.close !== "function") {
+    for (const [name, resource, diagnosticStore] of stores) {
+      const owned = typeof resource === "function" || typeof resource?.close === "function";
+      if (!owned) {
         const outcome = { name, closed: false, error: "store was not owned" };
         if (name === "auth-A" || name === "auth-B" || name === "auth-C") {
-          outcome.diagnostic = nonOwnedAuthStoreDiagnostic(store, fixture);
+          outcome.diagnostic = nonOwnedAuthStoreDiagnostic(diagnosticStore, fixture);
         }
         cleanup.storeOutcomes.push(outcome);
         cleanupErrors.push({ operation: `close-${name}`, error: "store was not owned" });
         continue;
       }
       try {
-        await store.close();
+        if (typeof resource === "function") await resource();
+        else await resource.close();
         cleanup.storeOutcomes.push({ name, closed: true });
       } catch (error) {
         cleanup.storeOutcomes.push({ name, closed: false, error: error?.message ?? String(error) });
