@@ -27,6 +27,12 @@ const secretKey = /(?:api.?key|access.?token|refresh.?token|password|authorizati
 const WINDOWS_ABSOLUTE_PATH = /(^|[\s"'([{=:])([A-Za-z]:[\\/](?:[^\\/\s"'<>]+[\\/])*[^\\/\s"'<>]+)/;
 const UNC_PATH = /(^|[\s"'([{=:])((?:\\\\|\/\/)[^\\/\s"'<>]+(?:[\\/][^\\/\s"'<>]+)+)/;
 const POSIX_ABSOLUTE_PATH = /(^|[\s"'([{=:])((?:\/[^\/\s"'<>]+)+)/;
+const SECRET_KEY_PATTERN = String.raw`[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)`;
+const SECRET_KEY_VALUE_PATTERN = new RegExp(
+  String.raw`\b${SECRET_KEY_PATTERN}\b\s*(?:[:=]\s*|\s+)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:Bearer\s+)?[^\s"',;}]+)`,
+  "gi",
+);
+const SECRET_KEY_ONLY_PATTERN = new RegExp(String.raw`\b${SECRET_KEY_PATTERN}\b`, "gi");
 
 function redactPathLikeText(text) {
   text = text.replace(
@@ -79,11 +85,8 @@ function sanitize(value, roots = []) {
     }
     text = text.replace(/(?:https?|wss?):\/\/[^\s"']+/gi, "<url-redacted>");
     return redactPathLikeText(text)
-      .replace(/\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b/gi, "<secret-redacted>")
-      .replace(/\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b\s*[:=]\s*["']?[^\s"',;}]+/gi, "<secret-redacted>")
-      .replace(/\b(?:api.?key|access.?token|refresh.?token|password|authorization|cookie|credential|broker|secret|oauth|token)\b\s*[:=]\s*["']?[^\s"',;}]+/gi, "<secret-redacted>")
-      .replace(/\b(?:api.?key|access.?token|refresh.?token|password|authorization|cookie|credential|broker|secret|oauth|token)\b[^\s,;]*/gi, "<secret-redacted>")
-      .replace(/(?:api.?key|access.?token|refresh.?token|password|authorization|cookie|credential|broker|secret|oauth|token)/gi, "<secret-redacted>")
+      .replace(SECRET_KEY_VALUE_PATTERN, "<secret-redacted>")
+      .replace(SECRET_KEY_ONLY_PATTERN, "<secret-redacted>")
       .replace(/<+secret-redacted>(?:-redacted>)*/g, "<secret-redacted>")
       .slice(0, 512);
   }
@@ -307,6 +310,39 @@ async function runOrder(order) {
   }
 }
 
+test("issue #62 redaction consumes complete secret values", () => {
+  const sentinels = [
+    "issue62-api-value",
+    "issue62-client-secret-value",
+    "issue62-auth-bearer-value",
+    "issue62-quoted-secret-value",
+    "issue62-generic-token-value",
+    "issue62-generic-credential-value",
+    "issue62-url-value",
+    "issue62-windows-value",
+    "issue62-unc-value",
+    "issue62-posix-value",
+  ];
+  const input = [
+    `API_KEY=${sentinels[0]}`,
+    `client_secret=${sentinels[1]}`,
+    `Authorization: Bearer ${sentinels[2]}`,
+    `token = "${sentinels[3]} quoted"`,
+    `generic token: ${sentinels[4]}`,
+    `credential=${sentinels[5]}`,
+    `url=https://issue62.example/${sentinels[6]}`,
+    `windows=C:\\Users\\issue62\\${sentinels[7]}`,
+    `unc=\\\\issue62-server\\share\\${sentinels[8]}`,
+    `posix=/tmp/issue62/${sentinels[9]}`,
+  ].join("\n");
+  const sanitized = sanitize(input);
+  for (const sentinel of sentinels) {
+    assert.equal(sanitized.includes(sentinel), false, `redaction leaked sentinel value: ${sentinel}`);
+  }
+  assertNoRawPaths(sanitized);
+  assert.match(sanitized, /<secret-redacted>/);
+  assert.match(sanitized, /<url-redacted>/);
+});
 test("issue #62 real SDK divergent-session probe", async () => {
   assert.ok(existsSync(fixture), `missing Bun fixture ${fixture}`);
   const nodeMajor = Number(process.versions.node.split(".")[0]);

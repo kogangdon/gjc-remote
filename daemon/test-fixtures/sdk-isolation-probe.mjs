@@ -140,6 +140,12 @@ function redactPathLikeText(text) {
     "$1<path-redacted>",
   );
 }
+const SECRET_KEY_PATTERN = String.raw`[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)`;
+const SECRET_KEY_VALUE_PATTERN = new RegExp(
+  String.raw`\b${SECRET_KEY_PATTERN}\b\s*(?:[:=]\s*|\s+)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:Bearer\s+)?[^\s"',;}]+)`,
+  "gi",
+);
+const SECRET_KEY_ONLY_PATTERN = new RegExp(String.raw`\b${SECRET_KEY_PATTERN}\b`, "gi");
 
 function redactedText(value, root, fixture) {
   let text = String(value ?? "");
@@ -160,20 +166,8 @@ function redactedText(value, root, fixture) {
   }
   text = text.replace(/(?:https?|wss?):\/\/[^\s"']+/gi, "<url-redacted>");
   text = redactPathLikeText(text);
-  text = text.replace(/\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b/gi, "<secret-redacted>");
-  text = text.replace(
-    /\b[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)\b\s*[:=]\s*["']?[^\s"',;}]+/gi,
-    "<secret-redacted>",
-  );
-  text = text.replace(
-    /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|oauth|password|authorization|cookie|broker|credential|secret|token)\b\s*[:=]\s*["']?[^\s"',;}]+/gi,
-    "<secret-redacted>",
-  );
-  text = text.replace(
-    /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|oauth|password|authorization|cookie|broker|credential|secret|token)\b[^\s,;]*/gi,
-    "<secret-redacted>",
-  );
-  text = text.replace(/(?:api[_-]?key|access[_-]?token|refresh[_-]?token|oauth|password|authorization|cookie|broker|credential|secret|token)/gi, "<secret-redacted>");
+  text = text.replace(SECRET_KEY_VALUE_PATTERN, "<secret-redacted>");
+  text = text.replace(SECRET_KEY_ONLY_PATTERN, "<secret-redacted>");
   text = text.replace(/<+secret-redacted>(?:-redacted>)*/g, "<secret-redacted>");
   if (fixture) text = text.replace(fixture, "<fixture-root>");
   return text.length > 512 ? `${text.slice(0, 509)}...` : text;

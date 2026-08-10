@@ -49,9 +49,12 @@ the classification is not a substitute for the provider-valued observations.
 | --- | --- | --- | --- |
 | A | `issue62-provider-b`, `issue62-capability-b`, `ollama`, `llama.cpp`, `lm-studio` | `issue62-provider-a/issue62-model-a` / same | A, B |
 | B | `issue62-provider-a`, `issue62-capability-a`, `ollama`, `llama.cpp`, `lm-studio` | `issue62-provider-b/issue62-model-b` / same | B, A |
-| C | A, B, capability A, capability B, `ollama`, `llama.cpp`, `lm-studio` | `issue62-no-such-provider/issue62-no-such-model` / same | A, B |
+| C | `ollama`, `llama.cpp`, `lm-studio` | `issue62-no-such-provider/issue62-no-such-model` / same | A, B |
 
 The enabled-model allow-list for A and B is exactly the two fixture selectors.
+Synthetic A/B providers remain enabled for C; only the local built-ins are
+disabled. C's nonmatching enabled-model allow-list therefore produces zero
+candidates before session construction.
 Capability counters are identical in both orders: A `2`, B `2`, controlled
 throwing provider `4`. Reads return one item with provider-specific `_source`
 metadata; the sibling disabled loader has zero invocations.
