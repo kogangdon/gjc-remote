@@ -48,14 +48,33 @@ function redactOpaqueId(value) {
   return isWorkspaceId(String(value)) ? String(value) : "[redacted-host]";
 }
 function normalizeRemoteError(error) {
-  if (error && typeof error === "object") return error;
-  if (typeof error !== "string") return error;
+  if (error && typeof error === "object") {
+    const code = typeof error.code === "string" ? error.code : undefined;
+    const remediation = code ? READINESS_REMEDIATIONS[code] : undefined;
+    return remediation
+      ? { code, ...remediation }
+      : { code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME, ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME] };
+  }
+  if (typeof error !== "string") {
+    return {
+      code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+      ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME],
+    };
+  }
   try {
     const parsed = JSON.parse(error);
-    return parsed && typeof parsed === "object" ? parsed : error;
+    if (parsed && typeof parsed === "object") return normalizeRemoteError(parsed);
   } catch {
-    return error;
+    // Legacy daemon errors are already bounded and sanitized by the daemon.
   }
+  return error;
+}
+function remediationError(code) {
+  return {
+    code,
+    ...(READINESS_REMEDIATIONS[code] ??
+      READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME]),
+  };
 }
 
 /**
@@ -72,6 +91,7 @@ export class HostRegistry {
    *   heartbeatTimeoutMs?: number,
    *   invokeIdleTimeoutMs?: number,
    *   invokeHardCapMs?: number,
+   *   workspaceServingEnabled?: boolean,
    *   timers?: typeof SYSTEM_TIMERS,
    *   now?: () => number,
    *   monotonicNow?: () => number,
@@ -85,6 +105,7 @@ export class HostRegistry {
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
     invokeIdleTimeoutMs = INVOKE_IDLE_TIMEOUT_MS,
     invokeHardCapMs = INVOKE_HARD_CAP_MS,
+    workspaceServingEnabled = false,
     timers = SYSTEM_TIMERS,
     now = () => Date.now(),
     monotonicNow = () =>
@@ -109,6 +130,7 @@ export class HostRegistry {
     this.tokensByHostId = tokensByHostId;
     this.heartbeatTimeoutMs = heartbeatTimeoutMs;
     this.invokeIdleTimeoutMs = invokeIdleTimeoutMs;
+    this.workspaceServingEnabled = workspaceServingEnabled === true;
     this.invokeHardCapMs = invokeHardCapMs;
     this.timers = timers;
     this.now = now;
@@ -123,7 +145,7 @@ export class HostRegistry {
     this.pendingCountBySocket = new Map();
     /** @type {Map<string, { protocolVersion: number, capabilities: string[] }>} */
     this.hostInfo = new Map();
-    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number }>} */
+    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number, workspaceId?: string, workspaceGeneration?: number }>} */
     this.readinessAuthorities = new Map();
     /** @type {Map<string, object>} */
     this.readinessStates = new Map();
@@ -172,7 +194,7 @@ export class HostRegistry {
       hostId = msg.hostId;
       const previous = this.connections.get(hostId);
       if (previous && previous !== socket) {
-        this.#dropConnection(hostId, previous, `host '${hostId}' connection replaced`);
+        this.#dropConnection(hostId, previous, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
         previous.terminate();
       }
 
@@ -254,7 +276,7 @@ export class HostRegistry {
         const wasCurrent = this.#dropConnection(
           hostId,
           socket,
-          `host '${hostId}' disconnected`
+          remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST)
         );
         if (wasCurrent) console.log(`HostRegistry: host '${hostId}' disconnected`);
       });
@@ -381,7 +403,11 @@ export class HostRegistry {
     if (state.socketGeneration === undefined && authority) {
       if (
         msg.socketGeneration <= authority.socketGeneration ||
-        msg.observedAt < authority.observedAt
+        msg.observedAt < authority.observedAt ||
+        (msg.workspaceId !== undefined &&
+          msg.workspaceId === authority.workspaceId &&
+          authority.workspaceGeneration !== undefined &&
+          msg.workspaceGeneration < authority.workspaceGeneration)
       ) {
         this.#recordReadinessError(state, PROTOCOL_ERROR_CODES.READINESS_REPLAYED, receivedAt);
         return false;
@@ -465,6 +491,11 @@ export class HostRegistry {
       state.workspaceMonoExpiresAt =
         monotonicReceivedAt + Math.min(ttlMs, READINESS_MAX_TTL_MS);
       state.workspaceExpired = false;
+      state.hostExpired = false;
+      state.expiresAt = receivedAt + ttlMs;
+      state.monoExpiresAt =
+        monotonicReceivedAt + Math.min(ttlMs, READINESS_MAX_TTL_MS);
+      this.#armReadinessExpiry(state, false, ttlMs);
       this.#armReadinessExpiry(state, true, ttlMs);
     } else {
       state.hostDimensions = { ...msg.status };
@@ -484,6 +515,8 @@ export class HostRegistry {
       socketGeneration: state.socketGeneration,
       revision: state.revision,
       observedAt: state.observedAt,
+      workspaceId: state.workspaceId,
+      workspaceGeneration: state.workspaceGeneration,
     });
     return true;
   }
@@ -751,7 +784,7 @@ export class HostRegistry {
     const state = this.heartbeatStates.get(socket);
     if (state?.timeout !== timeout) return;
 
-    this.#dropConnection(hostId, socket, `host '${hostId}' heartbeat timed out`);
+    this.#dropConnection(hostId, socket, remediationError(PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT));
     socket.terminate();
   }
 
@@ -762,7 +795,7 @@ export class HostRegistry {
       const state = this.heartbeatStates.get(socket);
       if (!state || state.timeout) continue;
       if (socket.readyState !== WebSocket.OPEN) {
-        this.#dropConnection(hostId, socket, `host '${hostId}' disconnected`);
+        this.#dropConnection(hostId, socket, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
         continue;
       }
 
@@ -777,11 +810,11 @@ export class HostRegistry {
       try {
         socket.send(PING_PAYLOAD, (error) => {
           if (!error) return;
-          this.#dropConnection(hostId, socket, `host '${hostId}' heartbeat failed`);
+          this.#dropConnection(hostId, socket, remediationError(PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT));
           socket.terminate();
         });
       } catch {
-        this.#dropConnection(hostId, socket, `host '${hostId}' heartbeat failed`);
+        this.#dropConnection(hostId, socket, remediationError(PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT));
         socket.terminate();
       }
     }
@@ -797,7 +830,7 @@ export class HostRegistry {
     for (const socket of this.wss.clients) {
       const state = this.heartbeatStates.get(socket);
       if (state) {
-        this.#dropConnection(state.hostId, socket, "HostRegistry shut down");
+        this.#dropConnection(state.hostId, socket, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
       } else {
         this.#clearHeartbeat(socket);
       }
@@ -889,13 +922,19 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
           error: this.#notReadyResult(readiness, aggregate),
         });
       }
+      if (!this.workspaceServingEnabled) {
+        return Promise.resolve({
+          ok: false,
+          error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
+        });
+      }
     }
 
     const pendingForSocket = this.pendingCountBySocket.get(socket) ?? 0;
     if (pendingForSocket >= V0_LIMITS.MAX_PENDING_PER_HOST) {
       return Promise.resolve({
         ok: false,
-        error: `host '${hostId}' has too many in-flight requests`,
+        error: remediationError(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED),
       });
     }
 

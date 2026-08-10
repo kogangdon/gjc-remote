@@ -119,6 +119,7 @@ async function startReadinessDaemon({
       HOST_TOKEN: "readiness-test-token",
       BOT_WS_URL: `ws://127.0.0.1:${port}`,
       GJC_READINESS_TTL_MS: "1000",
+      GJC_READINESS_V2: "1",
       GJC_READINESS_TEST_INJECTION: testInjection ? "1" : "0",
       GJC_READINESS_TEST_PROBE: "pass",
       GJC_READINESS_TEST_WORKSPACE_ID: "workspace-test",
@@ -609,7 +610,7 @@ test("failed current-run readiness probes stay non-ready and expose only bounded
     );
     const error = JSON.parse(rejection.error);
     assert.equal(error.code, "UNKNOWN_RUNTIME");
-    assert.equal(error.remediation.action, "retry_later");
+    assert.equal(error.action, "retry_later");
     assert.equal(rejection.error.includes(secret), false);
     assert.equal(rejection.error.includes("private"), false);
     const readiness = daemon.frames.filter((message) => message.type === "readiness");

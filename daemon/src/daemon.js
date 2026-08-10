@@ -12,6 +12,7 @@ import {
   READINESS_DIMENSIONS,
   READINESS_MAX_TTL_MS,
   READINESS_MIN_TTL_MS,
+  READINESS_REMEDIATIONS,
   V0_LIMITS,
   WORKSPACE_READINESS_CAPABILITY,
   isWorkspaceId,
@@ -71,10 +72,7 @@ const daemonSensitiveValues = [
 function sanitizeDaemonError(error) {
   return sanitizeErrorMessage(error, daemonSensitiveValues);
 }
-const readinessV2Advertised =
-  process.env.GJC_READINESS_V2 === "1" ||
-  (process.env.GJC_READINESS_V2 !== "0" &&
-    process.env.GJC_READINESS_TTL_MS !== undefined);
+const readinessV2Advertised = process.env.GJC_READINESS_V2 === "1";
 const DAEMON_PROTOCOL_VERSION = readinessV2Advertised
   ? Math.max(PROTOCOL_VERSION, PROTOCOL_VERSION_V2)
   : PROTOCOL_VERSION;
@@ -111,77 +109,6 @@ try {
 }
 
 const READINESS_ERROR_CODES = new Set(Object.values(PROTOCOL_ERROR_CODES));
-const READINESS_REMEDIATIONS = Object.freeze({
-  [PROTOCOL_ERROR_CODES.AUTH_REJECTED]: { retryable: false, action: "contact_admin" },
-  [PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE]: {
-    retryable: false,
-    action: "contact_admin",
-  },
-  [PROTOCOL_ERROR_CODES.CONNECTION_LOST]: { retryable: true, action: "retry_later" },
-  [PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT]: { retryable: true, action: "retry_later" },
-  [PROTOCOL_ERROR_CODES.PROVIDER_MISSING]: { retryable: true, action: "login" },
-  [PROTOCOL_ERROR_CODES.PROVIDER_INVALID]: {
-    retryable: false,
-    action: "repair_profile",
-  },
-  [PROTOCOL_ERROR_CODES.PROVIDER_EXPIRED]: { retryable: true, action: "login" },
-  [PROTOCOL_ERROR_CODES.PROVIDER_UNAVAILABLE]: {
-    retryable: true,
-    action: "retry_later",
-  },
-  [PROTOCOL_ERROR_CODES.MODEL_PROFILE_MISSING]: {
-    retryable: false,
-    action: "repair_profile",
-  },
-  [PROTOCOL_ERROR_CODES.MODEL_PROFILE_INVALID]: {
-    retryable: false,
-    action: "repair_profile",
-  },
-  [PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE]: {
-    retryable: false,
-    action: "contact_admin",
-  },
-  [PROTOCOL_ERROR_CODES.CONFIG_INVALID]: {
-    retryable: false,
-    action: "contact_admin",
-  },
-  [PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME]: {
-    retryable: true,
-    action: "retry_later",
-  },
-  [PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND]: {
-    retryable: false,
-    action: "refresh_workspace",
-  },
-  [PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE]: {
-    retryable: false,
-    action: "refresh_workspace",
-  },
-  [PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED]: {
-    retryable: false,
-    action: "contact_admin",
-  },
-  [PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED]: {
-    retryable: false,
-    action: "refresh_workspace",
-  },
-  [PROTOCOL_ERROR_CODES.CONTAINMENT_UNSUPPORTED]: {
-    retryable: false,
-    action: "contact_admin",
-  },
-  [PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID]: {
-    retryable: false,
-    action: "contact_admin",
-  },
-  [PROTOCOL_ERROR_CODES.READINESS_REPLAYED]: {
-    retryable: false,
-    action: "contact_admin",
-  },
-  [PROTOCOL_ERROR_CODES.READINESS_EXPIRED]: {
-    retryable: true,
-    action: "retry_later",
-  },
-});
 
 function readinessRemediation(code) {
   return {
@@ -218,6 +145,7 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
 
 const READINESS_TEST_INJECTION_ENABLED =
   process.env.GJC_READINESS_TEST_INJECTION === "1";
+const NATIVE_WORKSPACE_SERVING_ENABLED = false;
 
 function readReadinessTestEvidence() {
   if (!READINESS_TEST_INJECTION_ENABLED) return undefined;
@@ -630,6 +558,9 @@ async function admitReadyWorkload(state, workDir, message) {
   if (effectiveWorkDir === undefined) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED) };
   }
+  if (!NATIVE_WORKSPACE_SERVING_ENABLED) {
+    return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
+  }
   try {
     const session = await pool.ensureSession(effectiveWorkDir);
     return { session };
@@ -644,7 +575,7 @@ function formatReadinessRejection(error) {
   const normalized = error?.code ? error : makeReadinessError(PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
   return JSON.stringify({
     code: normalized.code,
-    remediation: normalized.remediation,
+    ...normalized.remediation,
   });
 }
 const retryScheduler = createReconnectScheduler({
@@ -874,12 +805,19 @@ async function handleMessage(
 
     send(undefined, { done: true });
   } catch (err) {
-    send(undefined, {
-      error: formatReadinessRejection(
-        makeReadinessError(classifyReadinessError(err, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME))
-      ),
-      done: true,
-    });
+    if (readinessState?.committed) {
+      send(undefined, {
+        error: formatReadinessRejection(
+          makeReadinessError(classifyReadinessError(err, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME))
+        ),
+        done: true,
+      });
+    } else {
+      send(undefined, {
+        error: sanitizeDaemonError(normalizeProtocolError(err)),
+        done: true,
+      });
+    }
   } finally {
     inFlightByRequestId.delete(requestId);
   }

@@ -785,7 +785,7 @@ test("heartbeat timeout disconnects a host and fails its pending invoke", async 
 
     assert.deepEqual(await result, {
       ok: false,
-      error: "host 'host-a' heartbeat timed out",
+      error: { code: "HEARTBEAT_TIMEOUT", retryable: true, action: "retry_later" },
     });
     assert.equal(server.registry.isOnline("host-a"), false);
     assert.equal(server.registry.pendingRequests.size, 0);
@@ -823,7 +823,7 @@ test("replacement sockets are not removed by stale heartbeat state", async () =>
 
     assert.deepEqual(await originalResult, {
       ok: false,
-      error: "host 'host-a' connection replaced",
+      error: { code: "CONNECTION_LOST", retryable: true, action: "retry_later" },
     });
     assert.equal(timers.timeoutCount, 0);
     timers.runClearedTimeouts();
@@ -871,7 +871,7 @@ test("registry shutdown clears heartbeat state and settles pending invokes", asy
 
   assert.deepEqual(await result, {
     ok: false,
-    error: "HostRegistry shut down",
+    error: { code: "CONNECTION_LOST", retryable: true, action: "retry_later" },
   });
   assert.equal(timers.intervalCount, 0);
   assert.equal(timers.timeoutCount, 0);
@@ -905,7 +905,7 @@ test("per-host in-flight invokes are capped and freed on completion", async () =
     );
     assert.deepEqual(overflow, {
       ok: false,
-      error: "host 'host-a' has too many in-flight requests",
+      error: { code: "RESOURCE_EXHAUSTED", retryable: true, action: "retry_later" },
     });
     assert.equal(server.registry.pendingRequests.size, cap);
 
