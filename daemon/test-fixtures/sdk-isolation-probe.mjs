@@ -618,12 +618,28 @@ async function runOrder(order, fixture, provenance) {
   const pool = new SessionPool({
     sessionFactory: workDir => {
       const comparable = comparableWorkDir(workDir);
-      const label = comparable === comparableWorkDir(fixture.workDirs.A)
+      const normalizedAPath = comparableWorkDir(fixture.workDirs.A);
+      const normalizedBPath = comparableWorkDir(fixture.workDirs.B);
+      const label = comparable === normalizedAPath
         ? "A"
-        : comparable === comparableWorkDir(fixture.workDirs.B)
+        : comparable === normalizedBPath
           ? "B"
           : undefined;
-      requireCondition(label, "API_CONTRACT_MISMATCH", "pool requested an unexpected workDir");
+      requireCondition(
+        label,
+        "API_CONTRACT_MISMATCH",
+        "pool requested an unexpected workDir",
+        {
+          workDir,
+          normalizedIncomingPath: comparable,
+          normalizedAPath,
+          normalizedBPath,
+          fixtureWorkDirs: {
+            A: fixture.workDirs.A,
+            B: fixture.workDirs.B,
+          },
+        },
+      );
       return createPooledSession(fixture, fixture.globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources);
     },
     sessionCreateTimeoutMs: 30_000,
