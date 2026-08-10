@@ -27,7 +27,7 @@ const secretKey = /(?:api.?key|access.?token|refresh.?token|password|authorizati
 const WINDOWS_ABSOLUTE_PATH = /(^|[\s"'([{=:])([A-Za-z]:[\\/](?:[^\\/\s"'<>]+[\\/])*[^\\/\s"'<>]+)/;
 const UNC_PATH = /(^|[\s"'([{=:])((?:\\\\|\/\/)[^\\/\s"'<>]+(?:[\\/][^\\/\s"'<>]+)+)/;
 const POSIX_ABSOLUTE_PATH = /(^|[\s"'([{=:])((?:\/[^\/\s"'<>]+)+)/;
-const SECRET_KEY_PATTERN = String.raw`[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)`;
+const SECRET_KEY_PATTERN = String.raw`[A-Z0-9_]*(?:API[\s_-]*KEY|ACCESS[\s_-]*TOKEN|REFRESH[\s_-]*TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)`;
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
   String.raw`\b${SECRET_KEY_PATTERN}\b\s*(?:[:=]\s*|\s+)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:Bearer\s+)?[^\s"',;}]+)`,
   "gi",
@@ -131,13 +131,13 @@ function parseReceipt(stdout, roots = []) {
   assert.fail(`Bun fixture emitted no structured receipt: ${diagnostic}`);
 }
 
-async function spawnFixture(order, envInfo) {
+async function spawnBun(args, envInfo) {
   const { env } = envInfo;
   await mkdir(env.HOME, { recursive: true });
   await mkdir(env.TMP, { recursive: true });
   return new Promise((resolveResult, reject) => {
     const bun = process.env.BUN_BIN || "bun";
-    const child = spawn(bun, [fixture, `--order=${order}`, "--json"], {
+    const child = spawn(bun, [fixture, ...args], {
       cwd: repoRoot,
       env,
       windowsHide: true,
@@ -166,6 +166,19 @@ async function spawnFixture(order, envInfo) {
       resolveResult({ code, signal, stdout, stderr });
     });
   });
+}
+
+async function spawnFixture(order, envInfo) {
+  return spawnBun([`--order=${order}`, "--json"], envInfo);
+}
+
+async function spawnRedactionProbe() {
+  const envInfo = stableEnv("redaction-probe");
+  try {
+    return await spawnBun(["--redaction-probe"], envInfo);
+  } finally {
+    await removeWrapperRoot(envInfo.roots[0]);
+  }
 }
 
 async function removeWrapperRoot(root) {
@@ -310,38 +323,79 @@ async function runOrder(order) {
   }
 }
 
+function assertNoDistinctiveSentinels(text, sentinels) {
+  const fragments = [
+    ...new Set([
+      ...sentinels,
+      ...sentinels.map(value => value.slice(0, 8)),
+      ...sentinels.map(value => value.slice(-8)),
+    ]),
+  ];
+  for (const [index, fragment] of fragments.entries()) {
+    assert.equal(text.includes(fragment), false, `redaction leaked sentinel fragment ${index}`);
+  }
+}
+
 test("issue #62 redaction consumes complete secret values", () => {
   const sentinels = [
-    "issue62-api-value",
-    "issue62-client-secret-value",
-    "issue62-auth-bearer-value",
-    "issue62-quoted-secret-value",
-    "issue62-generic-token-value",
-    "issue62-generic-credential-value",
-    "issue62-url-value",
-    "issue62-windows-value",
-    "issue62-unc-value",
-    "issue62-posix-value",
+    "q7M4vN9xC2pL8rK",
+    "h3W8sD1kF6yT0mQ",
+    "z5R2cV9nJ4bX7pH",
+    "n8G1uK6eP3aS0wY",
+    "f4Q9mL2xZ7dC5rV",
+    "b6H0tN3jA8kE1sU",
+    "p2Y7gR4wM9cD6vX",
+    "x9C5nB1qT8hV3kL",
+    "d8K2sF7wL4nP0yR",
+    "m5V1cX8qH3tB6zJ",
+    "r4J8aD2sW6fQ0cM",
+    "v6N1pH9yC3kR7bT",
+    "u2L7eX4mS9qV5dF",
+    "w8C3gT6nK1zP4hY",
+    "e5P0bV7jL2xS9qN",
   ];
   const input = [
-    `API_KEY=${sentinels[0]}`,
-    `client_secret=${sentinels[1]}`,
-    `Authorization: Bearer ${sentinels[2]}`,
-    `token = "${sentinels[3]} quoted"`,
-    `generic token: ${sentinels[4]}`,
-    `credential=${sentinels[5]}`,
-    `url=https://issue62.example/${sentinels[6]}`,
-    `windows=C:\\Users\\issue62\\${sentinels[7]}`,
-    `unc=\\\\issue62-server\\share\\${sentinels[8]}`,
-    `posix=/tmp/issue62/${sentinels[9]}`,
+    `API_KEY = ${sentinels[0]}`,
+    `API key = ${sentinels[1]}`,
+    `API key: Bearer ${sentinels[2]}`,
+    `Api_Key = "${sentinels[3]} quoted"`,
+    `API-KEY: '${sentinels[4]} quoted'`,
+    `APIKEY ${sentinels[5]}`,
+    `client_secret=${sentinels[6]}`,
+    `Authorization: Bearer ${sentinels[7]}`,
+    `token = "${sentinels[8]} quoted"`,
+    `generic token: ${sentinels[9]}`,
+    `credential=${sentinels[10]}`,
+    `url=https://issue62.example/${sentinels[11]}`,
+    `windows=C:\\Users\\issue62\\${sentinels[12]}`,
+    `unc=\\\\issue62-server\\share\\${sentinels[13]}`,
+    `posix=/tmp/issue62/${sentinels[14]}`,
   ].join("\n");
   const sanitized = sanitize(input);
-  for (const sentinel of sentinels) {
-    assert.equal(sanitized.includes(sentinel), false, `redaction leaked sentinel value: ${sentinel}`);
-  }
+  assertNoDistinctiveSentinels(sanitized, sentinels);
   assertNoRawPaths(sanitized);
   assert.match(sanitized, /<secret-redacted>/);
   assert.match(sanitized, /<url-redacted>/);
+});
+
+test("issue #62 Bun redaction probe consumes opaque values and fragments", async () => {
+  assert.ok(existsSync(fixture), `missing Bun fixture ${fixture}`);
+  const result = await spawnRedactionProbe();
+  assert.equal(result.code, 0, `Bun redaction probe failed (${result.signal})`);
+  const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+  assert.equal(lines.length, 1, "Bun redaction probe emitted unexpected output");
+  let receipt;
+  try {
+    receipt = JSON.parse(lines[0]);
+  } catch {
+    assert.fail("Bun redaction probe emitted invalid JSON");
+  }
+  assert.deepEqual(receipt, {
+    schema: "issue62-sdk-isolation-redaction-probe-v1",
+    sentinelCount: 10,
+    fragmentCount: 30,
+    secretMarker: true,
+  });
 });
 test("issue #62 real SDK divergent-session probe", async () => {
   assert.ok(existsSync(fixture), `missing Bun fixture ${fixture}`);

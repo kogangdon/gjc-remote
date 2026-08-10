@@ -140,12 +140,32 @@ function redactPathLikeText(text) {
     "$1<path-redacted>",
   );
 }
-const SECRET_KEY_PATTERN = String.raw`[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)`;
+const SECRET_KEY_PATTERN = String.raw`[A-Z0-9_]*(?:API[\s_-]*KEY|ACCESS[\s_-]*TOKEN|REFRESH[\s_-]*TOKEN|OAUTH|PASSWORD|AUTHORIZATION|COOKIE|BROKER|CREDENTIAL|SECRET|TOKEN)`;
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
   String.raw`\b${SECRET_KEY_PATTERN}\b\s*(?:[:=]\s*|\s+)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:Bearer\s+)?[^\s"',;}]+)`,
   "gi",
 );
 const SECRET_KEY_ONLY_PATTERN = new RegExp(String.raw`\b${SECRET_KEY_PATTERN}\b`, "gi");
+const REDACTION_PROBE_SCHEMA = "issue62-sdk-isolation-redaction-probe-v1";
+const REDACTION_PROBE_SENTINELS = Object.freeze([
+  "q7M4vN9xC2pL8rK",
+  "h3W8sD1kF6yT0mQ",
+  "z5R2cV9nJ4bX7pH",
+  "n8G1uK6eP3aS0wY",
+  "f4Q9mL2xZ7dC5rV",
+  "b6H0tN3jA8kE1sU",
+  "p2Y7gR4wM9cD6vX",
+  "x9C5nB1qT8hV3kL",
+  "d8K2sF7wL4nP0yR",
+  "m5V1cX8qH3tB6zJ",
+]);
+const REDACTION_PROBE_FRAGMENTS = Object.freeze([
+  ...new Set([
+    ...REDACTION_PROBE_SENTINELS,
+    ...REDACTION_PROBE_SENTINELS.map(value => value.slice(0, 8)),
+    ...REDACTION_PROBE_SENTINELS.map(value => value.slice(-8)),
+  ]),
+]);
 
 function redactedText(value, root, fixture) {
   let text = String(value ?? "");
@@ -171,6 +191,31 @@ function redactedText(value, root, fixture) {
   text = text.replace(/<+secret-redacted>(?:-redacted>)*/g, "<secret-redacted>");
   if (fixture) text = text.replace(fixture, "<fixture-root>");
   return text.length > 512 ? `${text.slice(0, 509)}...` : text;
+}
+function runRedactionProbe() {
+  const [apiAssignment, apiBearer, apiHyphen, apiQuoted, apiCompact, accessToken, refreshToken, credential, genericToken, tokenQuoted] = REDACTION_PROBE_SENTINELS;
+  const input = [
+    `API key = ${apiAssignment}`,
+    `API key: Bearer ${apiBearer}`,
+    `api-key = ${apiHyphen}`,
+    `Api_Key: '${apiQuoted} quoted'`,
+    `APIKEY ${apiCompact}`,
+    `ACCESS TOKEN = ${accessToken}`,
+    `refresh-token: Bearer ${refreshToken}`,
+    `credential = ${credential}`,
+    `generic token: ${genericToken}`,
+    `token = "${tokenQuoted} quoted"`,
+  ].join("\n");
+  const redacted = redactedText(input, {});
+  const leakedIndex = REDACTION_PROBE_FRAGMENTS.findIndex(fragment => redacted.includes(fragment));
+  requireCondition(leakedIndex === -1, "REDACTION_LEAK", "redaction probe leaked an opaque sentinel", { leakedFragmentIndex: leakedIndex });
+  requireCondition(redacted.includes("<secret-redacted>"), "REDACTION_PROBE_INVALID", "redaction probe produced no secret marker");
+  process.stdout.write(`${JSON.stringify({
+    schema: REDACTION_PROBE_SCHEMA,
+    sentinelCount: REDACTION_PROBE_SENTINELS.length,
+    fragmentCount: REDACTION_PROBE_FRAGMENTS.length,
+    secretMarker: true,
+  })}\n`);
 }
 
 function redactValue(value, root) {
@@ -1030,4 +1075,7 @@ async function main() {
   }
 }
 
-if (import.meta.main) await main();
+if (import.meta.main) {
+  if (process.argv.includes("--redaction-probe")) runRedactionProbe();
+  else await main();
+}
