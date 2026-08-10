@@ -255,28 +255,31 @@ re-sign (`--sign-key`/`--signature`, optionally with `--require-signature`).
 A trust store (`trusted.json` or `local-dev.json`) with two entries sharing a
 `keyId` is rejected fail-closed rather than silently using whichever entry
 `Array.prototype.find` reaches first and shadowing the other.
-Enforcement is opt-in and keyed off `trusted.json` contents rather than an
-environment variable: with at least one key pinned in `trusted.json`,
-`loadVerifiedAddon()` requires a valid sidecar signed by a pinned key and
+Enforcement is keyed off `trusted.json` contents, not an environment variable.
+This checkout's `trusted.json` contains exactly one production entry,
+`keyId: "prod-2026-08-r2"` with `algorithm: "ed25519"` (the key recorded by
+issue #44 evidence). Signature enforcement is therefore LIVE:
+`loadVerifiedAddon()` requires a valid sidecar signed by that pinned key and
 refuses fail-closed (`ERR_NATIVE_CONTROL_REFUSED`) on a missing, malformed,
-unknown-`keyId`, algorithm-mismatched, or cryptographically invalid
-signature. With zero keys pinned in `trusted.json` and none in the gitignored
-`native-control/release-keys/local-dev.json` either — the state this
-repository ships in, since the operator has not yet provisioned the release
-key — loading proceeds as before hash/contract verification existed, but
-emits one explicit warning that addon provenance is UNVERIFIED; an invalid or
-malformed sidecar is never silently treated as verified in this state
-either. While `trusted.json` is still in that zero-key bootstrap state,
-`local-dev.json` may be used to unblock local iteration: loading with a
-`local-dev.json`-pinned key succeeds but warns that a development key was
-used. As soon as one production key is pinned in `trusted.json`, keys in
-`local-dev.json` are ignored entirely — never merged, never consulted, never
-a fallback — so a dev-signed artifact fails closed with an unknown-`keyId`
-refusal instead of loading; this is a one-way transition with no downgrade
-path back to trusting development keys. Key rotation adds a new
-`{ keyId, algorithm, publicKeyPem }` entry to `trusted.json` alongside the
-old one — old manifests stay verifiable under their original `keyId` until
-it is deliberately removed.
+unknown-`keyId`, algorithm-mismatched, or cryptographically invalid signature.
+The release gate also verifies strictly against `trusted.json`; a
+`local-dev.json` key can never satisfy it.
+
+Historical (pre-provisioning) state: older revisions had zero keys pinned in
+`trusted.json` and no local development key. In that bootstrap state loading
+could proceed after hash/contract verification while emitting one explicit
+warning that addon provenance was `UNVERIFIED`; malformed and invalid sidecars
+were still refused, and zero keys meant "cannot check", not "trust anything."
+While that historical zero-key state held, a deliberately created
+`local-dev.json` key could unblock local iteration with a development-key
+warning. Once a production key was pinned, local development keys were ignored
+entirely and a dev-signed artifact failed closed with unknown-`keyId`; this
+one-way boundary has no downgrade path. The historical description is retained
+to explain the policy, not to describe this checkout.
+
+Key rotation adds a new `{ keyId, algorithm, publicKeyPem }` entry to
+`trusted.json` alongside the old one — old manifests stay verifiable under
+their original `keyId` until it is deliberately removed.
 
 #### Residual assumption: in-tree verification requires a protected deployment
 

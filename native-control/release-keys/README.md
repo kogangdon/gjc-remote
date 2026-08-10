@@ -51,17 +51,21 @@ source control and is reviewed like any other change.
 - For cloud KMS or a hardware/PIV token instead of a local file, produce the
   detached signature over the exact manifest bytes with that custody tool and
   pass it in: `--signature <file> --key-id <id> --algorithm <alg>`.
-## Bootstrap state
+## Historical bootstrap state (pre-provisioning)
 
-This file currently ships with an **empty `keys` array** because the
-operator has not yet provisioned the release signing key. With zero pinned
-keys, `loadVerifiedAddon()` cannot enforce a signature and falls back to
-today's hash/contract-only verification, emitting a single explicit warning
-that addon provenance is UNVERIFIED. It never treats an unsigned or
-malformed sidecar as verified, and it never accepts an invalid signature —
-zero pinned keys means "cannot check", not "check disabled by trusting
-anything presented." As soon as the operator adds a key here, signature
-enforcement turns on automatically; no code change or flag is required.
+Older revisions shipped an empty `keys` array because the operator had not yet
+provisioned a release signing key. In that zero-key state,
+`loadVerifiedAddon()` could not enforce a production signature and fell back to
+hash/contract-only verification with one explicit `UNVERIFIED` warning. This
+was a pre-provisioning state, not a trust decision to accept arbitrary input:
+unsigned, malformed, and invalid sidecars were never treated as verified.
+Pinning a production key turned enforcement on automatically.
+
+This repository no longer ships in that bootstrap state: `trusted.json` pins
+`prod-2026-08-r2` (Ed25519), so the live contract is the fail-closed signature
+enforcement described above. The historical local-development exception is
+retained below as policy context only; it is not an active fallback for this
+checkout.
 
 ## Backup, restore, and rotation runbook
 
@@ -135,27 +139,27 @@ To rotate: add a new `{ keyId, algorithm, publicKeyPem }` entry alongside
 the old one, start signing new releases with the new key, and only remove
 the old entry once no manifest that must still verify was signed with it.
 
-## Local development
+## Local development (historical pre-provisioning boundary)
 
 `local-dev.json` (same shape, **gitignored**, see `../../.gitignore`) may hold
 additional keys accepted only on the machine that created it, and only while
-`trusted.json` is still in its bootstrap, zero-key state. Signing a local
-build with a development key still turns on enforcement (a missing or
-invalid sidecar still refuses to load) but `loadVerifiedAddon()` warns that a
-development key was used. This is not an env-var bypass: it requires
-deliberately creating a local, untracked trust file, and it never accepts an
-unsigned or invalid signature.
+`trusted.json` is in its historical zero-key state. Signing a local build with
+a development key still turns on enforcement (a missing or invalid sidecar
+still refuses to load) but `loadVerifiedAddon()` warns that a development key
+was used. This is not an env-var bypass: it requires deliberately creating a
+local, untracked trust file, and it never accepts an unsigned or invalid
+signature.
 
 As soon as the operator pins even one production key in `trusted.json`, keys
 in `local-dev.json` are dropped entirely — not merged, not consulted as a
 fallback, not eligible to shadow a production `keyId`. A dev-signed artifact
-then fails closed with "unknown signing keyId" exactly like any other
-untrusted signature. This is a deliberate one-way transition: dev keys exist
-to unblock local iteration before a production key is provisioned, never as
-a standing downgrade path once one is. The release gate
+then fails closed with "unknown signing keyId" exactly like any other untrusted
+signature. This is a deliberate one-way transition: dev keys exist to unblock
+local iteration before a production key is provisioned, never as a standing
+downgrade path once one is. The release gate
 (`node scripts/verify-build.mjs --require-signature`) goes further and never
-consults `local-dev.json` at all, at any trust-store state, so a release
-build can never be satisfied by a development key.
+consults `local-dev.json` at all, at any trust-store state, so a release build
+can never be satisfied by a development key.
 
 A trust store (`trusted.json` or `local-dev.json`) containing two entries
 with the same `keyId` is rejected outright — loading refuses fail-closed
