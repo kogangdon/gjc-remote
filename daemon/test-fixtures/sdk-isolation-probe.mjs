@@ -71,6 +71,11 @@ function fail(code, message, details) {
 function requireCondition(value, code, message, details) {
   if (!value) fail(code, message, details);
 }
+function comparableWorkDir(value) {
+  if (typeof value !== "string") return undefined;
+  const normalized = resolve(value).replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
 
 function sortedStrings(value) {
   return [...new Set((Array.isArray(value) ? value : []).filter(item => typeof item === "string"))].sort();
@@ -612,7 +617,12 @@ async function runOrder(order, fixture, provenance) {
   const ownedAuthResources = [];
   const pool = new SessionPool({
     sessionFactory: workDir => {
-      const label = workDir === fixture.workDirs.A ? "A" : workDir === fixture.workDirs.B ? "B" : undefined;
+      const comparable = comparableWorkDir(workDir);
+      const label = comparable === comparableWorkDir(fixture.workDirs.A)
+        ? "A"
+        : comparable === comparableWorkDir(fixture.workDirs.B)
+          ? "B"
+          : undefined;
       requireCondition(label, "API_CONTRACT_MISMATCH", "pool requested an unexpected workDir");
       return createPooledSession(fixture, fixture.globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources);
     },
