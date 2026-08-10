@@ -698,7 +698,19 @@ async function runOrder(order, fixture, provenance) {
     }
     for (const [label, record] of Object.entries(registries)) {
       if (!record?.rawSession) continue;
-      const closed = record.rawSession.isDisposed === true;
+      let closed = record.rawSession.isDisposed === true;
+      if (!closed) {
+        try {
+          await disposeRawSessionBounded(record.rawSession, `cleanup-${label}`);
+        } catch (error) {
+          cleanupErrors.push({
+            operation: `raw-session-${label}`,
+            error: error?.message ?? String(error),
+            details: error?.details,
+          });
+        }
+        closed = record.rawSession.isDisposed === true;
+      }
       cleanup.sessionDisposals.push({ label, closed });
       if (!closed) {
         cleanupErrors.push({ operation: `raw-session-${label}`, error: "session did not reach disposed state after pool shutdown" });

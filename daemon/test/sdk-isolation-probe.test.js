@@ -91,12 +91,15 @@ function parseReceipt(stdout) {
   assert.fail(`Bun fixture emitted no structured receipt: ${sanitize(lines.at(-1))}`);
 }
 
-function spawnFixture(order) {
+async function spawnFixture(order) {
+  const env = stableEnv(order);
+  await mkdir(env.HOME, { recursive: true });
+  await mkdir(env.TMP, { recursive: true });
   return new Promise((resolveResult, reject) => {
     const bun = process.env.BUN_BIN || "bun";
     const child = spawn(bun, [fixture, `--order=${order}`, "--json"], {
       cwd: repoRoot,
-      env: stableEnv(order),
+      env,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
