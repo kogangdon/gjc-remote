@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /* Issue #62: real SDK/session-pool isolation probe. Bun-only; stdout is not an artifact. */
-import { readFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { readFile, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -52,6 +52,7 @@ const CHANGE_FILES = [
 const UNKNOWN_CAPABILITY_ID = "issue62-unknown-capability";
 const UNKNOWN_CAPABILITY_MESSAGE = `Unknown capability: "${UNKNOWN_CAPABILITY_ID}"`;
 const RAW_SESSION_DISPOSE_TIMEOUT_MS = 5_000;
+const WORK_DIR_REALPATH_TIMEOUT_MS = 5_000;
 const AUTH_STORE_DIAGNOSTIC_MAX_METHODS = 32;
 const AUTH_STORE_DIAGNOSTIC_MAX_TEXT = 128;
 
@@ -71,6 +72,22 @@ function fail(code, message, details) {
 function requireCondition(value, code, message, details) {
   if (!value) fail(code, message, details);
 }
+async function canonicalWorkDir(value) {
+  if (typeof value !== "string") return undefined;
+  let timer;
+  const result = await Promise.race([
+    realpath(value).then(
+      canonical => ({ status: "fulfilled", canonical }),
+      error => ({ status: "rejected", error }),
+    ),
+    new Promise(resolve => {
+      timer = setTimeout(() => resolve({ status: "timed_out" }), WORK_DIR_REALPATH_TIMEOUT_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+  return result.status === "fulfilled" ? result.canonical : undefined;
+}
+
 function comparableWorkDir(value) {
   if (typeof value !== "string") return undefined;
   const normalized = resolve(value).replaceAll("\\", "/");
@@ -615,11 +632,18 @@ async function runOrder(order, fixture, provenance) {
   const registries = {};
   const settingsByLabel = {};
   const ownedAuthResources = [];
+  const canonicalFixtureWorkDirs = {
+    A: await canonicalWorkDir(fixture.workDirs.A),
+    B: await canonicalWorkDir(fixture.workDirs.B),
+  };
   const pool = new SessionPool({
-    sessionFactory: workDir => {
-      const comparable = comparableWorkDir(workDir);
-      const normalizedAPath = comparableWorkDir(fixture.workDirs.A);
-      const normalizedBPath = comparableWorkDir(fixture.workDirs.B);
+    sessionFactory: async workDir => {
+      const canonicalIncomingPath = await canonicalWorkDir(workDir);
+      const comparable = comparableWorkDir(canonicalIncomingPath);
+      const canonicalAPath = canonicalFixtureWorkDirs.A;
+      const canonicalBPath = canonicalFixtureWorkDirs.B;
+      const normalizedAPath = comparableWorkDir(canonicalAPath);
+      const normalizedBPath = comparableWorkDir(canonicalBPath);
       const label = comparable === normalizedAPath
         ? "A"
         : comparable === normalizedBPath
@@ -631,12 +655,15 @@ async function runOrder(order, fixture, provenance) {
         "pool requested an unexpected workDir",
         {
           workDir,
+          canonicalIncomingPath,
+          canonicalAPath,
+          canonicalBPath,
           normalizedIncomingPath: comparable,
           normalizedAPath,
           normalizedBPath,
           fixtureWorkDirs: {
-            A: fixture.workDirs.A,
-            B: fixture.workDirs.B,
+            A: canonicalAPath,
+            B: canonicalBPath,
           },
         },
       );
