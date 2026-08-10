@@ -8,12 +8,29 @@ import {
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PROTOCOL_VERSION,
+  PROTOCOL_VERSION_V2,
+  PROTOCOL_ERROR_CODES,
+  READINESS_REMEDIATIONS,
   V0_LIMITS,
+  READINESS_DEFAULT_TTL_MS,
+  READINESS_DIMENSIONS,
+  READINESS_MAX_TTL_MS,
+  READINESS_MIN_TTL_MS,
+  READINESS_STATUS_VALUES,
+  WORKSPACE_ID_MAX_LENGTH,
+  WORKSPACE_READINESS_CAPABILITY,
   isAnswerMessage,
   isEventMessage,
   isGateRequestEvent,
   isInvokeMessage,
+  isReadinessCapabilityGate,
+  isReadinessMessage,
+  isReadinessStatus,
+  isReadinessTtl,
+  normalizeReadinessTtl,
   isRegisterMessage,
+  isRegisterOkMessage,
+  isWorkspaceId,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { WebSocketServer } from "ws";
@@ -424,4 +441,398 @@ test("adding #35 message types does not break backward-compat validators", () =>
   assert.equal(isInvokeMessage({ type: "answer", requestId: "r", gateId: "g", answer: "y" }), false);
   assert.equal(isAnswerMessage({ type: "event", requestId: "r", event: {} }), false);
   assert.equal(isGateRequestEvent({ type: "event", requestId: "r" }), false);
+});
+function makeReadinessFrame(overrides = {}) {
+  return {
+    type: MSG_TYPES.READINESS,
+    socketGeneration: 1,
+    revision: 1,
+    observedAt: Date.now(),
+    status: {
+      connection: "online",
+      runtime: "ready",
+      providerAuth: "configured",
+      modelProfile: "ready",
+      workspace: "ready",
+    },
+    ...overrides,
+  };
+}
+
+test("workspace readiness validates bounded opaque IDs and generation pairing", () => {
+  assert.equal(isWorkspaceId("workspace-1"), true);
+  assert.equal(isWorkspaceId("ws_01.alpha"), true);
+  assert.equal(isWorkspaceId(""), false);
+  assert.equal(isWorkspaceId("../escape"), false);
+  assert.equal(isWorkspaceId("workspace/name"), false);
+  assert.equal(isWorkspaceId("workspace\\name"), false);
+  assert.equal(isWorkspaceId("workspace name"), false);
+  assert.equal(isWorkspaceId("workspace\nname"), false);
+  assert.equal(isWorkspaceId("x".repeat(WORKSPACE_ID_MAX_LENGTH + 1)), false);
+
+  assert.equal(
+    isReadinessMessage(
+      makeReadinessFrame({ workspaceId: "workspace-1", workspaceGeneration: 7 })
+    ),
+    true
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ workspaceId: "workspace-1" })),
+    false,
+    "workspaceId requires workspaceGeneration"
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ workspaceGeneration: 7 })),
+    false,
+    "workspaceGeneration cannot be host-level"
+  );
+});
+
+test("readiness validates all five dimensions and every documented status value", () => {
+  assert.deepEqual(READINESS_DIMENSIONS, [
+    "connection",
+    "runtime",
+    "providerAuth",
+    "modelProfile",
+    "workspace",
+  ]);
+  assert.equal(isReadinessStatus(makeReadinessFrame().status), true);
+
+  for (const dimension of READINESS_DIMENSIONS) {
+    for (const status of READINESS_STATUS_VALUES[dimension]) {
+      const frame = makeReadinessFrame();
+      frame.status[dimension] = status;
+      assert.equal(
+        isReadinessMessage(frame),
+        true,
+        `${dimension}=${status} should be valid`
+      );
+    }
+  }
+
+  assert.equal(
+    isReadinessMessage(
+      makeReadinessFrame({
+        status: { ...makeReadinessFrame().status, runtime: "unknown" },
+      })
+    ),
+    false,
+    "unknown dimension value"
+  );
+  assert.equal(
+    isReadinessStatus({
+      ...makeReadinessFrame().status,
+      unexpected: "ready",
+    }),
+    false,
+    "unknown dimension"
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ status: { connection: "online" } })),
+    false,
+    "missing dimensions"
+  );
+});
+
+test("readiness enforces TTL bounds/default and bounded frame fields", () => {
+  assert.equal(isReadinessTtl(READINESS_MIN_TTL_MS), true);
+  assert.equal(isReadinessTtl(READINESS_MAX_TTL_MS), true);
+  assert.equal(isReadinessTtl(READINESS_MIN_TTL_MS - 1), false);
+  assert.equal(isReadinessTtl(READINESS_MAX_TTL_MS + 1), false);
+  assert.equal(isReadinessTtl(1.5), false);
+  assert.equal(normalizeReadinessTtl(undefined), READINESS_DEFAULT_TTL_MS);
+
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ ttlMs: READINESS_MIN_TTL_MS })),
+    true
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ ttlMs: READINESS_MAX_TTL_MS })),
+    true
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ ttlMs: READINESS_MIN_TTL_MS - 1 })),
+    false
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ ttlMs: READINESS_MAX_TTL_MS + 1 })),
+    false
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ observedAt: "2026-08-03T00:00:00.000Z" })),
+    false,
+    "timestamps are bounded numeric wire values"
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ revision: 0 })),
+    false,
+    "revision starts at one"
+  );
+  assert.equal(
+    isReadinessMessage(makeReadinessFrame({ socketGeneration: Number.MAX_SAFE_INTEGER + 1 })),
+    false,
+    "socket generation is a safe integer"
+  );
+});
+
+test("readiness revision fences accept only newer data on the current socket", () => {
+  const previous = makeReadinessFrame({ socketGeneration: 4, revision: 10 });
+  assert.equal(
+    isReadinessMessage(
+      makeReadinessFrame({ socketGeneration: 4, revision: 11 }),
+      { currentSocketGeneration: 4, previous }
+    ),
+    true
+  );
+  assert.equal(
+    isReadinessMessage(
+      makeReadinessFrame({ socketGeneration: 4, revision: 10 }),
+      { currentSocketGeneration: 4, previous }
+    ),
+    false,
+    "duplicate revision"
+  );
+  assert.equal(
+    isReadinessMessage(
+      makeReadinessFrame({ socketGeneration: 4, revision: 9 }),
+      { currentSocketGeneration: 4, previous }
+    ),
+    false,
+    "lower revision"
+  );
+  assert.equal(
+    isReadinessMessage(
+      makeReadinessFrame({ socketGeneration: 3, revision: 11 }),
+      { currentSocketGeneration: 4, previous }
+    ),
+    false,
+    "old socket generation"
+  );
+});
+
+test("readiness capability gate requires both bounded v2 register frames", () => {
+  const register = {
+    type: "register",
+    hostId: "host-1",
+    token: "token-1",
+    protocolVersion: PROTOCOL_VERSION_V2,
+    capabilities: [WORKSPACE_READINESS_CAPABILITY],
+  };
+  const registerOk = {
+    type: "register_ok",
+    protocolVersion: PROTOCOL_VERSION_V2,
+    capabilities: [WORKSPACE_READINESS_CAPABILITY],
+  };
+  assert.equal(isReadinessCapabilityGate(register, registerOk), true);
+  assert.equal(isReadinessCapabilityGate({ register, registerOk }), true);
+  assert.equal(
+    isReadinessCapabilityGate(
+      { ...register, capabilities: [...CAPABILITIES] },
+      registerOk
+    ),
+    false,
+    "register advertisement is required"
+  );
+  assert.equal(
+    isReadinessCapabilityGate(register, { ...registerOk, capabilities: [] }),
+    false,
+    "register response capability is required"
+  );
+  assert.equal(
+    isReadinessCapabilityGate(register, { ...registerOk, protocolVersion: PROTOCOL_VERSION }),
+    false,
+    "protocol v1 cannot commit v2"
+  );
+  assert.equal(
+    isReadinessCapabilityGate(register, { type: "register_ok" }),
+    false,
+    "missing response negotiation fields fail closed"
+  );
+});
+test("protocol negotiation rejects future versions and never down-negotiates readiness", () => {
+  const register = {
+    type: "register",
+    hostId: "host-1",
+    token: "token-1",
+    protocolVersion: PROTOCOL_VERSION_V2,
+    capabilities: [WORKSPACE_READINESS_CAPABILITY],
+  };
+  const registerOk = {
+    type: "register_ok",
+    protocolVersion: PROTOCOL_VERSION_V2,
+    capabilities: [WORKSPACE_READINESS_CAPABILITY],
+  };
+
+  assert.equal(
+    isRegisterMessage({ ...register, protocolVersion: PROTOCOL_VERSION_V2 + 1 }),
+    false
+  );
+  assert.equal(
+    isRegisterOkMessage({ ...registerOk, protocolVersion: PROTOCOL_VERSION_V2 + 1 }),
+    false
+  );
+  assert.equal(
+    isReadinessCapabilityGate(
+      { ...register, protocolVersion: PROTOCOL_VERSION_V2 + 1 },
+      registerOk
+    ),
+    false
+  );
+  assert.equal(
+    isReadinessCapabilityGate(register, {
+      ...registerOk,
+      protocolVersion: PROTOCOL_VERSION_V2 + 1,
+    }),
+    false
+  );
+  assert.equal(
+    isReadinessCapabilityGate({
+      negotiatedVersion: PROTOCOL_VERSION_V2 + 1,
+      localCapabilities: [WORKSPACE_READINESS_CAPABILITY],
+      remoteCapabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }),
+    false
+  );
+  assert.equal(
+    isRegisterMessage({ ...register, protocolVersion: "2" }),
+    false,
+    "version strings are malformed"
+  );
+  assert.equal(
+    isRegisterOkMessage({ ...registerOk, protocolVersion: null }),
+    false,
+    "null versions are malformed"
+  );
+});
+
+test("v2 invoke identity is bounded, exact, and gated from legacy sockets", () => {
+  const command = { kind: "prompt", message: "hello" };
+  const legacy = {
+    type: "invoke",
+    requestId: "request-1",
+    workDir: "/workspace",
+    command,
+  };
+  assert.equal(isInvokeMessage(legacy), true);
+
+  for (const field of [
+    "mappingId",
+    "mappingGeneration",
+    "mappingVersion",
+    "workspaceId",
+    "workspaceGeneration",
+  ]) {
+    assert.equal(
+      isInvokeMessage({ ...legacy, [field]: field === "mappingId" ? "mapping-1" : 1 }),
+      false,
+      `${field} is reserved before v2 capability commit`
+    );
+  }
+
+  const valid = {
+    type: "invoke",
+    requestId: "request-2",
+    mappingId: "mapping-1",
+    mappingGeneration: 2,
+    mappingVersion: 3,
+    command,
+  };
+  assert.equal(isInvokeMessage(valid, { v2: true }), true);
+  assert.equal(
+    isInvokeMessage({ ...valid, workspaceId: "workspace-1" }, { v2: true }),
+    true
+  );
+  assert.equal(
+    isInvokeMessage({ ...valid, workDir: "/workspace" }, { v2: true }),
+    true
+  );
+  assert.equal(
+    isInvokeMessage(
+      { ...valid, workspaceId: "workspace-1", workDir: "workspace-1" },
+      { v2: true }
+    ),
+    true
+  );
+  assert.equal(
+    isInvokeMessage(
+      { ...valid, workspaceId: "workspace-1", workDir: "other-workspace" },
+      { v2: true }
+    ),
+    true,
+    "canonical mapping resolution, not string equality, binds workspaceId to workDir"
+  );
+  assert.equal(
+    isInvokeMessage({ ...valid, mappingId: "../escape" }, { v2: true }),
+    false
+  );
+  assert.equal(
+    isInvokeMessage({ ...valid, mappingId: "x".repeat(129) }, { v2: true }),
+    false
+  );
+  assert.equal(
+    isInvokeMessage({ ...valid, mappingGeneration: 0 }, { v2: true }),
+    false
+  );
+  assert.equal(
+    isInvokeMessage({ ...valid, mappingGeneration: 1.5 }, { v2: true }),
+    false
+  );
+  assert.equal(
+    isInvokeMessage({ ...valid, mappingVersion: Number.MAX_SAFE_INTEGER + 1 }, { v2: true }),
+    false
+  );
+  assert.equal(
+    isInvokeMessage({ ...valid, futureMappingField: "ignored" }, { v2: true }),
+    false,
+    "unknown v2 fields are not silently ignored"
+  );
+});
+
+test("readiness remediation tuples are canonical and stable", () => {
+  const expected = {
+    [PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID]: {
+      code: PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID,
+      retryable: false,
+      action: "contact_admin",
+    },
+    [PROTOCOL_ERROR_CODES.READINESS_REPLAYED]: {
+      code: PROTOCOL_ERROR_CODES.READINESS_REPLAYED,
+      retryable: false,
+      action: "contact_admin",
+    },
+    [PROTOCOL_ERROR_CODES.CONNECTION_LOST]: {
+      code: PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+      retryable: true,
+      action: "retry_later",
+    },
+    [PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND]: {
+      code: PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
+      retryable: false,
+      action: "refresh_workspace",
+    },
+    [PROTOCOL_ERROR_CODES.PROVIDER_MISSING]: {
+      code: PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+      retryable: true,
+      action: "login",
+    },
+    [PROTOCOL_ERROR_CODES.PROVIDER_INVALID]: {
+      code: PROTOCOL_ERROR_CODES.PROVIDER_INVALID,
+      retryable: false,
+      action: "repair_profile",
+    },
+    [PROTOCOL_ERROR_CODES.MODEL_PROFILE_MISSING]: {
+      code: PROTOCOL_ERROR_CODES.MODEL_PROFILE_MISSING,
+      retryable: false,
+      action: "repair_profile",
+    },
+    [PROTOCOL_ERROR_CODES.MODEL_PROFILE_INVALID]: {
+      code: PROTOCOL_ERROR_CODES.MODEL_PROFILE_INVALID,
+      retryable: false,
+      action: "repair_profile",
+    },
+  };
+  for (const [code, tuple] of Object.entries(expected)) {
+    assert.deepEqual(READINESS_REMEDIATIONS[code], tuple);
+    assert.equal(Object.isFrozen(READINESS_REMEDIATIONS[code]), true);
+  }
 });

@@ -7,6 +7,23 @@ const CHUNK_DELAY_MS = 600;
 export function createTextAttachment(text, name) {
   return new AttachmentBuilder(Buffer.from(text, "utf8"), { name });
 }
+export function formatDeliveryError(error) {
+  if (!error || typeof error !== "object") return String(error ?? "unknown error");
+  if (
+    typeof error.code === "string" &&
+    typeof error.retryable === "boolean" &&
+    typeof error.action === "string"
+  ) {
+    return `${error.code} (action: ${error.action}; ${
+      error.retryable ? "retryable" : "not retryable"
+    })`;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "unknown error";
+  }
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -23,7 +40,9 @@ export async function deliverResult({
   sendFollow,
   delayMs = CHUNK_DELAY_MS,
 }) {
-  const text = result.ok ? result.text ?? "(no text output)" : result.error ?? "unknown error";
+  const text = result.ok
+    ? result.text ?? "(no text output)"
+    : formatDeliveryError(result.error);
   const body = `${header}\n${text}`;
 
   if (body.length <= CHUNK_LIMIT) {

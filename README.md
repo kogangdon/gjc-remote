@@ -154,7 +154,14 @@ shells out to the `node src/bot.js` package script on PATH.
   logs; `GJC_MODEL_PROFILE` overrides the activated model profile;
   `GJC_SHUTDOWN_TIMEOUT_MS` overrides the daemon shutdown deadline (default
   15000ms, validated from 1000ms through the runtime timer maximum). Keep it
-  below the external supervisor's daemon stop timeout.
+  below the external supervisor's daemon stop timeout;
+  `GJC_READINESS_V2=1` enables the opt-in protocol v2 workspace-readiness
+  advertisement. `GJC_READINESS_TTL_MS` sets the bounded readiness TTL from
+  1,000 through 60,000 milliseconds (default 60,000); it has no effect on
+  whether v2 is advertised. Readiness remains a contract/test-scaffolding
+  feature and does not authorize native workspace serving. With this branch,
+  v2 readiness can report state but workspace invokes remain fail-closed with
+  `RUNTIME_INCOMPATIBLE` until the native-serving boundary is approved.
 
 ## Provider authentication (e.g. GitHub Copilot)
 

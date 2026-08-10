@@ -52,6 +52,22 @@ function waitForLength(collection, length, description, timeoutMs = TEST_TIMEOUT
     }, 10);
   });
 }
+function waitForFrame(collection, predicate, description, timeoutMs = TEST_TIMEOUT_MS) {
+  if (collection.some(predicate)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let poll;
+    const deadline = setTimeout(() => {
+      clearInterval(poll);
+      reject(new Error(`timed out waiting for ${description}`));
+    }, timeoutMs);
+    poll = setInterval(() => {
+      if (!collection.some(predicate)) return;
+      clearTimeout(deadline);
+      clearInterval(poll);
+      resolve();
+    }, 10);
+  });
+}
 
 async function stopChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
@@ -65,6 +81,77 @@ async function stopChild(child) {
     child.kill("SIGKILL");
     await exited;
   }
+}
+async function startReadinessDaemon({
+  registerResponse = {
+    type: "register_ok",
+    protocolVersion: 2,
+    capabilities: ["workspace_readiness_v2"],
+  },
+  envOverrides = {},
+  onMessage,
+  testInjection = true,
+} = {}) {
+  const frames = [];
+  const registrations = [];
+  const sockets = [];
+  const wss = new WebSocketServer({ port: 0 });
+  await once(wss, "listening");
+  const { port } = wss.address();
+  wss.on("connection", (socket) => {
+    sockets.push(socket);
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "register") {
+        registrations.push(message);
+        socket.send(JSON.stringify(registerResponse));
+        return;
+      }
+      frames.push(message);
+      onMessage?.(message, socket);
+    });
+  });
+
+  const child = spawn(process.env.BUN_BIN || "bun", [daemonEntry], {
+    env: {
+      ...process.env,
+      HOST_ID: "readiness-test-host",
+      HOST_TOKEN: "readiness-test-token",
+      BOT_WS_URL: `ws://127.0.0.1:${port}`,
+      GJC_READINESS_TTL_MS: "1000",
+      GJC_READINESS_V2: "1",
+      GJC_READINESS_TEST_INJECTION: testInjection ? "1" : "0",
+      GJC_READINESS_TEST_PROBE: "pass",
+      GJC_READINESS_TEST_WORKSPACE_ID: "workspace-test",
+      GJC_READINESS_TEST_WORKSPACE_GENERATION: "1",
+      GJC_READINESS_TEST_MAPPING_ID: "mapping-test",
+      GJC_READINESS_TEST_MAPPING_GENERATION: "1",
+      GJC_READINESS_TEST_MAPPING_VERSION: "1",
+      GJC_READINESS_TEST_WORK_DIR: "C:\\workspace",
+      ...envOverrides,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => {
+    output += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    output += chunk.toString();
+  });
+
+  return {
+    frames,
+    registrations,
+    sockets,
+    output: () => output,
+    async stop() {
+      await stopChild(child);
+      for (const socket of sockets) socket.terminate();
+      await new Promise((resolve) => wss.close(() => resolve()));
+    },
+  };
 }
 
 test("denied registration uses one fixed retry and accepted recovery restores normal reconnects", async () => {
@@ -243,4 +330,298 @@ test("a signal during fatal-initiated shutdown neither re-enters nor changes exi
   );
   assert.equal((output.match(/POOL_SHUTDOWN_CALLED/g) ?? []).length, 1, output);
   assert.match(output, /daemon: uncaught exception: .*early fatal/);
+});
+test("v2 starts connected-not-ready and ignores legacy readiness labels and workspace identity", async () => {
+  const daemon = await startReadinessDaemon({
+    testInjection: false,
+    envOverrides: {
+      GJC_READINESS_PROVIDER_AUTH_STATUS: "configured",
+      GJC_MODEL_PROFILE: "legacy-profile",
+      GJC_WORKSPACE_ID: "legacy-workspace",
+      GJC_WORKSPACE_GENERATION: "99",
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.frames,
+      (message) => message.type === "readiness" && message.revision === 1,
+      "initial connected-not-ready readiness"
+    );
+    const initial = daemon.frames.find(
+      (message) => message.type === "readiness" && message.revision === 1
+    );
+    assert.deepEqual(initial.status, {
+      connection: "online",
+      runtime: "ready",
+      providerAuth: "missing",
+      modelProfile: "missing",
+      workspace: "unknown",
+    });
+    assert.equal(Object.hasOwn(initial, "workspaceId"), false);
+    assert.equal(Object.hasOwn(initial, "workspaceGeneration"), false);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("v2 probe success promotes all dimensions only with explicit mapping evidence", async () => {
+  const daemon = await startReadinessDaemon();
+  try {
+    await waitForFrame(
+      daemon.frames,
+      (message) =>
+        message.type === "readiness" &&
+        message.status.providerAuth === "configured" &&
+        message.status.modelProfile === "ready" &&
+        message.status.workspace === "ready",
+      "successful current-run probe"
+    );
+    const ready = daemon.frames.find(
+      (message) =>
+        message.type === "readiness" &&
+        message.status.providerAuth === "configured" &&
+        message.status.workspace === "ready"
+    );
+    assert.equal(ready.workspaceId, "workspace-test");
+    assert.equal(ready.workspaceGeneration, 1);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("missing authenticated mapping stays non-ready and rejects before session creation", async () => {
+  let invoked = false;
+  const daemon = await startReadinessDaemon({
+    envOverrides: {
+      GJC_READINESS_TEST_WORKSPACE_ID: "",
+      GJC_READINESS_TEST_WORKSPACE_GENERATION: "",
+      GJC_READINESS_TEST_MAPPING_ID: "",
+      GJC_READINESS_TEST_MAPPING_GENERATION: "",
+      GJC_READINESS_TEST_MAPPING_VERSION: "",
+      GJC_READINESS_TEST_WORK_DIR: "",
+    },
+    onMessage(message, socket) {
+      if (
+        message.type === "readiness" &&
+        message.lastError?.code === "MAPPING_ID_REQUIRED" &&
+        !invoked
+      ) {
+        invoked = true;
+        socket.send(
+          JSON.stringify({
+            type: "invoke",
+            requestId: "missing-mapping-request",
+            workDir: "C:\\private\\workspace",
+            command: { kind: "prompt", message: "hello" },
+          })
+        );
+      }
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.frames,
+      (message) =>
+        message.type === "event" &&
+        message.requestId === "missing-mapping-request",
+      "missing mapping rejection"
+    );
+    const event = daemon.frames.find(
+      (message) =>
+        message.type === "event" &&
+        message.requestId === "missing-mapping-request"
+    );
+    const error = JSON.parse(event.error);
+    assert.equal(error.code, "MAPPING_ID_REQUIRED");
+    assert.equal(event.error.includes("private"), false);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("duplicate register_ok cannot change a committed readiness handshake", async () => {
+  let duplicateSent = false;
+  const daemon = await startReadinessDaemon({
+    onMessage(message, socket) {
+      if (message.type === "readiness" && !duplicateSent) {
+        duplicateSent = true;
+        socket.send(
+          JSON.stringify({
+            type: "register_ok",
+            protocolVersion: 1,
+            capabilities: [],
+          })
+        );
+      }
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.frames,
+      (message) =>
+        message.type === "readiness" &&
+        message.status.providerAuth === "configured" &&
+        message.status.workspace === "ready" &&
+        message.revision >= 3,
+      "readiness after duplicate register_ok"
+    );
+    const ready = daemon.frames.find(
+      (message) =>
+        message.type === "readiness" &&
+        message.status.providerAuth === "configured" &&
+        message.status.workspace === "ready"
+    );
+    assert.equal(ready.workspaceId, "workspace-test");
+    assert.equal(daemon.registrations.length, 1);
+  } finally {
+    await daemon.stop();
+  }
+});
+test("v2 readiness publishes at TTL/2 and ping/pong never refreshes it", async () => {
+  let pingSent = false;
+  const daemon = await startReadinessDaemon({
+    onMessage(message, socket) {
+      if (message.type === "readiness" && !pingSent) {
+        pingSent = true;
+        socket.send(JSON.stringify({ type: "ping" }));
+      }
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.frames,
+      (message) => message.type === "readiness" && message.revision >= 3,
+      "two TTL/2 readiness publications"
+    );
+    const readiness = daemon.frames.filter((message) => message.type === "readiness");
+    assert.ok(readiness.length >= 3);
+    assert.equal(readiness[0].status.providerAuth, "missing");
+    const steady = readiness.slice(1);
+    assert.ok(
+      steady[1].observedAt - steady[0].observedAt >= 400,
+      "readiness must not publish faster than TTL/2"
+    );
+    assert.ok(daemon.frames.some((message) => message.type === "pong"));
+    assert.deepEqual(
+      daemon.frames.filter((message) => message.type === "pong"),
+      [{ type: "pong" }]
+    );
+    assert.equal(steady[0].revision, 2);
+    assert.equal(steady[1].revision, 3);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("v1 register response suppresses readiness egress and ping remains a plain pong", async () => {
+  const daemon = await startReadinessDaemon({
+    registerResponse: { type: "register_ok" },
+  });
+  try {
+    await waitForLength(daemon.registrations, 1, "v1 registration");
+    daemon.sockets[0].send(JSON.stringify({ type: "ping" }));
+    await waitForFrame(
+      daemon.frames,
+      (message) => message.type === "pong",
+      "plain pong"
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    assert.equal(
+      daemon.frames.filter((message) => message.type === "readiness").length,
+      0
+    );
+    assert.deepEqual(
+      daemon.frames.filter((message) => message.type === "pong"),
+      [{ type: "pong" }]
+    );
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("replacement sockets reset readiness generation and revision", async () => {
+  let closedFirst = false;
+  const daemon = await startReadinessDaemon({
+    onMessage(message, socket) {
+      if (message.type === "readiness" && !closedFirst) {
+        closedFirst = true;
+        socket.close();
+      }
+    },
+  });
+  try {
+    await waitForLength(daemon.registrations, 2, "replacement registration", 6_000);
+    await waitForFrame(
+      daemon.frames,
+      (message) => message.type === "readiness" && message.socketGeneration >= 2,
+      "replacement readiness"
+    );
+    const readiness = daemon.frames.filter((message) => message.type === "readiness");
+    const generations = [...new Set(readiness.map((message) => message.socketGeneration))];
+    assert.ok(generations.length >= 2);
+    const replacement = readiness.find(
+      (message) => message.socketGeneration === generations[1]
+    );
+    assert.equal(replacement.revision, 1);
+    assert.notEqual(replacement.socketGeneration, readiness[0].socketGeneration);
+    assert.equal(replacement.workspaceGeneration, 1);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("failed current-run readiness probes stay non-ready and expose only bounded taxonomy", async () => {
+  const secret = "probe-secret-value";
+  let invoked = false;
+  const daemon = await startReadinessDaemon({
+    envOverrides: {
+      GJC_READINESS_TEST_PROBE: "fail",
+      GJC_READINESS_TEST_PROBE_ERROR_CODE: "UNKNOWN_RUNTIME",
+      HOST_TOKEN: secret,
+    },
+    onMessage(message, socket) {
+      if (
+        message.type === "readiness" &&
+        message.lastError?.code === "UNKNOWN_RUNTIME" &&
+        !invoked
+      ) {
+        invoked = true;
+        setTimeout(() => {
+          socket.send(
+            JSON.stringify({
+              type: "invoke",
+              requestId: "probe-request",
+              workDir: "C:\\private\\workspace",
+              command: { kind: "prompt", message: "hello" },
+            })
+          );
+        }, 0);
+      }
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.frames,
+      (message) => message.type === "event" && message.requestId === "probe-request",
+      "probe rejection event"
+    );
+    const rejection = daemon.frames.find(
+      (message) => message.type === "event" && message.requestId === "probe-request"
+    );
+    const error = JSON.parse(rejection.error);
+    assert.equal(error.code, "UNKNOWN_RUNTIME");
+    assert.equal(error.action, "retry_later");
+    assert.equal(rejection.error.includes(secret), false);
+    assert.equal(rejection.error.includes("private"), false);
+    const readiness = daemon.frames.filter((message) => message.type === "readiness");
+    const failed = readiness.find(
+      (message) => message.lastError?.code === "UNKNOWN_RUNTIME"
+    );
+    assert.ok(failed);
+    assert.equal(failed.status.workspace, "unknown");
+    assert.equal(JSON.stringify(failed).includes(secret), false);
+    assert.equal(JSON.stringify(failed).includes("private"), false);
+  } finally {
+    await daemon.stop();
+  }
 });

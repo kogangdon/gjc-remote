@@ -25,7 +25,12 @@ import {
 import { watchConfigHints } from "./config-watcher.js";
 import { dispatchGate } from "./managed-dispatch.js";
 import { createManagedAuthorityReader } from "./managed-authority-reader.js";
-import { CHUNK_LIMIT, createTextAttachment, deliverResult } from "./delivery.js";
+import {
+  CHUNK_LIMIT,
+  createTextAttachment,
+  deliverResult,
+  formatDeliveryError,
+} from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
@@ -265,14 +270,34 @@ client.on("interactionCreate", async (interaction) => {
   });
 });
 
+function formatHostProjection(projection) {
+  const hostId = typeof projection?.hostId === "string" ? projection.hostId : "unknown";
+  const aggregate = typeof projection?.aggregate === "string" ? projection.aggregate : "unknown";
+  const dimensions =
+    projection?.dimensions && typeof projection.dimensions === "object"
+      ? Object.entries(projection.dimensions)
+          .map(([name, value]) => `${name}=${String(value)}`)
+          .join(", ")
+      : "";
+  const details = [`${hostId}: ${aggregate}`];
+  if (dimensions) details.push(dimensions);
+  if (projection?.lastError?.remediation) {
+    details.push(formatDeliveryError(projection.lastError.remediation));
+  }
+  return details.join(" — ");
+}
+
 async function handleChatInputInteraction(interaction) {
   const { commandName } = interaction;
   if (!dispatchGate(channelMapping, (content) => interaction.reply({ content, ephemeral: true }), verifyLegacyFence)) return;
 
   if (commandName === "hosts") {
-    if (!dispatchGate(channelMapping, (content) => interaction.reply({ content, ephemeral: true }), verifyLegacyFence)) return;
-    const online = registry.listOnline();
-    await interaction.reply(online.length ? `Online: ${online.join(", ")}` : "No hosts connected.");
+    const hosts = registry.listHosts();
+    await interaction.reply(
+      hosts.length
+        ? hosts.map(formatHostProjection).join("\n")
+        : "No hosts connected."
+    );
     return;
   }
 
@@ -466,7 +491,16 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
         editProgress();
       },
       undefined,
-      trackedOnGate
+      trackedOnGate,
+      route.mappingId === undefined
+        ? undefined
+        : {
+            mappingId: route.mappingId,
+            mappingGeneration: route.mappingGeneration,
+            mappingVersion: route.mappingVersion,
+            workspaceId: route.workspaceId,
+            workspaceGeneration: route.workspaceGeneration,
+          }
     );
   } finally {
     clearInterval(heartbeat);
