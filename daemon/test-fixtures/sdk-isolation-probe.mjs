@@ -785,9 +785,9 @@ async function runOrder(order, fixture, provenance) {
     cleanup.poolShutdown = poolShutdownResolved &&
       cleanup.sessionDisposals.every(outcome => outcome.closed);
     const stores = [
-      ["auth-A", registries.A?.authStoreClose, registries.A?.authStore],
-      ["auth-B", registries.B?.authStoreClose, registries.B?.authStore],
-      ["auth-C", registries.C?.authStoreClose, registries.C?.authStore],
+      ["auth-A", { close: registries.A?.authStoreClose }, registries.A?.authStore],
+      ["auth-B", { close: registries.B?.authStoreClose }, registries.B?.authStore],
+      ["auth-C", { close: registries.C?.authStoreClose }, registries.C?.authStore],
       ["settings", fixture.globalSettings?.getStorage?.()],
       ["model-cache", { close: () => closeModelCache(join(dirname(fixture.modelsPath), "models.db")) }],
     ];
