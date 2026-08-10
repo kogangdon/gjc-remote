@@ -1478,7 +1478,15 @@ test("phase 1 preserves readiness fences across replacement and records replay s
   const server = await startRegistry();
   try {
     const first = await connectV2(server);
-    await sendReadiness(first.socket, readinessFrame({ socketGeneration: 7, observedAt: Date.now() }));
+    await sendReadiness(
+      first.socket,
+      readinessFrame({
+        socketGeneration: 7,
+        observedAt: Date.now(),
+        workspaceId: "workspace-1",
+        workspaceGeneration: 5,
+      })
+    );
     first.socket.terminate();
     await waitFor(() => server.registry.getHostReadiness("host-a") === undefined);
 
@@ -1487,9 +1495,11 @@ test("phase 1 preserves readiness fences across replacement and records replay s
     replacement.socket.send(
       JSON.stringify(
         readinessFrame({
-          socketGeneration: 7,
-          revision: 2,
+          socketGeneration: 8,
+          revision: 1,
           observedAt: Date.now(),
+          workspaceId: "workspace-1",
+          workspaceGeneration: 4,
         })
       )
     );
@@ -1502,9 +1512,15 @@ test("phase 1 preserves readiness fences across replacement and records replay s
     const current = await connectV2(server);
     await sendReadiness(
       current.socket,
-      readinessFrame({ socketGeneration: 8, revision: 1, observedAt: Date.now() })
+      readinessFrame({
+        socketGeneration: 9,
+        revision: 1,
+        observedAt: Date.now(),
+        workspaceId: "workspace-1",
+        workspaceGeneration: 5,
+      })
     );
-    assert.equal(server.registry.getHostReadiness("host-a").socketGeneration, 8);
+    assert.equal(server.registry.getHostReadiness("host-a").socketGeneration, 9);
     current.socket.terminate();
   } finally {
     await server.close();
