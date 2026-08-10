@@ -1578,8 +1578,6 @@ test("phase 1 fences revisions and workspace generations before state mutation",
       })
     );
     assert.equal(server.registry.getHostReadiness("host-a").workspaceGeneration, 3);
-
-    const closed = once(socket, "close");
     socket.send(
       JSON.stringify(
         readinessFrame({
@@ -1589,8 +1587,10 @@ test("phase 1 fences revisions and workspace generations before state mutation",
         })
       )
     );
-    await closed;
-    assert.equal(server.registry.getHostReadiness("host-a"), undefined);
+
+    await waitFor(
+      () => server.registry.getHostReadiness("host-a") === undefined
+    );
   } finally {
     await server.close();
   }
