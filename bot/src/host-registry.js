@@ -71,9 +71,9 @@ function normalizeRemoteError(error) {
 }
 function remediationError(code) {
   return {
-    code,
     ...(READINESS_REMEDIATIONS[code] ??
       READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME]),
+    code,
   };
 }
 
@@ -916,7 +916,7 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     const readiness = this.readinessStates.get(hostId);
     if (readiness?.readinessEnabled) {
       const aggregate = this.#aggregate(readiness);
-      if (aggregate !== "ready") {
+      if (aggregate === "offline") {
         return Promise.resolve({
           ok: false,
           error: this.#notReadyResult(readiness, aggregate),
@@ -926,6 +926,12 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         return Promise.resolve({
           ok: false,
           error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
+        });
+      }
+      if (aggregate !== "ready") {
+        return Promise.resolve({
+          ok: false,
+          error: this.#notReadyResult(readiness, aggregate),
         });
       }
     }

@@ -1508,6 +1508,24 @@ test("phase 1 preserves readiness fences across replacement and records replay s
       server.registry.readinessStates.get("host-a")?.lastError?.code,
       PROTOCOL_ERROR_CODES.READINESS_REPLAYED
     );
+    const reused = await connectV2(server);
+    const reusedClosed = once(reused.socket, "close");
+    reused.socket.send(
+      JSON.stringify(
+        readinessFrame({
+          socketGeneration: 7,
+          revision: 1,
+          observedAt: Date.now(),
+          workspaceId: "workspace-1",
+          workspaceGeneration: 5,
+        })
+      )
+    );
+    await reusedClosed;
+    assert.equal(
+      server.registry.readinessStates.get("host-a")?.lastError?.code,
+      PROTOCOL_ERROR_CODES.READINESS_REPLAYED
+    );
 
     const current = await connectV2(server);
     await sendReadiness(
@@ -1683,8 +1701,8 @@ test("phase 1 aggregate precedence and not-ready invoke remediation allocate no 
       [
         { code: "CONNECTION_LOST", retryable: true, action: "retry_later" },
         { code: "RUNTIME_INCOMPATIBLE", retryable: false, action: "contact_admin" },
-        { code: "PROVIDER_UNAVAILABLE", retryable: true, action: "retry_later" },
-        { code: "PROVIDER_MISSING", retryable: true, action: "login" },
+        { code: "RUNTIME_INCOMPATIBLE", retryable: false, action: "contact_admin" },
+        { code: "RUNTIME_INCOMPATIBLE", retryable: false, action: "contact_admin" },
       ]
     );
     assert.equal(server.registry.pendingRequests.size, 0);
