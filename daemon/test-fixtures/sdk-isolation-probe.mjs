@@ -510,7 +510,7 @@ async function disposeRawSessionBounded(rawSession, label) {
   }
 }
 
-async function createPooledSession(fixture, globalSettings, workDir, label, guard, registries, settingsByLabel) {
+async function createPooledSession(fixture, globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources) {
   const settings = await globalSettings.cloneForCwd(workDir);
   settings.override("modelProviderOrder", label === "A" ? [PROVIDER_A, PROVIDER_B] : [PROVIDER_B, PROVIDER_A]);
   settings.override("startup.networkPrewarm", false);
@@ -536,10 +536,11 @@ async function createPooledSession(fixture, globalSettings, workDir, label, guar
   };
   registries[label] = record;
   try {
-    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
-    record.authStoreClose = () => authStore.close();
-    record.authStore = authStore;
-    record.authStorage = new AuthStorage(authStore);
+    const rawStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, `auth-${label}.db`));
+    ownedAuthResources.push({ name: `auth-${label}`, close: () => rawStore.close(), diagnosticStore: rawStore });
+    record.authStoreClose = () => rawStore.close();
+    record.authStore = rawStore;
+    record.authStorage = new AuthStorage(rawStore);
     await record.authStorage.reload();
     record.modelRegistry = new ModelRegistry(record.authStorage, fixture.modelsPath);
     requireCondition(record.modelRegistry.getCanonicalVariants(CANONICAL, { availableOnly: false }).length === 2, "API_CONTRACT_MISMATCH", "canonical equivalence did not produce two variants");
@@ -608,11 +609,12 @@ async function runOrder(order, fixture, provenance) {
   const guard = armNetworkGuard();
   const registries = {};
   const settingsByLabel = {};
+  const ownedAuthResources = [];
   const pool = new SessionPool({
     sessionFactory: workDir => {
       const label = workDir === fixture.workDirs.A ? "A" : workDir === fixture.workDirs.B ? "B" : undefined;
       requireCondition(label, "API_CONTRACT_MISMATCH", "pool requested an unexpected workDir");
-      return createPooledSession(fixture, fixture.globalSettings, workDir, label, guard, registries, settingsByLabel);
+      return createPooledSession(fixture, fixture.globalSettings, workDir, label, guard, registries, settingsByLabel, ownedAuthResources);
     },
     sessionCreateTimeoutMs: 30_000,
     sessionDisposeTimeoutMs: 5_000,
@@ -642,10 +644,11 @@ async function runOrder(order, fixture, provenance) {
     const reads = await Promise.all(order.map(label => readSession(registries[label], fixture)));
     const finalRegistry = registries[order[1]].modelRegistry;
     const finalSnapshot = registrySnapshot(finalRegistry, "global-final");
-    const authStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, "auth-C.db"));
-    cResources.authStoreClose = () => authStore.close();
-    cResources.authStore = authStore;
-    cResources.authStorage = new AuthStorage(authStore);
+    const rawStore = await SqliteAuthCredentialStore.open(join(fixture.authDir, "auth-C.db"));
+    ownedAuthResources.push({ name: "auth-C", close: () => rawStore.close(), diagnosticStore: rawStore });
+    cResources.authStoreClose = () => rawStore.close();
+    cResources.authStore = rawStore;
+    cResources.authStorage = new AuthStorage(rawStore);
     await cResources.authStorage.reload();
     const cSettings = await fixture.globalSettings.cloneForCwd(fixture.workDirs.C);
     requireCondition(cSettings.get("startup.networkPrewarm") === false, "API_CONTRACT_MISMATCH", "C startup.networkPrewarm is not false");
@@ -785,14 +788,12 @@ async function runOrder(order, fixture, provenance) {
     cleanup.poolShutdown = poolShutdownResolved &&
       cleanup.sessionDisposals.every(outcome => outcome.closed);
     const stores = [
-      ["auth-A", { close: registries.A?.authStoreClose }, registries.A?.authStore],
-      ["auth-B", { close: registries.B?.authStoreClose }, registries.B?.authStore],
-      ["auth-C", { close: registries.C?.authStoreClose }, registries.C?.authStore],
-      ["settings", fixture.globalSettings?.getStorage?.()],
-      ["model-cache", { close: () => closeModelCache(join(dirname(fixture.modelsPath), "models.db")) }],
+      ...ownedAuthResources,
+      { name: "settings", close: fixture.globalSettings?.getStorage?.() },
+      { name: "model-cache", close: () => closeModelCache(join(dirname(fixture.modelsPath), "models.db")) },
     ];
-    for (const [name, resource, diagnosticStore] of stores) {
-      const owned = typeof resource === "function" || typeof resource?.close === "function";
+    for (const { name, close, diagnosticStore } of stores) {
+      const owned = typeof close === "function" || typeof close?.close === "function";
       if (!owned) {
         const outcome = { name, closed: false, error: "store was not owned" };
         if (name === "auth-A" || name === "auth-B" || name === "auth-C") {
@@ -803,8 +804,8 @@ async function runOrder(order, fixture, provenance) {
         continue;
       }
       try {
-        if (typeof resource === "function") await resource();
-        else await resource.close();
+        if (typeof close === "function") await close();
+        else await close.close();
         cleanup.storeOutcomes.push({ name, closed: true });
       } catch (error) {
         cleanup.storeOutcomes.push({ name, closed: false, error: error?.message ?? String(error) });
