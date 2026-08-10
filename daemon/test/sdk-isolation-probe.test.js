@@ -230,7 +230,12 @@ async function runOrder(order) {
   await mkdir(artifactsDir, { recursive: true });
   const result = await spawnFixture(order);
   const receipt = parseReceipt(result.stdout);
-  assert.equal(result.code, 0, `${order} fixture failed (${result.signal}): ${sanitize(result.stderr)}\n${sanitize(receipt.error ?? "")}`);
+  const failureReceipt = sanitize({
+    error: receipt.error ?? null,
+    details: receipt.details ?? {},
+    cleanup: receipt.cleanup ?? {},
+  });
+  assert.equal(result.code, 0, `${order} fixture failed (${result.signal}): ${sanitize(result.stderr)}\nSanitized receipt diagnostics: ${JSON.stringify(failureReceipt)}`);
   await validateReceipt(receipt, order);
   await writeReceiptArtifact(name, { ...receipt, nodeWrapperVersion: process.version });
   return receipt;
