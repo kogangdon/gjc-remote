@@ -715,7 +715,13 @@ test("v2 invoke identity is bounded, exact, and gated from legacy sockets", () =
   };
   assert.equal(isInvokeMessage(legacy), true);
 
-  for (const field of ["mappingId", "mappingGeneration", "mappingVersion", "workspaceId"]) {
+  for (const field of [
+    "mappingId",
+    "mappingGeneration",
+    "mappingVersion",
+    "workspaceId",
+    "workspaceGeneration",
+  ]) {
     assert.equal(
       isInvokeMessage({ ...legacy, [field]: field === "mappingId" ? "mapping-1" : 1 }),
       false,

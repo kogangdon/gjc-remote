@@ -836,7 +836,13 @@ export function isInvokeMessage(value, context = undefined) {
   }
 
   const isV2 = isObject(context) && context.v2 === true;
-  const v2Fields = ["mappingId", "mappingGeneration", "mappingVersion", "workspaceId"];
+  const v2Fields = [
+    "mappingId",
+    "mappingGeneration",
+    "mappingVersion",
+    "workspaceId",
+    "workspaceGeneration",
+  ];
   const hasV2Field = v2Fields.some((field) => hasOwn(value, field));
   // A legacy socket must never carry v2 identity, even if the fields happen
   // to have valid values. This keeps the capability gate atomic.
@@ -850,6 +856,7 @@ export function isInvokeMessage(value, context = undefined) {
       "mappingGeneration",
       "mappingVersion",
       "workspaceId",
+      "workspaceGeneration",
       "workDir",
       "command",
     ]);
@@ -862,6 +869,9 @@ export function isInvokeMessage(value, context = undefined) {
       return false;
     }
     if (hasOwn(value, "workspaceId") && !isWorkspaceId(value.workspaceId)) {
+      return false;
+    }
+    if (hasOwn(value, "workspaceGeneration") && !isReadinessWorkspaceGeneration(value.workspaceGeneration)) {
       return false;
     }
     if (hasOwn(value, "workDir") && !isBoundedString(value.workDir, V0_LIMITS.WORK_DIR)) {

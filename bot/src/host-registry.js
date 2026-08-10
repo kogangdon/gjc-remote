@@ -900,18 +900,24 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     }
 
     const requestId = randomUUID();
-    const invoke = { type: MSG_TYPES.INVOKE, requestId, workDir, command };
     const usesV2 = readiness?.readinessEnabled === true;
+    const invoke = { type: MSG_TYPES.INVOKE, requestId, command };
     if (usesV2) {
-      Object.assign(invoke, routeIdentity ?? {});
+      for (const [key, value] of Object.entries(routeIdentity ?? {})) {
+        if (value !== undefined && value !== null) invoke[key] = value;
+      }
+      if (workDir !== undefined && workDir !== null) invoke.workDir = workDir;
       if (!isInvokeMessage(invoke, { v2: true })) {
         return Promise.resolve({
           ok: false,
           error: { ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED] },
         });
       }
-    } else if (!isInvokeMessage(invoke)) {
-      return Promise.resolve({ ok: false, error: "invalid invoke request" });
+    } else {
+      invoke.workDir = workDir;
+      if (!isInvokeMessage(invoke)) {
+        return Promise.resolve({ ok: false, error: "invalid invoke request" });
+      }
     }
 
     let payload;
