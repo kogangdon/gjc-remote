@@ -169,7 +169,7 @@ incidental barrel re-export. The `createSdkSession(workDir, loadSdk)` seam is
 unchanged — tests still inject a fake `{ createAgentSession, SessionManager }`;
 only the default production loader was narrowed.
 
-## Concurrency model: single event loop, and the subprocess alternative (feasibility-confirmed, not implemented)
+## Concurrency model: single event loop (current SDK 0.12.21)
 
 **Current model — cooperative concurrency, NOT parallelism.** Every pooled
 `AgentSession` runs *in-process* inside the one daemon Bun process (see
@@ -198,47 +198,57 @@ Constraint that follows:
   Evidence and the exact artifact/read-redaction boundary are recorded in
   [docs/verification/issue62-evidence.md](docs/verification/issue62-evidence.md).
 
-**Subprocess alternative — feasible, and the SDK already ships the transport.**
-Confirmed against installed `@gajae-code/coding-agent` (asked 2026-07-28):
-- `gjc` is a spawnable bin. The CLI exposes `--mode=acp` (`src/cli.ts`:
+The current SDK pin is established independently in `daemon/package.json` and
+`bun.lock` (0.12.21). That pin is a runtime dependency fact; it is not ACP
+conformance evidence.
+
+### Historical ACP feasibility evidence (ca411c3; 2026-07-28)
+
+Commit `ca411c3` records a source inspection requested on **2026-07-28**. The
+SDK version inspected for that note was **unknown/not established**. The
+following bullets are therefore historical feasibility evidence only; they do
+not establish the current 0.12.21 package's ACP conformance, behavior, or
+support contract.
+
+- The historical inspection reported that `gjc` was a spawnable bin and that the
+  CLI exposed `--mode=acp` (`src/cli.ts`:
   `mode: Flags.string({ options: ["text","json","acp"] })`) plus a dedicated
   `gjc acp` subcommand.
-- `src/modes/acp/acp-mode.ts` `runAcpMode()` drives an `AgentSideConnection`
-  over **ndjson on stdin/stdout** via `@agentclientprotocol/sdk`
-  (`ndJsonStream(process.stdout, process.stdin)`). ACP (Agent Client Protocol)
-  is the editor-standard "drive an agent session as a subprocess over stdio" —
-  exactly this use case, no new protocol needed.
-- Precedent: the daemon *used to* run subprocess RPC (see Implementation
-  findings — deleted `rpc-client.js`/`RpcSession`, "formerly provided by the RPC
-  transport"). The `SdkSession` adapter is already shaped as a swappable
-  command/event transport, so a subprocess route replaces only the in-process
-  `createAgentSession` seam.
+- It reported that `src/modes/acp/acp-mode.ts` `runAcpMode()` drove an
+  `AgentSideConnection` over **ndjson on stdin/stdout** via
+  `@agentclientprotocol/sdk` (`ndJsonStream(process.stdout, process.stdin)`).
+  That observation is not a current ACP conformance or compatibility claim.
+- The deleted RPC subprocess transport (`rpc-client.js`/`RpcSession`) is
+  historical precedent only. The current implementation remains in-process.
 
-Two routes if pursued:
-- **A — `gjc --mode=acp` per session** (standard). Reuses ACP; must map our
-  invoke/set_model/steer/follow_up onto ACP session/prompt + its permission
-  model (`modes/acp/permission-mode.ts`, `terminal-auth.ts`).
-- **B — `Bun.spawn` custom worker per session** (Bun↔Bun `ipc`). Worker imports
-  the SDK and runs one session; relays today's `SdkSession` invoke/event
-  interface unchanged. No ACP mapping; you own the harness.
+If a subprocess route is separately approved, the options are bounded as follows:
 
-Both buy **true parallelism** (N OS processes, N event loops) and **full state
-isolation** (dissolves the capability-global caveat). Costs — this re-pays what
-the in-process migration deliberately removed:
-- **Memory**: one full gjc runtime per session (interactive `gjc` observed ~465
-  MB) vs. one shared runtime today → ≈ N×hundreds-MB.
-- **Cold start**: spawn + ACP handshake + model-profile activation per session
-  (profile activation is why `SESSION_CREATE_TIMEOUT_MS` is 60s).
-- **Lifecycle**: idle reap becomes process-kill not object-dispose; child
-  crash/zombie reaping; re-apply payload cap + backpressure at the stdio edge.
-- **Version drift**: a `GJC_BIN`-spawned child uses the on-PATH gjc, which can
-  differ from the daemon's imported SDK (current daemon pin: 0.12.21; an
-  independently installed child can still differ) — independent upgrades (pro)
-  but two versions to track (con).
+- **Option A — mandatory standard candidate:** start with one
+  `gjc --mode=acp` child per session and explicitly map our
+  `invoke`/`set_model`/`steer`/`follow_up` operations onto ACP session/prompt and
+  permission semantics before claiming support.
+- **Option B — optional custom alternative:** a separately approved
+  `Bun.spawn` worker per session may relay today's `SdkSession` interface, but
+  it is not ACP, owns a new harness, and must carry its own lifecycle,
+  crash/backpressure, and protocol verification. It is not a fallback silently
+  enabled by this documentation.
 
-**Status: feasibility only.** No route chosen, nothing implemented. The real
-question is not "can we" (yes) but "is parallelism + full isolation worth
-re-paying the memory/complexity the team dropped by going in-process?"
+Both options would buy **true parallelism** (N OS processes, N event loops) and
+isolate process-local SDK/module state per worker, including the capability and
+model/provider registries. That is not end-to-end state isolation: provider
+credentials and model profiles remain in host/user configuration (for example
+`~/.gjc/agent`), session history remains under each configured
+`<workDir>/.gjc-remote-session`, and route/workDir ownership plus filesystem ACL
+boundaries remain on the daemon host. Costs include one full runtime per
+session, spawn/ACP handshake and model-profile cold start, child crash/zombie
+reaping, stdio backpressure, and possible version drift between an on-PATH
+`gjc` child and the daemon's imported SDK.
+
+**Ownership and status:** the current code has no ACP adapter, worker, or
+subprocess route. No route is selected or implemented; the existing in-process
+`SdkSession` adapter and `createAgentSession` seam retain ownership. This note
+does not authorize an implementation, migration, provider setup, or production
+readiness claim.
 
 ## Decided config values (don't re-ask the user these)
 
