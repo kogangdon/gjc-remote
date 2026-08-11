@@ -36,6 +36,7 @@ test("short Windows absolute paths remain plain text without attachments", async
   assert.equal(capture.first[0].content, `**GJC** result:\n${text}`);
   assert.equal("files" in capture.first[0], false);
   assert.equal(capture.follow.length, 0);
+  assert.deepEqual(capture.first[0].allowedMentions, { parse: [] });
 });
 
 test("short POSIX absolute paths remain plain text without attachments", async () => {
@@ -91,6 +92,14 @@ test("normal long output is chunked and components are attached to the last part
   assert.equal("files" in payloads[1], false);
   assert.equal("components" in payloads[0], false);
   assert.equal(payloads[1].components, components);
+});
+test("delivered content disables Discord mention parsing", async () => {
+  const capture = captureDelivery();
+
+  await deliver("untrusted <@&123456789> @everyone @here", capture);
+
+  assert.equal(capture.first[0].content.includes("<@&123456789>"), true);
+  assert.deepEqual(capture.first[0].allowedMentions, { parse: [] });
 });
 
 test("delivery rejects and stops after the first send fails", async () => {

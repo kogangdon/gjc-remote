@@ -1,5 +1,6 @@
 import { AttachmentBuilder } from "discord.js";
 
+export const NO_MENTIONS = Object.freeze({ parse: [] });
 export const CHUNK_LIMIT = 1900;
 export const MAX_CHUNKS = 7;
 const CHUNK_DELAY_MS = 600;
@@ -46,7 +47,7 @@ export async function deliverResult({
   const body = `${header}\n${text}`;
 
   if (body.length <= CHUNK_LIMIT) {
-    await sendFirst({ content: body, components });
+    await sendFirst({ content: body, components, allowedMentions: NO_MENTIONS });
     return;
   }
 
@@ -55,7 +56,7 @@ export async function deliverResult({
     for (let i = 0; i < chunks.length; i++) {
       const isLast = i === chunks.length - 1;
       const label = chunks.length > 1 ? `_(Part ${i + 1}/${chunks.length})_\n` : "";
-      const payload = { content: `${label}${chunks[i]}` };
+      const payload = { content: `${label}${chunks[i]}`, allowedMentions: NO_MENTIONS };
       if (isLast && components.length > 0) payload.components = components;
       await (i === 0 ? sendFirst(payload) : sendFollow(payload));
       if (!isLast && delayMs > 0) await sleep(delayMs);
@@ -64,7 +65,12 @@ export async function deliverResult({
   }
 
   const file = createTextAttachment(text, outputName);
-  await sendFirst({ content: `${header} (output attached, ${text.length} chars)`, files: [file], components });
+  await sendFirst({
+    content: `${header} (output attached, ${text.length} chars)`,
+    files: [file],
+    components,
+    allowedMentions: NO_MENTIONS,
+  });
 }
 
 function splitForDiscord(text, limit) {
