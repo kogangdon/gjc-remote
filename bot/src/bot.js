@@ -550,6 +550,10 @@ function renderGateToChannel(channel, channelId, hostId, gate) {
   } else {
     lines.push("_Reply in this channel with your answer._");
   }
+  if (!channel || typeof channel.send !== "function") {
+    console.error("Failed to render workflow gate: channel is unavailable");
+    return Promise.resolve();
+  }
   return channel.send(noMentions(lines.join("\n"))).catch((error) => {
     console.error("Failed to render workflow gate:", error);
   });
