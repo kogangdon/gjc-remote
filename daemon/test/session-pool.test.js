@@ -50,6 +50,28 @@ test("a closed SDK session is disposed and replaced", async () => {
     await pool.shutdown();
   }
 });
+test("idle reaper skips busy sessions and reaps them after work settles", async () => {
+  const session = new FakeSession();
+  let busy = true;
+  session.isBusy = () => busy;
+  const pool = createPool({
+    idleTimeoutMs: 5,
+    reapIntervalMs: 5,
+    sessionFactory: async () => session,
+  });
+
+  try {
+    await pool.ensureSession(WORK_DIR);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(session.disposeCalls, 0);
+
+    busy = false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(session.disposeCalls, 1);
+  } finally {
+    await pool.shutdown();
+  }
+});
 
 test("replacement creation proceeds when closed-session disposal stalls", async () => {
   const created = [];

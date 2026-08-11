@@ -27,6 +27,10 @@ export class SessionPool {
     platform = process.platform,
     sessionDisposeTimeoutMs = SESSION_DISPOSE_TIMEOUT_MS,
     sessionCreateTimeoutMs = SESSION_CREATE_TIMEOUT_MS,
+    idleTimeoutMs = IDLE_TIMEOUT_MS,
+    reapIntervalMs = 5 * 60 * 1000,
+    setIntervalFn = setInterval,
+    clearIntervalFn = clearInterval,
     sensitiveValues = [],
   } = {}) {
     /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
@@ -37,14 +41,17 @@ export class SessionPool {
     this.platform = platform;
     this.sessionCreateTimeoutMs = sessionCreateTimeoutMs;
     this.sessionDisposeTimeoutMs = sessionDisposeTimeoutMs;
+    this.idleTimeoutMs = idleTimeoutMs;
+    this.setIntervalFn = setIntervalFn;
+    this.clearIntervalFn = clearIntervalFn;
     this.closed = false;
     this.sensitiveValues = [...sensitiveValues];
     this.pendingOperations = new Map();
-    this.reapTimer = setInterval(() => {
+    this.reapTimer = this.setIntervalFn(() => {
       void this.#reapIdle().catch((error) =>
         console.error(`SessionPool: idle reap failed: ${this.#sanitize(error)}`)
       );
-    }, 5 * 60 * 1000);
+    }, reapIntervalMs);
     this.reapTimer.unref?.();
   }
   #sanitize(value) {
@@ -55,7 +62,12 @@ export class SessionPool {
     const now = Date.now();
     const disposals = [];
     for (const [workDir, entry] of this.sessions) {
-      if (entry.session && now - entry.lastUsed > IDLE_TIMEOUT_MS) {
+      if (!entry.session) continue;
+      if (typeof entry.session.isBusy === "function" && entry.session.isBusy()) {
+        entry.lastUsed = now;
+        continue;
+      }
+      if (now - entry.lastUsed > this.idleTimeoutMs) {
         console.log(`SessionPool: reaping idle session for ${this.#sanitize(workDir)}`);
         this.sessions.delete(workDir);
         disposals.push(this.#disposeIgnoringFailure(entry.session, workDir, "idle"));
@@ -206,7 +218,7 @@ export class SessionPool {
   async shutdown() {
     if (this.closed) return;
     this.closed = true;
-    clearInterval(this.reapTimer);
+    this.clearIntervalFn(this.reapTimer);
 
     const entries = [...this.sessions.entries()];
     this.sessions.clear();
