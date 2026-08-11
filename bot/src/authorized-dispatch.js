@@ -18,7 +18,11 @@ export async function dispatchAuthorizedInteraction({
     try {
       await onButton(interaction);
       return "handled";
-    } catch {
+    } catch (error) {
+      console.error(
+        "Discord button interaction handler failed:",
+        error instanceof Error ? error.message : String(error)
+      );
       return "failed";
     }
   }
@@ -37,7 +41,11 @@ export async function dispatchAuthorizedInteraction({
   try {
     await onChatInput(interaction);
     return "handled";
-  } catch {
+  } catch (error) {
+    console.error(
+      "Discord chat-input interaction handler failed:",
+      error instanceof Error ? error.message : String(error)
+    );
     return "failed";
   }
 }

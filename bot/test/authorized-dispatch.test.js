@@ -188,3 +188,21 @@ test("authorized interaction handler failures are contained", async () => {
 
   assert.equal(status, "failed");
 });
+test("authorized button handler failures are contained", async () => {
+  const interaction = {
+    user: { id: "allowed-user" },
+    isButton: () => true,
+    isChatInputCommand: () => false,
+  };
+
+  const status = await dispatchAuthorizedInteraction({
+    interaction,
+    authorization,
+    onButton: async () => {
+      throw new Error("interaction expired");
+    },
+    onChatInput: () => assert.fail("chat handler must not run"),
+  });
+
+  assert.equal(status, "failed");
+});
