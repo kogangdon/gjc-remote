@@ -15,8 +15,12 @@ export async function dispatchAuthorizedInteraction({
       return "denied";
     }
 
-    await onButton(interaction);
-    return "handled";
+    try {
+      await onButton(interaction);
+      return "handled";
+    } catch {
+      return "failed";
+    }
   }
 
   if (!interaction.isChatInputCommand()) return "ignored";
@@ -30,8 +34,12 @@ export async function dispatchAuthorizedInteraction({
     return "denied";
   }
 
-  await onChatInput(interaction);
-  return "handled";
+  try {
+    await onChatInput(interaction);
+    return "handled";
+  } catch {
+    return "failed";
+  }
 }
 
 export async function dispatchAuthorizedMessage({ message, authorization, onMessage }) {
