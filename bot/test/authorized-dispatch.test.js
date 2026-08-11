@@ -170,3 +170,39 @@ test("authorized interactions and messages reach their protected handlers", asyn
   );
   assert.deepEqual(calls, ["command", "message"]);
 });
+test("authorized interaction handler failures are contained", async () => {
+  const interaction = {
+    user: { id: "allowed-user" },
+    isButton: () => false,
+    isChatInputCommand: () => true,
+  };
+
+  const status = await dispatchAuthorizedInteraction({
+    interaction,
+    authorization,
+    onButton: () => assert.fail("button handler must not run"),
+    onChatInput: async () => {
+      throw new Error("interaction expired");
+    },
+  });
+
+  assert.equal(status, "failed");
+});
+test("authorized button handler failures are contained", async () => {
+  const interaction = {
+    user: { id: "allowed-user" },
+    isButton: () => true,
+    isChatInputCommand: () => false,
+  };
+
+  const status = await dispatchAuthorizedInteraction({
+    interaction,
+    authorization,
+    onButton: async () => {
+      throw new Error("interaction expired");
+    },
+    onChatInput: () => assert.fail("chat handler must not run"),
+  });
+
+  assert.equal(status, "failed");
+});

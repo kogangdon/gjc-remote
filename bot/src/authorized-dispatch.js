@@ -15,8 +15,16 @@ export async function dispatchAuthorizedInteraction({
       return "denied";
     }
 
-    await onButton(interaction);
-    return "handled";
+    try {
+      await onButton(interaction);
+      return "handled";
+    } catch (error) {
+      console.error(
+        "Discord button interaction handler failed:",
+        error instanceof Error ? error.message : String(error)
+      );
+      return "failed";
+    }
   }
 
   if (!interaction.isChatInputCommand()) return "ignored";
@@ -30,8 +38,16 @@ export async function dispatchAuthorizedInteraction({
     return "denied";
   }
 
-  await onChatInput(interaction);
-  return "handled";
+  try {
+    await onChatInput(interaction);
+    return "handled";
+  } catch (error) {
+    console.error(
+      "Discord chat-input interaction handler failed:",
+      error instanceof Error ? error.message : String(error)
+    );
+    return "failed";
+  }
 }
 
 export async function dispatchAuthorizedMessage({ message, authorization, onMessage }) {
