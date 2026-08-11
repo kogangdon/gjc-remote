@@ -356,6 +356,8 @@ async function handleChatInputInteraction(interaction) {
     channelId: interaction.channelId,
     edit: (content) => interaction.editReply(noMentions(content)),
     deliver: (result) => deliverInteraction(interaction, commandName, result),
+    onGate: (gate) =>
+      renderGateToChannel(interaction.channel, interaction.channelId, route.hostId, gate),
   }).catch(async (error) => {
     console.error(`Failed to handle /${commandName} interaction:`, error);
     await interaction.editReply(noMentions("GJC request failed before a result could be delivered.")).catch((editError) => {
@@ -547,6 +549,10 @@ function renderGateToChannel(channel, channelId, hostId, gate) {
     lines.push("_Reply with the option number or its exact text._");
   } else {
     lines.push("_Reply in this channel with your answer._");
+  }
+  if (!channel || typeof channel.send !== "function") {
+    console.error("Failed to render workflow gate: channel is unavailable");
+    return Promise.resolve();
   }
   return channel.send(noMentions(lines.join("\n"))).catch((error) => {
     console.error("Failed to render workflow gate:", error);

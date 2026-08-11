@@ -338,13 +338,20 @@ export class HostRegistry {
         clearTimeout(pending.idleTimer);
         // Route to the dedicated gate callback (carries requestId, needed to send
         // the answer back). Not forwarded to onEvent — gates are not stream text.
-        pending.onGate?.({
-          gateId: event.gateId,
-          requestId: msg.requestId,
-          prompt: event.prompt,
-          kind: event.kind,
-          choices: event.choices,
-        });
+        try {
+          pending.onGate?.({
+            gateId: event.gateId,
+            requestId: msg.requestId,
+            prompt: event.prompt,
+            kind: event.kind,
+            choices: event.choices,
+          });
+        } catch (error) {
+          console.error(
+            "HostRegistry gate handler failed:",
+            error instanceof Error ? error.message : String(error)
+          );
+        }
         return;
       }
       const text = extractAssistantText(event);
