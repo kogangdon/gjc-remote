@@ -1144,6 +1144,49 @@ test("free-text gate (no options) passes the answer through verbatim", async () 
   await session.dispose();
 });
 
+test("a workflow gate suspends idle timers for every active run", async () => {
+  class MultiRunGatingAgent extends GatingAgentSession {
+    constructor() {
+      super({ gate_id: "g-all", kind: "question", context: { prompt: "Continue" } });
+      this.allowGate = new Promise((resolve) => {
+        this.releaseGate = resolve;
+      });
+      this.steerBlock = new Promise(() => {});
+    }
+    async prompt(message) {
+      this.calls.push(["prompt", message]);
+      await this.allowGate;
+      this.answers.push(await this.gateEmitter.emitGate(this.gates[0]));
+      this.emit({ type: "agent_end" });
+    }
+    async steer(message) {
+      this.calls.push(["steer", message]);
+      await this.steerBlock;
+    }
+  }
+
+  const agent = new MultiRunGatingAgent();
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 25,
+    hardCapMs: 5_000,
+    gateAnswerWindowMs: 1_000,
+  });
+  const prompt = session.send({ type: "prompt", message: "first" }, () => {});
+  const steer = session.send({ type: "steer", message: "adjust" }, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  agent.releaseGate();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(session.pendingGates.size, 1);
+  const lateSteer = session.send({ type: "steer", message: "late-adjust" }, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(session.pendingGates.size, 1);
+
+  await gateDelay(75);
+  assert.equal(session.closed, false);
+  await session.answerGate("g-all", "ok");
+  await session.dispose();
+  await Promise.allSettled([prompt, steer, lateSteer]);
+});
 test("gate-answer window expiry disposes the session with a distinct error", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g4",
@@ -1163,6 +1206,28 @@ test("gate-answer window expiry disposes the session with a distinct error", asy
   assert.equal(session.closed, true);
   await session.dispose();
   assert.equal(agent.disposeCalls >= 1, true);
+});
+test("a failed run removes its pending workflow gate", async () => {
+  class FailingGatingAgent extends GatingAgentSession {
+    async prompt(message) {
+      this.calls.push(["prompt", message]);
+      void this.gateEmitter.emitGate(this.gates[0]);
+      throw new Error("SDK prompt failed");
+    }
+  }
+
+  const agent = new FailingGatingAgent({
+    gate_id: "g-failure",
+    kind: "question",
+    context: { prompt: "Will fail" },
+  });
+  const session = new SdkSession(agent);
+  await assert.rejects(
+    session.send({ type: "prompt", message: "first" }, () => {}),
+    /SDK prompt failed/
+  );
+  assert.equal(session.pendingGates.size, 0);
+  await session.dispose();
 });
 
 test("answerGate on an unknown/stale gate id is a safe no-op", async () => {

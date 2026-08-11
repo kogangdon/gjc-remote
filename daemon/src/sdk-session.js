@@ -317,10 +317,11 @@ export class SdkSession {
       this.liveFollowUpAcceptance = new Promise((resolve) => {
         releaseAcceptance = resolve;
       });
-      const settleAcceptance = async (queued, observedAgentEnds) => {
+      const settleAcceptance = async (queued, getObservedAgentEnds) => {
         await previousAcceptance;
         let agentEndsToWait;
         if (queued) {
+          const observedAgentEnds = getObservedAgentEnds();
           agentEndsToWait =
             observedAgentEnds +
             this.outstandingAcceptedFollowUps +
@@ -372,9 +373,10 @@ export class SdkSession {
     this.queuedCommands += 1;
     const result = this.queue
       .then(async () => {
-        if (this.closed) throw new Error("GJC SDK session is not running");
-        const barrier = this.liveFollowUpBarrier;
-        if (barrier) await barrier;
+        while (this.liveFollowUpBarrier) {
+          const barrier = this.liveFollowUpBarrier;
+          await barrier;
+        }
         if (this.closed) throw new Error("GJC SDK session is not running");
         return this.#dispatch(command, onEvent, timeoutMs);
       })
@@ -507,7 +509,7 @@ export class SdkSession {
               throw error;
             }
             if (settleFollowUpAcceptance) {
-              requiredAgentEnds = await settleFollowUpAcceptance(true, observedAgentEnds);
+              requiredAgentEnds = await settleFollowUpAcceptance(true, () => observedAgentEnds);
               resolveIfComplete();
             }
           }
@@ -519,12 +521,23 @@ export class SdkSession {
         (controller) => {
           resetIdle = controller.arm;
           gateRun.controller = controller;
+          if (this.pendingGates.size > 0) {
+            controller.suspendForGate();
+          }
         }
       );
       if (eventConsumerError) throw eventConsumerError;
     } finally {
       markPromptInactive();
       unsubscribe();
+      for (const [gateId, entry] of this.pendingGates) {
+        if (entry.owner !== gateRun) continue;
+        this.pendingGates.delete(gateId);
+        for (const activeRun of this.activeGateRuns) {
+          activeRun.controller?.resumeAfterGate();
+        }
+        void this.#rejectGate(entry.emitter, gateId);
+      }
       const runIndex = this.activeGateRuns.indexOf(gateRun);
       if (runIndex >= 0) this.activeGateRuns.splice(runIndex, 1);
     }
@@ -581,9 +594,12 @@ export class SdkSession {
     this.pendingGates.set(gateId, {
       gate,
       emitter: gateEmitter,
+      owner: gateRun,
       controller: gateRun.controller,
     });
-    gateRun.controller?.suspendForGate();
+    for (const activeRun of this.activeGateRuns) {
+      activeRun.controller?.suspendForGate();
+    }
     try {
       gateRun.onEvent(event);
     } catch (error) {
@@ -627,7 +643,9 @@ export class SdkSession {
     const entry = this.pendingGates.get(gateId);
     if (!entry) return { ok: false, error: "no pending gate for id" };
     this.pendingGates.delete(gateId);
-    entry.controller?.resumeAfterGate();
+    for (const activeRun of this.activeGateRuns) {
+      activeRun.controller?.resumeAfterGate();
+    }
     try {
       const resolution = await entry.emitter.resolveGate({
         gate_id: gateId,
