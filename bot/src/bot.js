@@ -356,6 +356,8 @@ async function handleChatInputInteraction(interaction) {
     channelId: interaction.channelId,
     edit: (content) => interaction.editReply(noMentions(content)),
     deliver: (result) => deliverInteraction(interaction, commandName, result),
+    onGate: (gate) =>
+      renderGateToChannel(interaction.channel, interaction.channelId, route.hostId, gate),
   }).catch(async (error) => {
     console.error(`Failed to handle /${commandName} interaction:`, error);
     await interaction.editReply(noMentions("GJC request failed before a result could be delivered.")).catch((editError) => {
