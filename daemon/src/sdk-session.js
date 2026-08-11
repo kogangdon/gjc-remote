@@ -226,6 +226,7 @@ export class SdkSession {
     this.session = session;
     this.closed = false;
     this.queue = Promise.resolve();
+    this.queuedCommands = 0;
     this.inFlightControls = new Set();
     this.activePromptRuns = 0;
     this.pendingLiveFollowUps = 0;
@@ -281,6 +282,16 @@ export class SdkSession {
     this.gateUnsubscribe = undefined;
   }
 
+  isBusy() {
+    return (
+      this.queuedCommands > 0 ||
+      this.activePromptRuns > 0 ||
+      this.inFlightControls.size > 0 ||
+      this.pendingLiveFollowUps > 0 ||
+      this.outstandingAcceptedFollowUps > 0 ||
+      this.pendingGates.size > 0
+    );
+  }
   send(command, onEvent, timeoutMs = this.idleTimeoutMs) {
     if (this.closed) return Promise.reject(new Error("GJC SDK session is not running"));
 
@@ -358,13 +369,18 @@ export class SdkSession {
   }
 
   #enqueue(command, onEvent, timeoutMs) {
-    const result = this.queue.then(async () => {
-      if (this.closed) throw new Error("GJC SDK session is not running");
-      const barrier = this.liveFollowUpBarrier;
-      if (barrier) await barrier;
-      if (this.closed) throw new Error("GJC SDK session is not running");
-      return this.#dispatch(command, onEvent, timeoutMs);
-    });
+    this.queuedCommands += 1;
+    const result = this.queue
+      .then(async () => {
+        if (this.closed) throw new Error("GJC SDK session is not running");
+        const barrier = this.liveFollowUpBarrier;
+        if (barrier) await barrier;
+        if (this.closed) throw new Error("GJC SDK session is not running");
+        return this.#dispatch(command, onEvent, timeoutMs);
+      })
+      .finally(() => {
+        this.queuedCommands -= 1;
+      });
     this.queue = result.catch(() => {});
     return result;
   }
