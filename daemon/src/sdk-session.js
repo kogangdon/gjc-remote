@@ -521,6 +521,9 @@ export class SdkSession {
         (controller) => {
           resetIdle = controller.arm;
           gateRun.controller = controller;
+          if (this.pendingGates.size > 0) {
+            controller.suspendForGate();
+          }
         }
       );
       if (eventConsumerError) throw eventConsumerError;
@@ -530,8 +533,8 @@ export class SdkSession {
       for (const [gateId, entry] of this.pendingGates) {
         if (entry.owner !== gateRun) continue;
         this.pendingGates.delete(gateId);
-        for (const controller of entry.controllers ?? [entry.controller]) {
-          controller?.resumeAfterGate();
+        for (const activeRun of this.activeGateRuns) {
+          activeRun.controller?.resumeAfterGate();
         }
         void this.#rejectGate(entry.emitter, gateId);
       }
@@ -593,9 +596,6 @@ export class SdkSession {
       emitter: gateEmitter,
       owner: gateRun,
       controller: gateRun.controller,
-      controllers: this.activeGateRuns
-        .map((activeRun) => activeRun.controller)
-        .filter(Boolean),
     });
     for (const activeRun of this.activeGateRuns) {
       activeRun.controller?.suspendForGate();
@@ -643,8 +643,8 @@ export class SdkSession {
     const entry = this.pendingGates.get(gateId);
     if (!entry) return { ok: false, error: "no pending gate for id" };
     this.pendingGates.delete(gateId);
-    for (const controller of entry.controllers ?? [entry.controller]) {
-      controller?.resumeAfterGate();
+    for (const activeRun of this.activeGateRuns) {
+      activeRun.controller?.resumeAfterGate();
     }
     try {
       const resolution = await entry.emitter.resolveGate({

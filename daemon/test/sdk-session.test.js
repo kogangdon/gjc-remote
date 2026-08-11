@@ -1177,12 +1177,15 @@ test("a workflow gate suspends idle timers for every active run", async () => {
   agent.releaseGate();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(session.pendingGates.size, 1);
+  const lateSteer = session.send({ type: "steer", message: "late-adjust" }, () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(session.pendingGates.size, 1);
 
   await gateDelay(75);
   assert.equal(session.closed, false);
   await session.answerGate("g-all", "ok");
   await session.dispose();
-  await Promise.allSettled([prompt, steer]);
+  await Promise.allSettled([prompt, steer, lateSteer]);
 });
 test("gate-answer window expiry disposes the session with a distinct error", async () => {
   const agent = new GatingAgentSession({
