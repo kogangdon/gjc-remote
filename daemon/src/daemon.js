@@ -34,6 +34,7 @@ import {
   webSocketPayloadByteLength,
   webSocketPayloadToUtf8,
 } from "./ws-payload.js";
+import { serializeEventFrame } from "./event-frame.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -774,9 +775,7 @@ async function handleMessage(
 
   const { requestId, workDir, command } = msg;
   const send = (event, extra = {}) =>
-    connection.send(
-      JSON.stringify({ type: MSG_TYPES.EVENT, requestId, event, ...extra })
-    );
+    connection.send(serializeEventFrame(requestId, event, extra));
 
   try {
     let session;
