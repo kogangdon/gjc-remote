@@ -256,6 +256,7 @@ const pendingGateByChannel = new Map();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  allowedMentions: { parse: [] },
 });
 
 client.once("clientReady", () => {
@@ -586,12 +587,17 @@ async function handleButtonInteraction(interaction) {
 
   const text = formatToolLog(entry.toolCalls);
   if (text.length <= CHUNK_LIMIT) {
-    await interaction.reply({ content: text, ephemeral: true }).catch(() => {});
+    await interaction.reply(noMentions(text, { ephemeral: true })).catch(() => {});
     return;
   }
 
   const file = createTextAttachment(text, "gjc-tool-log.md");
-  await interaction.reply({ content: `Tool log (${entry.toolCalls.length} calls)`, files: [file], ephemeral: true }).catch(() => {});
+  await interaction.reply(
+    noMentions(`Tool log (${entry.toolCalls.length} calls)`, {
+      files: [file],
+      ephemeral: true,
+    })
+  ).catch(() => {});
 }
 
 function toolLogComponents(toolCalls) {
