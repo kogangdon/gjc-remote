@@ -27,6 +27,7 @@ import { dispatchGate } from "./managed-dispatch.js";
 import { createManagedAuthorityReader } from "./managed-authority-reader.js";
 import {
   CHUNK_LIMIT,
+  NO_MENTIONS,
   createTextAttachment,
   deliverResult,
   formatDeliveryError,
@@ -287,32 +288,39 @@ function formatHostProjection(projection) {
   return details.join(" — ");
 }
 
+function noMentions(content, extra = {}) {
+  return {
+    ...extra,
+    content,
+    allowedMentions: NO_MENTIONS,
+  };
+}
+
 async function handleChatInputInteraction(interaction) {
   const { commandName } = interaction;
-  if (!dispatchGate(channelMapping, (content) => interaction.reply({ content, ephemeral: true }), verifyLegacyFence)) return;
+  if (!dispatchGate(channelMapping, (content) => interaction.reply(noMentions(content, { ephemeral: true })), verifyLegacyFence)) return;
 
   if (commandName === "hosts") {
     const hosts = registry.listHosts();
-    await interaction.reply(
+    await interaction.reply(noMentions(
       hosts.length
         ? hosts.map(formatHostProjection).join("\n")
         : "No hosts connected."
-    );
+    ));
     return;
   }
 
   const route = channelMap[interaction.channelId];
   if (!route) {
-    await interaction.reply({
-      content: "This channel has no host/workDir mapping. Add it to channels.json.",
-      ephemeral: true,
-    });
+    await interaction.reply(
+      noMentions("This channel has no host/workDir mapping. Add it to channels.json.", { ephemeral: true })
+    );
     return;
   }
 
-  if (!dispatchGate(channelMapping, (content) => interaction.reply({ content, ephemeral: true }), verifyLegacyFence)) return;
+  if (!dispatchGate(channelMapping, (content) => interaction.reply(noMentions(content, { ephemeral: true })), verifyLegacyFence)) return;
   if (!registry.isOnline(route.hostId)) {
-    await interaction.reply({ content: `Host '${route.hostId}' is not connected right now.`, ephemeral: true });
+    await interaction.reply(noMentions(`Host '${route.hostId}' is not connected right now.`, { ephemeral: true }));
     return;
   }
 
@@ -325,10 +333,9 @@ async function handleChatInputInteraction(interaction) {
   if (isModel) {
     const name = interaction.options.getString("name", true);
     if (!isModelName(name)) {
-      await interaction.reply({
-        content: `Model name must be between 1 and ${V0_LIMITS.MODEL_NAME} characters.`,
-        ephemeral: true,
-      });
+      await interaction.reply(
+        noMentions(`Model name must be between 1 and ${V0_LIMITS.MODEL_NAME} characters.`, { ephemeral: true })
+      );
       return;
     }
     command = { kind: "set_model", modelName: name };
@@ -346,11 +353,11 @@ async function handleChatInputInteraction(interaction) {
     requestLabel: `${commandName}:${interaction.id}`,
     userId: interaction.user.id,
     channelId: interaction.channelId,
-    edit: (content) => interaction.editReply(content),
+    edit: (content) => interaction.editReply(noMentions(content)),
     deliver: (result) => deliverInteraction(interaction, commandName, result),
   }).catch(async (error) => {
     console.error(`Failed to handle /${commandName} interaction:`, error);
-    await interaction.editReply("GJC request failed before a result could be delivered.").catch((editError) => {
+    await interaction.editReply(noMentions("GJC request failed before a result could be delivered.")).catch((editError) => {
       console.error(`Failed to report /${commandName} interaction error:`, editError);
     });
   });
@@ -367,7 +374,7 @@ client.on("messageCreate", async (message) => {
 async function handleAuthorizedMessage(message) {
   const prompt = message.content.trim();
   if (!prompt) return;
-  if (!dispatchGate(channelMapping, (content) => message.reply(content), verifyLegacyFence)) return;
+  if (!dispatchGate(channelMapping, (content) => message.reply(noMentions(content)), verifyLegacyFence)) return;
 
   const route = channelMap[message.channelId];
   if (!route) return;
@@ -395,13 +402,13 @@ async function handleAuthorizedMessage(message) {
     );
   }
 
-  if (!dispatchGate(channelMapping, (content) => message.reply(content), verifyLegacyFence)) return;
+  if (!dispatchGate(channelMapping, (content) => message.reply(noMentions(content)), verifyLegacyFence)) return;
   if (!registry.isOnline(route.hostId)) {
-    await message.reply(`Host '${route.hostId}' is not connected right now.`).catch(() => {});
+    await message.reply(noMentions(`Host '${route.hostId}' is not connected right now.`)).catch(() => {});
     return;
   }
 
-  const progressMessage = await message.reply("Queued `gjc` prompt...").catch(() => undefined);
+  const progressMessage = await message.reply(noMentions("Queued `gjc` prompt...")).catch(() => undefined);
   if (!progressMessage) return;
 
   await runAndDeliver({
@@ -411,12 +418,12 @@ async function handleAuthorizedMessage(message) {
     requestLabel: `chat:${message.id}`,
     userId: message.author.id,
     channelId: message.channelId,
-    edit: (content) => progressMessage.edit(content),
+    edit: (content) => progressMessage.edit(noMentions(content)),
     deliver: (result) => deliverMessage(progressMessage, result),
     onGate: (gate) => renderGateToChannel(message.channel, message.channelId, route.hostId, gate),
   }).catch(async (error) => {
     console.error("Failed to handle message delivery:", error);
-    await progressMessage.edit("GJC request failed before a result could be delivered.").catch((editError) => {
+    await progressMessage.edit(noMentions("GJC request failed before a result could be delivered.")).catch((editError) => {
       console.error("Failed to report message delivery error:", editError);
     });
   });
@@ -540,7 +547,7 @@ function renderGateToChannel(channel, channelId, hostId, gate) {
   } else {
     lines.push("_Reply in this channel with your answer._");
   }
-  return channel.send(lines.join("\n")).catch((error) => {
+  return channel.send(noMentions(lines.join("\n"))).catch((error) => {
     console.error("Failed to render workflow gate:", error);
   });
 }
