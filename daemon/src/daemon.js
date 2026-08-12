@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { createHash } from "node:crypto";
 import WebSocket from "ws";
 import {
   CAPABILITIES,
@@ -18,6 +19,7 @@ import {
   isWorkspaceId,
   isReadinessWorkspaceGeneration,
   isAnswerMessage,
+  isBindWorkspaceMessage,
   isInvokeMessage,
   isPingMessage,
   isReadinessCapabilityGate,
@@ -277,6 +279,26 @@ let shutdownExitCode = null;
 let readinessSocketGeneration = 0;
 const readinessByConnection = new WeakMap();
 
+function bindingFingerprint(binding) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        binding.bindingId,
+        binding.hostId,
+        binding.mappingId,
+        binding.mappingGeneration,
+        binding.mappingVersion,
+        binding.workspaceId,
+        binding.workspaceGeneration,
+        binding.sourcePlatform,
+        binding.routeFingerprint,
+        binding.authorityFingerprint,
+        binding.inventoryGeneration,
+      ])
+    )
+    .digest("hex");
+}
+
 function nextReadinessSocketGeneration() {
   readinessSocketGeneration =
     readinessSocketGeneration >= Number.MAX_SAFE_INTEGER
@@ -328,10 +350,29 @@ function createReadinessState(connection) {
     workspaceKey: undefined,
     workspaceId: staticReadiness.workspaceId,
     workspaceGeneration: staticReadiness.workspaceGeneration,
+    binding: undefined,
+    bindingAccepted: false,
     lastError: staticErrorCode ? makeReadinessError(staticErrorCode) : undefined,
   };
   readinessByConnection.set(connection, state);
   return state;
+}
+
+function acceptWorkspaceBinding(state, message) {
+  if (
+    !state?.committed ||
+    message.hostId !== HOST_ID ||
+    message.workspaceId === undefined
+  ) {
+    return false;
+  }
+  state.binding = Object.freeze({ ...message });
+  // Binding acceptance is intentionally separate from readiness. The daemon
+  // still needs a verified local inventory match before it can serve.
+  state.bindingAccepted = true;
+  state.status.workspace = "unknown";
+  state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+  return true;
 }
 
 function clearReadinessTimer(state) {
@@ -757,6 +798,21 @@ async function handleMessage(
         );
       }
     }
+    return;
+  }
+  if (msg?.type === MSG_TYPES.BIND_WORKSPACE) {
+    if (!isBindWorkspaceMessage(msg) || !acceptWorkspaceBinding(readinessState, msg)) {
+      connection.close(1008, "invalid workspace binding");
+      return;
+    }
+    connection.send(
+      JSON.stringify({
+        type: MSG_TYPES.BIND_OK,
+        bindingId: msg.bindingId,
+        bindingFingerprint: bindingFingerprint(msg),
+      })
+    );
+    publishReadiness(readinessState);
     return;
   }
   const hasV2RouteField = [
