@@ -305,6 +305,59 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
   }
 });
 
+test("daemon rejects an invoke with a stale workspace generation", async () => {
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_WORKSPACE_INVENTORY: JSON.stringify({
+      version: 1,
+      inventoryGeneration: validBinding.inventoryGeneration,
+      workspaces: [{
+        hostId: validBinding.hostId,
+        mappingId: validBinding.mappingId,
+        mappingGeneration: validBinding.mappingGeneration,
+        workspaceGeneration: validBinding.workspaceGeneration,
+        mappingVersion: validBinding.mappingVersion,
+        workspaceId: validBinding.workspaceId,
+        sourcePlatform: validBinding.sourcePlatform,
+        workDir: "/srv/workspace",
+        routeFingerprint: validBinding.routeFingerprint,
+        authorityFingerprint: validBinding.authorityFingerprint,
+      }],
+    }),
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    daemon.peer.send(JSON.stringify(validBinding));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    await waitForMessage(
+      daemon.peer,
+      (message) => message.type === MSG_TYPES.READINESS && message.status.workspace === "ready"
+    );
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.INVOKE,
+      requestId: "stale-workspace-generation",
+      mappingId: validBinding.mappingId,
+      mappingGeneration: validBinding.mappingGeneration,
+      mappingVersion: validBinding.mappingVersion,
+      workspaceId: validBinding.workspaceId,
+      workspaceGeneration: validBinding.workspaceGeneration - 1,
+      command: { kind: "prompt", message: "hello" },
+    }));
+    const response = await onceMessage(daemon.peer, MSG_TYPES.EVENT);
+    assert.equal(response.requestId, "stale-workspace-generation");
+    assert.equal(JSON.parse(response.error).code, PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE);
+  } finally {
+    await daemon.close();
+  }
+});
+
 test("daemon rejects stale workspace binding generations", async () => {
   const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
   try {

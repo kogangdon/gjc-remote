@@ -609,6 +609,12 @@ function invokeMappingRejection(state, message) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED);
   }
   if (
+    message.workspaceGeneration !== undefined &&
+    message.workspaceGeneration !== state.workspaceGeneration
+  ) {
+    return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE);
+  }
+  if (
     message.mappingId !== state.mappingId ||
     message.mappingGeneration !== state.mappingGeneration ||
     message.mappingVersion !== state.mappingVersion ||
