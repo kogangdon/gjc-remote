@@ -31,7 +31,8 @@ provider, and resource gates below must close. Docker, platform, and readiness-c
 remain required at their later Docker or release boundary.
 1. **#44 mapping envelope:** the serving-runtime contract is the exact authenticated/versioned route
    envelope, not merely a field sketch. It includes `hostId`, `mappingId`, `mappingGeneration`,
-   `mappingVersion`, `sourcePlatform`, and either legacy `workDir` or `workspaceId`; canonical
+   `workspaceGeneration`, `mappingVersion`, `sourcePlatform`, and either legacy `workDir` or
+   `workspaceId`; canonical
    native/container roots, volume/share identity, case policy, persistence, migration timing,
    authentication, audit, idempotency, and concurrency ownership are defined. #44 alone mutates
    the mapping registry.
@@ -99,7 +100,8 @@ validation. Before that commit point ingress rejects workspaceId/mapping/readine
 sends none. Unknown or malformed versions/capabilities fail closed; replacement sockets start with
 v2 disabled and no inherited readiness.
 
-A v2 invoke repeats `mappingId`, `mappingGeneration`, and `mappingVersion`; a mappingVersion change
+A v2 invoke repeats `mappingId`, `mappingGeneration`, `workspaceGeneration`, and `mappingVersion`;
+a mappingVersion change
 must bump mappingGeneration or be rejected stale. Optional `workspaceId` and legacy `workDir` must
 resolve to the same mapping and generation. A legacy socket captures the #44 mapping fingerprint,
 route equality, and singleton default identity at registration. Legacy fallback is valid only when

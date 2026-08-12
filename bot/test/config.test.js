@@ -4,6 +4,7 @@ import {
   createManagedAuthoritySelection,
   loadChannelMapState,
   loadManagedChannelMapState,
+  projectManagedRoutes,
   parseAllowedUsers,
   parseChannelMap,
   parseHostTokens,
@@ -12,6 +13,8 @@ import {
   parseHostTokensForAuthority,
   validateChannelHosts,
 } from "../src/config.js";
+import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord } from "../../shared/mapping-envelope.js";
+import { canonicalJsonHash } from "../../shared/strict-json.js";
 
 test("parseChannelMap normalizes POSIX and Windows routes and omits _comment", () => {
   const raw = {
@@ -25,6 +28,67 @@ test("parseChannelMap normalizes POSIX and Windows routes and omits _comment", (
     "123": { hostId: "posix-host", workDir: "/srv/project" },
     "456": { hostId: "windows-host", workDir: String.raw`C:\work\project` },
     "789": { hostId: "unc-host", workDir: String.raw`\\server\share\project` },
+  });
+});
+
+test("projectManagedRoutes preserves authenticated workspace identity without paths", () => {
+  const mapping = fingerprintManagedMappingRecord({
+    mappingId: "mapping-1",
+    hostId: "host",
+    fenceGeneration: 1,
+    mappingGeneration: 4,
+    workspaceGeneration: 7,
+    mappingVersion: 1,
+    sourcePlatform: "posix",
+    workspaceId: "workspace-1",
+    workDir: null,
+    sourceRoot: "/srv/repo",
+    containerRoot: "/workspace",
+    volumeIdentity: "volume-1",
+    casePolicy: "sensitive",
+    immutableDefault: false,
+    mappingFingerprint: null,
+  });
+  const route = fingerprintManagedRouteRecord({
+    channelId: "123",
+    hostId: mapping.hostId,
+    mappingId: mapping.mappingId,
+    fenceGeneration: mapping.fenceGeneration,
+    mappingGeneration: mapping.mappingGeneration,
+    workspaceGeneration: mapping.workspaceGeneration,
+    mappingVersion: mapping.mappingVersion,
+    sourcePlatform: mapping.sourcePlatform,
+    workspaceId: mapping.workspaceId,
+    workDir: mapping.workDir,
+    routeFingerprint: null,
+  }, mapping);
+  const target = {
+    version: 2,
+    managementStamp: "gjc-management-channels/v2",
+    revision: 1,
+    authorityEpoch: 1,
+    fenceGeneration: 1,
+    mappingGeneration: 4,
+    tokenConfigGeneration: 1,
+    tokenConfigHostSetFingerprint: "a".repeat(64),
+    targetState: "managed",
+    dispatchClass: "workspace-only",
+    mappings: { [mapping.mappingId]: mapping },
+    routes: { "123": route },
+    configFingerprint: null,
+  };
+  const { configFingerprint: _ignored, ...withoutFingerprint } = target;
+  target.configFingerprint = canonicalJsonHash(withoutFingerprint);
+  const projected = projectManagedRoutes(target);
+  assert.deepEqual(projected["123"], {
+    hostId: "host",
+    workDir: null,
+    mappingId: "mapping-1",
+    mappingGeneration: 4,
+    workspaceGeneration: 7,
+    mappingVersion: 1,
+    sourcePlatform: "posix",
+    workspaceId: "workspace-1",
   });
 });
 

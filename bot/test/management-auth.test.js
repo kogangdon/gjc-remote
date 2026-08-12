@@ -340,7 +340,7 @@ test("issue #44 management rejects serving-shaped workDir mappings", async () =>
   });
   assert.equal(genesis.ok, true, JSON.stringify(genesis));
   const mapping = fingerprintManagedMappingRecord({
-    mappingId: "serving-shaped", hostId: "host", fenceGeneration: 1, mappingGeneration: 1,
+    mappingId: "serving-shaped", hostId: "host", fenceGeneration: 1, mappingGeneration: 1, workspaceGeneration: 1,
     mappingVersion: 1, sourcePlatform: "posix", workspaceId: null,
     workDir: "/srv/workspace", sourceRoot: "/srv/workspace",
     containerRoot: null, volumeIdentity: "volume-a", casePolicy: "sensitive",

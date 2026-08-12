@@ -114,13 +114,13 @@ const MANAGED_CHANNEL_KEYS = [
   "mappings", "routes", "configFingerprint",
 ];
 const MAPPING_KEYS = [
-  "mappingId", "hostId", "fenceGeneration", "mappingGeneration", "mappingVersion",
+  "mappingId", "hostId", "fenceGeneration", "mappingGeneration", "workspaceGeneration", "mappingVersion",
   "sourcePlatform", "workspaceId", "workDir", "sourceRoot",
   "containerRoot", "volumeIdentity", "casePolicy", "immutableDefault",
   "mappingFingerprint",
 ];
 const ROUTE_KEYS = [
-  "channelId", "hostId", "mappingId", "fenceGeneration", "mappingGeneration",
+  "channelId", "hostId", "mappingId", "fenceGeneration", "mappingGeneration", "workspaceGeneration",
   "mappingVersion", "sourcePlatform", "workspaceId", "workDir",
   "routeFingerprint",
 ];
@@ -165,7 +165,8 @@ function validMappingLocation(mapping) {
 export function validateManagedMappingRecord(mapping) {
   if (!exact(mapping, MAPPING_KEYS) || !OPAQUE_TOKEN.test(mapping.mappingId) ||
       !exactHostId(mapping.hostId) || !positiveFence(mapping.fenceGeneration) || !Number.isSafeInteger(mapping.mappingGeneration) ||
-      mapping.mappingGeneration < 1 || mapping.mappingVersion !== 1 ||
+      mapping.mappingGeneration < 1 || !Number.isSafeInteger(mapping.workspaceGeneration) ||
+      mapping.workspaceGeneration < 1 || mapping.mappingVersion !== 1 ||
       !validMappingLocation(mapping) || typeof mapping.immutableDefault !== "boolean" ||
       !isHex64(mapping.mappingFingerprint)) throw new TypeError("MANAGED_MAPPING_INVALID");
   const workspace = mapping.workspaceId !== null;
@@ -181,7 +182,7 @@ export function validateManagedRouteRecord(route, mapping) {
   if (!exact(route, ROUTE_KEYS) || !DISCORD_ID.test(route.channelId) ||
       !isHex64(route.routeFingerprint)) throw new TypeError("MANAGED_ROUTE_INVALID");
   validateManagedMappingRecord(mapping);
-  for (const key of ["hostId", "mappingId", "fenceGeneration", "mappingGeneration", "mappingVersion", "sourcePlatform", "workspaceId", "workDir"]) {
+  for (const key of ["hostId", "mappingId", "fenceGeneration", "mappingGeneration", "workspaceGeneration", "mappingVersion", "sourcePlatform", "workspaceId", "workDir"]) {
     if (route[key] !== mapping[key]) throw new TypeError("MANAGED_ROUTE_INVALID");
   }
   if (hashWithout(route, "routeFingerprint") !== route.routeFingerprint) throw new TypeError("MANAGED_ROUTE_INVALID");

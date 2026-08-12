@@ -34,9 +34,9 @@ shortfalls, and failed allow/deny egress probes.
 
 Existing native absolute `workDir` routes remain supported. Docker translation never guesses a
 root from path spelling. #44 owns authenticated mapping records containing an opaque `mappingId`,
-`mappingGeneration`, `mappingVersion`, source platform, canonical native root, canonical POSIX
+`mappingGeneration`, `workspaceGeneration`, `mappingVersion`, source platform, canonical native root, canonical POSIX
 container root, volume/share identity, and case policy.
-A v2 route and invoke repeat mapping identity and generation. POSIX, Windows drive, and UNC
+A v2 route and invoke repeat mapping identity, mapping generation, and workspace generation. POSIX, Windows drive, and UNC
 paths are validated using native rules, canonicalized by path segments, and translated only after
 identity checks. Windows drive/share identity, reparse/junction state, and final file identity
 must remain stable. Unsupported no-follow primitives fail closed with `CONTAINMENT_UNSUPPORTED`.

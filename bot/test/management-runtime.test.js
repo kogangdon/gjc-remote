@@ -500,7 +500,7 @@ test('pending bot writers require durable handshake and immutable admission arch
 
 function mappingInput(mappingId, generation = 1, fenceGeneration = 1, channelId = '123') {
   const mapping = fingerprintManagedMappingRecord({
-    mappingId, hostId: 'host', fenceGeneration, mappingGeneration: generation, mappingVersion: 1,
+    mappingId, hostId: 'host', fenceGeneration, mappingGeneration: generation, workspaceGeneration: generation, mappingVersion: 1,
     sourcePlatform: 'posix', workspaceId: 'workspace-a', workDir: null,
     sourceRoot: '/source', containerRoot: '/workspace', volumeIdentity: 'volume-a',
     casePolicy: 'sensitive', immutableDefault: false, mappingFingerprint: null,
@@ -509,6 +509,7 @@ function mappingInput(mappingId, generation = 1, fenceGeneration = 1, channelId 
     channelId, hostId: mapping.hostId, mappingId: mapping.mappingId,
     fenceGeneration: mapping.fenceGeneration,
     mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion,
+    workspaceGeneration: mapping.workspaceGeneration,
     sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId,
     workDir: mapping.workDir, routeFingerprint: null,
   }, mapping);
