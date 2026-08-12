@@ -91,6 +91,7 @@ async function startReadinessDaemon({
   envOverrides = {},
   onMessage,
   testInjection = true,
+  autoBind = false,
 } = {}) {
   const frames = [];
   const registrations = [];
@@ -105,6 +106,22 @@ async function startReadinessDaemon({
       if (message.type === "register") {
         registrations.push(message);
         socket.send(JSON.stringify(registerResponse));
+        if (autoBind && registerResponse.protocolVersion === 2) {
+          socket.send(JSON.stringify({
+            type: "bind_workspace",
+            bindingId: "binding-test",
+            hostId: "readiness-test-host",
+            mappingId: "mapping-test",
+            mappingGeneration: 1,
+            mappingVersion: 1,
+            workspaceId: "workspace-test",
+            workspaceGeneration: 1,
+            sourcePlatform: "windows-drive",
+            routeFingerprint: "a".repeat(64),
+            authorityFingerprint: "b".repeat(64),
+            inventoryGeneration: 1,
+          }));
+        }
         return;
       }
       frames.push(message);
@@ -128,6 +145,22 @@ async function startReadinessDaemon({
       GJC_READINESS_TEST_MAPPING_GENERATION: "1",
       GJC_READINESS_TEST_MAPPING_VERSION: "1",
       GJC_READINESS_TEST_WORK_DIR: "C:\\workspace",
+      GJC_WORKSPACE_INVENTORY: JSON.stringify({
+        version: 1,
+        inventoryGeneration: 1,
+        workspaces: [{
+          hostId: "readiness-test-host",
+          mappingId: "mapping-test",
+          mappingGeneration: 1,
+          workspaceGeneration: 1,
+          mappingVersion: 1,
+          workspaceId: "workspace-test",
+          sourcePlatform: "windows-drive",
+          workDir: "C:\\workspace",
+          routeFingerprint: "a".repeat(64),
+          authorityFingerprint: "b".repeat(64),
+        }],
+      }),
       ...envOverrides,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -365,7 +398,7 @@ test("v2 starts connected-not-ready and ignores legacy readiness labels and work
 });
 
 test("v2 probe success promotes all dimensions only with explicit mapping evidence", async () => {
-  const daemon = await startReadinessDaemon();
+  const daemon = await startReadinessDaemon({ autoBind: true });
   try {
     await waitForFrame(
       daemon.frames,
@@ -442,6 +475,7 @@ test("missing authenticated mapping stays non-ready and rejects before session c
 test("duplicate register_ok cannot change a committed readiness handshake", async () => {
   let duplicateSent = false;
   const daemon = await startReadinessDaemon({
+    autoBind: true,
     onMessage(message, socket) {
       if (message.type === "readiness" && !duplicateSent) {
         duplicateSent = true;
