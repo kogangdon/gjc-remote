@@ -90,6 +90,31 @@ test("projectManagedRoutes preserves authenticated workspace identity without pa
     sourcePlatform: "posix",
     workspaceId: "workspace-1",
   });
+
+  const legacyMapping = fingerprintManagedMappingRecord({
+    ...mapping,
+    workspaceId: null,
+    workDir: "/srv/repo",
+    mappingFingerprint: null,
+  });
+  const legacyRoute = fingerprintManagedRouteRecord({
+    ...route,
+    workspaceId: null,
+    workDir: "/srv/repo",
+    routeFingerprint: null,
+  }, legacyMapping);
+  const legacyTarget = {
+    ...target,
+    mappings: { [legacyMapping.mappingId]: legacyMapping },
+    routes: { "123": legacyRoute },
+    configFingerprint: null,
+  };
+  const { configFingerprint: _legacyIgnored, ...legacyWithoutFingerprint } = legacyTarget;
+  legacyTarget.configFingerprint = canonicalJsonHash(legacyWithoutFingerprint);
+  assert.throws(
+    () => projectManagedRoutes(legacyTarget),
+    { name: "TypeError", message: "MANAGED_ROUTE_PATH_FORBIDDEN" }
+  );
 });
 
 test("parseChannelMap returns fresh objects without mutating its input", () => {

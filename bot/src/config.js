@@ -305,6 +305,11 @@ export function loadChannelMapState({ current, readText, validate = () => {} }) 
 
 export function projectManagedRoutes(target, validate = () => {}) {
   validateManagedChannelsV2(target);
+  for (const route of Object.values(target.routes)) {
+    if (route.workDir !== null) {
+      throw new TypeError("MANAGED_ROUTE_PATH_FORBIDDEN");
+    }
+  }
   const projected = Object.fromEntries(
     Object.entries(target.routes).map(([channelId, route]) => [
       channelId,
