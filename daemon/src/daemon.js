@@ -366,6 +366,30 @@ function acceptWorkspaceBinding(state, message) {
   ) {
     return false;
   }
+  const previous = state.binding;
+  if (previous) {
+    const sameBinding = [
+      "bindingId",
+      "hostId",
+      "mappingId",
+      "mappingGeneration",
+      "mappingVersion",
+      "workspaceId",
+      "workspaceGeneration",
+      "sourcePlatform",
+      "routeFingerprint",
+      "authorityFingerprint",
+      "inventoryGeneration",
+    ].every((field) => previous[field] === message[field]);
+    if (!sameBinding && (
+      message.mappingGeneration < previous.mappingGeneration ||
+      message.workspaceGeneration < previous.workspaceGeneration ||
+      message.inventoryGeneration < previous.inventoryGeneration
+    )) {
+      return false;
+    }
+    if (sameBinding) return true;
+  }
   state.binding = Object.freeze({ ...message });
   // Binding acceptance is intentionally separate from readiness. The daemon
   // still needs a verified local inventory match before it can serve.
@@ -809,6 +833,9 @@ async function handleMessage(
       JSON.stringify({
         type: MSG_TYPES.BIND_OK,
         bindingId: msg.bindingId,
+        // This is an acknowledgement receipt, not authority proof. The
+        // fingerprint covers sender-supplied fields; local inventory and
+        // authenticated mapping verification remain separate gates.
         bindingFingerprint: bindingFingerprint(msg),
       })
     );

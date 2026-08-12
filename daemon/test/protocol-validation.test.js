@@ -157,6 +157,19 @@ async function startDaemon(extraEnv = {}) {
   };
 }
 
+function onceMessage(socket, type) {
+  return new Promise((resolve) => {
+    const onMessage = (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === type) {
+        socket.off("message", onMessage);
+        resolve(message);
+      }
+    };
+    socket.on("message", onMessage);
+  });
+}
+
 test("daemon accepts path-free workspace binding without promoting readiness", async () => {
   const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
   try {
@@ -184,6 +197,54 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
     const response = await bindOk;
     assert.equal(response.type, MSG_TYPES.BIND_OK);
     assert.equal(response.bindingId, validBinding.bindingId);
+
+    const postBindReadiness = new Promise((resolve) => {
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type === MSG_TYPES.READINESS) {
+          daemon.peer.off("message", onMessage);
+          resolve(message);
+        }
+      };
+      daemon.peer.on("message", onMessage);
+    });
+    const readiness = await postBindReadiness;
+    assert.equal(readiness.status.workspace, "unknown");
+    assert.equal(readiness.lastError?.code, PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon rejects stale workspace binding generations", async () => {
+  const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
+  try {
+    const registerOk = new Promise((resolve) => {
+      const onMessage = (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type === MSG_TYPES.READINESS) {
+          daemon.peer.off("message", onMessage);
+          resolve(message);
+        }
+      };
+      daemon.peer.on("message", onMessage);
+    });
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await registerOk;
+    daemon.peer.send(JSON.stringify(validBinding));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify({
+      ...validBinding,
+      mappingGeneration: validBinding.mappingGeneration - 1,
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
   } finally {
     await daemon.close();
   }
