@@ -303,6 +303,18 @@ this gap; it is out of scope for this change and tracked separately from
 the in-tree runtime check documented above.
 
 #44 does not authorize daemon serving or readiness, OAuth/provider setup,
-network deployment, container rollout, or changes under `ops/`. Native serving
+network deployment, container rollout, or changes under `ops`. Native serving
 and readiness remain blocked pending their separately required native-applicable
 gates and evidence.
+
+## Pre-production schema compatibility policy
+
+The managed mapping envelope is still pre-production scaffolding. During this
+phase, adding a required authenticated field is allowed without a compatibility
+migration when the field is covered by the record fingerprint and exact-key
+validation. Older durable managed state must fail closed as
+`WORKSPACE_MAPPING_UNAVAILABLE`; it must not be guessed, silently upgraded, or
+served. Operators must regenerate it through the management authority before
+serving is enabled. A production schema change requires an explicit
+`mappingVersion` bump and a verified migration or a documented replacement
+procedure before release promotion.

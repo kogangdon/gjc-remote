@@ -2051,6 +2051,7 @@ export class ManagementRuntime {
           hostId: mapping.hostId,
           mappingId: mapping.mappingId,
           mappingGeneration: mapping.mappingGeneration,
+          workspaceGeneration: mapping.workspaceGeneration,
           mappingVersion: mapping.mappingVersion,
           sourcePlatform: mapping.sourcePlatform,
           workspaceId: mapping.workspaceId,
@@ -2645,7 +2646,7 @@ export class ManagementRuntime {
     const mapping = fingerprintManagedMappingRecord({ ...candidate, fenceGeneration: state.fenceGeneration, mappingGeneration: state.mappingGeneration + 1 });
     const routes = {};
     for (const candidateRoute of routeCandidates) {
-      const route = fingerprintManagedRouteRecord({ ...candidateRoute, fenceGeneration: mapping.fenceGeneration, hostId: mapping.hostId, mappingId: mapping.mappingId, mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion, sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId, workDir: mapping.workDir }, mapping);
+      const route = fingerprintManagedRouteRecord({ ...candidateRoute, fenceGeneration: mapping.fenceGeneration, hostId: mapping.hostId, mappingId: mapping.mappingId, mappingGeneration: mapping.mappingGeneration, workspaceGeneration: mapping.workspaceGeneration, mappingVersion: mapping.mappingVersion, sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId, workDir: mapping.workDir }, mapping);
       if (Object.hasOwn(routes, route.channelId)) throw new Error("MAPPING_INVALID");
       routes[route.channelId] = route;
     }

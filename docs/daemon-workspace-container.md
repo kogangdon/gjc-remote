@@ -32,10 +32,11 @@ fails before workload admission.
 ## Absolute paths and mappings
 
 The bot remains a syntax-only forwarder for POSIX, Windows drive, and UNC absolute paths. #44's
-mapping record is authoritative and includes `mappingId`, `mappingGeneration`, `sourcePlatform`,
+#44's mapping record is authoritative and includes `mappingId`, `mappingGeneration`,
+`workspaceGeneration`, `sourcePlatform`,
 canonical source/container roots, volume/share identity, and case policy.
 
-The v2 route and invoke repeat mapping identity and generation. Resolve the record from
+The v2 route and invoke repeat mapping identity, mapping generation, and workspace generation. Resolve the record from
 authenticated state, check host ownership, `mappingVersion`, source volume/share identity, and
 case policy, then translate only the verified relative suffix. A Windows drive must match drive
 identity; a UNC path must match server/share identity. Do not replace slashes or infer a root.

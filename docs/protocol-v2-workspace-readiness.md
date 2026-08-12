@@ -13,8 +13,8 @@ workspaceId, mapping identity, or readiness fields. A replacement socket starts 
 The negotiated v2 invoke is bounded and carries the route identity:
 
 ```text
-{ type: "invoke", requestId, mappingId, mappingGeneration, mappingVersion,
-  workspaceId?, workDir?, command }
+{ type: "invoke", requestId, mappingId, mappingGeneration, workspaceGeneration,
+  mappingVersion, workspaceId?, workDir?, command }
 ```
 
 If both `workspaceId` and `workDir` are present they must resolve to identical mapping and
@@ -22,7 +22,8 @@ workspace generation. Missing, foreign, stale, or mismatched identity is a stabl
 
 ## Mapping and legacy fallback
 
-A route references an opaque `mappingId`, `mappingGeneration`, `mappingVersion`, `sourcePlatform`,
+A route references an opaque `mappingId`, `mappingGeneration`, `workspaceGeneration`,
+`mappingVersion`, `sourcePlatform`,
 and optionally `workspaceId` or legacy `workDir`. #44 owns the exact envelope and persistence. The
 daemon validates host ownership, source root/share/volume identity, generation, canonical equality,
 case policy, and containment. Workspace IDs are bounded safe-alphabet tokens and are looked up in

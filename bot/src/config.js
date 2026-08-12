@@ -117,7 +117,7 @@ export function verifyLegacyV0SourceFence(options, expectedFence) {
 }
 
 import { isFullyQualifiedRouteWorkDir } from "@gjc-remote/shared/work-dir.js";
-import { classifyMappingEnvelope, parseManagedHostTokens } from "@gjc-remote/shared/mapping-envelope";
+import { classifyMappingEnvelope, parseManagedHostTokens, validateManagedChannelsV2 } from "@gjc-remote/shared/mapping-envelope";
 
 
 function isPlainObject(value) {
@@ -302,6 +302,33 @@ export function loadChannelMapState({ current, readText, validate = () => {} }) 
     return { ok: false, map: current, error };
   }
 }
+
+export function projectManagedRoutes(target, validate = () => {}) {
+  validateManagedChannelsV2(target);
+  for (const route of Object.values(target.routes)) {
+    if (route.workDir !== null) {
+      throw new TypeError("MANAGED_ROUTE_PATH_FORBIDDEN");
+    }
+  }
+  const projected = Object.fromEntries(
+    Object.entries(target.routes).map(([channelId, route]) => [
+      channelId,
+      {
+        hostId: route.hostId,
+        workDir: route.workDir,
+        mappingId: route.mappingId,
+        mappingGeneration: route.mappingGeneration,
+        workspaceGeneration: route.workspaceGeneration,
+        mappingVersion: route.mappingVersion,
+        sourcePlatform: route.sourcePlatform,
+        workspaceId: route.workspaceId,
+      },
+    ])
+  );
+  validate(projected);
+  return projected;
+}
+
 export async function loadManagedChannelMapState({
   current,
   readSnapshot,
@@ -357,10 +384,14 @@ export async function loadManagedChannelMapState({
       parseLegacyV0,
     });
     if (!classification.ok) return unavailableState("WORKSPACE_MAPPING_UNAVAILABLE");
+    const target = JSON.parse(Buffer.from(snapshot.targetBytes).toString("utf8"));
+    const map = classification.sourceKind === "managed-v1"
+      ? projectManagedRoutes(target, validate)
+      : {};
 
     return {
       ok: true,
-      map: {},
+      map,
       classification: {
         sourceKind: classification.sourceKind,
         dispatchClass: classification.dispatchClass,
