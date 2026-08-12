@@ -457,6 +457,8 @@ export const MSG_TYPES = Object.freeze({
   REGISTER: "register",
   REGISTER_OK: "register_ok",
   REGISTER_DENIED: "register_denied",
+  BIND_WORKSPACE: "bind_workspace",
+  BIND_OK: "bind_ok",
   INVOKE: "invoke",
   EVENT: "event",
   PING: "ping",
@@ -822,6 +824,67 @@ export function isRegisterDeniedMessage(value) {
     isObject(value) &&
     value.type === MSG_TYPES.REGISTER_DENIED &&
     isBoundedString(value.reason, V0_LIMITS.DENIAL_REASON, true)
+  );
+}
+
+const HEX64_PATTERN = /^[0-9a-f]{64}$/;
+const BINDING_SOURCE_PLATFORMS = new Set(["posix", "windows-drive", "windows-unc"]);
+
+function isHex64(value) {
+  return typeof value === "string" && HEX64_PATTERN.test(value);
+}
+
+function isBindingIdentity(value) {
+  return (
+    isObject(value) &&
+    isMappingId(value.bindingId) &&
+    isBoundedString(value.hostId, V0_LIMITS.HOST_ID) &&
+    isMappingId(value.mappingId) &&
+    isMappingGeneration(value.mappingGeneration) &&
+    isMappingVersion(value.mappingVersion) &&
+    isWorkspaceId(value.workspaceId) &&
+    isReadinessWorkspaceGeneration(value.workspaceGeneration) &&
+    BINDING_SOURCE_PLATFORMS.has(value.sourcePlatform) &&
+    isHex64(value.routeFingerprint) &&
+    isHex64(value.authorityFingerprint) &&
+    isReadinessWorkspaceGeneration(value.inventoryGeneration)
+  );
+}
+
+/**
+ * The management authority sends this path-free binding after registration.
+ * It is deliberately only an identity/proof tuple: the daemon must resolve
+ * the workspace from its own verified local inventory before serving it.
+ */
+export function isBindWorkspaceMessage(value) {
+  if (!isBindingIdentity(value) || value.type !== MSG_TYPES.BIND_WORKSPACE) return false;
+  return Object.keys(value).every((key) => [
+    "type",
+    "bindingId",
+    "hostId",
+    "mappingId",
+    "mappingGeneration",
+    "mappingVersion",
+    "workspaceId",
+    "workspaceGeneration",
+    "sourcePlatform",
+    "routeFingerprint",
+    "authorityFingerprint",
+    "inventoryGeneration",
+  ].includes(key));
+}
+
+export function isBindOkMessage(value) {
+  if (
+    !isObject(value) ||
+    value.type !== MSG_TYPES.BIND_OK ||
+    !isBoundedString(value.bindingId, V2_LIMITS.MAPPING_ID) ||
+    !isHex64(value.bindingFingerprint)
+  ) {
+    return false;
+  }
+  return Object.keys(value).every((key) =>
+    ["type", "bindingId", "bindingFingerprint"].includes(key)
   );
 }
 
