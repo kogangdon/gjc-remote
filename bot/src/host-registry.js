@@ -145,7 +145,7 @@ export class HostRegistry {
     this.pendingCountBySocket = new Map();
     /** @type {Map<string, { protocolVersion: number, capabilities: string[] }>} */
     this.hostInfo = new Map();
-    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number, workspaceId?: string, workspaceGeneration?: number }>} */
+    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number, bindingId?: string, workspaceId?: string, workspaceGeneration?: number }>} */
     this.readinessAuthorities = new Map();
     /** @type {Map<string, object>} */
     this.readinessStates = new Map();
@@ -249,6 +249,7 @@ export class HostRegistry {
         },
         workspaceId: undefined,
         workspaceGeneration: undefined,
+        bindingId: undefined,
         workspaceDimensions: undefined,
         workspaceExpiresAt: undefined,
         workspaceMonoExpiresAt: undefined,
@@ -492,6 +493,7 @@ export class HostRegistry {
       }
       state.workspaceId = msg.workspaceId;
       state.workspaceGeneration = msg.workspaceGeneration;
+      state.bindingId = msg.bindingId;
       state.hostDimensions = { ...msg.status };
       state.workspaceDimensions = { ...msg.status };
       state.workspaceExpiresAt = receivedAt + ttlMs;
@@ -522,6 +524,7 @@ export class HostRegistry {
       socketGeneration: state.socketGeneration,
       revision: state.revision,
       observedAt: state.observedAt,
+      bindingId: state.bindingId,
       workspaceId: state.workspaceId,
       workspaceGeneration: state.workspaceGeneration,
     });
@@ -649,6 +652,7 @@ export class HostRegistry {
       socketGeneration: state.socketGeneration ?? null,
     };
     if (state.workspaceId !== undefined) {
+      if (state.bindingId !== undefined) projection.bindingId = state.bindingId;
       projection.workspaceId = redactOpaqueId(state.workspaceId);
       projection.workspaceGeneration = state.workspaceGeneration;
     }
@@ -896,6 +900,24 @@ export class HostRegistry {
     };
   }
 
+  /**
+   * Resolve the current receiver-local binding for a managed route. The
+   * binding id is transport identity, not control-plane authority.
+   */
+  resolveBindingId(hostId, routeIdentity = {}) {
+    const state = this.readinessStates.get(hostId);
+    if (!state || this.connections.get(hostId) !== state.socket) return undefined;
+    if (
+      routeIdentity.workspaceId !== undefined &&
+      state.workspaceId !== routeIdentity.workspaceId
+    ) return undefined;
+    if (
+      routeIdentity.workspaceGeneration !== undefined &&
+      state.workspaceGeneration !== routeIdentity.workspaceGeneration
+    ) return undefined;
+    return state.bindingId;
+  }
+
 /**
  * Sends an invoke request to a host and resolves once the daemon reports
  * `done: true` for that requestId. Streamed events are delivered via onEvent
@@ -909,7 +931,7 @@ export class HostRegistry {
  * @param {(gate: { gateId: string, requestId: string, prompt: string, kind: string, choices?: {value: unknown, label: string}[] }) => void} [onGate]
  *   #35: invoked when the daemon opens a workflow gate; carries the requestId
  *   needed to route the answer back via answerGate().
- * @param {{ mappingId?: string, mappingGeneration?: number, mappingVersion?: number,
+ * @param {{ bindingId?: string, mappingId?: string, mappingGeneration?: number, mappingVersion?: number,
  *   workspaceId?: string, workspaceGeneration?: number }} [routeIdentity]
  */
 invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, onGate, routeIdentity) {
@@ -955,7 +977,12 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     const usesV2 = readiness?.readinessEnabled === true;
     const invoke = { type: MSG_TYPES.INVOKE, requestId, command };
     if (usesV2) {
-      for (const [key, value] of Object.entries(routeIdentity ?? {})) {
+      const effectiveRouteIdentity = {
+        ...routeIdentity,
+        bindingId: routeIdentity?.bindingId ??
+          this.resolveBindingId(hostId, routeIdentity),
+      };
+      for (const [key, value] of Object.entries(effectiveRouteIdentity)) {
         if (value !== undefined && value !== null) invoke[key] = value;
       }
       if (workDir !== undefined && workDir !== null) invoke.workDir = workDir;

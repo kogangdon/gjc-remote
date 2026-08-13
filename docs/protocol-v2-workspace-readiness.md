@@ -13,7 +13,7 @@ workspaceId, mapping identity, or readiness fields. A replacement socket starts 
 The negotiated v2 invoke is bounded and carries the route identity:
 
 ```text
-{ type: "invoke", requestId, mappingId, mappingGeneration, workspaceGeneration,
+{ type: "invoke", requestId, bindingId?, mappingId, mappingGeneration, workspaceGeneration,
   mappingVersion, workspaceId?, workDir?, command }
 ```
 

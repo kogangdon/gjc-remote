@@ -412,6 +412,45 @@ test("valid invoke events relay callbacks and assistant text", async () => {
     await server.close();
   }
 });
+
+test("managed v2 invokes carry the bindingId selected by readiness", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(
+      socket,
+      readinessFrame({
+        bindingId: "binding-1",
+        observedAt: Date.now(),
+      })
+    );
+    assert.equal(server.registry.getHostReadiness("host-a").bindingId, "binding-1");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "hello" },
+      () => {},
+      1000,
+      undefined,
+      {
+        mappingId: "mapping-1",
+        mappingGeneration: 1,
+        mappingVersion: 1,
+        workspaceId: "workspace-1",
+        workspaceGeneration: 1,
+      }
+    );
+    const [raw] = await invokeFrame;
+    const invoke = JSON.parse(raw.toString());
+    assert.equal(invoke.bindingId, "binding-1");
+    assert.equal(invoke.workspaceId, "workspace-1");
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+  } finally {
+    await server.close();
+  }
+});
 test("invoke idle timer resets on each streamed event", async () => {
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 60,
