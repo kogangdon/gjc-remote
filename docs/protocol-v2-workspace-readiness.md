@@ -20,6 +20,12 @@ The negotiated v2 invoke is bounded and carries the route identity:
 If both `workspaceId` and `workDir` are present they must resolve to identical mapping and
 workspace generation. Missing, foreign, stale, or mismatched identity is a stable rejection.
 
+The daemon may promote a bound workspace to `ready` only after its local inventory independently
+matches the authenticated binding tuple, including `mappingGeneration`, `workspaceGeneration`,
+`mappingVersion`, source platform, route/authority fingerprints, and inventory generation. The
+inventory's local `workDir` is never sent in the managed bind frame and is capability evidence,
+not a second mapping authority. Missing or drifted inventory remains non-ready.
+
 ## Mapping and legacy fallback
 
 A route references an opaque `mappingId`, `mappingGeneration`, `workspaceGeneration`,

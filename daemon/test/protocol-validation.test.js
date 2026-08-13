@@ -36,6 +36,7 @@ import {
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { WebSocketServer } from "ws";
+import { findWorkspaceInventory, parseWorkspaceInventory } from "../src/workspace-inventory.js";
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const CHILD_EXIT_TIMEOUT_MS = 2_000;
@@ -82,6 +83,38 @@ test("workspace binding is path-free and validates the complete identity tuple",
     isBindWorkspaceMessage({ ...validBinding, workDir: "/srv/workspace" }),
     false,
     "managed binding must not carry a path"
+  );
+});
+
+test("local workspace inventory validates and matches the complete binding identity", () => {
+  const inventory = parseWorkspaceInventory(JSON.stringify({
+    version: 1,
+    inventoryGeneration: validBinding.inventoryGeneration,
+    workspaces: [{
+      hostId: validBinding.hostId,
+      mappingId: validBinding.mappingId,
+      mappingGeneration: validBinding.mappingGeneration,
+      workspaceGeneration: validBinding.workspaceGeneration,
+      mappingVersion: validBinding.mappingVersion,
+      workspaceId: validBinding.workspaceId,
+      sourcePlatform: validBinding.sourcePlatform,
+      workDir: "/srv/workspace",
+      routeFingerprint: validBinding.routeFingerprint,
+      authorityFingerprint: validBinding.authorityFingerprint,
+    }],
+  }));
+  assert.equal(inventory.workspaces.length, 1);
+  assert.ok(findWorkspaceInventory(inventory, validBinding));
+  assert.equal(
+    findWorkspaceInventory(inventory, { ...validBinding, mappingGeneration: 3 }),
+    undefined
+  );
+  assert.throws(
+    () => parseWorkspaceInventory(JSON.stringify({
+      ...inventory,
+      workspaces: [{ ...inventory.workspaces[0], workspaceGeneration: 0 }],
+    })),
+    /WORKSPACE_INVENTORY_INVALID/
   );
 });
 
@@ -170,6 +203,19 @@ function onceMessage(socket, type) {
   });
 }
 
+function waitForMessage(socket, predicate) {
+  return new Promise((resolve) => {
+    const onMessage = (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (predicate(message)) {
+        socket.off("message", onMessage);
+        resolve(message);
+      }
+    };
+    socket.on("message", onMessage);
+  });
+}
+
 test("daemon accepts path-free workspace binding without promoting readiness", async () => {
   const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
   try {
@@ -211,6 +257,102 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
     const readiness = await postBindReadiness;
     assert.equal(readiness.status.workspace, "unknown");
     assert.equal(readiness.lastError?.code, PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon promotes workspace readiness only after local inventory proof", async () => {
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_WORKSPACE_INVENTORY: JSON.stringify({
+      version: 1,
+      inventoryGeneration: validBinding.inventoryGeneration,
+      workspaces: [{
+        hostId: validBinding.hostId,
+        mappingId: validBinding.mappingId,
+        mappingGeneration: validBinding.mappingGeneration,
+        workspaceGeneration: validBinding.workspaceGeneration,
+        mappingVersion: validBinding.mappingVersion,
+        workspaceId: validBinding.workspaceId,
+        sourcePlatform: validBinding.sourcePlatform,
+        workDir: "/srv/workspace",
+        routeFingerprint: validBinding.routeFingerprint,
+        authorityFingerprint: validBinding.authorityFingerprint,
+      }],
+    }),
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    daemon.peer.send(JSON.stringify(validBinding));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    const readiness = await waitForMessage(
+      daemon.peer,
+      (message) => message.type === MSG_TYPES.READINESS && message.status.workspace === "ready"
+    );
+    assert.equal(readiness.status.workspace, "ready");
+    assert.equal(readiness.workspaceId, validBinding.workspaceId);
+    assert.equal(readiness.workspaceGeneration, validBinding.workspaceGeneration);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon rejects an invoke with a stale workspace generation", async () => {
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_WORKSPACE_INVENTORY: JSON.stringify({
+      version: 1,
+      inventoryGeneration: validBinding.inventoryGeneration,
+      workspaces: [{
+        hostId: validBinding.hostId,
+        mappingId: validBinding.mappingId,
+        mappingGeneration: validBinding.mappingGeneration,
+        workspaceGeneration: validBinding.workspaceGeneration,
+        mappingVersion: validBinding.mappingVersion,
+        workspaceId: validBinding.workspaceId,
+        sourcePlatform: validBinding.sourcePlatform,
+        workDir: "/srv/workspace",
+        routeFingerprint: validBinding.routeFingerprint,
+        authorityFingerprint: validBinding.authorityFingerprint,
+      }],
+    }),
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    daemon.peer.send(JSON.stringify(validBinding));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    await waitForMessage(
+      daemon.peer,
+      (message) => message.type === MSG_TYPES.READINESS && message.status.workspace === "ready"
+    );
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.INVOKE,
+      requestId: "stale-workspace-generation",
+      mappingId: validBinding.mappingId,
+      mappingGeneration: validBinding.mappingGeneration,
+      mappingVersion: validBinding.mappingVersion,
+      workspaceId: validBinding.workspaceId,
+      workspaceGeneration: validBinding.workspaceGeneration - 1,
+      command: { kind: "prompt", message: "hello" },
+    }));
+    const response = await onceMessage(daemon.peer, MSG_TYPES.EVENT);
+    assert.equal(response.requestId, "stale-workspace-generation");
+    assert.equal(JSON.parse(response.error).code, PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE);
   } finally {
     await daemon.close();
   }

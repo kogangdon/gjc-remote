@@ -37,6 +37,7 @@ import {
   webSocketPayloadToUtf8,
 } from "./ws-payload.js";
 import { serializeEventFrame } from "./event-frame.js";
+import { findWorkspaceInventory, parseWorkspaceInventory } from "./workspace-inventory.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -149,6 +150,16 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
 const READINESS_TEST_INJECTION_ENABLED =
   process.env.GJC_READINESS_TEST_INJECTION === "1";
 const NATIVE_WORKSPACE_SERVING_ENABLED = false;
+
+let localWorkspaceInventory;
+if (process.env.GJC_WORKSPACE_INVENTORY !== undefined) {
+  try {
+    localWorkspaceInventory = parseWorkspaceInventory(process.env.GJC_WORKSPACE_INVENTORY);
+  } catch (error) {
+    console.error(`daemon: invalid GJC_WORKSPACE_INVENTORY: ${sanitizeDaemonError(error)}`);
+    process.exit(1);
+  }
+}
 
 function readReadinessTestEvidence() {
   if (!READINESS_TEST_INJECTION_ENABLED) return undefined;
@@ -352,6 +363,7 @@ function createReadinessState(connection) {
     workspaceGeneration: staticReadiness.workspaceGeneration,
     binding: undefined,
     bindingAccepted: false,
+    inventoryWorkspace: undefined,
     lastError: staticErrorCode ? makeReadinessError(staticErrorCode) : undefined,
   };
   readinessByConnection.set(connection, state);
@@ -391,11 +403,27 @@ function acceptWorkspaceBinding(state, message) {
     if (sameBinding) return true;
   }
   state.binding = Object.freeze({ ...message });
+  state.inventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, message);
   // Binding acceptance is intentionally separate from readiness. The daemon
   // still needs a verified local inventory match before it can serve.
   state.bindingAccepted = true;
   state.status.workspace = "unknown";
   state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+  promoteWorkspaceIfProven(state);
+  return true;
+}
+
+function promoteWorkspaceIfProven(state) {
+  if (!state?.bindingAccepted || !state.inventoryWorkspace || !state.probePassed) return false;
+  state.mappingId = state.binding.mappingId;
+  state.mappingGeneration = state.binding.mappingGeneration;
+  state.mappingVersion = state.binding.mappingVersion;
+  state.workspaceId = state.binding.workspaceId;
+  state.workspaceGeneration = state.binding.workspaceGeneration;
+  state.mappingWorkDir = state.inventoryWorkspace.workDir;
+  state.workspaceKey = state.inventoryWorkspace.workDir;
+  state.status.workspace = "ready";
+  state.lastError = undefined;
   return true;
 }
 
@@ -555,22 +583,11 @@ async function probeReadiness(state) {
     state.status.runtime = evidence.runtime;
     state.status.providerAuth = evidence.providerAuth;
     state.status.modelProfile = evidence.modelProfile;
-    if (
-      state.mappingId !== undefined &&
-      state.mappingGeneration !== undefined &&
-      state.mappingVersion !== undefined &&
-      state.workspaceId !== undefined &&
-      state.workspaceGeneration !== undefined &&
-      state.mappingWorkDir !== undefined
-    ) {
-      state.workspaceKey = state.mappingWorkDir;
-      state.status.workspace = "ready";
-      state.lastError = undefined;
-    } else {
+    state.probePassed = true;
+    if (!promoteWorkspaceIfProven(state)) {
       state.status.workspace = "unknown";
       state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED);
     }
-    state.probePassed = true;
   } catch (error) {
     setReadinessError(state, error, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
     state.probeStarted = false;
@@ -590,6 +607,12 @@ function invokeMappingRejection(state, message) {
   );
   if (!hasMappingIdentity || state.mappingId === undefined) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED);
+  }
+  if (
+    message.workspaceGeneration !== undefined &&
+    message.workspaceGeneration !== state.workspaceGeneration
+  ) {
+    return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE);
   }
   if (
     message.mappingId !== state.mappingId ||
