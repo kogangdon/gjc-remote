@@ -651,6 +651,7 @@ function isReadinessFrameShape(value) {
     "ttlMs",
     "workspaceId",
     "workspaceGeneration",
+    "bindingId",
     "status",
     "lastError",
     "expiresAt",
@@ -667,7 +668,8 @@ function isReadinessFrameShape(value) {
   if (hasWorkspaceId) {
     return (
       isWorkspaceId(value.workspaceId) &&
-      isReadinessWorkspaceGeneration(value.workspaceGeneration)
+      isReadinessWorkspaceGeneration(value.workspaceGeneration) &&
+      (!hasOwn(value, "bindingId") || isMappingId(value.bindingId))
     );
   }
   return true;

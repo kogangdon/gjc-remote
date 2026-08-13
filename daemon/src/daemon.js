@@ -364,6 +364,7 @@ function createReadinessState(connection) {
     binding: undefined,
     bindingAccepted: false,
     inventoryWorkspace: undefined,
+    bindings: new Map(),
     lastError: staticErrorCode ? makeReadinessError(staticErrorCode) : undefined,
   };
   readinessByConnection.set(connection, state);
@@ -404,6 +405,11 @@ function acceptWorkspaceBinding(state, message) {
   }
   state.binding = Object.freeze({ ...message });
   state.inventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, message);
+  state.bindings.set(message.bindingId, {
+    binding: state.binding,
+    inventoryWorkspace: state.inventoryWorkspace,
+    ready: false,
+  });
   // Binding acceptance is intentionally separate from readiness. The daemon
   // still needs a verified local inventory match before it can serve.
   state.bindingAccepted = true;
@@ -424,6 +430,8 @@ function promoteWorkspaceIfProven(state) {
   state.workspaceKey = state.inventoryWorkspace.workDir;
   state.status.workspace = "ready";
   state.lastError = undefined;
+  const bindingState = state.bindings.get(state.binding.bindingId);
+  if (bindingState) bindingState.ready = true;
   return true;
 }
 
@@ -433,7 +441,10 @@ function clearReadinessTimer(state) {
   state.timer = undefined;
 }
 
-function readinessFrame(state) {
+function readinessFrame(state, bindingState = undefined) {
+  const binding = bindingState?.binding ?? state.binding;
+  const inventoryWorkspace = bindingState?.inventoryWorkspace ?? state.inventoryWorkspace;
+  const ready = bindingState?.ready ?? state.status.workspace === "ready";
   const frame = {
     type: MSG_TYPES.READINESS,
     socketGeneration: state.socketGeneration,
@@ -441,11 +452,20 @@ function readinessFrame(state) {
     observedAt: Date.now(),
     ttlMs: READINESS_TTL_MS,
     status: Object.fromEntries(
-      READINESS_DIMENSIONS.map((dimension) => [dimension, state.status[dimension]])
+      READINESS_DIMENSIONS.map((dimension) => [
+        dimension,
+        dimension === "workspace"
+          ? (ready ? "ready" : "unknown")
+          : state.status[dimension],
+      ])
     ),
     expiresAt: Date.now() + READINESS_TTL_MS,
   };
-  if (state.workspaceId !== undefined && state.workspaceGeneration !== undefined) {
+  if (binding) {
+    frame.bindingId = binding.bindingId;
+    frame.workspaceId = binding.workspaceId;
+    frame.workspaceGeneration = binding.workspaceGeneration;
+  } else if (state.workspaceId !== undefined && state.workspaceGeneration !== undefined) {
     frame.workspaceId = state.workspaceId;
     frame.workspaceGeneration = state.workspaceGeneration;
   }
@@ -461,14 +481,19 @@ function publishReadiness(state) {
   ) {
     return false;
   }
-  const frame = readinessFrame(state);
-  if (!isReadinessMessage(frame)) {
-    state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
-    return false;
-  }
+  const records = state.bindings.size > 0
+    ? [...state.bindings.values()]
+    : [undefined];
   try {
-    state.connection.send(JSON.stringify(frame));
-    state.revision = frame.revision;
+    for (const bindingState of records) {
+      const frame = readinessFrame(state, bindingState);
+      if (!isReadinessMessage(frame)) {
+        state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+        return false;
+      }
+      state.connection.send(JSON.stringify(frame));
+      state.revision = frame.revision;
+    }
     return true;
   } catch {
     state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.CONNECTION_LOST);
@@ -584,7 +609,13 @@ async function probeReadiness(state) {
     state.status.providerAuth = evidence.providerAuth;
     state.status.modelProfile = evidence.modelProfile;
     state.probePassed = true;
-    if (!promoteWorkspaceIfProven(state)) {
+    if (state.bindings.size > 0) {
+      for (const bindingState of state.bindings.values()) {
+        state.binding = bindingState.binding;
+        state.inventoryWorkspace = bindingState.inventoryWorkspace;
+        promoteWorkspaceIfProven(state);
+      }
+    } else if (!promoteWorkspaceIfProven(state)) {
       state.status.workspace = "unknown";
       state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED);
     }
