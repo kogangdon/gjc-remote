@@ -84,6 +84,25 @@ test("workspace binding is path-free and validates the complete identity tuple",
     false,
     "managed binding must not carry a path"
   );
+  assert.equal(
+    isReadinessMessage({
+      type: MSG_TYPES.READINESS,
+      socketGeneration: 1,
+      revision: 1,
+      observedAt: Date.now(),
+      ttlMs: 1000,
+      bindingId: "../invalid",
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+    }),
+    false,
+    "bindingId must be validated even without workspace identity"
+  );
 });
 
 test("local workspace inventory validates and matches the complete binding identity", () => {
@@ -285,21 +304,107 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
     }),
   });
   try {
+    const initialReadiness = onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
       capabilities: [WORKSPACE_READINESS_CAPABILITY],
     }));
-    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
-    daemon.peer.send(JSON.stringify(validBinding));
-    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
-    const readiness = await waitForMessage(
+    await initialReadiness;
+    const readinessPromise = waitForMessage(
       daemon.peer,
       (message) => message.type === MSG_TYPES.READINESS && message.status.workspace === "ready"
     );
+    const bindOkPromise = onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    daemon.peer.send(JSON.stringify(validBinding));
+    await bindOkPromise;
+    const readiness = await readinessPromise;
     assert.equal(readiness.status.workspace, "ready");
     assert.equal(readiness.workspaceId, validBinding.workspaceId);
     assert.equal(readiness.workspaceGeneration, validBinding.workspaceGeneration);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon publishes readiness independently for multiple workspace bindings", async () => {
+  const firstBinding = { ...validBinding, inventoryGeneration: 5 };
+  const secondBinding = {
+    ...validBinding,
+    bindingId: "binding-2",
+    mappingId: "mapping-2",
+    workspaceId: "workspace-2",
+    mappingGeneration: 1,
+    workspaceGeneration: 1,
+    routeFingerprint: "c".repeat(64),
+    authorityFingerprint: "d".repeat(64),
+    inventoryGeneration: 5,
+  };
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_WORKSPACE_INVENTORY: JSON.stringify({
+      version: 1,
+      inventoryGeneration: 5,
+      workspaces: [
+        {
+          hostId: validBinding.hostId,
+          mappingId: validBinding.mappingId,
+          mappingGeneration: validBinding.mappingGeneration,
+          workspaceGeneration: validBinding.workspaceGeneration,
+          mappingVersion: validBinding.mappingVersion,
+          workspaceId: validBinding.workspaceId,
+          sourcePlatform: validBinding.sourcePlatform,
+          workDir: "/srv/workspace-1",
+          routeFingerprint: validBinding.routeFingerprint,
+          authorityFingerprint: validBinding.authorityFingerprint,
+        },
+        {
+          hostId: secondBinding.hostId,
+          mappingId: secondBinding.mappingId,
+          mappingGeneration: secondBinding.mappingGeneration,
+          workspaceGeneration: secondBinding.workspaceGeneration,
+          mappingVersion: secondBinding.mappingVersion,
+          workspaceId: secondBinding.workspaceId,
+          sourcePlatform: secondBinding.sourcePlatform,
+          workDir: "/srv/workspace-2",
+          routeFingerprint: secondBinding.routeFingerprint,
+          authorityFingerprint: secondBinding.authorityFingerprint,
+        },
+      ],
+    }),
+  });
+  try {
+    const initial = onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await initial;
+    const bindingReceipts = Promise.all([
+      onceMessage(daemon.peer, MSG_TYPES.BIND_OK),
+      onceMessage(daemon.peer, MSG_TYPES.BIND_OK),
+    ]);
+    const readinessFrames = [
+      waitForMessage(
+        daemon.peer,
+        (frame) => frame.type === MSG_TYPES.READINESS &&
+          frame.bindingId === firstBinding.bindingId && frame.status.workspace === "ready"
+      ),
+      waitForMessage(
+        daemon.peer,
+        (frame) => frame.type === MSG_TYPES.READINESS &&
+          frame.bindingId === secondBinding.bindingId && frame.status.workspace === "ready"
+      ),
+    ];
+    daemon.peer.send(JSON.stringify(firstBinding));
+    daemon.peer.send(JSON.stringify(secondBinding));
+    await bindingReceipts;
+    const [firstReady, secondReady] = await Promise.all(readinessFrames);
+    assert.equal(firstReady.workspaceId, firstBinding.workspaceId);
+    assert.equal(secondReady.workspaceId, secondBinding.workspaceId);
   } finally {
     await daemon.close();
   }
@@ -343,6 +448,7 @@ test("daemon rejects an invoke with a stale workspace generation", async () => {
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.INVOKE,
       requestId: "stale-workspace-generation",
+      bindingId: validBinding.bindingId,
       mappingId: validBinding.mappingId,
       mappingGeneration: validBinding.mappingGeneration,
       mappingVersion: validBinding.mappingVersion,
