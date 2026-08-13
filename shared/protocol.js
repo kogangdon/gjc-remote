@@ -672,6 +672,7 @@ function isReadinessFrameShape(value) {
       (!hasOwn(value, "bindingId") || isMappingId(value.bindingId))
     );
   }
+  if (hasOwn(value, "bindingId") && !isMappingId(value.bindingId)) return false;
   return true;
 }
 
@@ -902,6 +903,7 @@ export function isInvokeMessage(value, context = undefined) {
 
   const isV2 = isObject(context) && context.v2 === true;
   const v2Fields = [
+    "bindingId",
     "mappingId",
     "mappingGeneration",
     "mappingVersion",
@@ -917,6 +919,7 @@ export function isInvokeMessage(value, context = undefined) {
     const allowedFields = new Set([
       "type",
       "requestId",
+      "bindingId",
       "mappingId",
       "mappingGeneration",
       "mappingVersion",
@@ -933,6 +936,7 @@ export function isInvokeMessage(value, context = undefined) {
     ) {
       return false;
     }
+    if (hasOwn(value, "bindingId") && !isMappingId(value.bindingId)) return false;
     if (hasOwn(value, "workspaceId") && !isWorkspaceId(value.workspaceId)) {
       return false;
     }

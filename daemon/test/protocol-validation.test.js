@@ -84,6 +84,25 @@ test("workspace binding is path-free and validates the complete identity tuple",
     false,
     "managed binding must not carry a path"
   );
+  assert.equal(
+    isReadinessMessage({
+      type: MSG_TYPES.READINESS,
+      socketGeneration: 1,
+      revision: 1,
+      observedAt: Date.now(),
+      ttlMs: 1000,
+      bindingId: "../invalid",
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+    }),
+    false,
+    "bindingId must be validated even without workspace identity"
+  );
 });
 
 test("local workspace inventory validates and matches the complete binding identity", () => {
@@ -315,8 +334,8 @@ test("daemon publishes readiness independently for multiple workspace bindings",
     bindingId: "binding-2",
     mappingId: "mapping-2",
     workspaceId: "workspace-2",
-    mappingGeneration: 3,
-    workspaceGeneration: 4,
+    mappingGeneration: 1,
+    workspaceGeneration: 1,
     routeFingerprint: "c".repeat(64),
     authorityFingerprint: "d".repeat(64),
     inventoryGeneration: 5,
@@ -429,6 +448,7 @@ test("daemon rejects an invoke with a stale workspace generation", async () => {
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.INVOKE,
       requestId: "stale-workspace-generation",
+      bindingId: validBinding.bindingId,
       mappingId: validBinding.mappingId,
       mappingGeneration: validBinding.mappingGeneration,
       mappingVersion: validBinding.mappingVersion,

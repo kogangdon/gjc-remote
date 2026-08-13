@@ -150,6 +150,7 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
 const READINESS_TEST_INJECTION_ENABLED =
   process.env.GJC_READINESS_TEST_INJECTION === "1";
 const NATIVE_WORKSPACE_SERVING_ENABLED = false;
+const MAX_BINDINGS_PER_SOCKET = 64;
 
 let localWorkspaceInventory;
 if (process.env.GJC_WORKSPACE_INVENTORY !== undefined) {
@@ -379,7 +380,8 @@ function acceptWorkspaceBinding(state, message) {
   ) {
     return false;
   }
-  const previous = state.binding;
+  const previousState = state.bindings.get(message.bindingId);
+  const previous = previousState?.binding;
   if (previous) {
     const sameBinding = [
       "bindingId",
@@ -403,35 +405,25 @@ function acceptWorkspaceBinding(state, message) {
     }
     if (sameBinding) return true;
   }
-  state.binding = Object.freeze({ ...message });
-  state.inventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, message);
+  if (!previousState && state.bindings.size >= MAX_BINDINGS_PER_SOCKET) return false;
+  const binding = Object.freeze({ ...message });
+  const inventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, message);
   state.bindings.set(message.bindingId, {
-    binding: state.binding,
-    inventoryWorkspace: state.inventoryWorkspace,
+    binding,
+    inventoryWorkspace,
     ready: false,
+    lastError: makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND),
   });
   // Binding acceptance is intentionally separate from readiness. The daemon
   // still needs a verified local inventory match before it can serve.
-  state.bindingAccepted = true;
-  state.status.workspace = "unknown";
-  state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
-  promoteWorkspaceIfProven(state);
+  promoteWorkspaceIfProven(state, state.bindings.get(message.bindingId));
   return true;
 }
 
-function promoteWorkspaceIfProven(state) {
-  if (!state?.bindingAccepted || !state.inventoryWorkspace || !state.probePassed) return false;
-  state.mappingId = state.binding.mappingId;
-  state.mappingGeneration = state.binding.mappingGeneration;
-  state.mappingVersion = state.binding.mappingVersion;
-  state.workspaceId = state.binding.workspaceId;
-  state.workspaceGeneration = state.binding.workspaceGeneration;
-  state.mappingWorkDir = state.inventoryWorkspace.workDir;
-  state.workspaceKey = state.inventoryWorkspace.workDir;
-  state.status.workspace = "ready";
-  state.lastError = undefined;
-  const bindingState = state.bindings.get(state.binding.bindingId);
-  if (bindingState) bindingState.ready = true;
+function promoteWorkspaceIfProven(state, bindingState) {
+  if (!state?.probePassed || !bindingState?.inventoryWorkspace) return false;
+  bindingState.ready = true;
+  bindingState.lastError = undefined;
   return true;
 }
 
@@ -443,7 +435,6 @@ function clearReadinessTimer(state) {
 
 function readinessFrame(state, bindingState = undefined) {
   const binding = bindingState?.binding ?? state.binding;
-  const inventoryWorkspace = bindingState?.inventoryWorkspace ?? state.inventoryWorkspace;
   const ready = bindingState?.ready ?? state.status.workspace === "ready";
   const frame = {
     type: MSG_TYPES.READINESS,
@@ -469,7 +460,8 @@ function readinessFrame(state, bindingState = undefined) {
     frame.workspaceId = state.workspaceId;
     frame.workspaceGeneration = state.workspaceGeneration;
   }
-  if (state.lastError) frame.lastError = state.lastError;
+  const lastError = bindingState?.lastError ?? state.lastError;
+  if (lastError) frame.lastError = lastError;
   return frame;
 }
 
@@ -513,11 +505,12 @@ function scheduleReadinessPublication(state) {
   state.timer.unref?.();
 }
 
-function readinessRejection(state) {
+function readinessRejection(state, bindingState = undefined) {
   const dimensions = state.status;
   if (
-    state.lastError?.code === PROTOCOL_ERROR_CODES.CONFIG_INVALID ||
-    state.lastError?.code === PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED
+    !bindingState &&
+    (state.lastError?.code === PROTOCOL_ERROR_CODES.CONFIG_INVALID ||
+      state.lastError?.code === PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED)
   ) {
     return state.lastError;
   }
@@ -546,7 +539,10 @@ function readinessRejection(state) {
           : PROTOCOL_ERROR_CODES.MODEL_PROFILE_MISSING;
     return makeReadinessError(code);
   }
-  if (dimensions.workspace !== "ready") {
+  if (bindingState && !bindingState.ready) {
+    return bindingState.lastError ?? makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+  }
+  if (!bindingState && dimensions.workspace !== "ready") {
     return makeReadinessError(
       state.lastError?.code ?? PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
     );
@@ -611,9 +607,7 @@ async function probeReadiness(state) {
     state.probePassed = true;
     if (state.bindings.size > 0) {
       for (const bindingState of state.bindings.values()) {
-        state.binding = bindingState.binding;
-        state.inventoryWorkspace = bindingState.inventoryWorkspace;
-        promoteWorkspaceIfProven(state);
+        promoteWorkspaceIfProven(state, bindingState);
       }
     } else if (!promoteWorkspaceIfProven(state)) {
       state.status.workspace = "unknown";
@@ -621,12 +615,25 @@ async function probeReadiness(state) {
     }
   } catch (error) {
     setReadinessError(state, error, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+    for (const bindingState of state.bindings.values()) {
+      if (!bindingState.ready) bindingState.lastError = state.lastError;
+    }
     state.probeStarted = false;
   }
   publishReadiness(state);
 }
 
 function invokeMappingRejection(state, message) {
+  const bindingState = message.bindingId !== undefined
+    ? state.bindings.get(message.bindingId)
+    : undefined;
+  if (message.bindingId !== undefined && !bindingState) {
+    return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
+  }
+  if (bindingState && !bindingState.ready) {
+    return bindingState.lastError ?? makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+  }
+  const identity = bindingState?.binding ?? state;
   const mappingFields = [
     "mappingId",
     "mappingGeneration",
@@ -636,27 +643,28 @@ function invokeMappingRejection(state, message) {
   const hasMappingIdentity = mappingFields.some((field) =>
     Object.prototype.hasOwnProperty.call(message, field)
   );
-  if (!hasMappingIdentity || state.mappingId === undefined) {
+  if (!hasMappingIdentity || identity.mappingId === undefined) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED);
   }
   if (
     message.workspaceGeneration !== undefined &&
-    message.workspaceGeneration !== state.workspaceGeneration
+    message.workspaceGeneration !== identity.workspaceGeneration
   ) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE);
   }
   if (
-    message.mappingId !== state.mappingId ||
-    message.mappingGeneration !== state.mappingGeneration ||
-    message.mappingVersion !== state.mappingVersion ||
-    (message.workspaceId !== undefined && message.workspaceId !== state.workspaceId)
+    message.mappingId !== identity.mappingId ||
+    message.mappingGeneration !== identity.mappingGeneration ||
+    message.mappingVersion !== identity.mappingVersion ||
+    (message.workspaceId !== undefined && message.workspaceId !== identity.workspaceId)
   ) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
   }
   if (
     message.workDir !== undefined &&
-    state.mappingWorkDir !== undefined &&
-    message.workDir !== state.mappingWorkDir
+    (bindingState
+      ? message.workDir !== bindingState.inventoryWorkspace?.workDir
+      : state.mappingWorkDir !== undefined && message.workDir !== state.mappingWorkDir)
   ) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
   }
@@ -664,11 +672,14 @@ function invokeMappingRejection(state, message) {
 }
 
 async function admitReadyWorkload(state, workDir, message) {
-  const early = readinessRejection(state);
+  const bindingState = message.bindingId !== undefined
+    ? state.bindings.get(message.bindingId)
+    : undefined;
+  const early = readinessRejection(state, bindingState);
   if (early) return { error: early };
   const mappingError = invokeMappingRejection(state, message);
   if (mappingError) return { error: mappingError };
-  const effectiveWorkDir = workDir ?? state.mappingWorkDir;
+  const effectiveWorkDir = workDir ?? bindingState?.inventoryWorkspace?.workDir ?? state.mappingWorkDir;
   if (state.workspaceKey !== undefined && state.workspaceKey !== effectiveWorkDir) {
     return {
       error: makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE),
