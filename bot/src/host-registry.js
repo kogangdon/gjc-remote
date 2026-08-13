@@ -250,6 +250,8 @@ export class HostRegistry {
         workspaceId: undefined,
         workspaceGeneration: undefined,
         bindingId: undefined,
+        /** @type {Map<string, object>} */
+        bindingReadiness: new Map(),
         workspaceDimensions: undefined,
         workspaceExpiresAt: undefined,
         workspaceMonoExpiresAt: undefined,
@@ -494,6 +496,18 @@ export class HostRegistry {
       state.workspaceId = msg.workspaceId;
       state.workspaceGeneration = msg.workspaceGeneration;
       state.bindingId = msg.bindingId;
+      if (msg.bindingId !== undefined) {
+        state.bindingReadiness.set(msg.bindingId, {
+          bindingId: msg.bindingId,
+          workspaceId: msg.workspaceId,
+          workspaceGeneration: msg.workspaceGeneration,
+          dimensions: { ...msg.status },
+          lastError: msg.lastError ? normalizeRemoteError(msg.lastError) : undefined,
+          receivedAt,
+          expiresAt: receivedAt + ttlMs,
+          expired: false,
+        });
+      }
       state.hostDimensions = { ...msg.status };
       state.workspaceDimensions = { ...msg.status };
       state.workspaceExpiresAt = receivedAt + ttlMs;
@@ -652,7 +666,7 @@ export class HostRegistry {
       socketGeneration: state.socketGeneration ?? null,
     };
     if (state.workspaceId !== undefined) {
-      if (state.bindingId !== undefined) projection.bindingId = state.bindingId;
+      if (state.bindingId !== undefined) projection.bindingId = redactOpaqueId(state.bindingId);
       projection.workspaceId = redactOpaqueId(state.workspaceId);
       projection.workspaceGeneration = state.workspaceGeneration;
     }
@@ -907,15 +921,19 @@ export class HostRegistry {
   resolveBindingId(hostId, routeIdentity = {}) {
     const state = this.readinessStates.get(hostId);
     if (!state || this.connections.get(hostId) !== state.socket) return undefined;
-    if (
-      routeIdentity.workspaceId !== undefined &&
-      state.workspaceId !== routeIdentity.workspaceId
-    ) return undefined;
-    if (
-      routeIdentity.workspaceGeneration !== undefined &&
-      state.workspaceGeneration !== routeIdentity.workspaceGeneration
-    ) return undefined;
-    return state.bindingId;
+    for (const binding of state.bindingReadiness.values()) {
+      if (
+        routeIdentity.workspaceId !== undefined &&
+        binding.workspaceId !== routeIdentity.workspaceId
+      ) continue;
+      if (
+        routeIdentity.workspaceGeneration !== undefined &&
+        binding.workspaceGeneration !== routeIdentity.workspaceGeneration
+      ) continue;
+      if (binding.expired || binding.lastError || binding.expiresAt <= this.now()) continue;
+      return binding.bindingId;
+    }
+    return undefined;
   }
 
 /**
