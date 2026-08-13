@@ -478,16 +478,16 @@ test("managed v2 invokes select the matching binding from multiple readiness fra
       1000,
       undefined,
       {
-        mappingId: "mapping-b",
+        mappingId: "mapping-a",
         mappingGeneration: 1,
         mappingVersion: 1,
-        workspaceId: "workspace-b",
-        workspaceGeneration: 2,
+        workspaceId: "workspace-a",
+        workspaceGeneration: 1,
       }
     );
     const [raw] = await invokeFrame;
     const invoke = JSON.parse(raw.toString());
-    assert.equal(invoke.bindingId, "binding-b");
+    assert.equal(invoke.bindingId, "binding-a");
     socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
     assert.deepEqual(await resultPromise, { ok: true, text: undefined });
   } finally {
