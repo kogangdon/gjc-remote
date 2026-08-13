@@ -362,9 +362,6 @@ function createReadinessState(connection) {
     workspaceKey: undefined,
     workspaceId: staticReadiness.workspaceId,
     workspaceGeneration: staticReadiness.workspaceGeneration,
-    binding: undefined,
-    bindingAccepted: false,
-    inventoryWorkspace: undefined,
     bindings: new Map(),
     lastError: staticErrorCode ? makeReadinessError(staticErrorCode) : undefined,
   };
@@ -434,7 +431,7 @@ function clearReadinessTimer(state) {
 }
 
 function readinessFrame(state, bindingState = undefined) {
-  const binding = bindingState?.binding ?? state.binding;
+  const binding = bindingState?.binding;
   const ready = bindingState?.ready ?? state.status.workspace === "ready";
   const frame = {
     type: MSG_TYPES.READINESS,
