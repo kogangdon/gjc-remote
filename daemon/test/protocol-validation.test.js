@@ -319,7 +319,46 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
     });
     const readiness = await postBindReadiness;
     assert.equal(readiness.status.workspace, "unknown");
-    assert.equal(readiness.lastError?.code, PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+    assert.equal(readiness.lastError?.code, PROTOCOL_ERROR_CODES.INVENTORY_PENDING);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon reports verified inventory absence as workspace not found", async () => {
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_WORKSPACE_INVENTORY: JSON.stringify({
+      version: 1,
+      inventoryGeneration: validBinding.inventoryGeneration,
+      workspaces: [],
+    }),
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    daemon.peer.send(JSON.stringify(validBinding));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    const readiness = await waitForMessage(
+      daemon.peer,
+      (message) =>
+        message.type === MSG_TYPES.READINESS &&
+        message.bindingId === validBinding.bindingId
+    );
+    assert.equal(readiness.status.workspace, "unknown");
+    assert.deepEqual(readiness.lastError, {
+      code: PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
+      at: readiness.lastError.at,
+      remediation: {
+        code: PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
+        retryable: false,
+        action: "refresh_workspace",
+      },
+    });
   } finally {
     await daemon.close();
   }
@@ -1306,6 +1345,11 @@ test("readiness remediation tuples are canonical and stable", () => {
       code: PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
       retryable: false,
       action: "refresh_workspace",
+    },
+    [PROTOCOL_ERROR_CODES.INVENTORY_PENDING]: {
+      code: PROTOCOL_ERROR_CODES.INVENTORY_PENDING,
+      retryable: true,
+      action: "retry_later",
     },
     [PROTOCOL_ERROR_CODES.PROVIDER_MISSING]: {
       code: PROTOCOL_ERROR_CODES.PROVIDER_MISSING,

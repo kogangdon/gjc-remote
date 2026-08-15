@@ -9,6 +9,9 @@ Current v0/v1 peers continue to use existing workDir-only frames. A socket enabl
 only when negotiated version is at least 2 and both register advertisements and the valid response
 contain `workspace_readiness_v2`. Until that gate commits, ingress rejects and egress never emits
 workspaceId, mapping identity, or readiness fields. A replacement socket starts disabled.
+When a release adds a closed-set protocol error code, deploy the bot before its daemons: an older
+bot intentionally rejects a newer unknown readiness code, while a newer bot continues to accept
+the older daemon's still-supported codes.
 
 The negotiated v2 invoke is bounded and carries the route identity:
 
@@ -106,8 +109,10 @@ Stable classes include:
   `SHUTDOWN_TIMEOUT`;
 - fatal: `DAEMON_FATAL`, `UNHANDLED_REJECTION`, `UNCAUGHT_EXCEPTION`.
 The validator rejects unknown dimension values, oversized frame/ID fields, unsafe IDs, and malformed
-status before state mutation. Stable workspace outcomes include `WORKSPACE_NOT_FOUND` and
-`MAPPING_GENERATION_STALE`; Git transport failures use `GIT_NETWORK_FAILED`, while authentication
+status before state mutation. An accepted binding awaiting verified local inventory reports
+`INVENTORY_PENDING` with retry-later remediation; a verified absence remains
+`WORKSPACE_NOT_FOUND`. Stable workspace outcomes also include `MAPPING_GENERATION_STALE`; Git
+transport failures use `GIT_NETWORK_FAILED`, while authentication
 uses `GIT_AUTH_FAILED`. These codes have path-free rendering, distinct retry/audit semantics, and
 never bypass containment or readiness.
 
