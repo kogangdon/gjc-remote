@@ -31,6 +31,7 @@ import {
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
+import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
 import { setSessionModel } from "./model-command.js";
 import {
   webSocketPayloadByteLength,
@@ -343,16 +344,11 @@ function sameBindingFields(previous, candidate, fields = BINDING_IDENTITY_FIELDS
 function invalidateBindingRequests(state, bindingState) {
   if (!bindingState) return;
   bindingState.invalidated = true;
-  for (const [requestId, request] of inFlightByRequestId) {
-    if (
-      request.connection !== state.connection ||
-      request.bindingId !== bindingState.binding.bindingId
-    ) {
-      continue;
-    }
-    void Promise.resolve(request.session.dispose()).catch(() => {});
-    inFlightByRequestId.delete(requestId);
-  }
+  disposeReplacedBindingRequests(
+    inFlightByRequestId,
+    state.connection,
+    bindingState.binding.bindingId
+  );
 }
 
 function currentBindingState(state, bindingState, fingerprint) {

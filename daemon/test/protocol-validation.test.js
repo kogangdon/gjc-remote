@@ -37,6 +37,7 @@ import {
 } from "@gjc-remote/shared";
 import { WebSocketServer } from "ws";
 import { findWorkspaceInventory, parseWorkspaceInventory } from "../src/workspace-inventory.js";
+import { invalidateBindingRequests } from "../src/binding-fence.js";
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const CHILD_EXIT_TIMEOUT_MS = 2_000;
@@ -55,6 +56,49 @@ const validBinding = {
   authorityFingerprint: "b".repeat(64),
   inventoryGeneration: 4,
 };
+
+test("replaced binding requests are disposed without touching other bindings", async () => {
+  const connection = {};
+  const otherConnection = {};
+  const disposed = [];
+  const inFlight = new Map([
+    ["old-request", {
+      connection,
+      bindingId: "binding-old",
+      session: {
+        dispose: async () => {
+          disposed.push("old-request");
+        },
+      },
+    }],
+    ["other-binding", {
+      connection,
+      bindingId: "binding-new",
+      session: {
+        dispose: async () => {
+          disposed.push("other-binding");
+        },
+      },
+    }],
+    ["other-connection", {
+      connection: otherConnection,
+      bindingId: "binding-old",
+      session: {
+        dispose: async () => {
+          disposed.push("other-connection");
+        },
+      },
+    }],
+  ]);
+
+  invalidateBindingRequests(inFlight, connection, "binding-old");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(disposed, ["old-request"]);
+  assert.equal(inFlight.has("old-request"), false);
+  assert.equal(inFlight.has("other-binding"), true);
+  assert.equal(inFlight.has("other-connection"), true);
+});
 
 test("workspace binding is path-free and validates the complete identity tuple", () => {
   assert.equal(isBindWorkspaceMessage(validBinding), true);
