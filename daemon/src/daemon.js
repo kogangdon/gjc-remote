@@ -39,7 +39,8 @@ import {
   webSocketPayloadToUtf8,
 } from "./ws-payload.js";
 import { serializeEventFrame } from "./event-frame.js";
-import { findWorkspaceInventory, parseWorkspaceInventory } from "./workspace-inventory.js";
+import { findWorkspaceInventory } from "./workspace-inventory.js";
+import { createWorkspaceInventoryProvider } from "./workspace-inventory-provider.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -155,13 +156,18 @@ const NATIVE_WORKSPACE_SERVING_ENABLED = false;
 const MAX_BINDINGS_PER_SOCKET = 64;
 
 let localWorkspaceInventory;
-if (process.env.GJC_WORKSPACE_INVENTORY !== undefined) {
-  try {
-    localWorkspaceInventory = parseWorkspaceInventory(process.env.GJC_WORKSPACE_INVENTORY);
-  } catch (error) {
-    console.error(`daemon: invalid GJC_WORKSPACE_INVENTORY: ${sanitizeDaemonError(error)}`);
-    process.exit(1);
+try {
+  const inventoryProvider = createWorkspaceInventoryProvider({
+    testInjectionEnabled: READINESS_TEST_INJECTION_ENABLED,
+    serializedTestInventory: process.env.GJC_WORKSPACE_INVENTORY,
+  });
+  const inventoryRead = await inventoryProvider.read();
+  if (inventoryRead.status === "present") {
+    localWorkspaceInventory = inventoryRead.inventory;
   }
+} catch (error) {
+  console.error(`daemon: invalid GJC_WORKSPACE_INVENTORY: ${sanitizeDaemonError(error)}`);
+  process.exit(1);
 }
 
 function readReadinessTestEvidence() {
