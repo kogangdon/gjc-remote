@@ -328,6 +328,8 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
 test("daemon reports verified inventory absence as workspace not found", async () => {
   const daemon = await startDaemon({
     GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
     GJC_WORKSPACE_INVENTORY: JSON.stringify({
       version: 1,
       inventoryGeneration: validBinding.inventoryGeneration,
@@ -405,6 +407,24 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
     assert.equal(readiness.status.workspace, "ready");
     assert.equal(readiness.workspaceId, validBinding.workspaceId);
     assert.equal(readiness.workspaceGeneration, validBinding.workspaceGeneration);
+
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.INVOKE,
+      requestId: "native-serving-remains-disabled",
+      bindingId: validBinding.bindingId,
+      mappingId: validBinding.mappingId,
+      mappingGeneration: validBinding.mappingGeneration,
+      mappingVersion: validBinding.mappingVersion,
+      workspaceId: validBinding.workspaceId,
+      workspaceGeneration: validBinding.workspaceGeneration,
+      command: { kind: "prompt", message: "blocked" },
+    }));
+    const response = await onceMessage(daemon.peer, MSG_TYPES.EVENT);
+    assert.equal(response.requestId, "native-serving-remains-disabled");
+    assert.equal(
+      JSON.parse(response.error).code,
+      PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+    );
   } finally {
     await daemon.close();
   }

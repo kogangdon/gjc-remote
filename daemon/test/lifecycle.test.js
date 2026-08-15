@@ -145,22 +145,26 @@ async function startReadinessDaemon({
       GJC_READINESS_TEST_MAPPING_GENERATION: "1",
       GJC_READINESS_TEST_MAPPING_VERSION: "1",
       GJC_READINESS_TEST_WORK_DIR: "C:\\workspace",
-      GJC_WORKSPACE_INVENTORY: JSON.stringify({
-        version: 1,
-        inventoryGeneration: 1,
-        workspaces: [{
-          hostId: "readiness-test-host",
-          mappingId: "mapping-test",
-          mappingGeneration: 1,
-          workspaceGeneration: 1,
-          mappingVersion: 1,
-          workspaceId: "workspace-test",
-          sourcePlatform: "windows-drive",
-          workDir: "C:\\workspace",
-          routeFingerprint: "a".repeat(64),
-          authorityFingerprint: "b".repeat(64),
-        }],
-      }),
+      ...(testInjection
+        ? {
+            GJC_WORKSPACE_INVENTORY: JSON.stringify({
+              version: 1,
+              inventoryGeneration: 1,
+              workspaces: [{
+                hostId: "readiness-test-host",
+                mappingId: "mapping-test",
+                mappingGeneration: 1,
+                workspaceGeneration: 1,
+                mappingVersion: 1,
+                workspaceId: "workspace-test",
+                sourcePlatform: "windows-drive",
+                workDir: "C:\\workspace",
+                routeFingerprint: "a".repeat(64),
+                authorityFingerprint: "b".repeat(64),
+              }],
+            }),
+          }
+        : {}),
       ...envOverrides,
     },
     stdio: ["ignore", "pipe", "pipe"],
