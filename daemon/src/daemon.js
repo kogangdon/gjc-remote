@@ -32,6 +32,7 @@ import {
 } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
 import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
+import { AdmissionBudget } from "./admission-budget.js";
 import { setSessionModel } from "./model-command.js";
 import {
   webSocketPayloadByteLength,
@@ -281,6 +282,7 @@ try {
 }
 
 const pool = new SessionPool({ sensitiveValues: daemonSensitiveValues });
+const admissionBudget = new AdmissionBudget();
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
@@ -989,6 +991,17 @@ async function handleMessage(
   const { requestId, workDir, command } = msg;
   const send = (event, extra = {}) =>
     connection.send(serializeEventFrame(requestId, event, extra));
+  const releaseAdmission = admissionBudget.tryAcquireInvoke();
+  if (!releaseAdmission) {
+    const exhausted = makeReadinessError(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
+    send(undefined, {
+      error: readinessState?.committed
+        ? formatReadinessRejection(exhausted)
+        : exhausted.code,
+      done: true,
+    });
+    return;
+  }
   let session;
 
   try {
@@ -1050,6 +1063,7 @@ async function handleMessage(
       });
     }
   } finally {
+    releaseAdmission();
     const request = inFlightByRequestId.get(requestId);
     if (request?.connection === connection && request.session === session) {
       inFlightByRequestId.delete(requestId);

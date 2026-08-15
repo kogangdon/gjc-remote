@@ -5,6 +5,7 @@ import { validateNativeWorkDir } from "./work-dir.js";
 import { sanitizeErrorMessage } from "./reconnect.js";
 
 const SESSION_DISPOSE_TIMEOUT_MS = 5_000;
+export const DEFAULT_MAX_SESSIONS = 8;
 // Session creation activates the host's model profile, which can touch the
 // credential store and model registry (potentially a network token exchange),
 // so it needs a far larger bound than teardown. Sharing the 5s dispose bound
@@ -32,7 +33,11 @@ export class SessionPool {
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
     sensitiveValues = [],
+    maxSessions = DEFAULT_MAX_SESSIONS,
   } = {}) {
+    if (!Number.isSafeInteger(maxSessions) || maxSessions < 1) {
+      throw new TypeError("maxSessions must be a positive safe integer");
+    }
     /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
     this.sessions = new Map();
     this.sessionFactory = sessionFactory;
@@ -46,6 +51,7 @@ export class SessionPool {
     this.clearIntervalFn = clearIntervalFn;
     this.closed = false;
     this.sensitiveValues = [...sensitiveValues];
+    this.maxSessions = maxSessions;
     this.pendingOperations = new Map();
     this.reapTimer = this.setIntervalFn(() => {
       void this.#reapIdle().catch((error) =>
@@ -105,6 +111,21 @@ export class SessionPool {
       workDir,
       operation,
     }));
+  }
+
+  getAdmissionSnapshot() {
+    let activeSessions = 0;
+    let pendingSessions = 0;
+    for (const entry of this.sessions.values()) {
+      if (entry.session && !entry.session.closed) activeSessions += 1;
+      if (entry.creation) pendingSessions += 1;
+    }
+    return Object.freeze({
+      activeSessions,
+      pendingSessions,
+      admittedWorkspaces: this.sessions.size,
+      maxSessions: this.maxSessions,
+    });
   }
 
   #disposeBounded(session, workDir, context) {
@@ -185,6 +206,11 @@ export class SessionPool {
     if (existing?.creation) {
       existing.lastUsed = Date.now();
       return await existing.creation;
+    }
+    if (this.sessions.size >= this.maxSessions) {
+      const error = new Error("SDK session admission limit reached");
+      error.code = "SESSION_LIMIT";
+      throw error;
     }
 
     const entry = { lastUsed: Date.now(), session: undefined, creation: undefined };
