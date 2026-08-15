@@ -14,11 +14,12 @@ The negotiated v2 invoke is bounded and carries the route identity:
 
 ```text
 { type: "invoke", requestId, bindingId?, mappingId, mappingGeneration, workspaceGeneration,
-  mappingVersion, workspaceId?, workDir?, command }
+  mappingVersion, workspaceId?, command }
 ```
 
-If both `workspaceId` and `workDir` are present they must resolve to identical mapping and
-workspace generation. Missing, foreign, stale, or mismatched identity is a stable rejection.
+Managed v2 invokes are path-free. A `workDir` or any other path-bearing field is rejected even when
+the remaining identity tuple is valid. Missing, foreign, stale, or mismatched identity is a stable
+rejection. Current v0/v1 peers retain the bounded workDir-only shape.
 
 The daemon may promote a bound workspace to `ready` only after its local inventory independently
 matches the authenticated binding tuple, including `mappingGeneration`, `workspaceGeneration`,
@@ -52,8 +53,9 @@ before first work:
 
 ```text
 { type: "readiness", socketGeneration, revision, observedAt, ttlMs?,
-  workspaceId?, workspaceGeneration?, status: { connection, runtime, providerAuth,
-  modelProfile, workspace }, lastError?: { code, at, remediation } }
+  bindingId?, workspaceId?, workspaceGeneration?, expiresAt?,
+  status: { connection, runtime, providerAuth, modelProfile, workspace },
+  lastError?: { code, at, remediation } }
 ```
 
 The five dimensions are independent. Connected means only that registration is current; it does

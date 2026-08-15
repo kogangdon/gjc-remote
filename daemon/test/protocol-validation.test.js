@@ -1240,22 +1240,23 @@ test("v2 invoke identity is bounded, exact, and gated from legacy sockets", () =
   );
   assert.equal(
     isInvokeMessage({ ...valid, workDir: "/workspace" }, { v2: true }),
-    true
+    false,
+    "managed v2 invokes must remain path-free"
   );
   assert.equal(
     isInvokeMessage(
       { ...valid, workspaceId: "workspace-1", workDir: "workspace-1" },
       { v2: true }
     ),
-    true
+    false
   );
   assert.equal(
     isInvokeMessage(
       { ...valid, workspaceId: "workspace-1", workDir: "other-workspace" },
       { v2: true }
     ),
-    true,
-    "canonical mapping resolution, not string equality, binds workspaceId to workDir"
+    false,
+    "managed v2 paths are rejected before canonical mapping resolution"
   );
   assert.equal(
     isInvokeMessage({ ...valid, mappingId: "../escape" }, { v2: true }),

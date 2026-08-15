@@ -1803,7 +1803,9 @@ test("phase 1 host projections redact hostile identity and readiness diagnostics
     await sendReadiness(
       socket,
       readinessFrame({
+        bindingId: "binding-1",
         observedAt: Date.now(),
+        expiresAt: Date.now() + 250,
         lastError: {
           code: "PROVIDER_MISSING",
           at: Date.now(),
@@ -1813,7 +1815,12 @@ test("phase 1 host projections redact hostile identity and readiness diagnostics
     );
     const projection = server.registry.getHostReadiness(hostId);
     assert.equal(projection.hostId, "[redacted-host]");
+    assert.equal(projection.bindingId, "binding-1");
+    assert.equal(projection.revision, 1);
+    assert.equal(projection.socketGeneration, 1);
     assert.equal(projection.lastErrorAt > 0, true);
+    assert.equal(projection.receivedAt > 0, true);
+    assert.equal(projection.expiresAt, projection.receivedAt + 1_000);
     assert.equal(JSON.stringify(projection).includes(token), false);
     assert.equal(JSON.stringify(projection).includes("/var/lib"), false);
     assert.equal(/[\u0000-\u001f]/.test(JSON.stringify(projection)), false);
