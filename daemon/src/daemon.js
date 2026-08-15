@@ -355,6 +355,7 @@ function invalidateBindingRequests(state, bindingState) {
 
 function currentBindingState(state, bindingState, fingerprint) {
   return (
+    state?.committed === true &&
     state?.bindings.get(bindingState?.binding.bindingId) === bindingState &&
     !bindingState.invalidated &&
     bindingFingerprint(bindingState.binding) === fingerprint
@@ -844,6 +845,10 @@ function connectToBot() {
   connection.on("close", () => {
     clearReadinessTimer(readinessState);
     readinessState.committed = false;
+    // Transport loss alone does not invalidate an already admitted immutable
+    // mapping generation. Its run may finish coherently, but no pending
+    // admission can cross the committed-state recheck below. Authority remaps
+    // remain the separate path that disposes captured binding requests.
     readinessState.status.connection = "offline";
     readinessState.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.CONNECTION_LOST);
     connections.delete(connection);
