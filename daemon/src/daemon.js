@@ -717,14 +717,6 @@ function invokeMappingRejection(state, message) {
   ) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
   }
-  if (
-    message.workDir !== undefined &&
-    (bindingState
-      ? message.workDir !== bindingState.inventoryWorkspace?.workDir
-      : state.mappingWorkDir !== undefined && message.workDir !== state.mappingWorkDir)
-  ) {
-    return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
-  }
   return undefined;
 }
 
