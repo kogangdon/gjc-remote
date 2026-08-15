@@ -413,14 +413,34 @@ export class HostRegistry {
     if (!isReadinessMessage(msg)) return false;
 
     const authority = this.readinessAuthorities.get(hostId);
+    let authorityWorkspaceGenerationHighWater;
     if (state.socketGeneration === undefined && authority) {
+      authorityWorkspaceGenerationHighWater = new Map(
+        authority.workspaceGenerationHighWater ?? []
+      );
+      if (
+        authority.workspaceId !== undefined &&
+        authority.workspaceGeneration !== undefined
+      ) {
+        const retained = authorityWorkspaceGenerationHighWater.get(
+          authority.workspaceId
+        );
+        authorityWorkspaceGenerationHighWater.set(
+          authority.workspaceId,
+          retained === undefined
+            ? authority.workspaceGeneration
+            : Math.max(retained, authority.workspaceGeneration)
+        );
+      }
+      const authorityWorkspaceGeneration =
+        msg.workspaceId !== undefined
+          ? authorityWorkspaceGenerationHighWater.get(msg.workspaceId)
+          : undefined;
       if (
         msg.socketGeneration <= authority.socketGeneration ||
         msg.observedAt < authority.observedAt ||
-        (msg.workspaceId !== undefined &&
-          msg.workspaceId === authority.workspaceId &&
-          authority.workspaceGeneration !== undefined &&
-          msg.workspaceGeneration < authority.workspaceGeneration)
+        (authorityWorkspaceGeneration !== undefined &&
+          msg.workspaceGeneration < authorityWorkspaceGeneration)
       ) {
         this.#recordReadinessError(state, PROTOCOL_ERROR_CODES.READINESS_REPLAYED, receivedAt);
         return false;
@@ -447,8 +467,11 @@ export class HostRegistry {
     }
 
     const hasWorkspace = msg.workspaceId !== undefined;
+    const workspaceGenerationFence =
+      authorityWorkspaceGenerationHighWater ??
+      state.workspaceGenerationHighWater;
     const workspaceGenerationHighWater = hasWorkspace
-      ? state.workspaceGenerationHighWater.get(msg.workspaceId)
+      ? workspaceGenerationFence.get(msg.workspaceId)
       : undefined;
     const retainedWorkspaceBinding = hasWorkspace
       ? [...state.bindingReadiness.values()].find(
@@ -471,7 +494,7 @@ export class HostRegistry {
     if (
       hasWorkspace &&
       workspaceGenerationHighWater === undefined &&
-      state.workspaceGenerationHighWater.size >= MAX_BINDING_READINESS_STATES
+      workspaceGenerationFence.size >= MAX_BINDING_READINESS_STATES
     ) {
       this.#recordReadinessError(
         state,
@@ -481,6 +504,10 @@ export class HostRegistry {
       return false;
     }
 
+    if (authorityWorkspaceGenerationHighWater) {
+      state.workspaceGenerationHighWater =
+        authorityWorkspaceGenerationHighWater;
+    }
     const ttlMs = normalizeReadinessTtl(msg.ttlMs);
     const monotonicReceivedAt = this.monotonicNow();
     this.#refreshExpired(state);
@@ -619,6 +646,9 @@ export class HostRegistry {
       bindingId: state.bindingId,
       workspaceId: state.workspaceId,
       workspaceGeneration: state.workspaceGeneration,
+      workspaceGenerationHighWater: new Map(
+        state.workspaceGenerationHighWater
+      ),
     });
     return true;
   }
