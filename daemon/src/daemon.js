@@ -31,6 +31,7 @@ import {
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
+import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
 import { setSessionModel } from "./model-command.js";
 import {
   webSocketPayloadByteLength,
@@ -311,6 +312,53 @@ function bindingFingerprint(binding) {
     .digest("hex");
 }
 
+const BINDING_IDENTITY_FIELDS = [
+  "bindingId",
+  "hostId",
+  "mappingId",
+  "mappingGeneration",
+  "mappingVersion",
+  "workspaceId",
+  "workspaceGeneration",
+  "sourcePlatform",
+  "routeFingerprint",
+  "authorityFingerprint",
+  "inventoryGeneration",
+];
+const BINDING_AUTHORITY_FIELDS = BINDING_IDENTITY_FIELDS.filter(
+  (field) => field !== "bindingId" && field !== "inventoryGeneration"
+);
+
+function hasBindingGenerationRegression(previous, candidate) {
+  return (
+    candidate.mappingGeneration < previous.mappingGeneration ||
+    candidate.workspaceGeneration < previous.workspaceGeneration ||
+    candidate.inventoryGeneration < previous.inventoryGeneration
+  );
+}
+
+function sameBindingFields(previous, candidate, fields = BINDING_IDENTITY_FIELDS) {
+  return fields.every((field) => previous[field] === candidate[field]);
+}
+
+function invalidateBindingRequests(state, bindingState) {
+  if (!bindingState) return;
+  bindingState.invalidated = true;
+  disposeReplacedBindingRequests(
+    inFlightByRequestId,
+    state.connection,
+    bindingState.binding.bindingId
+  );
+}
+
+function currentBindingState(state, bindingState, fingerprint) {
+  return (
+    state?.bindings.get(bindingState?.binding.bindingId) === bindingState &&
+    !bindingState.invalidated &&
+    bindingFingerprint(bindingState.binding) === fingerprint
+  );
+}
+
 function nextReadinessSocketGeneration() {
   readinessSocketGeneration =
     readinessSocketGeneration >= Number.MAX_SAFE_INTEGER
@@ -380,29 +428,41 @@ function acceptWorkspaceBinding(state, message) {
   const previousState = state.bindings.get(message.bindingId);
   const previous = previousState?.binding;
   if (previous) {
-    const sameBinding = [
-      "bindingId",
-      "hostId",
-      "mappingId",
-      "mappingGeneration",
-      "mappingVersion",
-      "workspaceId",
-      "workspaceGeneration",
-      "sourcePlatform",
-      "routeFingerprint",
-      "authorityFingerprint",
-      "inventoryGeneration",
-    ].every((field) => previous[field] === message[field]);
-    if (!sameBinding && (
-      message.mappingGeneration < previous.mappingGeneration ||
-      message.workspaceGeneration < previous.workspaceGeneration ||
-      message.inventoryGeneration < previous.inventoryGeneration
-    )) {
-      return false;
-    }
-    if (sameBinding) return true;
+    if (sameBindingFields(previous, message)) return true;
+    // A bindingId is immutable for the lifetime of a socket. Reusing it for
+    // another identity would make replayed bind receipts indistinguishable
+    // from an authorized remap.
+    return false;
   }
   if (!previousState && state.bindings.size >= MAX_BINDINGS_PER_SOCKET) return false;
+
+  const previousWorkspaceState = [...state.bindings.values()].find(
+    (candidate) => candidate.binding.workspaceId === message.workspaceId
+  );
+  if (previousWorkspaceState) {
+    const previousWorkspace = previousWorkspaceState.binding;
+    if (hasBindingGenerationRegression(previousWorkspace, message)) return false;
+
+    const authorityChanged = !sameBindingFields(
+      previousWorkspace,
+      message,
+      BINDING_AUTHORITY_FIELDS
+    );
+    const mappingGenerationAdvanced =
+      message.mappingGeneration > previousWorkspace.mappingGeneration ||
+      message.workspaceGeneration > previousWorkspace.workspaceGeneration;
+    const inventoryGenerationAdvanced =
+      message.inventoryGeneration > previousWorkspace.inventoryGeneration;
+    if (!mappingGenerationAdvanced && !inventoryGenerationAdvanced) return false;
+    if (authorityChanged && !mappingGenerationAdvanced) return false;
+
+    // A workspace has one active binding per socket. Replace the old receipt
+    // only after the new identity passes monotonic fencing; old invokes are
+    // disposed and can no longer cross the remap boundary.
+    state.bindings.delete(previousWorkspace.bindingId);
+    invalidateBindingRequests(state, previousWorkspaceState);
+  }
+
   const binding = Object.freeze({ ...message });
   const inventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, message);
   state.bindings.set(message.bindingId, {
@@ -672,6 +732,11 @@ async function admitReadyWorkload(state, workDir, message) {
   const bindingState = message.bindingId !== undefined
     ? state.bindings.get(message.bindingId)
     : undefined;
+  if (message.bindingId !== undefined && !bindingState) {
+    return {
+      error: makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED),
+    };
+  }
   const early = readinessRejection(state, bindingState);
   if (early) return { error: early };
   const mappingError = invokeMappingRejection(state, message);
@@ -688,9 +753,20 @@ async function admitReadyWorkload(state, workDir, message) {
   if (!NATIVE_WORKSPACE_SERVING_ENABLED) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
   }
+  const bindingFingerprintValue = bindingState
+    ? bindingFingerprint(bindingState.binding)
+    : undefined;
   try {
     const session = await pool.ensureSession(effectiveWorkDir);
-    return { session };
+    if (
+      bindingState &&
+      !currentBindingState(state, bindingState, bindingFingerprintValue)
+    ) {
+      return {
+        error: makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED),
+      };
+    }
+    return { session, bindingState, bindingFingerprint: bindingFingerprintValue };
   } catch (error) {
     setReadinessError(state, error, PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
     publishReadiness(state);
@@ -874,10 +950,10 @@ async function handleMessage(
     // #35: route a gate answer to the in-flight session that owns the gate.
     // Stale/unknown requestIds are silently ignored (the gate may have already
     // resolved, timed out, or the session disposed).
-    const session = inFlightByRequestId.get(msg.requestId);
-    if (session) {
+    const request = inFlightByRequestId.get(msg.requestId);
+    if (request) {
       try {
-        await session.answerGate(msg.gateId, msg.answer);
+        await request.session.answerGate(msg.gateId, msg.answer);
       } catch (err) {
         console.error(
           `daemon: failed to answer gate: ${sanitizeDaemonError(err)}`
@@ -921,9 +997,9 @@ async function handleMessage(
   const { requestId, workDir, command } = msg;
   const send = (event, extra = {}) =>
     connection.send(serializeEventFrame(requestId, event, extra));
+  let session;
 
   try {
-    let session;
     if (readinessState?.committed) {
       const admission = await admitReadyWorkload(readinessState, workDir, msg);
       if (admission.error) {
@@ -934,10 +1010,30 @@ async function handleMessage(
         return;
       }
       session = admission.session;
+      if (
+        admission.bindingState &&
+        !currentBindingState(
+          readinessState,
+          admission.bindingState,
+          admission.bindingFingerprint
+        )
+      ) {
+        send(undefined, {
+          error: formatReadinessRejection(
+            makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED)
+          ),
+          done: true,
+        });
+        return;
+      }
     } else {
       session = await pool.ensureSession(workDir);
     }
-    inFlightByRequestId.set(requestId, session);
+    inFlightByRequestId.set(requestId, {
+      connection,
+      session,
+      bindingId: msg.bindingId,
+    });
 
     if (command.kind === "set_model") {
       await setSessionModel(session, command, (event) => send(event));
@@ -962,7 +1058,10 @@ async function handleMessage(
       });
     }
   } finally {
-    inFlightByRequestId.delete(requestId);
+    const request = inFlightByRequestId.get(requestId);
+    if (request?.connection === connection && request.session === session) {
+      inFlightByRequestId.delete(requestId);
+    }
   }
 }
 

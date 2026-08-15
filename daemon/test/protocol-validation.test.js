@@ -37,6 +37,7 @@ import {
 } from "@gjc-remote/shared";
 import { WebSocketServer } from "ws";
 import { findWorkspaceInventory, parseWorkspaceInventory } from "../src/workspace-inventory.js";
+import { invalidateBindingRequests } from "../src/binding-fence.js";
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const CHILD_EXIT_TIMEOUT_MS = 2_000;
@@ -55,6 +56,49 @@ const validBinding = {
   authorityFingerprint: "b".repeat(64),
   inventoryGeneration: 4,
 };
+
+test("replaced binding requests are disposed without touching other bindings", async () => {
+  const connection = {};
+  const otherConnection = {};
+  const disposed = [];
+  const inFlight = new Map([
+    ["old-request", {
+      connection,
+      bindingId: "binding-old",
+      session: {
+        dispose: async () => {
+          disposed.push("old-request");
+        },
+      },
+    }],
+    ["other-binding", {
+      connection,
+      bindingId: "binding-new",
+      session: {
+        dispose: async () => {
+          disposed.push("other-binding");
+        },
+      },
+    }],
+    ["other-connection", {
+      connection: otherConnection,
+      bindingId: "binding-old",
+      session: {
+        dispose: async () => {
+          disposed.push("other-connection");
+        },
+      },
+    }],
+  ]);
+
+  invalidateBindingRequests(inFlight, connection, "binding-old");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(disposed, ["old-request"]);
+  assert.equal(inFlight.has("old-request"), false);
+  assert.equal(inFlight.has("other-binding"), true);
+  assert.equal(inFlight.has("other-connection"), true);
+});
 
 test("workspace binding is path-free and validates the complete identity tuple", () => {
   assert.equal(isBindWorkspaceMessage(validBinding), true);
@@ -493,6 +537,69 @@ test("daemon rejects stale workspace binding generations", async () => {
     }));
     const [code] = await closed;
     assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon rejects a second binding for the same workspace without a generation advance", async () => {
+  const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    daemon.peer.send(JSON.stringify(validBinding));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify({
+      ...validBinding,
+      bindingId: "binding-2",
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon replaces an older binding for the same workspace after a generation advance", async () => {
+  const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    daemon.peer.send(JSON.stringify(validBinding));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+
+    const replacement = {
+      ...validBinding,
+      bindingId: "binding-2",
+      mappingGeneration: validBinding.mappingGeneration + 1,
+    };
+    daemon.peer.send(JSON.stringify(replacement));
+    const bindOk = await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    assert.equal(bindOk.bindingId, replacement.bindingId);
+
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.INVOKE,
+      requestId: "old-binding",
+      bindingId: validBinding.bindingId,
+      mappingId: validBinding.mappingId,
+      mappingGeneration: validBinding.mappingGeneration,
+      mappingVersion: validBinding.mappingVersion,
+      workspaceId: validBinding.workspaceId,
+      workspaceGeneration: validBinding.workspaceGeneration,
+      command: { kind: "prompt", message: "hello" },
+    }));
+    const response = await onceMessage(daemon.peer, MSG_TYPES.EVENT);
+    assert.equal(JSON.parse(response.error).code, PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
   } finally {
     await daemon.close();
   }
