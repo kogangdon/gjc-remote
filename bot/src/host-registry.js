@@ -32,6 +32,7 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 const INVOKE_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
+export const MAX_BINDING_READINESS_STATES = 64;
 const PING_PAYLOAD = JSON.stringify(PING);
 const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
 const SYSTEM_TIMERS = {
@@ -252,6 +253,8 @@ export class HostRegistry {
         bindingId: undefined,
         /** @type {Map<string, object>} */
         bindingReadiness: new Map(),
+        /** @type {Map<string, number>} */
+        workspaceGenerationHighWater: new Map(),
         workspaceDimensions: undefined,
         workspaceExpiresAt: undefined,
         workspaceMonoExpiresAt: undefined,
@@ -444,13 +447,37 @@ export class HostRegistry {
     }
 
     const hasWorkspace = msg.workspaceId !== undefined;
+    const workspaceGenerationHighWater = hasWorkspace
+      ? state.workspaceGenerationHighWater.get(msg.workspaceId)
+      : undefined;
+    const retainedWorkspaceBinding = hasWorkspace
+      ? [...state.bindingReadiness.values()].find(
+          (binding) => binding.workspaceId === msg.workspaceId
+        )
+      : undefined;
     if (
       hasWorkspace &&
-      state.workspaceGeneration !== undefined &&
-      (msg.workspaceId === state.workspaceId &&
-        msg.workspaceGeneration < state.workspaceGeneration)
+      ((state.workspaceGeneration !== undefined &&
+        msg.workspaceId === state.workspaceId &&
+        msg.workspaceGeneration < state.workspaceGeneration) ||
+        (workspaceGenerationHighWater !== undefined &&
+          msg.workspaceGeneration < workspaceGenerationHighWater) ||
+        (retainedWorkspaceBinding &&
+          msg.workspaceGeneration < retainedWorkspaceBinding.workspaceGeneration))
     ) {
       this.#recordReadinessError(state, PROTOCOL_ERROR_CODES.READINESS_REPLAYED, receivedAt);
+      return false;
+    }
+    if (
+      hasWorkspace &&
+      workspaceGenerationHighWater === undefined &&
+      state.workspaceGenerationHighWater.size >= MAX_BINDING_READINESS_STATES
+    ) {
+      this.#recordReadinessError(
+        state,
+        PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED,
+        receivedAt
+      );
       return false;
     }
 
@@ -485,6 +512,18 @@ export class HostRegistry {
     }
 
     if (hasWorkspace) {
+      state.workspaceGenerationHighWater.set(
+        msg.workspaceId,
+        msg.workspaceGeneration
+      );
+      for (const [bindingId, binding] of state.bindingReadiness) {
+        if (
+          binding.workspaceId === msg.workspaceId &&
+          binding.workspaceGeneration < msg.workspaceGeneration
+        ) {
+          state.bindingReadiness.delete(bindingId);
+        }
+      }
       const generationChanged =
         state.workspaceId !== msg.workspaceId ||
         state.workspaceGeneration !== msg.workspaceGeneration;
@@ -497,15 +536,54 @@ export class HostRegistry {
       state.workspaceGeneration = msg.workspaceGeneration;
       state.bindingId = msg.bindingId;
       if (msg.bindingId !== undefined) {
+        for (const [bindingId, binding] of state.bindingReadiness) {
+          if (
+            bindingId !== msg.bindingId &&
+            binding.workspaceId === msg.workspaceId
+          ) {
+            state.bindingReadiness.delete(bindingId);
+          }
+        }
+        if (
+          !state.bindingReadiness.has(msg.bindingId) &&
+          state.bindingReadiness.size >= MAX_BINDING_READINESS_STATES
+        ) {
+          const expired = [...state.bindingReadiness.values()]
+            .filter((binding) => binding.monoExpiresAt <= monotonicReceivedAt)
+            .sort(
+              (left, right) =>
+                left.monoExpiresAt - right.monoExpiresAt ||
+                left.bindingId.localeCompare(right.bindingId)
+            );
+          if (expired.length === 0) {
+            this.#recordReadinessError(
+              state,
+              PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED,
+              receivedAt
+            );
+            return false;
+          }
+          state.bindingReadiness.delete(expired[0].bindingId);
+        }
         state.bindingReadiness.set(msg.bindingId, {
           bindingId: msg.bindingId,
           workspaceId: msg.workspaceId,
           workspaceGeneration: msg.workspaceGeneration,
           dimensions: { ...msg.status },
-          lastError: msg.lastError ? normalizeRemoteError(msg.lastError) : undefined,
+          lastError: msg.lastError
+            ? {
+                code: state.lastError.code,
+                at: state.lastError.at,
+                remediation: { ...state.lastError.remediation },
+              }
+            : undefined,
+          priorReady:
+            state.bindingReadiness.get(msg.bindingId)?.priorReady === true ||
+            (!msg.lastError && this.#dimensionsReady(msg.status)),
           receivedAt,
           expiresAt: receivedAt + ttlMs,
-          expired: false,
+          monoExpiresAt:
+            monotonicReceivedAt + Math.min(ttlMs, READINESS_MAX_TTL_MS),
         });
       }
       state.hostDimensions = { ...msg.status };
@@ -636,6 +714,10 @@ export class HostRegistry {
   }
   #allDimensionsReady(state) {
     const dimensions = this.#effectiveDimensions(state);
+    return this.#dimensionsReady(dimensions);
+  }
+
+  #dimensionsReady(dimensions) {
     return READINESS_DIMENSIONS.every(
       (dimension) =>
         dimensions[dimension] === "ready" ||
@@ -656,6 +738,20 @@ export class HostRegistry {
     return "ready";
   }
 
+  #bindingAggregate(state, binding) {
+    if (!binding || this.connections.get(state.hostId) !== state.socket) return "offline";
+    const dimensions = binding.dimensions;
+    if (dimensions.connection === "offline") return "offline";
+    if (dimensions.runtime === "incompatible") return "incompatible";
+    if (binding.lastError) {
+      return "degraded";
+    }
+    if (binding.monoExpiresAt <= this.monotonicNow()) {
+      return binding.priorReady ? "degraded" : "connected-not-ready";
+    }
+    return this.#dimensionsReady(dimensions) ? "ready" : "connected-not-ready";
+  }
+
   #projectHost(hostId, state) {
     const projection = {
       hostId: redactOpaqueId(hostId),
@@ -674,11 +770,40 @@ export class HostRegistry {
     if (state.receivedAt !== undefined) projection.receivedAt = state.receivedAt;
     const localExpiry = state.workspaceExpiresAt ?? state.expiresAt;
     if (localExpiry !== undefined) projection.expiresAt = localExpiry;
+    if (state.bindingReadiness.size > 0) {
+      projection.bindings = [...state.bindingReadiness.values()]
+        .map((binding) => ({
+          bindingId: redactOpaqueId(binding.bindingId),
+          workspaceId: redactOpaqueId(binding.workspaceId),
+          workspaceGeneration: binding.workspaceGeneration,
+          aggregate: this.#bindingAggregate(state, binding),
+          dimensions: { ...binding.dimensions },
+          receivedAt: binding.receivedAt,
+          expiresAt: binding.expiresAt,
+          lastErrorAt: binding.lastError ? binding.receivedAt : null,
+        }))
+        .sort((left, right) => left.bindingId.localeCompare(right.bindingId));
+    }
     return projection;
   }
 
   #notReadyResult(state, aggregate) {
-    const dimensions = this.#effectiveDimensions(state);
+    return this.#notReadyFromDimensions(
+      this.#effectiveDimensions(state),
+      state.lastError,
+      aggregate
+    );
+  }
+
+  #bindingNotReadyResult(binding, aggregate) {
+    return this.#notReadyFromDimensions(
+      binding.dimensions,
+      binding.lastError,
+      aggregate
+    );
+  }
+
+  #notReadyFromDimensions(dimensions, lastError, aggregate) {
     if (aggregate === "offline") {
       return { ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.CONNECTION_LOST] };
     }
@@ -690,7 +815,7 @@ export class HostRegistry {
       };
     }
     if (aggregate === "degraded") {
-      const remediation = state.lastError?.remediation;
+      const remediation = lastError?.remediation;
       return remediation
         ? { ...remediation }
         : { ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.READINESS_EXPIRED] };
@@ -914,14 +1039,13 @@ export class HostRegistry {
     };
   }
 
-  /**
-   * Resolve the current receiver-local binding for a managed route. The
-   * binding id is transport identity, not control-plane authority.
-   */
-  resolveBindingId(hostId, routeIdentity = {}) {
-    const state = this.readinessStates.get(hostId);
-    if (!state || this.connections.get(hostId) !== state.socket) return undefined;
+  #findBindingReadiness(state, routeIdentity = {}) {
+    let match;
     for (const binding of state.bindingReadiness.values()) {
+      if (
+        routeIdentity.bindingId !== undefined &&
+        binding.bindingId !== routeIdentity.bindingId
+      ) continue;
       if (
         routeIdentity.workspaceId !== undefined &&
         binding.workspaceId !== routeIdentity.workspaceId
@@ -930,10 +1054,10 @@ export class HostRegistry {
         routeIdentity.workspaceGeneration !== undefined &&
         binding.workspaceGeneration !== routeIdentity.workspaceGeneration
       ) continue;
-      if (binding.expired || binding.lastError || binding.expiresAt <= this.now()) continue;
-      return binding.bindingId;
+      if (match) return undefined;
+      match = binding;
     }
-    return undefined;
+    return match;
   }
 
 /**
@@ -961,8 +1085,21 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       });
     }
     const readiness = this.readinessStates.get(hostId);
+    let selectedBindingId;
     if (readiness?.readinessEnabled) {
-      const aggregate = this.#aggregate(readiness);
+      const hasBindingSelector =
+        routeIdentity?.bindingId !== undefined ||
+        routeIdentity?.workspaceId !== undefined ||
+        routeIdentity?.workspaceGeneration !== undefined;
+      const binding =
+        hasBindingSelector
+          ? this.#findBindingReadiness(readiness, routeIdentity)
+          : undefined;
+      selectedBindingId = binding?.bindingId;
+      const aggregate =
+        hasBindingSelector && binding
+          ? this.#bindingAggregate(readiness, binding)
+          : this.#aggregate(readiness);
       if (aggregate === "offline") {
         return Promise.resolve({
           ok: false,
@@ -975,10 +1112,18 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
           error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
         });
       }
+      if (hasBindingSelector && !binding) {
+        return Promise.resolve({
+          ok: false,
+          error: remediationError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED),
+        });
+      }
       if (aggregate !== "ready") {
         return Promise.resolve({
           ok: false,
-          error: this.#notReadyResult(readiness, aggregate),
+          error: binding
+            ? this.#bindingNotReadyResult(binding, aggregate)
+            : this.#notReadyResult(readiness, aggregate),
         });
       }
     }
@@ -997,8 +1142,7 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     if (usesV2) {
       const effectiveRouteIdentity = {
         ...routeIdentity,
-        bindingId: routeIdentity?.bindingId ??
-          this.resolveBindingId(hostId, routeIdentity),
+        bindingId: routeIdentity?.bindingId ?? selectedBindingId,
       };
       for (const [key, value] of Object.entries(effectiveRouteIdentity)) {
         if (value !== undefined && value !== null) invoke[key] = value;
