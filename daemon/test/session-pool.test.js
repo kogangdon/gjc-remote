@@ -50,6 +50,88 @@ test("a closed SDK session is disposed and replaced", async () => {
     await pool.shutdown();
   }
 });
+
+test("session admission rejects a ninth workspace before SDK creation", async () => {
+  const created = [];
+  const workDirs = Array.from({ length: 9 }, (_, index) =>
+    process.platform === "win32" ? `C:\\work-${index}` : `/work-${index}`
+  );
+  const pool = new SessionPool({
+    statSyncFn: () => ({ isDirectory: () => true }),
+    realpathSyncFn: (workDir) => workDir,
+    sessionFactory: async (workDir) => {
+      created.push(workDir);
+      return new FakeSession();
+    },
+  });
+
+  try {
+    for (const workDir of workDirs.slice(0, 8)) {
+      await pool.ensureSession(workDir);
+    }
+    await assert.rejects(
+      pool.ensureSession(workDirs[8]),
+      (error) => error?.code === "SESSION_LIMIT"
+    );
+    assert.equal(created.length, 8);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("concurrent session admission reserves all eight slots before creation settles", async () => {
+  let releaseCreation;
+  const creationGate = new Promise((resolve) => {
+    releaseCreation = resolve;
+  });
+  const workDirs = Array.from({ length: 9 }, (_, index) =>
+    process.platform === "win32" ? `C:\\pending-${index}` : `/pending-${index}`
+  );
+  const pool = new SessionPool({
+    statSyncFn: () => ({ isDirectory: () => true }),
+    realpathSyncFn: (workDir) => workDir,
+    sessionFactory: async () => {
+      await creationGate;
+      return new FakeSession();
+    },
+  });
+
+  try {
+    const admitted = workDirs.slice(0, 8).map((workDir) => pool.ensureSession(workDir));
+    await assert.rejects(
+      pool.ensureSession(workDirs[8]),
+      (error) => error?.code === "SESSION_LIMIT"
+    );
+    assert.deepEqual(pool.getAdmissionSnapshot(), {
+      activeSessions: 0,
+      pendingSessions: 8,
+      admittedWorkspaces: 8,
+      maxSessions: 8,
+    });
+
+    releaseCreation();
+    await Promise.all(admitted);
+    assert.deepEqual(pool.getAdmissionSnapshot(), {
+      activeSessions: 8,
+      pendingSessions: 0,
+      admittedWorkspaces: 8,
+      maxSessions: 8,
+    });
+  } finally {
+    releaseCreation();
+    await pool.shutdown();
+  }
+});
+
+test("session admission validates configured bounds", async () => {
+  assert.throws(() => createPool({ maxSessions: 0 }), /positive safe integer/);
+  assert.throws(
+    () => createPool({ maxSessions: Number.MAX_SAFE_INTEGER + 1 }),
+    /positive safe integer/
+  );
+  const pool = createPool({ maxSessions: 1 });
+  await pool.shutdown();
+});
 test("idle reaper skips busy sessions and reaps them after work settles", async () => {
   const session = new FakeSession();
   let busy = true;
