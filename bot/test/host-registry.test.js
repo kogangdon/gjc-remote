@@ -20,7 +20,10 @@ import {
   PROTOCOL_ERROR_CODES,
   WORKSPACE_READINESS_CAPABILITY,
 } from "@gjc-remote/shared";
-import { HostRegistry } from "../src/host-registry.js";
+import {
+  HostRegistry,
+  MAX_BINDING_READINESS_STATES,
+} from "../src/host-registry.js";
 
 function createManualTimers() {
   const intervals = new Map();
@@ -490,6 +493,668 @@ test("managed v2 invokes select the matching binding from multiple readiness fra
     assert.equal(invoke.bindingId, "binding-a");
     socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
     assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed v2 readiness gates and projects each binding independently", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-b",
+      revision: 2,
+      workspaceId: "workspace-b",
+      workspaceGeneration: 2,
+      observedAt: Date.now(),
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "missing",
+        modelProfile: "ready",
+        workspace: "ready",
+      },
+    }));
+
+    const projection = server.registry.getHostReadiness("host-a");
+    assert.deepEqual(
+      projection.bindings.map(({ bindingId, workspaceId, aggregate }) => ({
+        bindingId,
+        workspaceId,
+        aggregate,
+      })),
+      [
+        { bindingId: "binding-a", workspaceId: "workspace-a", aggregate: "ready" },
+        {
+          bindingId: "binding-b",
+          workspaceId: "workspace-b",
+          aggregate: "connected-not-ready",
+        },
+      ]
+    );
+
+    const invokeFrame = once(socket, "message");
+    const readyResult = server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "hello" },
+      () => {},
+      1000,
+      undefined,
+      {
+        mappingId: "mapping-a",
+        mappingGeneration: 1,
+        mappingVersion: 1,
+        workspaceId: "workspace-a",
+        workspaceGeneration: 1,
+      }
+    );
+    const [raw] = await invokeFrame;
+    const invoke = JSON.parse(raw.toString());
+    assert.equal(invoke.bindingId, "binding-a");
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
+    assert.deepEqual(await readyResult, { ok: true, text: undefined });
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "blocked" },
+        () => {},
+        1000,
+        undefined,
+        {
+          mappingId: "mapping-b",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+          workspaceId: "workspace-b",
+          workspaceGeneration: 2,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+          retryable: true,
+          action: "login",
+        },
+      }
+    );
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed v2 invoke rejects a route without a live matching binding", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "blocked" },
+        () => {},
+        1000,
+        undefined,
+        {
+          mappingId: "mapping-b",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+          workspaceId: "workspace-b",
+          workspaceGeneration: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      }
+    );
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed v2 invoke without any binding preserves the closed serving boundary", async () => {
+  const server = await startRegistry();
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      workspaceId: undefined,
+      workspaceGeneration: undefined,
+      observedAt: Date.now(),
+    }));
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "blocked" },
+        () => {},
+        1000,
+        undefined,
+        {
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+          workspaceId: "workspace-a",
+          workspaceGeneration: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+          retryable: false,
+          action: "contact_admin",
+        },
+      }
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed v2 invoke without any binding fails closed when serving is enabled", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      workspaceId: undefined,
+      workspaceGeneration: undefined,
+      observedAt: Date.now(),
+    }));
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "blocked" },
+        () => {},
+        1000,
+        undefined,
+        {
+          bindingId: "binding-missing",
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      }
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("binding-scoped readiness expires from receiver monotonic time", async () => {
+  let wall = 1_700_000_000_000;
+  let monotonic = 100;
+  const server = await startRegistry(undefined, {
+    workspaceServingEnabled: true,
+    now: () => wall,
+    monotonicNow: () => monotonic,
+    timers: createManualTimers().api,
+  });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: wall,
+      ttlMs: 1_000,
+    }));
+    monotonic = 1_101;
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "expired" },
+        () => {},
+        1000,
+        undefined,
+        {
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+          workspaceId: "workspace-a",
+          workspaceGeneration: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.READINESS_EXPIRED,
+          retryable: true,
+          action: "retry_later",
+        },
+      }
+    );
+    assert.equal(wall, 1_700_000_000_000);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a never-ready binding stays connected-not-ready after monotonic expiry", async () => {
+  let wall = 1_700_000_000_000;
+  let monotonic = 100;
+  const server = await startRegistry(undefined, {
+    workspaceServingEnabled: true,
+    now: () => wall,
+    monotonicNow: () => monotonic,
+    timers: createManualTimers().api,
+  });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: wall,
+      ttlMs: 1_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "missing",
+        modelProfile: "ready",
+        workspace: "ready",
+      },
+    }));
+    monotonic = 1_101;
+
+    const projection = server.registry.getHostReadiness("host-a");
+    assert.equal(projection.bindings[0].aggregate, "connected-not-ready");
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "blocked" },
+        () => {},
+        1000,
+        undefined,
+        {
+          bindingId: "binding-a",
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+          retryable: true,
+          action: "login",
+        },
+      }
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("same-workspace binding replacement retires the superseded binding", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-old",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-new",
+      revision: 2,
+      workspaceId: "workspace-a",
+      workspaceGeneration: 2,
+      observedAt: Date.now(),
+    }));
+
+    assert.deepEqual(
+      server.registry.getHostReadiness("host-a").bindings.map(
+        ({ bindingId, workspaceGeneration }) => ({ bindingId, workspaceGeneration })
+      ),
+      [{ bindingId: "binding-new", workspaceGeneration: 2 }]
+    );
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "stale" },
+        () => {},
+        1000,
+        undefined,
+        {
+          bindingId: "binding-old",
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      }
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("interleaved readiness cannot regress a retained workspace generation", async () => {
+  const server = await startRegistry();
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a-new",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 2,
+      observedAt: Date.now(),
+    }));
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-b",
+      revision: 2,
+      workspaceId: "workspace-b",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+
+    const closed = once(socket, "close");
+    socket.send(JSON.stringify(readinessFrame({
+      bindingId: "binding-a-stale",
+      revision: 3,
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    })));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await server.close();
+  }
+});
+
+test("bindingless readiness advances the retained workspace generation fence", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 2,
+      observedAt: Date.now(),
+    }));
+    await sendReadiness(socket, readinessFrame({
+      bindingId: undefined,
+      revision: 2,
+      workspaceId: "workspace-a",
+      workspaceGeneration: 3,
+      observedAt: Date.now(),
+    }));
+    assert.deepEqual(server.registry.getHostReadiness("host-a").bindings, undefined);
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "stale" },
+        () => {},
+        1000,
+        undefined,
+        {
+          bindingId: "binding-a",
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      }
+    );
+    assert.equal(server.registry.pendingRequests.size, 0);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-b",
+      revision: 3,
+      workspaceId: "workspace-b",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+
+    const closed = once(socket, "close");
+    socket.send(JSON.stringify(readinessFrame({
+      bindingId: "binding-a-stale",
+      revision: 4,
+      workspaceId: "workspace-a",
+      workspaceGeneration: 2,
+      observedAt: Date.now(),
+    })));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed v2 invoke matches an explicit bindingId without workspace selectors", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+
+    const invokeFrame = once(socket, "message");
+    const result = server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "hello" },
+      () => {},
+      1000,
+      undefined,
+      {
+        bindingId: "binding-a",
+        mappingId: "mapping-a",
+        mappingGeneration: 1,
+        mappingVersion: 1,
+      }
+    );
+    const [raw] = await invokeFrame;
+    const invoke = JSON.parse(raw.toString());
+    assert.equal(invoke.bindingId, "binding-a");
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
+    assert.deepEqual(await result, { ok: true, text: undefined });
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "blocked" },
+        () => {},
+        1000,
+        undefined,
+        {
+          bindingId: "binding-stale",
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      }
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed v2 invoke rejects an ambiguous generation-only binding selector", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-b",
+      revision: 2,
+      workspaceId: "workspace-b",
+      workspaceGeneration: 1,
+      observedAt: Date.now(),
+    }));
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "ambiguous" },
+        () => {},
+        1000,
+        undefined,
+        {
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+          workspaceGeneration: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      }
+    );
+    assert.equal(server.registry.pendingRequests.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("binding-scoped remote errors preserve their remediation", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      bindingId: "binding-a",
+      observedAt: Date.now(),
+      lastError: {
+        code: PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+        at: Date.now(),
+        remediation: {
+          code: PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+          retryable: true,
+          action: "login",
+        },
+      },
+    }));
+
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "blocked" },
+        () => {},
+        1000,
+        undefined,
+        {
+          mappingId: "mapping-a",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+          workspaceId: "workspace-1",
+          workspaceGeneration: 1,
+        }
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.PROVIDER_MISSING,
+          retryable: true,
+          action: "login",
+        },
+      }
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("binding readiness retention is bounded per socket", async () => {
+  const server = await startRegistry();
+  try {
+    const { socket } = await connectV2(server);
+    const observedAt = Date.now();
+    for (let index = 0; index < MAX_BINDING_READINESS_STATES; index += 1) {
+      await sendReadiness(socket, readinessFrame({
+        bindingId: `binding-${index}`,
+        revision: index + 1,
+        workspaceId: `workspace-${index}`,
+        observedAt,
+      }));
+    }
+
+    const closed = once(socket, "close");
+    socket.send(JSON.stringify(readinessFrame({
+      bindingId: "binding-overflow",
+      revision: MAX_BINDING_READINESS_STATES + 1,
+      workspaceId: "workspace-overflow",
+      observedAt,
+    })));
+    const [code] = await closed;
+    assert.equal(code, 1008);
   } finally {
     await server.close();
   }

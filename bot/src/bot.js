@@ -34,6 +34,7 @@ import {
 } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
 import { HostRegistry } from "./host-registry.js";
+import { formatHostList } from "./host-projection.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
 import { ToolLogStore } from "./tool-log-store.js";
 import {
@@ -272,23 +273,6 @@ client.on("interactionCreate", async (interaction) => {
   });
 });
 
-function formatHostProjection(projection) {
-  const hostId = typeof projection?.hostId === "string" ? projection.hostId : "unknown";
-  const aggregate = typeof projection?.aggregate === "string" ? projection.aggregate : "unknown";
-  const dimensions =
-    projection?.dimensions && typeof projection.dimensions === "object"
-      ? Object.entries(projection.dimensions)
-          .map(([name, value]) => `${name}=${String(value)}`)
-          .join(", ")
-      : "";
-  const details = [`${hostId}: ${aggregate}`];
-  if (dimensions) details.push(dimensions);
-  if (projection?.lastError?.remediation) {
-    details.push(formatDeliveryError(projection.lastError.remediation));
-  }
-  return details.join(" — ");
-}
-
 function noMentions(content, extra = {}) {
   return {
     ...extra,
@@ -304,9 +288,7 @@ async function handleChatInputInteraction(interaction) {
   if (commandName === "hosts") {
     const hosts = registry.listHosts();
     await interaction.reply(noMentions(
-      hosts.length
-        ? hosts.map(formatHostProjection).join("\n")
-        : "No hosts connected."
+      formatHostList(hosts)
     ));
     return;
   }
