@@ -479,9 +479,9 @@ function acceptWorkspaceBinding(state, message) {
     inventoryWorkspace,
     ready: false,
     lastError: makeReadinessError(
-      localWorkspaceInventory === undefined
-        ? PROTOCOL_ERROR_CODES.INVENTORY_PENDING
-        : PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
+      localWorkspaceInventory !== undefined && inventoryWorkspace === undefined
+        ? PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
+        : PROTOCOL_ERROR_CODES.INVENTORY_PENDING
     ),
   });
   // Binding acceptance is intentionally separate from readiness. The daemon
