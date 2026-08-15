@@ -434,7 +434,13 @@ export const CAPABILITIES = Object.freeze(["invoke", "set_model", "heartbeat"]);
  * @typedef {{
  *   type: "invoke",
  *   requestId: string,
- *   workDir: string,
+ *   workDir?: string,
+ *   bindingId?: string,
+ *   mappingId?: string,
+ *   mappingGeneration?: number,
+ *   mappingVersion?: number,
+ *   workspaceId?: string,
+ *   workspaceGeneration?: number,
  *   command: { kind: "prompt" | "steer" | "follow_up", message: string }
  *     | { kind: "set_model", modelName: string },
  * }} InvokeMessage
@@ -925,7 +931,6 @@ export function isInvokeMessage(value, context = undefined) {
       "mappingVersion",
       "workspaceId",
       "workspaceGeneration",
-      "workDir",
       "command",
     ]);
     if (!Object.keys(value).every((key) => allowedFields.has(key))) return false;
@@ -941,9 +946,6 @@ export function isInvokeMessage(value, context = undefined) {
       return false;
     }
     if (hasOwn(value, "workspaceGeneration") && !isReadinessWorkspaceGeneration(value.workspaceGeneration)) {
-      return false;
-    }
-    if (hasOwn(value, "workDir") && !isBoundedString(value.workDir, V0_LIMITS.WORK_DIR)) {
       return false;
     }
   } else if (!isBoundedString(value.workDir, V0_LIMITS.WORK_DIR)) {
