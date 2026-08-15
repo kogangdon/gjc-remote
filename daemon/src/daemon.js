@@ -472,7 +472,11 @@ function acceptWorkspaceBinding(state, message) {
     binding,
     inventoryWorkspace,
     ready: false,
-    lastError: makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND),
+    lastError: makeReadinessError(
+      localWorkspaceInventory === undefined
+        ? PROTOCOL_ERROR_CODES.INVENTORY_PENDING
+        : PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
+    ),
   });
   // Binding acceptance is intentionally separate from readiness. The daemon
   // still needs a verified local inventory match before it can serve.
@@ -600,7 +604,7 @@ function readinessRejection(state, bindingState = undefined) {
     return makeReadinessError(code);
   }
   if (bindingState && !bindingState.ready) {
-    return bindingState.lastError ?? makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+    return bindingState.lastError ?? makeReadinessError(PROTOCOL_ERROR_CODES.INVENTORY_PENDING);
   }
   if (!bindingState && dimensions.workspace !== "ready") {
     return makeReadinessError(
@@ -691,7 +695,7 @@ function invokeMappingRejection(state, message) {
     return makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
   }
   if (bindingState && !bindingState.ready) {
-    return bindingState.lastError ?? makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
+    return bindingState.lastError ?? makeReadinessError(PROTOCOL_ERROR_CODES.INVENTORY_PENDING);
   }
   const identity = bindingState?.binding ?? state;
   const mappingFields = [

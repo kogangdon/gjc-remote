@@ -146,7 +146,7 @@ export class HostRegistry {
     this.pendingCountBySocket = new Map();
     /** @type {Map<string, { protocolVersion: number, capabilities: string[] }>} */
     this.hostInfo = new Map();
-    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number, bindingId?: string, workspaceId?: string, workspaceGeneration?: number }>} */
+    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number, bindingId?: string, workspaceId?: string, workspaceGeneration?: number, workspaceGenerationHighWater: Map<string, number> }>} */
     this.readinessAuthorities = new Map();
     /** @type {Map<string, object>} */
     this.readinessStates = new Map();
