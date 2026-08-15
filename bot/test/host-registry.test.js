@@ -2292,6 +2292,73 @@ test("phase 1 preserves readiness fences across replacement and records replay s
   }
 });
 
+test("replacement socket preserves generation fences for every workspace", async () => {
+  const server = await startRegistry();
+  try {
+    const first = await connectV2(server);
+    await sendReadiness(first.socket, readinessFrame({
+      socketGeneration: 7,
+      revision: 1,
+      observedAt: Date.now(),
+      bindingId: "binding-a",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 5,
+    }));
+    await sendReadiness(first.socket, readinessFrame({
+      socketGeneration: 7,
+      revision: 2,
+      observedAt: Date.now(),
+      bindingId: "binding-b",
+      workspaceId: "workspace-b",
+      workspaceGeneration: 2,
+    }));
+    first.socket.terminate();
+    await waitFor(() => server.registry.getHostReadiness("host-a") === undefined);
+
+    const stale = await connectV2(server);
+    await sendReadiness(stale.socket, readinessFrame({
+      socketGeneration: 8,
+      revision: 1,
+      observedAt: Date.now(),
+      bindingId: "binding-b-current",
+      workspaceId: "workspace-b",
+      workspaceGeneration: 2,
+    }));
+    const staleClosed = once(stale.socket, "close");
+    stale.socket.send(JSON.stringify(readinessFrame({
+      socketGeneration: 8,
+      revision: 2,
+      observedAt: Date.now(),
+      bindingId: "binding-a-replayed",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 4,
+    })));
+    const [code] = await staleClosed;
+    assert.equal(code, 1008);
+    assert.equal(
+      server.registry.readinessStates.get("host-a")?.lastError?.code,
+      PROTOCOL_ERROR_CODES.READINESS_REPLAYED
+    );
+
+    const current = await connectV2(server);
+    await sendReadiness(current.socket, readinessFrame({
+      socketGeneration: 9,
+      revision: 1,
+      observedAt: Date.now(),
+      bindingId: "binding-a-current",
+      workspaceId: "workspace-a",
+      workspaceGeneration: 5,
+    }));
+    assert.equal(
+      server.registry.getHostReadiness("host-a").bindings[0].bindingId,
+      "binding-a-current"
+    );
+    current.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
 test("phase 1 records invalid freshness and recovers degraded readiness on a fresh frame", async () => {
   let wall = 1_700_000_000_000;
   let monotonic = 0;
