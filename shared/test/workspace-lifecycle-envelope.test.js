@@ -48,3 +48,56 @@ test("only exact committed evidence routes and manual cleanup absorbs", () => {
   assert.equal(classifyWorkspaceLifecycleEvidence({ manualCleanup: manualCleanup() }), "manual_cleanup");
   assert.throws(() => validateWorkspaceLifecycleHead({ ...head, disposition: "manual_cleanup" }));
 });
+
+test("non-genesis committed evidence requires the exact predecessor head", () => {
+  const predecessor = buildWorkspaceLifecycleHead({
+    revision: 1,
+    currentRecordFingerprint: "2".repeat(64),
+    disposition: "committed",
+  });
+  const { version, kind, transactionFingerprint, ...base } = tx();
+  const transaction = buildWorkspaceLifecycleTransaction({
+    ...base,
+    txId: "transaction-2",
+    operation: "refresh",
+    expectedHeadRevision: 1,
+    expectedHeadFingerprint: predecessor.headFingerprint,
+    beforeFingerprint: "3".repeat(64),
+    priorFingerprint: "4".repeat(64),
+  });
+  const committed = buildWorkspaceLifecycleCheckpoint({
+    transaction,
+    phase: "committed",
+    operationEvidenceFingerprint: transaction.candidateFingerprint,
+  });
+  const head = buildWorkspaceLifecycleHead({
+    revision: 2,
+    currentRecordFingerprint: committed.checkpointFingerprint,
+    disposition: "committed",
+  });
+
+  assert.equal(
+    classifyWorkspaceLifecycleEvidence({
+      transaction,
+      checkpoint: committed,
+      head,
+      predecessorHead: predecessor,
+      authorityFingerprint: transaction.authorityFingerprint,
+    }),
+    "committed"
+  );
+  assert.equal(
+    classifyWorkspaceLifecycleEvidence({
+      transaction,
+      checkpoint: committed,
+      head,
+      predecessorHead: buildWorkspaceLifecycleHead({
+        revision: 1,
+        currentRecordFingerprint: "5".repeat(64),
+        disposition: "committed",
+      }),
+      authorityFingerprint: transaction.authorityFingerprint,
+    }),
+    "no-route"
+  );
+});
