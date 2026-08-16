@@ -241,6 +241,7 @@ async function startDaemon(extraEnv = {}) {
   return {
     child,
     peer,
+    wss,
     register,
     stderr: () => stderr,
     async close() {
@@ -594,6 +595,45 @@ test("daemon rejects stale workspace binding generations", async () => {
       ...validBinding,
       mappingGeneration: validBinding.mappingGeneration - 1,
     }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon rejects a stale workspace binding replayed on a new socket", async () => {
+  const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const newer = {
+      ...validBinding,
+      bindingId: "binding-newer",
+      mappingGeneration: validBinding.mappingGeneration + 1,
+      workspaceGeneration: validBinding.workspaceGeneration + 1,
+      inventoryGeneration: validBinding.inventoryGeneration + 1,
+    };
+    daemon.peer.send(JSON.stringify(newer));
+    await onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+
+    const reconnecting = once(daemon.wss, "connection");
+    daemon.peer.terminate();
+    const [nextPeer] = await reconnecting;
+    assert.equal((await onceMessage(nextPeer, MSG_TYPES.REGISTER)).type, MSG_TYPES.REGISTER);
+    nextPeer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(nextPeer, MSG_TYPES.READINESS);
+
+    const closed = once(nextPeer, "close");
+    nextPeer.send(JSON.stringify(validBinding));
     const [code] = await closed;
     assert.equal(code, 1008);
   } finally {

@@ -41,6 +41,7 @@ import {
 import { serializeEventFrame } from "./event-frame.js";
 import { findWorkspaceInventory } from "./workspace-inventory.js";
 import { createWorkspaceInventoryProvider } from "./workspace-inventory-provider.js";
+import { WorkspaceLeaseRegistry } from "./workspace-lease-registry.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -289,6 +290,7 @@ try {
 
 const pool = new SessionPool({ sensitiveValues: daemonSensitiveValues });
 const admissionBudget = new AdmissionBudget();
+const workspaceLeases = new WorkspaceLeaseRegistry();
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
@@ -464,12 +466,15 @@ function acceptWorkspaceBinding(state, message) {
       message.inventoryGeneration > previousWorkspace.inventoryGeneration;
     if (!mappingGenerationAdvanced && !inventoryGenerationAdvanced) return false;
     if (authorityChanged && !mappingGenerationAdvanced) return false;
+    if (!workspaceLeases.adoptBinding(message)) return false;
 
     // A workspace has one active binding per socket. Replace the old receipt
     // only after the new identity passes monotonic fencing; old invokes are
     // disposed and can no longer cross the remap boundary.
     state.bindings.delete(previousWorkspace.bindingId);
     invalidateBindingRequests(state, previousWorkspaceState);
+  } else if (!workspaceLeases.adoptBinding(message)) {
+    return false;
   }
 
   const binding = Object.freeze({ ...message });
@@ -761,18 +766,42 @@ async function admitReadyWorkload(state, workDir, message) {
   const bindingFingerprintValue = bindingState
     ? bindingFingerprint(bindingState.binding)
     : undefined;
+  let activityLease;
   try {
-    const session = await pool.ensureSession(effectiveWorkDir);
+    if (bindingState) {
+      activityLease = workspaceLeases.acquireActivity({
+        ...bindingState.binding,
+        bindingFingerprint: bindingFingerprintValue,
+      });
+    }
+    const session = await pool.ensureSession(effectiveWorkDir, {
+      managedIdentity: bindingFingerprintValue,
+    });
     if (
       bindingState &&
-      !currentBindingState(state, bindingState, bindingFingerprintValue)
+      (!activityLease.isCurrent() ||
+        !currentBindingState(state, bindingState, bindingFingerprintValue))
     ) {
+      activityLease.release();
       return {
         error: makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED),
       };
     }
-    return { session, bindingState, bindingFingerprint: bindingFingerprintValue };
+    return {
+      session,
+      bindingState,
+      bindingFingerprint: bindingFingerprintValue,
+      activityLease,
+    };
   } catch (error) {
+    activityLease?.release();
+    const errorCode = classifyReadinessError(
+      error,
+      PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
+    );
+    if (errorCode === PROTOCOL_ERROR_CODES.LEASE_CONFLICT) {
+      return { error: makeReadinessError(errorCode) };
+    }
     setReadinessError(state, error, PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);
     publishReadiness(state);
     return { error: state.lastError };
@@ -1018,6 +1047,7 @@ async function handleMessage(
     return;
   }
   let session;
+  let activityLease;
 
   try {
     if (readinessState?.committed) {
@@ -1030,13 +1060,15 @@ async function handleMessage(
         return;
       }
       session = admission.session;
+      activityLease = admission.activityLease;
       if (
         admission.bindingState &&
-        !currentBindingState(
-          readinessState,
-          admission.bindingState,
-          admission.bindingFingerprint
-        )
+        (!activityLease?.isCurrent() ||
+          !currentBindingState(
+            readinessState,
+            admission.bindingState,
+            admission.bindingFingerprint
+          ))
       ) {
         send(undefined, {
           error: formatReadinessRejection(
@@ -1078,6 +1110,7 @@ async function handleMessage(
       });
     }
   } finally {
+    activityLease?.release();
     releaseAdmission();
     const request = inFlightByRequestId.get(requestId);
     if (request?.connection === connection && request.session === session) {

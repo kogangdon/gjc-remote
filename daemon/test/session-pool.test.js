@@ -51,6 +51,277 @@ test("a closed SDK session is disposed and replaced", async () => {
   }
 });
 
+test("managed sessions reuse only the exact binding identity", async () => {
+  const created = [];
+  const pool = createPool({
+    sessionFactory: async () => {
+      const session = new FakeSession();
+      created.push(session);
+      return session;
+    },
+  });
+
+  try {
+    const original = await pool.ensureSession(WORK_DIR, {
+      managedIdentity: "binding-a",
+    });
+    assert.strictEqual(
+      await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" }),
+      original
+    );
+
+    const replacement = await pool.ensureSession(WORK_DIR, {
+      managedIdentity: "binding-b",
+    });
+    assert.notStrictEqual(replacement, original);
+    assert.equal(original.disposeCalls, 1);
+    assert.equal(created.length, 2);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("managed identity replacement rejects while prior creation is pending", async () => {
+  let releaseCreation;
+  const creationGate = new Promise((resolve) => {
+    releaseCreation = resolve;
+  });
+  const original = new FakeSession();
+  const replacement = new FakeSession();
+  const events = [];
+  original.dispose = async () => {
+    events.push("dispose");
+    original.disposeCalls += 1;
+    original.closed = true;
+  };
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      if (factoryCalls === 1) {
+        await creationGate;
+        events.push("original-created");
+        return original;
+      }
+      events.push("replacement-created");
+      return replacement;
+    },
+  });
+
+  try {
+    const pendingOriginal = pool.ensureSession(WORK_DIR, {
+      managedIdentity: "binding-a",
+    });
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    releaseCreation();
+
+    assert.strictEqual(await pendingOriginal, original);
+    assert.strictEqual(
+      await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      replacement
+    );
+    assert.deepEqual(events, [
+      "original-created",
+      "dispose",
+      "replacement-created",
+    ]);
+  } finally {
+    releaseCreation();
+    await pool.shutdown();
+  }
+});
+
+test("managed replacement disposal failure preserves the prior session", async () => {
+  const original = new FakeSession();
+  original.dispose = async () => {
+    original.disposeCalls += 1;
+    throw new Error("dispose failed");
+  };
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return original;
+    },
+  });
+
+  try {
+    await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" });
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    assert.equal(factoryCalls, 1);
+    assert.strictEqual(
+      await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" }),
+      original
+    );
+  } finally {
+    original.dispose = FakeSession.prototype.dispose;
+    await pool.shutdown();
+  }
+});
+
+test("failed managed transition cannot be bypassed by a third identity", async () => {
+  const original = new FakeSession();
+  let disposalAttempts = 0;
+  original.dispose = async () => {
+    disposalAttempts += 1;
+    if (disposalAttempts === 1) throw new Error("dispose failed");
+    original.closed = true;
+  };
+  const replacement = new FakeSession();
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return factoryCalls === 1 ? original : replacement;
+    },
+  });
+
+  try {
+    await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" });
+    const rejectedTransition = pool.ensureSession(WORK_DIR, {
+      managedIdentity: "binding-b",
+    });
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    await assert.rejects(
+      rejectedTransition,
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    assert.equal(factoryCalls, 1);
+
+    assert.strictEqual(
+      await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
+      replacement
+    );
+    assert.equal(disposalAttempts, 2);
+    assert.equal(factoryCalls, 2);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("managed replacement disposal timeout creates no replacement session", async () => {
+  const original = new FakeSession();
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  let disposalAttempts = 0;
+  original.dispose = async () => {
+    disposalAttempts += 1;
+    if (disposalAttempts === 1) await disposalGate;
+    original.closed = true;
+  };
+  const replacement = new FakeSession();
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return factoryCalls === 1 ? original : replacement;
+    },
+  });
+
+  try {
+    await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" });
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    assert.equal(factoryCalls, 1);
+
+    releaseDisposal();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(
+      await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
+      replacement
+    );
+    assert.equal(disposalAttempts, 2);
+    assert.equal(factoryCalls, 2);
+  } finally {
+    releaseDisposal();
+    await pool.shutdown();
+  }
+});
+
+test("managed identity change is fenced until late creation cleanup settles", async () => {
+  let releaseCreation;
+  const creationGate = new Promise((resolve) => {
+    releaseCreation = resolve;
+  });
+  const late = new FakeSession();
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  late.dispose = async () => {
+    late.disposeCalls += 1;
+    await disposalGate;
+    late.closed = true;
+  };
+  const replacement = new FakeSession();
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionCreateTimeoutMs: 1,
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      if (factoryCalls === 1) {
+        await creationGate;
+        return late;
+      }
+      return replacement;
+    },
+  });
+
+  try {
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" }),
+      /session creation timed out/
+    );
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+    assert.equal(factoryCalls, 1);
+
+    releaseCreation();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(late.disposeCalls, 1);
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
+
+    releaseDisposal();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(
+      await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      replacement
+    );
+    await pool.shutdown();
+  } finally {
+    releaseCreation();
+    releaseDisposal();
+  }
+});
+
 test("session admission rejects a ninth workspace before SDK creation", async () => {
   const created = [];
   const workDirs = Array.from({ length: 9 }, (_, index) =>
@@ -396,7 +667,11 @@ test("shutdown completes when session disposal stalls", async () => {
 });
 test("shutdown exposes pending work directories while disposal is in flight", async () => {
   const session = new FakeSession();
-  session.dispose = () => new Promise(() => {});
+  let releaseDisposal;
+  session.dispose = () =>
+    new Promise((resolve) => {
+      releaseDisposal = resolve;
+    });
   const pool = createPool({
     sessionDisposeTimeoutMs: 20,
     sessionFactory: async () => session,
@@ -408,6 +683,11 @@ test("shutdown exposes pending work directories while disposal is in flight", as
     { workDir: WORK_DIR, operation: "shutdown session disposal" },
   ]);
   await shutdown;
+  assert.deepEqual(pool.getPendingShutdownOperations(), [
+    { workDir: WORK_DIR, operation: "shutdown session disposal" },
+  ]);
+  releaseDisposal();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(pool.getPendingShutdownOperations(), []);
 });
 
