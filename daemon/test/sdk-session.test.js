@@ -118,6 +118,38 @@ class GatingAgentSession extends FakeAgentSession {
 
 const gateDelay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function createManualTimeouts() {
+  let now = 0;
+  const timers = new Map();
+
+  return {
+    setTimeout(callback, delay) {
+      const timer = {};
+      timers.set(timer, { callback, dueAt: now + delay });
+      return timer;
+    },
+    clearTimeout(timer) {
+      timers.delete(timer);
+    },
+    advance(ms) {
+      now += ms;
+      for (const [timer, { callback, dueAt }] of [...timers]) {
+        if (dueAt > now) continue;
+        timers.delete(timer);
+        callback();
+      }
+    },
+  };
+}
+
+async function waitForImmediate(predicate, maxTurns = 1_000) {
+  for (let turn = 0; turn < maxTurns; turn += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error("condition was not met within the immediate-turn bound");
+}
+
 test("createSdkSession uses the canonical workDir and dedicated session directory", async () => {
   const calls = [];
   const agent = new FakeAgentSession();
@@ -1054,6 +1086,7 @@ test("createSdkSession disposes the raw session when profile activation fails", 
 // ---------------------------------------------------------------------------
 
 test("gate emission produces a gate_request event and resolves on a label answer", async () => {
+  const timers = createManualTimeouts();
   const agent = new GatingAgentSession({
     gate_id: "g1",
     kind: "question",
@@ -1067,34 +1100,34 @@ test("gate emission produces a gate_request event and resolves on a label answer
     idleTimeoutMs: 40,
     hardCapMs: 10_000,
     gateAnswerWindowMs: 5_000,
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
   });
 
   const events = [];
   const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
 
-  await gateDelay(0);
-  const gateReq = events.find((e) => e && e.type === "gate_request");
-  assert.ok(gateReq, "a gate_request event is emitted");
-  assert.equal(gateReq.gateId, "g1");
-  assert.equal(gateReq.kind, "question");
-  assert.equal(gateReq.prompt, "Pick a fruit");
-  assert.deepEqual(gateReq.choices, [
-    { value: "a", label: "Apple" },
-    { value: "b", label: "Banana" },
-  ]);
-  assert.equal(session.pendingGates.size, 1);
+    await waitForImmediate(() => events.some((e) => e?.type === "gate_request"));
+    const gateReq = events.find((e) => e && e.type === "gate_request");
+    assert.ok(gateReq, "a gate_request event is emitted");
+    assert.equal(gateReq.gateId, "g1");
+    assert.equal(gateReq.kind, "question");
+    assert.equal(gateReq.prompt, "Pick a fruit");
+    assert.deepEqual(gateReq.choices, [
+      { value: "a", label: "Apple" },
+      { value: "b", label: "Banana" },
+    ]);
+    assert.equal(session.pendingGates.size, 1);
 
-  // Idle is suspended while the gate is pending: waiting well past idleTimeoutMs
-  // must NOT reap the session.
-  await gateDelay(120);
-  assert.equal(session.closed, false);
+    timers.advance(120);
+    assert.equal(session.closed, false);
 
-  const result = await session.answerGate("g1", "Banana");
-  assert.equal(result.ok, true);
-  await done;
+    const result = await session.answerGate("g1", "Banana");
+    assert.equal(result.ok, true);
+    await done;
 
-  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g1", answer: "b" }]);
-  assert.equal(session.pendingGates.size, 0);
+    assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g1", answer: "b" }]);
+    assert.equal(session.pendingGates.size, 0);
   await session.dispose();
 });
 
@@ -1166,24 +1199,28 @@ test("a workflow gate suspends idle timers for every active run", async () => {
   }
 
   const agent = new MultiRunGatingAgent();
+  const timers = createManualTimeouts();
   const session = new SdkSession(agent, {
     idleTimeoutMs: 25,
     hardCapMs: 5_000,
     gateAnswerWindowMs: 1_000,
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
   });
   const prompt = session.send({ type: "prompt", message: "first" }, () => {});
   const steer = session.send({ type: "steer", message: "adjust" }, () => {});
   await new Promise((resolve) => setImmediate(resolve));
   agent.releaseGate();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(session.pendingGates.size, 1);
+  await waitForImmediate(() => session.pendingGates.size === 1);
   const lateSteer = session.send({ type: "steer", message: "late-adjust" }, () => {});
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(session.pendingGates.size, 1);
 
-  await gateDelay(75);
+  timers.advance(75);
   assert.equal(session.closed, false);
   await session.answerGate("g-all", "ok");
+  timers.advance(5_000);
+  await new Promise((resolve) => setImmediate(resolve));
   await session.dispose();
   await Promise.allSettled([prompt, steer, lateSteer]);
 });
