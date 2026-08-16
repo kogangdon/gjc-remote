@@ -12,6 +12,12 @@ export const DEFAULT_MAX_SESSIONS = 8;
 // made cold-host creations spuriously "time out" and churn create/dispose.
 const SESSION_CREATE_TIMEOUT_MS = 60_000;
 
+function leaseConflict() {
+  const error = new Error("managed session transition is already in progress");
+  error.code = "LEASE_CONFLICT";
+  return error;
+}
+
 function normalizeCanonicalWorkDir(workDir, platform) {
   if (platform !== "win32") return workDir;
   return workDir
@@ -53,6 +59,7 @@ export class SessionPool {
     this.sensitiveValues = [...sensitiveValues];
     this.maxSessions = maxSessions;
     this.pendingOperations = new Map();
+    this.sessionTransitions = new Map();
     this.reapTimer = this.setIntervalFn(() => {
       void this.#reapIdle().catch((error) =>
         console.error(`SessionPool: idle reap failed: ${this.#sanitize(error)}`)
@@ -128,16 +135,27 @@ export class SessionPool {
     });
   }
 
-  #disposeBounded(session, workDir, context) {
-    return this.#trackPending(
-      workDir,
-      `${context} session disposal`,
-      () =>
-        this.#settleBounded(
-          Promise.resolve().then(() => session.dispose()),
-          this.sessionDisposeTimeoutMs
-        )
+  #startDispose(session, workDir, context) {
+    const operation = Promise.resolve().then(() => session.dispose());
+    const settlement = operation.then(
+      (value) => ({ status: "fulfilled", value }),
+      (reason) => ({ status: "rejected", reason })
     );
+    const token = Symbol(`${context} session disposal`);
+    this.pendingOperations.set(token, {
+      workDir,
+      operation: `${context} session disposal`,
+    });
+    void settlement.then(() => this.pendingOperations.delete(token));
+    const bounded = this.#settleBounded(
+      operation,
+      this.sessionDisposeTimeoutMs
+    );
+    return { bounded, settlement };
+  }
+
+  #disposeBounded(session, workDir, context) {
+    return this.#startDispose(session, workDir, context).bounded;
   }
 
   async #disposeIgnoringFailure(session, workDir, context) {
@@ -157,21 +175,133 @@ export class SessionPool {
     }
   }
 
+  async #disposeForReplacement(session, workDir) {
+    const disposal = this.#startDispose(session, workDir, "replacement");
+    const result = await disposal.bounded;
+    if (result.status === "fulfilled") return;
+    console.error(
+      result.status === "timed_out"
+        ? "SessionPool: managed replacement session disposal timed out"
+        : "SessionPool: managed replacement session disposal failed"
+    );
+    const error = new Error("prior managed session could not be fenced");
+    error.code = "LEASE_CONFLICT";
+    if (result.status === "timed_out") {
+      error.pendingCleanup = disposal.settlement;
+    }
+    throw error;
+  }
+
   async #createSessionBounded(workDir) {
     const pending = Promise.resolve().then(() => this.sessionFactory(workDir));
     const result = await this.#settleBounded(pending, this.sessionCreateTimeoutMs);
     if (result.status === "fulfilled") return result.value;
     if (result.status === "rejected") throw result.reason;
 
-    void pending.then(
-      (session) => this.#disposeIgnoringFailure(session, workDir, "late-created"),
+    const error = new Error(`GJC SDK session creation timed out for ${workDir}`);
+    error.pendingCleanup = pending.then(
+      async (session) => {
+        const disposal = this.#startDispose(session, workDir, "late-created");
+        const result = await disposal.bounded;
+        if (result.status === "rejected") {
+          console.error(
+            `SessionPool: failed to dispose late-created session for ${this.#sanitize(
+              workDir
+            )}: ` + this.#sanitize(result.reason)
+          );
+        } else if (result.status === "timed_out") {
+          console.error(
+            `SessionPool: late-created session disposal timed out for ${this.#sanitize(
+              workDir
+            )}`
+          );
+          await disposal.settlement;
+        }
+      },
       () => {}
     );
-    throw new Error(`GJC SDK session creation timed out for ${workDir}`);
+    throw error;
   }
 
-  async ensureSession(workDir) {
+  async #ensureCanonicalSession(canonicalWorkDir, managedIdentity) {
+    let existing = this.sessions.get(canonicalWorkDir);
+    const identityMatches = existing?.managedIdentity === managedIdentity;
+    if (identityMatches && existing?.session && !existing.session.closed) {
+      existing.lastUsed = Date.now();
+      return existing.session;
+    }
+    if (identityMatches && existing?.creation) {
+      existing.lastUsed = Date.now();
+      return await existing.creation;
+    }
+    if (!existing && this.sessions.size >= this.maxSessions) {
+      const error = new Error("SDK session admission limit reached");
+      error.code = "SESSION_LIMIT";
+      throw error;
+    }
+
+    const entry = {
+      lastUsed: Date.now(),
+      session: undefined,
+      creation: undefined,
+      managedIdentity,
+    };
+    const creation = (async () => {
+      let priorSession = existing?.session;
+      if (!priorSession && existing?.creation) {
+        try {
+          priorSession = await existing.creation;
+        } catch {
+          existing = undefined;
+          priorSession = undefined;
+        }
+      }
+      if (priorSession) {
+        if (existing?.managedIdentity !== managedIdentity) {
+          await this.#disposeForReplacement(priorSession, canonicalWorkDir);
+        } else {
+          await this.#disposeIgnoringFailure(
+            priorSession,
+            canonicalWorkDir,
+            "replacement"
+          );
+        }
+      }
+
+      const session = await this.#createSessionBounded(canonicalWorkDir);
+      if (this.closed) {
+        await this.#disposeIgnoringFailure(session, canonicalWorkDir, "late-created");
+        throw new Error("SessionPool was shut down during session creation");
+      }
+      entry.session = session;
+      entry.creation = undefined;
+      return session;
+    })();
+    entry.creation = creation;
+    this.sessions.set(canonicalWorkDir, entry);
+
+    try {
+      return await creation;
+    } catch (error) {
+      if (this.sessions.get(canonicalWorkDir) === entry) {
+        if (existing) {
+          this.sessions.set(canonicalWorkDir, existing);
+        } else {
+          this.sessions.delete(canonicalWorkDir);
+        }
+      }
+      throw error;
+    }
+  }
+
+  async ensureSession(workDir, { managedIdentity } = {}) {
     if (this.closed) throw new Error("SessionPool is shut down");
+    if (
+      managedIdentity !== undefined &&
+      (typeof managedIdentity !== "string" || managedIdentity.length === 0)
+    ) {
+      throw new TypeError("managedIdentity must be a non-empty string");
+    }
 
     const requestedWorkDir = validateNativeWorkDir(workDir, this.platform);
 
@@ -198,47 +328,47 @@ export class SessionPool {
       });
     }
 
-    const existing = this.sessions.get(canonicalWorkDir);
-    if (existing?.session && !existing.session.closed) {
-      existing.lastUsed = Date.now();
-      return existing.session;
-    }
-    if (existing?.creation) {
-      existing.lastUsed = Date.now();
-      return await existing.creation;
-    }
-    if (this.sessions.size >= this.maxSessions) {
-      const error = new Error("SDK session admission limit reached");
-      error.code = "SESSION_LIMIT";
-      throw error;
+    const active = this.sessionTransitions.get(canonicalWorkDir);
+    if (active) {
+      if (
+        active.managedIdentity === undefined &&
+        managedIdentity === undefined
+      ) {
+        return await this.#ensureCanonicalSession(canonicalWorkDir, managedIdentity);
+      }
+      if (active.managedIdentity === managedIdentity) {
+        return await active.operation;
+      }
+      throw leaseConflict();
     }
 
-    const entry = { lastUsed: Date.now(), session: undefined, creation: undefined };
-    const creation = (async () => {
-      if (existing?.session) {
-        await this.#disposeIgnoringFailure(existing.session, canonicalWorkDir, "replacement");
+    const rawOperation = this.#ensureCanonicalSession(
+      canonicalWorkDir,
+      managedIdentity
+    );
+    const transition = { managedIdentity, operation: undefined };
+    const clearTransition = () => {
+      if (this.sessionTransitions.get(canonicalWorkDir) === transition) {
+        this.sessionTransitions.delete(canonicalWorkDir);
       }
-
-      const session = await this.#createSessionBounded(canonicalWorkDir);
-      if (this.closed) {
-        await this.#disposeIgnoringFailure(session, canonicalWorkDir, "late-created");
-        throw new Error("SessionPool was shut down during session creation");
+    };
+    const operation = rawOperation.then(
+      (session) => {
+        clearTransition();
+        return session;
+      },
+      (error) => {
+        if (error?.pendingCleanup) {
+          void error.pendingCleanup.then(clearTransition);
+        } else {
+          clearTransition();
+        }
+        throw error;
       }
-      entry.session = session;
-      entry.creation = undefined;
-      return session;
-    })();
-    entry.creation = creation;
-    this.sessions.set(canonicalWorkDir, entry);
-
-    try {
-      return await creation;
-    } catch (error) {
-      if (this.sessions.get(canonicalWorkDir) === entry) {
-        this.sessions.delete(canonicalWorkDir);
-      }
-      throw error;
-    }
+    );
+    transition.operation = operation;
+    this.sessionTransitions.set(canonicalWorkDir, transition);
+    return await operation;
   }
 
   async shutdown() {
