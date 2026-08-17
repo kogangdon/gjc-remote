@@ -206,3 +206,20 @@ test("authorized button handler failures are contained", async () => {
 
   assert.equal(status, "failed");
 });
+
+test("authorized message handler failures are contained", async () => {
+  const message = {
+    guildId: "guild-1",
+    author: { id: "allowed-user", bot: false },
+  };
+
+  const status = await dispatchAuthorizedMessage({
+    message,
+    authorization,
+    onMessage: async () => {
+      throw new Error("message delivery failed");
+    },
+  });
+
+  assert.equal(status, "failed");
+});

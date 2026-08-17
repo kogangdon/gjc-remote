@@ -54,6 +54,11 @@ export async function dispatchAuthorizedMessage({ message, authorization, onMess
   if (message.author.bot || !message.guildId) return "ignored";
   if (!authorization.isAuthorized(message.author.id)) return "denied";
 
-  await onMessage(message);
-  return "handled";
+  try {
+    await onMessage(message);
+    return "handled";
+  } catch {
+    console.error("Discord message handler failed.");
+    return "failed";
+  }
 }
