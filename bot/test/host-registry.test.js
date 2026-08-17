@@ -1804,6 +1804,13 @@ test("register handshake negotiates protocol version and shared capabilities", a
       protocolVersion: PROTOCOL_VERSION,
       capabilities: ["invoke"],
     });
+    assert.deepEqual(server.registry.getHostReadiness("host-a"), {
+      hostId: "host-a",
+      aggregate: "online",
+      lastErrorAt: null,
+      revision: 0,
+      socketGeneration: null,
+    });
 
     const closed = once(socket, "close");
     socket.close();
@@ -1831,6 +1838,13 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
     assert.deepEqual(server.registry.getHostInfo("host-a"), {
       protocolVersion: 0,
       capabilities: [],
+    });
+    assert.deepEqual(server.registry.getHostReadiness("host-a"), {
+      hostId: "host-a",
+      aggregate: "online",
+      lastErrorAt: null,
+      revision: 0,
+      socketGeneration: null,
     });
   } finally {
     socket.terminate();

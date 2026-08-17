@@ -786,11 +786,13 @@ export class HostRegistry {
     const projection = {
       hostId: redactOpaqueId(hostId),
       aggregate: this.#aggregate(state),
-      dimensions: { ...this.#effectiveDimensions(state) },
       lastErrorAt: state.lastErrorAt ?? null,
       revision: state.revision,
       socketGeneration: state.socketGeneration ?? null,
     };
+    if (state.readinessEnabled) {
+      projection.dimensions = { ...this.#effectiveDimensions(state) };
+    }
     if (state.workspaceId !== undefined) {
       if (state.bindingId !== undefined) projection.bindingId = redactOpaqueId(state.bindingId);
       projection.workspaceId = redactOpaqueId(state.workspaceId);
