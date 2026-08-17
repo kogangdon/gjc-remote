@@ -32,6 +32,7 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 const INVOKE_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
+const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
 const PING_PAYLOAD = JSON.stringify(PING);
 const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
@@ -140,7 +141,7 @@ export class HostRegistry {
     this.connections = new Map();
     /** @type {Map<import("ws").WebSocket, { hostId: string, timeout?: object }>} */
     this.heartbeatStates = new Map();
-    /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string }>} */
+    /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string, truncated?: boolean }>} */
     this.pendingRequests = new Map();
     /** @type {Map<import("ws").WebSocket, number>} */
     this.pendingCountBySocket = new Map();
@@ -360,8 +361,15 @@ export class HostRegistry {
         }
         return;
       }
-      const text = extractAssistantText(event);
-      if (text !== undefined) pending.text = text;
+      if (
+        event?.type === "event_truncated" &&
+        event?.code === "EVENT_PAYLOAD_TOO_LARGE"
+      ) {
+        pending.truncated = true;
+      } else {
+        const text = extractAssistantText(event);
+        if (text !== undefined) pending.text = text;
+      }
       // Any non-gate event means the agent resumed, so the gate (if any) resolved.
       pending.gatePending = false;
       pending.gateId = undefined;
@@ -369,7 +377,12 @@ export class HostRegistry {
       this.#armIdleTimer(pending);
     }
     if (msg.done) {
-      pending.resolve({ ok: true, text: pending.text });
+      const text = pending.truncated
+        ? pending.text
+          ? `${pending.text}\n${OUTPUT_TRUNCATED_NOTICE}`
+          : OUTPUT_TRUNCATED_NOTICE
+        : pending.text;
+      pending.resolve({ ok: true, text });
       this.#deletePending(msg.requestId);
     }
   }

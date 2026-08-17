@@ -426,6 +426,144 @@ test("valid invoke events relay callbacks and assistant text", async () => {
   }
 });
 
+test("truncated invoke events produce a bounded visible result notice", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const events = [];
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      (event) => events.push(event),
+      1000
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    const truncated = {
+      type: "event_truncated",
+      code: "EVENT_PAYLOAD_TOO_LARGE",
+      originalType: "message_update",
+    };
+
+    socket.send(JSON.stringify({ type: "event", requestId, event: truncated }));
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+
+    assert.deepEqual(await resultPromise, {
+      ok: true,
+      text: "[output truncated: too large]",
+    });
+    assert.deepEqual(events, [truncated]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("truncation preserves assistant text and appends one notice", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const events = [];
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      (event) => events.push(event),
+      1000
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    const assistant = { message: { role: "assistant", content: "answer" } };
+    const truncated = {
+      type: "event_truncated",
+      code: "EVENT_PAYLOAD_TOO_LARGE",
+    };
+
+    socket.send(JSON.stringify({ type: "event", requestId, event: assistant }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: truncated }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: truncated }));
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+
+    assert.deepEqual(await resultPromise, {
+      ok: true,
+      text: "answer\n[output truncated: too large]",
+    });
+    assert.deepEqual(events, [assistant, truncated, truncated]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("truncation does not override errors or activate for near-match events", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const firstFrame = once(socket, "message");
+    const firstResult = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "first" },
+      () => {},
+      1000
+    );
+    const firstRequestId = JSON.parse((await firstFrame)[0].toString()).requestId;
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId: firstRequestId,
+        event: {
+          type: "event_truncated",
+          code: "EVENT_PAYLOAD_TOO_LARGE",
+        },
+      })
+    );
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId: firstRequestId,
+        error: "remote failed",
+      })
+    );
+    assert.deepEqual(await firstResult, { ok: false, error: "remote failed" });
+
+    const secondFrame = once(socket, "message");
+    const events = [];
+    const secondResult = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "second" },
+      (event) => events.push(event),
+      1000
+    );
+    const secondRequestId = JSON.parse((await secondFrame)[0].toString()).requestId;
+    const nearMatch = {
+      type: "event_truncated",
+      code: "OTHER_DIAGNOSTIC",
+    };
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId: secondRequestId,
+        event: nearMatch,
+      })
+    );
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        requestId: secondRequestId,
+        done: true,
+      })
+    );
+
+    assert.deepEqual(await secondResult, { ok: true, text: undefined });
+    assert.deepEqual(events, [nearMatch]);
+  } finally {
+    await server.close();
+  }
+});
+
 test("managed v2 invokes carry the bindingId selected by readiness", async () => {
   const server = await startRegistry(undefined, { workspaceServingEnabled: true });
   try {
