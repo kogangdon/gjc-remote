@@ -84,6 +84,7 @@ export const READINESS_STATUS_VALUES = Object.freeze({
 export const READINESS_DIMENSION_VALUES = READINESS_STATUS_VALUES;
 export const READINESS_STATUSES = READINESS_STATUS_VALUES;
 export const READINESS_AGGREGATE_STATUSES = Object.freeze([
+  "online",
   "offline",
   "incompatible",
   "degraded",
