@@ -1107,27 +1107,27 @@ test("gate emission produces a gate_request event and resolves on a label answer
   const events = [];
   const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
 
-    await waitForImmediate(() => events.some((e) => e?.type === "gate_request"));
-    const gateReq = events.find((e) => e && e.type === "gate_request");
-    assert.ok(gateReq, "a gate_request event is emitted");
-    assert.equal(gateReq.gateId, "g1");
-    assert.equal(gateReq.kind, "question");
-    assert.equal(gateReq.prompt, "Pick a fruit");
-    assert.deepEqual(gateReq.choices, [
-      { value: "a", label: "Apple" },
-      { value: "b", label: "Banana" },
-    ]);
-    assert.equal(session.pendingGates.size, 1);
+  await waitForImmediate(() => events.some((e) => e?.type === "gate_request"));
+  const gateReq = events.find((e) => e && e.type === "gate_request");
+  assert.ok(gateReq, "a gate_request event is emitted");
+  assert.equal(gateReq.gateId, "g1");
+  assert.equal(gateReq.kind, "question");
+  assert.equal(gateReq.prompt, "Pick a fruit");
+  assert.deepEqual(gateReq.choices, [
+    { value: "a", label: "Apple" },
+    { value: "b", label: "Banana" },
+  ]);
+  assert.equal(session.pendingGates.size, 1);
 
-    timers.advance(120);
-    assert.equal(session.closed, false);
+  timers.advance(120);
+  assert.equal(session.closed, false);
 
-    const result = await session.answerGate("g1", "Banana");
-    assert.equal(result.ok, true);
-    await done;
+  const result = await session.answerGate("g1", "Banana");
+  assert.equal(result.ok, true);
+  await done;
 
-    assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g1", answer: "b" }]);
-    assert.equal(session.pendingGates.size, 0);
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g1", answer: "b" }]);
+  assert.equal(session.pendingGates.size, 0);
   await session.dispose();
 });
 
