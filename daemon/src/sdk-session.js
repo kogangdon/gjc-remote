@@ -234,6 +234,8 @@ export class SdkSession {
     this.outstandingAcceptedFollowUps = 0;
     this.liveFollowUpBarrier = undefined;
     this.disposePromise = undefined;
+    this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
+    this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
     // idleTimeoutMs bounds silence between streamed events; hardCapMs is the
     // absolute per-run backstop that fires even under continuous activity and
     // always disposes the underlying session. Both default to the same values
@@ -672,7 +674,7 @@ export class SdkSession {
     const timeoutError = new Error("SDK command timed out");
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(timeoutError), timeoutMs);
+      timer = this.setTimeoutFn(() => reject(timeoutError), timeoutMs);
     });
 
     try {
@@ -684,7 +686,7 @@ export class SdkSession {
       }
       throw error;
     } finally {
-      clearTimeout(timer);
+      this.clearTimeoutFn(timer);
     }
   }
   async #withStreamingTimeout(operation, idleMs, hardCapMs, gateWindowMs, onArm) {
@@ -702,8 +704,8 @@ export class SdkSession {
     let gateSuspended = false;
     const armIdle = () => {
       if (settled || gateSuspended) return;
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => rejectTimeout(idleError), idleMs);
+      this.clearTimeoutFn(idleTimer);
+      idleTimer = this.setTimeoutFn(() => rejectTimeout(idleError), idleMs);
     };
     // #35: while a workflow gate is pending, stop the idle timer and bound the
     // wait by the dedicated gate-answer window instead. Idempotent: repeated
@@ -711,17 +713,17 @@ export class SdkSession {
     const suspendForGate = () => {
       if (settled || gateSuspended) return;
       gateSuspended = true;
-      clearTimeout(idleTimer);
-      gateTimer = setTimeout(() => rejectTimeout(gateError), gateWindowMs);
+      this.clearTimeoutFn(idleTimer);
+      gateTimer = this.setTimeoutFn(() => rejectTimeout(gateError), gateWindowMs);
     };
     const resumeAfterGate = () => {
       if (settled || !gateSuspended) return;
       gateSuspended = false;
-      clearTimeout(gateTimer);
+      this.clearTimeoutFn(gateTimer);
       armIdle();
     };
     armIdle();
-    hardCapTimer = setTimeout(() => rejectTimeout(hardCapError), hardCapMs);
+    hardCapTimer = this.setTimeoutFn(() => rejectTimeout(hardCapError), hardCapMs);
 
     onArm?.({ arm: armIdle, suspendForGate, resumeAfterGate });
 
@@ -739,9 +741,9 @@ export class SdkSession {
       throw error;
     } finally {
       settled = true;
-      clearTimeout(idleTimer);
-      clearTimeout(hardCapTimer);
-      clearTimeout(gateTimer);
+      this.clearTimeoutFn(idleTimer);
+      this.clearTimeoutFn(hardCapTimer);
+      this.clearTimeoutFn(gateTimer);
     }
   }
 

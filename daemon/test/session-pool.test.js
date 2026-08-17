@@ -406,20 +406,32 @@ test("session admission validates configured bounds", async () => {
 test("idle reaper skips busy sessions and reaps them after work settles", async () => {
   const session = new FakeSession();
   let busy = true;
+  let now = 0;
+  let reap;
   session.isBusy = () => busy;
   const pool = createPool({
+    nowFn: () => now,
     idleTimeoutMs: 5,
     reapIntervalMs: 5,
+    setIntervalFn: (callback) => {
+      reap = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn: () => {},
     sessionFactory: async () => session,
   });
 
   try {
     await pool.ensureSession(WORK_DIR);
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    now += 6;
+    reap();
+    await Promise.resolve();
     assert.equal(session.disposeCalls, 0);
 
     busy = false;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    now += 6;
+    reap();
+    await Promise.resolve();
     assert.equal(session.disposeCalls, 1);
   } finally {
     await pool.shutdown();

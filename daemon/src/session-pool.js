@@ -38,6 +38,7 @@ export class SessionPool {
     reapIntervalMs = 5 * 60 * 1000,
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
+    nowFn = Date.now,
     sensitiveValues = [],
     maxSessions = DEFAULT_MAX_SESSIONS,
   } = {}) {
@@ -55,6 +56,7 @@ export class SessionPool {
     this.idleTimeoutMs = idleTimeoutMs;
     this.setIntervalFn = setIntervalFn;
     this.clearIntervalFn = clearIntervalFn;
+    this.nowFn = nowFn;
     this.closed = false;
     this.sensitiveValues = [...sensitiveValues];
     this.maxSessions = maxSessions;
@@ -72,7 +74,7 @@ export class SessionPool {
   }
 
   async #reapIdle() {
-    const now = Date.now();
+    const now = this.nowFn();
     const disposals = [];
     for (const [workDir, entry] of this.sessions) {
       if (!entry.session) continue;
@@ -227,11 +229,11 @@ export class SessionPool {
     let existing = this.sessions.get(canonicalWorkDir);
     const identityMatches = existing?.managedIdentity === managedIdentity;
     if (identityMatches && existing?.session && !existing.session.closed) {
-      existing.lastUsed = Date.now();
+      existing.lastUsed = this.nowFn();
       return existing.session;
     }
     if (identityMatches && existing?.creation) {
-      existing.lastUsed = Date.now();
+      existing.lastUsed = this.nowFn();
       return await existing.creation;
     }
     if (!existing && this.sessions.size >= this.maxSessions) {
@@ -241,7 +243,7 @@ export class SessionPool {
     }
 
     const entry = {
-      lastUsed: Date.now(),
+      lastUsed: this.nowFn(),
       session: undefined,
       creation: undefined,
       managedIdentity,

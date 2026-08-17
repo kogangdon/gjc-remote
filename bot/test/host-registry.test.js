@@ -74,7 +74,9 @@ function createManualTimers() {
   };
 }
 
-async function waitFor(predicate, timeoutMs = 1000) {
+const registryBySocket = new WeakMap();
+
+async function waitFor(predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("condition was not met");
@@ -116,6 +118,7 @@ async function startRegistry(
         protocolVersion: PROTOCOL_VERSION,
         capabilities: CAPABILITIES,
       });
+      registryBySocket.set(socket, { registry, hostId });
       return socket;
     },
     close() {
@@ -139,6 +142,7 @@ async function connectV2(server, hostId = "host-a", token = "token-a", register 
     })
   );
   const [raw] = await response;
+  registryBySocket.set(socket, { registry: server.registry, hostId });
   return { socket, response: JSON.parse(raw.toString()) };
 }
 
@@ -164,7 +168,13 @@ function readinessFrame(overrides = {}) {
 
 async function sendReadiness(socket, frame) {
   socket.send(JSON.stringify(frame));
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  const registration = registryBySocket.get(socket);
+  assert.ok(registration, "socket is associated with a registry");
+  await waitFor(
+    () =>
+      registration.registry.readinessStates.get(registration.hostId)?.revision ===
+      frame.revision
+  );
 }
 
 async function expectPolicyClose(socket, payload) {
@@ -1167,11 +1177,12 @@ test("invoke idle timer resets on each streamed event", async () => {
   try {
     const socket = await server.connect("host-a", "token-a");
     const invokeFrame = once(socket, "message");
+    const events = [];
     const resultPromise = server.registry.invoke(
       "host-a",
       "/workspace",
       { kind: "prompt", message: "hi" },
-      () => {}
+      (event) => events.push(event)
     );
     let settled = false;
     resultPromise.then(() => {
@@ -1185,7 +1196,7 @@ test("invoke idle timer resets on each streamed event", async () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
       socket.send(JSON.stringify({ type: "event", requestId, event }));
     }
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await waitFor(() => events.length === 4);
     assert.equal(settled, false);
 
     socket.send(JSON.stringify({ type: "event", requestId, done: true }));
@@ -1261,9 +1272,11 @@ test("invoke hard cap fires despite continuous activity", async () => {
 });
 
 test("invoke timers are cleared on normal resolve", async () => {
+  const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 30,
     invokeHardCapMs: 200,
+    timers: timers.api,
   });
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -1281,9 +1294,7 @@ test("invoke timers are cleared on normal resolve", async () => {
     const result = await resultPromise;
     assert.deepEqual(result, { ok: true, text: undefined });
     assert.equal(server.registry.pendingRequests.size, 0);
-
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(server.registry.pendingRequests.size, 0);
+    assert.equal(timers.timeoutCount, 0);
   } finally {
     await server.close();
   }
@@ -1326,9 +1337,11 @@ test("adversarial: a stale settle call after normal resolution is a safe no-op (
 });
 
 test("adversarial: N sequential invokes leave no pending requests or armed timers (timer-leak safety)", async () => {
+  const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 50,
     invokeHardCapMs: 5000,
+    timers: timers.api,
   });
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -1348,10 +1361,8 @@ test("adversarial: N sequential invokes leave no pending requests or armed timer
       assert.deepEqual(result, { ok: true, text: undefined });
       assert.equal(server.registry.pendingRequests.size, 0);
       assert.equal(server.registry.pendingCountBySocket.size, 0);
+      assert.equal(timers.timeoutCount, 0);
     }
-    // Wait past the idle window: if a timer had leaked or been left armed on
-    // a prior iteration it would fire (and corrupt state) by now.
-    await new Promise((resolve) => setTimeout(resolve, 80));
     assert.equal(server.registry.pendingRequests.size, 0);
   } finally {
     await server.close();
@@ -1387,7 +1398,17 @@ test("adversarial: an event frame arriving after done is ignored and does not re
         })
       );
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    const barrierFrame = once(socket, "message");
+    const barrierResult = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "barrier" },
+      () => {}
+    );
+    const [barrierRaw] = await barrierFrame;
+    const barrierRequestId = JSON.parse(barrierRaw.toString()).requestId;
+    socket.send(JSON.stringify({ type: "event", requestId: barrierRequestId, done: true }));
+    assert.deepEqual(await barrierResult, { ok: true, text: undefined });
     assert.equal(server.registry.pendingRequests.size, 0);
     assert.equal(events.length, 0);
     assert.equal(socket.readyState, WebSocket.OPEN);
@@ -1421,8 +1442,6 @@ test("invalid or oversized outbound invokes fail locally without disconnecting t
       },
       () => {}
     );
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
     assert.deepEqual(invalid, { ok: false, error: "invalid invoke request" });
     assert.deepEqual(oversized, {
       ok: false,
