@@ -351,7 +351,8 @@ export class HostRegistry {
       if (isGateRequestEvent(event)) {
         pending.gatePending = true;
         pending.gateId = event.gateId;
-        clearTimeout(pending.idleTimer);
+        this.timers.clearTimeout(pending.idleTimer);
+        pending.idleTimer = undefined;
         // Route to the dedicated gate callback (carries requestId, needed to send
         // the answer back). Not forwarded to onEvent — gates are not stream text.
         try {
@@ -915,18 +916,30 @@ export class HostRegistry {
     // #35: while a gate is pending the invoke is deliberately not idle-bounded
     // (it is waiting on a human); never re-arm until the gate is answered.
     if (pending.gatePending) return;
-    clearTimeout(pending.idleTimer);
-    pending.idleTimer = setTimeout(() => {
+    this.timers.clearTimeout(pending.idleTimer);
+    const idleTimer = this.timers.setTimeout(() => {
+      if (
+        pending.idleTimer !== idleTimer ||
+        pending.gatePending ||
+        this.pendingRequests.get(pending.requestId) !== pending
+      ) {
+        return;
+      }
+      pending.idleTimer = undefined;
       this.#deletePending(pending.requestId);
       pending.settle({ ok: false, error: "timed out waiting for host response" });
     }, pending.idleMs);
+    pending.idleTimer = idleTimer;
+    idleTimer?.unref?.();
   }
 
   #deletePending(requestId) {
     const entry = this.pendingRequests.get(requestId);
     if (!entry) return;
-    clearTimeout(entry.idleTimer);
-    clearTimeout(entry.hardCapTimer);
+    this.timers.clearTimeout(entry.idleTimer);
+    this.timers.clearTimeout(entry.hardCapTimer);
+    entry.idleTimer = undefined;
+    entry.hardCapTimer = undefined;
     this.pendingRequests.delete(requestId);
     const next = (this.pendingCountBySocket.get(entry.socket) ?? 0) - 1;
     if (next > 0) this.pendingCountBySocket.set(entry.socket, next);
@@ -1240,16 +1253,17 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         settle: (result) => {
           if (settled) return;
           settled = true;
-          clearTimeout(pending.idleTimer);
-          clearTimeout(pending.hardCapTimer);
+          this.timers.clearTimeout(pending.idleTimer);
+          this.timers.clearTimeout(pending.hardCapTimer);
           resolve(result);
         },
         resolve: (result) => pending.settle(result),
       };
-      pending.hardCapTimer = setTimeout(() => {
+      pending.hardCapTimer = this.timers.setTimeout(() => {
         this.#deletePending(requestId);
         pending.settle({ ok: false, error: "invoke exceeded absolute hard-cap" });
       }, this.invokeHardCapMs);
+      pending.hardCapTimer?.unref?.();
 
       this.#addPending(requestId, pending);
       this.#armIdleTimer(pending);
