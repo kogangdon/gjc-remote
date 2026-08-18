@@ -213,13 +213,22 @@ test("authorized message handler failures are contained", async () => {
     author: { id: "allowed-user", bot: false },
   };
 
-  const status = await dispatchAuthorizedMessage({
-    message,
-    authorization,
-    onMessage: async () => {
-      throw new Error("message delivery failed");
-    },
-  });
+  const diagnostics = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => diagnostics.push(args);
+  let status;
+  try {
+    status = await dispatchAuthorizedMessage({
+      message,
+      authorization,
+      onMessage: async () => {
+        throw new TypeError("secret message delivery detail");
+      },
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
 
   assert.equal(status, "failed");
+  assert.deepEqual(diagnostics, [["Discord message handler failed:", "TypeError"]]);
 });
