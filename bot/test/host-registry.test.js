@@ -385,6 +385,41 @@ test("invalid registration frames close with a policy violation", async () => {
   }
 });
 
+test("host registration rejects wrong tokens across equal and unequal byte lengths", async () => {
+  const server = await startRegistry(new Map([["host-a", "tökén-a"]]));
+  try {
+    for (const token of ["tökén-b", "token-a", "short", "tökén-a-extra"]) {
+      const socket = new WebSocket(
+        `ws://127.0.0.1:${server.registry.wss.address().port}`
+      );
+      await once(socket, "open");
+      const denied = once(socket, "message");
+      const closed = once(socket, "close");
+      socket.send(
+        JSON.stringify({
+          type: "register",
+          hostId: "host-a",
+          token,
+        })
+      );
+
+      const [raw] = await denied;
+      assert.deepEqual(JSON.parse(raw.toString()), {
+        type: "register_denied",
+        reason: "bad token",
+      });
+      const [code] = await closed;
+      assert.equal(code, 1008);
+    }
+    assert.equal(server.registry.listOnline().length, 0);
+    const accepted = await server.connect("host-a", "tökén-a");
+    assert.equal(server.registry.isOnline("host-a"), true);
+    accepted.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
 test("malformed event frames close safely", async () => {
   const server = await startRegistry();
   try {
