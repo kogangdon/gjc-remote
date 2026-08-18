@@ -1,4 +1,6 @@
 export const DEFAULT_MAX_IN_FLIGHT_INVOKES = 64;
+export const LEGACY_RESOURCE_EXHAUSTED_ERROR =
+  "Host invoke capacity is exhausted; retry later.";
 
 export class AdmissionBudget {
   constructor({ maxInFlightInvokes = DEFAULT_MAX_IN_FLIGHT_INVOKES } = {}) {
