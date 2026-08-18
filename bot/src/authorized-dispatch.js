@@ -1,3 +1,7 @@
+function handlerErrorKind(error) {
+  return error instanceof Error ? error.name : typeof error;
+}
+
 export async function dispatchAuthorizedInteraction({
   interaction,
   authorization,
@@ -21,7 +25,7 @@ export async function dispatchAuthorizedInteraction({
     } catch (error) {
       console.error(
         "Discord button interaction handler failed:",
-        error instanceof Error ? error.message : String(error)
+        handlerErrorKind(error)
       );
       return "failed";
     }
@@ -44,7 +48,7 @@ export async function dispatchAuthorizedInteraction({
   } catch (error) {
     console.error(
       "Discord chat-input interaction handler failed:",
-      error instanceof Error ? error.message : String(error)
+        handlerErrorKind(error)
     );
     return "failed";
   }
@@ -54,6 +58,11 @@ export async function dispatchAuthorizedMessage({ message, authorization, onMess
   if (message.author.bot || !message.guildId) return "ignored";
   if (!authorization.isAuthorized(message.author.id)) return "denied";
 
-  await onMessage(message);
-  return "handled";
+  try {
+    await onMessage(message);
+    return "handled";
+  } catch (error) {
+    console.error("Discord message handler failed:", handlerErrorKind(error));
+    return "failed";
+  }
 }

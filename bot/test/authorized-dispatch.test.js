@@ -206,3 +206,29 @@ test("authorized button handler failures are contained", async () => {
 
   assert.equal(status, "failed");
 });
+
+test("authorized message handler failures are contained", async () => {
+  const message = {
+    guildId: "guild-1",
+    author: { id: "allowed-user", bot: false },
+  };
+
+  const diagnostics = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => diagnostics.push(args);
+  let status;
+  try {
+    status = await dispatchAuthorizedMessage({
+      message,
+      authorization,
+      onMessage: async () => {
+        throw new TypeError("secret message delivery detail");
+      },
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(status, "failed");
+  assert.deepEqual(diagnostics, [["Discord message handler failed:", "TypeError"]]);
+});
