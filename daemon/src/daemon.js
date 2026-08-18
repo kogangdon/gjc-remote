@@ -32,7 +32,10 @@ import {
 } from "@gjc-remote/shared";
 import { SessionPool } from "./session-pool.js";
 import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
-import { AdmissionBudget } from "./admission-budget.js";
+import {
+  AdmissionBudget,
+  LEGACY_RESOURCE_EXHAUSTED_ERROR,
+} from "./admission-budget.js";
 import { setSessionModel } from "./model-command.js";
 import {
   webSocketPayloadByteLength,
@@ -1041,7 +1044,7 @@ async function handleMessage(
     send(undefined, {
       error: readinessState?.committed
         ? formatReadinessRejection(exhausted)
-        : exhausted.code,
+        : LEGACY_RESOURCE_EXHAUSTED_ERROR,
       done: true,
     });
     return;

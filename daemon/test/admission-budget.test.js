@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   AdmissionBudget,
   DEFAULT_MAX_IN_FLIGHT_INVOKES,
+  LEGACY_RESOURCE_EXHAUSTED_ERROR,
 } from "../src/admission-budget.js";
 
 test("invoke admission rejects the sixty-fifth request without queueing", () => {
@@ -42,6 +43,14 @@ test("invoke admission releases each reservation at most once", () => {
 
   assert.equal(budget.inFlightInvokes, 0);
   assert.equal(typeof budget.tryAcquireInvoke(), "function");
+});
+
+test("legacy invoke overflow copy is bounded and actionable", () => {
+  assert.equal(
+    LEGACY_RESOURCE_EXHAUSTED_ERROR,
+    "Host invoke capacity is exhausted; retry later."
+  );
+  assert.equal(Buffer.byteLength(LEGACY_RESOURCE_EXHAUSTED_ERROR) <= 128, true);
 });
 
 test("invoke admission validates configured bounds", () => {
