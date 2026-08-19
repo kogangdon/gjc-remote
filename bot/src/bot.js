@@ -33,7 +33,7 @@ import {
   formatDeliveryError,
 } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
-import { HostRegistry } from "./host-registry.js";
+import { HostRegistry, extractAssistantText } from "./host-registry.js";
 import { formatHostList } from "./host-projection.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
 import { ToolLogStore } from "./tool-log-store.js";
@@ -476,7 +476,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
           debugRemote("tool-call", { requestLabel, name: toolCall.name, label: toolCall.label });
         }
 
-        const assistantText = extractAssistantText(evt);
+        const assistantText = extractAssistantText(evt)?.trim();
         if (assistantText) preview = assistantText;
         if (assistantText) debugRemote("assistant-text", { requestLabel, chars: assistantText.length });
 
@@ -600,29 +600,6 @@ function toolLogComponents(toolCalls) {
         .setStyle(ButtonStyle.Secondary)
     ),
   ];
-}
-
-function extractAssistantText(evt) {
-  const message = evt?.message ?? evt?.assistantMessageEvent?.message;
-  if (message?.role !== "assistant") return "";
-
-  return extractTextFromContent(message.content).trim();
-}
-
-function extractTextFromContent(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  return content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (!part || typeof part !== "object") return "";
-      if (typeof part.text === "string") return part.text;
-      if (typeof part.value === "string") return part.value;
-      if (typeof part.content === "string") return part.content;
-      return "";
-    })
-    .join("");
 }
 
 async function loadChannelMap({ fatal }) {
