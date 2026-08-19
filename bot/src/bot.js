@@ -23,7 +23,7 @@ import {
   dispatchAuthorizedMessage,
 } from "./authorized-dispatch.js";
 import { watchConfigHints } from "./config-watcher.js";
-import { dispatchGate } from "./managed-dispatch.js";
+import { dispatchGate, resolveDispatchRoute } from "./managed-dispatch.js";
 import { createManagedAuthorityReader } from "./managed-authority-reader.js";
 import {
   CHUNK_LIMIT,
@@ -283,7 +283,6 @@ function noMentions(content, extra = {}) {
 
 async function handleChatInputInteraction(interaction) {
   const { commandName } = interaction;
-  if (!dispatchGate(channelMapping, (content) => interaction.reply(noMentions(content, { ephemeral: true })), verifyLegacyFence)) return;
 
   if (commandName === "hosts") {
     const hosts = registry.listHosts();
@@ -293,15 +292,21 @@ async function handleChatInputInteraction(interaction) {
     return;
   }
 
-  const route = channelMap[interaction.channelId];
-  if (!route) {
+  const routeSelection = resolveDispatchRoute(
+    channelMap,
+    interaction.channelId,
+    channelMapping,
+    (content) => interaction.reply(noMentions(content, { ephemeral: true })),
+    verifyLegacyFence
+  );
+  if (routeSelection.status === "unmapped") {
     await interaction.reply(
       noMentions("This channel has no host/workDir mapping. Add it to channels.json.", { ephemeral: true })
     );
     return;
   }
-
-  if (!dispatchGate(channelMapping, (content) => interaction.reply(noMentions(content, { ephemeral: true })), verifyLegacyFence)) return;
+  if (routeSelection.status === "blocked") return;
+  const { route } = routeSelection;
   if (!registry.isOnline(route.hostId)) {
     await interaction.reply(noMentions(`Host '${route.hostId}' is not connected right now.`, { ephemeral: true }));
     return;
@@ -359,10 +364,15 @@ client.on("messageCreate", async (message) => {
 async function handleAuthorizedMessage(message) {
   const prompt = message.content.trim();
   if (!prompt) return;
-  if (!dispatchGate(channelMapping, (content) => message.reply(noMentions(content)), verifyLegacyFence)) return;
-
-  const route = channelMap[message.channelId];
-  if (!route) return;
+  const routeSelection = resolveDispatchRoute(
+    channelMap,
+    message.channelId,
+    channelMapping,
+    (content) => message.reply(noMentions(content)),
+    verifyLegacyFence
+  );
+  if (routeSelection.status !== "ready") return;
+  const { route } = routeSelection;
 
   // #35: if a workflow gate is awaiting an answer in this channel, route this
   // message to the daemon as the gate answer instead of starting a new prompt.
@@ -387,7 +397,6 @@ async function handleAuthorizedMessage(message) {
     );
   }
 
-  if (!dispatchGate(channelMapping, (content) => message.reply(noMentions(content)), verifyLegacyFence)) return;
   if (!registry.isOnline(route.hostId)) {
     await message.reply(noMentions(`Host '${route.hostId}' is not connected right now.`)).catch(() => {});
     return;
@@ -462,7 +471,6 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   try {
     if (!dispatchGate(channelMapping, edit, verifyLegacyFence)) return;
     editProgress(true);
-    if (!dispatchGate(channelMapping, edit, verifyLegacyFence)) return;
     result = await registry.invoke(
       route.hostId,
       route.workDir,
