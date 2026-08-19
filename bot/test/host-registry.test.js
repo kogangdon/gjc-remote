@@ -55,6 +55,21 @@ function createManualTimers() {
       timeouts.clear();
       for (const { callback } of entries) callback();
     },
+    runTimeoutByDelay(delay) {
+      const match = [...timeouts.entries()].find(
+        ([, entry]) => entry.delay === delay
+      );
+      assert.ok(match, `expected an armed timeout with delay ${delay}`);
+      const [timer, entry] = match;
+      timeouts.delete(timer);
+      entry.callback();
+    },
+    runTimeout(timer) {
+      const entry = timeouts.get(timer);
+      assert.ok(entry, "expected an armed timeout handle");
+      timeouts.delete(timer);
+      entry.callback();
+    },
     runClearedTimeouts() {
       const callbacks = clearedTimeouts.splice(0);
       for (const callback of callbacks) callback();
@@ -70,6 +85,9 @@ function createManualTimers() {
     },
     get timeoutDelays() {
       return [...timeouts.values()].map(({ delay }) => delay);
+    },
+    timeoutHandleByDelay(delay) {
+      return [...timeouts.entries()].find(([, entry]) => entry.delay === delay)?.[0];
     },
   };
 }
@@ -1343,9 +1361,11 @@ test("binding readiness retention is bounded per socket", async () => {
   }
 });
 test("invoke idle timer resets on each streamed event", async () => {
+  const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 60,
     invokeHardCapMs: 5000,
+    timers: timers.api,
   });
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -1363,13 +1383,26 @@ test("invoke idle timer resets on each streamed event", async () => {
     });
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
+    const hardCapTimer = timers.timeoutHandleByDelay(5000);
+    let idleTimer = timers.timeoutHandleByDelay(60);
+    assert.ok(hardCapTimer);
+    assert.ok(idleTimer);
 
     const event = { message: { role: "assistant", content: "still working" } };
     for (let i = 0; i < 4; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
       socket.send(JSON.stringify({ type: "event", requestId, event }));
+      await waitFor(() => events.length === i + 1);
+      assert.equal(settled, false);
+      assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [60, 5000]);
+      assert.strictEqual(timers.timeoutHandleByDelay(5000), hardCapTimer);
+      const replacementIdleTimer = timers.timeoutHandleByDelay(60);
+      assert.ok(replacementIdleTimer);
+      assert.notStrictEqual(replacementIdleTimer, idleTimer);
+      timers.runClearedTimeouts();
+      assert.equal(settled, false);
+      assert.equal(server.registry.pendingRequests.has(requestId), true);
+      idleTimer = replacementIdleTimer;
     }
-    await waitFor(() => events.length === 4);
     assert.equal(settled, false);
 
     socket.send(JSON.stringify({ type: "event", requestId, done: true }));
@@ -1380,18 +1413,23 @@ test("invoke idle timer resets on each streamed event", async () => {
 });
 
 test("invoke idle expiry fires with zero events", async () => {
+  const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 20,
     invokeHardCapMs: 5000,
+    timers: timers.api,
   });
   try {
     await server.connect("host-a", "token-a");
-    const result = await server.registry.invoke(
+    const resultPromise = server.registry.invoke(
       "host-a",
       "/workspace",
       { kind: "prompt", message: "hi" },
       () => {}
     );
+    assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [20, 5000]);
+    timers.runTimeoutByDelay(20);
+    const result = await resultPromise;
     assert.deepEqual(result, {
       ok: false,
       error: "timed out waiting for host response",
@@ -1403,37 +1441,35 @@ test("invoke idle expiry fires with zero events", async () => {
 });
 
 test("invoke hard cap fires despite continuous activity", async () => {
+  const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 1000,
     invokeHardCapMs: 40,
+    timers: timers.api,
   });
   try {
     const socket = await server.connect("host-a", "token-a");
     const invokeFrame = once(socket, "message");
+    const events = [];
     const resultPromise = server.registry.invoke(
       "host-a",
       "/workspace",
       { kind: "prompt", message: "hi" },
-      () => {}
+      (event) => events.push(event)
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
+    const hardCapTimer = timers.timeoutHandleByDelay(40);
+    assert.ok(hardCapTimer);
 
-    let settled = false;
-    resultPromise.then(() => {
-      settled = true;
-    });
     const event = { message: { role: "assistant", content: "still working" } };
-    const interval = setInterval(() => {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "event", requestId, event }));
-      }
-    }, 10);
-    try {
-      await waitFor(() => settled, 2000);
-    } finally {
-      clearInterval(interval);
+    for (let index = 0; index < 3; index += 1) {
+      socket.send(JSON.stringify({ type: "event", requestId, event }));
+      await waitFor(() => events.length === index + 1);
+      assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [40, 1000]);
+      assert.strictEqual(timers.timeoutHandleByDelay(40), hardCapTimer);
     }
+    timers.runTimeout(hardCapTimer);
 
     assert.deepEqual(await resultPromise, {
       ok: false,
@@ -1462,6 +1498,7 @@ test("invoke timers are cleared on normal resolve", async () => {
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
+    assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [30, 200]);
     socket.send(JSON.stringify({ type: "event", requestId, done: true }));
 
     const result = await resultPromise;
@@ -1718,8 +1755,11 @@ test("heartbeat timeout disconnects a host and fails its pending invoke", async 
     const closed = once(socket, "close");
     timers.runIntervals();
     await ping;
-    assert.deepEqual(timers.timeoutDelays, [10_000]);
-    timers.runTimeouts();
+    assert.deepEqual(
+      timers.timeoutDelays.sort((a, b) => a - b),
+      [1_000, 10_000, 30 * 60 * 1_000]
+    );
+    timers.runTimeoutByDelay(10_000);
     await closed;
 
     assert.deepEqual(await result, {
@@ -1754,7 +1794,7 @@ test("replacement sockets are not removed by stale heartbeat state", async () =>
     const originalPing = once(original, "message");
     timers.runIntervals();
     await originalPing;
-    assert.equal(timers.timeoutCount, 1);
+    assert.equal(timers.timeoutCount, 3);
 
     const originalClosed = once(original, "close");
     const replacement = await server.connect("host-a", "token-a");
@@ -1802,7 +1842,7 @@ test("registry shutdown clears heartbeat state and settles pending invokes", asy
   timers.runIntervals();
   await ping;
   assert.equal(timers.intervalCount, 1);
-  assert.equal(timers.timeoutCount, 1);
+  assert.equal(timers.timeoutCount, 3);
 
   const closing = server.registry.close();
   assert.strictEqual(server.registry.close(), closing);
@@ -2053,9 +2093,11 @@ test("future protocol versions fail closed", async () => {
 // ---------------------------------------------------------------------------
 
 test("#35 a gate_request fires onGate, suspends the invoke idle timer, and answerGate sends an answer frame", async () => {
+  const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 40,
     invokeHardCapMs: 5000,
+    timers: timers.api,
   });
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -2075,6 +2117,10 @@ test("#35 a gate_request fires onGate, suspends the invoke idle timer, and answe
     });
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
+    const idleTimer = timers.timeoutHandleByDelay(40);
+    const hardCapTimer = timers.timeoutHandleByDelay(5000);
+    assert.ok(idleTimer);
+    assert.ok(hardCapTimer);
 
     const gateEvent = {
       type: "gate_request",
@@ -2092,9 +2138,11 @@ test("#35 a gate_request fires onGate, suspends the invoke idle timer, and answe
     assert.equal(gates[0].kind, "question");
     assert.deepEqual(gates[0].choices, [{ value: "a", label: "Apple" }]);
 
-    // The idle window (40ms) must NOT reap the invoke while the gate is pending.
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.deepEqual(timers.timeoutDelays, [5000]);
+    timers.runClearedTimeouts();
     assert.equal(settled, false);
+    assert.equal(server.registry.pendingRequests.has(requestId), true);
+    assert.strictEqual(timers.timeoutHandleByDelay(5000), hardCapTimer);
 
     const answerFrame = once(socket, "message");
     const answerResult = server.registry.answerGate("host-a", requestId, "g1", "Apple");
@@ -2106,6 +2154,10 @@ test("#35 a gate_request fires onGate, suspends the invoke idle timer, and answe
       gateId: "g1",
       answer: "Apple",
     });
+    assert.deepEqual(
+      timers.timeoutDelays.sort((a, b) => a - b),
+      [40, 5000]
+    );
 
     socket.send(
       JSON.stringify({
