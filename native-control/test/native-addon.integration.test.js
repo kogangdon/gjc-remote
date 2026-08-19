@@ -311,6 +311,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     assert.deepEqual(Buffer.from(await addon.read_verified_bytes(destination)), replacement);
 
     const lock = await addon.acquire_native_lock(join(root, "authority.lock"), ...roles, "authority");
+    assert.throws(
+      () => addon.read_handle_bytes(lock._native),
+      /argument must be a verified native handle/,
+      "NativeLock external must not be accepted as a VerifiedHandle"
+    );
     await lock.release();
 
     if (process.platform === "linux") {
