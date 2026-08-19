@@ -75,6 +75,36 @@ loop (current SDK 0.12.21)" for the full model and the subprocess option
 
 ## Setup
 
+Install the repository prerequisites before running `bun install`:
+
+- **Node.js 26 or newer.** Node runs the bot, management CLI, smoke harness,
+  and every `node --test` workspace suite.
+- **Bun 1.3.14 or newer.** Bun installs the committed `bun.lock`, runs the
+  daemon, and must be on `PATH` because daemon integration tests spawn a real
+  Bun child even when `npm test` is launched with Node.
+- **A native C++ build toolchain supported by `node-gyp`.** The
+  `native-control` workspace has no portable fallback; installation and the
+  native verification path require its N-API addon to build successfully.
+- **Linux ACL development headers.** Debian and Ubuntu hosts must install
+  `libacl1-dev` before dependency installation, otherwise compilation stops at
+  `sys/acl.h`:
+
+  ```bash
+  sudo apt-get update
+  sudo apt-get install -y libacl1-dev
+  ```
+
+  Other Linux distributions must install the package that provides
+  `sys/acl.h`. The approved native-control addon targets are **Linux x64**,
+  **Linux arm64**, and **Windows x64**. Windows x64 requires the Visual Studio
+  C++ build tools. Every other OS/architecture tuple—including Windows arm64
+  and all macOS targets—is currently unsupported for native-control.
+
+These are the same runtime and native-header prerequisites enforced by the
+repository package metadata and the Ubuntu/Windows CI matrix. A missing native
+prerequisite is an installation error, not a reason to skip native-control
+verification.
+
 ```bash
 bun install   # installs all workspaces (bot, daemon, shared, native-control) from bun.lock
 
