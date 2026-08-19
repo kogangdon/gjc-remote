@@ -11,9 +11,16 @@ function isFullyQualifiedWindowsWorkDir(workDir) {
   return WINDOWS_DRIVE_ROOT.test(workDir) || WINDOWS_UNC_PATH.test(workDir);
 }
 
+function hasDotSegment(workDir) {
+  return workDir
+    .split(/[\\/]+/)
+    .some((segment) => segment === "." || segment === "..");
+}
+
 export function isFullyQualifiedRouteWorkDir(workDir) {
   return (
     isNormalizedWorkDir(workDir) &&
+    !hasDotSegment(workDir) &&
     (posix.isAbsolute(workDir) || isFullyQualifiedWindowsWorkDir(workDir))
   );
 }
