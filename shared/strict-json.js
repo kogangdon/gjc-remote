@@ -148,7 +148,14 @@ export function parseStrictJson(source, limits = STRICT_JSON_LIMITS, options = {
       while (true) { array.push(value(depth + 1)); whitespace(); if (source[at] === "]") { at += 1; return array; } if (source[at++] !== ",") fail("expected comma"); }
     }
     const match = /^(?:-?(?:0|[1-9][0-9]*))(?![.eE0-9])/.exec(source.slice(at));
-    if (match) { at += match[0].length; const number = Number(match[0]); if (!Number.isSafeInteger(number)) fail("unsafe number"); return number; }
+    if (match) {
+      const token = match[0];
+      if (token === "-0") fail("negative zero");
+      at += token.length;
+      const number = Number(token);
+      if (!Number.isSafeInteger(number)) fail("unsafe number");
+      return number;
+    }
     for (const [literal, result] of [["true", true], ["false", false], ["null", null]]) if (source.startsWith(literal, at)) { at += literal.length; return result; }
     fail("expected value");
   };
