@@ -36,7 +36,7 @@ import {
   AdmissionBudget,
   LEGACY_RESOURCE_EXHAUSTED_ERROR,
 } from "./admission-budget.js";
-import { setSessionModel } from "./model-command.js";
+import { modelCommandDiagnostic, setSessionModel } from "./model-command.js";
 import {
   webSocketPayloadByteLength,
   webSocketPayloadToUtf8,
@@ -1106,6 +1106,13 @@ async function handleMessage(
 
     send(undefined, { done: true });
   } catch (err) {
+    const modelDiagnostic =
+      command.kind === "set_model" ? modelCommandDiagnostic(err) : undefined;
+    if (modelDiagnostic !== undefined) {
+      console.error(
+        `daemon: set_model failed: ${sanitizeDaemonError(modelDiagnostic)}`
+      );
+    }
     if (readinessState?.committed) {
       send(undefined, {
         error: formatReadinessRejection(

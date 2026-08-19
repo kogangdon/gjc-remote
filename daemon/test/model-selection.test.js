@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { resolveModel, validateModelList } from "../src/model-lookup.js";
-import { setSessionModel } from "../src/model-command.js";
+import { modelCommandDiagnostic, setSessionModel } from "../src/model-command.js";
 
 const MODELS = [
   { provider: "anthropic", id: "claude-haiku", name: "Claude Haiku (latest)" },
@@ -130,21 +130,79 @@ test("setSessionModel sends the exact set_model payload and receipt after succes
 
 test("setSessionModel emits no success receipt when set_model fails", async () => {
   const events = [];
+  const cause = new Error("raw provider failure");
   const session = {
     async send(command, onEvent) {
       if (command.type === "get_available_models") {
         onEvent({ command: "get_available_models", data: { models: MODELS } });
         return;
       }
-      throw new Error("raw provider failure");
+      throw cause;
     },
   };
 
   await assert.rejects(
     setSessionModel(session, { modelName: "openai:gpt-5" }, (event) => events.push(event)),
-    { message: "Could not set the selected model." }
+    (error) => {
+      assert.equal(error.message, "Could not set the selected model.");
+      assert.strictEqual(error.cause, cause);
+      assert.equal(
+        modelCommandDiagnostic(error),
+        "operation=set_model category=unknown"
+      );
+      return true;
+    }
   );
   assert.deepEqual(events, []);
+});
+
+test("model command diagnostics expose only allowlisted operational categories", async () => {
+  const secret = "private-provider-token";
+  const cause = new Error(`request timed out for ${secret}\nstack-like detail`);
+  const session = {
+    async send() {
+      throw cause;
+    },
+  };
+
+  await assert.rejects(
+    setSessionModel(session, { modelName: "openai:gpt-5" }, () => {}),
+    (error) => {
+      assert.equal(error.message, "Could not read the available model list.");
+      assert.equal(error.message.includes(secret), false);
+      assert.strictEqual(error.cause, cause);
+      assert.equal(
+        modelCommandDiagnostic(error),
+        "operation=list_models category=unknown"
+      );
+      return true;
+    }
+  );
+  assert.equal(modelCommandDiagnostic(new Error("unrelated")), undefined);
+});
+
+test("model command diagnostics identify timeout and poisoned-session causes", async () => {
+  for (const [message, category] of [
+    ["SDK command timed out", "timeout"],
+    ["SDK command exceeded absolute hard-cap", "hard_cap"],
+    ["GJC SDK session is not running", "session_closed"],
+  ]) {
+    const session = {
+      async send(command, onEvent) {
+        if (command.type === "get_available_models") {
+          onEvent({ command: "get_available_models", data: { models: MODELS } });
+          return;
+        }
+        throw new Error(message);
+      },
+    };
+    await assert.rejects(
+      setSessionModel(session, { modelName: "openai:gpt-5" }, () => {}),
+      (error) =>
+        modelCommandDiagnostic(error) ===
+        `operation=set_model category=${category}`
+    );
+  }
 });
 
 test("ambiguous errors are sanitized, deterministic, and capped at five candidates", async () => {
@@ -178,7 +236,11 @@ test("not-found and malformed-list errors do not echo unsafe query or payload te
   const rawPayload = "PRIVATE_MODEL_PAYLOAD";
   await assert.rejects(
     setSessionModel(listOnlySession([{ id: rawPayload }]), { modelName: "x" }, () => {}),
-    (error) => error.message.length < 200 && !error.message.includes(rawPayload)
+    (error) =>
+      error.message.length < 200 &&
+      !error.message.includes(rawPayload) &&
+      modelCommandDiagnostic(error) ===
+        "operation=validate_models category=invalid_model_list"
   );
 });
 

@@ -7,6 +7,35 @@ const DISPLAY_PROVIDER_LENGTH = 64;
 const DISPLAY_ID_LENGTH = 96;
 const DISPLAY_NAME_LENGTH = 96;
 
+class ModelCommandError extends Error {
+  constructor(message, operation, cause) {
+    super(message, { cause });
+    this.name = "ModelCommandError";
+    this.operation = operation;
+  }
+}
+
+export function modelCommandDiagnostic(error) {
+  if (!(error instanceof ModelCommandError)) return undefined;
+  return `operation=${error.operation} category=${causeCategory(error.cause)}`;
+}
+
+function causeCategory(cause) {
+  if (!(cause instanceof Error)) return "unknown";
+  switch (cause.message) {
+    case "SDK command timed out":
+      return "timeout";
+    case "SDK command exceeded absolute hard-cap":
+      return "hard_cap";
+    case "GJC SDK session is not running":
+      return "session_closed";
+    case "Available model list is invalid.":
+      return "invalid_model_list";
+    default:
+      return "unknown";
+  }
+}
+
 /**
  * Resolve and set a session model using serialized SDK commands.
  *
@@ -28,15 +57,15 @@ export async function setSessionModel(session, command, onEvent) {
         listResponse = event;
       }
     });
-  } catch {
-    throw new Error(LIST_ERROR);
+  } catch (cause) {
+    throw new ModelCommandError(LIST_ERROR, "list_models", cause);
   }
 
   let result;
   try {
     result = resolveModel(listResponse?.data?.models, command?.modelName);
-  } catch {
-    throw new Error(LIST_ERROR);
+  } catch (cause) {
+    throw new ModelCommandError(LIST_ERROR, "validate_models", cause);
   }
 
   if (result.status === "not_found") throw new Error(NOT_FOUND_ERROR);
@@ -47,8 +76,8 @@ export async function setSessionModel(session, command, onEvent) {
       { type: "set_model", provider: result.provider, modelId: result.modelId },
       onEvent
     );
-  } catch {
-    throw new Error(SET_ERROR);
+  } catch (cause) {
+    throw new ModelCommandError(SET_ERROR, "set_model", cause);
   }
 
   onEvent({
