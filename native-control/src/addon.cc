@@ -1927,6 +1927,11 @@ napi_value ReplaceExistingAtomic(napi_env env, napi_callback_info info) {
   napi_value result; napi_get_undefined(env, &result); return result;
 }
 
+const napi_type_tag kNativeLockTypeTag = {
+    0x4e61746976654c6fULL,
+    0x636b3a7631000001ULL,
+};
+
 struct NativeLock {
   bool released = false;
 #ifdef _WIN32
@@ -2026,7 +2031,15 @@ napi_value AcquireNativeLock(napi_env env, napi_callback_info info) {
 #endif
   napi_value result, handle;
   napi_create_object(env, &result);
-  napi_create_external(env, lock, ReleaseLock, nullptr, &handle);
+  if (napi_create_external(env, lock, ReleaseLock, nullptr, &handle) != napi_ok) {
+    ReleaseLock(env, lock, nullptr);
+    Throw(env, "ERR_NATIVE_CONTROL_LOCK", "unable to create native lock handle");
+    return nullptr;
+  }
+  if (napi_type_tag_object(env, handle, &kNativeLockTypeTag) != napi_ok) {
+    Throw(env, "ERR_NATIVE_CONTROL_LOCK", "unable to type-tag native lock handle");
+    return nullptr;
+  }
   napi_set_named_property(env, result, "_native", handle);
   napi_value release;
   napi_create_function(env, "release", NAPI_AUTO_LENGTH, ReleaseNativeLock, lock, &release);
@@ -2315,6 +2328,11 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
 #endif
 }
 
+const napi_type_tag kVerifiedHandleTypeTag = {
+    0x5665726966696564ULL,
+    0x48616e646c653a01ULL,
+};
+
 struct VerifiedHandle {
 #ifdef _WIN32
   HANDLE handle = INVALID_HANDLE_VALUE;
@@ -2338,7 +2356,27 @@ void ReleaseVerifiedHandle(napi_env, void* data, void*) {
 }
 bool HandleArg(napi_env env, napi_callback_info info, size_t index, VerifiedHandle** result) {
   size_t argc = 16; napi_value args[16]; napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-  if (argc <= index || napi_get_value_external(env, args[index], reinterpret_cast<void**>(result)) != napi_ok || !*result) { Throw(env, "ERR_INVALID_ARG_TYPE", "argument must be a verified native handle"); return false; }
+  bool tagged = false;
+  if (argc <= index ||
+      napi_check_object_type_tag(env, args[index], &kVerifiedHandleTypeTag, &tagged) != napi_ok ||
+      !tagged ||
+      napi_get_value_external(env, args[index], reinterpret_cast<void**>(result)) != napi_ok ||
+      !*result) {
+    Throw(env, "ERR_INVALID_ARG_TYPE", "argument must be a verified native handle");
+    return false;
+  }
+  return true;
+}
+bool CreateVerifiedHandleExternal(napi_env env, VerifiedHandle* value, napi_value* result) {
+  if (napi_create_external(env, value, ReleaseVerifiedHandle, nullptr, result) != napi_ok) {
+    ReleaseVerifiedHandle(env, value, nullptr);
+    Throw(env, "ERR_NATIVE_CONTROL_OPEN", "unable to create verified native handle");
+    return false;
+  }
+  if (napi_type_tag_object(env, *result, &kVerifiedHandleTypeTag) != napi_ok) {
+    Throw(env, "ERR_NATIVE_CONTROL_OPEN", "unable to type-tag verified native handle");
+    return false;
+  }
   return true;
 }
 napi_value OpenVerifiedParentHandle(napi_env env, napi_callback_info info) {
@@ -2352,7 +2390,9 @@ napi_value OpenVerifiedParentHandle(napi_env env, napi_callback_info info) {
   value->fd = OpenDirectoryNoFollow(parent.u8string());
   if (value->fd < 0) { delete value; Throw(env, "ERR_NATIVE_CONTROL_OPEN", "unable to retain verified parent handle"); return nullptr; }
 #endif
-  napi_value result; napi_create_external(env, value, ReleaseVerifiedHandle, nullptr, &result); return result;
+  napi_value result;
+  if (!CreateVerifiedHandleExternal(env, value, &result)) return nullptr;
+  return result;
 }
 napi_value OpenVerifiedObjectHandle(napi_env env, napi_callback_info info) {
   VerifiedHandle* parent; std::string name;
@@ -2370,7 +2410,9 @@ napi_value OpenVerifiedObjectHandle(napi_env env, napi_callback_info info) {
   value->parent_fd = dup(parent->fd); value->name = name;
   if (value->parent_fd < 0) { ReleaseVerifiedHandle(env, value, nullptr); Throw(env, "ERR_NATIVE_CONTROL_OPEN", "unable to retain object parent"); return nullptr; }
 #endif
-  napi_value result; napi_create_external(env, value, ReleaseVerifiedHandle, nullptr, &result); return result;
+  napi_value result;
+  if (!CreateVerifiedHandleExternal(env, value, &result)) return nullptr;
+  return result;
 }
 napi_value ReadHandleBytes(napi_env env, napi_callback_info info) {
   VerifiedHandle* value; if (!HandleArg(env, info, 0, &value)) return nullptr;
