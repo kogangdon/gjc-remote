@@ -23,6 +23,7 @@ import {
 import {
   HostRegistry,
   MAX_BINDING_READINESS_STATES,
+  extractAssistantText,
 } from "../src/host-registry.js";
 
 function createManualTimers() {
@@ -201,6 +202,44 @@ async function expectPolicyClose(socket, payload) {
   const [code] = await closed;
   assert.equal(code, 1008);
 }
+
+test("assistant text extraction preserves delivery whitespace and mixed content", () => {
+  assert.equal(
+    extractAssistantText({
+      message: {
+        role: "assistant",
+        content: [
+          "  lead",
+          { text: " middle" },
+          { value: " value" },
+          { content: " tail  " },
+          { unsupported: true },
+        ],
+      },
+    }),
+    "  lead middle value tail  "
+  );
+  assert.equal(
+    extractAssistantText({
+      assistantMessageEvent: {
+        message: { role: "assistant", content: "\n  answer  \n" },
+      },
+    }),
+    "\n  answer  \n"
+  );
+  assert.equal(
+    extractAssistantText({
+      message: { role: "user", content: "ignored" },
+    }),
+    undefined
+  );
+  assert.equal(
+    extractAssistantText({
+      message: { role: "assistant", content: [] },
+    }),
+    undefined
+  );
+});
 
 test("WebSocket server errors are surfaced through the registry callback", async () => {
   const blocker = createServer();
