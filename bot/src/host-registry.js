@@ -1,5 +1,5 @@
 import { WebSocket, WebSocketServer } from "ws";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   CAPABILITIES,
   MAX_WS_PAYLOAD_BYTES,
@@ -48,6 +48,15 @@ function isPositiveDuration(value) {
 }
 function redactOpaqueId(value) {
   return isWorkspaceId(String(value)) ? String(value) : "[redacted-host]";
+}
+function hostTokenMatches(expected, actual) {
+  if (typeof expected !== "string" || typeof actual !== "string") return false;
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const actualBytes = Buffer.from(actual, "utf8");
+  return (
+    expectedBytes.length === actualBytes.length &&
+    timingSafeEqual(expectedBytes, actualBytes)
+  );
 }
 function normalizeRemoteError(error) {
   if (error && typeof error === "object") {
@@ -187,7 +196,7 @@ export class HostRegistry {
         return;
       }
       const expectedToken = this.tokensByHostId.get(msg.hostId);
-      if (!expectedToken || expectedToken !== msg.token) {
+      if (!hostTokenMatches(expectedToken, msg.token)) {
         socket.send(JSON.stringify({ type: MSG_TYPES.REGISTER_DENIED, reason: "bad token" }));
         socket.close(1008, "auth failed");
         return;
