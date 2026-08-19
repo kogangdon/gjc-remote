@@ -7,7 +7,11 @@ import { createGenesisEmptyChannels } from "@gjc-remote/shared/mapping-envelope"
 import { attestTokenFloor, buildAttestedTokenFloorProof, buildGenesisPrecommit, commitTokenFloor, reserveTokenGeneration } from "@gjc-remote/shared/genesis-envelope";
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationState, buildPublicationTransaction, buildPublicationU, buildPublicationY, buildPublicationZp } from "@gjc-remote/shared/publication-envelope";
 import { createManagedAuthoritySelection, loadManagedChannelMapState, readLegacyV0SourceSnapshot, verifyLegacyV0SourceFence } from "../src/config.js";
-import { dispatchGate, WORKSPACE_MAPPING_UNAVAILABLE } from "../src/managed-dispatch.js";
+import {
+  dispatchGate,
+  resolveDispatchRoute,
+  WORKSPACE_MAPPING_UNAVAILABLE,
+} from "../src/managed-dispatch.js";
 import { createManagedAuthorityReader, validateManagedProof } from "../src/managed-authority-reader.js";
 import { createTestManagedAuthorityReader } from "./helpers/managed-authority-reader.js";
 import { watchConfigHints } from "../src/config-watcher.js";
@@ -768,6 +772,46 @@ test("managed dispatch never reaches online or invoke and redacts mapping detail
   assert.match(diagnostic, new RegExp(WORKSPACE_MAPPING_UNAVAILABLE));
   assert.doesNotMatch(diagnostic, /secret-host|secret\/path|[A-Za-z]:\\/);
   assert.equal(dispatchGate({ sourceKind: "legacy-retained" }, () => {}), false);
+});
+test("route resolution distinguishes unmapped channels before applying the gate", async () => {
+  const route = { hostId: "host-a", workDir: "/workspace" };
+  const replies = [];
+
+  assert.deepEqual(
+    resolveDispatchRoute(
+      { mapped: route },
+      "unmapped",
+      { sourceKind: "unavailable" },
+      (message) => replies.push(message)
+    ),
+    { status: "unmapped" }
+  );
+  assert.deepEqual(replies, []);
+
+  assert.deepEqual(
+    resolveDispatchRoute(
+      { mapped: route },
+      "mapped",
+      { sourceKind: "unavailable" },
+      (message) => replies.push(message)
+    ),
+    { status: "blocked" }
+  );
+  await Promise.resolve();
+  assert.deepEqual(replies, [
+    `Workspace mapping unavailable (${WORKSPACE_MAPPING_UNAVAILABLE}).`,
+  ]);
+
+  assert.deepEqual(
+    resolveDispatchRoute(
+      { mapped: route },
+      "mapped",
+      { sourceKind: "legacy-v0", legacyFence: "fence" },
+      () => replies.push("unexpected"),
+      (fence) => fence === "fence"
+    ),
+    { status: "ready", route }
+  );
 });
 test("legacy source fence rejects missed marker events and target identity drift before dispatch", () => {
   const paths = { targetPath: "/safe/channels.json", controlDirectoryPath: "/safe/.gjc-remote-control", controlRootPath: "/safe/.gjc-remote-control/control-root.json" };

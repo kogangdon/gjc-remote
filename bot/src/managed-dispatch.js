@@ -11,6 +11,21 @@ export function dispatchGate(mapping, respond, verifyLegacyFence) {
   return false;
 }
 
+export function resolveDispatchRoute(
+  channelMap,
+  channelId,
+  mapping,
+  respond,
+  verifyLegacyFence
+) {
+  const route = channelMap?.[channelId];
+  if (!route) return { status: "unmapped" };
+  if (!dispatchGate(mapping, respond, verifyLegacyFence)) {
+    return { status: "blocked" };
+  }
+  return { status: "ready", route };
+}
+
 export function workspaceMappingDiagnostic() {
   return DIAGNOSTIC;
 }
