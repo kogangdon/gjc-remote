@@ -185,6 +185,34 @@ test("denied retry scheduling is isolated and accepted registration restores nor
   timers[1].callback();
   assert.deepEqual(reconnects, ["connect"]);
 });
+test("normal backoff advances across pre-registration closes and resets only on acceptance", () => {
+  const timers = [];
+  const scheduler = createReconnectScheduler({
+    logger: () => {},
+    random: () => 0,
+    setTimeoutFn: (callback, delay) => {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+  });
+
+  scheduler.onClose();
+  assert.equal(timers[0].delay, RECONNECT_BASE_MS / 2);
+  timers[0].callback();
+
+  scheduler.onClose();
+  assert.equal(timers[1].delay, RECONNECT_BASE_MS);
+  timers[1].callback();
+
+  scheduler.onClose();
+  assert.equal(timers[2].delay, RECONNECT_BASE_MS * 2);
+  timers[2].callback();
+
+  scheduler.markAccepted();
+  scheduler.onClose();
+  assert.equal(timers[3].delay, RECONNECT_BASE_MS / 2);
+});
 test("error diagnostics redact secrets, controls, and stacks", () => {
   const token = "host-token";
   const error = new Error(
