@@ -35,7 +35,7 @@ import {
   isWorkspaceId,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { findWorkspaceInventory, parseWorkspaceInventory } from "../src/workspace-inventory.js";
 import { invalidateBindingRequests } from "../src/binding-fence.js";
 
@@ -798,6 +798,54 @@ test("malformed invoke closes with a policy violation", async () => {
 
     // Stop the child after the peer observes the policy close.
     await stopChild(daemon.child);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon closes a socket that reuses an in-flight requestId", async () => {
+  const daemon = await startDaemon();
+  try {
+    daemon.peer.send(JSON.stringify({ type: "register_ok" }));
+    const closed = once(daemon.peer, "close");
+    const invoke = {
+      type: "invoke",
+      requestId: "duplicate-request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "hold ownership" },
+    };
+
+    daemon.peer.send(JSON.stringify(invoke));
+    daemon.peer.send(JSON.stringify(invoke));
+
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon permits requestId reuse only after the prior invoke settles", async () => {
+  const daemon = await startDaemon();
+  try {
+    daemon.peer.send(JSON.stringify({ type: "register_ok" }));
+    const invoke = {
+      type: "invoke",
+      requestId: "reusable-request",
+      workDir: `${process.cwd()}/missing-request-id-fence-workdir`,
+      command: { kind: "prompt", message: "fail setup" },
+    };
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = once(daemon.peer, "message");
+      daemon.peer.send(JSON.stringify(invoke));
+      const [raw] = await response;
+      const event = JSON.parse(raw.toString());
+      assert.equal(event.requestId, invoke.requestId);
+      assert.equal(event.done, true);
+      assert.equal(typeof event.error, "string");
+    }
+    assert.equal(daemon.peer.readyState, WebSocket.OPEN);
   } finally {
     await daemon.close();
   }

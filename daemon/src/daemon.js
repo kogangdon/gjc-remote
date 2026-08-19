@@ -45,6 +45,7 @@ import { serializeEventFrame } from "./event-frame.js";
 import { findWorkspaceInventory } from "./workspace-inventory.js";
 import { createWorkspaceInventoryProvider } from "./workspace-inventory-provider.js";
 import { WorkspaceLeaseRegistry } from "./workspace-lease-registry.js";
+import { RequestIdFence } from "./request-id-fence.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -294,6 +295,7 @@ try {
 const pool = new SessionPool({ sensitiveValues: daemonSensitiveValues });
 const admissionBudget = new AdmissionBudget();
 const workspaceLeases = new WorkspaceLeaseRegistry();
+const requestIds = new RequestIdFence();
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
@@ -1038,8 +1040,14 @@ async function handleMessage(
   const { requestId, workDir, command } = msg;
   const send = (event, extra = {}) =>
     connection.send(serializeEventFrame(requestId, event, extra));
+  const releaseRequestId = requestIds.tryAcquire(requestId);
+  if (!releaseRequestId) {
+    connection.close(1008, "duplicate request id");
+    return;
+  }
   const releaseAdmission = admissionBudget.tryAcquireInvoke();
   if (!releaseAdmission) {
+    releaseRequestId();
     const exhausted = makeReadinessError(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
     send(undefined, {
       error: readinessState?.committed
@@ -1113,6 +1121,7 @@ async function handleMessage(
       });
     }
   } finally {
+    releaseRequestId();
     activityLease?.release();
     releaseAdmission();
     const request = inFlightByRequestId.get(requestId);
