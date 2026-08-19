@@ -182,14 +182,12 @@ function createReconnectScheduler({
 
   return {
     clear,
-    resetBackoff() {
-      reconnectDelay = RECONNECT_BASE_MS;
-    },
     markDenied() {
       registrationDenied = true;
     },
     markAccepted() {
       registrationDenied = false;
+      reconnectDelay = RECONNECT_BASE_MS;
       clear();
     },
     scheduleNormal,

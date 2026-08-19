@@ -857,7 +857,6 @@ function connectToBot() {
   connections.add(connection);
 
   connection.on("open", () => {
-    retryScheduler.resetBackoff();
     const registration = {
       type: MSG_TYPES.REGISTER,
       hostId: HOST_ID,
