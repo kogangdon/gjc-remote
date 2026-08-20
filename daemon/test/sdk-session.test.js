@@ -139,6 +139,9 @@ function createManualTimeouts() {
         callback();
       }
     },
+    get size() {
+      return timers.size;
+    },
   };
 }
 
@@ -239,23 +242,48 @@ test("SDK adapter forwards prompt events and preserves model command receipts", 
 
 test("prompt completion waits for the final agent_end event", async () => {
   const agent = new FakeAgentSession();
+  const timers = createManualTimeouts();
   agent.prompt = async (message) => {
     agent.calls.push(["prompt", message]);
   };
-  const session = new SdkSession(agent);
+  const session = new SdkSession(agent, {
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
+  });
   let settled = false;
 
-  const result = session
-    .send({ type: "prompt", message: "hello" }, () => {}, 100)
-    .then(() => {
+  const result = session.send(
+    { type: "prompt", message: "hello" },
+    () => {},
+    100
+  );
+  const observed = result.then(
+    () => {
       settled = true;
-    });
+      return { ok: true };
+    },
+    (error) => {
+      settled = true;
+      return { ok: false, error };
+    }
+  );
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settled, false);
+  assert.equal(timers.size, 2);
 
   agent.emit({ type: "agent_end" });
-  await result;
+  try {
+    await waitForImmediate(() => settled, 20);
+    const outcome = await observed;
+    if (!outcome.ok) throw outcome.error;
+  } catch (error) {
+    timers.advance(100);
+    await observed;
+    assert.equal(timers.size, 0);
+    throw error;
+  }
   assert.equal(settled, true);
+  assert.equal(timers.size, 0);
   await session.dispose();
 });
 
