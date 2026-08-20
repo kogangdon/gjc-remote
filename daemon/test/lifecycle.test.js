@@ -3,6 +3,10 @@ import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import {
+  buildWorkspaceInventory,
+  workspaceInventoryBytes,
+} from "@gjc-remote/shared/workspace-inventory";
 import { WebSocketServer } from "ws";
 // Fixtures live OUTSIDE test/: bare `node --test` (the CI invocation)
 // discovers every .mjs under a directory named `test` and would run the
@@ -11,6 +15,18 @@ const fixturesDir = new URL("../test-fixtures/", import.meta.url);
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const TEST_TIMEOUT_MS = 8_000;
+const TEST_INVENTORY = workspaceInventoryBytes(buildWorkspaceInventory({
+  hostId: "readiness-test-host",
+  inventoryGeneration: 1,
+  workspaces: [{
+    hostId: "readiness-test-host",
+    workspaceId: "workspace-test",
+    sourcePlatform: "windows-drive",
+    workDir: "C:\\workspace",
+    rootIdentityFingerprint: "1".repeat(64),
+    storageIdentityFingerprint: "2".repeat(64),
+  }],
+})).toString("utf8");
 
 function waitForOutput(output, text, timeoutMs = TEST_TIMEOUT_MS) {
   if (output.value.includes(text)) return Promise.resolve();
@@ -147,22 +163,7 @@ async function startReadinessDaemon({
       GJC_READINESS_TEST_WORK_DIR: "C:\\workspace",
       ...(testInjection
         ? {
-            GJC_WORKSPACE_INVENTORY: JSON.stringify({
-              version: 1,
-              inventoryGeneration: 1,
-              workspaces: [{
-                hostId: "readiness-test-host",
-                mappingId: "mapping-test",
-                mappingGeneration: 1,
-                workspaceGeneration: 1,
-                mappingVersion: 1,
-                workspaceId: "workspace-test",
-                sourcePlatform: "windows-drive",
-                workDir: "C:\\workspace",
-                routeFingerprint: "a".repeat(64),
-                authorityFingerprint: "b".repeat(64),
-              }],
-            }),
+            GJC_WORKSPACE_INVENTORY: TEST_INVENTORY,
           }
         : {}),
       ...envOverrides,

@@ -35,6 +35,10 @@ import {
   isWorkspaceId,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
+import {
+  buildWorkspaceInventory,
+  workspaceInventoryBytes,
+} from "@gjc-remote/shared/workspace-inventory";
 import { WebSocket, WebSocketServer } from "ws";
 import { findWorkspaceInventory, parseWorkspaceInventory } from "../src/workspace-inventory.js";
 import { invalidateBindingRequests } from "../src/binding-fence.js";
@@ -56,6 +60,31 @@ const validBinding = {
   authorityFingerprint: "b".repeat(64),
   inventoryGeneration: 4,
 };
+const ROOT_IDENTITY_FINGERPRINT = "1".repeat(64);
+const STORAGE_IDENTITY_FINGERPRINT = "2".repeat(64);
+
+function capabilityWorkspace(binding, workDir) {
+  return {
+    hostId: binding.hostId,
+    workspaceId: binding.workspaceId,
+    sourcePlatform: binding.sourcePlatform,
+    workDir,
+    rootIdentityFingerprint: ROOT_IDENTITY_FINGERPRINT,
+    storageIdentityFingerprint: STORAGE_IDENTITY_FINGERPRINT,
+  };
+}
+
+function serializedTestInventory({
+  hostId = validBinding.hostId,
+  inventoryGeneration = validBinding.inventoryGeneration,
+  workspaces = [],
+} = {}) {
+  return workspaceInventoryBytes(buildWorkspaceInventory({
+    hostId,
+    inventoryGeneration,
+    workspaces,
+  })).toString("utf8");
+}
 
 test("replaced binding requests are disposed without touching other bindings", async () => {
   const connection = {};
@@ -149,33 +178,30 @@ test("workspace binding is path-free and validates the complete identity tuple",
   );
 });
 
-test("local workspace inventory validates and matches the complete binding identity", () => {
-  const inventory = parseWorkspaceInventory(JSON.stringify({
-    version: 1,
+test("local workspace inventory v2 is capability-only and matches local identity", () => {
+  const inventory = parseWorkspaceInventory(serializedTestInventory({
     inventoryGeneration: validBinding.inventoryGeneration,
-    workspaces: [{
-      hostId: validBinding.hostId,
-      mappingId: validBinding.mappingId,
-      mappingGeneration: validBinding.mappingGeneration,
-      workspaceGeneration: validBinding.workspaceGeneration,
-      mappingVersion: validBinding.mappingVersion,
-      workspaceId: validBinding.workspaceId,
-      sourcePlatform: validBinding.sourcePlatform,
-      workDir: "/srv/workspace",
-      routeFingerprint: validBinding.routeFingerprint,
-      authorityFingerprint: validBinding.authorityFingerprint,
-    }],
+    workspaces: [capabilityWorkspace(validBinding, "/srv/workspace")],
   }));
+  assert.equal(inventory.version, 2);
   assert.equal(inventory.workspaces.length, 1);
   assert.ok(findWorkspaceInventory(inventory, validBinding));
-  assert.equal(
-    findWorkspaceInventory(inventory, { ...validBinding, mappingGeneration: 3 }),
-    undefined
-  );
+  assert.ok(findWorkspaceInventory(inventory, {
+    ...validBinding,
+    mappingId: "different-mapping",
+    mappingGeneration: 999,
+    workspaceGeneration: 999,
+    routeFingerprint: "c".repeat(64),
+    authorityFingerprint: "d".repeat(64),
+  }));
+  assert.equal(findWorkspaceInventory(inventory, {
+    ...validBinding,
+    inventoryGeneration: validBinding.inventoryGeneration + 1,
+  }), undefined);
   assert.throws(
     () => parseWorkspaceInventory(JSON.stringify({
       ...inventory,
-      workspaces: [{ ...inventory.workspaces[0], workspaceGeneration: 0 }],
+      workspaces: [{ ...inventory.workspaces[0], routeFingerprint: "a".repeat(64) }],
     })),
     /WORKSPACE_INVENTORY_INVALID/
   );
@@ -331,8 +357,7 @@ test("daemon reports verified inventory absence as workspace not found", async (
     GJC_READINESS_V2: "1",
     GJC_READINESS_TEST_INJECTION: "1",
     GJC_READINESS_TEST_PROBE: "pass",
-    GJC_WORKSPACE_INVENTORY: JSON.stringify({
-      version: 1,
+    GJC_WORKSPACE_INVENTORY: serializedTestInventory({
       inventoryGeneration: validBinding.inventoryGeneration,
       workspaces: [],
     }),
@@ -372,21 +397,9 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
     GJC_READINESS_V2: "1",
     GJC_READINESS_TEST_INJECTION: "1",
     GJC_READINESS_TEST_PROBE: "pass",
-    GJC_WORKSPACE_INVENTORY: JSON.stringify({
-      version: 1,
+    GJC_WORKSPACE_INVENTORY: serializedTestInventory({
       inventoryGeneration: validBinding.inventoryGeneration,
-      workspaces: [{
-        hostId: validBinding.hostId,
-        mappingId: validBinding.mappingId,
-        mappingGeneration: validBinding.mappingGeneration,
-        workspaceGeneration: validBinding.workspaceGeneration,
-        mappingVersion: validBinding.mappingVersion,
-        workspaceId: validBinding.workspaceId,
-        sourcePlatform: validBinding.sourcePlatform,
-        workDir: "/srv/workspace",
-        routeFingerprint: validBinding.routeFingerprint,
-        authorityFingerprint: validBinding.authorityFingerprint,
-      }],
+      workspaces: [capabilityWorkspace(validBinding, "/srv/workspace")],
     }),
   });
   try {
@@ -448,34 +461,11 @@ test("daemon publishes readiness independently for multiple workspace bindings",
     GJC_READINESS_V2: "1",
     GJC_READINESS_TEST_INJECTION: "1",
     GJC_READINESS_TEST_PROBE: "pass",
-    GJC_WORKSPACE_INVENTORY: JSON.stringify({
-      version: 1,
+    GJC_WORKSPACE_INVENTORY: serializedTestInventory({
       inventoryGeneration: 5,
       workspaces: [
-        {
-          hostId: validBinding.hostId,
-          mappingId: validBinding.mappingId,
-          mappingGeneration: validBinding.mappingGeneration,
-          workspaceGeneration: validBinding.workspaceGeneration,
-          mappingVersion: validBinding.mappingVersion,
-          workspaceId: validBinding.workspaceId,
-          sourcePlatform: validBinding.sourcePlatform,
-          workDir: "/srv/workspace-1",
-          routeFingerprint: validBinding.routeFingerprint,
-          authorityFingerprint: validBinding.authorityFingerprint,
-        },
-        {
-          hostId: secondBinding.hostId,
-          mappingId: secondBinding.mappingId,
-          mappingGeneration: secondBinding.mappingGeneration,
-          workspaceGeneration: secondBinding.workspaceGeneration,
-          mappingVersion: secondBinding.mappingVersion,
-          workspaceId: secondBinding.workspaceId,
-          sourcePlatform: secondBinding.sourcePlatform,
-          workDir: "/srv/workspace-2",
-          routeFingerprint: secondBinding.routeFingerprint,
-          authorityFingerprint: secondBinding.authorityFingerprint,
-        },
+        capabilityWorkspace(validBinding, "/srv/workspace-1"),
+        capabilityWorkspace(secondBinding, "/srv/workspace-2"),
       ],
     }),
   });
@@ -519,21 +509,9 @@ test("daemon rejects an invoke with a stale workspace generation", async () => {
     GJC_READINESS_V2: "1",
     GJC_READINESS_TEST_INJECTION: "1",
     GJC_READINESS_TEST_PROBE: "pass",
-    GJC_WORKSPACE_INVENTORY: JSON.stringify({
-      version: 1,
+    GJC_WORKSPACE_INVENTORY: serializedTestInventory({
       inventoryGeneration: validBinding.inventoryGeneration,
-      workspaces: [{
-        hostId: validBinding.hostId,
-        mappingId: validBinding.mappingId,
-        mappingGeneration: validBinding.mappingGeneration,
-        workspaceGeneration: validBinding.workspaceGeneration,
-        mappingVersion: validBinding.mappingVersion,
-        workspaceId: validBinding.workspaceId,
-        sourcePlatform: validBinding.sourcePlatform,
-        workDir: "/srv/workspace",
-        routeFingerprint: validBinding.routeFingerprint,
-        authorityFingerprint: validBinding.authorityFingerprint,
-      }],
+      workspaces: [capabilityWorkspace(validBinding, "/srv/workspace")],
     }),
   });
   try {
