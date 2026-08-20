@@ -24,7 +24,12 @@ test('production package surface excludes the low-level test adapter', () => {
 });
 
 test('management adapter validates its explicit native dependency subset', () => {
-  assert.strictEqual(capabilities, managementCapabilities);
+  assert.equal(managementCapabilities.length, 25);
+  assert.deepEqual(
+    capabilities.slice(0, managementCapabilities.length),
+    managementCapabilities,
+  );
+  assert.equal(new Set(capabilities).size, capabilities.length);
   const { lowLevel, roles } = fake();
   delete lowLevel.current_os_principal;
   assert.throws(
