@@ -1,6 +1,8 @@
 // Shared WS message shapes between bot/ and daemon/.
 // Kept dependency-free and framework-agnostic so both sides can import it
 // directly (Node ESM) without a build step.
+import { isWorkspaceAuthorityDescriptor } from "./workspace-binding.js";
+
 export const MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
 export const V0_LIMITS = Object.freeze({
@@ -33,6 +35,9 @@ export const V0_LIMITS = Object.freeze({
 export const WORKSPACE_READINESS_CAPABILITY = "workspace_readiness_v2";
 export const WORKSPACE_READINESS_V2_CAPABILITY = WORKSPACE_READINESS_CAPABILITY;
 export const PROTOCOL_VERSION_V2 = 2;
+export const PROTOCOL_VERSION_V3 = 3;
+export const WORKSPACE_INVENTORY_RECEIPT_CAPABILITY = "workspace_inventory_receipt_v2";
+export const INVENTORY_RECEIPT_TTL_MS = 10_000;
 export const WORKSPACE_READINESS_V2 = WORKSPACE_READINESS_CAPABILITY;
 
 /**
@@ -147,6 +152,11 @@ export const PROTOCOL_ERROR_CODES = Object.freeze({
   CONFIG_INVALID: "CONFIG_INVALID",
   UNKNOWN_RUNTIME: "UNKNOWN_RUNTIME",
   INVENTORY_PENDING: "INVENTORY_PENDING",
+  INVENTORY_INVALID: "INVENTORY_INVALID",
+  INVENTORY_ACCESS_DENIED: "INVENTORY_ACCESS_DENIED",
+  INVENTORY_STALE: "INVENTORY_STALE",
+  INVENTORY_MANUAL_CLEANUP: "INVENTORY_MANUAL_CLEANUP",
+  INVENTORY_IO_FAILED: "INVENTORY_IO_FAILED",
   WORKSPACE_NOT_FOUND: "WORKSPACE_NOT_FOUND",
   WORKSPACE_ROOT_ESCAPE: "WORKSPACE_ROOT_ESCAPE",
   CONTAINMENT_UNSUPPORTED: "CONTAINMENT_UNSUPPORTED",
@@ -193,6 +203,11 @@ export const READINESS_ERROR_TAXONOMY = Object.freeze({
   ]),
   workspaceMappingLease: Object.freeze([
     PROTOCOL_ERROR_CODES.INVENTORY_PENDING,
+    PROTOCOL_ERROR_CODES.INVENTORY_INVALID,
+    PROTOCOL_ERROR_CODES.INVENTORY_ACCESS_DENIED,
+    PROTOCOL_ERROR_CODES.INVENTORY_STALE,
+    PROTOCOL_ERROR_CODES.INVENTORY_MANUAL_CLEANUP,
+    PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED,
     PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
     PROTOCOL_ERROR_CODES.WORKSPACE_ROOT_ESCAPE,
     PROTOCOL_ERROR_CODES.CONTAINMENT_UNSUPPORTED,
@@ -301,6 +316,31 @@ export const READINESS_REMEDIATIONS = Object.freeze({
   ),
   [PROTOCOL_ERROR_CODES.INVENTORY_PENDING]: remediationTuple(
     PROTOCOL_ERROR_CODES.INVENTORY_PENDING,
+    true,
+    "retry_later"
+  ),
+  [PROTOCOL_ERROR_CODES.INVENTORY_INVALID]: remediationTuple(
+    PROTOCOL_ERROR_CODES.INVENTORY_INVALID,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.INVENTORY_ACCESS_DENIED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.INVENTORY_ACCESS_DENIED,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.INVENTORY_STALE]: remediationTuple(
+    PROTOCOL_ERROR_CODES.INVENTORY_STALE,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.INVENTORY_MANUAL_CLEANUP]: remediationTuple(
+    PROTOCOL_ERROR_CODES.INVENTORY_MANUAL_CLEANUP,
+    false,
+    "contact_admin"
+  ),
+  [PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED]: remediationTuple(
+    PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED,
     true,
     "retry_later"
   ),
@@ -473,6 +513,8 @@ export const MSG_TYPES = Object.freeze({
   REGISTER_DENIED: "register_denied",
   BIND_WORKSPACE: "bind_workspace",
   BIND_OK: "bind_ok",
+  UNBIND_WORKSPACE: "unbind_workspace",
+  UNBIND_OK: "unbind_ok",
   INVOKE: "invoke",
   EVENT: "event",
   PING: "ping",
@@ -487,6 +529,12 @@ export const MSG_TYPES = Object.freeze({
 });
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactFields(value, fields) {
+  return isObject(value) &&
+    Object.keys(value).length === fields.length &&
+    fields.every((field) => hasOwn(value, field));
 }
 
 function hasOwn(value, key) {
@@ -513,7 +561,7 @@ export function isProtocolVersion(value) {
   return (
     Number.isInteger(value) &&
     value >= 0 &&
-    value <= PROTOCOL_VERSION_V2
+    value <= PROTOCOL_VERSION_V3
   );
 }
 
@@ -697,6 +745,10 @@ function isReadinessFrameShape(value) {
  */
 export function isReadinessMessage(value, context = undefined) {
   if (!isReadinessFrameShape(value)) return false;
+  return isReadinessContextValid(value, context);
+}
+
+function isReadinessContextValid(value, context) {
   if (!isObject(context)) return true;
 
   const currentSocketGeneration =
@@ -738,6 +790,99 @@ export function isReadinessMessage(value, context = undefined) {
 }
 
 export const isWorkspaceReadinessMessage = isReadinessMessage;
+
+const INVENTORY_RECEIPT_READINESS_ERRORS = new Set([
+  PROTOCOL_ERROR_CODES.INVENTORY_PENDING,
+  PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
+  PROTOCOL_ERROR_CODES.INVENTORY_INVALID,
+  PROTOCOL_ERROR_CODES.INVENTORY_ACCESS_DENIED,
+  PROTOCOL_ERROR_CODES.INVENTORY_STALE,
+  PROTOCOL_ERROR_CODES.INVENTORY_MANUAL_CLEANUP,
+  PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED,
+  PROTOCOL_ERROR_CODES.WORKSPACE_ROOT_ESCAPE,
+  PROTOCOL_ERROR_CODES.CONTAINMENT_UNSUPPORTED,
+  PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+]);
+const INVENTORY_RECEIPT_READINESS_FIELDS = new Set([
+  "type",
+  "socketGeneration",
+  "revision",
+  "observedAt",
+  "ttlMs",
+  "bindingId",
+  "workspaceId",
+  "workspaceGeneration",
+  "status",
+  "lastError",
+  "inventoryGeneration",
+  "inventoryFingerprint",
+  "bindingFingerprint",
+  "expiresAt",
+]);
+const RECEIPT_IDENTITY_FIELDS = [
+  "bindingId",
+  "workspaceId",
+  "workspaceGeneration",
+];
+const RECEIPT_PROOF_FIELDS = [
+  "inventoryGeneration",
+  "inventoryFingerprint",
+  "bindingFingerprint",
+];
+
+function isInventoryReceiptReadinessShape(value) {
+  if (!isObject(value) || value.type !== MSG_TYPES.READINESS) return false;
+  const hasBindingState = [...RECEIPT_IDENTITY_FIELDS, ...RECEIPT_PROOF_FIELDS]
+    .some((field) => hasOwn(value, field));
+  if (!hasBindingState) {
+    return isReadinessFrameShape(value) &&
+      !hasOwn(value, "workspaceId") &&
+      !hasOwn(value, "workspaceGeneration") &&
+      !hasOwn(value, "bindingId");
+  }
+  if (
+    !Object.keys(value).every((key) => INVENTORY_RECEIPT_READINESS_FIELDS.has(key)) ||
+    !isReadinessSocketGeneration(value.socketGeneration) ||
+    !isReadinessRevision(value.revision) ||
+    !isReadinessTimestamp(value.observedAt) ||
+    value.ttlMs !== INVENTORY_RECEIPT_TTL_MS ||
+    !isMappingId(value.bindingId) ||
+    !isWorkspaceId(value.workspaceId) ||
+    !isReadinessWorkspaceGeneration(value.workspaceGeneration) ||
+    !isReadinessStatus(value.status) ||
+    (hasOwn(value, "expiresAt") && !isReadinessTimestamp(value.expiresAt))
+  ) {
+    return false;
+  }
+
+  const hasLastError = hasOwn(value, "lastError");
+  const proofCount = RECEIPT_PROOF_FIELDS.filter((field) => hasOwn(value, field)).length;
+  if (hasLastError) {
+    return proofCount === 0 &&
+      value.status.workspace === READINESS_WORKSPACE_STATUS.UNKNOWN &&
+      isReadinessError(value.lastError) &&
+      INVENTORY_RECEIPT_READINESS_ERRORS.has(value.lastError.code);
+  }
+  if (
+    proofCount !== RECEIPT_PROOF_FIELDS.length ||
+    !isReadinessWorkspaceGeneration(value.inventoryGeneration) ||
+    !isHex64(value.inventoryFingerprint) ||
+    !isHex64(value.bindingFingerprint) ||
+    ![READINESS_WORKSPACE_STATUS.UNKNOWN, READINESS_WORKSPACE_STATUS.READY]
+      .includes(value.status.workspace)
+  ) {
+    return false;
+  }
+  return value.status.workspace !== READINESS_WORKSPACE_STATUS.READY ||
+    READINESS_DIMENSIONS.every((dimension) =>
+      value.status[dimension] === READINESS_STATUS_VALUES[dimension][0]
+    );
+}
+
+export function isInventoryReceiptReadinessMessage(value, context = undefined) {
+  return isInventoryReceiptReadinessShape(value) &&
+    isReadinessContextValid(value, context);
+}
 
 /**
  * Atomically enable the v2 workspace/readiness extension only when both
@@ -782,6 +927,57 @@ export function isReadinessCapabilityGate(register, registerOk) {
     registerOk.protocolVersion === PROTOCOL_VERSION_V2 &&
     register.capabilities.includes(WORKSPACE_READINESS_CAPABILITY) &&
     registerOk.capabilities.includes(WORKSPACE_READINESS_CAPABILITY)
+  );
+}
+
+/**
+ * Atomically enable inventory receipt frames only when both peers negotiated
+ * protocol v3 and advertised both the retained readiness capability and the
+ * distinct receipt capability.
+ */
+export function isInventoryReceiptCapabilityGate(register, registerOk) {
+  if (
+    arguments.length === 1 &&
+    isObject(register) &&
+    isObject(register.register) &&
+    (isObject(register.registerOk) || isObject(register.response))
+  ) {
+    registerOk = register.registerOk ?? register.response;
+    register = register.register;
+  }
+  if (
+    arguments.length === 1 &&
+    isObject(register) &&
+    Number.isSafeInteger(register.negotiatedVersion)
+  ) {
+    return (
+      register.negotiatedVersion === PROTOCOL_VERSION_V3 &&
+      isCapabilityList(register.localCapabilities) &&
+      isCapabilityList(register.remoteCapabilities) &&
+      [WORKSPACE_READINESS_CAPABILITY, WORKSPACE_INVENTORY_RECEIPT_CAPABILITY]
+        .every((capability) =>
+          register.localCapabilities.includes(capability) &&
+          register.remoteCapabilities.includes(capability)
+        )
+    );
+  }
+  if (!isRegisterMessage(register) || !isRegisterOkMessage(registerOk)) return false;
+  if (
+    !hasOwn(register, "protocolVersion") ||
+    !hasOwn(register, "capabilities") ||
+    !hasOwn(registerOk, "protocolVersion") ||
+    !hasOwn(registerOk, "capabilities")
+  ) {
+    return false;
+  }
+  return (
+    register.protocolVersion === PROTOCOL_VERSION_V3 &&
+    registerOk.protocolVersion === PROTOCOL_VERSION_V3 &&
+    [WORKSPACE_READINESS_CAPABILITY, WORKSPACE_INVENTORY_RECEIPT_CAPABILITY]
+      .every((capability) =>
+        register.capabilities.includes(capability) &&
+        registerOk.capabilities.includes(capability)
+      )
   );
 }
 
@@ -903,6 +1099,72 @@ export function isBindOkMessage(value) {
   return Object.keys(value).every((key) =>
     ["type", "bindingId", "bindingFingerprint"].includes(key)
   );
+}
+
+const RECEIPT_BIND_KEYS = Object.freeze([
+  "type",
+  "bindingId",
+  "authorityEpoch",
+  "fenceGeneration",
+  "hostId",
+  "mappingId",
+  "mappingGeneration",
+  "mappingVersion",
+  "workspaceId",
+  "workspaceGeneration",
+  "sourcePlatform",
+  "authorityFingerprint",
+]);
+const RECEIPT_BIND_OK_KEYS = Object.freeze([
+  "type",
+  "bindingId",
+  "inventoryGeneration",
+  "inventoryFingerprint",
+  "bindingFingerprint",
+]);
+const RECEIPT_UNBIND_KEYS = Object.freeze(["type", "bindingId"]);
+
+function receiptAuthorityDescriptor(value) {
+  return {
+    authorityEpoch: value.authorityEpoch,
+    fenceGeneration: value.fenceGeneration,
+    hostId: value.hostId,
+    mappingId: value.mappingId,
+    mappingGeneration: value.mappingGeneration,
+    workspaceGeneration: value.workspaceGeneration,
+    mappingVersion: value.mappingVersion,
+    sourcePlatform: value.sourcePlatform,
+    workspaceId: value.workspaceId,
+    authorityFingerprint: value.authorityFingerprint,
+  };
+}
+
+export function isInventoryReceiptBindWorkspaceMessage(value) {
+  return hasExactFields(value, RECEIPT_BIND_KEYS) &&
+    value.type === MSG_TYPES.BIND_WORKSPACE &&
+    isMappingId(value.bindingId) &&
+    isWorkspaceAuthorityDescriptor(receiptAuthorityDescriptor(value));
+}
+
+export function isInventoryReceiptBindOkMessage(value) {
+  return hasExactFields(value, RECEIPT_BIND_OK_KEYS) &&
+    value.type === MSG_TYPES.BIND_OK &&
+    isMappingId(value.bindingId) &&
+    isReadinessWorkspaceGeneration(value.inventoryGeneration) &&
+    isHex64(value.inventoryFingerprint) &&
+    isHex64(value.bindingFingerprint);
+}
+
+export function isUnbindWorkspaceMessage(value) {
+  return hasExactFields(value, RECEIPT_UNBIND_KEYS) &&
+    value.type === MSG_TYPES.UNBIND_WORKSPACE &&
+    isMappingId(value.bindingId);
+}
+
+export function isUnbindOkMessage(value) {
+  return hasExactFields(value, RECEIPT_UNBIND_KEYS) &&
+    value.type === MSG_TYPES.UNBIND_OK &&
+    isMappingId(value.bindingId);
 }
 
 export function isInvokeMessage(value, context = undefined) {

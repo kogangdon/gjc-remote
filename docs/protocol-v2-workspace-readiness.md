@@ -13,6 +13,37 @@ When a release adds a closed-set protocol error code, deploy the bot before its 
 bot intentionally rejects a newer unknown readiness code, while a newer bot continues to accept
 the older daemon's still-supported codes.
 
+Protocol v3 adds the separately negotiated `workspace_inventory_receipt_v2` capability. Receipt
+frames are enabled only when both peers negotiate version 3 and advertise both that capability and
+`workspace_readiness_v2`. Missing either capability is incompatible for receipt-required managed
+routes; it never falls back to authority-bearing inventory or changes the exact v2 frame shapes.
+`GJC_NATIVE_INVENTORY_MODE=off` withholds the receipt capability, sends no v3 bind/receipt/unbind
+frames, and must not create a reconnect loop. Existing v0/v1 and readiness-v2 sockets retain their
+current behavior.
+
+The path-free v3 bind carries one immutable #44 authority descriptor:
+
+```text
+{ type: "bind_workspace", bindingId, authorityEpoch, fenceGeneration, hostId,
+  mappingId, mappingGeneration, mappingVersion, workspaceId, workspaceGeneration,
+  sourcePlatform, authorityFingerprint }
+```
+
+`authorityFingerprint` is the verified mapping fingerprint. Per-channel `routeFingerprint`,
+`workDir`, and bot-claimed inventory fields are forbidden. A successful daemon observation returns:
+
+```text
+{ type: "bind_ok", bindingId, inventoryGeneration, inventoryFingerprint,
+  bindingFingerprint }
+```
+
+`bindingFingerprint` is SHA-256 over canonical JSON
+`{schemaVersion:1,authority:<descriptor>,inventory:{inventoryGeneration,inventoryFingerprint}}`.
+`bindingId` is socket-local correlation and is not hashed. Both pending and receipt-bearing
+bindings retire through exact `{type:"unbind_workspace",bindingId}` /
+`{type:"unbind_ok",bindingId}` frames; requiring a receipt would make negative or pending binds
+impossible to remove.
+
 The negotiated v2 invoke is bounded and carries the route identity:
 
 ```text
@@ -25,10 +56,10 @@ the remaining identity tuple is valid. Missing, foreign, stale, or mismatched id
 rejection. Current v0/v1 peers retain the bounded workDir-only shape.
 
 The daemon may promote a bound workspace to `ready` only after its local inventory independently
-matches the authenticated binding tuple, including `mappingGeneration`, `workspaceGeneration`,
-`mappingVersion`, source platform, route/authority fingerprints, and inventory generation. The
-inventory's local `workDir` is never sent in the managed bind frame and is capability evidence,
-not a second mapping authority. Missing or drifted inventory remains non-ready.
+matches host, workspace, source platform, and the daemon-observed inventory generation/fingerprint.
+Mapping identity and generations remain in the authenticated #44 descriptor; route fingerprints
+remain bot-local. The inventory's local `workDir` and root/storage identities are capability
+evidence and are never sent as route authority. Missing or drifted inventory remains non-ready.
 
 ## Mapping and legacy fallback
 
@@ -89,6 +120,15 @@ implementation gates. Aggregate precedence is deterministic: `offline`, `incompa
 error, `connected-not-ready` when registration is current without a prior-ready expiry, then
 `ready` only for a current, unexpired selected workspace with all five dimensions ready.
 
+Receipt binding readiness has an exact 10-second TTL. Pending or verified-negative frames carry
+only `bindingId`, workspace identity, `status.workspace:"unknown"`, and one exact error; receipt
+fields are forbidden. Positive frames carry `bindingFingerprint`, `inventoryGeneration`, and
+`inventoryFingerprint`, have no `lastError`, and may report workspace `unknown` until the current
+probe completes. Workspace `ready` requires all five dimensions ready. Positive readiness received
+before its matching `bind_ok` is held only until the bind deadline and never renders ready.
+Malformed, foreign, replayed, unknown-key, partial-receipt, or mismatched frames close the socket
+with policy violation semantics and invalidate its cache.
+
 ## Projection and errors
 
 `/hosts` exposes only opaque IDs, current aggregate, per-dimension state, local `lastErrorAt`,
@@ -101,6 +141,8 @@ Stable classes include:
   `PROVIDER_UNAVAILABLE`, `MODEL_PROFILE_MISSING`, `MODEL_PROFILE_INVALID`;
 - runtime/config: `RUNTIME_INCOMPATIBLE`, `CONFIG_INVALID`, `UNKNOWN_RUNTIME`;
 - workspace/mapping/lease: `WORKSPACE_ROOT_ESCAPE`, `CONTAINMENT_UNSUPPORTED`,
+  `INVENTORY_PENDING`, `INVENTORY_INVALID`, `INVENTORY_ACCESS_DENIED`, `INVENTORY_STALE`,
+  `INVENTORY_MANUAL_CLEANUP`, `INVENTORY_IO_FAILED`, `WORKSPACE_NOT_FOUND`,
   `MAPPING_ID_REQUIRED`, `WORKSPACE_MAPPING_CHANGED`, `WORKSPACE_BUSY`,
   `WORKSPACE_GENERATION_STALE`, `LEASE_CONFLICT`;
 - Git: `GIT_GRAPH_INCOMPLETE`, `GIT_AUTH_FAILED`;

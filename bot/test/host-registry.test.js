@@ -8,6 +8,7 @@ import {
   MAX_WS_PAYLOAD_BYTES,
   PONG,
   PROTOCOL_VERSION,
+  PROTOCOL_VERSION_V3,
   READINESS_MAX_TTL_MS,
   V0_LIMITS,
   isEventMessage,
@@ -2117,7 +2118,8 @@ test("protocol version validators accept only supported versions", () => {
   assert.equal(isProtocolVersion(0), true);
   assert.equal(isProtocolVersion(1), true);
   assert.equal(isProtocolVersion(2), true);
-  for (const bad of [-1, 3, 1.5, "1", Number.NaN, V0_LIMITS.PROTOCOL_VERSION_MAX]) {
+  assert.equal(isProtocolVersion(PROTOCOL_VERSION_V3), true);
+  for (const bad of [-1, PROTOCOL_VERSION_V3 + 1, 1.5, "1", Number.NaN, V0_LIMITS.PROTOCOL_VERSION_MAX]) {
     assert.equal(isProtocolVersion(bad), false);
   }
 
