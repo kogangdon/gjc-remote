@@ -19,6 +19,7 @@
     "./recovery-envelope": "./recovery-envelope.js",
     "./strict-json": "./strict-json.js",
     "./successor-envelope": "./successor-envelope.js",
+    "./workspace-inventory": "./workspace-inventory.js",
     "./*": "./*"
   }
 }
