@@ -397,7 +397,42 @@ function currentBindingState(state, bindingState, fingerprint) {
     state?.committed === true &&
     state?.bindings.get(bindingState?.binding.bindingId) === bindingState &&
     !bindingState.invalidated &&
-    bindingFingerprint(bindingState.binding) === fingerprint
+    (bindingState.receipt
+      ? bindingState.proof?.bindingFingerprint === fingerprint
+      : bindingFingerprint(bindingState.binding) === fingerprint)
+  );
+}
+
+function receiptActivityIdentity(state, bindingState) {
+  const bindingFingerprintValue = bindingState?.proof?.bindingFingerprint;
+  if (
+    !bindingState?.receipt ||
+    !Number.isSafeInteger(state?.socketGeneration) ||
+    state.socketGeneration < 1 ||
+    typeof bindingState.binding.bindingId !== "string" ||
+    !/^[0-9a-f]{64}$/.test(bindingFingerprintValue ?? "")
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    socketGeneration: state.socketGeneration,
+    bindingId: bindingState.binding.bindingId,
+    bindingFingerprint: bindingFingerprintValue,
+  });
+}
+
+function retireReceiptSession(state, bindingState) {
+  const workDir = bindingState?.inventoryWorkspace?.workDir;
+  const identity = receiptActivityIdentity(state, bindingState);
+  if (!workDir || !identity) return Promise.resolve(true);
+  return pool.retireManagedReceipt(workDir, identity).then(
+    () => true,
+    (error) => {
+      console.error(
+        `daemon: failed to retire receipt session: ${sanitizeDaemonError(error)}`
+      );
+      return false;
+    }
   );
 }
 
@@ -600,7 +635,10 @@ function retireSupersededReceiptBinding(state, bindingState) {
     workspaceLeases.retireBinding({
       ...receiptAuthority(bindingState.binding),
       ...bindingState.proof,
+      socketGeneration: state.socketGeneration,
+      bindingId: bindingState.binding.bindingId,
     });
+    bindingState.retirement = retireReceiptSession(state, bindingState);
   }
   state.retiredBindings.set(bindingState.binding.bindingId, bindingState);
 }
@@ -745,7 +783,12 @@ async function acceptReceiptBinding(state, message) {
   bindingState.lastError = proof ? undefined : makeReadinessError(errorCode);
   if (
     proof &&
-    !workspaceLeases.adoptBinding({ ...receiptAuthority(message), ...proof })
+    !workspaceLeases.adoptBinding({
+      ...receiptAuthority(message),
+      ...proof,
+      socketGeneration: state.socketGeneration,
+      bindingId: message.bindingId,
+    })
   ) {
     bindingState.proof = undefined;
     bindingState.phase = "negative";
@@ -779,19 +822,27 @@ function connectionSendBindOk(connection, bindingId, proof) {
   if (isInventoryReceiptBindOkMessage(frame)) connection.send(JSON.stringify(frame));
 }
 
-function unbindReceiptBinding(state, bindingId) {
+async function unbindReceiptBinding(state, bindingId) {
   const bindingState = state?.bindings.get(bindingId);
-  if (!bindingState) return state?.retiredBindings.get(bindingId) !== undefined;
+  if (!bindingState) {
+    const retired = state?.retiredBindings.get(bindingId);
+    if (!retired) return false;
+    return retired.retirement ? await retired.retirement : true;
+  }
   state.bindings.delete(bindingId);
   bindingState.invalidated = true;
   invalidateBindingRequests(state, bindingState);
+  state.retiredBindings.set(bindingId, bindingState);
   if (bindingState.proof) {
     workspaceLeases.retireBinding({
       ...receiptAuthority(bindingState.binding),
       ...bindingState.proof,
+      socketGeneration: state.socketGeneration,
+      bindingId: bindingState.binding.bindingId,
     });
+    bindingState.retirement = retireReceiptSession(state, bindingState);
+    if (!(await bindingState.retirement)) return false;
   }
-  state.retiredBindings.set(bindingId, bindingState);
   if (state.bindings.size === 0) state.receiptUnbound = true;
   return true;
 }
@@ -1151,19 +1202,24 @@ async function admitReadyWorkload(state, workDir, message) {
   if (!NATIVE_WORKSPACE_SERVING_ENABLED) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
   }
-  const bindingFingerprintValue = bindingState
-    ? bindingFingerprint(bindingState.binding)
-    : undefined;
+  const receiptIdentity = receiptActivityIdentity(state, bindingState);
+  const bindingFingerprintValue = receiptIdentity?.bindingFingerprint ??
+    (bindingState ? bindingFingerprint(bindingState.binding) : undefined);
   let activityLease;
   try {
     if (bindingState) {
       activityLease = workspaceLeases.acquireActivity({
-        ...bindingState.binding,
+        ...(bindingState.receipt
+          ? receiptAuthority(bindingState.binding)
+          : bindingState.binding),
         bindingFingerprint: bindingFingerprintValue,
+        ...(receiptIdentity ?? {}),
       });
     }
     const session = await pool.ensureSession(effectiveWorkDir, {
-      managedIdentity: bindingFingerprintValue,
+      ...(receiptIdentity ? { receiptIdentity } : {
+        managedIdentity: bindingFingerprintValue,
+      }),
     });
     if (
       bindingState &&
@@ -1278,7 +1334,10 @@ function connectToBot() {
           workspaceLeases.retireBinding({
             ...receiptAuthority(bindingState.binding),
             ...bindingState.proof,
+            socketGeneration: readinessState.socketGeneration,
+            bindingId: bindingState.binding.bindingId,
           });
+          retireReceiptSession(readinessState, bindingState);
         }
         readinessState.bindings.delete(bindingId);
       }
@@ -1435,7 +1494,7 @@ async function handleMessage(
   if (msg?.type === MSG_TYPES.UNBIND_WORKSPACE) {
     if (!readinessState?.receiptCommitted ||
         !isUnbindWorkspaceMessage(msg) ||
-        !unbindReceiptBinding(readinessState, msg.bindingId)) {
+        !(await unbindReceiptBinding(readinessState, msg.bindingId))) {
       connection.close(1008, "invalid workspace unbind");
       return;
     }

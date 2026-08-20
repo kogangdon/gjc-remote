@@ -33,6 +33,11 @@ const GENERATION_FIELDS = [
   "workspaceGeneration",
   "inventoryGeneration",
 ];
+const RECEIPT_IDENTITY_FIELDS = [
+  "socketGeneration",
+  "bindingId",
+  "bindingFingerprint",
+];
 
 function leaseConflict() {
   const error = new Error(PROTOCOL_ERROR_CODES.LEASE_CONFLICT);
@@ -47,6 +52,9 @@ function requireAuthority(candidate) {
   const generationFields = candidate?.authorityEpoch === undefined
     ? ["mappingGeneration", "workspaceGeneration", "inventoryGeneration"]
     : GENERATION_FIELDS;
+  const hasReceiptIdentity =
+    candidate?.authorityEpoch !== undefined ||
+    candidate?.socketGeneration !== undefined;
   if (
     !candidate ||
     fields.some((field) => candidate[field] === undefined) ||
@@ -55,24 +63,37 @@ function requireAuthority(candidate) {
     generationFields.some(
       (field) =>
         !Number.isSafeInteger(candidate[field]) || candidate[field] < 0
-    )
+    ) ||
+    (hasReceiptIdentity &&
+      (!RECEIPT_IDENTITY_FIELDS.every((field) => candidate[field] !== undefined) ||
+        !Number.isSafeInteger(candidate.socketGeneration) ||
+        candidate.socketGeneration < 1 ||
+        typeof candidate.bindingId !== "string" ||
+        candidate.bindingId.length === 0 ||
+        !/^[0-9a-f]{64}$/.test(candidate.bindingFingerprint)))
   ) {
     throw new TypeError("workspace lease authority is invalid");
   }
-  return Object.freeze(
-    Object.fromEntries(fields.map((field) => [field, candidate[field]]))
-  );
+  return Object.freeze(Object.fromEntries(
+    [...fields, ...(hasReceiptIdentity ? RECEIPT_IDENTITY_FIELDS : [])]
+      .map((field) => [field, candidate[field]])
+  ));
 }
 
 function sameAuthority(left, right) {
   const fields = left?.authorityEpoch === undefined
     ? V2_AUTHORITY_FIELDS
     : V3_AUTHORITY_FIELDS;
-  return fields.every((field) => left[field] === right[field]);
+  return [...fields, ...RECEIPT_IDENTITY_FIELDS].every(
+    (field) => left[field] === right[field]
+  );
 }
 
 function regresses(previous, candidate) {
-  return GENERATION_FIELDS.some((field) => candidate[field] < previous[field]);
+  return [
+    ...GENERATION_FIELDS,
+    ...(previous.socketGeneration === undefined ? [] : ["socketGeneration"]),
+  ].some((field) => candidate[field] < previous[field]);
 }
 
 function authorityChanged(previous, candidate) {
@@ -122,7 +143,8 @@ export class WorkspaceLeaseRegistry {
       authority.inventoryGeneration > previous.inventoryGeneration;
     const fenceAdvanced =
       (authority.authorityEpoch ?? 0) > (previous.authorityEpoch ?? 0) ||
-      (authority.fenceGeneration ?? 0) > (previous.fenceGeneration ?? 0);
+      (authority.fenceGeneration ?? 0) > (previous.fenceGeneration ?? 0) ||
+      (authority.socketGeneration ?? 0) > (previous.socketGeneration ?? 0);
     if (!mappingAdvanced && !inventoryAdvanced && !fenceAdvanced) return false;
     if (authorityChanged(previous, authority) && !mappingAdvanced) return false;
 
@@ -150,8 +172,13 @@ export class WorkspaceLeaseRegistry {
 
   acquireActivity(candidate) {
     const authority = requireAuthority(candidate);
-    const bindingFingerprint = candidate?.bindingFingerprint;
-    if (typeof bindingFingerprint !== "string" || bindingFingerprint.length === 0) {
+    const receipt = authority.socketGeneration !== undefined;
+    const legacyBindingFingerprint = candidate?.bindingFingerprint;
+    if (
+      !receipt &&
+      (typeof legacyBindingFingerprint !== "string" ||
+        legacyBindingFingerprint.length === 0)
+    ) {
       throw new TypeError("workspace lease identity is invalid");
     }
     const currentAuthority = this.authorities.get(authority.workspaceId);
@@ -161,7 +188,15 @@ export class WorkspaceLeaseRegistry {
 
     let entry = this.activities.get(authority.workspaceId);
     if (entry) {
-      if (entry.invalidated || entry.bindingFingerprint !== bindingFingerprint) {
+      if (
+        entry.invalidated ||
+        entry.receipt !== receipt ||
+        (receipt &&
+          (entry.socketGeneration !== authority.socketGeneration ||
+            entry.bindingId !== authority.bindingId ||
+            entry.bindingFingerprint !== authority.bindingFingerprint)) ||
+        (!receipt && entry.bindingFingerprint !== legacyBindingFingerprint)
+      ) {
         if (entry.holders > 0) throw leaseConflict();
         this.activities.delete(authority.workspaceId);
         entry = undefined;
@@ -172,7 +207,12 @@ export class WorkspaceLeaseRegistry {
       this.nextFence =
         this.nextFence >= Number.MAX_SAFE_INTEGER ? 1 : this.nextFence + 1;
       entry = {
-        bindingFingerprint,
+        receipt,
+        socketGeneration: authority.socketGeneration,
+        bindingId: authority.bindingId,
+        bindingFingerprint: receipt
+          ? authority.bindingFingerprint
+          : legacyBindingFingerprint,
         fence: this.nextFence,
         holders: 0,
         invalidated: false,
