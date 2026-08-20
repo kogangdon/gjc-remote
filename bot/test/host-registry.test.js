@@ -3394,6 +3394,31 @@ test("positive readiness is held until the exact bind acknowledgement", async ()
       workspaceId: route.workspaceId,
       workspaceGeneration: route.workspaceGeneration,
       ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "INVENTORY_PENDING",
+        at: Date.now(),
+        remediation: {
+          code: "INVENTORY_PENDING",
+          retryable: true,
+          action: "retry_later",
+        },
+      },
+    })));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(connection.socket.readyState, WebSocket.OPEN);
+    connection.socket.send(JSON.stringify(readinessFrame({
+      revision: 2,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
       inventoryGeneration,
       inventoryFingerprint,
       bindingFingerprint,
@@ -3667,15 +3692,39 @@ test("64 bindings are exact, the 65th is incompatible, and replacement gets fres
   }
 });
 
-test("bind deadline terminates a silent v3 socket", async () => {
+test("bind deadline terminates a v3 socket that remains pending", async () => {
   const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     timers: timers.api,
   });
   try {
-    server.registry.setManagedRoutes({ "channel-a": managedRoute("a") });
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
     const connection = await connectV3(server);
-    await connection.nextFrame();
+    const bind = await connection.nextFrame();
+    connection.socket.send(JSON.stringify(readinessFrame({
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "INVENTORY_PENDING",
+        at: Date.now(),
+        remediation: {
+          code: "INVENTORY_PENDING",
+          retryable: true,
+          action: "retry_later",
+        },
+      },
+    })));
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(timers.timeoutDelays.includes(10_000), true);
     const closed = once(connection.socket, "close");
     timers.runTimeoutByDelay(10_000);

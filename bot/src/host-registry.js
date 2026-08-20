@@ -523,7 +523,10 @@ export class HostRegistry {
           binding.receipt?.inventoryFingerprint === msg.inventoryFingerprint &&
           binding.receipt?.bindingFingerprint === msg.bindingFingerprint;
       }
-      if (!binding || binding.status !== "binding") return false;
+      if (
+        !binding ||
+        (binding.status !== "binding" && binding.status !== "pending")
+      ) return false;
       const fingerprint = workspaceBindingFingerprint({
         authority: binding.authority,
         inventoryGeneration: msg.inventoryGeneration,
@@ -603,14 +606,16 @@ export class HostRegistry {
     state.receiptSocketGeneration ??= msg.socketGeneration;
     state.receiptPrevious = msg;
     if (msg.lastError !== undefined) {
-      this.#clearBindingDeadline(binding);
-      binding.status = "negative";
+      const pending =
+        msg.lastError.code === PROTOCOL_ERROR_CODES.INVENTORY_PENDING;
+      if (!pending) this.#clearBindingDeadline(binding);
+      binding.status = pending ? "pending" : "negative";
       binding.receipt = undefined;
       binding.readiness = Object.freeze({ ...msg });
       binding.heldReadiness = undefined;
       return true;
     }
-    if (binding.status === "binding") {
+    if (binding.status === "binding" || binding.status === "pending") {
       binding.heldReadiness = Object.freeze({ ...msg });
       return true;
     }

@@ -1,6 +1,20 @@
 import { PROTOCOL_ERROR_CODES } from "@gjc-remote/shared";
 
-const AUTHORITY_FIELDS = [
+const V3_AUTHORITY_FIELDS = [
+  "authorityEpoch",
+  "fenceGeneration",
+  "hostId",
+  "mappingId",
+  "mappingGeneration",
+  "mappingVersion",
+  "workspaceId",
+  "workspaceGeneration",
+  "sourcePlatform",
+  "authorityFingerprint",
+  "inventoryGeneration",
+  "inventoryFingerprint",
+];
+const V2_AUTHORITY_FIELDS = [
   "hostId",
   "mappingId",
   "mappingGeneration",
@@ -13,6 +27,8 @@ const AUTHORITY_FIELDS = [
   "inventoryGeneration",
 ];
 const GENERATION_FIELDS = [
+  "authorityEpoch",
+  "fenceGeneration",
   "mappingGeneration",
   "workspaceGeneration",
   "inventoryGeneration",
@@ -25,12 +41,18 @@ function leaseConflict() {
 }
 
 function requireAuthority(candidate) {
+  const fields = candidate?.authorityEpoch === undefined
+    ? V2_AUTHORITY_FIELDS
+    : V3_AUTHORITY_FIELDS;
+  const generationFields = candidate?.authorityEpoch === undefined
+    ? ["mappingGeneration", "workspaceGeneration", "inventoryGeneration"]
+    : GENERATION_FIELDS;
   if (
     !candidate ||
-    AUTHORITY_FIELDS.some((field) => candidate[field] === undefined) ||
+    fields.some((field) => candidate[field] === undefined) ||
     typeof candidate.workspaceId !== "string" ||
     candidate.workspaceId.length === 0 ||
-    GENERATION_FIELDS.some(
+    generationFields.some(
       (field) =>
         !Number.isSafeInteger(candidate[field]) || candidate[field] < 0
     )
@@ -38,12 +60,15 @@ function requireAuthority(candidate) {
     throw new TypeError("workspace lease authority is invalid");
   }
   return Object.freeze(
-    Object.fromEntries(AUTHORITY_FIELDS.map((field) => [field, candidate[field]]))
+    Object.fromEntries(fields.map((field) => [field, candidate[field]]))
   );
 }
 
 function sameAuthority(left, right) {
-  return AUTHORITY_FIELDS.every((field) => left[field] === right[field]);
+  const fields = left?.authorityEpoch === undefined
+    ? V2_AUTHORITY_FIELDS
+    : V3_AUTHORITY_FIELDS;
+  return fields.every((field) => left[field] === right[field]);
 }
 
 function regresses(previous, candidate) {
@@ -56,7 +81,7 @@ function authorityChanged(previous, candidate) {
     "mappingId",
     "mappingVersion",
     "sourcePlatform",
-    "routeFingerprint",
+    ...(previous.authorityEpoch === undefined ? ["routeFingerprint"] : []),
     "authorityFingerprint",
   ].some((field) => previous[field] !== candidate[field]);
 }
@@ -95,10 +120,26 @@ export class WorkspaceLeaseRegistry {
       authority.workspaceGeneration > previous.workspaceGeneration;
     const inventoryAdvanced =
       authority.inventoryGeneration > previous.inventoryGeneration;
-    if (!mappingAdvanced && !inventoryAdvanced) return false;
+    const fenceAdvanced =
+      (authority.authorityEpoch ?? 0) > (previous.authorityEpoch ?? 0) ||
+      (authority.fenceGeneration ?? 0) > (previous.fenceGeneration ?? 0);
+    if (!mappingAdvanced && !inventoryAdvanced && !fenceAdvanced) return false;
     if (authorityChanged(previous, authority) && !mappingAdvanced) return false;
 
     this.authorities.set(authority.workspaceId, authority);
+    const activity = this.activities.get(authority.workspaceId);
+    if (activity) {
+      activity.invalidated = true;
+      if (activity.holders === 0) this.activities.delete(authority.workspaceId);
+    }
+    return true;
+  }
+
+  retireBinding(candidate) {
+    const authority = requireAuthority(candidate);
+    const current = this.authorities.get(authority.workspaceId);
+    if (!current || !sameAuthority(current, authority)) return false;
+    this.authorities.delete(authority.workspaceId);
     const activity = this.activities.get(authority.workspaceId);
     if (activity) {
       activity.invalidated = true;

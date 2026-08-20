@@ -20,6 +20,8 @@ import {
   READINESS_STATUS_VALUES,
   WORKSPACE_ID_MAX_LENGTH,
   WORKSPACE_READINESS_CAPABILITY,
+  WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+  INVENTORY_RECEIPT_TTL_MS,
   isAnswerMessage,
   isBindOkMessage,
   isBindWorkspaceMessage,
@@ -36,6 +38,7 @@ import {
   isWorkspaceId,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
+import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
 import {
   buildWorkspaceInventory,
   workspaceInventoryBytes,
@@ -63,6 +66,20 @@ const validBinding = {
 };
 const ROOT_IDENTITY_FINGERPRINT = "1".repeat(64);
 const STORAGE_IDENTITY_FINGERPRINT = "2".repeat(64);
+const receiptBinding = {
+  type: MSG_TYPES.BIND_WORKSPACE,
+  bindingId: "receipt-binding-1",
+  authorityEpoch: 1,
+  fenceGeneration: 1,
+  hostId: "test-host",
+  mappingId: "mapping-1",
+  mappingGeneration: 2,
+  mappingVersion: 1,
+  workspaceId: "workspace-1",
+  workspaceGeneration: 3,
+  sourcePlatform: "posix",
+  authorityFingerprint: "b".repeat(64),
+};
 
 function capabilityWorkspace(binding, workDir) {
   return {
@@ -330,21 +347,17 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
       };
       daemon.peer.on("message", onMessage);
     });
+    const postBindReadiness = waitForMessage(
+      daemon.peer,
+      (message) =>
+        message.type === MSG_TYPES.READINESS &&
+        message.bindingId === validBinding.bindingId
+    );
     daemon.peer.send(JSON.stringify(validBinding));
     const response = await bindOk;
     assert.equal(response.type, MSG_TYPES.BIND_OK);
     assert.equal(response.bindingId, validBinding.bindingId);
 
-    const postBindReadiness = new Promise((resolve) => {
-      const onMessage = (raw) => {
-        const message = JSON.parse(raw.toString());
-        if (message.type === MSG_TYPES.READINESS) {
-          daemon.peer.off("message", onMessage);
-          resolve(message);
-        }
-      };
-      daemon.peer.on("message", onMessage);
-    });
     const readiness = await postBindReadiness;
     assert.equal(readiness.status.workspace, "unknown");
     assert.equal(readiness.lastError?.code, PROTOCOL_ERROR_CODES.INVENTORY_PENDING);
@@ -440,6 +453,353 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
       JSON.parse(response.error).code,
       PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
     );
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("v3 receipt bind derives local proof and unbind is bindingId-only", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    assert.equal(daemon.register.protocolVersion, PROTOCOL_VERSION_V3);
+    assert.ok(daemon.register.capabilities.includes(WORKSPACE_INVENTORY_RECEIPT_CAPABILITY));
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const receipt = onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    const pendingReadiness = waitForMessage(
+      daemon.peer,
+      (frame) => frame.type === MSG_TYPES.READINESS &&
+        frame.bindingId === receiptBinding.bindingId &&
+        frame.lastError?.code === PROTOCOL_ERROR_CODES.INVENTORY_PENDING
+    );
+    const receiptReadiness = waitForMessage(
+      daemon.peer,
+      (frame) => frame.type === MSG_TYPES.READINESS &&
+        frame.bindingId === receiptBinding.bindingId &&
+        frame.bindingFingerprint !== undefined
+    );
+    daemon.peer.send(JSON.stringify(receiptBinding));
+    const pending = await pendingReadiness;
+    assert.equal(Object.hasOwn(pending, "bindingFingerprint"), false);
+    const bindOk = await receipt;
+    const parsedInventory = parseWorkspaceInventory(inventory);
+    assert.equal(bindOk.inventoryGeneration, parsedInventory.inventoryGeneration);
+    assert.equal(bindOk.inventoryFingerprint, parsedInventory.inventoryFingerprint);
+    assert.equal(bindOk.bindingFingerprint, workspaceBindingFingerprint({
+      authority: {
+        authorityEpoch: receiptBinding.authorityEpoch,
+        fenceGeneration: receiptBinding.fenceGeneration,
+        hostId: receiptBinding.hostId,
+        mappingId: receiptBinding.mappingId,
+        mappingGeneration: receiptBinding.mappingGeneration,
+        workspaceGeneration: receiptBinding.workspaceGeneration,
+        mappingVersion: receiptBinding.mappingVersion,
+        sourcePlatform: receiptBinding.sourcePlatform,
+        workspaceId: receiptBinding.workspaceId,
+        authorityFingerprint: receiptBinding.authorityFingerprint,
+      },
+      inventoryGeneration: parsedInventory.inventoryGeneration,
+      inventoryFingerprint: parsedInventory.inventoryFingerprint,
+    }));
+    const readiness = await receiptReadiness;
+    assert.equal(readiness.ttlMs, INVENTORY_RECEIPT_TTL_MS);
+    assert.equal(readiness.bindingFingerprint, bindOk.bindingFingerprint);
+    const unbound = onceMessage(daemon.peer, MSG_TYPES.UNBIND_OK);
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.UNBIND_WORKSPACE,
+      bindingId: receiptBinding.bindingId,
+    }));
+    assert.deepEqual(await unbound, {
+      type: MSG_TYPES.UNBIND_OK,
+      bindingId: receiptBinding.bindingId,
+    });
+    const duplicateUnbound = onceMessage(daemon.peer, MSG_TYPES.UNBIND_OK);
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.UNBIND_WORKSPACE,
+      bindingId: receiptBinding.bindingId,
+    }));
+    assert.deepEqual(await duplicateUnbound, {
+      type: MSG_TYPES.UNBIND_OK,
+      bindingId: receiptBinding.bindingId,
+    });
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify(receiptBinding));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("v3 receipt refuses provider epoch drift without acknowledging", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY_TEST_EPOCH_MISMATCH: "1",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const readiness = waitForMessage(
+      daemon.peer,
+      (frame) => frame.type === MSG_TYPES.READINESS &&
+        frame.bindingId === receiptBinding.bindingId
+    );
+    daemon.peer.send(JSON.stringify(receiptBinding));
+    const frame = await readiness;
+    assert.equal(frame.lastError?.code, PROTOCOL_ERROR_CODES.INVENTORY_PENDING);
+    assert.equal(Object.hasOwn(frame, "bindingFingerprint"), false);
+    assert.equal(Object.hasOwn(frame, "inventoryFingerprint"), false);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("native inventory off mode withholds v3 receipt capability", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_NATIVE_INVENTORY_MODE: "off",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    assert.equal(daemon.register.protocolVersion, PROTOCOL_VERSION_V2);
+    assert.equal(
+      daemon.register.capabilities.includes(WORKSPACE_INVENTORY_RECEIPT_CAPABILITY),
+      false
+    );
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("v3 retired authority floor rejects a lower descriptor under a fresh id", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const newer = {
+      ...receiptBinding,
+      bindingId: "receipt-newer",
+      authorityEpoch: 2,
+      fenceGeneration: 2,
+    };
+    const bound = onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    daemon.peer.send(JSON.stringify(newer));
+    await bound;
+    const unbound = onceMessage(daemon.peer, MSG_TYPES.UNBIND_OK);
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.UNBIND_WORKSPACE,
+      bindingId: newer.bindingId,
+    }));
+    await unbound;
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify({
+      ...receiptBinding,
+      bindingId: "receipt-regressed",
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("v3 newer authority retires an already-positive older binding before pending", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const bound = onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    const oldReady = waitForMessage(
+      daemon.peer,
+      (frame) =>
+        frame.type === MSG_TYPES.READINESS &&
+        frame.bindingId === receiptBinding.bindingId &&
+        frame.status.workspace === "ready"
+    );
+    daemon.peer.send(JSON.stringify(receiptBinding));
+    await bound;
+    await oldReady;
+
+    const observed = [];
+    const collect = (raw) => observed.push(JSON.parse(raw.toString()));
+    daemon.peer.on("message", collect);
+    const newer = {
+      ...receiptBinding,
+      bindingId: "receipt-newer-negative",
+      mappingGeneration: receiptBinding.mappingGeneration + 1,
+      sourcePlatform: "windows-drive",
+    };
+    const newerNegative = waitForMessage(
+      daemon.peer,
+      (frame) =>
+        frame.type === MSG_TYPES.READINESS &&
+        frame.bindingId === newer.bindingId &&
+        frame.lastError?.code === PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
+    );
+    daemon.peer.send(JSON.stringify(newer));
+    await newerNegative;
+    daemon.peer.off("message", collect);
+    assert.equal(
+      observed.some(
+        (frame) =>
+          frame.type === MSG_TYPES.READINESS &&
+          frame.bindingId === receiptBinding.bindingId
+      ),
+      false
+    );
+    const retired = onceMessage(daemon.peer, MSG_TYPES.UNBIND_OK);
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.UNBIND_WORKSPACE,
+      bindingId: receiptBinding.bindingId,
+    }));
+    await retired;
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("v3 reserves the 64-id capacity before provider reads complete", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const closed = once(daemon.peer, "close");
+    for (let index = 0; index < 65; index += 1) {
+      daemon.peer.send(JSON.stringify({
+        ...receiptBinding,
+        bindingId: `receipt-capacity-${index}`,
+        mappingId: `mapping-capacity-${index}`,
+        workspaceId: `workspace-capacity-${index}`,
+      }));
+    }
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("v3 rejects an unknown bindingId-only unbind", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.UNBIND_WORKSPACE,
+      bindingId: "unknown-binding",
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
   } finally {
     await daemon.close();
   }

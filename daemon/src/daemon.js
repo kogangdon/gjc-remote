@@ -9,6 +9,7 @@ import {
   PROTOCOL_ERROR_CODES,
   PROTOCOL_VERSION,
   PROTOCOL_VERSION_V2,
+  PROTOCOL_VERSION_V3,
   READINESS_DEFAULT_TTL_MS,
   READINESS_DIMENSIONS,
   READINESS_MAX_TTL_MS,
@@ -16,10 +17,17 @@ import {
   READINESS_REMEDIATIONS,
   V0_LIMITS,
   WORKSPACE_READINESS_CAPABILITY,
+  WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+  INVENTORY_RECEIPT_TTL_MS,
   isWorkspaceId,
   isReadinessWorkspaceGeneration,
   isAnswerMessage,
   isBindWorkspaceMessage,
+  isInventoryReceiptBindWorkspaceMessage,
+  isInventoryReceiptBindOkMessage,
+  isInventoryReceiptCapabilityGate,
+  isInventoryReceiptReadinessMessage,
+  isUnbindWorkspaceMessage,
   isInvokeMessage,
   isPingMessage,
   isReadinessCapabilityGate,
@@ -30,6 +38,7 @@ import {
   negotiateCapabilities,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
+import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
 import { SessionPool } from "./session-pool.js";
 import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
 import {
@@ -85,12 +94,44 @@ function sanitizeDaemonError(error) {
   return sanitizeErrorMessage(error, daemonSensitiveValues);
 }
 const readinessV2Advertised = process.env.GJC_READINESS_V2 === "1";
-const DAEMON_PROTOCOL_VERSION = readinessV2Advertised
+const READINESS_TEST_INJECTION_ENABLED =
+  process.env.GJC_READINESS_TEST_INJECTION === "1";
+const nativeInventoryMode =
+  `${process.env.GJC_NATIVE_INVENTORY_MODE ?? "off"}`.trim().toLowerCase();
+if (nativeInventoryMode !== "off" && nativeInventoryMode !== "verify") {
+  console.error("daemon: GJC_NATIVE_INVENTORY_MODE must be off or verify");
+  process.exit(1);
+}
+let inventoryProvider;
+let initialInventoryRead;
+try {
+  inventoryProvider = createWorkspaceInventoryProvider({
+    testInjectionEnabled: READINESS_TEST_INJECTION_ENABLED,
+    serializedTestInventory: process.env.GJC_WORKSPACE_INVENTORY,
+    testStatus: process.env.GJC_WORKSPACE_INVENTORY_TEST_STATUS,
+    testEpochMismatch: process.env.GJC_WORKSPACE_INVENTORY_TEST_EPOCH_MISMATCH === "1",
+  });
+  initialInventoryRead = await inventoryProvider.read();
+} catch (error) {
+  console.error(`daemon: invalid GJC_WORKSPACE_INVENTORY: ${sanitizeDaemonError(error)}`);
+  process.exit(1);
+}
+const inventoryReceiptAdvertised =
+  nativeInventoryMode === "verify" &&
+  readinessV2Advertised &&
+  inventoryProvider.receiptCapable === true;
+const DAEMON_PROTOCOL_VERSION = inventoryReceiptAdvertised
+  ? PROTOCOL_VERSION_V3
+  : readinessV2Advertised
   ? Math.max(PROTOCOL_VERSION, PROTOCOL_VERSION_V2)
   : PROTOCOL_VERSION;
 const DAEMON_CAPABILITIES = Object.freeze(
   readinessV2Advertised
-    ? [...new Set([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY])]
+    ? [...new Set([
+        ...CAPABILITIES,
+        WORKSPACE_READINESS_CAPABILITY,
+        ...(inventoryReceiptAdvertised ? [WORKSPACE_INVENTORY_RECEIPT_CAPABILITY] : []),
+      ])]
     : [...CAPABILITIES]
 );
 
@@ -155,25 +196,10 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
     : PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
 }
 
-const READINESS_TEST_INJECTION_ENABLED =
-  process.env.GJC_READINESS_TEST_INJECTION === "1";
 const NATIVE_WORKSPACE_SERVING_ENABLED = false;
 const MAX_BINDINGS_PER_SOCKET = 64;
-
-let localWorkspaceInventory;
-try {
-  const inventoryProvider = createWorkspaceInventoryProvider({
-    testInjectionEnabled: READINESS_TEST_INJECTION_ENABLED,
-    serializedTestInventory: process.env.GJC_WORKSPACE_INVENTORY,
-  });
-  const inventoryRead = await inventoryProvider.read();
-  if (inventoryRead.status === "present") {
-    localWorkspaceInventory = inventoryRead.inventory;
-  }
-} catch (error) {
-  console.error(`daemon: invalid GJC_WORKSPACE_INVENTORY: ${sanitizeDaemonError(error)}`);
-  process.exit(1);
-}
+const localWorkspaceInventory =
+  initialInventoryRead?.status === "present" ? initialInventoryRead.inventory : undefined;
 
 function readReadinessTestEvidence() {
   if (!READINESS_TEST_INJECTION_ENABLED) return undefined;
@@ -427,10 +453,347 @@ function createReadinessState(connection) {
     workspaceId: staticReadiness.workspaceId,
     workspaceGeneration: staticReadiness.workspaceGeneration,
     bindings: new Map(),
+    retiredBindings: new Map(),
+    receiptWorkspaceFloors: new Map(),
+    receiptCommitted: false,
+    receiptUnbound: false,
     lastError: staticErrorCode ? makeReadinessError(staticErrorCode) : undefined,
   };
   readinessByConnection.set(connection, state);
   return state;
+}
+
+function receiptAuthority(message) {
+  const {
+    authorityEpoch,
+    fenceGeneration,
+    hostId,
+    mappingId,
+    mappingGeneration,
+    mappingVersion,
+    workspaceId,
+    workspaceGeneration,
+    sourcePlatform,
+    authorityFingerprint,
+  } = message;
+  return {
+    authorityEpoch,
+    fenceGeneration,
+    hostId,
+    mappingId,
+    mappingGeneration,
+    workspaceGeneration,
+    mappingVersion,
+    sourcePlatform,
+    workspaceId,
+    authorityFingerprint,
+  };
+}
+
+function sameReceiptBinding(left, right) {
+  return JSON.stringify(receiptAuthority(left)) === JSON.stringify(receiptAuthority(right));
+}
+
+function receiptInventoryError(read) {
+  if (read?.status === "missing" || read?.status === "transient") {
+    return PROTOCOL_ERROR_CODES.INVENTORY_PENDING;
+  }
+  if (read?.status === "present") return PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND;
+  return classifyReadinessError(read, PROTOCOL_ERROR_CODES.INVENTORY_INVALID);
+}
+
+const RECEIPT_AUTHORITY_GENERATIONS = [
+  "authorityEpoch",
+  "fenceGeneration",
+  "mappingGeneration",
+  "workspaceGeneration",
+];
+const RECEIPT_AUTHORITY_IDENTITY = [
+  "hostId",
+  "mappingId",
+  "mappingVersion",
+  "sourcePlatform",
+  "workspaceId",
+  "authorityFingerprint",
+];
+
+function reserveReceiptAuthorityFloor(state, binding) {
+  const candidate = receiptAuthority(binding);
+  const floor = state.receiptWorkspaceFloors.get(candidate.workspaceId);
+  let generationAdvanced = false;
+  if (floor) {
+    if (RECEIPT_AUTHORITY_GENERATIONS.some(
+      (field) => candidate[field] < floor[field]
+    )) return false;
+    generationAdvanced = RECEIPT_AUTHORITY_GENERATIONS.some(
+      (field) => candidate[field] > floor[field]
+    );
+    if (
+      !generationAdvanced &&
+      RECEIPT_AUTHORITY_IDENTITY.some((field) => candidate[field] !== floor[field])
+    ) return false;
+    if (
+      !generationAdvanced &&
+      [...state.bindings.values()].some(
+        (bindingState) =>
+          bindingState.binding.workspaceId === candidate.workspaceId &&
+          bindingState.binding.bindingId !== binding.bindingId
+      )
+    ) return false;
+  }
+  if (generationAdvanced) {
+    for (const bindingState of [...state.bindings.values()]) {
+      if (bindingState.binding.workspaceId === candidate.workspaceId) {
+        retireSupersededReceiptBinding(state, bindingState);
+      }
+    }
+  }
+  state.receiptWorkspaceFloors.set(candidate.workspaceId, Object.freeze({
+    ...candidate,
+    inventoryGeneration: floor?.inventoryGeneration,
+    inventoryFingerprint: floor?.inventoryFingerprint,
+  }));
+  return true;
+}
+
+function acceptReceiptInventoryFloor(state, binding, inventory) {
+  const floor = state.receiptWorkspaceFloors.get(binding.workspaceId);
+  if (!floor) return false;
+  if (
+    floor.inventoryGeneration !== undefined &&
+    inventory.inventoryGeneration < floor.inventoryGeneration
+  ) return false;
+  if (
+    inventory.inventoryGeneration === floor.inventoryGeneration &&
+    inventory.inventoryFingerprint !== floor.inventoryFingerprint
+  ) return false;
+  state.receiptWorkspaceFloors.set(binding.workspaceId, Object.freeze({
+    ...floor,
+    inventoryGeneration: inventory.inventoryGeneration,
+    inventoryFingerprint: inventory.inventoryFingerprint,
+  }));
+  return true;
+}
+
+function currentReceiptBinding(state, bindingState) {
+  return state?.receiptCommitted === true &&
+    connections.has(state.connection) &&
+    state.bindings.get(bindingState.binding.bindingId) === bindingState &&
+    !bindingState.invalidated;
+}
+
+function ownsReceiptAuthorityFloor(state, binding) {
+  const floor = state.receiptWorkspaceFloors.get(binding.workspaceId);
+  const authority = receiptAuthority(binding);
+  return floor !== undefined &&
+    [...RECEIPT_AUTHORITY_GENERATIONS, ...RECEIPT_AUTHORITY_IDENTITY].every(
+      (field) => floor[field] === authority[field]
+    );
+}
+
+function retireSupersededReceiptBinding(state, bindingState) {
+  if (state.bindings.get(bindingState.binding.bindingId) !== bindingState) return;
+  state.bindings.delete(bindingState.binding.bindingId);
+  bindingState.invalidated = true;
+  invalidateBindingRequests(state, bindingState);
+  if (bindingState.proof) {
+    workspaceLeases.retireBinding({
+      ...receiptAuthority(bindingState.binding),
+      ...bindingState.proof,
+    });
+  }
+  state.retiredBindings.set(bindingState.binding.bindingId, bindingState);
+}
+
+async function acceptReceiptBinding(state, message) {
+  if (!state?.receiptCommitted || message.hostId !== HOST_ID) return false;
+  const existing = state.bindings.get(message.bindingId) ??
+    state.retiredBindings.get(message.bindingId);
+  if (existing) {
+    if (state.retiredBindings.get(message.bindingId) === existing) return false;
+    if (!sameReceiptBinding(existing.binding, message)) return false;
+    if (state.bindings.get(message.bindingId) === existing && existing.proof) {
+      connectionSendBindOk(state.connection, message.bindingId, existing.proof);
+    }
+    return true;
+  }
+  if (state.bindings.size + state.retiredBindings.size >= MAX_BINDINGS_PER_SOCKET) return false;
+  if (!reserveReceiptAuthorityFloor(state, message)) return false;
+
+  const binding = Object.freeze({ ...message });
+  const bindingState = {
+    binding,
+    inventoryWorkspace: undefined,
+    proof: undefined,
+    ready: false,
+    lastError: makeReadinessError(PROTOCOL_ERROR_CODES.INVENTORY_PENDING),
+    receipt: true,
+    invalidated: false,
+    phase: "pending",
+  };
+  state.bindings.set(message.bindingId, bindingState);
+  state.receiptUnbound = false;
+  publishReadiness(state);
+
+  let first;
+  try {
+    first = await inventoryProvider.read();
+  } catch (error) {
+    if (!currentReceiptBinding(state, bindingState)) return true;
+    bindingState.phase = "negative";
+    bindingState.lastError = makeReadinessError(
+      classifyReadinessError(error, PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED)
+    );
+    publishReadiness(state);
+    return true;
+  }
+  if (!currentReceiptBinding(state, bindingState)) return true;
+  if (!ownsReceiptAuthorityFloor(state, binding)) {
+    retireSupersededReceiptBinding(state, bindingState);
+    return true;
+  }
+  let inventoryWorkspace;
+  let proof;
+  let errorCode = receiptInventoryError(first);
+  if (first?.status === "present") {
+    inventoryWorkspace = first.inventory.workspaces.find((workspace) =>
+      workspace.hostId === message.hostId &&
+      workspace.workspaceId === message.workspaceId &&
+      workspace.sourcePlatform === message.sourcePlatform
+    );
+    if (inventoryWorkspace) {
+      let second;
+      try {
+        second = await inventoryProvider.read();
+      } catch (error) {
+        if (!currentReceiptBinding(state, bindingState)) return true;
+        second = {
+          status: "error",
+          code: classifyReadinessError(
+            error,
+            PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED
+          ),
+        };
+      }
+      if (!currentReceiptBinding(state, bindingState)) return true;
+      if (!ownsReceiptAuthorityFloor(state, binding)) {
+        retireSupersededReceiptBinding(state, bindingState);
+        return true;
+      }
+      if (second?.status !== "present") {
+        errorCode = receiptInventoryError(second);
+      } else if (second.epoch !== first.epoch) {
+        errorCode = PROTOCOL_ERROR_CODES.INVENTORY_PENDING;
+      } else if (
+        second.inventory.inventoryGeneration !== first.inventory.inventoryGeneration ||
+        second.inventory.inventoryFingerprint !== first.inventory.inventoryFingerprint
+      ) {
+        errorCode = PROTOCOL_ERROR_CODES.INVENTORY_STALE;
+      } else if (!acceptReceiptInventoryFloor(state, message, first.inventory)) {
+        errorCode = PROTOCOL_ERROR_CODES.INVENTORY_STALE;
+      } else {
+        proof = Object.freeze({
+          inventoryGeneration: first.inventory.inventoryGeneration,
+          inventoryFingerprint: first.inventory.inventoryFingerprint,
+          bindingFingerprint: workspaceBindingFingerprint({
+            authority: receiptAuthority(message),
+            inventoryGeneration: first.inventory.inventoryGeneration,
+            inventoryFingerprint: first.inventory.inventoryFingerprint,
+          }),
+        });
+      }
+    } else {
+      let second;
+      try {
+        second = await inventoryProvider.read();
+      } catch (error) {
+        if (!currentReceiptBinding(state, bindingState)) return true;
+        second = {
+          status: "error",
+          code: classifyReadinessError(
+            error,
+            PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED
+          ),
+        };
+      }
+      if (!currentReceiptBinding(state, bindingState)) return true;
+      if (!ownsReceiptAuthorityFloor(state, binding)) {
+        retireSupersededReceiptBinding(state, bindingState);
+        return true;
+      }
+      if (second?.status !== "present") {
+        errorCode = receiptInventoryError(second);
+      } else if (second.epoch !== first.epoch) {
+        errorCode = PROTOCOL_ERROR_CODES.INVENTORY_PENDING;
+      } else if (
+        second.inventory.inventoryGeneration !== first.inventory.inventoryGeneration ||
+        second.inventory.inventoryFingerprint !== first.inventory.inventoryFingerprint ||
+        !acceptReceiptInventoryFloor(state, message, first.inventory)
+      ) {
+        errorCode = PROTOCOL_ERROR_CODES.INVENTORY_STALE;
+      }
+    }
+  }
+  if (!currentReceiptBinding(state, bindingState)) return true;
+  if (!ownsReceiptAuthorityFloor(state, binding)) {
+    retireSupersededReceiptBinding(state, bindingState);
+    return true;
+  }
+  bindingState.inventoryWorkspace = inventoryWorkspace;
+  bindingState.proof = proof;
+  bindingState.phase = proof ? "positive" : "negative";
+  bindingState.lastError = proof ? undefined : makeReadinessError(errorCode);
+  if (
+    proof &&
+    !workspaceLeases.adoptBinding({ ...receiptAuthority(message), ...proof })
+  ) {
+    bindingState.proof = undefined;
+    bindingState.phase = "negative";
+    bindingState.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.INVENTORY_STALE);
+    proof = undefined;
+  }
+  if (proof) {
+    connectionSendBindOk(state.connection, message.bindingId, proof);
+    // Receipt bindings always expose the pre-probe observation, even when a
+    // probe completed between registration and bind delivery.
+    publishReadiness(state);
+    queueMicrotask(() => {
+      if (state.bindings.get(message.bindingId) !== bindingState) return;
+      promoteWorkspaceIfProven(state, bindingState);
+      publishReadiness(state);
+    });
+  } else {
+    publishReadiness(state);
+  }
+  return true;
+}
+
+function connectionSendBindOk(connection, bindingId, proof) {
+  const frame = {
+    type: MSG_TYPES.BIND_OK,
+    bindingId,
+    inventoryGeneration: proof.inventoryGeneration,
+    inventoryFingerprint: proof.inventoryFingerprint,
+    bindingFingerprint: proof.bindingFingerprint,
+  };
+  if (isInventoryReceiptBindOkMessage(frame)) connection.send(JSON.stringify(frame));
+}
+
+function unbindReceiptBinding(state, bindingId) {
+  const bindingState = state?.bindings.get(bindingId);
+  if (!bindingState) return state?.retiredBindings.get(bindingId) !== undefined;
+  state.bindings.delete(bindingId);
+  bindingState.invalidated = true;
+  invalidateBindingRequests(state, bindingState);
+  if (bindingState.proof) {
+    workspaceLeases.retireBinding({
+      ...receiptAuthority(bindingState.binding),
+      ...bindingState.proof,
+    });
+  }
+  state.retiredBindings.set(bindingId, bindingState);
+  if (state.bindings.size === 0) state.receiptUnbound = true;
+  return true;
 }
 
 function acceptWorkspaceBinding(state, message) {
@@ -502,6 +865,7 @@ function acceptWorkspaceBinding(state, message) {
 
 function promoteWorkspaceIfProven(state, bindingState) {
   if (!state?.probePassed || !bindingState?.inventoryWorkspace) return false;
+  if (bindingState.receipt === true && !bindingState.proof) return false;
   bindingState.ready = true;
   bindingState.lastError = undefined;
   return true;
@@ -516,12 +880,14 @@ function clearReadinessTimer(state) {
 function readinessFrame(state, bindingState = undefined) {
   const binding = bindingState?.binding;
   const ready = bindingState?.ready ?? state.status.workspace === "ready";
+  const receiptBinding = bindingState?.receipt === true;
+  const ttlMs = receiptBinding ? INVENTORY_RECEIPT_TTL_MS : READINESS_TTL_MS;
   const frame = {
     type: MSG_TYPES.READINESS,
     socketGeneration: state.socketGeneration,
     revision: state.revision + 1,
     observedAt: Date.now(),
-    ttlMs: READINESS_TTL_MS,
+    ttlMs,
     status: Object.fromEntries(
       READINESS_DIMENSIONS.map((dimension) => [
         dimension,
@@ -530,7 +896,7 @@ function readinessFrame(state, bindingState = undefined) {
           : state.status[dimension],
       ])
     ),
-    expiresAt: Date.now() + READINESS_TTL_MS,
+    expiresAt: Date.now() + ttlMs,
   };
   if (binding) {
     frame.bindingId = binding.bindingId;
@@ -540,13 +906,23 @@ function readinessFrame(state, bindingState = undefined) {
     frame.workspaceId = state.workspaceId;
     frame.workspaceGeneration = state.workspaceGeneration;
   }
-  const lastError = bindingState?.lastError ?? state.lastError;
+  if (receiptBinding && bindingState.proof) {
+    frame.inventoryGeneration = bindingState.proof.inventoryGeneration;
+    frame.inventoryFingerprint = bindingState.proof.inventoryFingerprint;
+    frame.bindingFingerprint = bindingState.proof.bindingFingerprint;
+  }
+  const lastError = receiptBinding
+    ? bindingState.lastError
+    : bindingState?.lastError ?? state.lastError;
   if (lastError) frame.lastError = lastError;
   return frame;
 }
 
 function publishReadiness(state) {
   if (!state?.committed || !connections.has(state.connection)) return false;
+  if (state.receiptCommitted && state.receiptUnbound && state.bindings.size === 0) {
+    return true;
+  }
   if (
     state.connection.readyState !== undefined &&
     state.connection.readyState !== WebSocket.OPEN
@@ -559,7 +935,9 @@ function publishReadiness(state) {
   try {
     for (const bindingState of records) {
       const frame = readinessFrame(state, bindingState);
-      if (!isReadinessMessage(frame)) {
+      if (!(bindingState?.receipt
+        ? isInventoryReceiptReadinessMessage(frame)
+        : isReadinessMessage(frame))) {
         state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
         return false;
       }
@@ -581,7 +959,12 @@ function scheduleReadinessPublication(state) {
       return;
     }
     publishReadiness(state);
-  }, Math.max(1, Math.floor(READINESS_TTL_MS / 2)));
+  }, Math.max(
+    1,
+    Math.floor(
+      (state.receiptCommitted ? INVENTORY_RECEIPT_TTL_MS : READINESS_TTL_MS) / 2
+    )
+  ));
   state.timer.unref?.();
 }
 
@@ -888,6 +1271,20 @@ function connectToBot() {
   connection.on("close", () => {
     clearReadinessTimer(readinessState);
     readinessState.committed = false;
+    if (readinessState.receiptCommitted) {
+      for (const [bindingId, bindingState] of readinessState.bindings) {
+        invalidateBindingRequests(readinessState, bindingState);
+        if (bindingState.proof) {
+          workspaceLeases.retireBinding({
+            ...receiptAuthority(bindingState.binding),
+            ...bindingState.proof,
+          });
+        }
+        readinessState.bindings.delete(bindingId);
+      }
+      readinessState.retiredBindings.clear();
+      readinessState.receiptCommitted = false;
+    }
     // Transport loss alone does not invalidate an already admitted immutable
     // mapping generation. Its run may finish coherently, but no pending
     // admission can cross the committed-state recheck below. Authority remaps
@@ -947,10 +1344,16 @@ async function handleMessage(
     );
     const shared = negotiateCapabilities(DAEMON_CAPABILITIES, msg.capabilities);
     readinessState.status.connection = "online";
-    readinessState.committed = isReadinessCapabilityGate(
+    const readinessV2Committed = isReadinessCapabilityGate(
       readinessState.registration,
       msg
     );
+    readinessState.receiptCommitted = isInventoryReceiptCapabilityGate(
+      readinessState.registration,
+      msg
+    );
+    readinessState.committed =
+      readinessV2Committed || readinessState.receiptCommitted;
     if (readinessState.committed) {
       publishReadiness(readinessState);
       scheduleReadinessPublication(readinessState);
@@ -1005,6 +1408,13 @@ async function handleMessage(
     return;
   }
   if (msg?.type === MSG_TYPES.BIND_WORKSPACE) {
+    if (readinessState?.receiptCommitted) {
+      if (!isInventoryReceiptBindWorkspaceMessage(msg) ||
+          !(await acceptReceiptBinding(readinessState, msg))) {
+        connection.close(1008, "invalid workspace binding");
+      }
+      return;
+    }
     if (!isBindWorkspaceMessage(msg) || !acceptWorkspaceBinding(readinessState, msg)) {
       connection.close(1008, "invalid workspace binding");
       return;
@@ -1020,6 +1430,16 @@ async function handleMessage(
       })
     );
     publishReadiness(readinessState);
+    return;
+  }
+  if (msg?.type === MSG_TYPES.UNBIND_WORKSPACE) {
+    if (!readinessState?.receiptCommitted ||
+        !isUnbindWorkspaceMessage(msg) ||
+        !unbindReceiptBinding(readinessState, msg.bindingId)) {
+      connection.close(1008, "invalid workspace unbind");
+      return;
+    }
+    connection.send(JSON.stringify({ type: MSG_TYPES.UNBIND_OK, bindingId: msg.bindingId }));
     return;
   }
   const hasV2RouteField = [
