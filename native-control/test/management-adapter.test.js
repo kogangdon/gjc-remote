@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { buildManifest, validateBuildManifest } from '../src/index.js';
+import { capabilities, managementCapabilities } from '../src/capabilities.js';
 import { createManagementNativeForTest } from './helpers/management-native.js';
 import * as publicApi from '../src/public.js';
 import { ManagementRuntime } from '../../bot/src/management-runtime.js';
@@ -19,6 +20,20 @@ test('production package surface excludes the low-level test adapter', () => {
   assert.deepEqual(
     Object.keys(publicApi).sort(),
     ['buildManifest', 'createManagementNative', 'validateBuildManifest'],
+  );
+});
+
+test('management adapter validates its explicit native dependency subset', () => {
+  assert.strictEqual(capabilities, managementCapabilities);
+  const { lowLevel, roles } = fake();
+  delete lowLevel.current_os_principal;
+  assert.throws(
+    () => createManagementNativeForTest({
+      lowLevel,
+      configPath: 'C:/state/channels.json',
+      roles,
+    }),
+    /missing native capability: current_os_principal/
   );
 });
 
