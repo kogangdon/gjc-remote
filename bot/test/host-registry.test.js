@@ -26,6 +26,7 @@ import {
   HostRegistry,
   MAX_BINDING_READINESS_STATES,
   extractAssistantText,
+  freezeManagedAuthorityDescriptor,
 } from "../src/host-registry.js";
 
 function createManualTimers() {
@@ -682,14 +683,29 @@ test("managed v2 invokes carry the bindingId selected by readiness", async () =>
         mappingId: "mapping-1",
         mappingGeneration: 1,
         mappingVersion: 1,
+        sourcePlatform: "posix",
         workspaceId: "workspace-1",
         workspaceGeneration: 1,
+        authority: {
+          authorityEpoch: 1,
+          fenceGeneration: 1,
+          hostId: "host-a",
+          mappingId: "mapping-1",
+          mappingGeneration: 1,
+          workspaceGeneration: 1,
+          mappingVersion: 1,
+          sourcePlatform: "posix",
+          workspaceId: "workspace-1",
+          authorityFingerprint: "a".repeat(64),
+        },
       }
     );
     const [raw] = await invokeFrame;
     const invoke = JSON.parse(raw.toString());
     assert.equal(invoke.bindingId, "binding-1");
     assert.equal(invoke.workspaceId, "workspace-1");
+    assert.equal(Object.hasOwn(invoke, "authority"), false);
+    assert.equal(Object.hasOwn(invoke, "sourcePlatform"), false);
     socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
     assert.deepEqual(await resultPromise, { ok: true, text: undefined });
   } finally {
@@ -2167,6 +2183,48 @@ test("protocol version validators accept only supported versions", () => {
   ]);
   assert.deepEqual(negotiateCapabilities(["invoke"], undefined), []);
   assert.deepEqual(negotiateCapabilities(["invoke"], "not-a-list"), []);
+});
+test("managed authority descriptors are revalidated, copied, and frozen", () => {
+  const authority = {
+    authorityEpoch: 3,
+    fenceGeneration: 2,
+    hostId: "host-a",
+    mappingId: "mapping-1",
+    mappingGeneration: 4,
+    workspaceGeneration: 7,
+    mappingVersion: 1,
+    sourcePlatform: "posix",
+    workspaceId: "workspace-1",
+    authorityFingerprint: "a".repeat(64),
+  };
+  const routeIdentity = {
+    mappingId: authority.mappingId,
+    mappingGeneration: authority.mappingGeneration,
+    mappingVersion: authority.mappingVersion,
+    sourcePlatform: authority.sourcePlatform,
+    workspaceId: authority.workspaceId,
+    workspaceGeneration: authority.workspaceGeneration,
+    authority,
+  };
+  const frozen = freezeManagedAuthorityDescriptor("host-a", routeIdentity);
+  assert.deepEqual(frozen, authority);
+  assert.notEqual(frozen, authority);
+  assert.equal(Object.isFrozen(frozen), true);
+
+  for (const invalid of [
+    { ...routeIdentity, mappingGeneration: 5 },
+    { ...routeIdentity, sourcePlatform: "windows-drive" },
+    { ...routeIdentity, authority: { ...authority, routeFingerprint: "b".repeat(64) } },
+  ]) {
+    assert.throws(
+      () => freezeManagedAuthorityDescriptor("host-a", invalid),
+      { name: "TypeError" },
+    );
+  }
+  assert.throws(
+    () => freezeManagedAuthorityDescriptor("foreign-host", routeIdentity),
+    { name: "TypeError", message: "MANAGED_AUTHORITY_INVALID" },
+  );
 });
 
 test("register handshake negotiates protocol version and shared capabilities", async () => {

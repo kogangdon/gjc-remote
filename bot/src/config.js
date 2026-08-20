@@ -118,6 +118,7 @@ export function verifyLegacyV0SourceFence(options, expectedFence) {
 
 import { isFullyQualifiedRouteWorkDir } from "@gjc-remote/shared/work-dir.js";
 import { classifyMappingEnvelope, parseManagedHostTokens, validateManagedChannelsV2 } from "@gjc-remote/shared/mapping-envelope";
+import { validateWorkspaceAuthorityDescriptor } from "@gjc-remote/shared/workspace-binding";
 
 
 function isPlainObject(value) {
@@ -311,19 +312,37 @@ export function projectManagedRoutes(target, validate = () => {}) {
     }
   }
   const projected = Object.fromEntries(
-    Object.entries(target.routes).map(([channelId, route]) => [
-      channelId,
-      {
-        hostId: route.hostId,
-        workDir: route.workDir,
-        mappingId: route.mappingId,
-        mappingGeneration: route.mappingGeneration,
-        workspaceGeneration: route.workspaceGeneration,
-        mappingVersion: route.mappingVersion,
-        sourcePlatform: route.sourcePlatform,
-        workspaceId: route.workspaceId,
-      },
-    ])
+    Object.entries(target.routes).map(([channelId, route]) => {
+      const mapping = target.mappings[route.mappingId];
+      const authority = {
+        authorityEpoch: target.authorityEpoch,
+        fenceGeneration: mapping.fenceGeneration,
+        hostId: mapping.hostId,
+        mappingId: mapping.mappingId,
+        mappingGeneration: mapping.mappingGeneration,
+        workspaceGeneration: mapping.workspaceGeneration,
+        mappingVersion: mapping.mappingVersion,
+        sourcePlatform: mapping.sourcePlatform,
+        workspaceId: mapping.workspaceId,
+        authorityFingerprint: mapping.mappingFingerprint,
+      };
+      validateWorkspaceAuthorityDescriptor(authority);
+      return [
+        channelId,
+        Object.freeze({
+          hostId: route.hostId,
+          workDir: route.workDir,
+          mappingId: route.mappingId,
+          mappingGeneration: route.mappingGeneration,
+          workspaceGeneration: route.workspaceGeneration,
+          mappingVersion: route.mappingVersion,
+          sourcePlatform: route.sourcePlatform,
+          workspaceId: route.workspaceId,
+          routeFingerprint: route.routeFingerprint,
+          authority: Object.freeze(authority),
+        }),
+      ];
+    })
   );
   validate(projected);
   return projected;
