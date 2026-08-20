@@ -9,6 +9,7 @@ import {
   MSG_TYPES,
   PROTOCOL_VERSION,
   PROTOCOL_VERSION_V2,
+  PROTOCOL_VERSION_V3,
   PROTOCOL_ERROR_CODES,
   READINESS_REMEDIATIONS,
   V0_LIMITS,
@@ -1285,16 +1286,24 @@ test("protocol negotiation rejects future versions and never down-negotiates rea
   };
 
   assert.equal(
-    isRegisterMessage({ ...register, protocolVersion: PROTOCOL_VERSION_V2 + 1 }),
+    isRegisterMessage({ ...register, protocolVersion: PROTOCOL_VERSION_V3 }),
+    true
+  );
+  assert.equal(
+    isRegisterOkMessage({ ...registerOk, protocolVersion: PROTOCOL_VERSION_V3 }),
+    true
+  );
+  assert.equal(
+    isRegisterMessage({ ...register, protocolVersion: PROTOCOL_VERSION_V3 + 1 }),
     false
   );
   assert.equal(
-    isRegisterOkMessage({ ...registerOk, protocolVersion: PROTOCOL_VERSION_V2 + 1 }),
+    isRegisterOkMessage({ ...registerOk, protocolVersion: PROTOCOL_VERSION_V3 + 1 }),
     false
   );
   assert.equal(
     isReadinessCapabilityGate(
-      { ...register, protocolVersion: PROTOCOL_VERSION_V2 + 1 },
+      { ...register, protocolVersion: PROTOCOL_VERSION_V3 },
       registerOk
     ),
     false
@@ -1302,7 +1311,7 @@ test("protocol negotiation rejects future versions and never down-negotiates rea
   assert.equal(
     isReadinessCapabilityGate(register, {
       ...registerOk,
-      protocolVersion: PROTOCOL_VERSION_V2 + 1,
+      protocolVersion: PROTOCOL_VERSION_V3,
     }),
     false
   );
