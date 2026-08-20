@@ -170,7 +170,7 @@ export class HostRegistry {
     this.pendingCountBySocket = new Map();
     /** @type {Map<string, { protocolVersion: number, capabilities: string[] }>} */
     this.hostInfo = new Map();
-    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number, bindingId?: string, workspaceId?: string, workspaceGeneration?: number, workspaceGenerationHighWater: Map<string, number> }>} */
+    /** @type {Map<string, { socketGeneration: number, revision: number, observedAt: number, bindingId?: string, workspaceId?: string, workspaceGeneration?: number, workspaceGenerationHighWater: Map<string, number>, offlineRetireAt?: number, retirementTimer?: object }>} */
     this.readinessAuthorities = new Map();
     /** @type {Map<string, object>} */
     this.readinessStates = new Map();
@@ -222,7 +222,6 @@ export class HostRegistry {
         this.#dropConnection(hostId, previous, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
         previous.terminate();
       }
-
       this.connections.set(hostId, socket);
       this.heartbeatStates.set(socket, { hostId });
       const wantsReadiness =
@@ -449,7 +448,7 @@ export class HostRegistry {
     }
     if (!isReadinessMessage(msg)) return false;
 
-    const authority = this.readinessAuthorities.get(hostId);
+    const authority = this.#getReadinessAuthority(hostId);
     let authorityWorkspaceGenerationHighWater;
     if (state.socketGeneration === undefined && authority) {
       authorityWorkspaceGenerationHighWater = new Map(
@@ -676,6 +675,11 @@ export class HostRegistry {
       if (hasWorkspace) state.workspacePriorReady = false;
     }
 
+    const priorAuthority = this.readinessAuthorities.get(hostId);
+    if (priorAuthority?.retirementTimer) {
+      this.timers.clearTimeout(priorAuthority.retirementTimer);
+      priorAuthority.retirementTimer = undefined;
+    }
     this.readinessAuthorities.set(hostId, {
       socketGeneration: state.socketGeneration,
       revision: state.revision,
@@ -1009,6 +1013,59 @@ export class HostRegistry {
     if (state.workspaceDimensions) {
       state.workspaceDimensions = { ...state.workspaceDimensions, connection: "offline" };
     }
+    const authority = this.#getReadinessAuthority(state.hostId);
+    if (authority && authority.offlineRetireAt === undefined) {
+      authority.offlineRetireAt =
+        this.monotonicNow() + READINESS_MAX_TTL_MS;
+    }
+    if (authority) this.#armAuthorityRetirement(state.hostId, authority);
+  }
+
+  #getReadinessAuthority(hostId) {
+    const authority = this.readinessAuthorities.get(hostId);
+    if (!authority || authority.offlineRetireAt === undefined) return authority;
+    if (this.monotonicNow() < authority.offlineRetireAt) return authority;
+    if (authority.retirementTimer) {
+      this.timers.clearTimeout(authority.retirementTimer);
+      authority.retirementTimer = undefined;
+    }
+    if (this.readinessAuthorities.get(hostId) === authority) {
+      this.readinessAuthorities.delete(hostId);
+    }
+    return undefined;
+  }
+
+  #armAuthorityRetirement(hostId, authority) {
+    if (authority.retirementTimer) {
+      this.timers.clearTimeout(authority.retirementTimer);
+      authority.retirementTimer = undefined;
+    }
+    if (
+      this.closed ||
+      authority.offlineRetireAt === undefined ||
+      this.readinessAuthorities.get(hostId) !== authority
+    ) {
+      return;
+    }
+    const delay = Math.max(
+      0,
+      authority.offlineRetireAt - this.monotonicNow()
+    );
+
+    const timer = this.timers.setTimeout(() => {
+      if (authority.retirementTimer !== timer) return;
+      authority.retirementTimer = undefined;
+      if (this.closed || this.readinessAuthorities.get(hostId) !== authority) {
+        return;
+      }
+      if (this.monotonicNow() < authority.offlineRetireAt) {
+        this.#armAuthorityRetirement(hostId, authority);
+        return;
+      }
+      this.readinessAuthorities.delete(hostId);
+    }, delay);
+    authority.retirementTimer = timer;
+    timer?.unref?.();
   }
 
   #expireHeartbeat(hostId, socket, timeout) {
@@ -1069,7 +1126,22 @@ export class HostRegistry {
     }
     this.connections.clear();
     this.hostInfo.clear();
+    for (const state of this.readinessStates.values()) {
+      for (const key of [
+        "expiryTimer",
+        "workspaceExpiryTimer",
+      ]) {
+        if (state[key]) this.timers.clearTimeout(state[key]);
+        state[key] = undefined;
+      }
+    }
     this.readinessStates.clear();
+    for (const authority of this.readinessAuthorities.values()) {
+      if (authority.retirementTimer) {
+        this.timers.clearTimeout(authority.retirementTimer);
+        authority.retirementTimer = undefined;
+      }
+    }
     this.readinessAuthorities.clear();
 
     this.closePromise = new Promise((resolve, reject) => {

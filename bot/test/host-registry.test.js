@@ -8,6 +8,7 @@ import {
   MAX_WS_PAYLOAD_BYTES,
   PONG,
   PROTOCOL_VERSION,
+  READINESS_MAX_TTL_MS,
   V0_LIMITS,
   isEventMessage,
   isInvokeMessage,
@@ -2706,6 +2707,142 @@ test("phase 1 preserves readiness fences across replacement and records replay s
     current.socket.terminate();
   } finally {
     await server.close();
+  }
+});
+
+test("offline readiness authority expires after the maximum TTL horizon", async () => {
+  const timers = createManualTimers();
+  let monotonicNow = 0;
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    monotonicNow: () => monotonicNow,
+  });
+  const sockets = [];
+  try {
+    const first = await connectV2(server, "host-a", "token-a");
+    sockets.push(first.socket);
+    await sendReadiness(
+      first.socket,
+      readinessFrame({
+        socketGeneration: 7,
+        workspaceGeneration: 5,
+      })
+    );
+    assert.equal(
+      server.registry.readinessAuthorities.get("host-a")?.socketGeneration,
+      7
+    );
+
+    first.socket.terminate();
+    await waitFor(
+      () =>
+        !server.registry.isOnline("host-a") &&
+        timers.timeoutDelays.includes(READINESS_MAX_TTL_MS)
+    );
+
+    monotonicNow = 1_000;
+    const rejected = await connectV2(server, "host-a", "token-a");
+    sockets.push(rejected.socket);
+    await expectPolicyClose(
+      rejected.socket,
+      JSON.stringify(
+        readinessFrame({
+          socketGeneration: 6,
+          workspaceGeneration: 5,
+        })
+      )
+    );
+    await waitFor(() =>
+      timers.timeoutDelays.includes(READINESS_MAX_TTL_MS - monotonicNow)
+    );
+    assert.equal(
+      server.registry.readinessAuthorities.get("host-a")?.socketGeneration,
+      7
+    );
+
+    const remainingHorizon = READINESS_MAX_TTL_MS - monotonicNow;
+    timers.runTimeoutByDelay(remainingHorizon);
+    assert.equal(
+      server.registry.readinessAuthorities.get("host-a")?.socketGeneration,
+      7
+    );
+    assert.equal(timers.timeoutDelays.includes(remainingHorizon), true);
+
+    const waiting = await connectV2(server, "host-a", "token-a");
+    sockets.push(waiting.socket);
+    monotonicNow = READINESS_MAX_TTL_MS;
+    timers.runTimeoutByDelay(remainingHorizon);
+    assert.equal(server.registry.readinessAuthorities.has("host-a"), false);
+
+    await sendReadiness(
+      waiting.socket,
+      readinessFrame({
+        socketGeneration: 1,
+        workspaceGeneration: 1,
+      })
+    );
+    assert.equal(
+      server.registry.readinessAuthorities.get("host-a")?.socketGeneration,
+      1
+    );
+
+    monotonicNow = READINESS_MAX_TTL_MS + 1_000;
+    waiting.socket.terminate();
+    await waitFor(() =>
+      timers.timeoutDelays.includes(READINESS_MAX_TTL_MS)
+    );
+    const successor = await connectV2(server, "host-a", "token-a");
+    sockets.push(successor.socket);
+    await sendReadiness(
+      successor.socket,
+      readinessFrame({
+        socketGeneration: 2,
+        workspaceGeneration: 2,
+      })
+    );
+    timers.runClearedTimeouts();
+    assert.equal(
+      server.registry.readinessAuthorities.get("host-a")?.socketGeneration,
+      2
+    );
+
+    monotonicNow += 1_000;
+    successor.socket.terminate();
+    await waitFor(() =>
+      timers.timeoutDelays.includes(READINESS_MAX_TTL_MS)
+    );
+    const delayed = await connectV2(server, "host-a", "token-a");
+    sockets.push(delayed.socket);
+    monotonicNow += READINESS_MAX_TTL_MS;
+    await sendReadiness(
+      delayed.socket,
+      readinessFrame({
+        socketGeneration: 1,
+        workspaceGeneration: 1,
+      })
+    );
+    assert.equal(
+      server.registry.readinessAuthorities.get("host-a")?.socketGeneration,
+      1
+    );
+
+    monotonicNow += 1_000;
+    delayed.socket.terminate();
+    await waitFor(() =>
+      timers.timeoutDelays.includes(READINESS_MAX_TTL_MS)
+    );
+    const legacy = await server.connect("host-a", "token-a", {
+      protocolVersion: undefined,
+      capabilities: undefined,
+    });
+    sockets.push(legacy);
+    monotonicNow += READINESS_MAX_TTL_MS;
+    timers.runTimeoutByDelay(READINESS_MAX_TTL_MS);
+    assert.equal(server.registry.readinessAuthorities.has("host-a"), false);
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await server.close();
+    assert.equal(timers.timeoutCount, 0);
   }
 });
 
