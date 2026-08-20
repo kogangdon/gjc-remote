@@ -9,7 +9,7 @@ import { validateAdmissionAck, validateAdmissionAckRecord, validateAdmissionGene
 import { buildPublicationC, buildPublicationK, buildPublicationP, buildPublicationQ, buildPublicationS, buildPublicationState, buildPublicationTransaction, buildPublicationU, buildPublicationY, buildPublicationZp, validatePublicationC, validatePublicationGraph, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationState, validatePublicationTransaction, validatePublicationU, validatePublicationY, validatePublicationZp } from '@gjc-remote/shared/publication-envelope';
 import { validateAuthorityCloseProof, validateAuthoritySuccessorAck, validateAuthoritySuccessorBaseline, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFence, validateAuthoritySuccessorFinality, validateAuthoritySuccessorHead, validateAuthoritySuccessorHeadTransition, validateAuthoritySuccessorLease, validateAuthoritySuccessorPredecessor, validateAuthoritySuccessorReaderProjection, validateAuthoritySuccessorReceipt, validateAuthoritySuccessorRequest, validateManagedHistoryMarkerSeal as validateSharedHistoryMarkerSeal } from '@gjc-remote/shared/successor-envelope';
 import { canonicalJson, canonicalJsonHash, parseCanonicalJsonBytes } from '@gjc-remote/shared/strict-json';
-import { capabilities } from './capabilities.js';
+import { managementCapabilities } from './capabilities.js';
 
 const refused = (operation, reason) => { const error = new Error(`${operation} refused: ${reason}`); error.code = 'ERR_NATIVE_CONTROL_REFUSED'; error.operation = operation; error.reason = reason; error.writes = 0; throw error; };
 const rejectLegacyRetainedMapping = (operation, targetState, refusalOperation) => {
@@ -242,7 +242,7 @@ export function createAdapter({ lowLevel, configPath, arbitraryPrincipalProbe, r
     return normalizedLeft !== null && normalizedRight !== null && canonical(normalizedLeft) === canonical(normalizedRight);
   };
   if (!lowLevel || !configPath || basename(configPath) !== 'channels.json') refused('create_management_native', 'a channels.json management path and verified native primitives are required');
-  for (const name of capabilities) if (typeof lowLevel[name] !== 'function') refused('create_management_native', `missing native capability: ${name}`);
+  for (const name of managementCapabilities) if (typeof lowLevel[name] !== 'function') refused('create_management_native', `missing native capability: ${name}`);
   const roleKind = platform === 'win32' ? 'sid' : 'uid';
   const normalizeUid = (value) => {
     if (typeof value !== 'string') return null;
