@@ -37,6 +37,38 @@ test("activity leases require process-wide adopted authority", () => {
   lease.release();
 });
 
+test("receipt authority retirement invalidates exact activity only", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  const receiptAuthority = {
+    authorityEpoch: 2,
+    fenceGeneration: 3,
+    hostId: "host-a",
+    mappingId: "mapping-receipt",
+    mappingGeneration: 4,
+    mappingVersion: 1,
+    workspaceId: "workspace-receipt",
+    workspaceGeneration: 5,
+    sourcePlatform: "posix",
+    authorityFingerprint: "a".repeat(64),
+    inventoryGeneration: 6,
+    inventoryFingerprint: "b".repeat(64),
+  };
+  assert.equal(registry.adoptBinding(receiptAuthority), true);
+  const lease = registry.acquireActivity({
+    ...receiptAuthority,
+    bindingFingerprint: "c".repeat(64),
+  });
+  assert.equal(lease.isCurrent(), true);
+  assert.equal(registry.retireBinding({
+    ...receiptAuthority,
+    inventoryFingerprint: "d".repeat(64),
+  }), false);
+  assert.equal(lease.isCurrent(), true);
+  assert.equal(registry.retireBinding(receiptAuthority), true);
+  assert.equal(lease.isCurrent(), false);
+  assert.deepEqual(registry.snapshot(), []);
+});
+
 test("activity leases share one fence for the same immutable binding identity", () => {
   const registry = new WorkspaceLeaseRegistry();
   registry.adoptBinding(authority);
