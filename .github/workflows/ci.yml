@@ -15,7 +15,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ubuntu-24.04-arm is a GitHub-hosted arm64 runner. Keep it as a
+        # first-class leg: native-control's manifest and runnable integration
+        # tests must execute on arm64 rather than relying on cross-compilation.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -55,7 +58,7 @@ jobs:
       # HEAD, so a merge-base against it is a no-op; --mode push instead
       # compares against the previous commit/tag so that path stays guarded.
       - name: Guard changelog history
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
 
   # Aggregate gate. `test` is the required status check on main, so it must stay a

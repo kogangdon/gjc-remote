@@ -24,6 +24,23 @@ implementation is released; design documents alone are not runtime evidence.
    provider-key recovery, volume manifests, secret sentinel scans, and manual-cleanup behavior.
 5. **Release/observability:** daemon and supervisor timelines, opaque structured events, `/hosts`
    snapshots, exact versions, rollback rehearsal, and #42 platform evidence.
+
+## Linux arm64 CI evidence
+
+The required `ubuntu-24.04-arm` GitHub-hosted CI leg builds `native-control` on
+the arm64 runner, writes and verifies its platform manifest, and runs the same
+runnable native integration and repository suites as Linux x64 and Windows
+x64. This is native arm64 execution evidence, not cross-compilation evidence.
+The lane installs `libacl1-dev`, so it covers the addon's real Linux libacl
+calls and fail-closed ACL checks under the runner account.
+
+This hosted lane does **not** prove multi-principal deployment behavior. GitHub
+Actions supplies one effective runner principal; it does not provision the
+separate M/B/R/D/SYSTEM accounts required for real-principal allow/deny and
+ownership evidence. Those checks require an owned host fixture with distinct
+UIDs and remain a release/platform gate. The arm64 lane also does not claim
+distribution-specific ACL behavior beyond Ubuntu 24.04 and its libacl package.
+
 Required structured event fields are `code`, `phase`, `duration`, opaque host/workspace/mapping/
 transaction IDs, socket generation, revision, fencing sequence, and local received/expiry times.
 Required gauges cover connected/ready/degraded/expired hosts, active leases/sessions/workspaces/
