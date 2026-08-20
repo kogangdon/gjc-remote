@@ -117,7 +117,7 @@ HostRegistry is the freshness authority:
 The initial remote skew bound is five minutes; exact min/max values and clock implementation are
 implementation gates. Aggregate precedence is deterministic: `offline`, `incompatible`,
 `degraded` only when a selected/current workspace previously known ready expires or has a readiness
-`connected-not-ready` when registration is current without a prior-ready expiry, then
+error, `connected-not-ready` when registration is current without a prior-ready expiry, then
 `ready` only for a current, unexpired selected workspace with all five dimensions ready.
 
 Receipt binding readiness has an exact 10-second TTL. Pending or verified-negative frames carry
