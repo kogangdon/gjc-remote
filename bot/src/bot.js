@@ -147,6 +147,7 @@ const managedAuthorityReader = await createManagedAuthorityReader({
 });
 let channelMap;
 let channelMapping;
+let registry;
 channelMap = await loadChannelMap({ fatal: true });
 watchConfigHints(
   [channelsPath, managedHistoryMarkerPath, bootstrapBlockerPath],
@@ -242,12 +243,15 @@ try {
   process.exit(1);
 }
 
-const registry = new HostRegistry({
+registry = new HostRegistry({
   port: hostWsPort,
   tokensByHostId,
   ...invokeTimeoutOptions,
   onError: (error) => handleFatal("host_ws_listen_failed", error),
 });
+registry.setManagedRoutes(
+  channelMapping.sourceKind === "managed-v1" ? channelMap : {}
+);
 const toolLogStore = new ToolLogStore();
 // #35: channelId -> { hostId, requestId, gateId } for a workflow gate currently
 // awaiting a user's answer in that channel. While an entry exists, the next
@@ -471,6 +475,9 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   try {
     if (!dispatchGate(channelMapping, edit, verifyLegacyFence)) return;
     editProgress(true);
+    const managedBinding = route.authority === undefined
+      ? undefined
+      : registry.getManagedRouteBinding(channelId);
     result = await registry.invoke(
       route.hostId,
       route.workDir,
@@ -495,6 +502,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
       route.mappingId === undefined
         ? undefined
         : {
+            bindingId: managedBinding?.bindingId,
             mappingId: route.mappingId,
             mappingGeneration: route.mappingGeneration,
             mappingVersion: route.mappingVersion,
@@ -622,6 +630,9 @@ async function loadChannelMap({ fatal }) {
 
   channelMap = result.map;
   channelMapping = result.classification ?? { sourceKind: "unavailable", dispatchClass: "workspace-only", routeDisposition: "no-route" };
+  registry?.setManagedRoutes(
+    channelMapping.sourceKind === "managed-v1" ? channelMap : {}
+  );
   if (result.ok) {
     const count = Object.keys(result.map).length;
     console.log(`Loaded channel map from ${channelsPath}: ${count} channel${count === 1 ? "" : "s"}`);

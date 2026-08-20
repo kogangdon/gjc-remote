@@ -20,14 +20,45 @@ import {
   isRegisterOkMessage,
   negotiateCapabilities,
   PROTOCOL_ERROR_CODES,
+  WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
 } from "@gjc-remote/shared";
+import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
 import {
   HostRegistry,
   MAX_BINDING_READINESS_STATES,
   extractAssistantText,
   freezeManagedAuthorityDescriptor,
 } from "../src/host-registry.js";
+
+function managedRoute(channelId, overrides = {}) {
+  const authority = {
+    authorityEpoch: 1,
+    fenceGeneration: 1,
+    hostId: "host-a",
+    mappingId: `mapping-${channelId}`,
+    mappingGeneration: 1,
+    mappingVersion: 1,
+    sourcePlatform: "posix",
+    workspaceId: `workspace-${channelId}`,
+    workspaceGeneration: 1,
+    authorityFingerprint: "a".repeat(64),
+    ...overrides.authority,
+  };
+  return Object.freeze({
+    hostId: authority.hostId,
+    workDir: null,
+    mappingId: authority.mappingId,
+    mappingGeneration: authority.mappingGeneration,
+    mappingVersion: authority.mappingVersion,
+    sourcePlatform: authority.sourcePlatform,
+    workspaceId: authority.workspaceId,
+    workspaceGeneration: authority.workspaceGeneration,
+    routeFingerprint: "b".repeat(64),
+    authority: Object.freeze(authority),
+    ...overrides,
+  });
+}
 
 function createManualTimers() {
   const intervals = new Map();
@@ -166,6 +197,37 @@ async function connectV2(server, hostId = "host-a", token = "token-a", register 
   const [raw] = await response;
   registryBySocket.set(socket, { registry: server.registry, hostId });
   return { socket, response: JSON.parse(raw.toString()) };
+}
+async function connectV3(server, hostId = "host-a", token = "token-a", register = {}) {
+  const port = server.registry.wss.address().port;
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  await once(socket, "open");
+  const frames = [];
+  socket.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
+  socket.send(JSON.stringify({
+    type: "register",
+    hostId,
+    token,
+    protocolVersion: PROTOCOL_VERSION_V3,
+    capabilities: [
+      ...CAPABILITIES,
+      WORKSPACE_READINESS_CAPABILITY,
+      WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+    ],
+    ...register,
+  }));
+  await waitFor(() => frames.length > 0);
+  const response = frames.shift();
+  registryBySocket.set(socket, { registry: server.registry, hostId });
+  return {
+    socket,
+    response,
+    async nextFrame() {
+      await waitFor(() => frames.length > 0);
+      return frames.shift();
+    },
+    frames,
+  };
 }
 
 function readinessFrame(overrides = {}) {
@@ -683,29 +745,14 @@ test("managed v2 invokes carry the bindingId selected by readiness", async () =>
         mappingId: "mapping-1",
         mappingGeneration: 1,
         mappingVersion: 1,
-        sourcePlatform: "posix",
         workspaceId: "workspace-1",
         workspaceGeneration: 1,
-        authority: {
-          authorityEpoch: 1,
-          fenceGeneration: 1,
-          hostId: "host-a",
-          mappingId: "mapping-1",
-          mappingGeneration: 1,
-          workspaceGeneration: 1,
-          mappingVersion: 1,
-          sourcePlatform: "posix",
-          workspaceId: "workspace-1",
-          authorityFingerprint: "a".repeat(64),
-        },
       }
     );
     const [raw] = await invokeFrame;
     const invoke = JSON.parse(raw.toString());
     assert.equal(invoke.bindingId, "binding-1");
     assert.equal(invoke.workspaceId, "workspace-1");
-    assert.equal(Object.hasOwn(invoke, "authority"), false);
-    assert.equal(Object.hasOwn(invoke, "sourcePlatform"), false);
     socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
     assert.deepEqual(await resultPromise, { ok: true, text: undefined });
   } finally {
@@ -3171,6 +3218,468 @@ test("phase 1 host projections redact hostile identity and readiness diagnostics
     assert.equal(JSON.stringify(projection).includes("/var/lib"), false);
     assert.equal(/[\u0000-\u001f]/.test(JSON.stringify(projection)), false);
     socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed routes retain offline desired state without exposing descriptors", async () => {
+  const server = await startRegistry();
+  try {
+    const shared = managedRoute("shared");
+    server.registry.setManagedRoutes({
+      "channel-a": shared,
+      "channel-b": managedRoute("shared", { routeFingerprint: "c".repeat(64) }),
+    });
+    const binding = server.registry.getManagedRouteBinding("channel-a");
+    assert.deepEqual(binding, { compatible: false });
+    assert.equal(Object.isFrozen(binding), true);
+    assert.equal(JSON.stringify(binding).includes("workspace"), false);
+    assert.equal(server.registry.getManagedRouteBinding("missing"), undefined);
+    const result = await server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "offline" },
+      () => {},
+      1_000,
+      undefined,
+      {
+        mappingId: shared.mappingId,
+        mappingGeneration: shared.mappingGeneration,
+        mappingVersion: shared.mappingVersion,
+        sourcePlatform: shared.sourcePlatform,
+        workspaceId: shared.workspaceId,
+        workspaceGeneration: shared.workspaceGeneration,
+        authority: shared.authority,
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "PROTOCOL_INCOMPATIBLE");
+  } finally {
+    await server.close();
+  }
+});
+
+test("v3 deduplicates shared descriptors and accepts only the exact receipt", async () => {
+  const server = await startRegistry();
+  try {
+    const shared = managedRoute("shared");
+    server.registry.setManagedRoutes({
+      "channel-a": shared,
+      "channel-b": managedRoute("shared", { routeFingerprint: "c".repeat(64) }),
+    });
+    const connection = await connectV3(server);
+    assert.equal(connection.response.protocolVersion, PROTOCOL_VERSION_V3);
+    const bind = await connection.nextFrame();
+    assert.deepEqual(Object.keys(bind).sort(), [
+      "authorityEpoch", "authorityFingerprint", "bindingId", "fenceGeneration",
+      "hostId", "mappingGeneration", "mappingId", "mappingVersion",
+      "sourcePlatform", "type", "workspaceGeneration", "workspaceId",
+    ].sort());
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(connection.frames.length, 0, "shared routes emit one bind");
+    assert.deepEqual(server.registry.getManagedRouteBinding("channel-a"), {
+      compatible: false,
+    });
+
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "d".repeat(64);
+    const bindingFingerprint = workspaceBindingFingerprint({
+      authority: shared.authority,
+      inventoryGeneration,
+      inventoryFingerprint,
+    });
+    const ack = {
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    };
+    connection.socket.send(JSON.stringify(ack));
+    await waitFor(() =>
+      server.registry.getManagedRouteBinding("channel-a")?.state === "bound"
+    );
+    const managedBinding = server.registry.getManagedRouteBinding("channel-a");
+    const result = await server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "still disabled" },
+      () => {},
+      1_000,
+      undefined,
+      {
+        bindingId: managedBinding.bindingId,
+        mappingId: shared.mappingId,
+        mappingGeneration: shared.mappingGeneration,
+        mappingVersion: shared.mappingVersion,
+        sourcePlatform: shared.sourcePlatform,
+        workspaceId: shared.workspaceId,
+        workspaceGeneration: shared.workspaceGeneration,
+        authority: shared.authority,
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "RUNTIME_INCOMPATIBLE");
+    assert.equal(
+      server.registry.getManagedRouteBinding("channel-a").bindingId,
+      server.registry.getManagedRouteBinding("channel-b").bindingId,
+    );
+    connection.socket.send(JSON.stringify(ack));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(connection.socket.readyState, WebSocket.OPEN);
+
+    const closed = once(connection.socket, "close");
+    connection.socket.send(JSON.stringify({ ...ack, inventoryGeneration: 2 }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await server.close();
+  }
+});
+
+test("old v2 receipt-off sockets stay incompatible without bind timers", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, { timers: timers.api });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const { socket, response } = await connectV2(server);
+    assert.equal(response.protocolVersion, 2);
+    assert.deepEqual(server.registry.getManagedRouteBinding("channel-a"), {
+      compatible: false,
+    });
+    assert.equal(timers.timeoutCount, 0);
+    const result = await server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "blocked" },
+      () => {},
+      1_000,
+      undefined,
+      {
+        mappingId: route.mappingId,
+        mappingGeneration: route.mappingGeneration,
+        mappingVersion: route.mappingVersion,
+        sourcePlatform: route.sourcePlatform,
+        workspaceId: route.workspaceId,
+        workspaceGeneration: route.workspaceGeneration,
+        authority: route.authority,
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "PROTOCOL_INCOMPATIBLE");
+    socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("positive readiness is held until the exact bind acknowledgement", async () => {
+  const server = await startRegistry();
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "d".repeat(64);
+    const bindingFingerprint = workspaceBindingFingerprint({
+      authority: route.authority,
+      inventoryGeneration,
+      inventoryFingerprint,
+    });
+    connection.socket.send(JSON.stringify(readinessFrame({
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    })));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(connection.socket.readyState, WebSocket.OPEN);
+    assert.deepEqual(server.registry.getManagedRouteBinding("channel-a"), {
+      compatible: false,
+    });
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    }));
+    await waitFor(() =>
+      server.registry.getManagedRouteBinding("channel-a")?.state === "bound"
+    );
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("v3 host and binding readiness share one revision fence", async () => {
+  const server = await startRegistry();
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    connection.socket.send(JSON.stringify(readinessFrame({
+      revision: 2,
+      workspaceId: undefined,
+      workspaceGeneration: undefined,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+    })));
+    await waitFor(() =>
+      server.registry.getHostReadiness("host-a")?.revision === 2
+    );
+    const closed = once(connection.socket, "close");
+    connection.socket.send(JSON.stringify(readinessFrame({
+      revision: 1,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "INVENTORY_PENDING",
+        at: Date.now(),
+        remediation: {
+          code: "INVENTORY_PENDING",
+          retryable: true,
+          action: "retry_later",
+        },
+      },
+    })));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await server.close();
+  }
+});
+
+test("negative readiness ends the bind deadline and remains totally unbindable", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, { timers: timers.api });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    connection.socket.send(JSON.stringify(readinessFrame({
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "WORKSPACE_NOT_FOUND",
+        at: Date.now(),
+        remediation: {
+          code: "WORKSPACE_NOT_FOUND",
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      },
+    })));
+    await waitFor(() => timers.timeoutCount === 0);
+    assert.deepEqual(server.registry.getManagedRouteBinding("channel-a"), {
+      compatible: false,
+    });
+    server.registry.setManagedRoutes({});
+    assert.deepEqual(await connection.nextFrame(), {
+      type: "unbind_workspace",
+      bindingId: bind.bindingId,
+    });
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("binding removal tombstones before unbind and late frames cannot repopulate it", async () => {
+  const server = await startRegistry();
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "d".repeat(64);
+    const bindOk = {
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint: workspaceBindingFingerprint({
+        authority: route.authority,
+        inventoryGeneration,
+        inventoryFingerprint,
+      }),
+    };
+    connection.socket.send(JSON.stringify(bindOk));
+    await waitFor(() =>
+      server.registry.getManagedRouteBinding("channel-a")?.state === "bound"
+    );
+
+    server.registry.setManagedRoutes({});
+    assert.equal(server.registry.getManagedRouteBinding("channel-a"), undefined);
+    const unbind = await connection.nextFrame();
+    assert.deepEqual(unbind, {
+      type: "unbind_workspace",
+      bindingId: bind.bindingId,
+    });
+    connection.socket.send(JSON.stringify(bindOk));
+    connection.socket.send(JSON.stringify(readinessFrame({
+      bindingId: bind.bindingId,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "INVENTORY_PENDING",
+        at: Date.now(),
+        remediation: {
+          code: "INVENTORY_PENDING",
+          retryable: true,
+          action: "retry_later",
+        },
+      },
+    })));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(connection.socket.readyState, WebSocket.OPEN);
+
+    connection.socket.send(JSON.stringify({
+      type: "unbind_ok",
+      bindingId: bind.bindingId,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const closed = once(connection.socket, "close");
+    connection.socket.send(JSON.stringify(readinessFrame({
+      bindingId: bind.bindingId,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "INVENTORY_PENDING",
+        at: Date.now(),
+        remediation: {
+          code: "INVENTORY_PENDING",
+          retryable: true,
+          action: "retry_later",
+        },
+      },
+    })));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await server.close();
+  }
+});
+
+test("descriptor replacement unbinds a pending id before binding its successor", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, { timers: timers.api });
+  try {
+    server.registry.setManagedRoutes({ "channel-a": managedRoute("old") });
+    const connection = await connectV3(server);
+    const oldBind = await connection.nextFrame();
+    server.registry.setManagedRoutes({ "channel-a": managedRoute("new") });
+    const unbind = await connection.nextFrame();
+    assert.deepEqual(unbind, {
+      type: "unbind_workspace",
+      bindingId: oldBind.bindingId,
+    });
+    timers.runClearedTimeouts();
+    assert.equal(connection.socket.readyState, WebSocket.OPEN);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(connection.frames.length, 0, "successor waits for unbind_ok");
+    connection.socket.send(JSON.stringify({
+      type: "unbind_ok",
+      bindingId: oldBind.bindingId,
+    }));
+    const newBind = await connection.nextFrame();
+    assert.equal(newBind.type, "bind_workspace");
+    assert.notEqual(newBind.bindingId, oldBind.bindingId);
+    assert.equal(newBind.mappingId, "mapping-new");
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("64 bindings are exact, the 65th is incompatible, and replacement gets fresh ids", async () => {
+  const server = await startRegistry();
+  try {
+    const routes = Object.fromEntries(
+      Array.from({ length: MAX_BINDING_READINESS_STATES + 1 }, (_, index) => [
+        `channel-${index}`,
+        managedRoute(String(index)),
+      ])
+    );
+    server.registry.setManagedRoutes(routes);
+    const first = await connectV3(server);
+    await waitFor(() => first.frames.length === MAX_BINDING_READINESS_STATES);
+    const firstIds = new Set(first.frames.map((frame) => frame.bindingId));
+    assert.equal(firstIds.size, MAX_BINDING_READINESS_STATES);
+    assert.deepEqual(
+      server.registry.getManagedRouteBinding(`channel-${MAX_BINDING_READINESS_STATES}`),
+      { compatible: false },
+    );
+
+    const replacement = await connectV3(server);
+    await waitFor(() => replacement.frames.length === MAX_BINDING_READINESS_STATES);
+    const replacementIds = new Set(replacement.frames.map((frame) => frame.bindingId));
+    assert.equal([...replacementIds].some((id) => firstIds.has(id)), false);
+    first.socket.terminate();
+    replacement.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("bind deadline terminates a silent v3 socket", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+  });
+  try {
+    server.registry.setManagedRoutes({ "channel-a": managedRoute("a") });
+    const connection = await connectV3(server);
+    await connection.nextFrame();
+    assert.equal(timers.timeoutDelays.includes(10_000), true);
+    const closed = once(connection.socket, "close");
+    timers.runTimeoutByDelay(10_000);
+    await closed;
   } finally {
     await server.close();
   }
