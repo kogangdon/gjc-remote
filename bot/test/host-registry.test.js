@@ -1704,6 +1704,102 @@ test("invalid or oversized outbound invokes fail locally without disconnecting t
   }
 });
 
+test("managed path-free routes fail with structured remediation on a legacy host", async () => {
+  for (const register of [
+    { protocolVersion: undefined, capabilities: undefined },
+    {},
+  ]) {
+    const server = await startRegistry();
+    try {
+      const socket = await server.connect("host-a", "token-a", register);
+      const pendingBefore = server.registry.pendingRequests.size;
+      const perSocketBefore =
+        server.registry.pendingCountBySocket.get(socket) ?? 0;
+      const managedIdentity = {
+        mappingId: "mapping-a",
+        mappingGeneration: 1,
+        mappingVersion: 1,
+        workspaceId: "workspace-a",
+        workspaceGeneration: 1,
+      };
+
+      const managed = await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "hello" },
+        () => {},
+        undefined,
+        undefined,
+        managedIdentity
+      );
+      const unrelatedInvalid = await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "hello" },
+        () => {}
+      );
+      const malformedManaged = await server.registry.invoke(
+        "host-a",
+        null,
+        { kind: "prompt", message: "hello" },
+        () => {},
+        undefined,
+        undefined,
+        { ...managedIdentity, mappingId: null }
+      );
+
+      assert.deepEqual(managed, {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+          retryable: false,
+          action: "contact_admin",
+        },
+      });
+      assert.deepEqual(unrelatedInvalid, {
+        ok: false,
+        error: "invalid invoke request",
+      });
+      assert.deepEqual(malformedManaged, {
+        ok: false,
+        error: "invalid invoke request",
+      });
+      assert.equal(server.registry.pendingRequests.size, pendingBefore);
+      assert.equal(
+        server.registry.pendingCountBySocket.get(socket) ?? 0,
+        perSocketBefore
+      );
+
+      const barrierFrame = once(socket, "message");
+      const barrierResult = server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: "barrier" },
+        () => {}
+      );
+      const [barrierRaw] = await barrierFrame;
+      const barrier = JSON.parse(barrierRaw.toString());
+      assert.equal(barrier.workDir, "/workspace");
+      socket.send(
+        JSON.stringify({
+          type: "event",
+          requestId: barrier.requestId,
+          done: true,
+        })
+      );
+      assert.deepEqual(await barrierResult, { ok: true, text: undefined });
+      assert.equal(socket.readyState, WebSocket.OPEN);
+      assert.equal(server.registry.pendingRequests.size, pendingBefore);
+      assert.equal(
+        server.registry.pendingCountBySocket.get(socket) ?? 0,
+        perSocketBefore
+      );
+    } finally {
+      await server.close();
+    }
+  }
+});
+
 test("a different registered socket cannot spoof a pending requestId", async () => {
   const server = await startRegistry(
     new Map([
@@ -1924,6 +2020,30 @@ test("per-host in-flight invokes are capped and freed on completion", async () =
     assert.deepEqual(overflow, {
       ok: false,
       error: { code: "RESOURCE_EXHAUSTED", retryable: true, action: "retry_later" },
+    });
+    assert.equal(server.registry.pendingRequests.size, cap);
+    const incompatibleManaged = await server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "hello" },
+      () => {},
+      10_000,
+      undefined,
+      {
+        mappingId: "mapping-a",
+        mappingGeneration: 1,
+        mappingVersion: 1,
+        workspaceId: "workspace-a",
+        workspaceGeneration: 1,
+      }
+    );
+    assert.deepEqual(incompatibleManaged, {
+      ok: false,
+      error: {
+        code: PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+        retryable: false,
+        action: "contact_admin",
+      },
     });
     assert.equal(server.registry.pendingRequests.size, cap);
 

@@ -17,11 +17,15 @@ import {
   isEventMessage,
   isGateRequestEvent,
   isInvokeMessage,
+  isMappingGeneration,
+  isMappingId,
+  isMappingVersion,
   isPongMessage,
   isReadinessCapabilityGate,
   isReadinessMessage,
   isRegisterMessage,
   isRegisterOkMessage,
+  isReadinessWorkspaceGeneration,
   isWorkspaceId,
   negotiateCapabilities,
   normalizeReadinessTtl,
@@ -56,6 +60,16 @@ function hostTokenMatches(expected, actual) {
   return (
     expectedBytes.length === actualBytes.length &&
     timingSafeEqual(expectedBytes, actualBytes)
+  );
+}
+function isManagedPathFreeRoute(workDir, routeIdentity) {
+  return (
+    workDir === null &&
+    isMappingId(routeIdentity?.mappingId) &&
+    isMappingGeneration(routeIdentity?.mappingGeneration) &&
+    isMappingVersion(routeIdentity?.mappingVersion) &&
+    isWorkspaceId(routeIdentity?.workspaceId) &&
+    isReadinessWorkspaceGeneration(routeIdentity?.workspaceGeneration)
   );
 }
 function normalizeRemoteError(error) {
@@ -1195,6 +1209,14 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       }
     }
 
+    const usesV2 = readiness?.readinessEnabled === true;
+    if (!usesV2 && isManagedPathFreeRoute(workDir, routeIdentity)) {
+      return Promise.resolve({
+        ok: false,
+        error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
+      });
+    }
+
     const pendingForSocket = this.pendingCountBySocket.get(socket) ?? 0;
     if (pendingForSocket >= V0_LIMITS.MAX_PENDING_PER_HOST) {
       return Promise.resolve({
@@ -1204,7 +1226,6 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     }
 
     const requestId = randomUUID();
-    const usesV2 = readiness?.readinessEnabled === true;
     const invoke = { type: MSG_TYPES.INVOKE, requestId, command };
     if (usesV2) {
       const effectiveRouteIdentity = {
