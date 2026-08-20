@@ -14,14 +14,14 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # daemon/test/protocol-validation.test.js spawns a real `bun` child, and
       # the daemon loads the SDK from bun-executed TS source, so bun must be on
       # PATH even though the *.test.js files run under node --test.
       - uses: oven-sh/setup-bun@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '26'
 
