@@ -18,7 +18,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # changelog-history-guard needs full history to compute a merge-base
           # against origin/main; a shallow (depth-1) checkout can't do that.
@@ -28,7 +28,7 @@ jobs:
       # so bun must be on PATH even though the test files run under node --test.
       - uses: oven-sh/setup-bun@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '26'
 
