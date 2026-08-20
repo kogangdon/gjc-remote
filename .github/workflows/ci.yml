@@ -39,10 +39,19 @@ jobs:
       # isolation; no restore prefix can admit a stale dependency set.
       - name: Cache Bun package downloads
         if: runner.os == 'Windows'
+        id: bun-package-cache
         uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup-bun.outputs.bun-version }}-${{ hashFiles('bun.lock') }}
+
+      # actions/cache may restore a longer primary-key prefix match even without
+      # restore-keys. Only an exact hit is trusted; clear every other restore so
+      # frozen install repopulates the directory from registry-verified bytes.
+      - name: Reject non-exact Bun package cache
+        if: runner.os == 'Windows' && steps.bun-package-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: Remove-Item -LiteralPath "$HOME/.bun/install/cache" -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Install native ACL headers
         if: runner.os == 'Linux'
