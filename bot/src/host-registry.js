@@ -7,12 +7,14 @@ import {
   PING,
   PROTOCOL_VERSION,
   PROTOCOL_VERSION_V2,
+  PROTOCOL_VERSION_V3,
   READINESS_DIMENSIONS,
   READINESS_MAX_SKEW_MS,
   READINESS_MAX_TTL_MS,
   PROTOCOL_ERROR_CODES,
   V0_LIMITS,
   WORKSPACE_READINESS_CAPABILITY,
+  WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   isAnswerMessage,
   isEventMessage,
   isGateRequestEvent,
@@ -22,6 +24,10 @@ import {
   isMappingVersion,
   isPongMessage,
   isReadinessCapabilityGate,
+  isInventoryReceiptBindOkMessage,
+  isInventoryReceiptCapabilityGate,
+  isInventoryReceiptReadinessMessage,
+  isUnbindOkMessage,
   isReadinessMessage,
   isRegisterMessage,
   isRegisterOkMessage,
@@ -31,7 +37,11 @@ import {
   normalizeReadinessTtl,
   READINESS_REMEDIATIONS,
 } from "@gjc-remote/shared";
-import { validateWorkspaceAuthorityDescriptor } from "@gjc-remote/shared/workspace-binding";
+import { canonicalJsonHash } from "@gjc-remote/shared/strict-json";
+import {
+  validateWorkspaceAuthorityDescriptor,
+  workspaceBindingFingerprint,
+} from "@gjc-remote/shared/workspace-binding";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -39,8 +49,13 @@ const INVOKE_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
 const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
+const BINDING_DEADLINE_MS = 10_000;
 const PING_PAYLOAD = JSON.stringify(PING);
 const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
+const V3_CAPABILITIES = Object.freeze([
+  ...V2_CAPABILITIES,
+  WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+]);
 const SYSTEM_TIMERS = {
   setInterval: (callback, delay) => setInterval(callback, delay),
   clearInterval: (timer) => clearInterval(timer),
@@ -172,12 +187,12 @@ export class HostRegistry {
     if (!isPositiveDuration(invokeHardCapMs)) {
       throw new Error("invokeHardCapMs must be a positive duration");
     }
-
     this.tokensByHostId = tokensByHostId;
     this.heartbeatTimeoutMs = heartbeatTimeoutMs;
     this.invokeIdleTimeoutMs = invokeIdleTimeoutMs;
     this.workspaceServingEnabled = workspaceServingEnabled === true;
     this.invokeHardCapMs = invokeHardCapMs;
+    this.bindingDeadlineMs = BINDING_DEADLINE_MS;
     this.timers = timers;
     this.now = now;
     this.monotonicNow = monotonicNow;
@@ -195,6 +210,10 @@ export class HostRegistry {
     this.readinessAuthorities = new Map();
     /** @type {Map<string, object>} */
     this.readinessStates = new Map();
+    /** @type {Map<string, { hostId: string, descriptorKey: string }>} */
+    this.managedRoutes = new Map();
+    /** @type {Map<string, { hostId: string, authority: object, channelIds: Set<string> }>} */
+    this.managedDescriptors = new Map();
     this.closed = false;
     this.closePromise = undefined;
 
@@ -245,11 +264,23 @@ export class HostRegistry {
       }
       this.connections.set(hostId, socket);
       this.heartbeatStates.set(socket, { hostId });
+      const wantsInventoryReceipt =
+        (msg.protocolVersion ?? 0) >= PROTOCOL_VERSION_V3 &&
+        Array.isArray(msg.capabilities) &&
+        msg.capabilities.includes(WORKSPACE_READINESS_CAPABILITY) &&
+        msg.capabilities.includes(WORKSPACE_INVENTORY_RECEIPT_CAPABILITY);
       const wantsReadiness =
+        !wantsInventoryReceipt &&
         (msg.protocolVersion ?? 0) >= PROTOCOL_VERSION_V2 &&
         Array.isArray(msg.capabilities) &&
         msg.capabilities.includes(WORKSPACE_READINESS_CAPABILITY);
-      const registerOk = wantsReadiness
+      const registerOk = wantsInventoryReceipt
+        ? {
+            type: MSG_TYPES.REGISTER_OK,
+            protocolVersion: PROTOCOL_VERSION_V3,
+            capabilities: V3_CAPABILITIES,
+          }
+        : wantsReadiness
         ? {
             type: MSG_TYPES.REGISTER_OK,
             protocolVersion: PROTOCOL_VERSION_V2,
@@ -264,13 +295,15 @@ export class HostRegistry {
         socket.close(1008, "invalid register response");
         return;
       }
-      const readinessEnabled = isReadinessCapabilityGate(msg, registerOk);
+      const bindingEnabled = isInventoryReceiptCapabilityGate(msg, registerOk);
+      const readinessEnabled =
+        isReadinessCapabilityGate(msg, registerOk) || bindingEnabled;
       const protocolVersion = Math.min(
         registerOk.protocolVersion,
         msg.protocolVersion ?? 0
       );
       const capabilities = negotiateCapabilities(
-        readinessEnabled ? V2_CAPABILITIES : CAPABILITIES,
+        bindingEnabled ? V3_CAPABILITIES : readinessEnabled ? V2_CAPABILITIES : CAPABILITIES,
         msg.capabilities
       );
       this.hostInfo.set(hostId, { protocolVersion, capabilities });
@@ -278,6 +311,9 @@ export class HostRegistry {
         socket,
         hostId,
         readinessEnabled,
+        bindingEnabled,
+        receiptSocketGeneration: undefined,
+        receiptPrevious: undefined,
         revision: 0,
         socketGeneration: undefined,
         observedAt: undefined,
@@ -297,6 +333,10 @@ export class HostRegistry {
         bindingId: undefined,
         /** @type {Map<string, object>} */
         bindingReadiness: new Map(),
+        /** @type {Map<string, object>} */
+        bindingsById: new Map(),
+        /** @type {Map<string, object>} */
+        bindingsByDescriptor: new Map(),
         /** @type {Map<string, number>} */
         workspaceGenerationHighWater: new Map(),
         workspaceDimensions: undefined,
@@ -314,6 +354,7 @@ export class HostRegistry {
         rejected: false,
       });
       socket.send(JSON.stringify(registerOk));
+      this.#reconcileManagedBindings(hostId);
       console.log(
         `HostRegistry: host '${hostId}' connected (${msg.label ?? "no label"}, ` +
           `protocol v${protocolVersion}, capabilities: ${capabilities.join(", ") || "none"})`
@@ -353,7 +394,20 @@ export class HostRegistry {
       this.#acceptPong(socket);
       return;
     }
+    if (msg?.type === MSG_TYPES.BIND_OK || msg?.type === MSG_TYPES.UNBIND_OK) {
+      if (!this.#acceptBindingReply(socket, msg)) {
+        socket.close(1008, "invalid binding reply");
+      }
+      return;
+    }
     if (msg?.type === MSG_TYPES.READINESS) {
+      const state = this.#bindingState(socket);
+      if (state?.bindingEnabled) {
+        if (!this.#acceptInventoryReceiptReadiness(state, msg)) {
+          socket.close(1008, "invalid receipt readiness");
+        }
+        return;
+      }
       if (!this.#acceptReadiness(socket, msg)) {
         socket.close(1008, "invalid readiness");
       }
@@ -428,6 +482,182 @@ export class HostRegistry {
         : pending.text;
       pending.resolve({ ok: true, text });
       this.#deletePending(msg.requestId);
+    }
+  }
+
+  #bindingState(socket) {
+    const hostId = this.heartbeatStates.get(socket)?.hostId;
+    const state = hostId ? this.readinessStates.get(hostId) : undefined;
+    return state?.socket === socket && this.connections.get(hostId) === socket
+      ? state
+      : undefined;
+  }
+
+  #armBindingDeadline(socket, binding) {
+    const deadline = this.timers.setTimeout(() => {
+      if (binding.deadline === deadline) {
+        binding.deadline = undefined;
+        socket.terminate();
+      }
+    }, this.bindingDeadlineMs);
+    binding.deadline = deadline;
+    deadline.unref?.();
+  }
+
+  #clearBindingDeadline(binding) {
+    if (binding.deadline !== undefined) {
+      this.timers.clearTimeout(binding.deadline);
+      binding.deadline = undefined;
+    }
+  }
+
+  #acceptBindingReply(socket, msg) {
+    const state = this.#bindingState(socket);
+    if (!state?.bindingEnabled) return false;
+    if (msg.type === MSG_TYPES.BIND_OK) {
+      if (!isInventoryReceiptBindOkMessage(msg)) return false;
+      const binding = state.bindingsById.get(msg.bindingId);
+      if (binding?.status === "unbinding") return true;
+      if (binding?.status === "bound") {
+        return binding.receipt?.inventoryGeneration === msg.inventoryGeneration &&
+          binding.receipt?.inventoryFingerprint === msg.inventoryFingerprint &&
+          binding.receipt?.bindingFingerprint === msg.bindingFingerprint;
+      }
+      if (!binding || binding.status !== "binding") return false;
+      const fingerprint = workspaceBindingFingerprint({
+        authority: binding.authority,
+        inventoryGeneration: msg.inventoryGeneration,
+        inventoryFingerprint: msg.inventoryFingerprint,
+      });
+      if (fingerprint !== msg.bindingFingerprint) return false;
+      if (binding.heldReadiness) {
+        if (!this.#receiptMatchesReadiness(msg, binding.heldReadiness)) return false;
+        binding.readiness = binding.heldReadiness;
+        binding.heldReadiness = undefined;
+      }
+      this.#clearBindingDeadline(binding);
+      binding.status = "bound";
+      binding.receipt = Object.freeze({
+        inventoryGeneration: msg.inventoryGeneration,
+        inventoryFingerprint: msg.inventoryFingerprint,
+        bindingFingerprint: msg.bindingFingerprint,
+      });
+      return true;
+    }
+    if (!isUnbindOkMessage(msg)) return false;
+    const binding = state.bindingsById.get(msg.bindingId);
+    if (!binding || binding.status !== "unbinding") return false;
+    this.#clearBindingDeadline(binding);
+    binding.status = "tombstone";
+    state.bindingsByDescriptor.delete(binding.descriptorKey);
+    this.#reconcileManagedBindings(state.hostId);
+    return true;
+  }
+
+  #unbindBinding(state, binding) {
+    if (binding.status === "unbinding" || binding.status === "tombstone") return;
+    binding.status = "unbinding";
+    binding.receipt = undefined;
+    binding.readiness = undefined;
+    binding.heldReadiness = undefined;
+    state.bindingsByDescriptor.delete(binding.descriptorKey);
+    this.#clearBindingDeadline(binding);
+    this.#armBindingDeadline(state.socket, binding);
+    state.socket.send(JSON.stringify({
+      type: MSG_TYPES.UNBIND_WORKSPACE,
+      bindingId: binding.bindingId,
+    }));
+  }
+
+  #receiptMatchesReadiness(receipt, readiness) {
+    return receipt.inventoryGeneration === readiness.inventoryGeneration &&
+      receipt.inventoryFingerprint === readiness.inventoryFingerprint &&
+      receipt.bindingFingerprint === readiness.bindingFingerprint;
+  }
+
+  #acceptInventoryReceiptReadiness(state, msg) {
+    if (!isInventoryReceiptReadinessMessage(msg, {
+      currentSocketGeneration: state.receiptSocketGeneration,
+      previous: state.receiptPrevious,
+      receivedAt: this.now(),
+    })) return false;
+    if (msg.bindingId === undefined) {
+      const accepted = this.#acceptReadiness(state.socket, msg);
+      if (accepted) {
+        state.receiptSocketGeneration ??= msg.socketGeneration;
+        state.receiptPrevious = msg;
+      }
+      return accepted;
+    }
+    const binding = state.bindingsById.get(msg.bindingId);
+    if (!binding || binding.status === "tombstone") return false;
+    if (binding.status === "unbinding") return true;
+    if (
+      msg.workspaceId !== binding.authority.workspaceId ||
+      msg.workspaceGeneration !== binding.authority.workspaceGeneration
+    ) return false;
+    if (
+      state.receiptSocketGeneration !== undefined &&
+      state.receiptSocketGeneration !== msg.socketGeneration
+    ) return false;
+    state.receiptSocketGeneration ??= msg.socketGeneration;
+    state.receiptPrevious = msg;
+    if (msg.lastError !== undefined) {
+      this.#clearBindingDeadline(binding);
+      binding.status = "negative";
+      binding.receipt = undefined;
+      binding.readiness = Object.freeze({ ...msg });
+      binding.heldReadiness = undefined;
+      return true;
+    }
+    if (binding.status === "binding") {
+      binding.heldReadiness = Object.freeze({ ...msg });
+      return true;
+    }
+    if (binding.status !== "bound" || !binding.receipt) return false;
+    if (!this.#receiptMatchesReadiness(binding.receipt, msg)) return false;
+    binding.readiness = Object.freeze({ ...msg });
+    return true;
+  }
+
+  #reconcileManagedBindings(hostId) {
+    const state = this.readinessStates.get(hostId);
+    if (
+      !state?.bindingEnabled ||
+      this.connections.get(hostId) !== state.socket
+    ) return;
+    const desired = [...this.managedDescriptors.entries()]
+      .filter(([, descriptor]) => descriptor.hostId === hostId);
+
+    for (const binding of state.bindingsByDescriptor.values()) {
+      if (!this.managedDescriptors.has(binding.descriptorKey)) {
+        this.#unbindBinding(state, binding);
+      }
+    }
+    if ([...state.bindingsById.values()].some((binding) => binding.status === "unbinding")) {
+      return;
+    }
+    for (const [descriptorKey, descriptor] of desired) {
+      if (state.bindingsByDescriptor.has(descriptorKey)) continue;
+      if (state.bindingsById.size >= MAX_BINDING_READINESS_STATES) continue;
+      const binding = {
+        bindingId: randomUUID(),
+        descriptorKey,
+        authority: descriptor.authority,
+        status: "binding",
+        deadline: undefined,
+        receipt: undefined,
+        readiness: undefined,
+        heldReadiness: undefined,
+      };
+      state.bindingsById.set(binding.bindingId, binding);
+      state.bindingsByDescriptor.set(descriptorKey, binding);
+      this.#armBindingDeadline(state.socket, binding);
+      state.socket.send(JSON.stringify({
+        type: MSG_TYPES.BIND_WORKSPACE,
+        bindingId: binding.bindingId,
+        ...binding.authority,
+      }));
     }
   }
 
@@ -1029,6 +1259,11 @@ export class HostRegistry {
     state.monoExpiresAt = undefined;
     state.workspaceExpiresAt = undefined;
     state.workspaceMonoExpiresAt = undefined;
+    for (const binding of state.bindingsById?.values() ?? []) {
+      this.#clearBindingDeadline(binding);
+    }
+    state.bindingsById?.clear();
+    state.bindingsByDescriptor?.clear();
     state.connected = false;
     state.hostDimensions = { ...state.hostDimensions, connection: "offline" };
     if (state.workspaceDimensions) {
@@ -1155,6 +1390,9 @@ export class HostRegistry {
         if (state[key]) this.timers.clearTimeout(state[key]);
         state[key] = undefined;
       }
+      for (const binding of state.bindingsById?.values() ?? []) {
+        this.#clearBindingDeadline(binding);
+      }
     }
     this.readinessStates.clear();
     for (const authority of this.readinessAuthorities.values()) {
@@ -1169,6 +1407,54 @@ export class HostRegistry {
       this.wss.close((error) => (error ? reject(error) : resolve()));
     });
     return this.closePromise;
+  }
+
+  setManagedRoutes(routes) {
+    if (routes === null || typeof routes !== "object" || Array.isArray(routes)) {
+      throw new TypeError("MANAGED_ROUTES_INVALID");
+    }
+    const nextRoutes = new Map();
+    const nextDescriptors = new Map();
+    for (const [channelId, route] of Object.entries(routes)) {
+      if (typeof channelId !== "string" || channelId.length === 0 || !route) {
+        throw new TypeError("MANAGED_ROUTES_INVALID");
+      }
+      const authority = freezeManagedAuthorityDescriptor(route.hostId, route);
+      if (!authority) throw new TypeError("MANAGED_AUTHORITY_INVALID");
+      const descriptorKey = canonicalJsonHash(authority);
+      let descriptor = nextDescriptors.get(descriptorKey);
+      if (!descriptor) {
+        descriptor = { hostId: authority.hostId, authority, channelIds: new Set() };
+        nextDescriptors.set(descriptorKey, descriptor);
+      }
+      descriptor.channelIds.add(channelId);
+      nextRoutes.set(channelId, { hostId: authority.hostId, descriptorKey });
+    }
+    const affectedHosts = new Set([
+      ...[...this.managedDescriptors.values()].map((descriptor) => descriptor.hostId),
+      ...[...nextDescriptors.values()].map((descriptor) => descriptor.hostId),
+    ]);
+    this.managedRoutes = nextRoutes;
+    this.managedDescriptors = nextDescriptors;
+    for (const hostId of affectedHosts) this.#reconcileManagedBindings(hostId);
+  }
+
+  getManagedRouteBinding(channelId) {
+    const route = this.managedRoutes.get(channelId);
+    if (!route) return undefined;
+    const state = this.readinessStates.get(route.hostId);
+    if (!state?.bindingEnabled || this.connections.get(route.hostId) !== state.socket) {
+      return Object.freeze({ compatible: false });
+    }
+    const binding = state.bindingsByDescriptor.get(route.descriptorKey);
+    if (!binding || binding.status !== "bound") {
+      return Object.freeze({ compatible: false });
+    }
+    return Object.freeze({
+      compatible: true,
+      bindingId: binding.bindingId,
+      state: binding.status,
+    });
   }
 
   isOnline(hostId) {
@@ -1251,9 +1537,12 @@ export class HostRegistry {
  *   sourcePlatform?: string, workspaceId?: string, workspaceGeneration?: number, authority?: object }} [routeIdentity]
  */
 invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, onGate, routeIdentity) {
+    let managedAuthority;
     try {
-      const authority = freezeManagedAuthorityDescriptor(hostId, routeIdentity);
-      if (authority) routeIdentity = Object.freeze({ ...routeIdentity, authority });
+      managedAuthority = freezeManagedAuthorityDescriptor(hostId, routeIdentity);
+      if (managedAuthority) {
+        routeIdentity = Object.freeze({ ...routeIdentity, authority: managedAuthority });
+      }
     } catch {
       return Promise.resolve({
         ok: false,
@@ -1261,15 +1550,41 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       });
     }
     const socket = this.connections.get(hostId);
+    const readiness = this.readinessStates.get(hostId);
+    let selectedBindingId;
+    if (managedAuthority) {
+      const descriptorKey = canonicalJsonHash(managedAuthority);
+      const binding =
+        socket &&
+        readiness?.socket === socket &&
+        readiness.bindingEnabled
+        ? readiness.bindingsByDescriptor.get(descriptorKey)
+        : undefined;
+      if (
+        !binding ||
+        binding.status !== "bound" ||
+        routeIdentity.bindingId !== binding.bindingId
+      ) {
+        return Promise.resolve({
+          ok: false,
+          error: remediationError(PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE),
+        });
+      }
+      selectedBindingId = binding.bindingId;
+      if (!this.workspaceServingEnabled) {
+        return Promise.resolve({
+          ok: false,
+          error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
+        });
+      }
+    }
     if (!socket) {
       return Promise.resolve({
         ok: false,
         error: { ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.CONNECTION_LOST] },
       });
     }
-    const readiness = this.readinessStates.get(hostId);
-    let selectedBindingId;
-    if (readiness?.readinessEnabled) {
+    if (readiness?.readinessEnabled && !readiness.bindingEnabled) {
       const hasBindingSelector =
         routeIdentity?.bindingId !== undefined ||
         routeIdentity?.workspaceId !== undefined ||
