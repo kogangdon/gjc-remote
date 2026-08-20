@@ -31,6 +31,7 @@ import {
   normalizeReadinessTtl,
   READINESS_REMEDIATIONS,
 } from "@gjc-remote/shared";
+import { validateWorkspaceAuthorityDescriptor } from "@gjc-remote/shared/workspace-binding";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -71,6 +72,26 @@ function isManagedPathFreeRoute(workDir, routeIdentity) {
     isWorkspaceId(routeIdentity?.workspaceId) &&
     isReadinessWorkspaceGeneration(routeIdentity?.workspaceGeneration)
   );
+}
+const AUTHORITY_ROUTE_FIELDS = Object.freeze([
+  "mappingId",
+  "mappingGeneration",
+  "mappingVersion",
+  "sourcePlatform",
+  "workspaceId",
+  "workspaceGeneration",
+]);
+export function freezeManagedAuthorityDescriptor(hostId, routeIdentity) {
+  if (routeIdentity?.authority === undefined) return undefined;
+  const authority = { ...routeIdentity.authority };
+  validateWorkspaceAuthorityDescriptor(authority);
+  if (
+    authority.hostId !== hostId ||
+    AUTHORITY_ROUTE_FIELDS.some((field) => routeIdentity[field] !== authority[field])
+  ) {
+    throw new TypeError("MANAGED_AUTHORITY_INVALID");
+  }
+  return Object.freeze(authority);
 }
 function normalizeRemoteError(error) {
   if (error && typeof error === "object") {
@@ -1227,9 +1248,18 @@ export class HostRegistry {
  *   #35: invoked when the daemon opens a workflow gate; carries the requestId
  *   needed to route the answer back via answerGate().
  * @param {{ bindingId?: string, mappingId?: string, mappingGeneration?: number, mappingVersion?: number,
- *   workspaceId?: string, workspaceGeneration?: number }} [routeIdentity]
+ *   sourcePlatform?: string, workspaceId?: string, workspaceGeneration?: number, authority?: object }} [routeIdentity]
  */
 invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, onGate, routeIdentity) {
+    try {
+      const authority = freezeManagedAuthorityDescriptor(hostId, routeIdentity);
+      if (authority) routeIdentity = Object.freeze({ ...routeIdentity, authority });
+    } catch {
+      return Promise.resolve({
+        ok: false,
+        error: remediationError(PROTOCOL_ERROR_CODES.CONFIG_INVALID),
+      });
+    }
     const socket = this.connections.get(hostId);
     if (!socket) {
       return Promise.resolve({
@@ -1300,8 +1330,13 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     const requestId = randomUUID();
     const invoke = { type: MSG_TYPES.INVOKE, requestId, command };
     if (usesV2) {
+      const {
+        authority: _authority,
+        sourcePlatform: _sourcePlatform,
+        ...wireRouteIdentity
+      } = routeIdentity ?? {};
       const effectiveRouteIdentity = {
-        ...routeIdentity,
+        ...wireRouteIdentity,
         bindingId: routeIdentity?.bindingId ?? selectedBindingId,
       };
       for (const [key, value] of Object.entries(effectiveRouteIdentity)) {

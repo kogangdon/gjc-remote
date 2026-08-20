@@ -498,8 +498,10 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
             mappingId: route.mappingId,
             mappingGeneration: route.mappingGeneration,
             mappingVersion: route.mappingVersion,
+            sourcePlatform: route.sourcePlatform,
             workspaceId: route.workspaceId,
             workspaceGeneration: route.workspaceGeneration,
+            authority: route.authority,
           }
     );
   } finally {

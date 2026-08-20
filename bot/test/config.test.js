@@ -89,7 +89,24 @@ test("projectManagedRoutes preserves authenticated workspace identity without pa
     mappingVersion: 1,
     sourcePlatform: "posix",
     workspaceId: "workspace-1",
+    routeFingerprint: route.routeFingerprint,
+    authority: {
+      authorityEpoch: 1,
+      fenceGeneration: 1,
+      hostId: "host",
+      mappingId: "mapping-1",
+      mappingGeneration: 4,
+      workspaceGeneration: 7,
+      mappingVersion: 1,
+      sourcePlatform: "posix",
+      workspaceId: "workspace-1",
+      authorityFingerprint: mapping.mappingFingerprint,
+    },
   });
+  assert.equal(Object.isFrozen(projected["123"]), true);
+  assert.equal(Object.isFrozen(projected["123"].authority), true);
+  assert.equal(projected["123"].authority.authorityFingerprint, mapping.mappingFingerprint);
+  assert.notEqual(projected["123"].routeFingerprint, projected["123"].authority.authorityFingerprint);
 
   const legacyMapping = fingerprintManagedMappingRecord({
     ...mapping,
