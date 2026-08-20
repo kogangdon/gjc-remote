@@ -72,7 +72,8 @@ function strictText(value, name, maxBytes) {
 function validateWorkspace(workspace, hostId) {
   if (!hasExactKeys(workspace, WORKSPACE_KEYS)) fail("workspace keys");
   if (workspace.hostId !== hostId) fail("workspace hostId");
-  if (!WORKSPACE_ID_PATTERN.test(workspace.workspaceId) ||
+  if (typeof workspace.workspaceId !== "string" ||
+      !WORKSPACE_ID_PATTERN.test(workspace.workspaceId) ||
       Buffer.byteLength(workspace.workspaceId, "utf8") > WORKSPACE_INVENTORY_LIMITS.maxWorkspaceIdBytes) {
     fail("workspaceId");
   }
@@ -132,13 +133,17 @@ export function workspaceInventoryFingerprint(inventory) {
   return canonicalJsonHash(preimage, WORKSPACE_INVENTORY_LIMITS);
 }
 
-export function validateWorkspaceInventory(inventory) {
+function validateWorkspaceInventoryAndBytes(inventory) {
   validatePreimage(inventory, TOP_LEVEL_KEYS);
   if (!isHex64(inventory.inventoryFingerprint)) fail("inventoryFingerprint");
   if (workspaceInventoryFingerprint(inventory) !== inventory.inventoryFingerprint) {
     fail("inventory fingerprint");
   }
-  assertDocumentByteLimit(inventory);
+  return assertDocumentByteLimit(inventory);
+}
+
+export function validateWorkspaceInventory(inventory) {
+  validateWorkspaceInventoryAndBytes(inventory);
   return inventory;
 }
 
@@ -159,12 +164,12 @@ export function buildWorkspaceInventory({
     workspaces: sortedWorkspaces,
   };
   inventory.inventoryFingerprint = workspaceInventoryFingerprint(inventory);
-  return validateWorkspaceInventory(inventory);
+  assertDocumentByteLimit(inventory);
+  return inventory;
 }
 
 export function workspaceInventoryBytes(inventory) {
-  validateWorkspaceInventory(inventory);
-  return assertDocumentByteLimit(inventory);
+  return validateWorkspaceInventoryAndBytes(inventory);
 }
 
 export function parseWorkspaceInventory(bytes) {

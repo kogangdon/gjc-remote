@@ -128,6 +128,12 @@ test("rejects invalid identifiers, platforms, paths, generations, and fingerprin
       /workspaceId/,
     );
   }
+  for (const workspaceId of [123, true, null]) {
+    assert.throws(
+      () => inventory({ workspaces: [workspace({ workspaceId })] }),
+      /WORKSPACE_INVENTORY_INVALID: workspaceId/,
+    );
+  }
   assert.throws(
     () => inventory({ workspaces: [workspace({ sourcePlatform: "darwin" })] }),
     /sourcePlatform/,
