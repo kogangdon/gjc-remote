@@ -52,12 +52,12 @@ test("receipt authority retirement invalidates exact activity only", () => {
     authorityFingerprint: "a".repeat(64),
     inventoryGeneration: 6,
     inventoryFingerprint: "b".repeat(64),
+    socketGeneration: 1,
+    bindingId: "receipt-binding",
+    bindingFingerprint: "c".repeat(64),
   };
   assert.equal(registry.adoptBinding(receiptAuthority), true);
-  const lease = registry.acquireActivity({
-    ...receiptAuthority,
-    bindingFingerprint: "c".repeat(64),
-  });
+  const lease = registry.acquireActivity(receiptAuthority);
   assert.equal(lease.isCurrent(), true);
   assert.equal(registry.retireBinding({
     ...receiptAuthority,
@@ -67,6 +67,79 @@ test("receipt authority retirement invalidates exact activity only", () => {
   assert.equal(registry.retireBinding(receiptAuthority), true);
   assert.equal(lease.isCurrent(), false);
   assert.deepEqual(registry.snapshot(), []);
+});
+
+test("receipt activities require the exact socket, binding, and fingerprint", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  const receipt = {
+    authorityEpoch: 2,
+    fenceGeneration: 3,
+    hostId: "host-a",
+    mappingId: "mapping-receipt",
+    mappingGeneration: 4,
+    mappingVersion: 1,
+    workspaceId: "workspace-receipt",
+    workspaceGeneration: 5,
+    sourcePlatform: "posix",
+    authorityFingerprint: "a".repeat(64),
+    inventoryGeneration: 6,
+    inventoryFingerprint: "b".repeat(64),
+    socketGeneration: 1,
+    bindingId: "ab",
+    bindingFingerprint: "c".repeat(64),
+  };
+  assert.equal(registry.adoptBinding(receipt), true);
+  const lease = registry.acquireActivity(receipt);
+  assert.equal(lease.isCurrent(), true);
+  assert.throws(
+    () => registry.acquireActivity({ ...receipt, bindingId: "a" }),
+    (error) => error.code === PROTOCOL_ERROR_CODES.LEASE_CONFLICT
+  );
+  const replacement = { ...receipt, socketGeneration: 2 };
+  assert.equal(registry.adoptBinding(replacement), true);
+  assert.equal(lease.isCurrent(), false);
+  lease.release();
+  const current = registry.acquireActivity(replacement);
+  assert.equal(current.isCurrent(), true);
+});
+
+test("receipt identity rotates on inventory or socket fence advancement", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  const first = {
+    authorityEpoch: 1,
+    fenceGeneration: 1,
+    hostId: "host-a",
+    mappingId: "mapping-a",
+    mappingGeneration: 1,
+    mappingVersion: 1,
+    workspaceId: "workspace-a",
+    workspaceGeneration: 1,
+    sourcePlatform: "posix",
+    authorityFingerprint: "a".repeat(64),
+    inventoryGeneration: 1,
+    inventoryFingerprint: "b".repeat(64),
+    socketGeneration: 1,
+    bindingId: "binding-a",
+    bindingFingerprint: "c".repeat(64),
+  };
+  assert.equal(registry.adoptBinding(first), true);
+  const inventorySuccessor = {
+    ...first,
+    inventoryGeneration: 2,
+    inventoryFingerprint: "d".repeat(64),
+    bindingId: "binding-b",
+    bindingFingerprint: "e".repeat(64),
+  };
+  assert.equal(registry.adoptBinding(inventorySuccessor), true);
+  const socketSuccessor = {
+    ...inventorySuccessor,
+    socketGeneration: 2,
+    bindingId: "binding-c",
+    bindingFingerprint: "f".repeat(64),
+  };
+  assert.equal(registry.adoptBinding(socketSuccessor), true);
+  const lease = registry.acquireActivity(socketSuccessor);
+  assert.equal(lease.isCurrent(), true);
 });
 
 test("activity leases share one fence for the same immutable binding identity", () => {

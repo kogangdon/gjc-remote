@@ -18,6 +18,35 @@ function leaseConflict() {
   return error;
 }
 
+function normalizeReceiptIdentity(receiptIdentity) {
+  if (
+    !receiptIdentity ||
+    typeof receiptIdentity !== "object" ||
+    !Number.isSafeInteger(receiptIdentity.socketGeneration) ||
+    receiptIdentity.socketGeneration < 1 ||
+    typeof receiptIdentity.bindingId !== "string" ||
+    receiptIdentity.bindingId.length === 0 ||
+    !/^[0-9a-f]{64}$/.test(receiptIdentity.bindingFingerprint)
+  ) {
+    throw new TypeError("receiptIdentity is invalid");
+  }
+  return Object.freeze({
+    socketGeneration: receiptIdentity.socketGeneration,
+    bindingId: receiptIdentity.bindingId,
+    bindingFingerprint: receiptIdentity.bindingFingerprint,
+  });
+}
+
+function receiptIdentityKey(receiptIdentity) {
+  // JSON array preserves field boundaries, so A/B/C cannot concatenate into
+  // the same managed identity.
+  return `receipt:${JSON.stringify([
+    receiptIdentity.socketGeneration,
+    receiptIdentity.bindingId,
+    receiptIdentity.bindingFingerprint,
+  ])}`;
+}
+
 function normalizeCanonicalWorkDir(workDir, platform) {
   if (platform !== "win32") return workDir;
   return workDir
@@ -62,6 +91,9 @@ export class SessionPool {
     this.maxSessions = maxSessions;
     this.pendingOperations = new Map();
     this.sessionTransitions = new Map();
+    this.failedManagedDisposals = new Set();
+    this.pendingManagedDisposals = new Set();
+    this.retiringReceiptIdentities = new Set();
     this.reapTimer = this.setIntervalFn(() => {
       void this.#reapIdle().catch((error) =>
         console.error(`SessionPool: idle reap failed: ${this.#sanitize(error)}`)
@@ -189,12 +221,22 @@ export class SessionPool {
     const error = new Error("prior managed session could not be fenced");
     error.code = "LEASE_CONFLICT";
     if (result.status === "timed_out") {
-      error.pendingCleanup = disposal.settlement;
+      error.pendingCleanup = disposal.settlement.then((settlement) => {
+        if (settlement.status === "rejected") {
+          this.failedManagedDisposals.add(workDir);
+          throw leaseConflict();
+        }
+        return settlement;
+      });
+    } else {
+      // A rejected dispose has no later settlement that can establish the
+      // session is gone. Do not retry into a potentially live SDK session.
+      this.failedManagedDisposals.add(workDir);
     }
     throw error;
   }
 
-  async #createSessionBounded(workDir) {
+  async #createSessionBounded(workDir, managed) {
     const pending = Promise.resolve().then(() => this.sessionFactory(workDir));
     const result = await this.#settleBounded(pending, this.sessionCreateTimeoutMs);
     if (result.status === "fulfilled") return result.value;
@@ -206,18 +248,24 @@ export class SessionPool {
         const disposal = this.#startDispose(session, workDir, "late-created");
         const result = await disposal.bounded;
         if (result.status === "rejected") {
+          if (managed) this.failedManagedDisposals.add(workDir);
           console.error(
             `SessionPool: failed to dispose late-created session for ${this.#sanitize(
               workDir
             )}: ` + this.#sanitize(result.reason)
           );
+          if (managed) throw leaseConflict();
         } else if (result.status === "timed_out") {
           console.error(
             `SessionPool: late-created session disposal timed out for ${this.#sanitize(
               workDir
             )}`
           );
-          await disposal.settlement;
+          const settlement = await disposal.settlement;
+          if (managed && settlement.status === "rejected") {
+            this.failedManagedDisposals.add(workDir);
+            throw leaseConflict();
+          }
         }
       },
       () => {}
@@ -259,7 +307,10 @@ export class SessionPool {
         }
       }
       if (priorSession) {
-        if (existing?.managedIdentity !== managedIdentity) {
+        if (
+          existing?.managedIdentity !== managedIdentity ||
+          managedIdentity !== undefined
+        ) {
           await this.#disposeForReplacement(priorSession, canonicalWorkDir);
         } else {
           await this.#disposeIgnoringFailure(
@@ -270,7 +321,10 @@ export class SessionPool {
         }
       }
 
-      const session = await this.#createSessionBounded(canonicalWorkDir);
+      const session = await this.#createSessionBounded(
+        canonicalWorkDir,
+        managedIdentity !== undefined
+      );
       if (this.closed) {
         await this.#disposeIgnoringFailure(session, canonicalWorkDir, "late-created");
         throw new Error("SessionPool was shut down during session creation");
@@ -296,13 +350,28 @@ export class SessionPool {
     }
   }
 
-  async ensureSession(workDir, { managedIdentity } = {}) {
+  async ensureSession(workDir, { managedIdentity, receiptIdentity } = {}) {
     if (this.closed) throw new Error("SessionPool is shut down");
+    if (managedIdentity !== undefined && receiptIdentity !== undefined) {
+      throw new TypeError("managedIdentity and receiptIdentity are mutually exclusive");
+    }
     if (
       managedIdentity !== undefined &&
       (typeof managedIdentity !== "string" || managedIdentity.length === 0)
     ) {
       throw new TypeError("managedIdentity must be a non-empty string");
+    }
+    const normalizedReceiptIdentity = receiptIdentity === undefined
+      ? undefined
+      : normalizeReceiptIdentity(receiptIdentity);
+    const effectiveManagedIdentity = normalizedReceiptIdentity === undefined
+      ? managedIdentity
+      : receiptIdentityKey(normalizedReceiptIdentity);
+    if (
+      effectiveManagedIdentity !== undefined &&
+      this.retiringReceiptIdentities.has(effectiveManagedIdentity)
+    ) {
+      throw leaseConflict();
     }
 
     const requestedWorkDir = validateNativeWorkDir(workDir, this.platform);
@@ -331,14 +400,20 @@ export class SessionPool {
     }
 
     const active = this.sessionTransitions.get(canonicalWorkDir);
+    if (
+      this.failedManagedDisposals.has(canonicalWorkDir) ||
+      this.pendingManagedDisposals.has(canonicalWorkDir)
+    ) {
+      throw leaseConflict();
+    }
     if (active) {
       if (
         active.managedIdentity === undefined &&
-        managedIdentity === undefined
+        effectiveManagedIdentity === undefined
       ) {
         return await this.#ensureCanonicalSession(canonicalWorkDir, managedIdentity);
       }
-      if (active.managedIdentity === managedIdentity) {
+      if (active.managedIdentity === effectiveManagedIdentity) {
         return await active.operation;
       }
       throw leaseConflict();
@@ -346,9 +421,9 @@ export class SessionPool {
 
     const rawOperation = this.#ensureCanonicalSession(
       canonicalWorkDir,
-      managedIdentity
+      effectiveManagedIdentity
     );
-    const transition = { managedIdentity, operation: undefined };
+    const transition = { managedIdentity: effectiveManagedIdentity, operation: undefined };
     const clearTransition = () => {
       if (this.sessionTransitions.get(canonicalWorkDir) === transition) {
         this.sessionTransitions.delete(canonicalWorkDir);
@@ -361,7 +436,7 @@ export class SessionPool {
       },
       (error) => {
         if (error?.pendingCleanup) {
-          void error.pendingCleanup.then(clearTransition);
+          void error.pendingCleanup.then(clearTransition, clearTransition);
         } else {
           clearTransition();
         }
@@ -371,6 +446,69 @@ export class SessionPool {
     transition.operation = operation;
     this.sessionTransitions.set(canonicalWorkDir, transition);
     return await operation;
+  }
+
+  async retireManagedReceipt(workDir, receiptIdentity) {
+    if (this.closed) return;
+    const identity = receiptIdentityKey(normalizeReceiptIdentity(receiptIdentity));
+    if (this.retiringReceiptIdentities.has(identity)) return;
+    this.retiringReceiptIdentities.add(identity);
+    const transitionMatch = [...this.sessionTransitions.entries()].find(
+      ([, transition]) => transition.managedIdentity === identity
+    );
+    const transition = transitionMatch?.[1];
+    if (transition) {
+      try {
+        await transition.operation;
+      } catch (error) {
+        if (!error?.pendingCleanup) {
+          this.retiringReceiptIdentities.delete(identity);
+          return;
+        }
+        try {
+          await error.pendingCleanup;
+        } catch {
+          throw leaseConflict();
+        }
+      }
+    }
+    const sessionMatch = [...this.sessions.entries()].find(
+      ([, entry]) => entry.managedIdentity === identity
+    );
+    if (!sessionMatch) {
+      this.retiringReceiptIdentities.delete(identity);
+      return;
+    }
+    const [canonicalWorkDir, entry] = sessionMatch;
+    this.sessions.delete(canonicalWorkDir);
+    const session = entry.session ?? await entry.creation;
+    this.pendingManagedDisposals.add(canonicalWorkDir);
+    const disposal = this.#startDispose(
+      session,
+      canonicalWorkDir,
+      "receipt retirement"
+    );
+    const result = await disposal.bounded;
+    if (result.status === "fulfilled") {
+      this.pendingManagedDisposals.delete(canonicalWorkDir);
+      this.retiringReceiptIdentities.delete(identity);
+      return;
+    }
+    const error = leaseConflict();
+    if (result.status === "timed_out") {
+      error.pendingCleanup = disposal.settlement.then((settlement) => {
+        this.pendingManagedDisposals.delete(canonicalWorkDir);
+        if (settlement.status === "fulfilled") {
+          this.retiringReceiptIdentities.delete(identity);
+        } else {
+          this.failedManagedDisposals.add(canonicalWorkDir);
+        }
+      });
+    } else {
+      this.pendingManagedDisposals.delete(canonicalWorkDir);
+      this.failedManagedDisposals.add(canonicalWorkDir);
+    }
+    throw error;
   }
 
   async shutdown() {
