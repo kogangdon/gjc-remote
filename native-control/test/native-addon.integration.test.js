@@ -773,6 +773,8 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(inventoryPublish, /if \(published \|\| GetLastError\(\) != ERROR_FILE_EXISTS\) break/);
   assert.match(source, /BCryptGenRandom\(nullptr, bytes\.data\(\), static_cast<ULONG>\(bytes\.size\(\)\),/);
   assert.match(source, /std::array<unsigned char, 16> bytes/);
+  assert.match(source, /!directory \|\| HasEmptyInventoryDefaultAcl\(fd\)/,
+    "default ACL proof applies to directories; regular files have no default ACL namespace");
   assert.doesNotMatch(source, /GetTickCount64|GetCurrentProcessId/,
     "Windows temporary names must not derive from process or clock state");
   const inventoryFenceStart = source.indexOf("napi_value AcquireInventoryFenceWindows");
@@ -785,6 +787,10 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(inventoryFence, /napi_reference_ref\(e, fence->object_ref/);
   assert.match(inventoryFence, /napi_reference_unref\(ce, item->fence->object_ref/);
   assert.match(inventoryFence, /if \(fence->release_promise\)/);
+  assert.match(inventoryFence, /CreateInventoryAsyncWork\(\s*env, "inventory\.acquire_fence"/);
+  assert.match(inventoryFence, /CreateInventoryAsyncWork\(\s*e, "inventory\.release_fence"/);
+  assert.match(source, /CreateInventoryAsyncWork\(\s*env, "inventory\.acquire_fence", AcquireFenceExecute/);
+  assert.match(source, /CreateInventoryAsyncWork\(\s*release_env, "inventory\.release_fence"/);
   assert.match(source, /if \(!fence->released\.exchange\(true\) && fence->handle != INVALID_HANDLE_VALUE\)/);
   assert.match(source, /if \(work->fence->released\.exchange\(true\) \|\| work->fence->handle == INVALID_HANDLE_VALUE\) return/);
   const posixPublishStart = source.indexOf("napi_value PublishInventoryObjectAtomicPosix");
