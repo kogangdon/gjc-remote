@@ -3998,9 +3998,10 @@ bool HasEmptyInventoryDefaultAcl(int fd) {
 #ifdef __linux__
   const std::string descriptor_path = "/proc/self/fd/" + std::to_string(fd);
   acl_t defaults = acl_get_file(descriptor_path.c_str(), ACL_TYPE_DEFAULT);
-  if (!defaults) return errno == ENODATA || errno == EINVAL;
+  if (!defaults) return false;
   acl_entry_t entry;
-  const bool empty = acl_get_entry(defaults, ACL_FIRST_ENTRY, &entry) != 1;
+  const bool empty =
+      acl_get_entry(defaults, ACL_FIRST_ENTRY, &entry) == 0;
   acl_free(defaults);
   return empty;
 #else

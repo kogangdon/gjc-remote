@@ -775,6 +775,10 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /std::array<unsigned char, 16> bytes/);
   assert.match(source, /!directory \|\| HasEmptyInventoryDefaultAcl\(fd\)/,
     "default ACL proof applies to directories; regular files have no default ACL namespace");
+  assert.match(source, /acl_get_entry\(defaults, ACL_FIRST_ENTRY, &entry\) == 0/,
+    "directory default ACL absence requires a successful zero-entry query");
+  assert.doesNotMatch(source, /errno == ENODATA \|\| errno == EINVAL/,
+    "default ACL query errors are never accepted as absence");
   assert.doesNotMatch(source, /GetTickCount64|GetCurrentProcessId/,
     "Windows temporary names must not derive from process or clock state");
   const inventoryFenceStart = source.indexOf("napi_value AcquireInventoryFenceWindows");
