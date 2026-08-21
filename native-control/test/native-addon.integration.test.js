@@ -138,6 +138,19 @@ test("Windows inventory rejects UNC and malformed roots while returning exact lo
     });
     invalid("read_inventory_object", () =>
       addon.read_inventory_object(root, 0, throwingProxyRoles, "inventory-file"));
+    let proxyValueRead = false;
+    const descriptorProxyRoles = new Proxy(
+      { management: {}, bot: {}, recovery: {}, daemon: {}, system: {} },
+      {
+        get(target, property, receiver) {
+          proxyValueRead = true;
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    invalid("read_inventory_object", () =>
+      addon.read_inventory_object(root, 0, descriptorProxyRoles, "inventory-file"));
+    assert.equal(proxyValueRead, false, "validated descriptor values must be snapshotted");
     t.diagnostic("Positive Windows inventory ACL/fence/publication evidence requires the owned four-distinct-account fixture; this test makes no unproven success claim.");
   } finally {
     await rm(root, { recursive: true, force: true });

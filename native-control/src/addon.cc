@@ -2599,7 +2599,8 @@ bool InventoryBufferArg(napi_env env, napi_callback_info info, size_t index, std
 napi_ref gInventoryObjectPrototype = nullptr;
 napi_ref gInventoryGetOwnPropertyDescriptors = nullptr;
 
-bool InventoryOrdinaryDataObject(napi_env env, napi_value value, const char* const* names, size_t expected) {
+bool InventoryOrdinaryDataObject(napi_env env, napi_value value, const char* const* names,
+                                 size_t expected, napi_value* captured = nullptr) {
   auto invalid = [&]() {
     bool pending = false;
     if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
@@ -2624,7 +2625,7 @@ bool InventoryOrdinaryDataObject(napi_env env, napi_value value, const char* con
   if (napi_call_function(env, object_prototype, get_descriptors, 1, &value, &descriptors) != napi_ok)
     return invalid();
   for (size_t i = 0; i < expected; ++i) {
-    napi_value descriptor, enumerable;
+    napi_value descriptor, enumerable, descriptor_value;
     bool flag = false, has_getter = false, has_setter = false;
     if (napi_get_named_property(env, descriptors, names[i], &descriptor) != napi_ok ||
         napi_typeof(env, descriptor, &type) != napi_ok || type != napi_object ||
@@ -2632,8 +2633,10 @@ bool InventoryOrdinaryDataObject(napi_env env, napi_value value, const char* con
         napi_get_value_bool(env, enumerable, &flag) != napi_ok || !flag ||
         napi_has_named_property(env, descriptor, "value", &flag) != napi_ok || !flag ||
         napi_has_named_property(env, descriptor, "get", &has_getter) != napi_ok || has_getter ||
-        napi_has_named_property(env, descriptor, "set", &has_setter) != napi_ok || has_setter)
+        napi_has_named_property(env, descriptor, "set", &has_setter) != napi_ok || has_setter ||
+        napi_get_named_property(env, descriptor, "value", &descriptor_value) != napi_ok)
       return invalid();
+    if (captured) captured[i] = descriptor_value;
   }
   return true;
 }
@@ -2669,34 +2672,20 @@ bool CanonicalUserSid(const std::string& text, bool system) {
   return ok && exact;
 }
 bool InventoryRole(napi_env env, napi_value value, std::string* result, bool system) {
-  napi_valuetype type; napi_value keys, kind, sid; uint32_t count = 0; bool a = false, b = false;
-  napi_value key;
+  napi_value captured[2];
   const char* fields[] = {"kind", "value"};
-  if (!InventoryOrdinaryDataObject(env, value, fields, 2) ||
-      napi_typeof(env, value, &type) != napi_ok || type != napi_object ||
-      napi_get_property_names(env, value, &keys) != napi_ok || napi_get_array_length(env, keys, &count) != napi_ok ||
-      count != 2 || napi_get_named_property(env, value, "kind", &kind) != napi_ok ||
-      napi_get_named_property(env, value, "value", &sid) != napi_ok) return false;
-  napi_create_string_utf8(env, "kind", NAPI_AUTO_LENGTH, &key);
-  if (napi_has_own_property(env, value, key, &a) != napi_ok || !a) return false;
-  napi_create_string_utf8(env, "value", NAPI_AUTO_LENGTH, &key);
-  if (napi_has_own_property(env, value, key, &b) != napi_ok || !b) return false;
-  std::string k; return InventoryString(env, kind, &k) && InventoryString(env, sid, result) &&
+  if (!InventoryOrdinaryDataObject(env, value, fields, 2, captured)) return false;
+  std::string k; return InventoryString(env, captured[0], &k) &&
+      InventoryString(env, captured[1], result) &&
       k == "sid" && CanonicalUserSid(*result, system);
 }
 bool InventoryRolesArg(napi_env env, napi_value value, InventoryRoles* roles) {
-  napi_valuetype type; napi_value keys; uint32_t count = 0;
+  napi_value captured[5];
   const char* fields[] = {"management", "bot", "recovery", "daemon", "system"};
-  if (!InventoryOrdinaryDataObject(env, value, fields, 5) ||
-      napi_typeof(env, value, &type) != napi_ok || type != napi_object ||
-      napi_get_property_names(env, value, &keys) != napi_ok || napi_get_array_length(env, keys, &count) != napi_ok || count != 5) return false;
-  const char* names[] = {"management", "bot", "recovery", "daemon", "system"};
+  if (!InventoryOrdinaryDataObject(env, value, fields, 5, captured)) return false;
   std::string* values[] = {&roles->management, &roles->bot, &roles->recovery, &roles->daemon, &roles->system};
-  for (size_t i = 0; i != 5; ++i) { napi_value v, key; bool own = false;
-    napi_create_string_utf8(env, names[i], NAPI_AUTO_LENGTH, &key);
-    if (napi_has_own_property(env, value, key, &own) != napi_ok || !own ||
-        napi_get_named_property(env, value, names[i], &v) != napi_ok || !InventoryRole(env, v, values[i], i == 4)) return false;
-  }
+  for (size_t i = 0; i != 5; ++i)
+    if (!InventoryRole(env, captured[i], values[i], i == 4)) return false;
   const std::string all[] = {roles->management, roles->bot, roles->recovery, roles->daemon, roles->system};
   for (size_t i = 0; i != 5; ++i) for (size_t j = i + 1; j != 5; ++j) if (all[i] == all[j]) return false;
   return true;
@@ -2814,15 +2803,16 @@ void InventoryIdentityValue(napi_env env, napi_value result, HANDLE handle) {
 }
 bool InventoryIdentityArg(napi_env env, napi_value object, HANDLE handle) {
   const char* fields[] = {"volumeSerial", "fileId", "attributes", "owner"};
-  if (!InventoryOrdinaryDataObject(env, object, fields, 4)) return false;
+  napi_value captured[4];
+  if (!InventoryOrdinaryDataObject(env, object, fields, 4, captured)) return false;
   napi_value actual; napi_create_object(env, &actual); InventoryIdentityValue(env, actual, handle);
-  napi_value keys; uint32_t count = 0;
-  if (napi_get_property_names(env, object, &keys) != napi_ok || napi_get_array_length(env, keys, &count) != napi_ok || count != 4) return false;
   const char* names[] = {"volumeSerial", "fileId", "attributes", "owner"};
-  for (const char* name : names) { napi_value a, b; bool own = false;
-    if (napi_get_named_property(env, object, name, &a) != napi_ok || napi_get_named_property(env, actual, name, &b) != napi_ok) return false;
-    napi_value key; napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &key); napi_has_own_property(env, object, key, &own);
-    bool equal = false; napi_strict_equals(env, a, b, &equal); if (!own || !equal) return false;
+  for (size_t index = 0; index < 4; ++index) {
+    napi_value actual_value;
+    if (napi_get_named_property(env, actual, names[index], &actual_value) != napi_ok) return false;
+    bool equal = false;
+    if (napi_strict_equals(env, captured[index], actual_value, &equal) != napi_ok || !equal)
+      return false;
   } return true;
 }
 bool WindowsInventoryBytesEqual(HANDLE handle, const std::vector<uint8_t>& expected) {
@@ -3046,6 +3036,47 @@ bool VerifyInventoryBaseWindows(const InventoryRoles& roles, const std::string& 
   if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
   return exact;
 }
+bool OpenInventoryParentBoundWindows(const std::string& path, const InventoryRoles& roles,
+                                     const std::string& profile, DWORD access,
+                                     HANDLE* parent, std::wstring* name) {
+  PWSTR program_data = nullptr;
+  if (FAILED(SHGetKnownFolderPath(
+          FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &program_data))) return false;
+  const std::string base_path = Utf8(program_data) +
+      (std::string(InventoryParentProfile(profile)) == "reader-directory" ?
+          "\\gjc-remote\\native-reader" : "\\gjc-remote\\native");
+  CoTaskMemFree(program_data);
+  if (path.rfind(base_path + "\\", 0) != 0) return false;
+  const std::string relative = path.substr(base_path.size() + 1);
+  const std::wstring host = Wide(relative.substr(0, 64));
+  const bool host_target = relative.size() == 64;
+  HANDLE base = OpenWindowsPathNoFollow(base_path,
+      READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE |
+          (host_target ? access : 0),
+      VerifiedObjectType::Directory);
+  if (base == INVALID_HANDLE_VALUE ||
+      !VerifyInventoryAcl(base, roles, InventoryParentProfile(profile))) {
+    if (base != INVALID_HANDLE_VALUE) CloseHandle(base);
+    return false;
+  }
+  if (host_target) {
+    *parent = base;
+    *name = host;
+    return true;
+  }
+  HANDLE host_root = OpenWindowsRelative(base, host,
+      READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | access,
+      kFileOpen, VerifiedObjectType::Directory);
+  CloseHandle(base);
+  if (host_root == INVALID_HANDLE_VALUE ||
+      !VerifyInventoryAcl(host_root, roles, InventoryParentProfile(profile))) {
+    if (host_root != INVALID_HANDLE_VALUE) CloseHandle(host_root);
+    return false;
+  }
+  *parent = host_root;
+  *name = Wide(relative.substr(65));
+  return true;
+}
 napi_value EnsureInventoryDirectoryWindows(napi_env env, napi_callback_info info) {
   napi_value args[3]; std::string path, profile; InventoryRoles roles{};
   if (!InventoryArgs(env, info, 3, args) || !InventoryString(env, args[0], &path) || !InventoryRolesArg(env, args[1], &roles) ||
@@ -3064,7 +3095,10 @@ napi_value EnsureInventoryDirectoryWindows(napi_env env, napi_callback_info info
     CloseHandle(existing); if (!ok) InventoryError(env, "INVENTORY_ACCESS_DENIED", "ensure_inventory_directory"); return ok ? result : nullptr;
   }
   HANDLE parent; std::wstring name;
-  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsMutationParentAccess)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "ensure_inventory_directory"); return nullptr; }
+  if (!OpenInventoryParentBoundWindows(
+          path, roles, profile, kWindowsMutationParentAccess, &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "ensure_inventory_directory"); return nullptr;
+  }
   if (!VerifyInventoryAcl(parent, roles, InventoryParentProfile(profile))) {
     CloseHandle(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "ensure_inventory_directory"); return nullptr;
   }
@@ -3121,8 +3155,16 @@ napi_value VerifyInventoryAclWindows(napi_env env, napi_callback_info info) {
   if (!InventoryArgs(env, info, 3, args) || !InventoryString(env, args[0], &path) || !InventoryRolesArg(env, args[1], &roles) ||
       !InventoryString(env, args[2], &profile) || !InventoryPath(path, profile) || !CurrentInventoryActor(roles, true, true, true, true)) { InventoryError(env, "INVENTORY_INVALID", "verify_inventory_acl"); return nullptr; }
   if (!VerifyInventoryBaseWindows(roles, profile)) { InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr; }
-  HANDLE h = OpenWindowsPathNoFollow(path, READ_CONTROL | FILE_READ_ATTRIBUTES, profile.find("directory") != std::string::npos ? VerifiedObjectType::Directory : VerifiedObjectType::File);
-  const bool ok = h != INVALID_HANDLE_VALUE && VerifyInventoryAcl(h, roles, profile); if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+  HANDLE parent = INVALID_HANDLE_VALUE;
+  std::wstring name;
+  const bool directory = profile.find("directory") != std::string::npos;
+  HANDLE h = OpenInventoryParentBoundWindows(path, roles, profile, 0, &parent, &name) ?
+      OpenWindowsRelative(parent, name, READ_CONTROL | FILE_READ_ATTRIBUTES,
+          kFileOpen, directory ? VerifiedObjectType::Directory : VerifiedObjectType::File) :
+      INVALID_HANDLE_VALUE;
+  const bool ok = h != INVALID_HANDLE_VALUE && VerifyInventoryAcl(h, roles, profile);
+  if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+  if (parent != INVALID_HANDLE_VALUE) CloseHandle(parent);
   if (!ok) { InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr; } napi_value result; napi_get_boolean(env, true, &result); return result;
 }
 napi_value ReadInventoryObjectWindows(napi_env env, napi_callback_info info) {
@@ -3135,7 +3177,10 @@ napi_value ReadInventoryObjectWindows(napi_env env, napi_callback_info info) {
   }
   if (!VerifyInventoryBaseWindows(roles, profile)) { InventoryError(env, "INVENTORY_ACCESS_DENIED", "read_inventory_object"); return nullptr; }
   HANDLE parent; std::wstring name;
-  if (!OpenWindowsParentNoFollow(path, &parent, &name)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "read_inventory_object"); return nullptr; }
+  if (!OpenInventoryParentBoundWindows(
+          path, roles, profile, 0, &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "read_inventory_object"); return nullptr;
+  }
   if (!VerifyInventoryAcl(parent, roles, InventoryParentProfile(profile))) {
     CloseHandle(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "read_inventory_object"); return nullptr;
   }
@@ -3225,8 +3270,8 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
       !InventoryPath(path, "inventory-fence") || !CurrentInventoryActor(roles, true, true)) { InventoryError(env, "INVENTORY_INVALID", "acquire_inventory_fence"); return nullptr; }
   if (!VerifyInventoryBaseWindows(roles, "inventory-fence")) { InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr; }
   HANDLE verified_parent = INVALID_HANDLE_VALUE; std::wstring verified_name;
-  if (!OpenWindowsParentNoFollow(path, &verified_parent, &verified_name) ||
-      !VerifyInventoryAcl(verified_parent, roles, "inventory-directory")) {
+  if (!OpenInventoryParentBoundWindows(
+          path, roles, "inventory-fence", 0, &verified_parent, &verified_name)) {
     if (verified_parent != INVALID_HANDLE_VALUE) CloseHandle(verified_parent);
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
   }
@@ -3238,8 +3283,9 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
   if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND &&
       CurrentInventoryActor(roles, true, false)) {
     HANDLE parent = INVALID_HANDLE_VALUE; std::wstring name;
-    if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsChildMutationParentAccess)) {
-      InventoryError(env, "CONTAINMENT_UNSUPPORTED", "acquire_inventory_fence"); return nullptr;
+    if (!OpenInventoryParentBoundWindows(path, roles, "inventory-fence",
+            kWindowsChildMutationParentAccess, &parent, &name)) {
+      InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
     }
     if (!VerifyInventoryAcl(parent, roles, "inventory-directory")) {
       CloseHandle(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
@@ -3370,7 +3416,10 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
   }
   if (!VerifyInventoryBaseWindows(roles, profile)) { InventoryError(env, "INVENTORY_ACCESS_DENIED", "publish_inventory_object_atomic"); return nullptr; }
   HANDLE parent; std::wstring name;
-  if (!OpenWindowsParentNoFollow(path, &parent, &name, kWindowsChildMutationParentAccess)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "publish_inventory_object_atomic"); return nullptr; }
+  if (!OpenInventoryParentBoundWindows(
+          path, roles, profile, kWindowsChildMutationParentAccess, &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "publish_inventory_object_atomic"); return nullptr;
+  }
   if (!VerifyInventoryAcl(parent, roles, InventoryParentProfile(profile))) {
     CloseHandle(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "publish_inventory_object_atomic"); return nullptr;
   }
@@ -3698,46 +3747,22 @@ bool InventoryRandomName(std::string* value) {
 }
 
 bool InventoryRole(napi_env env, napi_value value, uid_t* uid) {
-  napi_valuetype type;
-  napi_value kind, principal, keys;
+  napi_value captured[2];
   const char* fields[] = {"kind", "value"};
-  if (!InventoryOrdinaryDataObject(env, value, fields, 2) ||
-      napi_typeof(env, value, &type) != napi_ok || type != napi_object ||
-      napi_get_property_names(env, value, &keys) != napi_ok ||
-      napi_get_named_property(env, value, "kind", &kind) != napi_ok ||
-      napi_get_named_property(env, value, "value", &principal) != napi_ok) return false;
-  uint32_t count = 0;
-  bool has_kind = false, has_value = false;
-  napi_value name;
-  napi_create_string_utf8(env, "kind", NAPI_AUTO_LENGTH, &name);
-  if (napi_get_array_length(env, keys, &count) != napi_ok || count != 2 ||
-      napi_has_own_property(env, value, name, &has_kind) != napi_ok || !has_kind) return false;
-  napi_create_string_utf8(env, "value", NAPI_AUTO_LENGTH, &name);
-  if (napi_has_own_property(env, value, name, &has_value) != napi_ok || !has_value) return false;
+  if (!InventoryOrdinaryDataObject(env, value, fields, 2, captured)) return false;
   std::string kind_text, principal_text;
-  return InventoryString(env, kind, &kind_text) && InventoryString(env, principal, &principal_text) &&
+  return InventoryString(env, captured[0], &kind_text) &&
+      InventoryString(env, captured[1], &principal_text) &&
       kind_text == "uid" && ParseUid(principal_text, uid);
 }
 
 bool InventoryRolesArg(napi_env env, napi_value value, InventoryRoles* roles) {
-  napi_valuetype type;
+  napi_value captured[5];
   const char* fields[] = {"management", "bot", "recovery", "daemon", "system"};
-  if (!InventoryOrdinaryDataObject(env, value, fields, 5) ||
-      napi_typeof(env, value, &type) != napi_ok || type != napi_object) return false;
-  const char* names[] = {"management", "bot", "recovery", "daemon", "system"};
+  if (!InventoryOrdinaryDataObject(env, value, fields, 5, captured)) return false;
   uid_t* values[] = {&roles->management, &roles->bot, &roles->recovery, &roles->daemon, &roles->system};
-  napi_value keys;
-  if (napi_get_property_names(env, value, &keys) != napi_ok) return false;
-  uint32_t count = 0;
-  if (napi_get_array_length(env, keys, &count) != napi_ok || count != 5) return false;
-  for (size_t i = 0; i < 5; ++i) {
-    napi_value member, name;
-    bool has = false;
-    napi_create_string_utf8(env, names[i], NAPI_AUTO_LENGTH, &name);
-    if (napi_has_own_property(env, value, name, &has) != napi_ok || !has ||
-        napi_get_named_property(env, value, names[i], &member) != napi_ok ||
-        !InventoryRole(env, member, values[i])) return false;
-  }
+  for (size_t i = 0; i < 5; ++i)
+    if (!InventoryRole(env, captured[i], values[i])) return false;
   const uid_t all[] = {roles->management, roles->bot, roles->recovery, roles->daemon, roles->system};
   if (roles->system != 0) return false;
   for (size_t i = 0; i < 5; ++i) {
@@ -3882,6 +3907,36 @@ const char* InventoryBasePath(const std::string& profile) {
       "/var/lib/gjc-remote/native-reader" : "/var/lib/gjc-remote/native";
 }
 
+bool OpenInventoryParentBoundPosix(const std::string& path, const InventoryRoles& roles,
+                                   const std::string& profile, int* parent,
+                                   std::string* name) {
+  const std::string base_path = InventoryBasePath(profile);
+  if (path.rfind(base_path + "/", 0) != 0) return false;
+  const std::string relative = path.substr(base_path.size() + 1);
+  const std::string host = relative.substr(0, 64);
+  int base = OpenDirectoryNoFollow(base_path);
+  if (base < 0 || !VerifyInventoryAclExact(
+          base, roles, InventoryParentProfile(profile))) {
+    if (base >= 0) close(base);
+    return false;
+  }
+  if (relative.size() == 64) {
+    *parent = base;
+    *name = host;
+    return true;
+  }
+  int host_root = OpenObjectNoFollow(base, host, O_RDONLY | O_DIRECTORY);
+  close(base);
+  if (host_root < 0 || !VerifyInventoryAclExact(
+          host_root, roles, InventoryParentProfile(profile))) {
+    if (host_root >= 0) close(host_root);
+    return false;
+  }
+  *parent = host_root;
+  *name = relative.substr(65);
+  return true;
+}
+
 void InventoryIdentity(napi_env env, napi_value value, const struct stat& st) {
   napi_value part;
   const std::string device = std::to_string(static_cast<uint64_t>(st.st_dev));
@@ -3894,22 +3949,9 @@ void InventoryIdentity(napi_env env, napi_value value, const struct stat& st) {
 }
 
 bool InventoryIdentityArg(napi_env env, napi_value value, const struct stat& st) {
-  napi_valuetype type;
   const char* expected_fields[] = {"device", "inode", "mode", "owner"};
-  if (!InventoryOrdinaryDataObject(env, value, expected_fields, 4) ||
-      napi_typeof(env, value, &type) != napi_ok || type != napi_object) return false;
-  napi_value keys;
-  uint32_t count = 0;
-  if (napi_get_property_names(env, value, &keys) != napi_ok ||
-      napi_get_array_length(env, keys, &count) != napi_ok || count != 4) return false;
-  const char* names[] = {"device", "inode", "mode", "owner"};
   napi_value fields[4];
-  for (size_t i = 0; i < 4; ++i) {
-    napi_value name; bool own = false;
-    napi_create_string_utf8(env, names[i], NAPI_AUTO_LENGTH, &name);
-    if (napi_has_own_property(env, value, name, &own) != napi_ok || !own ||
-        napi_get_named_property(env, value, names[i], &fields[i]) != napi_ok) return false;
-  }
+  if (!InventoryOrdinaryDataObject(env, value, expected_fields, 4, fields)) return false;
   std::string device, inode, owner;
   uint32_t mode = 0;
   return InventoryString(env, fields[0], &device) && InventoryString(env, fields[1], &inode) &&
@@ -3990,7 +4032,9 @@ napi_value EnsureInventoryDirectoryPosix(napi_env env, napi_callback_info info) 
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "ensure_inventory_directory"); return nullptr;
   }
   int parent = -1; std::string name;
-  if (!OpenParentNoFollow(path, &parent, &name)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "ensure_inventory_directory"); return nullptr; }
+  if (!OpenInventoryParentBoundPosix(path, roles, profile, &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "ensure_inventory_directory"); return nullptr;
+  }
   int fd = OpenObjectNoFollow(parent, name, O_RDONLY | O_DIRECTORY);
   if (fd >= 0) {
     struct stat st{};
@@ -4021,11 +4065,15 @@ napi_value EnsureInventoryDirectoryPosix(napi_env env, napi_callback_info info) 
     const bool same_created = created_known &&
         fstatat(parent, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 &&
         named.st_dev == created.st_dev && named.st_ino == created.st_ino;
-    const bool removed = same_created && unlinkat(parent, name.c_str(), AT_REMOVEDIR) == 0 &&
-        fstatat(parent, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-        fsync(parent) == 0;
-    close(parent); InventoryError(env, removed ? "INVENTORY_ACCESS_DENIED" : "INVENTORY_MANUAL_CLEANUP",
-        "ensure_inventory_directory", (acl_set ? 2 : 1) + (removed ? 1 : 0), !removed); return nullptr;
+    const bool unlinked = same_created && unlinkat(parent, name.c_str(), AT_REMOVEDIR) == 0;
+    const bool absent = unlinked &&
+        fstatat(parent, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+    const bool cleanup_durable = absent && fsync(parent) == 0;
+    close(parent);
+    InventoryError(env, cleanup_durable ? "INVENTORY_ACCESS_DENIED" :
+        "INVENTORY_MANUAL_CLEANUP", "ensure_inventory_directory",
+        (acl_set ? 2 : 1) + (unlinked ? 1 : 0), !cleanup_durable);
+    return nullptr;
   }
   const bool durable = fsync(parent) == 0;
   if (!durable) {
@@ -4033,12 +4081,14 @@ napi_value EnsureInventoryDirectoryPosix(napi_env env, napi_callback_info info) 
     const bool same_created = created_known &&
         fstatat(parent, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 &&
         named.st_dev == created.st_dev && named.st_ino == created.st_ino;
-    const bool removed = same_created && unlinkat(parent, name.c_str(), AT_REMOVEDIR) == 0 &&
-        fstatat(parent, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
-        fsync(parent) == 0;
+    const bool unlinked = same_created && unlinkat(parent, name.c_str(), AT_REMOVEDIR) == 0;
+    const bool absent = unlinked &&
+        fstatat(parent, name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
+    const bool cleanup_durable = absent && fsync(parent) == 0;
     close(parent);
-    InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-        "ensure_inventory_directory", 2 + (removed ? 1 : 0), !removed);
+    InventoryError(env, cleanup_durable ? "INVENTORY_IO_FAILED" :
+        "INVENTORY_MANUAL_CLEANUP", "ensure_inventory_directory",
+        2 + (unlinked ? 1 : 0), !cleanup_durable);
     return nullptr;
   }
   close(parent);
@@ -4059,7 +4109,9 @@ napi_value VerifyInventoryAclPosix(napi_env env, napi_callback_info info) {
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr;
   }
   int parent = -1; std::string name;
-  if (!OpenParentNoFollow(path, &parent, &name)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "verify_inventory_acl"); return nullptr; }
+  if (!OpenInventoryParentBoundPosix(path, roles, profile, &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr;
+  }
   int fd = OpenObjectNoFollow(parent, name, O_RDONLY | (profile.find("directory") != std::string::npos ? O_DIRECTORY : 0));
   const bool ok = fd >= 0 && VerifyInventoryAclExact(fd, roles, profile);
   if (fd >= 0) close(fd); close(parent);
@@ -4079,7 +4131,9 @@ napi_value ReadInventoryObjectPosix(napi_env env, napi_callback_info info) {
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "read_inventory_object"); return nullptr;
   }
   int parent = -1; std::string name;
-  if (!OpenParentNoFollow(path, &parent, &name)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "read_inventory_object"); return nullptr; }
+  if (!OpenInventoryParentBoundPosix(path, roles, profile, &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "read_inventory_object"); return nullptr;
+  }
   if (!VerifyInventoryAclExact(parent, roles, InventoryParentProfile(profile))) {
     close(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "read_inventory_object"); return nullptr;
   }
@@ -4233,7 +4287,9 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
   }
   int parent; std::string name;
-  if (!OpenParentNoFollow(path, &parent, &name)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "acquire_inventory_fence"); return nullptr; }
+  if (!OpenInventoryParentBoundPosix(path, roles, "inventory-fence", &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
+  }
   if (!VerifyInventoryAclExact(parent, roles, "inventory-directory")) {
     close(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
   }
@@ -4364,7 +4420,9 @@ napi_value PublishInventoryObjectAtomicPosix(napi_env env, napi_callback_info in
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "publish_inventory_object_atomic"); return nullptr;
   }
   int parent; std::string name;
-  if (!OpenParentNoFollow(path, &parent, &name)) { InventoryError(env, "CONTAINMENT_UNSUPPORTED", "publish_inventory_object_atomic"); return nullptr; }
+  if (!OpenInventoryParentBoundPosix(path, roles, profile, &parent, &name)) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "publish_inventory_object_atomic"); return nullptr;
+  }
   if (!VerifyInventoryAclExact(parent, roles, InventoryParentProfile(profile))) {
     close(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "publish_inventory_object_atomic"); return nullptr;
   }
