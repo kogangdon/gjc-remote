@@ -16,6 +16,7 @@ import {
   contractRevision,
   validateBuildManifest,
 } from "../src/index.js";
+import * as publicApi from "../src/public.js";
 import { createManagementNativeForTest } from "./helpers/management-native.js";
 const execFile = promisify(execFileCallback);
 
@@ -95,6 +96,24 @@ test("contract-4 inventory ABI exposes only the frozen seven primitive signature
     read_inventory_object: ["path", "maxBytes", "roles", "profile"],
     publish_inventory_object_atomic: ["path", "tempPrefix", "bytes", "expectedIdentity", "roles", "profile"],
   });
+});
+
+test("staged public inventory adapters do not change the native ABI or expose low-level helpers", () => {
+  assert.deepEqual(Object.keys(publicApi).sort(), [
+    "buildManifest",
+    "createInventoryPublisher",
+    "createInventoryReader",
+    "createManagementNative",
+    "validateBuildManifest",
+  ]);
+  assert.equal(typeof publicApi.createInventoryPublisher, "function");
+  assert.equal(typeof publicApi.createInventoryReader, "function");
+  assert.equal("createInventoryPublisherAdapter" in publicApi, false);
+  assert.equal("createInventoryReaderAdapter" in publicApi, false);
+  assert.equal(publicApi.buildManifest.contractVersion, 4);
+  assert.equal(publicApi.buildManifest.contractRevision, 1);
+  assert.deepEqual(publicApi.buildManifest.capabilities, capabilities);
+  assert.deepEqual(publicApi.buildManifest.capabilitySignatures, capabilitySignatures);
 });
 
 test("inventory ACL verification atomically binds the requested actor", (t) => {

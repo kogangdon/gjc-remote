@@ -19,8 +19,16 @@ test('production package surface excludes the low-level test adapter', () => {
   assert.equal(publicApi.createManagementNativeForTest, undefined);
   assert.deepEqual(
     Object.keys(publicApi).sort(),
-    ['buildManifest', 'createManagementNative', 'validateBuildManifest'],
+    [
+      'buildManifest',
+      'createInventoryPublisher',
+      'createInventoryReader',
+      'createManagementNative',
+      'validateBuildManifest',
+    ],
   );
+  assert.equal(publicApi.createInventoryPublisherAdapter, undefined);
+  assert.equal(publicApi.createInventoryReaderAdapter, undefined);
 });
 
 test('management adapter validates its explicit native dependency subset', () => {

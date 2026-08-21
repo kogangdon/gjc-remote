@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '@gjc-remote/shared/strict-json';
 import { createAdapter } from './adapter.js';
 import { capabilities, capabilitySignatures, contractRevision, inventoryCapabilities } from './capabilities.js';
+import {
+  createInventoryPublisherAdapter,
+  createInventoryReaderAdapter,
+} from './inventory.js';
 export { capabilities, capabilitySignatures, contractRevision, inventoryCapabilities };
 
 const require = createRequire(import.meta.url);
@@ -192,3 +196,9 @@ export const buildManifest = Object.freeze({
 });
 
 export async function createManagementNative({ configPath, roles } = {}) { return createAdapter({ lowLevel: loadVerifiedAddon(), configPath, arbitraryPrincipalProbe: true, roles }); }
+export function createInventoryPublisher(options) {
+  return createInventoryPublisherAdapter(() => loadVerifiedAddon(), options);
+}
+export function createInventoryReader(options) {
+  return createInventoryReaderAdapter(() => loadVerifiedAddon(), options);
+}
