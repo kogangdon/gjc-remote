@@ -8,7 +8,7 @@
     ".": "./src/public.js"
   },
   "nativeControlContract": {
-    "version": 3,
+    "version": 4,
     "napi": 8,
     "platforms": [
       "linux-x64",

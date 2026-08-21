@@ -21,6 +21,9 @@ const capabilities = [
   'principal_access_check', 'remove_verified_file', 'open_verified_parent_handle',
   'open_verified_object_handle', 'read_handle_identity', 'read_handle_bytes',
   'write_handle_bytes', 'remove_verified_handle', 'verify_role_sid_not_group',
+  'resolve_native_state_root', 'read_workspace_root_facts', 'ensure_inventory_directory',
+  'verify_inventory_acl', 'acquire_inventory_fence', 'read_inventory_object',
+  'publish_inventory_object_atomic',
 ];
 const capabilitySignatures = {
   open_verified_parent: ['path'], open_no_follow: ['path'], read_identity: ['path'], read_acl: ['path'], path_exists_no_follow: ['path'],
@@ -37,6 +40,13 @@ const capabilitySignatures = {
   read_handle_identity: ['handle'], read_handle_bytes: ['handle'],
   write_handle_bytes: ['handle', 'bytes'], remove_verified_handle: ['handle', 'expectedBytes'],
   verify_role_sid_not_group: ['sid'],
+  resolve_native_state_root: ['hostKey', 'rootKind'],
+  read_workspace_root_facts: ['path', 'sourcePlatform'],
+  ensure_inventory_directory: ['path', 'roles', 'profile'],
+  verify_inventory_acl: ['path', 'roles', 'profile'],
+  acquire_inventory_fence: ['path', 'roles'],
+  read_inventory_object: ['path', 'maxBytes', 'roles', 'profile'],
+  publish_inventory_object_atomic: ['path', 'tempPrefix', 'bytes', 'expectedIdentity', 'roles', 'profile'],
 };
 
 function fail(message) {
@@ -188,7 +198,7 @@ function printSuccessReceipt({ manifestRewritten, addonSha256, signInfo, verifyI
     'native-control build verified',
     `  platform: ${process.platform}-${process.arch}`,
     `  addon sha256: ${addonSha256.slice(0, 12)}\u2026`,
-    '  contract: v3',
+    '  contract: v4',
     `  manifest rewritten: ${manifestRewritten ? 'yes' : 'no'}`,
     `  signature: ${describeSignatureOutcome(signInfo, verifyInfo)}`,
   ];
@@ -216,7 +226,7 @@ const isMainModule = (() => {
 if (isMainModule) {
 
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
-  version: 3, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+  version: 4, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
 })) fail('package native capability contract is invalid');
 
 if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${process.arch}`)) {
@@ -225,7 +235,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
   fail('native_control.node is missing');
 } else {
   const expected = {
-    contractVersion: 3,
+    contractVersion: 4,
     package: packageJson.name,
     version: packageJson.version,
     napi: 8,
@@ -242,7 +252,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     for (const name of capabilities) if (typeof loaded[name] !== 'function') fail(`native capability ${name} is missing`);
     let contract;
     try { contract = loaded.native_control_contract(); } catch { fail('native capability contract is missing or unreadable'); }
-    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 3, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
+    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 4, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
   }
   if (process.argv.includes('--write-manifest')) {
     if (!loaded || process.exitCode) process.exitCode = 1;
