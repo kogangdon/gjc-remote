@@ -40,6 +40,123 @@ function platformRoles(current) {
   return null;
 }
 
+test("contract-4 inventory ABI exposes only the frozen seven primitive signatures", () => {
+  const inventory = [
+    "resolve_native_state_root",
+    "read_workspace_root_facts",
+    "ensure_inventory_directory",
+    "verify_inventory_acl",
+    "acquire_inventory_fence",
+    "read_inventory_object",
+    "publish_inventory_object_atomic",
+  ];
+  assert.deepEqual(capabilities.slice(-inventory.length), inventory);
+  assert.deepEqual(Object.fromEntries(inventory.map((name) => [name, capabilitySignatures[name]])), {
+    resolve_native_state_root: ["hostKey", "rootKind"],
+    read_workspace_root_facts: ["path", "sourcePlatform"],
+    ensure_inventory_directory: ["path", "roles", "profile"],
+    verify_inventory_acl: ["path", "roles", "profile"],
+    acquire_inventory_fence: ["path", "roles"],
+    read_inventory_object: ["path", "maxBytes", "roles", "profile"],
+    publish_inventory_object_atomic: ["path", "tempPrefix", "bytes", "expectedIdentity", "roles", "profile"],
+  });
+});
+
+test("Windows inventory rejects UNC and malformed roots while returning exact local-drive facts", async (t) => {
+  if (process.platform !== "win32") {
+    return;
+  }
+  if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
+    t.skip("verified native addon is not built for this checkout");
+    return;
+  }
+  const addonBytes = readFileSync(addonUrl);
+  const manifest = JSON.parse(readFileSync(manifestUrl, "utf8"));
+  const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
+  if (!validateBuildManifest(manifest, packageJson, addonBytes)) {
+    t.skip("native build belongs to a different platform or architecture");
+    return;
+  }
+  const addon = require(fileURLToPath(addonUrl));
+  const root = await mkdtemp(join(tmpdir(), "gjc-native-inventory-drive-"));
+  try {
+    const facts = addon.read_workspace_root_facts(root, "windows-drive");
+    assert.deepEqual(Object.keys(facts), ["sourcePlatform", "workDir", "rootIdentity", "storageIdentity"]);
+    assert.equal(facts.sourcePlatform, "windows-drive");
+    assert.match(facts.workDir, /^(?:\\\\\?\\)?[A-Za-z]:\\/);
+    assert.equal(basename(facts.workDir).toLowerCase(), basename(root).toLowerCase());
+    assert.match(facts.rootIdentity.volumeSerial, /^[0-9a-f]{16}$/);
+    assert.match(facts.rootIdentity.fileId, /^[0-9a-f]{32}$/);
+    assert.equal(facts.storageIdentity.kind, "windows-drive-storage-v1");
+    assert.match(facts.storageIdentity.volumeGuid, /^\\\\\?\\VOLUME\{[0-9A-F-]+\}\\$/);
+    assert.match(facts.storageIdentity.volumeSerial, /^[0-9A-F]{8}$/);
+    assert.match(facts.storageIdentity.fileSystem, /^[A-Z0-9._-]{1,32}$/);
+    for (const path of ["relative", "\\\\server\\share\\workspace"]) {
+      assert.throws(() => addon.read_workspace_root_facts(path, "windows-drive"), (error) =>
+        error.code === "CONTAINMENT_UNSUPPORTED" &&
+        error.operation === "read_workspace_root_facts" &&
+        error.writes === 0 && error.ambiguous === false);
+    }
+    assert.throws(
+      () => addon.read_workspace_root_facts("\\\\server\\share\\workspace", "windows-unc"),
+      (error) => error.code === "CONTAINMENT_UNSUPPORTED" &&
+        error.operation === "read_workspace_root_facts" &&
+        error.writes === 0 && error.ambiguous === false,
+    );
+    const invalidRoles = {};
+    const invalid = (operation, invoke) => assert.throws(invoke, (error) =>
+      error.code === "INVENTORY_INVALID" && error.operation === operation &&
+      error.writes === 0 && error.ambiguous === false);
+    invalid("resolve_native_state_root", () => addon.resolve_native_state_root("X".repeat(64), "inventory"));
+    invalid("ensure_inventory_directory", () => addon.ensure_inventory_directory(root, invalidRoles, "inventory-directory"));
+    invalid("verify_inventory_acl", () => addon.verify_inventory_acl(root, invalidRoles, "inventory-directory"));
+    invalid("acquire_inventory_fence", () => addon.acquire_inventory_fence(root, invalidRoles));
+    invalid("read_inventory_object", () => addon.read_inventory_object(root, 0, invalidRoles, "inventory-file"));
+    invalid("publish_inventory_object_atomic", () =>
+      addon.publish_inventory_object_atomic(root, "bad/name", Buffer.alloc(0), null, invalidRoles, "inventory-file"));
+    let getterRead = false;
+    const accessorRoles = {};
+    Object.defineProperty(accessorRoles, "management", {
+      enumerable: true,
+      get() {
+        getterRead = true;
+        return {};
+      },
+    });
+    invalid("acquire_inventory_fence", () => addon.acquire_inventory_fence(root, accessorRoles));
+    assert.equal(getterRead, false, "role accessors must be rejected without execution");
+    const symbolRoles = { management: {}, bot: {}, recovery: {}, daemon: {}, system: {} };
+    symbolRoles[Symbol("unexpected")] = {};
+    invalid("read_inventory_object", () => addon.read_inventory_object(root, 0, symbolRoles, "inventory-file"));
+    const proxyRoles = new Proxy({}, {});
+    invalid("publish_inventory_object_atomic", () =>
+      addon.publish_inventory_object_atomic(root, "prefix", Buffer.alloc(0), null, proxyRoles, "inventory-file"));
+    const throwingProxyRoles = new Proxy({}, {
+      getPrototypeOf() {
+        throw new Error(`must-not-escape:${root}`);
+      },
+    });
+    invalid("read_inventory_object", () =>
+      addon.read_inventory_object(root, 0, throwingProxyRoles, "inventory-file"));
+    let proxyValueRead = false;
+    const descriptorProxyRoles = new Proxy(
+      { management: {}, bot: {}, recovery: {}, daemon: {}, system: {} },
+      {
+        get(target, property, receiver) {
+          proxyValueRead = true;
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    invalid("read_inventory_object", () =>
+      addon.read_inventory_object(root, 0, descriptorProxyRoles, "inventory-file"));
+    assert.equal(proxyValueRead, false, "validated descriptor values must be snapshotted");
+    t.diagnostic("Positive Windows inventory ACL/fence/publication evidence requires the owned four-distinct-account fixture; this test makes no unproven success claim.");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("verified native addon enforces retained-handle, ACL, replacement, durability, and no-follow primitives", async (t) => {
   if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
     t.skip("verified native addon is not built for this checkout");
@@ -56,7 +173,7 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
 
   const addon = require(fileURLToPath(addonUrl));
   const contract = addon.native_control_contract();
-  assert.equal(contract.contractVersion, 3);
+  assert.equal(contract.contractVersion, 4);
   assert.equal(contract.napi, 8);
   assert.deepEqual(contract.capabilities, capabilities);
   assert.deepEqual(contract.capabilitySignatures, capabilitySignatures);
@@ -616,4 +733,96 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /struct NamedGroupPermission \{ gid_t gid; mode_t bits; \}/);
   assert.match(source, /named_groups\.push_back\(\{\*qualifier, group_bits\}\)/);
   assert.match(source, /effective_group \|= named\.bits/);
+  const inventoryAclStart = source.indexOf("bool VerifyInventoryAcl(HANDLE");
+  const inventoryAclEnd = source.indexOf("napi_value EnsureInventoryDirectoryWindows", inventoryAclStart);
+  const inventoryAcl = source.slice(inventoryAclStart, inventoryAclEnd);
+  assert.match(inventoryAcl, /SE_DACL_PROTECTED/);
+  assert.match(inventoryAcl, /size\.AceCount == 4/);
+  assert.match(inventoryAcl, /header->AceType != ACCESS_ALLOWED_ACE_TYPE \|\| header->AceFlags != 0/);
+  const fileIdVectorsStart = source.indexOf("bool InventoryFileIdVectorsValid()");
+  const fileIdVectorsEnd = source.indexOf("bool InventoryIdentity(HANDLE", fileIdVectorsStart);
+  const fileIdVectors = source.slice(fileIdVectorsStart, fileIdVectorsEnd);
+  assert.notEqual(fileIdVectorsStart, -1);
+  assert.match(fileIdVectors, /0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,\s*0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f/);
+  assert.match(fileIdVectors, /WindowsFileIdText\(ascending\) == "000102030405060708090a0b0c0d0e0f"/);
+  assert.match(fileIdVectors, /0xff, 0x00, 0x80, 0x7f, 0x10, 0x20, 0x30, 0x40,\s*0x50, 0x60, 0x70, 0x90, 0xa0, 0xb0, 0xc0, 0xd0/);
+  assert.match(fileIdVectors, /WindowsFileIdText\(asymmetric\) == "ff00807f1020304050607090a0b0c0d0"/);
+  assert.match(source, /if \(!InventoryFileIdVectorsValid\(\)\)/);
+  const inventoryPublishStart = source.indexOf("napi_value PublishInventoryObjectAtomicWindows");
+  const inventoryPublishEnd = source.indexOf("#else", inventoryPublishStart);
+  const inventoryPublish = source.slice(inventoryPublishStart, inventoryPublishEnd);
+  assert.match(inventoryPublish, /RenameWindowsRelative\(candidate, parent, name, false\)/);
+  assert.match(inventoryPublish, /ReplaceFileW\([^,]+, [^,]+, [^,]+,\s*0,/);
+  assert.match(inventoryPublish, /FlushFileBuffers\(result\)/);
+  assert.match(inventoryPublish, /FlushFileBuffers\(displaced\)/);
+  assert.match(inventoryPublish, /FlushInventoryParent\(parent, parent_id, canonical_parent\)/);
+  assert.match(inventoryPublish, /displaced_is_predecessor/);
+  assert.match(inventoryPublish, /const bool rollback_mutated = InventoryParentStable/);
+  assert.match(inventoryPublish, /const bool rolled_back = rollback_mutated/);
+  assert.match(inventoryPublish, /restored_serial == predecessor_serial/);
+  assert.match(inventoryPublish, /residual_delete_pending &&\s*residual_probe == INVALID_HANDLE_VALUE && residual_error == ERROR_FILE_NOT_FOUND &&\s*flush_parent\(\)/);
+  assert.match(inventoryPublish, /CanonicalInventoryParent\(parent, &parent_id, &canonical_parent\)/);
+  assert.match(inventoryPublish, /InventoryParentStable\(parent, parent_id, canonical_parent\)/);
+  assert.match(source, /GetFinalPathNameByHandleW\(parent, nullptr, 0, FILE_NAME_NORMALIZED \| VOLUME_NAME_DOS\)/);
+  assert.match(source, /SameWindowsFileId\(named, expected\)/);
+  assert.match(source, /FlushInventoryParent\(HANDLE retained, const FILE_ID_INFO& expected/);
+  assert.match(inventoryPublish, /InventoryChildPath\(canonical_parent, name\)/);
+  assert.match(inventoryPublish, /ReplaceFileW\(destination_path\.c_str\(\), temporary_path\.c_str\(\), backup_path\.c_str\(\),\s*0,/);
+  assert.match(inventoryPublish, /ReplaceFileW\(destination_path\.c_str\(\), backup_path\.c_str\(\), rollback_temp\.c_str\(\),/);
+  assert.match(inventoryPublish, /parent, name, GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL,/,
+    "verified destination handles carry the write access required by FlushFileBuffers");
+  assert.match(inventoryPublish, /parent, backup,\s*GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL \| DELETE,/,
+    "verified displaced predecessor handles carry write access for durability and DELETE for cleanup");
+  assert.match(inventoryPublish, /HANDLE restored = rolled_back \? OpenWindowsRelative\(\s*parent, name, GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL,\s*kFileOpen, VerifiedObjectType::File\) : INVALID_HANDLE_VALUE;/,
+    "rollback-restored predecessor handles carry the write access required by FlushFileBuffers");
+  assert.match(inventoryPublish, /for \(unsigned attempt = 0; attempt != 128; \+\+attempt\)/);
+  assert.match(inventoryPublish, /if \(published \|\| GetLastError\(\) != ERROR_FILE_EXISTS\) break/);
+  assert.match(source, /BCryptGenRandom\(nullptr, bytes\.data\(\), static_cast<ULONG>\(bytes\.size\(\)\),/);
+  assert.match(source, /std::array<unsigned char, 16> bytes/);
+  assert.match(source, /!directory \|\| HasEmptyInventoryDefaultAcl\(fd\)/,
+    "default ACL proof applies to directories; regular files have no default ACL namespace");
+  assert.match(source, /acl_get_entry\(defaults, ACL_FIRST_ENTRY, &entry\) == 0/,
+    "directory default ACL absence requires a successful zero-entry query");
+  assert.doesNotMatch(source, /errno == ENODATA \|\| errno == EINVAL/,
+    "default ACL query errors are never accepted as absence");
+  assert.doesNotMatch(source, /GetTickCount64|GetCurrentProcessId/,
+    "Windows temporary names must not derive from process or clock state");
+  const inventoryFenceStart = source.indexOf("napi_value AcquireInventoryFenceWindows");
+  const inventoryFenceEnd = source.indexOf("napi_value PublishInventoryObjectAtomicWindows", inventoryFenceStart);
+  const inventoryFence = source.slice(inventoryFenceStart, inventoryFenceEnd);
+  assert.match(inventoryFence, /GENERIC_READ \| READ_CONTROL/);
+  assert.match(source, /LockFileEx\(work->fence->handle, LOCKFILE_EXCLUSIVE_LOCK \| LOCKFILE_FAIL_IMMEDIATELY/);
+  assert.match(inventoryFence, /RenameWindowsRelative\(temporary, parent, name, false\)/);
+  assert.match(inventoryFence, /napi_create_reference\(complete, object, 0, &work->fence->object_ref\)/);
+  assert.match(inventoryFence, /napi_reference_ref\(e, fence->object_ref/);
+  assert.match(inventoryFence, /napi_reference_unref\(ce, item->fence->object_ref/);
+  assert.match(inventoryFence, /if \(fence->release_promise\)/);
+  assert.match(inventoryFence, /CreateInventoryAsyncWork\(\s*env, "inventory\.acquire_fence"/);
+  assert.match(inventoryFence, /CreateInventoryAsyncWork\(\s*e, "inventory\.release_fence"/);
+  assert.match(source, /CreateInventoryAsyncWork\(\s*env, "inventory\.acquire_fence", AcquireFenceExecute/);
+  assert.match(source, /CreateInventoryAsyncWork\(\s*release_env, "inventory\.release_fence"/);
+  assert.match(source, /if \(!fence->released\.exchange\(true\) && fence->handle != INVALID_HANDLE_VALUE\)/);
+  assert.match(source, /if \(work->fence->released\.exchange\(true\) \|\| work->fence->handle == INVALID_HANDLE_VALUE\) return/);
+  const posixPublishStart = source.indexOf("napi_value PublishInventoryObjectAtomicPosix");
+  const posixPublishEnd = source.indexOf("#endif", posixPublishStart);
+  const posixPublish = source.slice(posixPublishStart, posixPublishEnd);
+  assert.match(posixPublish, /auto clean = \[&\]\(const std::string& entry, const struct stat& expected\)/,
+    "every pre-publication cleanup must account for unlink and parent durability");
+  assert.match(posixPublish, /InventoryError\(env, cleaned \? code : "INVENTORY_MANUAL_CLEANUP"/,
+    "a failed early cleanup is ambiguous, never reported as an ordinary bounded failure");
+  assert.match(posixPublish, /if \(fsync\(parent\) != 0 \|\| !candidate_at_name\(&result_stat\)\) return reconcile\(\);/,
+    "a post-rename durability or verification failure must reconcile rather than succeed");
+  assert.match(posixPublish, /RenameAt2\(parent, temp, name, EXCHANGE\)/,
+    "replacement reconciliation exchanges the retained predecessor back into place");
+  assert.match(posixPublish, /!read_exact\(name, previous, &restored\) \|\| restored != predecessor_bytes/,
+    "replacement reconciliation reopens and proves predecessor bytes, identity, and ACL");
+  assert.match(posixPublish, /!candidate_at_name\(&named\) \|\| !clean\(name, candidate\)/,
+    "absent publication removes only a proven candidate and durably records the removal");
+  assert.match(posixPublish, /!read_exact\(temp, previous, &displaced\) \|\| displaced != predecessor_bytes \|\|\s*!clean\(temp, previous\)/,
+    "normal replacement never succeeds after a failed predecessor cleanup barrier");
+  const posixFenceStart = source.indexOf("napi_value AcquireInventoryFencePosix");
+  const posixFenceEnd = source.indexOf("long RenameAt2", posixFenceStart);
+  const posixFence = source.slice(posixFenceStart, posixFenceEnd);
+  assert.match(posixFence, /auto discard = \[&\]\(const std::string& entry, const struct stat& expected\)/);
+  assert.match(posixFence, /cleaned \? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP"/);
 });
