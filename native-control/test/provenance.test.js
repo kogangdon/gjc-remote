@@ -159,6 +159,11 @@ function loadOptions(fixture, extra) {
   };
 }
 
+test('contract revision 2 is the fence write-receipt provenance boundary', () => {
+  assert.equal(contractRevision, 2);
+  assert.deepEqual(capabilitySignatures.acquire_inventory_fence, ['path', 'roles']);
+});
+
 test('loadVerifiedAddon: missing sidecar refuses when a key is pinned', (t) => {
   if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
   withFixtureDir((dir) => {

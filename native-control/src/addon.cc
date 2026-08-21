@@ -2520,6 +2520,21 @@ napi_value ReadHandleIdentity(napi_env env, napi_callback_info info) {
   napi_set_named_property(env, error, "ambiguous", value);
   return error;
 }
+bool InventoryFenceProperties(napi_env env, napi_value object,
+                              napi_value release, uint32_t writes) {
+  napi_value write_count;
+  if (napi_create_uint32(env, writes, &write_count) != napi_ok) return false;
+  const napi_property_descriptor properties[] = {
+      {"release", nullptr, nullptr, nullptr, nullptr, release,
+       napi_enumerable, nullptr},
+      {"writes", nullptr, nullptr, nullptr, nullptr, write_count,
+       napi_enumerable, nullptr},
+  };
+  return napi_define_properties(
+             env, object, sizeof(properties) / sizeof(properties[0]),
+             properties) == napi_ok &&
+      napi_object_freeze(env, object) == napi_ok;
+}
 void InventoryError(napi_env env, const char* code, const char* operation,
                     uint32_t writes = 0, bool ambiguous = false) {
   napi_throw(env, InventoryErrorValue(env, code, operation, writes, ambiguous));
@@ -3322,10 +3337,13 @@ struct WindowsFenceWork {
 };
 void WindowsFenceFinalize(napi_env, void* raw, void*) {
   auto* fence = static_cast<WindowsInventoryFence*>(raw);
-  if (!fence->released.exchange(true) && fence->handle != INVALID_HANDLE_VALUE) {
-    OVERLAPPED o{}; UnlockFileEx(fence->handle, 0, MAXDWORD, MAXDWORD, &o); CloseHandle(fence->handle);
+  if (fence->handle != INVALID_HANDLE_VALUE) {
+    OVERLAPPED o{};
+    UnlockFileEx(fence->handle, 0, MAXDWORD, MAXDWORD, &o);
+    CloseHandle(fence->handle);
     fence->handle = INVALID_HANDLE_VALUE;
   }
+  fence->released.store(true);
   if (fence->release_promise) napi_delete_reference(fence->env, fence->release_promise);
   if (fence->object_ref) napi_delete_reference(fence->env, fence->object_ref);
   delete fence;
@@ -3333,11 +3351,15 @@ void WindowsFenceFinalize(napi_env, void* raw, void*) {
 void WindowsFenceExecute(napi_env, void* raw) { auto* work = static_cast<WindowsFenceWork*>(raw);
   if (work->release) {
     OVERLAPPED o{};
-    if (work->fence->released.exchange(true) || work->fence->handle == INVALID_HANDLE_VALUE) return;
+    if (work->fence->released.load() ||
+        work->fence->handle == INVALID_HANDLE_VALUE) return;
     const bool unlocked = UnlockFileEx(work->fence->handle, 0, MAXDWORD, MAXDWORD, &o) != FALSE;
     const bool closed = CloseHandle(work->fence->handle) != FALSE;
     work->failed = !unlocked || !closed;
-    if (closed) work->fence->handle = INVALID_HANDLE_VALUE;
+    if (closed) {
+      work->fence->handle = INVALID_HANDLE_VALUE;
+      work->fence->released.store(true);
+    }
     return;
   }
   const auto end = work->deadline; OVERLAPPED o{};
@@ -3451,28 +3473,40 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
       rolled_back = delete_pending && probe == INVALID_HANDLE_VALUE &&
           probe_error == ERROR_FILE_NOT_FOUND && flush_parent();
     }
+    const uint32_t creation_writes = (temporary_created ? 1 : 0) +
+        (acl_applied ? 1 : 0) + (renamed ? 1 : 0) +
+        ((cleanup_mutated || rollback_mutated) ? 1 : 0);
+    const bool lost_create_race = !renamed && cleaned &&
+        (rename_error == ERROR_FILE_EXISTS ||
+         rename_error == ERROR_ALREADY_EXISTS);
+    if (lost_create_race) {
+      h = OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL,
+          kFileOpen, VerifiedObjectType::File);
+      fence_open_error =
+          h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    }
     if (published) {
       h = OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL,
           kFileOpen, VerifiedObjectType::File);
       fence_open_error = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
     }
     CloseHandle(parent);
-    if (!published) {
-      const uint32_t writes = (temporary_created ? 1 : 0) +
-          (acl_applied ? 1 : 0) + (renamed ? 1 : 0) +
-          ((cleanup_mutated || rollback_mutated) ? 1 : 0);
+    if (!published && !lost_create_race) {
       InventoryError(env, (cleaned || rolled_back) ?
           (rename_error == ERROR_FILE_EXISTS || rename_error == ERROR_ALREADY_EXISTS ?
               "INVENTORY_STALE" : rename_error == ERROR_CALL_NOT_IMPLEMENTED ||
                   rename_error == ERROR_NOT_SUPPORTED ?
                       "CONTAINMENT_UNSUPPORTED" : "INVENTORY_IO_FAILED") :
-          "INVENTORY_MANUAL_CLEANUP", "acquire_inventory_fence", writes,
+          "INVENTORY_MANUAL_CLEANUP", "acquire_inventory_fence",
+          creation_writes,
           !(cleaned || rolled_back));
       return nullptr;
     }
-    published_fence_id = temporary_id;
-    fence_writes = 3;
-    created_by_call = true;
+    fence_writes = creation_writes;
+    if (published) {
+      published_fence_id = temporary_id;
+      created_by_call = true;
+    }
   }
   FILE_ID_INFO reopened_fence_id{};
   const bool reopened_exact = h != INVALID_HANDLE_VALUE &&
@@ -3499,16 +3533,46 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
   auto* fence = new WindowsInventoryFence{h, env};
   fence->acquisition_writes = fence_writes;
   fence->acquisition_ambiguous = false;
-  napi_value promise; napi_deferred deferred; napi_create_promise(env, &deferred, &promise);
+  napi_value promise;
+  napi_deferred deferred;
+  if (napi_create_promise(env, &deferred, &promise) != napi_ok) {
+    CloseHandle(h);
+    delete fence;
+    InventoryError(env, "INVENTORY_IO_FAILED",
+        "acquire_inventory_fence", fence_writes);
+    return nullptr;
+  }
   auto* work = new WindowsFenceWork{deferred, nullptr, fence, false, false, false, deadline};
   const napi_status create_status = CreateInventoryAsyncWork(
     env, "inventory.acquire_fence", WindowsFenceExecute,
     [](napi_env complete, napi_status, void* raw) { auto* work = static_cast<WindowsFenceWork*>(raw);
       if (work->pending || work->failed) { if (work->fence->handle != INVALID_HANDLE_VALUE) CloseHandle(work->fence->handle); napi_reject_deferred(complete, work->deferred, InventoryErrorValue(complete, work->pending ? "INVENTORY_PENDING" : "INVENTORY_IO_FAILED", "acquire_inventory_fence", work->fence->acquisition_writes, work->fence->acquisition_ambiguous)); delete work->fence; }
-      else { napi_value object, release; napi_create_object(complete, &object); napi_type_tag_object(complete, object, &kWindowsInventoryFenceTypeTag);
-        napi_create_function(complete, "release", NAPI_AUTO_LENGTH, [](napi_env e, napi_callback_info i) -> napi_value { void* data; napi_get_cb_info(e, i, nullptr, nullptr, nullptr, &data); auto* fence = static_cast<WindowsInventoryFence*>(data); napi_value promise;
-          if (fence->release_promise) { napi_get_reference_value(e, fence->release_promise, &promise); return promise; }
-          napi_deferred deferred; napi_create_promise(e, &deferred, &promise);
+      else {
+        napi_value object = nullptr, release = nullptr;
+        napi_status setup_status = napi_create_object(complete, &object);
+        if (setup_status == napi_ok) {
+          setup_status = napi_type_tag_object(
+              complete, object, &kWindowsInventoryFenceTypeTag);
+        }
+        if (setup_status == napi_ok) {
+          setup_status = napi_create_function(
+              complete, "release", NAPI_AUTO_LENGTH,
+              [](napi_env e, napi_callback_info i) -> napi_value { void* data; napi_get_cb_info(e, i, nullptr, nullptr, nullptr, &data); auto* fence = static_cast<WindowsInventoryFence*>(data); napi_value promise;
+          if (fence->release_promise) {
+            if (napi_get_reference_value(
+                    e, fence->release_promise, &promise) != napi_ok) {
+              InventoryError(e, "INVENTORY_IO_FAILED",
+                  "release_inventory_fence", 0, true);
+              return nullptr;
+            }
+            return promise;
+          }
+          napi_deferred deferred;
+          if (napi_create_promise(e, &deferred, &promise) != napi_ok) {
+            InventoryError(e, "INVENTORY_IO_FAILED",
+                "release_inventory_fence", 0, true);
+            return nullptr;
+          }
           if (napi_create_reference(e, promise, 1, &fence->release_promise) != napi_ok ||
               [&]() { uint32_t count = 0; return napi_reference_ref(e, fence->object_ref, &count); }() != napi_ok) {
             napi_reject_deferred(e, deferred, InventoryErrorValue(e, "INVENTORY_IO_FAILED", "release_inventory_fence", 0, true));
@@ -3549,7 +3613,46 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
           }
           return promise;
         }, work->fence, &release);
-        napi_set_named_property(complete, object, "release", release); napi_wrap(complete, object, work->fence, WindowsFenceFinalize, nullptr, nullptr); napi_create_reference(complete, object, 0, &work->fence->object_ref); napi_resolve_deferred(complete, work->deferred, object); }
+        }
+        if (setup_status != napi_ok || !InventoryFenceProperties(
+                complete, object, release, work->fence->acquisition_writes)) {
+          if (work->fence->handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(work->fence->handle);
+            work->fence->handle = INVALID_HANDLE_VALUE;
+          }
+          napi_reject_deferred(
+              complete, work->deferred,
+              InventoryErrorValue(complete, "INVENTORY_IO_FAILED",
+                  "acquire_inventory_fence",
+                  work->fence->acquisition_writes, true));
+          delete work->fence;
+        } else {
+          const napi_status reference_status = napi_create_reference(
+              complete, object, 0, &work->fence->object_ref);
+          const napi_status wrap_status = reference_status == napi_ok
+              ? napi_wrap(complete, object, work->fence,
+                    WindowsFenceFinalize, nullptr, nullptr)
+              : reference_status;
+          if (reference_status != napi_ok || wrap_status != napi_ok) {
+            if (work->fence->object_ref) {
+              napi_delete_reference(complete, work->fence->object_ref);
+              work->fence->object_ref = nullptr;
+            }
+            if (work->fence->handle != INVALID_HANDLE_VALUE) {
+              CloseHandle(work->fence->handle);
+              work->fence->handle = INVALID_HANDLE_VALUE;
+            }
+            napi_reject_deferred(
+                complete, work->deferred,
+                InventoryErrorValue(complete, "INVENTORY_IO_FAILED",
+                    "acquire_inventory_fence",
+                    work->fence->acquisition_writes, true));
+            delete work->fence;
+          } else {
+            napi_resolve_deferred(complete, work->deferred, object);
+          }
+        }
+      }
       napi_delete_async_work(complete, work->work); delete work; }, work, &work->work);
   const napi_status queue_status = create_status == napi_ok
       ? napi_queue_async_work(env, work->work)
@@ -4391,7 +4494,12 @@ struct InventoryFenceReleaseWork {
 };
 void FenceFinalize(napi_env, void* data, void*) {
   auto* fence = static_cast<InventoryFence*>(data);
-  if (fence->fd >= 0) { flock(fence->fd, LOCK_UN); close(fence->fd); }
+  if (fence->fd >= 0) {
+    flock(fence->fd, LOCK_UN);
+    close(fence->fd);
+    fence->fd = -1;
+  }
+  fence->released.store(true);
   if (fence->release_promise) napi_delete_reference(fence->env, fence->release_promise);
   if (fence->object_ref) napi_delete_reference(fence->env, fence->object_ref);
   delete fence;
@@ -4422,22 +4530,41 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
       InventoryErrorValue(env, "INVENTORY_IO_FAILED", "acquire_inventory_fence",
           work->fence->acquisition_writes));
   else {
-    napi_value object, release;
-    napi_create_object(env, &object);
-    napi_type_tag_object(env, object, &kInventoryFenceTypeTag);
-    napi_create_function(env, "release", NAPI_AUTO_LENGTH,
+    napi_value object = nullptr, release = nullptr;
+    napi_status setup_status = napi_create_object(env, &object);
+    if (setup_status == napi_ok) {
+      setup_status =
+          napi_type_tag_object(env, object, &kInventoryFenceTypeTag);
+    }
+    if (setup_status == napi_ok) {
+      setup_status = napi_create_function(env, "release", NAPI_AUTO_LENGTH,
       [](napi_env release_env, napi_callback_info release_info) -> napi_value {
         void* data = nullptr; size_t argc = 0;
         napi_get_cb_info(release_env, release_info, &argc, nullptr, nullptr, &data);
         auto* fence = static_cast<InventoryFence*>(data);
         napi_value promise;
         if (fence->release_promise) {
-          napi_get_reference_value(release_env, fence->release_promise, &promise); return promise;
+          if (napi_get_reference_value(
+                  release_env, fence->release_promise, &promise) != napi_ok) {
+            InventoryError(release_env, "INVENTORY_IO_FAILED",
+                "release_inventory_fence", 0, true);
+            return nullptr;
+          }
+          return promise;
         }
-        napi_deferred deferred; napi_create_promise(release_env, &deferred, &promise);
-        napi_create_reference(release_env, promise, 1, &fence->release_promise);
+        napi_deferred deferred;
+        if (napi_create_promise(
+                release_env, &deferred, &promise) != napi_ok) {
+          InventoryError(release_env, "INVENTORY_IO_FAILED",
+              "release_inventory_fence", 0, true);
+          return nullptr;
+        }
         uint32_t ref_count = 0;
-        if (!fence->object_ref || napi_reference_ref(release_env, fence->object_ref, &ref_count) != napi_ok) {
+        if (napi_create_reference(
+                release_env, promise, 1, &fence->release_promise) != napi_ok ||
+            !fence->object_ref ||
+            napi_reference_ref(
+                release_env, fence->object_ref, &ref_count) != napi_ok) {
           napi_reject_deferred(release_env, deferred,
               InventoryErrorValue(release_env, "INVENTORY_IO_FAILED", "release_inventory_fence", 0, true));
           return promise;
@@ -4447,11 +4574,14 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
           release_env, "inventory.release_fence",
           [](napi_env, void* raw) {
             auto* item = static_cast<InventoryFenceReleaseWork*>(raw);
-            if (!item->fence->released.exchange(true) && item->fence->fd >= 0) {
+            if (!item->fence->released.load() && item->fence->fd >= 0) {
               const bool unlocked = flock(item->fence->fd, LOCK_UN) == 0;
               const bool closed = close(item->fence->fd) == 0;
               item->failed = !unlocked || !closed;
-              if (closed) item->fence->fd = -1;
+              if (closed) {
+                item->fence->fd = -1;
+                item->fence->released.store(true);
+              }
             }
           },
           [](napi_env complete_env, napi_status, void* raw) {
@@ -4477,10 +4607,47 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
         }
         return promise;
       }, work->fence, &release);
-    napi_set_named_property(env, object, "release", release);
-    napi_wrap(env, object, work->fence, FenceFinalize, nullptr, nullptr);
-    napi_create_reference(env, object, 0, &work->fence->object_ref);
-    napi_resolve_deferred(env, work->deferred, object);
+    }
+    if (setup_status != napi_ok || !InventoryFenceProperties(
+            env, object, release, work->fence->acquisition_writes)) {
+      if (work->fence->fd >= 0) {
+        flock(work->fence->fd, LOCK_UN);
+        close(work->fence->fd);
+        work->fence->fd = -1;
+      }
+      napi_reject_deferred(
+          env, work->deferred,
+          InventoryErrorValue(env, "INVENTORY_IO_FAILED",
+              "acquire_inventory_fence",
+              work->fence->acquisition_writes, true));
+      work->failed = true;
+    } else {
+      const napi_status reference_status =
+          napi_create_reference(env, object, 0, &work->fence->object_ref);
+      const napi_status wrap_status = reference_status == napi_ok
+          ? napi_wrap(env, object, work->fence, FenceFinalize,
+                nullptr, nullptr)
+          : reference_status;
+      if (reference_status != napi_ok || wrap_status != napi_ok) {
+        if (work->fence->object_ref) {
+          napi_delete_reference(env, work->fence->object_ref);
+          work->fence->object_ref = nullptr;
+        }
+        if (work->fence->fd >= 0) {
+          flock(work->fence->fd, LOCK_UN);
+          close(work->fence->fd);
+          work->fence->fd = -1;
+        }
+        napi_reject_deferred(
+            env, work->deferred,
+            InventoryErrorValue(env, "INVENTORY_IO_FAILED",
+                "acquire_inventory_fence",
+                work->fence->acquisition_writes, true));
+        work->failed = true;
+      } else {
+        napi_resolve_deferred(env, work->deferred, object);
+      }
+    }
   }
   napi_delete_async_work(env, work->work);
   if (work->timed_out || work->failed) delete work->fence;
@@ -4556,7 +4723,15 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
     }
     if (RenameAt2(parent, temporary, name, 1) != 0) {
       const int failure = errno; const bool cleaned = discard(temporary, created_identity);
-      if (failure != EEXIST) {
+      if (failure == EEXIST) {
+        if (!cleaned) {
+          close(parent);
+          InventoryError(env, "INVENTORY_MANUAL_CLEANUP",
+              "acquire_inventory_fence", writes, true);
+          return nullptr;
+        }
+        fence_writes = writes;
+      } else {
         close(parent); InventoryError(env, cleaned ? (failure == ENOSYS || failure == EINVAL ? "CONTAINMENT_UNSUPPORTED" : "INVENTORY_IO_FAILED") :
             "INVENTORY_MANUAL_CLEANUP", "acquire_inventory_fence", writes, !cleaned); return nullptr;
       }
@@ -4580,7 +4755,12 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
     }
     fd = OpenObjectNoFollow(parent, name, O_RDONLY);
   }
-  if (fd < 0) { close(parent); InventoryError(env, errno == ENOENT ? "INVENTORY_STALE" : "INVENTORY_IO_FAILED", "acquire_inventory_fence"); return nullptr; }
+  if (fd < 0) {
+    close(parent);
+    InventoryError(env, errno == ENOENT ? "INVENTORY_STALE" :
+        "INVENTORY_IO_FAILED", "acquire_inventory_fence", fence_writes);
+    return nullptr;
+  }
   struct stat fence_stat{};
   const bool fence_ok = fstat(fd, &fence_stat) == 0 && S_ISREG(fence_stat.st_mode) && fence_stat.st_size == 0 &&
       VerifyInventoryAclExact(fd, roles, "inventory-fence") &&
@@ -4594,7 +4774,14 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
         created_by_call);
     return nullptr;
   }
-  napi_value promise; napi_deferred deferred; napi_create_promise(env, &deferred, &promise);
+  napi_value promise;
+  napi_deferred deferred;
+  if (napi_create_promise(env, &deferred, &promise) != napi_ok) {
+    close(fd);
+    InventoryError(env, "INVENTORY_IO_FAILED",
+        "acquire_inventory_fence", fence_writes);
+    return nullptr;
+  }
   auto* fence = new InventoryFence();
   fence->env = env;
   fence->acquisition_writes = fence_writes;
@@ -4854,7 +5041,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
   napi_create_uint32(env, 4, &value); napi_set_named_property(env, result, "contractVersion", value);
-  napi_create_uint32(env, 1, &value); napi_set_named_property(env, result, "contractRevision", value);
+  napi_create_uint32(env, 2, &value); napi_set_named_property(env, result, "contractRevision", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
