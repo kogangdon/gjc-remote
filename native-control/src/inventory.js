@@ -63,7 +63,10 @@ function validateOptions(options) {
   const principals = ROLE_KEYS.map((key) => principalSnapshot(roleValues[key]));
   if (principals.some((principal) => principal === null)) invalid();
   const kind = principals[0].kind;
+  const requiredKind = process.platform === 'win32' ? 'sid' :
+    process.platform === 'linux' ? 'uid' : null;
   if (!principals.every((principal) => principal.kind === kind) ||
+      kind !== requiredKind ||
       new Set(principals.map((principal) => principal.value)).size !== principals.length ||
       (kind === 'sid' ? principals[4].value !== 'S-1-5-18' : principals[4].value !== 'uid:0')) invalid();
   let hostKey;

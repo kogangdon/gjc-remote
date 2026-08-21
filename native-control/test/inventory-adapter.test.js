@@ -8,7 +8,13 @@ import * as publicApi from '../src/public.js';
 
 const hostId = 'owned-host';
 const hostKey = '53adf929ced7346019d88ec53d76cda70c485f8ef9348a392cf38ae382055b7d';
-const roles = Object.freeze({
+const roles = Object.freeze(process.platform === 'win32' ? {
+  management: Object.freeze({ kind: 'sid', value: 'S-1-5-21-111111111-222222222-333333333-1001' }),
+  bot: Object.freeze({ kind: 'sid', value: 'S-1-5-21-111111111-222222222-333333333-1002' }),
+  recovery: Object.freeze({ kind: 'sid', value: 'S-1-5-21-111111111-222222222-333333333-1003' }),
+  daemon: Object.freeze({ kind: 'sid', value: 'S-1-5-21-111111111-222222222-333333333-1004' }),
+  system: Object.freeze({ kind: 'sid', value: 'S-1-5-18' }),
+} : {
   management: Object.freeze({ kind: 'uid', value: 'uid:1001' }),
   bot: Object.freeze({ kind: 'uid', value: 'uid:1002' }),
   recovery: Object.freeze({ kind: 'uid', value: 'uid:1003' }),
@@ -137,8 +143,8 @@ test('validated role snapshots do not observe later input mutation', async () =>
   mutableRoles.daemon = mutableRoles.management;
   await publisher.selfTest();
   const supplied = state.calls.at(-1)[2];
-  assert.equal(supplied.management.value, 'uid:1001');
-  assert.equal(supplied.daemon.value, 'uid:1004');
+  assert.equal(supplied.management.value, roles.management.value);
+  assert.equal(supplied.daemon.value, roles.daemon.value);
   assert.equal(Object.isFrozen(supplied), true);
   assert.equal(Object.isFrozen(supplied.management), true);
 });
@@ -162,12 +168,28 @@ test('factory validation rejects malformed options before addon loading', async 
 });
 
 test('role validation rejects malformed, duplicate, mixed-kind, and non-system bindings', async () => {
+  const wrongKindRoles = process.platform === 'win32' ? {
+    management: { kind: 'uid', value: 'uid:1001' },
+    bot: { kind: 'uid', value: 'uid:1002' },
+    recovery: { kind: 'uid', value: 'uid:1003' },
+    daemon: { kind: 'uid', value: 'uid:1004' },
+    system: { kind: 'uid', value: 'uid:0' },
+  } : {
+    management: { kind: 'sid', value: 'S-1-5-21-100-1001' },
+    bot: { kind: 'sid', value: 'S-1-5-21-100-1002' },
+    recovery: { kind: 'sid', value: 'S-1-5-21-100-1003' },
+    daemon: { kind: 'sid', value: 'S-1-5-21-100-1004' },
+    system: { kind: 'sid', value: 'S-1-5-18' },
+  };
   const variants = [
     { ...roles, daemon: roles.management },
-    { ...roles, daemon: { kind: 'sid', value: 'S-1-5-21-100' } },
-    { ...roles, system: { kind: 'uid', value: 'uid:1' } },
-    { ...roles, bot: { kind: 'uid', value: 'uid:01' } },
-    { ...roles, extra: { kind: 'uid', value: 'uid:9' } },
+    wrongKindRoles,
+    { ...roles, system: { kind: roles.system.kind, value:
+      roles.system.kind === 'sid' ? 'S-1-5-19' : 'uid:1' } },
+    { ...roles, bot: { kind: roles.bot.kind, value:
+      roles.bot.kind === 'sid' ? 's-1-5-21-100' : 'uid:01' } },
+    { ...roles, extra: { kind: roles.bot.kind, value:
+      roles.bot.kind === 'sid' ? 'S-1-5-21-100-9' : 'uid:9' } },
     Object.assign(Object.create(null), roles),
   ];
   for (const invalidRoles of variants) await rejectsInvalid({ hostId, roles: invalidRoles });
@@ -175,8 +197,8 @@ test('role validation rejects malformed, duplicate, mixed-kind, and non-system b
   Object.defineProperty(principalAccessor, 'bot', {
     enumerable: true,
     value: Object.defineProperties({}, {
-      kind: { enumerable: true, value: 'uid' },
-      value: { enumerable: true, get: () => 'uid:1002' },
+      kind: { enumerable: true, value: roles.bot.kind },
+      value: { enumerable: true, get: () => roles.bot.value },
     }),
   });
   await rejectsInvalid({ hostId, roles: principalAccessor });
