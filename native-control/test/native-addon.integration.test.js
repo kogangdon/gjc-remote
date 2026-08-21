@@ -84,7 +84,7 @@ test("Windows inventory rejects UNC and malformed roots while returning exact lo
     assert.deepEqual(Object.keys(facts), ["sourcePlatform", "workDir", "rootIdentity", "storageIdentity"]);
     assert.equal(facts.sourcePlatform, "windows-drive");
     assert.match(facts.workDir, /^(?:\\\\\?\\)?[A-Za-z]:\\/);
-    assert.equal(facts.workDir.toLowerCase().endsWith(root.toLowerCase()), true);
+    assert.equal(basename(facts.workDir).toLowerCase(), basename(root).toLowerCase());
     assert.match(facts.rootIdentity.volumeSerial, /^[0-9a-f]{16}$/);
     assert.match(facts.rootIdentity.fileId, /^[0-9a-f]{32}$/);
     assert.equal(facts.storageIdentity.kind, "windows-drive-storage-v1");

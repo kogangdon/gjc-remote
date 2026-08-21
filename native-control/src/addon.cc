@@ -2530,7 +2530,7 @@ bool InventoryString(napi_env env, napi_value value, std::string* text) {
   if (napi_get_value_string_utf16(env, value, nullptr, 0, &units) != napi_ok ||
       units > kMaximumStringUnits) return false;
   std::vector<char16_t> utf16;
-  try { utf16.resize(units + 1); } catch (const std::bad_alloc&) { return false; }
+  utf16.resize(units + 1);
   if (napi_get_value_string_utf16(env, value, utf16.data(), utf16.size(), &units) != napi_ok)
     return false;
   for (size_t index = 0; index < units; ++index) {
@@ -2545,7 +2545,7 @@ bool InventoryString(napi_env env, napi_value value, std::string* text) {
   size_t bytes = 0;
   if (napi_get_value_string_utf8(env, value, nullptr, 0, &bytes) != napi_ok ||
       bytes > kMaximumStringUnits * 4) return false;
-  try { text->resize(bytes + 1); } catch (const std::bad_alloc&) { return false; }
+  text->resize(bytes + 1);
   if (napi_get_value_string_utf8(env, value, text->data(), bytes + 1, &bytes) != napi_ok)
     return false;
   text->resize(bytes);
@@ -2579,8 +2579,7 @@ bool InventoryBufferArg(napi_env env, napi_callback_info info, size_t index, std
   if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc <= index ||
       napi_is_buffer(env, args[index], &is_buffer) != napi_ok || !is_buffer ||
       napi_get_buffer_info(env, args[index], &data, &length) != napi_ok || length > kInventoryMaxBytes) return false;
-  try { result->assign(static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + length); }
-  catch (const std::bad_alloc&) { return false; }
+  result->assign(static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + length);
   return true;
 }
 
@@ -3104,12 +3103,7 @@ napi_value ReadInventoryObjectWindows(napi_env env, napi_callback_info info) {
     CloseHandle(parent);
     InventoryError(env, "INVENTORY_IO_FAILED", "read_inventory_object"); return nullptr;
   }
-  std::vector<uint8_t> bytes;
-  try { bytes.resize(static_cast<size_t>(length.QuadPart)); }
-  catch (const std::bad_alloc&) {
-    CloseHandle(h); CloseHandle(parent);
-    InventoryError(env, "INVENTORY_IO_FAILED", "read_inventory_object"); return nullptr;
-  }
+  std::vector<uint8_t> bytes(static_cast<size_t>(length.QuadPart));
   DWORD read = 0;
   const bool ok = (bytes.empty() || (ReadFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size()));
   HANDLE named = OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL, kFileOpen,
@@ -3913,11 +3907,7 @@ napi_value ReadInventoryObjectPosix(napi_env env, napi_callback_info info) {
       !VerifyInventoryAclExact(fd, roles, profile)) {
     if (fd >= 0) close(fd); close(parent); InventoryError(env, "INVENTORY_IO_FAILED", "read_inventory_object"); return nullptr;
   }
-  std::vector<uint8_t> bytes;
-  try { bytes.resize(static_cast<size_t>(st.st_size)); }
-  catch (const std::bad_alloc&) {
-    close(fd); close(parent); InventoryError(env, "INVENTORY_IO_FAILED", "read_inventory_object"); return nullptr;
-  }
+  std::vector<uint8_t> bytes(static_cast<size_t>(st.st_size));
   size_t offset = 0;
   while (offset < bytes.size()) { const ssize_t n = read(fd, bytes.data() + offset, bytes.size() - offset); if (n <= 0) break; offset += static_cast<size_t>(n); }
   struct stat named{}, final{};
@@ -4229,8 +4219,7 @@ napi_value PublishInventoryObjectAtomicPosix(napi_env env, napi_callback_info in
         actual.st_size >= 0 && actual.st_size <= static_cast<off_t>(kInventoryMaxBytes) &&
         VerifyInventoryAclExact(object, roles, profile);
     if (ok) {
-      try { contents->resize(static_cast<size_t>(actual.st_size)); }
-      catch (const std::bad_alloc&) { ok = false; }
+      contents->resize(static_cast<size_t>(actual.st_size));
       size_t read_offset = 0;
       while (ok && read_offset < contents->size()) {
         const ssize_t n = read(object, contents->data() + read_offset, contents->size() - read_offset);
