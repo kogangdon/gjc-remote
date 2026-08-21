@@ -3704,7 +3704,7 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
           probe_error == ERROR_FILE_NOT_FOUND && flush_parent();
       CloseHandle(parent);
       InventoryError(env, rolled_back ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-          "publish_inventory_object_atomic", writes + (rolled_back ? 1 : 0), !rolled_back);
+          "publish_inventory_object_atomic", writes + (delete_pending ? 1 : 0), !rolled_back);
       return nullptr;
     }
     if (!displaced_is_predecessor) {
