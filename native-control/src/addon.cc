@@ -2570,6 +2570,17 @@ bool InventoryMaximumBytes(napi_env env, napi_value value, int64_t* result) {
   return true;
 }
 
+bool InventoryUint32(napi_env env, napi_value value, uint32_t* result) {
+  napi_valuetype type;
+  double numeric = 0;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number ||
+      napi_get_value_double(env, value, &numeric) != napi_ok || !std::isfinite(numeric) ||
+      numeric < 0 || numeric > static_cast<double>(std::numeric_limits<uint32_t>::max()) ||
+      std::floor(numeric) != numeric) return false;
+  *result = static_cast<uint32_t>(numeric);
+  return true;
+}
+
 bool InventoryBufferArg(napi_env env, napi_callback_info info, size_t index, std::vector<uint8_t>* result) {
   size_t argc = index + 1;
   napi_value args[6];
@@ -2589,21 +2600,29 @@ napi_ref gInventoryObjectPrototype = nullptr;
 napi_ref gInventoryGetOwnPropertyDescriptors = nullptr;
 
 bool InventoryOrdinaryDataObject(napi_env env, napi_value value, const char* const* names, size_t expected) {
+  auto invalid = [&]() {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value ignored;
+      napi_get_and_clear_last_exception(env, &ignored);
+    }
+    return false;
+  };
   napi_valuetype type;
   napi_value prototype, object_prototype, get_descriptors, descriptors, keys;
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_object ||
       !gInventoryObjectPrototype || !gInventoryGetOwnPropertyDescriptors ||
       napi_get_reference_value(env, gInventoryObjectPrototype, &object_prototype) != napi_ok ||
       napi_get_reference_value(env, gInventoryGetOwnPropertyDescriptors, &get_descriptors) != napi_ok ||
-      napi_get_prototype(env, value, &prototype) != napi_ok) return false;
+      napi_get_prototype(env, value, &prototype) != napi_ok) return invalid();
   bool same = false;
   if (napi_strict_equals(env, prototype, object_prototype, &same) != napi_ok || !same ||
       napi_get_all_property_names(env, value, napi_key_own_only, napi_key_all_properties,
-                                  napi_key_numbers_to_strings, &keys) != napi_ok) return false;
+                                  napi_key_numbers_to_strings, &keys) != napi_ok) return invalid();
   uint32_t count = 0;
-  if (napi_get_array_length(env, keys, &count) != napi_ok || count != expected) return false;
+  if (napi_get_array_length(env, keys, &count) != napi_ok || count != expected) return invalid();
   if (napi_call_function(env, object_prototype, get_descriptors, 1, &value, &descriptors) != napi_ok)
-    return false;
+    return invalid();
   for (size_t i = 0; i < expected; ++i) {
     napi_value descriptor, enumerable;
     bool flag = false, has_getter = false, has_setter = false;
@@ -2613,7 +2632,8 @@ bool InventoryOrdinaryDataObject(napi_env env, napi_value value, const char* con
         napi_get_value_bool(env, enumerable, &flag) != napi_ok || !flag ||
         napi_has_named_property(env, descriptor, "value", &flag) != napi_ok || !flag ||
         napi_has_named_property(env, descriptor, "get", &has_getter) != napi_ok || has_getter ||
-        napi_has_named_property(env, descriptor, "set", &has_setter) != napi_ok || has_setter) return false;
+        napi_has_named_property(env, descriptor, "set", &has_setter) != napi_ok || has_setter)
+      return invalid();
   }
   return true;
 }
@@ -2833,10 +2853,37 @@ napi_value ResolveInventoryStateRootWindows(napi_env env, napi_callback_info inf
   const std::string path = Utf8(base) + (kind == "inventory" ? "\\gjc-remote\\native\\" : "\\gjc-remote\\native-reader\\") + host;
   CoTaskMemFree(base); napi_value result; napi_create_string_utf8(env, path.c_str(), NAPI_AUTO_LENGTH, &result); return result;
 }
+bool ValidWindowsVolumeGuid(const std::wstring& value) {
+  if (value.size() != 49 || value.rfind(L"\\\\?\\VOLUME{", 0) != 0 ||
+      value[47] != L'}' || value[48] != L'\\') return false;
+  for (size_t index = 11; index < 47; ++index) {
+    if (index == 19 || index == 24 || index == 29 || index == 34) {
+      if (value[index] != L'-') return false;
+    } else if (!((value[index] >= L'0' && value[index] <= L'9') ||
+                 (value[index] >= L'A' && value[index] <= L'F'))) {
+      return false;
+    }
+  }
+  return true;
+}
+bool ValidWindowsFileSystem(const std::wstring& value) {
+  if (value.empty() || value.size() > 32) return false;
+  return std::all_of(value.begin(), value.end(), [](wchar_t character) {
+    return (character >= L'A' && character <= L'Z') ||
+        (character >= L'0' && character <= L'9') ||
+        character == L'.' || character == L'_' || character == L'-';
+  });
+}
 napi_value ReadWorkspaceRootFactsWindows(napi_env env, napi_callback_info info) {
   napi_value args[2]; std::string path, platform;
   if (!InventoryArgs(env, info, 2, args) || !InventoryString(env, args[0], &path) ||
-      !InventoryString(env, args[1], &platform) || platform != "windows-drive") {
+      !InventoryString(env, args[1], &platform)) {
+    InventoryError(env, "INVENTORY_INVALID", "read_workspace_root_facts"); return nullptr;
+  }
+  if (platform == "windows-unc") {
+    InventoryError(env, "CONTAINMENT_UNSUPPORTED", "read_workspace_root_facts"); return nullptr;
+  }
+  if (platform != "windows-drive") {
     InventoryError(env, "INVENTORY_INVALID", "read_workspace_root_facts"); return nullptr;
   }
   WindowsPathParts parts; if (!ParseWindowsPath(path, &parts)) {
@@ -2867,6 +2914,9 @@ napi_value ReadWorkspaceRootFactsWindows(napi_env env, napi_callback_info info) 
   CloseHandle(handle);
   std::wstring volume_guid(guid); for (auto& c : volume_guid) c = static_cast<wchar_t>(std::towupper(c));
   std::wstring filesystem(fs); for (auto& c : filesystem) c = static_cast<wchar_t>(std::towupper(c));
+  if (!ValidWindowsVolumeGuid(volume_guid) || !ValidWindowsFileSystem(filesystem)) {
+    InventoryError(env, "CONTAINMENT_UNSUPPORTED", "read_workspace_root_facts"); return nullptr;
+  }
   napi_value result, root, storage, value; napi_create_object(env, &result); napi_create_object(env, &root); napi_create_object(env, &storage);
   if (canonical_path.rfind(L"\\\\?\\", 0) == 0) canonical_path.erase(0, 4);
   const std::string canonical_work_dir = Utf8(canonical_path);
@@ -3181,6 +3231,9 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
   }
   CloseHandle(verified_parent);
+  FILE_ID_INFO published_fence_id{};
+  uint32_t fence_writes = 0;
+  bool created_by_call = false;
   HANDLE h = OpenWindowsPathNoFollow(path, GENERIC_READ | READ_CONTROL, VerifiedObjectType::File);
   if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND &&
       CurrentInventoryActor(roles, true, false)) {
@@ -3250,17 +3303,29 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
       const uint32_t writes = (temporary != INVALID_HANDLE_VALUE || temporary_known ? 1 : 0) +
           (acl_applied ? 1 : 0) + (renamed ? 1 : 0) + ((cleaned || rolled_back) ? 1 : 0);
       InventoryError(env, (cleaned || rolled_back) ?
-          (rename_error == ERROR_FILE_EXISTS ? "INVENTORY_STALE" : "INVENTORY_IO_FAILED") :
+          (rename_error == ERROR_FILE_EXISTS || rename_error == ERROR_ALREADY_EXISTS ?
+              "INVENTORY_STALE" : "INVENTORY_IO_FAILED") :
           "INVENTORY_MANUAL_CLEANUP", "acquire_inventory_fence", writes,
           !(cleaned || rolled_back));
       return nullptr;
     }
+    published_fence_id = temporary_id;
+    fence_writes = 3;
+    created_by_call = true;
     h = OpenWindowsPathNoFollow(path, GENERIC_READ | READ_CONTROL, VerifiedObjectType::File);
   }
-  if (h == INVALID_HANDLE_VALUE || !VerifyInventoryAcl(h, roles, "inventory-fence")) {
+  FILE_ID_INFO reopened_fence_id{};
+  const bool reopened_exact = h != INVALID_HANDLE_VALUE &&
+      VerifyInventoryAcl(h, roles, "inventory-fence") &&
+      GetFileInformationByHandleEx(h, FileIdInfo, &reopened_fence_id,
+          sizeof(reopened_fence_id)) &&
+      (!created_by_call || SameWindowsFileId(published_fence_id, reopened_fence_id));
+  if (!reopened_exact) {
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    InventoryError(env, h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND ? "INVENTORY_STALE" : "INVENTORY_IO_FAILED",
-        "acquire_inventory_fence");
+    InventoryError(env, created_by_call ? "INVENTORY_MANUAL_CLEANUP" :
+        (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND ?
+            "INVENTORY_STALE" : "INVENTORY_IO_FAILED"),
+        "acquire_inventory_fence", fence_writes, created_by_call);
     return nullptr;
   }
   LARGE_INTEGER fence_length{};
@@ -3375,7 +3440,15 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
         "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed); return nullptr;
   }
   HANDLE previous = OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL | DELETE, kFileOpen, VerifiedObjectType::File);
+  const DWORD previous_error = previous == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
   const bool present = previous != INVALID_HANDLE_VALUE;
+  if (!present && previous_error != ERROR_FILE_NOT_FOUND) {
+    const bool removed = discard_candidate();
+    CloseHandle(parent);
+    InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
+        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed);
+    return nullptr;
+  }
   if ((!present && expected_type != napi_null) || (present && (expected_type == napi_null || !InventoryIdentityArg(env, args[3], previous)))) {
     if (previous != INVALID_HANDLE_VALUE) CloseHandle(previous);
     const bool removed = discard_candidate(); CloseHandle(candidate); CloseHandle(parent);
@@ -3435,16 +3508,25 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
       if (retained != INVALID_HANDLE_VALUE) CloseHandle(retained);
       if (leftover != INVALID_HANDLE_VALUE) {
         FILE_DISPOSITION_INFO disposition{TRUE};
-        removed = destination_is_predecessor && leftover_is_candidate &&
+        const bool delete_pending = destination_is_predecessor && leftover_is_candidate &&
             InventoryParentStable(parent, parent_id, canonical_parent) &&
-            SetFileInformationByHandle(leftover, FileDispositionInfo, &disposition, sizeof(disposition)) &&
-            flush_parent();
+            SetFileInformationByHandle(leftover, FileDispositionInfo, &disposition, sizeof(disposition));
         CloseHandle(leftover);
+        leftover = INVALID_HANDLE_VALUE;
+        HANDLE probe = OpenWindowsRelative(parent, temp, FILE_READ_ATTRIBUTES,
+            kFileOpen, VerifiedObjectType::File);
+        const DWORD probe_error = probe == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+        removed = delete_pending && probe == INVALID_HANDLE_VALUE &&
+            probe_error == ERROR_FILE_NOT_FOUND && flush_parent();
       }
     }
     if (removed) ++writes;
     CloseHandle(parent);
-    InventoryError(env, removed ? (publication_error == ERROR_FILE_EXISTS ? "INVENTORY_STALE" : "INVENTORY_IO_FAILED") :
+    InventoryError(env, removed ?
+        (publication_error == ERROR_FILE_EXISTS || publication_error == ERROR_ALREADY_EXISTS ?
+            "INVENTORY_STALE" : publication_error == ERROR_ACCESS_DENIED ?
+                "INVENTORY_ACCESS_DENIED" : "INVENTORY_IO_FAILED") :
         "INVENTORY_MANUAL_CLEANUP", "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   writes++;
@@ -3498,6 +3580,12 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
       CloseHandle(parent);
       InventoryError(env, rolled_back ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
           "publish_inventory_object_atomic", writes + (rolled_back ? 1 : 0), !rolled_back);
+      return nullptr;
+    }
+    if (!displaced_is_predecessor) {
+      CloseHandle(parent);
+      InventoryError(env, "INVENTORY_MANUAL_CLEANUP",
+          "publish_inventory_object_atomic", writes, true);
       return nullptr;
     }
     const std::wstring backup_path = InventoryChildPath(canonical_parent, backup);
@@ -3825,7 +3913,7 @@ bool InventoryIdentityArg(napi_env env, napi_value value, const struct stat& st)
   std::string device, inode, owner;
   uint32_t mode = 0;
   return InventoryString(env, fields[0], &device) && InventoryString(env, fields[1], &inode) &&
-      napi_get_value_uint32(env, fields[2], &mode) == napi_ok && InventoryString(env, fields[3], &owner) &&
+      InventoryUint32(env, fields[2], &mode) && InventoryString(env, fields[3], &owner) &&
       device == std::to_string(static_cast<uint64_t>(st.st_dev)) &&
       inode == std::to_string(static_cast<uint64_t>(st.st_ino)) &&
       mode == static_cast<uint32_t>(st.st_mode) &&
@@ -4105,8 +4193,10 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
           [](napi_env, void* raw) {
             auto* item = static_cast<InventoryFenceReleaseWork*>(raw);
             if (!item->fence->released.exchange(true) && item->fence->fd >= 0) {
-              if (flock(item->fence->fd, LOCK_UN) != 0 || close(item->fence->fd) != 0) item->failed = true;
-              item->fence->fd = -1;
+              const bool unlocked = flock(item->fence->fd, LOCK_UN) == 0;
+              const bool closed = close(item->fence->fd) == 0;
+              item->failed = !unlocked || !closed;
+              if (closed) item->fence->fd = -1;
             }
           },
           [](napi_env complete_env, napi_status, void* raw) {
@@ -4147,6 +4237,9 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
   if (!VerifyInventoryAclExact(parent, roles, "inventory-directory")) {
     close(parent); InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
   }
+  bool created_by_call = false;
+  uint32_t fence_writes = 0;
+  struct stat published_identity{};
   int fd = OpenObjectNoFollow(parent, name, O_RDONLY);
   if (fd < 0 && errno == ENOENT && (geteuid() == roles.management || geteuid() == 0)) {
     std::string temporary; int created = -1;
@@ -4193,14 +4286,15 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
       close(parent); InventoryError(env, cleaned ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
           "acquire_inventory_fence", writes, !cleaned); return nullptr;
     }
-    ++writes;
     if (RenameAt2(parent, temporary, name, 1) != 0) {
       const int failure = errno; const bool cleaned = discard(temporary, created_identity);
       if (failure != EEXIST) {
         close(parent); InventoryError(env, cleaned ? (failure == ENOSYS || failure == EINVAL ? "CONTAINMENT_UNSUPPORTED" : "INVENTORY_IO_FAILED") :
             "INVENTORY_MANUAL_CLEANUP", "acquire_inventory_fence", writes, !cleaned); return nullptr;
       }
-    } else if (fsync(parent) != 0) {
+    } else {
+      ++writes;
+      if (fsync(parent) != 0) {
       int named = OpenObjectNoFollow(parent, name, O_RDONLY);
       struct stat named_identity{};
       const bool proven = named >= 0 && fstat(named, &named_identity) == 0 &&
@@ -4208,21 +4302,30 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
           VerifyInventoryAclExact(named, roles, "inventory-fence");
       if (named >= 0) close(named);
       const bool cleaned = proven && discard(name, created_identity);
-      if (cleaned) ++writes;
       const bool durable = cleaned && fsync(parent) == 0;
       close(parent); InventoryError(env, durable ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
           "acquire_inventory_fence", writes, !durable); return nullptr;
-    } else {
-      ++writes;
+      }
+      created_by_call = true;
+      fence_writes = writes;
+      published_identity = created_identity;
     }
     fd = OpenObjectNoFollow(parent, name, O_RDONLY);
   }
   if (fd < 0) { close(parent); InventoryError(env, errno == ENOENT ? "INVENTORY_STALE" : "INVENTORY_IO_FAILED", "acquire_inventory_fence"); return nullptr; }
   struct stat fence_stat{};
   const bool fence_ok = fstat(fd, &fence_stat) == 0 && S_ISREG(fence_stat.st_mode) && fence_stat.st_size == 0 &&
-      VerifyInventoryAclExact(fd, roles, "inventory-fence");
+      VerifyInventoryAclExact(fd, roles, "inventory-fence") &&
+      (!created_by_call || (fence_stat.st_dev == published_identity.st_dev &&
+          fence_stat.st_ino == published_identity.st_ino));
   close(parent);
-  if (!fence_ok) { close(fd); InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr; }
+  if (!fence_ok) {
+    close(fd);
+    InventoryError(env, created_by_call ? "INVENTORY_MANUAL_CLEANUP" :
+        "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence", fence_writes,
+        created_by_call);
+    return nullptr;
+  }
   napi_value promise; napi_deferred deferred; napi_create_promise(env, &deferred, &promise);
   auto* fence = new InventoryFence();
   fence->env = env;
@@ -4347,8 +4450,12 @@ napi_value PublishInventoryObjectAtomicPosix(napi_env env, napi_callback_info in
 
   const unsigned int NOREPLACE = 1, EXCHANGE = 2;
   if (RenameAt2(parent, temp, name, present ? EXCHANGE : NOREPLACE) != 0) {
-    const bool unsupported = errno == ENOSYS || errno == EINVAL;
-    return fail_clean(unsupported ? "CONTAINMENT_UNSUPPORTED" : "INVENTORY_STALE");
+    const int failure = errno;
+    const char* code = failure == ENOSYS || failure == EINVAL ? "CONTAINMENT_UNSUPPORTED" :
+        failure == EEXIST || failure == ENOTEMPTY ? "INVENTORY_STALE" :
+        failure == EACCES || failure == EPERM ? "INVENTORY_ACCESS_DENIED" :
+        "INVENTORY_IO_FAILED";
+    return fail_clean(code);
   }
   ++writes;
   auto candidate_at_name = [&](struct stat* result) {

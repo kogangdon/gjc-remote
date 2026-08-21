@@ -97,6 +97,12 @@ test("Windows inventory rejects UNC and malformed roots while returning exact lo
         error.operation === "read_workspace_root_facts" &&
         error.writes === 0 && error.ambiguous === false);
     }
+    assert.throws(
+      () => addon.read_workspace_root_facts("\\\\server\\share\\workspace", "windows-unc"),
+      (error) => error.code === "CONTAINMENT_UNSUPPORTED" &&
+        error.operation === "read_workspace_root_facts" &&
+        error.writes === 0 && error.ambiguous === false,
+    );
     const invalidRoles = {};
     const invalid = (operation, invoke) => assert.throws(invoke, (error) =>
       error.code === "INVENTORY_INVALID" && error.operation === operation &&
@@ -125,6 +131,13 @@ test("Windows inventory rejects UNC and malformed roots while returning exact lo
     const proxyRoles = new Proxy({}, {});
     invalid("publish_inventory_object_atomic", () =>
       addon.publish_inventory_object_atomic(root, "prefix", Buffer.alloc(0), null, proxyRoles, "inventory-file"));
+    const throwingProxyRoles = new Proxy({}, {
+      getPrototypeOf() {
+        throw new Error(`must-not-escape:${root}`);
+      },
+    });
+    invalid("read_inventory_object", () =>
+      addon.read_inventory_object(root, 0, throwingProxyRoles, "inventory-file"));
     t.diagnostic("Positive Windows inventory ACL/fence/publication evidence requires the owned four-distinct-account fixture; this test makes no unproven success claim.");
   } finally {
     await rm(root, { recursive: true, force: true });

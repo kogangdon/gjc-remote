@@ -278,6 +278,9 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     let actual;
     let manifestBytes;
     try { manifestBytes = readFileSync(manifestPath); actual = JSON.parse(manifestBytes.toString('utf8')); } catch { fail('manifest is not valid JSON'); process.exit(); }
+    if (JSON.stringify(Object.keys(actual).sort()) !== JSON.stringify(Object.keys(expected).sort())) {
+      fail('manifest keys do not match the exact local contract');
+    }
     for (const [key, value] of Object.entries(expected)) {
       if (JSON.stringify(actual[key]) !== JSON.stringify(value)) fail(`manifest ${key} does not match the local addon`);
     }
