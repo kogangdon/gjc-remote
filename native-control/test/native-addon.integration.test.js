@@ -739,6 +739,15 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(inventoryAcl, /SE_DACL_PROTECTED/);
   assert.match(inventoryAcl, /size\.AceCount == 4/);
   assert.match(inventoryAcl, /header->AceType != ACCESS_ALLOWED_ACE_TYPE \|\| header->AceFlags != 0/);
+  const fileIdVectorsStart = source.indexOf("bool InventoryFileIdVectorsValid()");
+  const fileIdVectorsEnd = source.indexOf("bool InventoryIdentity(HANDLE", fileIdVectorsStart);
+  const fileIdVectors = source.slice(fileIdVectorsStart, fileIdVectorsEnd);
+  assert.notEqual(fileIdVectorsStart, -1);
+  assert.match(fileIdVectors, /0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,\s*0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f/);
+  assert.match(fileIdVectors, /WindowsFileIdText\(ascending\) == "000102030405060708090a0b0c0d0e0f"/);
+  assert.match(fileIdVectors, /0xff, 0x00, 0x80, 0x7f, 0x10, 0x20, 0x30, 0x40,\s*0x50, 0x60, 0x70, 0x90, 0xa0, 0xb0, 0xc0, 0xd0/);
+  assert.match(fileIdVectors, /WindowsFileIdText\(asymmetric\) == "ff00807f1020304050607090a0b0c0d0"/);
+  assert.match(source, /if \(!InventoryFileIdVectorsValid\(\)\)/);
   const inventoryPublishStart = source.indexOf("napi_value PublishInventoryObjectAtomicWindows");
   const inventoryPublishEnd = source.indexOf("#else", inventoryPublishStart);
   const inventoryPublish = source.slice(inventoryPublishStart, inventoryPublishEnd);

@@ -2737,6 +2737,26 @@ bool InventoryPath(const std::string& path, const std::string& profile) {
       profile == "inventory-manual-cleanup" ? "inventory-manual-cleanup.v1.json" : "inventory-floor.v1.json";
   return leaf == expected;
 }
+std::string WindowsFileIdText(const FILE_ID_128& file_id) {
+  std::string result;
+  result.reserve(sizeof(file_id.Identifier) * 2);
+  char byte_text[3];
+  for (uint8_t byte : file_id.Identifier) {
+    std::snprintf(byte_text, sizeof(byte_text), "%02x", byte);
+    result += byte_text;
+  }
+  return result;
+}
+
+bool InventoryFileIdVectorsValid() {
+  const FILE_ID_128 ascending{{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+      0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f}};
+  const FILE_ID_128 asymmetric{{0xff, 0x00, 0x80, 0x7f, 0x10, 0x20, 0x30, 0x40,
+      0x50, 0x60, 0x70, 0x90, 0xa0, 0xb0, 0xc0, 0xd0}};
+  return WindowsFileIdText(ascending) == "000102030405060708090a0b0c0d0e0f" &&
+      WindowsFileIdText(asymmetric) == "ff00807f1020304050607090a0b0c0d0";
+}
+
 bool InventoryIdentity(HANDLE handle, std::string* serial, std::string* id, uint32_t* attributes, std::string* owner) {
   FILE_ID_INFO file_id{}; FILE_BASIC_INFO basic{}; PSID sid = nullptr; PSECURITY_DESCRIPTOR descriptor = nullptr; LPWSTR text = nullptr;
   const bool ok = GetFileInformationByHandleEx(handle, FileIdInfo, &file_id, sizeof(file_id)) &&
@@ -2744,7 +2764,7 @@ bool InventoryIdentity(HANDLE handle, std::string* serial, std::string* id, uint
       GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &sid, nullptr, nullptr, nullptr, &descriptor) == ERROR_SUCCESS &&
       sid && ConvertSidToStringSidW(sid, &text);
   if (ok) { char b[3]; *serial = ""; for (int i = 7; i >= 0; --i) { std::snprintf(b, sizeof(b), "%02x", static_cast<unsigned>((file_id.VolumeSerialNumber >> (i * 8)) & 0xff)); *serial += b; }
-    *id = ""; for (uint8_t byte : file_id.FileId.Identifier) { std::snprintf(b, sizeof(b), "%02x", byte); *id += b; }
+    *id = WindowsFileIdText(file_id.FileId);
     *attributes = basic.FileAttributes; *owner = Utf8(text);
   }
   if (text) LocalFree(text); if (descriptor) LocalFree(descriptor); return ok;
@@ -4770,6 +4790,13 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
+#ifdef _WIN32
+  if (!InventoryFileIdVectorsValid()) {
+    napi_throw_error(env, "ERR_NATIVE_CONTROL_INIT",
+        "native inventory identity self-check failed");
+    return nullptr;
+  }
+#endif
   napi_value plain, object_prototype, global, object_ctor, get_descriptors;
   if (napi_create_object(env, &plain) != napi_ok ||
       napi_get_prototype(env, plain, &object_prototype) != napi_ok ||
