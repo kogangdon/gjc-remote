@@ -192,6 +192,15 @@ test('role validation rejects malformed, duplicate, mixed-kind, and non-system b
       roles.bot.kind === 'sid' ? 'S-1-5-21-100-9' : 'uid:9' } },
     Object.assign(Object.create(null), roles),
   ];
+  if (process.platform === 'win32') {
+    variants.push({
+      ...roles,
+      management: {
+        kind: 'sid',
+        value: `S-1-5-${'1-'.repeat(2_100)}1`,
+      },
+    });
+  }
   for (const invalidRoles of variants) await rejectsInvalid({ hostId, roles: invalidRoles });
   const principalAccessor = { ...roles };
   Object.defineProperty(principalAccessor, 'bot', {
