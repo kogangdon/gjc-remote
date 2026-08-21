@@ -3357,6 +3357,7 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
       if (temporary != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_EXISTS) break;
     }
     FILE_ID_INFO temporary_id{};
+    const bool temporary_created = temporary != INVALID_HANDLE_VALUE;
     const bool temporary_known = temporary != INVALID_HANDLE_VALUE &&
         GetFileInformationByHandleEx(temporary, FileIdInfo, &temporary_id, sizeof(temporary_id));
     const bool acl_applied = temporary != INVALID_HANDLE_VALUE &&
@@ -3410,7 +3411,7 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
     }
     CloseHandle(parent);
     if (!published) {
-      const uint32_t writes = (temporary != INVALID_HANDLE_VALUE || temporary_known ? 1 : 0) +
+      const uint32_t writes = (temporary_created ? 1 : 0) +
           (acl_applied ? 1 : 0) + (renamed ? 1 : 0) +
           ((cleanup_mutated || rollback_mutated) ? 1 : 0);
       InventoryError(env, (cleaned || rolled_back) ?
