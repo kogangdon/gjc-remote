@@ -223,6 +223,14 @@ test('role validation rejects malformed, duplicate, mixed-kind, and non-system b
         value: `S-1-5-${'1-'.repeat(2_100)}1`,
       },
     });
+    for (const value of [
+      `S-1-5-${Array.from({ length: 16 }, () => '1').join('-')}`,
+      'S-1-281474976710656-1',
+      'S-1-5-4294967296',
+      'S-2-5-1',
+    ]) {
+      variants.push({ ...roles, management: { kind: 'sid', value } });
+    }
   }
   for (const invalidRoles of variants) await rejectsInvalid({ hostId, roles: invalidRoles });
   const principalAccessor = { ...roles };

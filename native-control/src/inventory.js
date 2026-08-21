@@ -44,9 +44,26 @@ function exactDataValues(value, keys) {
   }
 }
 
+function isWindowsSidShape(value) {
+  const fields = value.split('-');
+  if (fields.length < 4 || fields.length > 18 ||
+      fields[0] !== 'S' || fields[1] !== '1') return false;
+  const decimal = /^(0|[1-9][0-9]*)$/;
+  if (!fields.slice(2).every((field) => decimal.test(field))) return false;
+  try {
+    if (BigInt(fields[2]) > 281474976710655n) return false;
+    return fields.slice(3).every((field) => BigInt(field) <= 4294967295n);
+  } catch {
+    return false;
+  }
+}
+
 function principalSnapshot(value) {
   const values = exactDataValues(value, PRINCIPAL_KEYS);
   if (!values) return null;
+  if (typeof values.value !== 'string' ||
+      Buffer.byteLength(values.value, 'utf8') > 4096 ||
+      (values.kind === 'sid' && !isWindowsSidShape(values.value))) return null;
   const principal = { kind: values.kind, value: values.value };
   try {
     return isPrincipal(principal) ? Object.freeze(principal) : null;
