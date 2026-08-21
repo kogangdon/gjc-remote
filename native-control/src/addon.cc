@@ -3742,9 +3742,12 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
         "INVENTORY_MANUAL_CLEANUP", "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   HANDLE result = InventoryParentStable(parent, parent_id, canonical_parent) ?
-      OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL, kFileOpen, VerifiedObjectType::File) : INVALID_HANDLE_VALUE;
+      OpenWindowsRelative(parent, name, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+          kFileOpen, VerifiedObjectType::File) : INVALID_HANDLE_VALUE;
   HANDLE displaced = present && InventoryParentStable(parent, parent_id, canonical_parent) ?
-      OpenWindowsRelative(parent, backup, GENERIC_READ | READ_CONTROL | DELETE, kFileOpen, VerifiedObjectType::File) : INVALID_HANDLE_VALUE;
+      OpenWindowsRelative(parent, backup,
+          GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE,
+          kFileOpen, VerifiedObjectType::File) : INVALID_HANDLE_VALUE;
   FILE_ID_INFO result_id{}, displaced_id{};
   std::string result_serial, result_file, result_owner;
   uint32_t result_attributes = 0;
@@ -3806,7 +3809,8 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
         0, nullptr, nullptr) != FALSE;
     const bool rolled_back = rollback_mutated &&
         InventoryParentStable(parent, parent_id, canonical_parent);
-    HANDLE restored = rolled_back ? OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL,
+    HANDLE restored = rolled_back ? OpenWindowsRelative(
+        parent, name, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
         kFileOpen, VerifiedObjectType::File) : INVALID_HANDLE_VALUE;
     std::string restored_serial, restored_file, restored_owner;
     uint32_t restored_attributes = 0;

@@ -769,6 +769,12 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(inventoryPublish, /InventoryChildPath\(canonical_parent, name\)/);
   assert.match(inventoryPublish, /ReplaceFileW\(destination_path\.c_str\(\), temporary_path\.c_str\(\), backup_path\.c_str\(\),\s*0,/);
   assert.match(inventoryPublish, /ReplaceFileW\(destination_path\.c_str\(\), backup_path\.c_str\(\), rollback_temp\.c_str\(\),/);
+  assert.match(inventoryPublish, /parent, name, GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL,/,
+    "verified destination handles carry the write access required by FlushFileBuffers");
+  assert.match(inventoryPublish, /parent, backup,\s*GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL \| DELETE,/,
+    "verified displaced predecessor handles carry write access for durability and DELETE for cleanup");
+  assert.match(inventoryPublish, /HANDLE restored = rolled_back \? OpenWindowsRelative\(\s*parent, name, GENERIC_READ \| GENERIC_WRITE \| READ_CONTROL,\s*kFileOpen, VerifiedObjectType::File\) : INVALID_HANDLE_VALUE;/,
+    "rollback-restored predecessor handles carry the write access required by FlushFileBuffers");
   assert.match(inventoryPublish, /for \(unsigned attempt = 0; attempt != 128; \+\+attempt\)/);
   assert.match(inventoryPublish, /if \(published \|\| GetLastError\(\) != ERROR_FILE_EXISTS\) break/);
   assert.match(source, /BCryptGenRandom\(nullptr, bytes\.data\(\), static_cast<ULONG>\(bytes\.size\(\)\),/);
