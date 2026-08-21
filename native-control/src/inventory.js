@@ -95,17 +95,25 @@ async function verifyAcl(lowLevel, path, roles, profile, expectedActor) {
   }
 }
 
+function requireResolvedRoot(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw localError('INVENTORY_IO_FAILED', 'resolve_native_state_root');
+  }
+  return value;
+}
+
 async function createAdapter(loadLowLevel, options, role) {
   const validated = validateOptions(options);
   if (typeof loadLowLevel !== 'function') invalid();
   const lowLevel = requireLowLevel(await loadLowLevel());
-  const inventoryRoot = await lowLevel.resolve_native_state_root(validated.hostKey, 'inventory');
+  const inventoryRoot = requireResolvedRoot(
+    await lowLevel.resolve_native_state_root(validated.hostKey, 'inventory'));
   const readerRoot = role === 'daemon'
-    ? await lowLevel.resolve_native_state_root(validated.hostKey, 'reader')
-    : undefined;
+    ? requireResolvedRoot(await lowLevel.resolve_native_state_root(validated.hostKey, 'reader'))
+    : null;
   const selfTest = async () => {
     await verifyAcl(lowLevel, inventoryRoot, validated.roles, 'inventory-directory', role);
-    if (readerRoot !== undefined) {
+    if (readerRoot !== null) {
       await verifyAcl(lowLevel, readerRoot, validated.roles, 'reader-directory', role);
     }
     return Object.freeze({ role, contractVersion: 4, writes: 0 });

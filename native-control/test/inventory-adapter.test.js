@@ -133,6 +133,29 @@ test('native errors from roots and verification preserve exact identity and fiel
   );
 });
 
+test('factory rejects missing or malformed resolved roots before ACL verification', async () => {
+  for (const invalidRoot of [undefined, null, '', Buffer.from('/managed/inventory')]) {
+    const state = fixture();
+    state.lowLevel.resolve_native_state_root = async () => invalidRoot;
+    await assert.rejects(
+      createInventoryPublisherAdapter(() => state.lowLevel, { hostId, roles }),
+      (error) => assertBoundedError(error, 'INVENTORY_IO_FAILED', 'resolve_native_state_root'),
+    );
+    assert.equal(state.calls.some(([kind]) => kind === 'acl'), false);
+  }
+
+  const readerState = fixture();
+  readerState.lowLevel.resolve_native_state_root = async (key, kind) => {
+    readerState.calls.push(['root', key, kind]);
+    return kind === 'inventory' ? `/managed/inventory/${key}` : undefined;
+  };
+  await assert.rejects(
+    createInventoryReaderAdapter(() => readerState.lowLevel, { hostId, roles }),
+    (error) => assertBoundedError(error, 'INVENTORY_IO_FAILED', 'resolve_native_state_root'),
+  );
+  assert.equal(readerState.calls.some(([kind]) => kind === 'acl'), false);
+});
+
 test('validated role snapshots do not observe later input mutation', async () => {
   const mutableRoles = Object.fromEntries(
     Object.entries(roles).map(([key, value]) => [key, { ...value }]));
