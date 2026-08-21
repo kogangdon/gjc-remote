@@ -3433,8 +3433,11 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
         InventoryAcl(temporary, roles, "inventory-fence");
     const bool prepared = acl_applied && VerifyInventoryAcl(temporary, roles, "inventory-fence") &&
         FlushFileBuffers(temporary);
-    const bool renamed = prepared && RenameWindowsRelative(temporary, parent, name, false);
-    const DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
+    const bool rename_attempted = prepared;
+    const bool renamed = rename_attempted &&
+        RenameWindowsRelative(temporary, parent, name, false);
+    const DWORD rename_error = renamed ? ERROR_SUCCESS :
+        rename_attempted ? GetLastError() : ERROR_GEN_FAILURE;
     bool cleaned = false;
     bool cleanup_mutated = false;
     if (!renamed && temporary != INVALID_HANDLE_VALUE) {
@@ -3476,7 +3479,7 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
     const uint32_t creation_writes = (temporary_created ? 1 : 0) +
         (acl_applied ? 1 : 0) + (renamed ? 1 : 0) +
         ((cleanup_mutated || rollback_mutated) ? 1 : 0);
-    const bool lost_create_race = !renamed && cleaned &&
+    const bool lost_create_race = rename_attempted && !renamed && cleaned &&
         (rename_error == ERROR_FILE_EXISTS ||
          rename_error == ERROR_ALREADY_EXISTS);
     if (lost_create_race) {

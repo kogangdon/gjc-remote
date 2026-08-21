@@ -922,7 +922,10 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.equal((source.match(/const napi_status reference_status/g) ?? []).length, 2);
   assert.equal((source.match(/const napi_status wrap_status/g) ?? []).length, 2);
   assert.equal((source.match(/setup_status != napi_ok \|\| !InventoryFenceProperties/g) ?? []).length, 2);
-  assert.match(source, /const bool lost_create_race = !renamed && cleaned/);
+  assert.match(source,
+    /const bool lost_create_race = rename_attempted && !renamed && cleaned/);
+  assert.match(source,
+    /rename_attempted \? GetLastError\(\) : ERROR_GEN_FAILURE/);
   assert.match(source, /if \(!published && !lost_create_race\)/);
   assert.match(source, /if \(failure == EEXIST\) \{[\s\S]*fence_writes = writes;/);
   const inventoryFenceStart = source.indexOf("napi_value AcquireInventoryFenceWindows");
