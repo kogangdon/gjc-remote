@@ -724,7 +724,7 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(inventoryPublish, /displaced_is_predecessor/);
   assert.match(inventoryPublish, /const bool rolled_back = InventoryParentStable/);
   assert.match(inventoryPublish, /restored_serial == predecessor_serial/);
-  assert.match(inventoryPublish, /residual_removed && flush_parent\(\)/);
+  assert.match(inventoryPublish, /residual_delete_pending &&\s*residual_probe == INVALID_HANDLE_VALUE && residual_error == ERROR_FILE_NOT_FOUND &&\s*flush_parent\(\)/);
   assert.match(inventoryPublish, /CanonicalInventoryParent\(parent, &parent_id, &canonical_parent\)/);
   assert.match(inventoryPublish, /InventoryParentStable\(parent, parent_id, canonical_parent\)/);
   assert.match(source, /GetFinalPathNameByHandleW\(parent, nullptr, 0, FILE_NAME_NORMALIZED \| VOLUME_NAME_DOS\)/);
