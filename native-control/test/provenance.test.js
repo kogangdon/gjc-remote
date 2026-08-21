@@ -9,7 +9,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 import { evaluateRequiredSignature } from '../scripts/verify-build.mjs';
-import { capabilities, capabilitySignatures, loadVerifiedAddon, verifyManifestSignature } from '../src/index.js';
+import {
+  capabilities,
+  capabilitySignatures,
+  contractRevision,
+  loadVerifiedAddon,
+  verifyManifestSignature,
+} from '../src/index.js';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const realAddonPath = join(packageRoot, 'build', 'Release', 'native_control.node');
@@ -125,7 +131,7 @@ function writeManifestFixture(dir, { addonBytes, packageJson, copyAddon = false 
   if (copyAddon) writeFileSync(addonPath, addonBytes);
   writeFileSync(packageJsonPath, JSON.stringify(packageJson));
   const manifest = {
-    contractVersion: 4, package: packageJson.name, version: packageJson.version, napi: 8,
+    contractVersion: 4, contractRevision, package: packageJson.name, version: packageJson.version, napi: 8,
     platform: process.platform, arch: process.arch, addon: 'native_control.node',
     sha256: createHash('sha256').update(addonBytes).digest('hex'),
     capabilities, capabilitySignatures,

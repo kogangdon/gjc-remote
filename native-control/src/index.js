@@ -5,8 +5,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '@gjc-remote/shared/strict-json';
 import { createAdapter } from './adapter.js';
-import { capabilities, capabilitySignatures, inventoryCapabilities } from './capabilities.js';
-export { capabilities, capabilitySignatures, inventoryCapabilities };
+import { capabilities, capabilitySignatures, contractRevision, inventoryCapabilities } from './capabilities.js';
+export { capabilities, capabilitySignatures, contractRevision, inventoryCapabilities };
 
 const require = createRequire(import.meta.url);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -102,7 +102,7 @@ export function verifyManifestSignature(manifestBytes, sidecar, trustStore) {
 export function validateBuildManifest(manifest, packageJson, addonBytes, platform = process.platform, arch = process.arch) {
   if (!manifest || Object.getPrototypeOf(manifest) !== Object.prototype || !packageJson || Object.getPrototypeOf(packageJson) !== Object.prototype || !Buffer.isBuffer(addonBytes)) return false;
   const expected = {
-    contractVersion: 4, package: packageJson.name, version: packageJson.version, napi: 8,
+    contractVersion: 4, contractRevision, package: packageJson.name, version: packageJson.version, napi: 8,
     platform, arch, addon: 'native_control.node', sha256: fingerprint(addonBytes),
     capabilities, capabilitySignatures,
   };
@@ -130,12 +130,14 @@ export function loadVerifiedAddon({
     addonBytes = readFileSync(addonFilePath);
   } catch { refused('load_native_control', 'verified build manifest or native addon is missing, invalid, or unreadable'); }
   try {
-    if (!same(packageJson.nativeControlContract, { version: 4, napi: 8, platforms: approvedPlatforms })) {
+    if (!same(packageJson.nativeControlContract, {
+      version: 4, revision: contractRevision, napi: 8, platforms: approvedPlatforms,
+    })) {
       refused('load_native_control', 'package native capability contract is invalid');
     }
   } catch { refused('load_native_control', 'package native capability contract is invalid'); }
   const expected = {
-    contractVersion: 4, package: packageJson.name, version: packageJson.version, napi: 8,
+    contractVersion: 4, contractRevision, package: packageJson.name, version: packageJson.version, napi: 8,
     platform: process.platform, arch: process.arch, addon: 'native_control.node', sha256: fingerprint(addonBytes),
     capabilities, capabilitySignatures,
   };
@@ -178,12 +180,15 @@ export function loadVerifiedAddon({
   try { contract = addon.native_control_contract(); } catch { refused('load_native_control', 'native capability contract is unreadable'); }
   let validContract = false;
   try {
-    validContract = contract?.contractVersion === expected.contractVersion && contract.napi === expected.napi &&
+    validContract = contract?.contractVersion === expected.contractVersion &&
+      contract.contractRevision === expected.contractRevision && contract.napi === expected.napi &&
       same(contract.capabilities, capabilities) && same(contract.capabilitySignatures, capabilitySignatures);
   } catch {}
   if (!validContract) refused('load_native_control', 'native capability contract verification failed');
   return addon;
 }
-export const buildManifest = Object.freeze({ contractVersion: 4, napi: 8, capabilities, capabilitySignatures });
+export const buildManifest = Object.freeze({
+  contractVersion: 4, contractRevision, napi: 8, capabilities, capabilitySignatures,
+});
 
 export async function createManagementNative({ configPath, roles } = {}) { return createAdapter({ lowLevel: loadVerifiedAddon(), configPath, arbitraryPrincipalProbe: true, roles }); }

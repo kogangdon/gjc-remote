@@ -9,6 +9,7 @@
   },
   "nativeControlContract": {
     "version": 4,
+    "revision": 1,
     "napi": 8,
     "platforms": [
       "linux-x64",

@@ -10,7 +10,12 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { capabilities, capabilitySignatures, validateBuildManifest } from "../src/index.js";
+import {
+  capabilities,
+  capabilitySignatures,
+  contractRevision,
+  validateBuildManifest,
+} from "../src/index.js";
 import { createManagementNativeForTest } from "./helpers/management-native.js";
 const execFile = promisify(execFileCallback);
 
@@ -40,6 +45,36 @@ function platformRoles(current) {
   return null;
 }
 
+function inventoryRolesForCurrent(current) {
+  if (current?.kind === "uid" && current.value !== "uid:0") {
+    const reserved = new Set([current.value, "uid:0"]);
+    const candidates = readFileSync("/etc/passwd", "utf8").split("\n")
+      .map((line) => line.split(":"))
+      .filter((fields) => fields.length > 2 && /^(0|[1-9][0-9]*)$/.test(fields[2]))
+      .map((fields) => `uid:${fields[2]}`)
+      .filter((value, index, values) => !reserved.has(value) && values.indexOf(value) === index)
+      .slice(0, 3);
+    if (candidates.length !== 3) return null;
+    return {
+      management: current,
+      bot: { kind: "uid", value: candidates[0] },
+      recovery: { kind: "uid", value: candidates[1] },
+      daemon: { kind: "uid", value: candidates[2] },
+      system: { kind: "uid", value: "uid:0" },
+    };
+  }
+  if (current?.kind === "sid" && current.value !== "S-1-5-18") {
+    return {
+      management: current,
+      bot: { kind: "sid", value: "S-1-5-21-111111111-222222222-333333333-1001" },
+      recovery: { kind: "sid", value: "S-1-5-21-111111111-222222222-333333333-1002" },
+      daemon: { kind: "sid", value: "S-1-5-21-111111111-222222222-333333333-1003" },
+      system: { kind: "sid", value: "S-1-5-18" },
+    };
+  }
+  return null;
+}
+
 test("contract-4 inventory ABI exposes only the frozen seven primitive signatures", () => {
   const inventory = [
     "resolve_native_state_root",
@@ -55,11 +90,62 @@ test("contract-4 inventory ABI exposes only the frozen seven primitive signature
     resolve_native_state_root: ["hostKey", "rootKind"],
     read_workspace_root_facts: ["path", "sourcePlatform"],
     ensure_inventory_directory: ["path", "roles", "profile"],
-    verify_inventory_acl: ["path", "roles", "profile"],
+    verify_inventory_acl: ["path", "roles", "profile", "expectedActor"],
     acquire_inventory_fence: ["path", "roles"],
     read_inventory_object: ["path", "maxBytes", "roles", "profile"],
     publish_inventory_object_atomic: ["path", "tempPrefix", "bytes", "expectedIdentity", "roles", "profile"],
   });
+});
+
+test("inventory ACL verification atomically binds the requested actor", (t) => {
+  if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
+    t.skip("verified native addon is not built for this checkout");
+    return;
+  }
+  const addon = require(fileURLToPath(addonUrl));
+  if (process.platform === "win32") {
+    t.skip("Windows actor-bound verification requires the owned distinct-user fixture");
+    return;
+  }
+  const roles = inventoryRolesForCurrent(addon.current_os_principal());
+  if (roles === null) {
+    t.skip("actor-bound ACL verification requires a non-system current principal");
+    return;
+  }
+  const hostKey = "0".repeat(64);
+  const root = process.platform === "win32"
+    ? join(process.env.ProgramData, "gjc-remote", "native", hostKey)
+    : `/var/lib/gjc-remote/native/${hostKey}`;
+  assert.throws(
+    () => addon.verify_inventory_acl(root, roles, "inventory-directory", "daemon"),
+    (error) => error.code === "INVENTORY_ACCESS_DENIED" &&
+      error.operation === "verify_inventory_acl" &&
+      error.writes === 0 && error.ambiguous === false,
+  );
+  assert.throws(
+    () => addon.verify_inventory_acl("relative", roles, "inventory-directory", "daemon"),
+    (error) => error.code === "INVENTORY_ACCESS_DENIED" &&
+      error.operation === "verify_inventory_acl" &&
+      error.writes === 0 && error.ambiguous === false,
+  );
+  assert.throws(
+    () => addon.verify_inventory_acl(root, roles, "inventory-directory", "reader"),
+    (error) => error.code === "INVENTORY_INVALID" &&
+      error.operation === "verify_inventory_acl" &&
+      error.writes === 0 && error.ambiguous === false,
+  );
+  for (const invoke of [
+    () => addon.verify_inventory_acl(root, roles, "inventory-directory"),
+    () => addon.verify_inventory_acl(root, roles, "inventory-directory", null),
+    () => addon.verify_inventory_acl(root, roles, "inventory-directory", "management", "extra"),
+  ]) {
+    assert.throws(
+      invoke,
+      (error) => error.code === "INVENTORY_INVALID" &&
+        error.operation === "verify_inventory_acl" &&
+        error.writes === 0 && error.ambiguous === false,
+    );
+  }
 });
 
 test("Windows inventory rejects UNC and malformed roots while returning exact local-drive facts", async (t) => {
@@ -109,7 +195,12 @@ test("Windows inventory rejects UNC and malformed roots while returning exact lo
       error.writes === 0 && error.ambiguous === false);
     invalid("resolve_native_state_root", () => addon.resolve_native_state_root("X".repeat(64), "inventory"));
     invalid("ensure_inventory_directory", () => addon.ensure_inventory_directory(root, invalidRoles, "inventory-directory"));
-    invalid("verify_inventory_acl", () => addon.verify_inventory_acl(root, invalidRoles, "inventory-directory"));
+    invalid("verify_inventory_acl", () =>
+      addon.verify_inventory_acl(root, invalidRoles, "inventory-directory", "management"));
+    invalid("verify_inventory_acl", () =>
+      addon.verify_inventory_acl(root, invalidRoles, "inventory-directory"));
+    invalid("verify_inventory_acl", () =>
+      addon.verify_inventory_acl(root, invalidRoles, "inventory-directory", "reader"));
     invalid("acquire_inventory_fence", () => addon.acquire_inventory_fence(root, invalidRoles));
     invalid("read_inventory_object", () => addon.read_inventory_object(root, 0, invalidRoles, "inventory-file"));
     invalid("publish_inventory_object_atomic", () =>
@@ -174,10 +265,17 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   const addon = require(fileURLToPath(addonUrl));
   const contract = addon.native_control_contract();
   assert.equal(contract.contractVersion, 4);
+  assert.equal(contract.contractRevision, contractRevision);
   assert.equal(contract.napi, 8);
   assert.deepEqual(contract.capabilities, capabilities);
   assert.deepEqual(contract.capabilitySignatures, capabilitySignatures);
+  assert.equal(manifest.contractRevision, contractRevision);
   assert.equal(manifest.sha256, createHash("sha256").update(addonBytes).digest("hex"));
+  assert.equal(
+    validateBuildManifest({ ...manifest, contractRevision: contractRevision + 1 },
+      packageJson, addonBytes),
+    false,
+  );
   const signatureDrift = structuredClone(manifest);
   signatureDrift.capabilitySignatures.principal_access_check = ["path", "kind", "principal"];
   assert.equal(validateBuildManifest(signatureDrift, packageJson, addonBytes), false);
@@ -787,6 +885,20 @@ test("native source contains fail-closed ACL and publication guards", () => {
     "default ACL query errors are never accepted as absence");
   assert.doesNotMatch(source, /GetTickCount64|GetCurrentProcessId/,
     "Windows temporary names must not derive from process or clock state");
+  const windowsAclStart = source.indexOf("napi_value VerifyInventoryAclWindows");
+  const windowsAclEnd = source.indexOf("napi_value ReadInventoryObjectWindows", windowsAclStart);
+  const windowsAcl = source.slice(windowsAclStart, windowsAclEnd);
+  assert.match(windowsAcl, /expected_actor == "management" && CurrentInventoryActor\(roles, true, false\)/);
+  assert.match(windowsAcl, /expected_actor == "daemon" && CurrentInventoryActor\(roles, false, true\)/);
+  assert.match(windowsAcl, /expected_actor == "recovery" && CurrentInventoryActor\(roles, false, false, true\)/);
+  assert.match(windowsAcl, /expected_actor == "system" && CurrentInventoryActor\(roles, false, false, false, true\)/);
+  const posixAclStart = source.indexOf("napi_value VerifyInventoryAclPosix");
+  const posixAclEnd = source.indexOf("napi_value ReadInventoryObjectPosix", posixAclStart);
+  const posixAcl = source.slice(posixAclStart, posixAclEnd);
+  assert.match(posixAcl, /const uid_t expected_uid = expected_actor == "management" \? roles\.management/);
+  assert.match(posixAcl, /expected_actor == "daemon" \? roles\.daemon/);
+  assert.match(posixAcl, /expected_actor == "recovery" \? roles\.recovery : roles\.system/);
+  assert.match(posixAcl, /if \(geteuid\(\) != expected_uid\)/);
   const inventoryFenceStart = source.indexOf("napi_value AcquireInventoryFenceWindows");
   const inventoryFenceEnd = source.indexOf("napi_value PublishInventoryObjectAtomicWindows", inventoryFenceStart);
   const inventoryFence = source.slice(inventoryFenceStart, inventoryFenceEnd);
