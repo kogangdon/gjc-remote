@@ -3594,10 +3594,14 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
         "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   bool published = false;
+  bool publication_mutated = false;
   std::wstring backup;
-  if (!present) published = InventoryParentStable(parent, parent_id, canonical_parent) &&
-      RenameWindowsRelative(candidate, parent, name, false) &&
-      InventoryParentStable(parent, parent_id, canonical_parent);
+  if (!present) {
+    publication_mutated = InventoryParentStable(parent, parent_id, canonical_parent) &&
+        RenameWindowsRelative(candidate, parent, name, false);
+    published = publication_mutated &&
+        InventoryParentStable(parent, parent_id, canonical_parent);
+  }
   else {
     CloseHandle(candidate); candidate = INVALID_HANDLE_VALUE;
     const std::wstring temporary_path = InventoryChildPath(canonical_parent, temp);
@@ -3606,12 +3610,15 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
       if (!InventoryRandomName(&token)) break;
       backup = L"." + Wide(prefix) + L".backup." + token;
       const std::wstring backup_path = InventoryChildPath(canonical_parent, backup);
-      published = InventoryParentStable(parent, parent_id, canonical_parent) &&
-          ReplaceFileW(destination_path.c_str(), temporary_path.c_str(), backup_path.c_str(), 0, nullptr, nullptr) != FALSE &&
+      publication_mutated = InventoryParentStable(parent, parent_id, canonical_parent) &&
+          ReplaceFileW(destination_path.c_str(), temporary_path.c_str(), backup_path.c_str(),
+              0, nullptr, nullptr) != FALSE;
+      published = publication_mutated &&
           InventoryParentStable(parent, parent_id, canonical_parent);
       if (published || GetLastError() != ERROR_FILE_EXISTS) break;
     }
   }
+  if (publication_mutated) ++writes;
   const DWORD publication_error = GetLastError();
   if (previous != INVALID_HANDLE_VALUE) CloseHandle(previous);
   if (!published) {
@@ -3655,7 +3662,6 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
                         "CONTAINMENT_UNSUPPORTED" : "INVENTORY_IO_FAILED") :
         "INVENTORY_MANUAL_CLEANUP", "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
-  writes++;
   HANDLE result = InventoryParentStable(parent, parent_id, canonical_parent) ?
       OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL, kFileOpen, VerifiedObjectType::File) : INVALID_HANDLE_VALUE;
   HANDLE displaced = present && InventoryParentStable(parent, parent_id, canonical_parent) ?
@@ -3716,9 +3722,11 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
     }
     const std::wstring backup_path = InventoryChildPath(canonical_parent, backup);
     const std::wstring rollback_temp = InventoryChildPath(canonical_parent, temp);
-    const bool rolled_back = InventoryParentStable(parent, parent_id, canonical_parent) &&
+    const bool rollback_mutated = InventoryParentStable(parent, parent_id, canonical_parent) &&
         ReplaceFileW(destination_path.c_str(), backup_path.c_str(), rollback_temp.c_str(),
-        0, nullptr, nullptr) != FALSE && InventoryParentStable(parent, parent_id, canonical_parent);
+        0, nullptr, nullptr) != FALSE;
+    const bool rolled_back = rollback_mutated &&
+        InventoryParentStable(parent, parent_id, canonical_parent);
     HANDLE restored = rolled_back ? OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL,
         kFileOpen, VerifiedObjectType::File) : INVALID_HANDLE_VALUE;
     std::string restored_serial, restored_file, restored_owner;
@@ -3731,7 +3739,9 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
     if (restored != INVALID_HANDLE_VALUE) CloseHandle(restored);
     if (!restored_exact) {
       CloseHandle(parent);
-      InventoryError(env, "INVENTORY_MANUAL_CLEANUP", "publish_inventory_object_atomic", writes + (rolled_back ? 1 : 0), true);
+      InventoryError(env, "INVENTORY_MANUAL_CLEANUP",
+          "publish_inventory_object_atomic",
+          writes + (rollback_mutated ? 1 : 0), true);
       return nullptr;
     }
     HANDLE residual = OpenWindowsRelative(parent, temp, GENERIC_READ | DELETE, kFileOpen, VerifiedObjectType::File);

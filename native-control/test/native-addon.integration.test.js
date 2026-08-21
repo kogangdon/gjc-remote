@@ -743,12 +743,13 @@ test("native source contains fail-closed ACL and publication guards", () => {
   const inventoryPublishEnd = source.indexOf("#else", inventoryPublishStart);
   const inventoryPublish = source.slice(inventoryPublishStart, inventoryPublishEnd);
   assert.match(inventoryPublish, /RenameWindowsRelative\(candidate, parent, name, false\)/);
-  assert.match(inventoryPublish, /ReplaceFileW\([^,]+, [^,]+, [^,]+, 0,/);
+  assert.match(inventoryPublish, /ReplaceFileW\([^,]+, [^,]+, [^,]+,\s*0,/);
   assert.match(inventoryPublish, /FlushFileBuffers\(result\)/);
   assert.match(inventoryPublish, /FlushFileBuffers\(displaced\)/);
   assert.match(inventoryPublish, /FlushInventoryParent\(parent, parent_id, canonical_parent\)/);
   assert.match(inventoryPublish, /displaced_is_predecessor/);
-  assert.match(inventoryPublish, /const bool rolled_back = InventoryParentStable/);
+  assert.match(inventoryPublish, /const bool rollback_mutated = InventoryParentStable/);
+  assert.match(inventoryPublish, /const bool rolled_back = rollback_mutated/);
   assert.match(inventoryPublish, /restored_serial == predecessor_serial/);
   assert.match(inventoryPublish, /residual_delete_pending &&\s*residual_probe == INVALID_HANDLE_VALUE && residual_error == ERROR_FILE_NOT_FOUND &&\s*flush_parent\(\)/);
   assert.match(inventoryPublish, /CanonicalInventoryParent\(parent, &parent_id, &canonical_parent\)/);
@@ -757,7 +758,7 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(source, /SameWindowsFileId\(named, expected\)/);
   assert.match(source, /FlushInventoryParent\(HANDLE retained, const FILE_ID_INFO& expected/);
   assert.match(inventoryPublish, /InventoryChildPath\(canonical_parent, name\)/);
-  assert.match(inventoryPublish, /ReplaceFileW\(destination_path\.c_str\(\), temporary_path\.c_str\(\), backup_path\.c_str\(\), 0,/);
+  assert.match(inventoryPublish, /ReplaceFileW\(destination_path\.c_str\(\), temporary_path\.c_str\(\), backup_path\.c_str\(\),\s*0,/);
   assert.match(inventoryPublish, /ReplaceFileW\(destination_path\.c_str\(\), backup_path\.c_str\(\), rollback_temp\.c_str\(\),/);
   assert.match(inventoryPublish, /for \(unsigned attempt = 0; attempt != 128; \+\+attempt\)/);
   assert.match(inventoryPublish, /if \(published \|\| GetLastError\(\) != ERROR_FILE_EXISTS\) break/);
