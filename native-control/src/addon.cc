@@ -224,6 +224,9 @@ void SetNtError(LONG status) {
   else if (static_cast<ULONG>(status) == 0xC0000034u) SetLastError(ERROR_FILE_NOT_FOUND);
   else if (static_cast<ULONG>(status) == 0xC000003Au) SetLastError(ERROR_PATH_NOT_FOUND);
   else if (static_cast<ULONG>(status) == 0xC0000022u) SetLastError(ERROR_ACCESS_DENIED);
+  else if (static_cast<ULONG>(status) == 0xC0000002u ||
+           static_cast<ULONG>(status) == 0xC0000010u ||
+           static_cast<ULONG>(status) == 0xC00000BBu) SetLastError(ERROR_NOT_SUPPORTED);
   else SetLastError(ERROR_CANT_ACCESS_FILE);
 }
 
@@ -3363,10 +3366,12 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
     const bool renamed = prepared && RenameWindowsRelative(temporary, parent, name, false);
     const DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
     bool cleaned = false;
+    bool cleanup_mutated = false;
     if (!renamed && temporary != INVALID_HANDLE_VALUE) {
       FILE_DISPOSITION_INFO disposition{TRUE};
       const bool delete_pending = temporary_known &&
           SetFileInformationByHandle(temporary, FileDispositionInfo, &disposition, sizeof(disposition));
+      cleanup_mutated = delete_pending;
       CloseHandle(temporary);
       temporary = INVALID_HANDLE_VALUE;
       HANDLE probe = OpenWindowsRelative(parent, temporary_name, FILE_READ_ATTRIBUTES,
@@ -3379,6 +3384,7 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
     if (temporary != INVALID_HANDLE_VALUE) CloseHandle(temporary);
     bool published = renamed && flush_parent();
     bool rolled_back = false;
+    bool rollback_mutated = false;
     if (renamed && !published) {
       HANDLE retained = OpenWindowsRelative(parent, name, DELETE | FILE_READ_ATTRIBUTES,
           kFileOpen, VerifiedObjectType::File);
@@ -3388,6 +3394,7 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
           GetFileInformationByHandleEx(retained, FileIdInfo, &retained_id, sizeof(retained_id)) &&
           SameWindowsFileId(temporary_id, retained_id) &&
           SetFileInformationByHandle(retained, FileDispositionInfo, &disposition, sizeof(disposition));
+      rollback_mutated = delete_pending;
       if (retained != INVALID_HANDLE_VALUE) CloseHandle(retained);
       HANDLE probe = OpenWindowsRelative(parent, name, FILE_READ_ATTRIBUTES,
           kFileOpen, VerifiedObjectType::File);
@@ -3404,7 +3411,8 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
     CloseHandle(parent);
     if (!published) {
       const uint32_t writes = (temporary != INVALID_HANDLE_VALUE || temporary_known ? 1 : 0) +
-          (acl_applied ? 1 : 0) + (renamed ? 1 : 0) + ((cleaned || rolled_back) ? 1 : 0);
+          (acl_applied ? 1 : 0) + (renamed ? 1 : 0) +
+          ((cleanup_mutated || rollback_mutated) ? 1 : 0);
       InventoryError(env, (cleaned || rolled_back) ?
           (rename_error == ERROR_FILE_EXISTS || rename_error == ERROR_ALREADY_EXISTS ?
               "INVENTORY_STALE" : rename_error == ERROR_CALL_NOT_IMPLEMENTED ||
@@ -3434,7 +3442,11 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
   }
   LARGE_INTEGER fence_length{};
   if (!GetFileSizeEx(h, &fence_length) || fence_length.QuadPart != 0) {
-    CloseHandle(h); InventoryError(env, "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence"); return nullptr;
+    CloseHandle(h);
+    InventoryError(env, created_by_call ? "INVENTORY_MANUAL_CLEANUP" :
+        "INVENTORY_ACCESS_DENIED", "acquire_inventory_fence", fence_writes,
+        created_by_call);
+    return nullptr;
   }
   auto* fence = new WindowsInventoryFence{h, env};
   fence->acquisition_writes = fence_writes;
@@ -3514,6 +3526,7 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
     const bool delete_pending = InventoryParentStable(parent, parent_id, canonical_parent) &&
         candidate != INVALID_HANDLE_VALUE && candidate_known &&
         SetFileInformationByHandle(candidate, FileDispositionInfo, &disposition, sizeof(disposition));
+    if (delete_pending) ++writes;
     if (candidate != INVALID_HANDLE_VALUE) CloseHandle(candidate);
     candidate = INVALID_HANDLE_VALUE;
     HANDLE probe = OpenWindowsRelative(parent, temp, FILE_READ_ATTRIBUTES,
@@ -3526,7 +3539,7 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
   if ((!bytes.empty() && (!WriteFile(candidate, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) || written != bytes.size()))) {
     const bool removed = discard_candidate(); CloseHandle(candidate); CloseHandle(parent);
     InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed); return nullptr;
+        "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   writes++;
   const bool acl_applied = InventoryAcl(candidate, roles, profile);
@@ -3535,7 +3548,7 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
       !FlushFileBuffers(candidate)) {
     const bool removed = discard_candidate(); CloseHandle(candidate); CloseHandle(parent);
     InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed); return nullptr;
+        "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   FILE_ID_INFO verified_candidate_id{};
   std::string candidate_serial, candidate_file, candidate_owner;
@@ -3547,7 +3560,7 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
       !InventoryIdentity(candidate, &candidate_serial, &candidate_file, &candidate_attributes, &candidate_owner)) {
     const bool removed = discard_candidate(); CloseHandle(candidate); CloseHandle(parent);
     InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed); return nullptr;
+        "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   HANDLE previous = OpenWindowsRelative(parent, name, GENERIC_READ | READ_CONTROL | DELETE, kFileOpen, VerifiedObjectType::File);
   const DWORD previous_error = previous == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
@@ -3556,14 +3569,14 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
     const bool removed = discard_candidate();
     CloseHandle(parent);
     InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed);
+        "publish_inventory_object_atomic", writes, !removed);
     return nullptr;
   }
   if ((!present && expected_type != napi_null) || (present && (expected_type == napi_null || !InventoryIdentityArg(env, args[3], previous)))) {
     if (previous != INVALID_HANDLE_VALUE) CloseHandle(previous);
     const bool removed = discard_candidate(); CloseHandle(candidate); CloseHandle(parent);
     InventoryError(env, removed ? "INVENTORY_STALE" : "INVENTORY_MANUAL_CLEANUP",
-        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed); return nullptr;
+        "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   FILE_ID_INFO predecessor_id{};
   std::string predecessor_serial, predecessor_file, predecessor_owner;
@@ -3571,13 +3584,13 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
   if (present && !GetFileInformationByHandleEx(previous, FileIdInfo, &predecessor_id, sizeof(predecessor_id))) {
     CloseHandle(previous); const bool removed = discard_candidate(); CloseHandle(candidate); CloseHandle(parent);
     InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed); return nullptr;
+        "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   if (present && !InventoryIdentity(previous, &predecessor_serial, &predecessor_file,
       &predecessor_attributes, &predecessor_owner)) {
     CloseHandle(previous); const bool removed = discard_candidate(); CloseHandle(candidate); CloseHandle(parent);
     InventoryError(env, removed ? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP",
-        "publish_inventory_object_atomic", writes + (removed ? 1 : 0), !removed); return nullptr;
+        "publish_inventory_object_atomic", writes, !removed); return nullptr;
   }
   bool published = false;
   std::wstring backup;
@@ -3621,6 +3634,7 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
         const bool delete_pending = destination_is_predecessor && leftover_is_candidate &&
             InventoryParentStable(parent, parent_id, canonical_parent) &&
             SetFileInformationByHandle(leftover, FileDispositionInfo, &disposition, sizeof(disposition));
+        if (delete_pending) ++writes;
         CloseHandle(leftover);
         leftover = INVALID_HANDLE_VALUE;
         HANDLE probe = OpenWindowsRelative(parent, temp, FILE_READ_ATTRIBUTES,
@@ -3631,7 +3645,6 @@ napi_value PublishInventoryObjectAtomicWindows(napi_env env, napi_callback_info 
             probe_error == ERROR_FILE_NOT_FOUND && flush_parent();
       }
     }
-    if (removed) ++writes;
     CloseHandle(parent);
     InventoryError(env, removed ?
         (publication_error == ERROR_FILE_EXISTS || publication_error == ERROR_ALREADY_EXISTS ?
