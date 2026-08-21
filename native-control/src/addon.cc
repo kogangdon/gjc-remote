@@ -3222,9 +3222,25 @@ napi_value EnsureInventoryDirectoryWindows(napi_env env, napi_callback_info info
   napi_value result, identity, writes; napi_create_object(env, &result); napi_create_object(env, &identity); InventoryIdentityValue(env, identity, reopened); napi_set_named_property(env, result, "identity", identity); napi_create_uint32(env, 2, &writes); napi_set_named_property(env, result, "writes", writes); CloseHandle(reopened); CloseHandle(parent); return result;
 }
 napi_value VerifyInventoryAclWindows(napi_env env, napi_callback_info info) {
-  napi_value args[3]; std::string path, profile; InventoryRoles roles{};
-  if (!InventoryArgs(env, info, 3, args) || !InventoryString(env, args[0], &path) || !InventoryRolesArg(env, args[1], &roles) ||
-      !InventoryString(env, args[2], &profile) || !InventoryPath(path, profile) || !CurrentInventoryActor(roles, true, true, true, true)) { InventoryError(env, "INVENTORY_INVALID", "verify_inventory_acl"); return nullptr; }
+  napi_value args[4]; std::string path, profile, expected_actor; InventoryRoles roles{};
+  if (!InventoryArgs(env, info, 4, args) || !InventoryString(env, args[0], &path) ||
+      !InventoryRolesArg(env, args[1], &roles) || !InventoryString(env, args[2], &profile) ||
+      !InventoryString(env, args[3], &expected_actor) ||
+      (expected_actor != "management" && expected_actor != "daemon" &&
+       expected_actor != "recovery" && expected_actor != "system")) {
+    InventoryError(env, "INVENTORY_INVALID", "verify_inventory_acl"); return nullptr;
+  }
+  const bool expected_actor_matches =
+      (expected_actor == "management" && CurrentInventoryActor(roles, true, false)) ||
+      (expected_actor == "daemon" && CurrentInventoryActor(roles, false, true)) ||
+      (expected_actor == "recovery" && CurrentInventoryActor(roles, false, false, true)) ||
+      (expected_actor == "system" && CurrentInventoryActor(roles, false, false, false, true));
+  if (!expected_actor_matches) {
+    InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr;
+  }
+  if (!InventoryPath(path, profile)) {
+    InventoryError(env, "INVENTORY_INVALID", "verify_inventory_acl"); return nullptr;
+  }
   if (!VerifyInventoryBaseWindows(roles, profile)) { InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr; }
   HANDLE parent = INVALID_HANDLE_VALUE;
   std::wstring name;
@@ -4269,14 +4285,22 @@ napi_value EnsureInventoryDirectoryPosix(napi_env env, napi_callback_info info) 
 }
 
 napi_value VerifyInventoryAclPosix(napi_env env, napi_callback_info info) {
-  napi_value args[3]; std::string path, profile; InventoryRoles roles{};
-  if (!InventoryArgs(env, info, 3, args) || !InventoryString(env, args[0], &path) ||
-      !InventoryRolesArg(env, args[1], &roles) || !InventoryString(env, args[2], &profile) || !ValidInventoryPath(path, profile)) {
+  napi_value args[4]; std::string path, profile, expected_actor; InventoryRoles roles{};
+  if (!InventoryArgs(env, info, 4, args) || !InventoryString(env, args[0], &path) ||
+      !InventoryRolesArg(env, args[1], &roles) || !InventoryString(env, args[2], &profile) ||
+      !InventoryString(env, args[3], &expected_actor) ||
+      (expected_actor != "management" && expected_actor != "daemon" &&
+       expected_actor != "recovery" && expected_actor != "system")) {
     InventoryError(env, "INVENTORY_INVALID", "verify_inventory_acl"); return nullptr;
   }
-  if (geteuid() != roles.management && geteuid() != roles.daemon &&
-      geteuid() != roles.recovery && geteuid() != roles.system) {
+  const uid_t expected_uid = expected_actor == "management" ? roles.management :
+      expected_actor == "daemon" ? roles.daemon :
+      expected_actor == "recovery" ? roles.recovery : roles.system;
+  if (geteuid() != expected_uid) {
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr;
+  }
+  if (!ValidInventoryPath(path, profile)) {
+    InventoryError(env, "INVENTORY_INVALID", "verify_inventory_acl"); return nullptr;
   }
   if (!VerifyInventoryBasePosix(roles, profile)) {
     InventoryError(env, "INVENTORY_ACCESS_DENIED", "verify_inventory_acl"); return nullptr;
@@ -4830,6 +4854,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
   napi_create_uint32(env, 4, &value); napi_set_named_property(env, result, "contractVersion", value);
+  napi_create_uint32(env, 1, &value); napi_set_named_property(env, result, "contractRevision", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
@@ -4871,7 +4896,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("resolve_native_state_root", {"hostKey", "rootKind"});
   signature("read_workspace_root_facts", {"path", "sourcePlatform"});
   signature("ensure_inventory_directory", {"path", "roles", "profile"});
-  signature("verify_inventory_acl", {"path", "roles", "profile"});
+  signature("verify_inventory_acl", {"path", "roles", "profile", "expectedActor"});
   signature("acquire_inventory_fence", {"path", "roles"});
   signature("read_inventory_object", {"path", "maxBytes", "roles", "profile"});
   signature("publish_inventory_object_atomic", {"path", "tempPrefix", "bytes", "expectedIdentity", "roles", "profile"});

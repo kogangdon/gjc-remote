@@ -1,3 +1,4 @@
+export const contractRevision = 1;
 export const managementCapabilities = Object.freeze(['open_verified_parent', 'open_no_follow', 'read_identity', 'read_acl', 'path_exists_no_follow', 'set_exact_role_acl', 'verify_exact_role_acl', 'read_verified_bytes', 'create_exclusive_temp', 'flush_file', 'flush_directory_or_volume', 'replace_existing_atomic', 'create_absent_exclusive', 'ensure_control_directory', 'acquire_native_lock', 'current_os_principal', 'principal_access_check', 'remove_verified_file', 'open_verified_parent_handle', 'open_verified_object_handle', 'read_handle_identity', 'read_handle_bytes', 'write_handle_bytes', 'remove_verified_handle', 'verify_role_sid_not_group']);
 export const inventoryCapabilities = Object.freeze([
   'resolve_native_state_root',
@@ -27,7 +28,7 @@ export const capabilitySignatures = Object.freeze({
   resolve_native_state_root: ['hostKey', 'rootKind'],
   read_workspace_root_facts: ['path', 'sourcePlatform'],
   ensure_inventory_directory: ['path', 'roles', 'profile'],
-  verify_inventory_acl: ['path', 'roles', 'profile'],
+  verify_inventory_acl: ['path', 'roles', 'profile', 'expectedActor'],
   acquire_inventory_fence: ['path', 'roles'],
   read_inventory_object: ['path', 'maxBytes', 'roles', 'profile'],
   publish_inventory_object_atomic: ['path', 'tempPrefix', 'bytes', 'expectedIdentity', 'roles', 'profile'],

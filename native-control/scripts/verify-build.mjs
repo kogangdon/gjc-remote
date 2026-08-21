@@ -43,7 +43,7 @@ const capabilitySignatures = {
   resolve_native_state_root: ['hostKey', 'rootKind'],
   read_workspace_root_facts: ['path', 'sourcePlatform'],
   ensure_inventory_directory: ['path', 'roles', 'profile'],
-  verify_inventory_acl: ['path', 'roles', 'profile'],
+  verify_inventory_acl: ['path', 'roles', 'profile', 'expectedActor'],
   acquire_inventory_fence: ['path', 'roles'],
   read_inventory_object: ['path', 'maxBytes', 'roles', 'profile'],
   publish_inventory_object_atomic: ['path', 'tempPrefix', 'bytes', 'expectedIdentity', 'roles', 'profile'],
@@ -226,7 +226,7 @@ const isMainModule = (() => {
 if (isMainModule) {
 
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
-  version: 4, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+  version: 4, revision: 1, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
 })) fail('package native capability contract is invalid');
 
 if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${process.arch}`)) {
@@ -236,6 +236,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
 } else {
   const expected = {
     contractVersion: 4,
+    contractRevision: 1,
     package: packageJson.name,
     version: packageJson.version,
     napi: 8,
@@ -252,7 +253,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     for (const name of capabilities) if (typeof loaded[name] !== 'function') fail(`native capability ${name} is missing`);
     let contract;
     try { contract = loaded.native_control_contract(); } catch { fail('native capability contract is missing or unreadable'); }
-    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 4, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
+    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 4, contractRevision: 1, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
   }
   if (process.argv.includes('--write-manifest')) {
     if (!loaded || process.exitCode) process.exitCode = 1;
