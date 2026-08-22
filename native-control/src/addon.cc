@@ -4786,8 +4786,9 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
     fd = OpenObjectNoFollow(parent, name, O_RDONLY);
   }
   if (fd < 0) {
+    const int failure = errno;
     close(parent);
-    InventoryError(env, errno == ENOENT ? "INVENTORY_STALE" :
+    InventoryError(env, failure == ENOENT ? "INVENTORY_STALE" :
         "INVENTORY_IO_FAILED", "acquire_inventory_fence", fence_writes);
     return nullptr;
   }

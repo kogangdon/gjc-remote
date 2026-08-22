@@ -971,5 +971,7 @@ test("native source contains fail-closed ACL and publication guards", () => {
   const posixFence = source.slice(posixFenceStart, posixFenceEnd);
   assert.match(posixFence, /auto discard = \[&\]\(const std::string& entry, const struct stat& expected\)/);
   assert.match(posixFence, /cleaned \? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP"/);
+  assert.match(posixFence,
+    /int fd = OpenObjectNoFollow[\s\S]*if \(fd < 0\) \{[\s\S]*const int failure = errno;[\s\S]*close\(parent\);[\s\S]*failure == ENOENT/);
   assert.doesNotMatch(posixFence, /napi_set_named_property\([^;]*"release"/);
 });
