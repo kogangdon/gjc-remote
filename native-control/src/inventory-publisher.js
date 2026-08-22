@@ -166,7 +166,7 @@ function facts(workspace, value) {
     ? exact(result.storageIdentity, ['kind', 'device'])
     : workspace.sourcePlatform === 'windows-drive'
       ? exact(result.storageIdentity, ['kind', 'volumeGuid', 'volumeSerial', 'fileSystem']) : null;
-  if (!root || !storage || (workspace.sourcePlatform === 'posix' && (root.kind !== 'posix-root-v1' || storage.kind !== 'posix-storage-v1' || !uint64(root.device) || !uint64(root.inode) || !uint64(storage.device))) || (workspace.sourcePlatform === 'windows-drive' && (root.kind !== 'win32-root-v1' || storage.kind !== 'windows-drive-storage-v1' || !/^[a-f0-9]{16}$/.test(root.volumeSerial) || !/^[a-f0-9]{32}$/.test(root.fileId) || !/^\\\\\?\\Volume\{[0-9A-F-]{36}\}\\$/.test(storage.volumeGuid) || !/^[0-9A-F]{8}$/.test(storage.volumeSerial) || !/^[A-Z0-9._-]{1,32}$/.test(storage.fileSystem)))) return null;
+  if (!root || !storage || (workspace.sourcePlatform === 'posix' && (root.kind !== 'posix-root-v1' || storage.kind !== 'posix-storage-v1' || !uint64(root.device) || !uint64(root.inode) || !uint64(storage.device))) || (workspace.sourcePlatform === 'windows-drive' && (root.kind !== 'win32-root-v1' || storage.kind !== 'windows-drive-storage-v1' || !/^[a-f0-9]{16}$/.test(root.volumeSerial) || !/^[a-f0-9]{32}$/.test(root.fileId) || !/^\\\\\?\\VOLUME\{[0-9A-F-]{36}\}\\$/.test(storage.volumeGuid) || !/^[0-9A-F]{8}$/.test(storage.volumeSerial) || !/^[A-Z0-9._-]{1,32}$/.test(storage.fileSystem)))) return null;
   return Object.freeze({ workDir: result.workDir, root: Object.freeze(root), storage: Object.freeze(storage) });
 }
 function relation(inventory, commit, floor) {

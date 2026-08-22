@@ -476,7 +476,7 @@ test('a D-like holder of the shared fence blocks all M state reads', async () =>
 
 test('Windows drive facts use the frozen native fingerprint schema', async () => {
   const state = model();
-  state.lowLevel.read_workspace_root_facts = async (workDir, sourcePlatform) => ({
+  const windowsFacts = (workDir, sourcePlatform, volumeGuid) => ({
     sourcePlatform,
     workDir: `C:\\canonical${workDir}`,
     rootIdentity: {
@@ -486,17 +486,30 @@ test('Windows drive facts use the frozen native fingerprint schema', async () =>
     },
     storageIdentity: {
       kind: 'windows-drive-storage-v1',
-      volumeGuid: '\\\\?\\Volume{12345678-1234-1234-1234-123456789ABC}\\',
+      volumeGuid,
       volumeSerial: '89ABCDEF',
       fileSystem: 'NTFS',
     },
   });
+  state.lowLevel.read_workspace_root_facts = async (workDir, sourcePlatform) =>
+    windowsFacts(workDir, sourcePlatform,
+      '\\\\?\\VOLUME{12345678-1234-1234-1234-123456789ABC}\\');
   const result = await state.publisher(input([{
     workspaceId: 'windows',
     sourcePlatform: 'windows-drive',
     workDir: '\\workspace',
   }]));
   assert.equal(result.status, 'published');
+
+  const invalid = model();
+  invalid.lowLevel.read_workspace_root_facts = async (workDir, sourcePlatform) =>
+    windowsFacts(workDir, sourcePlatform,
+      '\\\\?\\Volume{12345678-1234-1234-1234-123456789ABC}\\');
+  await assert.rejects(invalid.publisher(input([{
+    workspaceId: 'windows',
+    sourcePlatform: 'windows-drive',
+    workDir: '\\workspace',
+  }])), (error) => error.code === 'INVENTORY_IO_FAILED' && error.writes === 0);
 });
 
 test('CLI rejects malformed input and redacts malformed role bindings', () => {
