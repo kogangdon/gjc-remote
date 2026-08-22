@@ -329,113 +329,113 @@ async function createReaderAdapter(lowLevel, validated) {
         }
         outcome = Object.freeze({ status: 'missing' });
       } else {
-      if (!inventory || !commit) {
-        throw localError('INVENTORY_MANUAL_CLEANUP', 'read_inventory');
-      }
-      const current = inventory.document;
-      if (current.hostId !== validated.hostId) {
-        throw localError('INVENTORY_INVALID', 'read_inventory');
-      }
-      if (commit.document.inventoryGeneration !== current.inventoryGeneration ||
-          commit.document.inventoryFingerprint !== current.inventoryFingerprint ||
-          commit.document.inventoryObjectIdentityFingerprint !== hash(inventory.identity)) {
-        throw localError('INVENTORY_MANUAL_CLEANUP', 'read_inventory');
-      }
-      await verifyAcl(lowLevel, paths.inventory, validated.roles, 'inventory-file', 'daemon');
-      await verifyAcl(lowLevel, paths.commit, validated.roles, 'inventory-commit', 'daemon');
-      for (const workspace of current.workspaces) {
-        if (!factsMatch(workspace, await lowLevel.read_workspace_root_facts(workspace.workDir, workspace.sourcePlatform))) {
-          throw localError('INVENTORY_STALE', 'read_inventory');
+        if (!inventory || !commit) {
+          throw localError('INVENTORY_MANUAL_CLEANUP', 'read_inventory');
         }
-      }
-      const expectedFloor = buildFloor({
-        hostId: validated.hostId,
-        inventoryGeneration: current.inventoryGeneration,
-        inventoryFingerprint: current.inventoryFingerprint,
-      });
-      const expectedFloorBytes = floorBytes(expectedFloor);
-      if (!priorFloor) {
-        if (current.inventoryGeneration !== 1) {
-          throw localError('INVENTORY_STALE', 'read_inventory');
+        const current = inventory.document;
+        if (current.hostId !== validated.hostId) {
+          throw localError('INVENTORY_INVALID', 'read_inventory');
         }
-      } else if (priorFloor.document.inventoryGeneration === current.inventoryGeneration &&
-          priorFloor.document.inventoryFingerprint === current.inventoryFingerprint) {
-        // Exact floor replay is a read-only success.
-      } else if (priorFloor.document.inventoryGeneration === current.inventoryGeneration - 1 &&
-          priorFloor.document.inventoryFingerprint !== current.inventoryFingerprint) {
-        const published = requirePublication(await lowLevel.publish_inventory_object_atomic(
-          paths.floor, '.inventory-floor.', expectedFloorBytes,
-          priorFloor.identity, validated.roles, 'inventory-floor'), 5);
-        writes += published.writes; returnedFloorIdentity = published.identity;
-      } else throw localError('INVENTORY_STALE', 'read_inventory');
-      if (priorFloor) {
-        await verifyAcl(lowLevel, paths.floor, validated.roles, 'inventory-floor', 'daemon');
-      }
-      if (!priorFloor) {
-        const published = requirePublication(await lowLevel.publish_inventory_object_atomic(
-          paths.floor, '.inventory-floor.', expectedFloorBytes, null,
-          validated.roles, 'inventory-floor'), 4);
-        writes += published.writes; returnedFloorIdentity = published.identity;
-      }
-      if (writes) {
-        const publishedFloor = readEnvelope(await read(paths.floor, 'inventory-floor'), (bytes) => parseFloor(bytes, validated.hostId));
-        if (!publishedFloor || !sameBytes(publishedFloor.bytes, expectedFloorBytes) ||
-            publishedFloor.document.floorFingerprint !== expectedFloor.floorFingerprint ||
-            hash(publishedFloor.identity) !== hash(returnedFloorIdentity)) {
+        if (commit.document.inventoryGeneration !== current.inventoryGeneration ||
+            commit.document.inventoryFingerprint !== current.inventoryFingerprint ||
+            commit.document.inventoryObjectIdentityFingerprint !== hash(inventory.identity)) {
+          throw localError('INVENTORY_MANUAL_CLEANUP', 'read_inventory');
+        }
+        await verifyAcl(lowLevel, paths.inventory, validated.roles, 'inventory-file', 'daemon');
+        await verifyAcl(lowLevel, paths.commit, validated.roles, 'inventory-commit', 'daemon');
+        for (const workspace of current.workspaces) {
+          if (!factsMatch(workspace, await lowLevel.read_workspace_root_facts(workspace.workDir, workspace.sourcePlatform))) {
+            throw localError('INVENTORY_STALE', 'read_inventory');
+          }
+        }
+        const expectedFloor = buildFloor({
+          hostId: validated.hostId,
+          inventoryGeneration: current.inventoryGeneration,
+          inventoryFingerprint: current.inventoryFingerprint,
+        });
+        const expectedFloorBytes = floorBytes(expectedFloor);
+        if (!priorFloor) {
+          if (current.inventoryGeneration !== 1) {
+            throw localError('INVENTORY_STALE', 'read_inventory');
+          }
+        } else if (priorFloor.document.inventoryGeneration === current.inventoryGeneration &&
+            priorFloor.document.inventoryFingerprint === current.inventoryFingerprint) {
+          // Exact floor replay is a read-only success.
+        } else if (priorFloor.document.inventoryGeneration === current.inventoryGeneration - 1 &&
+            priorFloor.document.inventoryFingerprint !== current.inventoryFingerprint) {
+          const published = requirePublication(await lowLevel.publish_inventory_object_atomic(
+            paths.floor, '.inventory-floor.', expectedFloorBytes,
+            priorFloor.identity, validated.roles, 'inventory-floor'), 5);
+          writes += published.writes; returnedFloorIdentity = published.identity;
+        } else throw localError('INVENTORY_STALE', 'read_inventory');
+        if (priorFloor) {
+          await verifyAcl(lowLevel, paths.floor, validated.roles, 'inventory-floor', 'daemon');
+        }
+        if (!priorFloor) {
+          const published = requirePublication(await lowLevel.publish_inventory_object_atomic(
+            paths.floor, '.inventory-floor.', expectedFloorBytes, null,
+            validated.roles, 'inventory-floor'), 4);
+          writes += published.writes; returnedFloorIdentity = published.identity;
+        }
+        if (writes) {
+          const publishedFloor = readEnvelope(await read(paths.floor, 'inventory-floor'), (bytes) => parseFloor(bytes, validated.hostId));
+          if (!publishedFloor || !sameBytes(publishedFloor.bytes, expectedFloorBytes) ||
+              publishedFloor.document.floorFingerprint !== expectedFloor.floorFingerprint ||
+              hash(publishedFloor.identity) !== hash(returnedFloorIdentity)) {
+            throw localError(
+              'INVENTORY_MANUAL_CLEANUP', 'read_inventory_object', writes, true);
+          }
+          await verifyAcl(lowLevel, paths.floor, validated.roles, 'inventory-floor', 'daemon');
+        }
+        const marker = await read(paths.marker, 'inventory-manual-cleanup');
+        const finalInventory = readEnvelope(
+          await read(paths.inventory, 'inventory-file'), parseWorkspaceInventory);
+        const finalCommit = readEnvelope(
+          await read(paths.commit, 'inventory-commit'),
+          (bytes) => parseCommit(bytes, validated.hostId));
+        const finalFloor = readEnvelope(
+          await read(paths.floor, 'inventory-floor'),
+          (bytes) => parseFloor(bytes, validated.hostId));
+        const expectedFloorIdentity = writes
+          ? returnedFloorIdentity : priorFloor.identity;
+        if (marker !== null || !finalInventory || !finalCommit || !finalFloor ||
+            !sameBytes(finalInventory.bytes, inventory.bytes) ||
+            !sameBytes(finalCommit.bytes, commit.bytes) ||
+            !sameBytes(finalFloor.bytes, expectedFloorBytes) ||
+            hash(finalInventory.identity) !== hash(inventory.identity) ||
+            hash(finalCommit.identity) !== hash(commit.identity) ||
+            hash(finalFloor.identity) !== hash(expectedFloorIdentity)) {
           throw localError(
-            'INVENTORY_MANUAL_CLEANUP', 'read_inventory_object', writes, true);
+            'INVENTORY_MANUAL_CLEANUP', 'read_inventory', writes, true);
         }
-        await verifyAcl(lowLevel, paths.floor, validated.roles, 'inventory-floor', 'daemon');
-      }
-      const marker = await read(paths.marker, 'inventory-manual-cleanup');
-      const finalInventory = readEnvelope(
-        await read(paths.inventory, 'inventory-file'), parseWorkspaceInventory);
-      const finalCommit = readEnvelope(
-        await read(paths.commit, 'inventory-commit'),
-        (bytes) => parseCommit(bytes, validated.hostId));
-      const finalFloor = readEnvelope(
-        await read(paths.floor, 'inventory-floor'),
-        (bytes) => parseFloor(bytes, validated.hostId));
-      const expectedFloorIdentity = writes
-        ? returnedFloorIdentity : priorFloor.identity;
-      if (marker !== null || !finalInventory || !finalCommit || !finalFloor ||
-          !sameBytes(finalInventory.bytes, inventory.bytes) ||
-          !sameBytes(finalCommit.bytes, commit.bytes) ||
-          !sameBytes(finalFloor.bytes, expectedFloorBytes) ||
-          hash(finalInventory.identity) !== hash(inventory.identity) ||
-          hash(finalCommit.identity) !== hash(commit.identity) ||
-          hash(finalFloor.identity) !== hash(expectedFloorIdentity)) {
-        throw localError(
-          'INVENTORY_MANUAL_CLEANUP', 'read_inventory', writes, true);
-      }
-      await verifyAcl(
-        lowLevel, paths.inventory, validated.roles,
-        'inventory-file', 'daemon');
-      await verifyAcl(
-        lowLevel, paths.commit, validated.roles,
-        'inventory-commit', 'daemon');
-      await verifyAcl(
-        lowLevel, paths.floor, validated.roles,
-        'inventory-floor', 'daemon');
-      for (const workspace of current.workspaces) {
-        if (!factsMatch(
-          workspace,
-          await lowLevel.read_workspace_root_facts(
-            workspace.workDir, workspace.sourcePlatform))) {
-          throw localError(
-            'INVENTORY_MANUAL_CLEANUP', 'read_inventory',
-            writes, writes > 0);
+        await verifyAcl(
+          lowLevel, paths.inventory, validated.roles,
+          'inventory-file', 'daemon');
+        await verifyAcl(
+          lowLevel, paths.commit, validated.roles,
+          'inventory-commit', 'daemon');
+        await verifyAcl(
+          lowLevel, paths.floor, validated.roles,
+          'inventory-floor', 'daemon');
+        for (const workspace of current.workspaces) {
+          if (!factsMatch(
+            workspace,
+            await lowLevel.read_workspace_root_facts(
+              workspace.workDir, workspace.sourcePlatform))) {
+            throw localError(
+              'INVENTORY_MANUAL_CLEANUP', 'read_inventory',
+              writes, writes > 0);
+          }
         }
-      }
-      outcome = Object.freeze({
-        status: 'present',
-        inventory: frozenInventory(current),
-        proof: Object.freeze({
-          source: 'native', inventoryGeneration: current.inventoryGeneration,
-          inventoryFingerprint: current.inventoryFingerprint, commitFingerprint: commit.document.commitFingerprint,
-          floorFingerprint: expectedFloor.floorFingerprint,
-        }),
-      });
+        outcome = Object.freeze({
+          status: 'present',
+          inventory: frozenInventory(current),
+          proof: Object.freeze({
+            source: 'native', inventoryGeneration: current.inventoryGeneration,
+            inventoryFingerprint: current.inventoryFingerprint, commitFingerprint: commit.document.commitFingerprint,
+            floorFingerprint: expectedFloor.floorFingerprint,
+          }),
+        });
       }
     } catch (caught) {
       if (isLocalError(caught)) {
