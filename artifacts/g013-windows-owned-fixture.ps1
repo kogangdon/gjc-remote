@@ -80,8 +80,8 @@ try{
   Invoke-Checked icacls.exe @($Root,'/grant',"*$($sids.M)`:(OI)(CI)(RX)","*$($sids.D)`:(OI)(CI)(RX)")
   New-Item -ItemType Directory -Path $Workspace -Force|Out-Null
   Invoke-Checked icacls.exe @($Workspace,'/inheritance:r','/grant:r',
-    "*$($sids.M)`:(OI)(CI)(F)",'*S-1-5-18:(OI)(CI)(F)',
-    '*S-1-5-32-544:(OI)(CI)(F)')
+    "*$($sids.M)`:(OI)(CI)(F)","*$($sids.D)`:(OI)(CI)(RX)",
+    '*S-1-5-18:(OI)(CI)(F)','*S-1-5-32-544:(OI)(CI)(F)')
   $hostId='g013-windows-owned';$sha=[Security.Cryptography.SHA256]::Create()
   try{$hostKey=([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($hostId)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
   $inventory=Join-Path $InventoryBase $hostKey;$reader=Join-Path $ReaderBase $hostKey
