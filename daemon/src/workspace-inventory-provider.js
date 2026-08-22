@@ -69,7 +69,7 @@ export function createWorkspaceInventoryProvider(options = {}) {
   }
   const hasTestInjection = serializedTestInventory !== undefined ||
     testStatus !== undefined || testEpochMismatch !== false;
-  if ((hasTestInjection || testEpochMismatch !== false) && !testInjectionEnabled) {
+  if (hasTestInjection && !testInjectionEnabled) {
     throw configError(
       "GJC_WORKSPACE_INVENTORY requires GJC_READINESS_TEST_INJECTION=1"
     );

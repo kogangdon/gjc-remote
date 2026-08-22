@@ -261,3 +261,17 @@ test("Reader capture requires an own data descriptor", () => {
     (error) => error?.code === "CONFIG_INVALID"
   );
 });
+
+test("Reader capture preserves the method receiver", async () => {
+  const nativeReader = Object.freeze({
+    selfTest: async () => {},
+    async readAccepted() {
+      assert.equal(this, nativeReader);
+      return Object.freeze({ status: "missing" });
+    },
+  });
+  assert.deepEqual(
+    await createInventoryFloor({ reader: nativeReader }).read(),
+    { status: "missing", epoch: 1 },
+  );
+});

@@ -185,7 +185,7 @@ export function captureInventoryReader(reader) {
     if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
       throw invalidReader();
     }
-    return descriptor.value;
+    return descriptor.value.bind(reader);
   } catch (error) {
     if (error?.code === "CONFIG_INVALID") throw error;
     throw invalidReader();
