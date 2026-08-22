@@ -4,67 +4,48 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, feat/host-local-inventory-publisher]
 
 jobs:
   suite:
-    # The native-control addon is built on every supported platform so the
-    # retained-handle / ACL / no-follow / replacement / durability probes run for
-    # real instead of skipping. Without a build the whole native integration test
-    # self-skips, which is why Windows behaviour used to be unproven in CI.
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-24.04-arm is a GitHub-hosted arm64 runner. Keep it as a
-        # first-class leg: native-control's manifest and runnable integration
-        # tests must execute on arm64 rather than relying on cross-compilation.
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
         with:
-          # changelog-history-guard needs full history to compute a merge-base
-          # against origin/main; a shallow (depth-1) checkout can't do that.
           fetch-depth: 0
-
-      # daemon/test/protocol-validation.test.js spawns a real `bun` child,
-      # so bun must be on PATH even though the test files run under node --test.
       - uses: oven-sh/setup-bun@v2
-
       - uses: actions/setup-node@v5
         with:
           node-version: '26'
-
       - name: Install native ACL headers
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libacl1-dev
-
-      # bun.lock is the committed lockfile (package-lock.json is gitignored),
-      # so install with bun rather than `npm ci`.
       - run: bun install --frozen-lockfile
-
-      # Builds native_control.node and writes the build manifest. No signature is
-      # produced here: the release signing key is held by the operator outside
-      # this repository, so CI proves capability and behaviour, never provenance.
       - name: Build native-control addon
         run: npm run build --workspace @gjc-remote/native-control
-
       - run: npm test
-
-      # Guards released CHANGELOG.md history against silent deletion. Runs
-      # once (Linux only) since it doesn't depend on the native addon build
-      # and would otherwise duplicate work across the matrix. On a direct
-      # push to main (the release commit path) origin/main already equals
-      # HEAD, so a merge-base against it is a no-op; --mode push instead
-      # compares against the previous commit/tag so that path stays guarded.
+      - name: Run exact-head Windows owned Publisher fixture
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./artifacts/g012-windows-owned-fixture.ps1
+      - name: Upload Windows owned Publisher receipts
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: g012-windows-owned-receipts
+          path: |
+            artifacts/g012-windows-owned-receipt.json
+            artifacts/g012-windows-owned-cleanup.json
+            artifacts/g012-windows-owned-failure.log
+          if-no-files-found: warn
       - name: Guard changelog history
         if: matrix.os == 'ubuntu-latest'
         run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
 
-  # Aggregate gate. `test` is the required status check on main, so it must stay a
-  # single stable context name even though the suite now fans out across a matrix.
-  # It fails unless every matrix leg succeeded, so a skipped or failed leg cannot
-  # be merged past.
   test:
     if: always()
     needs: [suite]
