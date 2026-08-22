@@ -7,6 +7,9 @@
   "exports": {
     ".": "./src/public.js"
   },
+  "bin": {
+    "gjc-remote-inventory": "./src/inventory-entrypoint.js"
+  },
   "nativeControlContract": {
     "version": 4,
     "revision": 2,

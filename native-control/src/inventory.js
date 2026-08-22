@@ -1,5 +1,6 @@
 import { isPrincipal } from '@gjc-remote/shared/identity';
 import { workspaceInventoryHostKey } from '@gjc-remote/shared/workspace-inventory';
+import { createInventoryPublisherTransaction } from './inventory-publisher.js';
 
 const FACTORY_KEYS = Object.freeze(['hostId', 'roles']);
 const ROLE_KEYS = Object.freeze(['management', 'bot', 'recovery', 'daemon', 'system']);
@@ -93,17 +94,41 @@ function validateOptions(options) {
     invalid();
   }
   return Object.freeze({
+    hostId: values.hostId,
     hostKey,
     roles: Object.freeze(
       Object.fromEntries(ROLE_KEYS.map((key, index) => [key, principals[index]]))),
   });
 }
 
-function requireLowLevel(lowLevel) {
+function requireLowLevel(lowLevel, publisher) {
   if (lowLevel === null || typeof lowLevel !== 'object' ||
-      typeof lowLevel.resolve_native_state_root !== 'function' ||
-      typeof lowLevel.verify_inventory_acl !== 'function') invalid();
-  return lowLevel;
+      Array.isArray(lowLevel)) invalid();
+  const names = publisher ? [
+    'resolve_native_state_root',
+    'verify_inventory_acl',
+    'read_workspace_root_facts',
+    'ensure_inventory_directory',
+    'acquire_inventory_fence',
+    'read_inventory_object',
+    'publish_inventory_object_atomic',
+  ] : ['resolve_native_state_root', 'verify_inventory_acl'];
+  let descriptors;
+  try {
+    descriptors = getOwnPropertyDescriptors(lowLevel);
+  } catch {
+    invalid();
+  }
+  const captured = {};
+  for (const name of names) {
+    const descriptor = descriptors[name];
+    if (!descriptor || descriptor.get !== undefined || descriptor.set !== undefined ||
+        !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'function') invalid();
+    captured[name] = descriptor.value;
+  }
+  // Capture each verified data property once so later object mutation cannot
+  // alter a Publisher transaction.
+  return Object.freeze(captured);
 }
 
 async function verifyAcl(lowLevel, path, roles, profile, expectedActor) {
@@ -122,7 +147,8 @@ function requireResolvedRoot(value) {
 async function createAdapter(loadLowLevel, options, role) {
   const validated = validateOptions(options);
   if (typeof loadLowLevel !== 'function') invalid();
-  const lowLevel = requireLowLevel(await loadLowLevel());
+  const publisher = role === 'management';
+  const lowLevel = requireLowLevel(await loadLowLevel(), publisher);
   const inventoryRoot = requireResolvedRoot(
     await lowLevel.resolve_native_state_root(validated.hostKey, 'inventory'));
   const readerRoot = role === 'daemon'
@@ -136,7 +162,14 @@ async function createAdapter(loadLowLevel, options, role) {
     return Object.freeze({ role, contractVersion: 4, writes: 0 });
   };
   await selfTest();
-  return Object.freeze({ selfTest });
+  if (!publisher) return Object.freeze({ selfTest });
+  const publish = createInventoryPublisherTransaction({
+    lowLevel,
+    hostId: validated.hostId,
+    roles: validated.roles,
+    inventoryRoot,
+  });
+  return Object.freeze({ selfTest, publish });
 }
 
 export function createInventoryPublisherAdapter(loadLowLevel, options) {
