@@ -90,6 +90,8 @@ try{
   Write-Utf8 $pending ([ordered]@{hostId=$hostId;expectedInventoryGeneration=1;workspaces=@()})
   Write-Utf8 $unchanged2 ([ordered]@{hostId=$hostId;expectedInventoryGeneration=2;workspaces=@()})
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'publish-allow-error',"`"$(Join-Path $Output 'genesis.json')`"","`"$genesis`"") 'genesis'|Out-Null
+  $genesisReceipt=Read-Json 'genesis.json'
+  if($genesisReceipt.status-ne'published'){throw "genesis failed: $($genesisReceipt|ConvertTo-Json -Compress)"}
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'publish-allow-error',"`"$(Join-Path $Output 'unchanged.json')`"","`"$unchanged`"") 'unchanged'|Out-Null
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'publish-allow-error',"`"$(Join-Path $Output 'pending.json')`"","`"$pending`"") 'pending'|Out-Null
   Invoke-As $credentials.D @("`"$Runner`"","`"$Config`"",'floor',"`"$(Join-Path $Output 'floor.json')`"") 'floor'|Out-Null
@@ -112,7 +114,14 @@ try{
   if($evidence.dFenceBlockedMs-lt 2500-or$evidence.blockedUnchanged.status-ne'unchanged'){throw 'D fence serialization mismatch'}
   if($evidence.markerFailure.code-ne'INVENTORY_MANUAL_CLEANUP'-or$evidence.markerFailure.writes-ne 4){throw 'marker receipt mismatch'}
   Write-Utf8 $Receipt $evidence
-}catch{$Failure=$_;Write-Utf8 $FailurePath $_.Exception.ToString()}finally{
+}catch{
+  $Failure=$_
+  $debug=@($_.Exception.ToString())
+  if(Test-Path $Output){
+    $debug+=@(Get-ChildItem $Output -Filter '*.json' -ErrorAction SilentlyContinue|ForEach-Object{\"--- $($_.Name) ---`n$(Get-Content $_.FullName -Raw)\"})
+  }
+  Write-Utf8 $FailurePath ($debug-join\"`n\")
+}finally{
   Remove-Protected $InventoryBase;Remove-Protected $ReaderBase;Remove-Protected $Root
   foreach($name in $Created){Remove-LocalUser $name -ErrorAction SilentlyContinue}
   $users=@(Get-LocalUser|Where-Object Name -like 'gjc12w_*')
