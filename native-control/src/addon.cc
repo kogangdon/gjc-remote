@@ -3552,7 +3552,17 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
         if (setup_status == napi_ok) {
           setup_status = napi_create_function(
               complete, "release", NAPI_AUTO_LENGTH,
-              [](napi_env e, napi_callback_info i) -> napi_value { void* data; napi_get_cb_info(e, i, nullptr, nullptr, nullptr, &data); auto* fence = static_cast<WindowsInventoryFence*>(data); napi_value promise;
+              [](napi_env e, napi_callback_info i) -> napi_value {
+          void* data = nullptr;
+          if (napi_get_cb_info(
+                  e, i, nullptr, nullptr, nullptr, &data) != napi_ok ||
+              data == nullptr) {
+            InventoryError(e, "INVENTORY_IO_FAILED",
+                "release_inventory_fence", 0, true);
+            return nullptr;
+          }
+          auto* fence = static_cast<WindowsInventoryFence*>(data);
+          napi_value promise;
           if (fence->release_promise) {
             if (napi_get_reference_value(
                     e, fence->release_promise, &promise) != napi_ok) {
@@ -4540,8 +4550,15 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
     if (setup_status == napi_ok) {
       setup_status = napi_create_function(env, "release", NAPI_AUTO_LENGTH,
       [](napi_env release_env, napi_callback_info release_info) -> napi_value {
-        void* data = nullptr; size_t argc = 0;
-        napi_get_cb_info(release_env, release_info, &argc, nullptr, nullptr, &data);
+        void* data = nullptr;
+        if (napi_get_cb_info(
+                release_env, release_info, nullptr, nullptr, nullptr,
+                &data) != napi_ok ||
+            data == nullptr) {
+          InventoryError(release_env, "INVENTORY_IO_FAILED",
+              "release_inventory_fence", 0, true);
+          return nullptr;
+        }
         auto* fence = static_cast<InventoryFence*>(data);
         napi_value promise;
         if (fence->release_promise) {

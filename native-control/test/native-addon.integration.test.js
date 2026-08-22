@@ -923,6 +923,7 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.equal((source.match(/const napi_status wrap_status/g) ?? []).length, 2);
   assert.equal((source.match(/const napi_status freeze_status/g) ?? []).length, 2);
   assert.equal((source.match(/napi_remove_wrap/g) ?? []).length, 2);
+  assert.equal((source.match(/data == nullptr\) \{/g) ?? []).length, 2);
   assert.equal((source.match(/setup_status != napi_ok \|\| !InventoryFenceProperties/g) ?? []).length, 2);
   assert.match(source,
     /const bool lost_create_race = rename_attempted && !renamed && cleaned/);
