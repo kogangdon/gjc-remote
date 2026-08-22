@@ -277,13 +277,13 @@ async function createReaderAdapter(lowLevel, validated) {
         floor: leaf(readerRoot, 'inventory-floor.v1.json'),
       };
       const read = (path, profile) => lowLevel.read_inventory_object(path, STRICT_JSON_LIMITS.maxBytes, validated.roles, profile);
-      try {
-        const acquired = await lowLevel.acquire_inventory_fence(paths.fence, validated.roles);
-        const checkedFence = fenceValue(acquired);
-        fence = checkedFence && { ...checkedFence, release: checkedFence.release.bind(acquired) };
-      } catch (caught) {
-        throw caught;
-      }
+      const acquired = await lowLevel.acquire_inventory_fence(
+        paths.fence, validated.roles);
+      const checkedFence = fenceValue(acquired);
+      fence = checkedFence && {
+        ...checkedFence,
+        release: checkedFence.release.bind(acquired),
+      };
       if (!fence) throw localError('INVENTORY_IO_FAILED', 'acquire_inventory_fence', 0, true);
       if (fence.writes !== 0) {
         throw localError(
