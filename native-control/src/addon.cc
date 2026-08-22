@@ -3337,13 +3337,10 @@ struct WindowsFenceWork {
 };
 void WindowsFenceFinalize(napi_env, void* raw, void*) {
   auto* fence = static_cast<WindowsInventoryFence*>(raw);
-  if (fence->handle != INVALID_HANDLE_VALUE) {
-    OVERLAPPED o{};
-    UnlockFileEx(fence->handle, 0, MAXDWORD, MAXDWORD, &o);
-    CloseHandle(fence->handle);
+  if (!fence->released.exchange(true) && fence->handle != INVALID_HANDLE_VALUE) {
+    OVERLAPPED o{}; UnlockFileEx(fence->handle, 0, MAXDWORD, MAXDWORD, &o); CloseHandle(fence->handle);
     fence->handle = INVALID_HANDLE_VALUE;
   }
-  fence->released.store(true);
   if (fence->release_promise) napi_delete_reference(fence->env, fence->release_promise);
   if (fence->object_ref) napi_delete_reference(fence->env, fence->object_ref);
   delete fence;
@@ -3351,15 +3348,11 @@ void WindowsFenceFinalize(napi_env, void* raw, void*) {
 void WindowsFenceExecute(napi_env, void* raw) { auto* work = static_cast<WindowsFenceWork*>(raw);
   if (work->release) {
     OVERLAPPED o{};
-    if (work->fence->released.load() ||
-        work->fence->handle == INVALID_HANDLE_VALUE) return;
+    if (work->fence->released.exchange(true) || work->fence->handle == INVALID_HANDLE_VALUE) return;
     const bool unlocked = UnlockFileEx(work->fence->handle, 0, MAXDWORD, MAXDWORD, &o) != FALSE;
     const bool closed = CloseHandle(work->fence->handle) != FALSE;
     work->failed = !unlocked || !closed;
-    if (closed) {
-      work->fence->handle = INVALID_HANDLE_VALUE;
-      work->fence->released.store(true);
-    }
+    if (closed) work->fence->handle = INVALID_HANDLE_VALUE;
     return;
   }
   const auto end = work->deadline; OVERLAPPED o{};
@@ -4497,12 +4490,7 @@ struct InventoryFenceReleaseWork {
 };
 void FenceFinalize(napi_env, void* data, void*) {
   auto* fence = static_cast<InventoryFence*>(data);
-  if (fence->fd >= 0) {
-    flock(fence->fd, LOCK_UN);
-    close(fence->fd);
-    fence->fd = -1;
-  }
-  fence->released.store(true);
+  if (fence->fd >= 0) { flock(fence->fd, LOCK_UN); close(fence->fd); }
   if (fence->release_promise) napi_delete_reference(fence->env, fence->release_promise);
   if (fence->object_ref) napi_delete_reference(fence->env, fence->object_ref);
   delete fence;
@@ -4577,14 +4565,11 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
           release_env, "inventory.release_fence",
           [](napi_env, void* raw) {
             auto* item = static_cast<InventoryFenceReleaseWork*>(raw);
-            if (!item->fence->released.load() && item->fence->fd >= 0) {
+            if (!item->fence->released.exchange(true) && item->fence->fd >= 0) {
               const bool unlocked = flock(item->fence->fd, LOCK_UN) == 0;
               const bool closed = close(item->fence->fd) == 0;
               item->failed = !unlocked || !closed;
-              if (closed) {
-                item->fence->fd = -1;
-                item->fence->released.store(true);
-              }
+              if (closed) item->fence->fd = -1;
             }
           },
           [](napi_env complete_env, napi_status, void* raw) {

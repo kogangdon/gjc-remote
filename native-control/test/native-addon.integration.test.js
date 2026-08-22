@@ -944,9 +944,8 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.doesNotMatch(inventoryFence, /napi_set_named_property\([^;]*"release"/);
   assert.match(source, /CreateInventoryAsyncWork\(\s*env, "inventory\.acquire_fence", AcquireFenceExecute/);
   assert.match(source, /CreateInventoryAsyncWork\(\s*release_env, "inventory\.release_fence"/);
-  assert.match(source, /if \(fence->handle != INVALID_HANDLE_VALUE\) \{[\s\S]*fence->released\.store\(true\)/);
-  assert.match(source, /if \(work->fence->released\.load\(\) \|\|[\s\S]*work->fence->handle == INVALID_HANDLE_VALUE\) return/);
-  assert.match(source, /if \(closed\) \{[\s\S]*work->fence->released\.store\(true\)/);
+  assert.match(source, /if \(!fence->released\.exchange\(true\) && fence->handle != INVALID_HANDLE_VALUE\)/);
+  assert.match(source, /if \(work->fence->released\.exchange\(true\) \|\| work->fence->handle == INVALID_HANDLE_VALUE\) return/);
   const posixPublishStart = source.indexOf("napi_value PublishInventoryObjectAtomicPosix");
   const posixPublishEnd = source.indexOf("#endif", posixPublishStart);
   const posixPublish = source.slice(posixPublishStart, posixPublishEnd);
