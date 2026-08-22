@@ -3554,8 +3554,9 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
               complete, "release", NAPI_AUTO_LENGTH,
               [](napi_env e, napi_callback_info i) -> napi_value {
           void* data = nullptr;
+          size_t argc = 0;
           if (napi_get_cb_info(
-                  e, i, nullptr, nullptr, nullptr, &data) != napi_ok ||
+                  e, i, &argc, nullptr, nullptr, &data) != napi_ok ||
               data == nullptr) {
             InventoryError(e, "INVENTORY_IO_FAILED",
                 "release_inventory_fence", 0, true);
@@ -4551,8 +4552,9 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
       setup_status = napi_create_function(env, "release", NAPI_AUTO_LENGTH,
       [](napi_env release_env, napi_callback_info release_info) -> napi_value {
         void* data = nullptr;
+        size_t argc = 0;
         if (napi_get_cb_info(
-                release_env, release_info, nullptr, nullptr, nullptr,
+                release_env, release_info, &argc, nullptr, nullptr,
                 &data) != napi_ok ||
             data == nullptr) {
           InventoryError(release_env, "INVENTORY_IO_FAILED",
