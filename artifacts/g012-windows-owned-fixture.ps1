@@ -79,8 +79,9 @@ try{
   $hostId='g012-windows-owned';$sha=[Security.Cryptography.SHA256]::Create()
   try{$hostKey=([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($hostId)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
   $inventory=Join-Path $InventoryBase $hostKey;$reader=Join-Path $ReaderBase $hostKey
-  Exact-Acl $InventoryBase $sids.M $sids.D $sids.R;Exact-Acl $inventory $sids.M $sids.D $sids.R
-  Exact-Acl $ReaderBase $sids.D $sids.M $sids.R;Exact-Acl $reader $sids.D $sids.M $sids.R
+  New-Item -ItemType Directory -Path $inventory,$reader -Force|Out-Null
+  Exact-Acl $inventory $sids.M $sids.D $sids.R;Exact-Acl $InventoryBase $sids.M $sids.D $sids.R
+  Exact-Acl $reader $sids.D $sids.M $sids.R;Exact-Acl $ReaderBase $sids.D $sids.M $sids.R
   $configValue=[ordered]@{repo=$WorkRepo;addonPath=(Join-Path $WorkRepo 'native-control\build\Release\native_control.node');hostId=$hostId;hostKey=$hostKey;ready=(Join-Path $Root 'ready');roles=[ordered]@{management=[ordered]@{kind='sid';value=$sids.M};bot=[ordered]@{kind='sid';value=$sids.B};recovery=[ordered]@{kind='sid';value=$sids.R};daemon=[ordered]@{kind='sid';value=$sids.D};system=[ordered]@{kind='sid';value='S-1-5-18'}}}
   Write-Utf8 $Config $configValue
   $genesis=Join-Path $Root 'genesis.json';$unchanged=Join-Path $Root 'unchanged.json';$pending=Join-Path $Root 'pending.json';$unchanged2=Join-Path $Root 'unchanged2.json'
