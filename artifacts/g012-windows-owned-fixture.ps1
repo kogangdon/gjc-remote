@@ -108,7 +108,8 @@ try{
   $deadline=[DateTime]::UtcNow.AddSeconds(10);while((Get-Item $ready).Length-eq 0-and[DateTime]::UtcNow-lt$deadline){Start-Sleep -Milliseconds 100}
   if((Get-Item $ready).Length-eq 0){throw 'D holder did not become ready'}
   $clock=[Diagnostics.Stopwatch]::StartNew();Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'publish-allow-error',"`"$(Join-Path $Output 'blocked.json')`"","`"$unchanged2`"") 'blocked'|Out-Null;$clock.Stop()
-  $holder.WaitForExit();if($holder.ExitCode-ne 0){throw 'D holder failed'}
+  $holder.WaitForExit();$holder.Refresh()
+  if($holder.ExitCode-ne 0){throw "D holder failed with exit $($holder.ExitCode)"}
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'corrupt-commit',"`"$(Join-Path $Output 'corrupt.json')`"") 'corrupt'|Out-Null
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'publish-allow-error',"`"$(Join-Path $Output 'marker.json')`"","`"$unchanged2`"") 'marker'|Out-Null
   $evidence=[ordered]@{schemaVersion=1;status='passed';head=$Head;platform='Windows 11 Pro x64 NTFS';principals=[ordered]@{M=$sids.M;B=$sids.B;R=$sids.R;D=$sids.D;SYSTEM='S-1-5-18'};genesis=(Read-Json 'genesis.json');unchanged=(Read-Json 'unchanged.json');pending=(Read-Json 'pending.json');floor=(Read-Json 'floor.json');replacement=(Read-Json 'replacement.json');dFenceBlockedMs=$clock.ElapsedMilliseconds;blockedUnchanged=(Read-Json 'blocked.json');holder=(Read-Json 'holder.json');markerFailure=(Read-Json 'marker.json');inventoryFiles=@(Get-ChildItem $inventory -Force|Select-Object -ExpandProperty Name);readerFiles=@(Get-ChildItem $reader -Force|Select-Object -ExpandProperty Name)}
