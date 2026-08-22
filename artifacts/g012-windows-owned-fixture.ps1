@@ -118,9 +118,10 @@ try{
   $Failure=$_
   $debug=@($_.Exception.ToString())
   if(Test-Path $Output){
-    $debug+=@(Get-ChildItem $Output -Filter '*.json' -ErrorAction SilentlyContinue|ForEach-Object{\"--- $($_.Name) ---`n$(Get-Content $_.FullName -Raw)\"})
+    $debug+=@(Get-ChildItem $Output -Filter '*.json' -ErrorAction SilentlyContinue |
+      ForEach-Object { "--- $($_.Name) ---`n$(Get-Content $_.FullName -Raw)" })
   }
-  Write-Utf8 $FailurePath ($debug-join\"`n\")
+  Write-Utf8 $FailurePath ($debug -join "`n")
 }finally{
   Remove-Protected $InventoryBase;Remove-Protected $ReaderBase;Remove-Protected $Root
   foreach($name in $Created){Remove-LocalUser $name -ErrorAction SilentlyContinue}
