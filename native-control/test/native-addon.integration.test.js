@@ -918,9 +918,11 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(posixAcl, /expected_actor == "daemon" \? roles\.daemon/);
   assert.match(posixAcl, /expected_actor == "recovery" \? roles\.recovery : roles\.system/);
   assert.match(posixAcl, /if \(geteuid\(\) != expected_uid\)/);
-  assert.match(source, /bool InventoryFenceProperties\([\s\S]*"release"[\s\S]*"writes"[\s\S]*napi_object_freeze/);
+  assert.match(source, /bool InventoryFenceProperties\([\s\S]*"release"[\s\S]*"writes"[\s\S]*napi_define_properties/);
   assert.equal((source.match(/const napi_status reference_status/g) ?? []).length, 2);
   assert.equal((source.match(/const napi_status wrap_status/g) ?? []).length, 2);
+  assert.equal((source.match(/const napi_status freeze_status/g) ?? []).length, 2);
+  assert.equal((source.match(/napi_remove_wrap/g) ?? []).length, 2);
   assert.equal((source.match(/setup_status != napi_ok \|\| !InventoryFenceProperties/g) ?? []).length, 2);
   assert.match(source,
     /const bool lost_create_race = rename_attempted && !renamed && cleaned/);

@@ -2531,9 +2531,8 @@ bool InventoryFenceProperties(napi_env env, napi_value object,
        napi_enumerable, nullptr},
   };
   return napi_define_properties(
-             env, object, sizeof(properties) / sizeof(properties[0]),
-             properties) == napi_ok &&
-      napi_object_freeze(env, object) == napi_ok;
+      env, object, sizeof(properties) / sizeof(properties[0]),
+      properties) == napi_ok;
 }
 void InventoryError(napi_env env, const char* code, const char* operation,
                     uint32_t writes = 0, bool ambiguous = false) {
@@ -3629,7 +3628,18 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
               ? napi_wrap(complete, object, work->fence,
                     WindowsFenceFinalize, nullptr, nullptr)
               : reference_status;
-          if (reference_status != napi_ok || wrap_status != napi_ok) {
+          const napi_status freeze_status = wrap_status == napi_ok
+              ? napi_object_freeze(complete, object)
+              : wrap_status;
+          if (reference_status != napi_ok || wrap_status != napi_ok ||
+              freeze_status != napi_ok) {
+            bool delete_fence = wrap_status != napi_ok;
+            if (wrap_status == napi_ok) {
+              void* removed = nullptr;
+              delete_fence =
+                  napi_remove_wrap(complete, object, &removed) == napi_ok &&
+                  removed == work->fence;
+            }
             if (work->fence->object_ref) {
               napi_delete_reference(complete, work->fence->object_ref);
               work->fence->object_ref = nullptr;
@@ -3643,7 +3653,7 @@ napi_value AcquireInventoryFenceWindows(napi_env env, napi_callback_info info) {
                 InventoryErrorValue(complete, "INVENTORY_IO_FAILED",
                     "acquire_inventory_fence",
                     work->fence->acquisition_writes, true));
-            delete work->fence;
+            if (delete_fence) delete work->fence;
           } else {
             napi_resolve_deferred(complete, work->deferred, object);
           }
@@ -4616,21 +4626,34 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
           ? napi_wrap(env, object, work->fence, FenceFinalize,
                 nullptr, nullptr)
           : reference_status;
-      if (reference_status != napi_ok || wrap_status != napi_ok) {
-        if (work->fence->object_ref) {
-          napi_delete_reference(env, work->fence->object_ref);
-          work->fence->object_ref = nullptr;
+      const napi_status freeze_status = wrap_status == napi_ok
+          ? napi_object_freeze(env, object)
+          : wrap_status;
+      if (reference_status != napi_ok || wrap_status != napi_ok ||
+          freeze_status != napi_ok) {
+        auto* fence = work->fence;
+        bool delete_fence = wrap_status != napi_ok;
+        if (wrap_status == napi_ok) {
+          void* removed = nullptr;
+          delete_fence =
+              napi_remove_wrap(env, object, &removed) == napi_ok &&
+              removed == fence;
         }
-        if (work->fence->fd >= 0) {
-          flock(work->fence->fd, LOCK_UN);
-          close(work->fence->fd);
-          work->fence->fd = -1;
+        if (fence->object_ref) {
+          napi_delete_reference(env, fence->object_ref);
+          fence->object_ref = nullptr;
+        }
+        if (fence->fd >= 0) {
+          flock(fence->fd, LOCK_UN);
+          close(fence->fd);
+          fence->fd = -1;
         }
         napi_reject_deferred(
             env, work->deferred,
             InventoryErrorValue(env, "INVENTORY_IO_FAILED",
                 "acquire_inventory_fence",
-                work->fence->acquisition_writes, true));
+                fence->acquisition_writes, true));
+        if (!delete_fence) work->fence = nullptr;
         work->failed = true;
       } else {
         napi_resolve_deferred(env, work->deferred, object);
