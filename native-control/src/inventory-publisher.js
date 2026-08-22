@@ -1,18 +1,19 @@
 import { randomBytes } from 'node:crypto';
 import {
-  STRICT_JSON_LIMITS, assertStrictText, canonicalJsonBytes, canonicalJsonHash, isHex64,
-  parseCanonicalJsonBytes,
+  STRICT_JSON_LIMITS, assertStrictText, canonicalJsonBytes,
 } from '@gjc-remote/shared/strict-json';
 import {
   buildWorkspaceInventory, parseWorkspaceInventory, workspaceInventoryHostKey,
 } from '@gjc-remote/shared/workspace-inventory';
+import {
+  buildCommit, buildMarker, commitBytes as inventoryCommitBytes,
+  exact, hash, leaf, markerBytes, objectIdentity, parseCommit, parseFloor,
+  readEnvelope, sameBytes, uint64,
+} from './inventory-state.js';
 
 const MAX = Number.MAX_SAFE_INTEGER;
-const objectPrototype = Object.prototype;
 const candidateKeys = ['expectedInventoryGeneration', 'workspaces'];
 const workspaceKeys = ['workspaceId', 'sourcePlatform', 'workDir'];
-const commitKeys = ['version', 'hostId', 'inventoryGeneration', 'inventoryFingerprint', 'inventoryObjectIdentityFingerprint', 'publicationNonce', 'commitFingerprint'];
-const floorKeys = ['version', 'hostId', 'inventoryGeneration', 'inventoryFingerprint', 'floorFingerprint'];
 
 function failure(code, operation, writes = 0, ambiguous = false) {
   const value = new Error('inventory operation failed');
@@ -21,20 +22,6 @@ function failure(code, operation, writes = 0, ambiguous = false) {
     writes: { value: writes, enumerable: true }, ambiguous: { value: ambiguous, enumerable: true },
   });
   return value;
-}
-function exact(value, names) {
-  try {
-    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== objectPrototype) return null;
-    const own = Reflect.ownKeys(value);
-    if (own.length !== names.length || own.some((name) => typeof name !== 'string') || !names.every((name) => own.includes(name))) return null;
-    const descriptors = Object.getOwnPropertyDescriptors(value); const result = {};
-    for (const name of names) {
-      const descriptor = descriptors[name];
-      if (!descriptor || !descriptor.enumerable || descriptor.get || descriptor.set || !Object.hasOwn(descriptor, 'value')) return null;
-      result[name] = descriptor.value;
-    }
-    return result;
-  } catch { return null; }
 }
 function arraySnapshot(value, maxLength) {
   try {
@@ -80,35 +67,6 @@ function text(value, max) {
     return false;
   }
 }
-function leaf(root, name) { return `${root}${root.endsWith('/') || root.endsWith('\\') ? '' : process.platform === 'win32' ? '\\' : '/'}${name}`; }
-function sameBytes(left, right) { return Buffer.isBuffer(left) && left.equals(right); }
-function hash(value) { return canonicalJsonHash(value, STRICT_JSON_LIMITS); }
-function documentFingerprint(value, name) { const { [name]: ignored, ...preimage } = value; return canonicalJsonHash(preimage, STRICT_JSON_LIMITS); }
-function uint64(value) { return typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value) && (() => { try { return BigInt(value) <= 18446744073709551615n; } catch { return false; } })(); }
-function uid(value) {
-  if (typeof value !== 'string' || !/^uid:(0|[1-9][0-9]*)$/.test(value)) return false;
-  try { return BigInt(value.slice(4)) <= 4294967295n; } catch { return false; }
-}
-function sid(value) {
-  if (typeof value !== 'string') return false;
-  const fields = value.split('-');
-  if (fields.length < 4 || fields.length > 18 ||
-      fields[0] !== 'S' || fields[1] !== '1' ||
-      !fields.slice(2).every((field) => /^(0|[1-9][0-9]*)$/.test(field))) return false;
-  try {
-    return BigInt(fields[2]) <= 281474976710655n &&
-      fields.slice(3).every((field) => BigInt(field) <= 4294967295n);
-  } catch {
-    return false;
-  }
-}
-function objectIdentity(value) {
-  const posix = exact(value, ['device', 'inode', 'mode', 'owner']);
-  if (posix && uint64(posix.device) && uint64(posix.inode) && Number.isInteger(posix.mode) && posix.mode >= 0 && posix.mode <= 0xffffffff && uid(posix.owner)) return posix;
-  const windows = exact(value, ['volumeSerial', 'fileId', 'attributes', 'owner']);
-  if (windows && /^[a-f0-9]{16}$/.test(windows.volumeSerial) && /^[a-f0-9]{32}$/.test(windows.fileId) && Number.isInteger(windows.attributes) && windows.attributes >= 0 && windows.attributes <= 0xffffffff && sid(windows.owner)) return windows;
-  return null;
-}
 function candidate(input) {
   const value = exact(input, candidateKeys);
   const workspaces = value ? arraySnapshot(value.workspaces, 64) : null;
@@ -123,24 +81,6 @@ function candidate(input) {
     seen.add(row.workspaceId); rows.push(Object.freeze({ ...row }));
   }
   return Object.freeze({ expectedInventoryGeneration: value.expectedInventoryGeneration, workspaces: Object.freeze(rows) });
-}
-function validDocument(value, names, fingerprintName, hostId) {
-  const result = exact(value, names);
-  return result && result.version === 1 && result.hostId === hostId && isHex64(result[fingerprintName]) && documentFingerprint(result, fingerprintName) === result[fingerprintName] ? result : null;
-}
-function parseCommit(bytes, hostId) {
-  const result = validDocument(parseCanonicalJsonBytes(bytes, STRICT_JSON_LIMITS), commitKeys, 'commitFingerprint', hostId);
-  return result && Number.isSafeInteger(result.inventoryGeneration) && result.inventoryGeneration >= 1 && isHex64(result.inventoryFingerprint) && isHex64(result.inventoryObjectIdentityFingerprint) && /^[a-f0-9]{32}$/.test(result.publicationNonce) ? result : null;
-}
-function parseFloor(bytes, hostId) {
-  const result = validDocument(parseCanonicalJsonBytes(bytes, STRICT_JSON_LIMITS), floorKeys, 'floorFingerprint', hostId);
-  return result && Number.isSafeInteger(result.inventoryGeneration) && result.inventoryGeneration >= 1 && isHex64(result.inventoryFingerprint) ? result : null;
-}
-function readEnvelope(value, parser) {
-  if (value === null) return null;
-  const envelope = exact(value, ['bytes', 'identity']);
-  if (!envelope || !Buffer.isBuffer(envelope.bytes) || !objectIdentity(envelope.identity)) return undefined;
-  try { const document = parser(envelope.bytes); return document ? { bytes: envelope.bytes, identity: envelope.identity, document } : undefined; } catch { return undefined; }
 }
 function add(total, amount) {
   if (!Number.isSafeInteger(amount) || amount < 0 || total > MAX - amount) throw failure('INVENTORY_IO_FAILED', 'publish_inventory', total, true);
@@ -180,13 +120,21 @@ function relation(inventory, commit, floor) {
   return 'floor-conflict';
 }
 function marker(hostId, reason, inventory, commit, floor) {
-  const result = { version: 1, hostId, reason, inventoryGeneration: inventory?.document.inventoryGeneration ?? null, inventoryFingerprint: inventory?.document.inventoryFingerprint ?? null, commitFingerprint: commit?.document.commitFingerprint ?? null, floorFingerprint: floor?.document.floorFingerprint ?? null, routeDisposition: 'no-route', blockedUntilOwnerAction: true };
-  result.manualCleanupFingerprint = documentFingerprint(result, 'manualCleanupFingerprint'); return result;
+  return buildMarker({
+    hostId, reason,
+    inventoryGeneration: inventory?.document.inventoryGeneration ?? null,
+    inventoryFingerprint: inventory?.document.inventoryFingerprint ?? null,
+    commitFingerprint: commit?.document.commitFingerprint ?? null,
+    floorFingerprint: floor?.document.floorFingerprint ?? null,
+  });
 }
 function commit(hostId, inventory, identity, previousNonce) {
   let publicationNonce; do { publicationNonce = randomBytes(16).toString('hex'); } while (publicationNonce === previousNonce);
-  const result = { version: 1, hostId, inventoryGeneration: inventory.inventoryGeneration, inventoryFingerprint: inventory.inventoryFingerprint, inventoryObjectIdentityFingerprint: hash(identity), publicationNonce };
-  result.commitFingerprint = documentFingerprint(result, 'commitFingerprint'); return result;
+  return buildCommit({
+    hostId, inventoryGeneration: inventory.inventoryGeneration,
+    inventoryFingerprint: inventory.inventoryFingerprint,
+    inventoryObjectIdentityFingerprint: hash(identity), publicationNonce,
+  });
 }
 
 export function createInventoryPublisherTransaction({ lowLevel, hostId, roles, inventoryRoot, checkpoint = async () => {} }) {
@@ -209,7 +157,7 @@ export function createInventoryPublisherTransaction({ lowLevel, hostId, roles, i
       const result = marker(hostId, reason, inventory, currentCommit, floor);
       try {
         await publish(paths.marker, '.inventory-manual-cleanup.',
-          canonicalJsonBytes(result, STRICT_JSON_LIMITS), null,
+          markerBytes(result), null,
           'inventory-manual-cleanup');
       } catch {
         throw failure('INVENTORY_MANUAL_CLEANUP', 'publish_inventory', writes, true);
@@ -289,7 +237,7 @@ export function createInventoryPublisherTransaction({ lowLevel, hostId, roles, i
         }
         await checkpoint('inventory-verified');
         const nextCommit = commit(hostId, next, reopened.identity, currentCommit?.document.publicationNonce);
-        const commitBytes = canonicalJsonBytes(nextCommit, STRICT_JSON_LIMITS);
+        const commitBytes = inventoryCommitBytes(nextCommit);
         const commitPublication = await publish(
           paths.commit, '.inventory-commit.', commitBytes,
           currentCommit?.identity ?? null, 'inventory-commit');
