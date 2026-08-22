@@ -8,6 +8,7 @@ $Output=Join-Path $Root 'output'
 $Runner=Join-Path $Root 'g012-owned-runner.mjs'
 $Config=Join-Path $Root 'config.json'
 $Managed='C:\ProgramData\gjc-remote'
+$Workspace='C:\Users\Public\gjc12w-workspace'
 $InventoryBase=Join-Path $Managed 'native'
 $ReaderBase=Join-Path $Managed 'native-reader'
 $Receipt=Join-Path $Repo 'artifacts\g012-windows-owned-receipt.json'
@@ -55,7 +56,8 @@ function Read-Json([string]$Name){Get-Content (Join-Path $Output $Name) -Raw|Con
 try{
   $identity=[Security.Principal.WindowsIdentity]::GetCurrent();$principal=[Security.Principal.WindowsPrincipal]$identity
   if(-not$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'administrator token required'}
-  if((Test-Path $Root) -or (Test-Path $InventoryBase) -or (Test-Path $ReaderBase)){throw 'fixture path already exists'}
+  if((Test-Path $Root) -or (Test-Path $InventoryBase) -or
+      (Test-Path $ReaderBase) -or (Test-Path $Workspace)){throw 'fixture path already exists'}
   foreach($name in $Names.Values){if(Get-LocalUser $name -ErrorAction SilentlyContinue){throw "fixture user exists: $name"}}
   New-Item -ItemType Directory -Path $Root,$Output -Force|Out-Null
   $credentials=@{};$sids=@{}
@@ -76,6 +78,10 @@ try{
   }finally{Pop-Location}
   Copy-Item (Join-Path $Repo 'artifacts\g012-owned-runner.mjs') $Runner
   Invoke-Checked icacls.exe @($Root,'/grant',"*$($sids.M)`:(OI)(CI)(RX)","*$($sids.D)`:(OI)(CI)(RX)")
+  New-Item -ItemType Directory -Path $Workspace -Force|Out-Null
+  Invoke-Checked icacls.exe @($Workspace,'/inheritance:r','/grant:r',
+    "*$($sids.M)`:(OI)(CI)(F)",'*S-1-5-18:(OI)(CI)(F)',
+    '*S-1-5-32-544:(OI)(CI)(F)')
   $hostId='g012-windows-owned';$sha=[Security.Cryptography.SHA256]::Create()
   try{$hostKey=([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($hostId)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
   $inventory=Join-Path $InventoryBase $hostKey;$reader=Join-Path $ReaderBase $hostKey
@@ -85,8 +91,8 @@ try{
   $configValue=[ordered]@{repo=$WorkRepo;addonPath=(Join-Path $WorkRepo 'native-control\build\Release\native_control.node');hostId=$hostId;hostKey=$hostKey;ready=(Join-Path $Root 'ready');roles=[ordered]@{management=[ordered]@{kind='sid';value=$sids.M};bot=[ordered]@{kind='sid';value=$sids.B};recovery=[ordered]@{kind='sid';value=$sids.R};daemon=[ordered]@{kind='sid';value=$sids.D};system=[ordered]@{kind='sid';value='S-1-5-18'}}}
   Write-Utf8 $Config $configValue
   $genesis=Join-Path $Root 'genesis.json';$unchanged=Join-Path $Root 'unchanged.json';$pending=Join-Path $Root 'pending.json';$unchanged2=Join-Path $Root 'unchanged2.json'
-  Write-Utf8 $genesis ([ordered]@{hostId=$hostId;expectedInventoryGeneration=0;workspaces=@([ordered]@{workspaceId='repo';sourcePlatform='windows-drive';workDir=$WorkRepo})})
-  Write-Utf8 $unchanged ([ordered]@{hostId=$hostId;expectedInventoryGeneration=1;workspaces=@([ordered]@{workspaceId='repo';sourcePlatform='windows-drive';workDir=$WorkRepo})})
+  Write-Utf8 $genesis ([ordered]@{hostId=$hostId;expectedInventoryGeneration=0;workspaces=@([ordered]@{workspaceId='repo';sourcePlatform='windows-drive';workDir=$Workspace})})
+  Write-Utf8 $unchanged ([ordered]@{hostId=$hostId;expectedInventoryGeneration=1;workspaces=@([ordered]@{workspaceId='repo';sourcePlatform='windows-drive';workDir=$Workspace})})
   Write-Utf8 $pending ([ordered]@{hostId=$hostId;expectedInventoryGeneration=1;workspaces=@()})
   Write-Utf8 $unchanged2 ([ordered]@{hostId=$hostId;expectedInventoryGeneration=2;workspaces=@()})
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'publish-allow-error',"`"$(Join-Path $Output 'genesis.json')`"","`"$genesis`"") 'genesis'|Out-Null
@@ -123,10 +129,11 @@ try{
   }
   Write-Utf8 $FailurePath ($debug -join "`n")
 }finally{
-  Remove-Protected $InventoryBase;Remove-Protected $ReaderBase;Remove-Protected $Root
+  Remove-Protected $InventoryBase;Remove-Protected $ReaderBase
+  Remove-Protected $Workspace;Remove-Protected $Root
   foreach($name in $Created){Remove-LocalUser $name -ErrorAction SilentlyContinue}
   $users=@(Get-LocalUser|Where-Object Name -like 'gjc12w_*')
-  $proof=[ordered]@{schemaVersion=1;status=if((-not(Test-Path $InventoryBase))-and(-not(Test-Path $ReaderBase))-and(-not(Test-Path $Root))-and$users.Count-eq 0){'passed'}else{'failed'};inventoryRootAbsent=(-not(Test-Path $InventoryBase));readerRootAbsent=(-not(Test-Path $ReaderBase));fixtureRootAbsent=(-not(Test-Path $Root));usersAbsent=($users.Count-eq 0)}
+  $proof=[ordered]@{schemaVersion=1;status=if((-not(Test-Path $InventoryBase))-and(-not(Test-Path $ReaderBase))-and(-not(Test-Path $Workspace))-and(-not(Test-Path $Root))-and$users.Count-eq 0){'passed'}else{'failed'};inventoryRootAbsent=(-not(Test-Path $InventoryBase));readerRootAbsent=(-not(Test-Path $ReaderBase));workspaceAbsent=(-not(Test-Path $Workspace));fixtureRootAbsent=(-not(Test-Path $Root));usersAbsent=($users.Count-eq 0)}
   Write-Utf8 $CleanupProof $proof
 }
 if($Failure){throw $Failure}
