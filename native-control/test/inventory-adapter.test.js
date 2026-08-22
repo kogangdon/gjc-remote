@@ -41,6 +41,7 @@ function fixture() {
       return true;
     },
     current_os_principal: forbidden,
+    read_workspace_root_facts: forbidden,
     ensure_inventory_directory: forbidden,
     acquire_inventory_fence: forbidden,
     read_inventory_object: forbidden,
@@ -48,6 +49,35 @@ function fixture() {
   };
   return { lowLevel, calls };
 }
+
+test('publisher rejects an incomplete low-level capability surface', async () => {
+  const state = fixture();
+  delete state.lowLevel.publish_inventory_object_atomic;
+  await assert.rejects(
+    createInventoryPublisherAdapter(() => state.lowLevel, { hostId, roles }),
+    (error) => assertBoundedError(error, 'INVENTORY_INVALID', 'resolve_native_state_root'),
+  );
+  assert.deepEqual(state.calls, []);
+});
+
+test('publisher rejects accessor capabilities without invoking them', async () => {
+  const state = fixture();
+  let getterCalls = 0;
+  Object.defineProperty(state.lowLevel, 'read_workspace_root_facts', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterCalls++;
+      return async () => {};
+    },
+  });
+  await assert.rejects(
+    createInventoryPublisherAdapter(() => state.lowLevel, { hostId, roles }),
+    (error) => assertBoundedError(error, 'INVENTORY_INVALID', 'resolve_native_state_root'),
+  );
+  assert.equal(getterCalls, 0);
+  assert.deepEqual(state.calls, []);
+});
 
 function assertBoundedError(error, code, operation) {
   assert.equal(error.message, 'inventory operation failed');
@@ -70,12 +100,12 @@ async function rejectsInvalid(options, create = createInventoryPublisherAdapter)
   assert.equal(loaded, false, 'input rejection must precede addon loading');
 }
 
-test('publisher factory returns only an actor-bound frozen selfTest', async () => {
+test('publisher factory returns an actor-bound frozen selfTest and publish', async () => {
   const state = fixture();
   const publisher = await createInventoryPublisherAdapter(() => state.lowLevel, { hostId, roles });
-  assert.deepEqual(Object.keys(publisher), ['selfTest']);
+  assert.deepEqual(Object.keys(publisher), ['selfTest', 'publish']);
   assert.equal(Object.isFrozen(publisher), true);
-  assert.equal('publish' in publisher, false);
+  assert.equal(typeof publisher.publish, 'function');
   assert.deepEqual(state.calls.map(([kind, path,, profile, actor]) => [kind, path, profile, actor]), [
     ['root', hostKey, undefined, undefined],
     ['acl', `/managed/inventory/${hostKey}`, 'inventory-directory', 'management'],
