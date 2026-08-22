@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -73,6 +73,10 @@ if (mode === 'publish' || mode === 'publish-allow-error') {
 } else if (mode === 'corrupt-commit') {
   await writeFile(join(inventoryRoot, 'inventory-commit.v1.json'), '{}', 'utf8');
   await emit({ status: 'passed' });
+} else if (mode === 'list-inventory') {
+  await emit({ status: 'passed', files: (await readdir(inventoryRoot)).sort() });
+} else if (mode === 'list-reader') {
+  await emit({ status: 'passed', files: (await readdir(readerRoot)).sort() });
 } else {
   throw new Error('unknown mode');
 }

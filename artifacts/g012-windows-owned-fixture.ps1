@@ -113,7 +113,9 @@ try{
   if($holderReceipt.status-ne'passed'){throw 'D holder receipt mismatch'}
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'corrupt-commit',"`"$(Join-Path $Output 'corrupt.json')`"") 'corrupt'|Out-Null
   Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'publish-allow-error',"`"$(Join-Path $Output 'marker.json')`"","`"$unchanged2`"") 'marker'|Out-Null
-  $evidence=[ordered]@{schemaVersion=1;status='passed';head=$Head;platform='Windows 11 Pro x64 NTFS';principals=[ordered]@{M=$sids.M;B=$sids.B;R=$sids.R;D=$sids.D;SYSTEM='S-1-5-18'};genesis=(Read-Json 'genesis.json');unchanged=(Read-Json 'unchanged.json');pending=(Read-Json 'pending.json');floor=(Read-Json 'floor.json');replacement=(Read-Json 'replacement.json');dFenceBlockedMs=$clock.ElapsedMilliseconds;blockedUnchanged=(Read-Json 'blocked.json');holder=(Read-Json 'holder.json');markerFailure=(Read-Json 'marker.json');inventoryFiles=@(Get-ChildItem $inventory -Force|Select-Object -ExpandProperty Name);readerFiles=@(Get-ChildItem $reader -Force|Select-Object -ExpandProperty Name)}
+  Invoke-As $credentials.M @("`"$Runner`"","`"$Config`"",'list-inventory',"`"$(Join-Path $Output 'inventory-list.json')`"") 'inventory-list'|Out-Null
+  Invoke-As $credentials.D @("`"$Runner`"","`"$Config`"",'list-reader',"`"$(Join-Path $Output 'reader-list.json')`"") 'reader-list'|Out-Null
+  $evidence=[ordered]@{schemaVersion=1;status='passed';head=$Head;platform='Windows 11 Pro x64 NTFS';principals=[ordered]@{M=$sids.M;B=$sids.B;R=$sids.R;D=$sids.D;SYSTEM='S-1-5-18'};genesis=(Read-Json 'genesis.json');unchanged=(Read-Json 'unchanged.json');pending=(Read-Json 'pending.json');floor=(Read-Json 'floor.json');replacement=(Read-Json 'replacement.json');dFenceBlockedMs=$clock.ElapsedMilliseconds;blockedUnchanged=(Read-Json 'blocked.json');holder=(Read-Json 'holder.json');markerFailure=(Read-Json 'marker.json');inventoryFiles=(Read-Json 'inventory-list.json').files;readerFiles=(Read-Json 'reader-list.json').files}
   if($evidence.genesis.status-ne'published'-or$evidence.genesis.writes-ne 11){throw 'genesis receipt mismatch'}
   if($evidence.unchanged.status-ne'unchanged'-or$evidence.unchanged.writes-ne 0){throw 'unchanged receipt mismatch'}
   if($evidence.pending.code-ne'INVENTORY_PENDING'-or$evidence.pending.writes-ne 0){throw 'pending receipt mismatch'}
@@ -121,6 +123,8 @@ try{
   if($evidence.replacement.inventoryGeneration-ne 2-or$evidence.replacement.writes-ne 10){throw 'replacement receipt mismatch'}
   if($evidence.dFenceBlockedMs-lt 2500-or$evidence.blockedUnchanged.status-ne'unchanged'){throw 'D fence serialization mismatch'}
   if($evidence.markerFailure.code-ne'INVENTORY_MANUAL_CLEANUP'-or$evidence.markerFailure.writes-ne 4){throw 'marker receipt mismatch'}
+  if(@(Compare-Object @('inventory-commit.v1.json','inventory-manual-cleanup.v1.json','inventory-publication.lock','workspace-inventory.v2.json') @($evidence.inventoryFiles)).Count-ne 0){throw 'unexpected inventory artifacts'}
+  if(@(Compare-Object @('inventory-floor.v1.json') @($evidence.readerFiles)).Count-ne 0){throw 'unexpected reader artifacts'}
   Write-Utf8 $Receipt $evidence
 }catch{
   $Failure=$_
