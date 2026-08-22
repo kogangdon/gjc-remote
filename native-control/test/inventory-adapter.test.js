@@ -342,6 +342,7 @@ function createReaderModel({
   floorAclDenied = false,
   factsMismatchAfter = null,
   finalInventoryDrift = false,
+  malformedMarkerRead = false,
 } = {}) {
   const inventoryRoot = '/managed/inventory';
   const readerRoot = '/managed/reader';
@@ -427,6 +428,10 @@ function createReaderModel({
     },
     read_inventory_object: async (path, _maxBytes, _roles, profile) => {
       calls.push(['read', path, profile]);
+      if (malformedMarkerRead &&
+          path.endsWith('inventory-manual-cleanup.v1.json')) {
+        return undefined;
+      }
       const count = (readCounts.get(path) ?? 0) + 1;
       readCounts.set(path, count);
       if (finalInventoryDrift &&
@@ -682,6 +687,14 @@ test('Reader preserves native fence errors and rejects stale workspace facts', a
     (await createModeledReader(
       createReaderModel({ acquireError: pending }))).readAccepted(),
     (error) => error === pending,
+  );
+
+  const malformedMarker = createReaderModel({ malformedMarkerRead: true });
+  await assert.rejects(
+    (await createModeledReader(malformedMarker)).readAccepted(),
+    (error) => error.code === 'INVENTORY_MANUAL_CLEANUP' &&
+      error.operation === 'read_inventory' &&
+      error.writes === 0 && error.ambiguous === true,
   );
 
   const staleFacts = createReaderModel({ factsMismatch: true });

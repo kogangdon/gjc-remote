@@ -307,7 +307,9 @@ async function createReaderAdapter(lowLevel, validated) {
         'reader-directory', 'daemon');
       const rawMarker = await read(paths.marker, 'inventory-manual-cleanup');
       if (rawMarker !== null) {
-        throw localError('INVENTORY_MANUAL_CLEANUP', 'read_inventory');
+        throw localError(
+          'INVENTORY_MANUAL_CLEANUP', 'read_inventory', 0,
+          rawMarker === undefined);
       }
       const inventory = readEnvelope(await read(paths.inventory, 'inventory-file'), parseWorkspaceInventory);
       const commit = readEnvelope(await read(paths.commit, 'inventory-commit'), (bytes) => parseCommit(bytes, validated.hostId));
