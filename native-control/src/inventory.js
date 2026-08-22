@@ -27,6 +27,12 @@ function localError(code, operation, writes = 0, ambiguous = false) {
   return error;
 }
 
+function isLocalError(value) {
+  return value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    localErrors.has(value);
+}
+
 function addWrites(total, amount) {
   if (!Number.isSafeInteger(amount) || amount < 0 ||
       total > Number.MAX_SAFE_INTEGER - amount) {
@@ -148,17 +154,8 @@ function requireLowLevel(lowLevel, publisher) {
         !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'function') invalid();
     captured[name] = descriptor.value;
   }
-  if (!publisher) {
-    for (const name of Reflect.ownKeys(descriptors)) {
-      const descriptor = descriptors[name];
-      if (typeof name === 'string' && descriptor && descriptor.get === undefined &&
-          descriptor.set === undefined && typeof descriptor.value === 'function') {
-        captured[name] = descriptor.value;
-      }
-    }
-  }
   // Capture each verified data property once so later object mutation cannot
-  // alter a Publisher transaction.
+  // alter an adapter transaction.
   return Object.freeze(captured);
 }
 
@@ -441,7 +438,7 @@ async function createReaderAdapter(lowLevel, validated) {
       });
       }
     } catch (caught) {
-      if (localErrors.has(caught)) {
+      if (isLocalError(caught)) {
         if (Number.isSafeInteger(caught.writes) && caught.writes >= 0) {
           writes = Math.max(writes, caught.writes);
         }
@@ -474,7 +471,7 @@ async function createReaderAdapter(lowLevel, validated) {
       throw localError('INVENTORY_IO_FAILED', 'release_inventory_fence', writes, true);
     }
     if (body) {
-      if ((localErrors.has(body) || bodyExact) && body.writes === writes) {
+      if ((isLocalError(body) || bodyExact) && body.writes === writes) {
         throw body;
       }
       throw localError(

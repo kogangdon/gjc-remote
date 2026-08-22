@@ -689,6 +689,14 @@ test('Reader preserves native fence errors and rejects stale workspace facts', a
     (error) => error === pending,
   );
 
+  await assert.rejects(
+    (await createModeledReader(
+      createReaderModel({ acquireError: 'primitive failure' }))).readAccepted(),
+    (error) => error.code === 'INVENTORY_IO_FAILED' &&
+      error.operation === 'read_inventory' &&
+      error.writes === 0 && error.ambiguous === false,
+  );
+
   const malformedMarker = createReaderModel({ malformedMarkerRead: true });
   await assert.rejects(
     (await createModeledReader(malformedMarker)).readAccepted(),
