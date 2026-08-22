@@ -104,7 +104,10 @@ export function verifyManifestSignature(manifestBytes, sidecar, trustStore) {
 }
 
 export function validateBuildManifest(manifest, packageJson, addonBytes, platform = process.platform, arch = process.arch) {
-  if (!manifest || Object.getPrototypeOf(manifest) !== Object.prototype || !packageJson || Object.getPrototypeOf(packageJson) !== Object.prototype || !Buffer.isBuffer(addonBytes)) return false;
+  if (contractRevision !== 2 || !manifest ||
+      Object.getPrototypeOf(manifest) !== Object.prototype || !packageJson ||
+      Object.getPrototypeOf(packageJson) !== Object.prototype ||
+      !Buffer.isBuffer(addonBytes)) return false;
   const expected = {
     contractVersion: 4, contractRevision, package: packageJson.name, version: packageJson.version, napi: 8,
     platform, arch, addon: 'native_control.node', sha256: fingerprint(addonBytes),

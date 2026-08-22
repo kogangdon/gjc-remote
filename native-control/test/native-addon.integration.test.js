@@ -111,7 +111,7 @@ test("staged public inventory adapters do not change the native ABI or expose lo
   assert.equal("createInventoryPublisherAdapter" in publicApi, false);
   assert.equal("createInventoryReaderAdapter" in publicApi, false);
   assert.equal(publicApi.buildManifest.contractVersion, 4);
-  assert.equal(publicApi.buildManifest.contractRevision, 1);
+  assert.equal(publicApi.buildManifest.contractRevision, 2);
   assert.deepEqual(publicApi.buildManifest.capabilities, capabilities);
   assert.deepEqual(publicApi.buildManifest.capabilitySignatures, capabilitySignatures);
 });
@@ -918,18 +918,33 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(posixAcl, /expected_actor == "daemon" \? roles\.daemon/);
   assert.match(posixAcl, /expected_actor == "recovery" \? roles\.recovery : roles\.system/);
   assert.match(posixAcl, /if \(geteuid\(\) != expected_uid\)/);
+  assert.match(source, /bool InventoryFenceProperties\([\s\S]*"release"[\s\S]*"writes"[\s\S]*napi_define_properties/);
+  assert.equal((source.match(/const napi_status reference_status/g) ?? []).length, 2);
+  assert.equal((source.match(/const napi_status wrap_status/g) ?? []).length, 2);
+  assert.equal((source.match(/const napi_status freeze_status/g) ?? []).length, 2);
+  assert.equal((source.match(/napi_remove_wrap/g) ?? []).length, 2);
+  assert.equal((source.match(/data == nullptr\) \{/g) ?? []).length, 2);
+  assert.equal((source.match(/setup_status != napi_ok \|\| !InventoryFenceProperties/g) ?? []).length, 2);
+  assert.match(source,
+    /const bool lost_create_race = rename_attempted && !renamed && cleaned/);
+  assert.match(source,
+    /rename_attempted \? GetLastError\(\) : ERROR_GEN_FAILURE/);
+  assert.match(source, /if \(!published && !lost_create_race\)/);
+  assert.match(source, /if \(failure == EEXIST\) \{[\s\S]*fence_writes = writes;/);
   const inventoryFenceStart = source.indexOf("napi_value AcquireInventoryFenceWindows");
   const inventoryFenceEnd = source.indexOf("napi_value PublishInventoryObjectAtomicWindows", inventoryFenceStart);
   const inventoryFence = source.slice(inventoryFenceStart, inventoryFenceEnd);
   assert.match(inventoryFence, /GENERIC_READ \| READ_CONTROL/);
   assert.match(source, /LockFileEx\(work->fence->handle, LOCKFILE_EXCLUSIVE_LOCK \| LOCKFILE_FAIL_IMMEDIATELY/);
   assert.match(inventoryFence, /RenameWindowsRelative\(temporary, parent, name, false\)/);
-  assert.match(inventoryFence, /napi_create_reference\(complete, object, 0, &work->fence->object_ref\)/);
+  assert.match(inventoryFence,
+    /napi_create_reference\(\s*complete,\s*object,\s*0,\s*&work->fence->object_ref\)/);
   assert.match(inventoryFence, /napi_reference_ref\(e, fence->object_ref/);
   assert.match(inventoryFence, /napi_reference_unref\(ce, item->fence->object_ref/);
   assert.match(inventoryFence, /if \(fence->release_promise\)/);
   assert.match(inventoryFence, /CreateInventoryAsyncWork\(\s*env, "inventory\.acquire_fence"/);
   assert.match(inventoryFence, /CreateInventoryAsyncWork\(\s*e, "inventory\.release_fence"/);
+  assert.doesNotMatch(inventoryFence, /napi_set_named_property\([^;]*"release"/);
   assert.match(source, /CreateInventoryAsyncWork\(\s*env, "inventory\.acquire_fence", AcquireFenceExecute/);
   assert.match(source, /CreateInventoryAsyncWork\(\s*release_env, "inventory\.release_fence"/);
   assert.match(source, /if \(!fence->released\.exchange\(true\) && fence->handle != INVALID_HANDLE_VALUE\)/);
@@ -956,4 +971,7 @@ test("native source contains fail-closed ACL and publication guards", () => {
   const posixFence = source.slice(posixFenceStart, posixFenceEnd);
   assert.match(posixFence, /auto discard = \[&\]\(const std::string& entry, const struct stat& expected\)/);
   assert.match(posixFence, /cleaned \? "INVENTORY_IO_FAILED" : "INVENTORY_MANUAL_CLEANUP"/);
+  assert.match(posixFence,
+    /int fd = OpenObjectNoFollow[\s\S]*if \(fd < 0\) \{[\s\S]*const int failure = errno;[\s\S]*close\(parent\);[\s\S]*failure == ENOENT/);
+  assert.doesNotMatch(posixFence, /napi_set_named_property\([^;]*"release"/);
 });
