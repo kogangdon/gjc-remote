@@ -1479,7 +1479,8 @@ async function admitReadyWorkload(state, workDir, message) {
         inventoryCascading ||
         admissionEpoch !== providerEpoch ||
         publishRead?.status !== "present" ||
-        publishRead.inventory.inventoryFingerprint !== bindingState.proof?.inventoryFingerprint;
+        publishRead.inventory.inventoryFingerprint !== bindingState.proof?.inventoryFingerprint ||
+        publishRead.inventory.inventoryGeneration !== bindingState.proof?.inventoryGeneration;
       if (rotated) {
         await Promise.resolve(session.dispose()).catch(() => {});
         activityLease?.release();

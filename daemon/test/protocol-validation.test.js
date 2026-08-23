@@ -625,6 +625,41 @@ test("live cascade bulk-invalidates the workspace lease registry", () => {
   assert.equal(registry.snapshot().length, 0);
 });
 
+test("live cascade reports adopted authorities with no active activity holder", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  const candidate = {
+    authorityEpoch: 1,
+    fenceGeneration: 1,
+    hostId: "test-host",
+    mappingId: "mapping-1",
+    mappingGeneration: 2,
+    mappingVersion: 1,
+    workspaceId: "workspace-authority-only",
+    workspaceGeneration: 3,
+    sourcePlatform: "posix",
+    authorityFingerprint: "b".repeat(64),
+    inventoryGeneration: 4,
+    inventoryFingerprint: "c".repeat(64),
+    socketGeneration: 1,
+    bindingId: "receipt-binding-authority-only",
+    bindingFingerprint: "d".repeat(64),
+  };
+  // Adopt an authority but never acquire an activity: the workspace has an
+  // authority and no activity holder.
+  assert.equal(registry.adoptBinding(candidate), true);
+
+  const invalidated = registry.invalidateAll();
+  // The returned set must include the authority-only workspace even though it
+  // never appeared in the activities map.
+  assert.deepEqual([...invalidated], ["workspace-authority-only"]);
+  assert.equal(registry.snapshot().length, 0);
+  // Authority cleared: a fresh acquire fails closed until a new adopt.
+  assert.throws(
+    () => registry.acquireActivity(candidate),
+    (error) => error.code === PROTOCOL_ERROR_CODES.LEASE_CONFLICT
+  );
+});
+
 test("live inventory epoch drift retires the receipt socket without creating a session", async () => {
   const inventory = serializedTestInventory({
     inventoryGeneration: 4,

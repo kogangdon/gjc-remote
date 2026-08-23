@@ -169,14 +169,19 @@ export class WorkspaceLeaseRegistry {
    * that were invalidated.
    */
   invalidateAll() {
-    const invalidated = [];
+    const invalidatedIds = new Set();
     for (const [workspaceId, activity] of this.activities) {
       activity.invalidated = true;
-      invalidated.push(workspaceId);
+      invalidatedIds.add(workspaceId);
       if (activity.holders === 0) this.activities.delete(workspaceId);
     }
+    // Adopted authorities with no active activity holder are still cleared
+    // below, so they belong in the returned set to keep the contract honest.
+    for (const workspaceId of this.authorities.keys()) {
+      invalidatedIds.add(workspaceId);
+    }
     this.authorities.clear();
-    return Object.freeze(invalidated);
+    return Object.freeze([...invalidatedIds]);
   }
 
   retireBinding(candidate) {
