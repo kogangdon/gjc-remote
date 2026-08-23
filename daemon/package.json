@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@gajae-code/coding-agent": "0.12.21",
+    "@gjc-remote/native-control": "*",
     "@gjc-remote/shared": "*",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0"

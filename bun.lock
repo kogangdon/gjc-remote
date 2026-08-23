@@ -7,7 +7,7 @@
     },
     "bot": {
       "name": "@gjc-remote/bot",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "bin": {
         "gjc-remote-admin": "./src/management-entrypoint.js",
       },
@@ -21,9 +21,10 @@
     },
     "daemon": {
       "name": "@gjc-remote/daemon",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@gajae-code/coding-agent": "0.12.21",
+        "@gjc-remote/native-control": "*",
         "@gjc-remote/shared": "*",
         "dotenv": "^16.4.5",
         "ws": "^8.18.0",
@@ -32,6 +33,9 @@
     "native-control": {
       "name": "@gjc-remote/native-control",
       "version": "1.0.0",
+      "bin": {
+        "gjc-remote-inventory": "./src/inventory-entrypoint.js",
+      },
       "dependencies": {
         "@gjc-remote/shared": "*",
       },
@@ -41,7 +45,7 @@
     },
     "shared": {
       "name": "@gjc-remote/shared",
-      "version": "0.3.0",
+      "version": "0.3.1",
     },
   },
   "packages": {
