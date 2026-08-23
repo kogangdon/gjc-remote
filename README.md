@@ -358,6 +358,50 @@ fails, while fatal shutdown exits non-zero.
   bounded current/`.old` log policy no longer applies to this repository. See
   [`docs/process-supervision.md`](docs/process-supervision.md).
 
+### Native workspace inventory (off by default)
+
+`GJC_NATIVE_INVENTORY_MODE` controls the daemon's native workspace inventory
+capability and defaults to `off`. Setting it to `verify` opts into the native
+inventory receipt contract (advertised only alongside opt-in protocol v2
+readiness and a receipt-capable inventory provider). Any value other than
+`off`/`verify` fails the daemon closed at startup (`process.exit(1)`) — there
+is no silent fallback.
+
+Native workspace **serving stays disabled regardless of mode.** Even a proven
+`verify`-mode receipt binding cannot serve workspace invokes: the daemon's
+hard serving gate returns `RUNTIME_INCOMPATIBLE` unconditionally. The
+inventory contract is capability evidence only — the issue #44 management
+mapping envelope remains the sole route authority, never the local
+inventory.
+
+**Production wiring gap:** today the production daemon boot does not
+construct a native inventory reader, so the native-reader path is not yet
+wired end-to-end. `verify`-mode receipt capability is therefore only
+reachable under test injection (`GJC_READINESS_TEST_INJECTION=1`); enabling
+it in production is a future reader-wiring/native-serving milestone, not
+current behavior.
+
+Five-role access control (`GJC_INVENTORY_ROLE_BINDINGS`, strict JSON) binds
+exactly the `management`, `bot`, `recovery`, `daemon`, and `system` roles to
+platform-native principals — a `uid:<n>` on Linux or a SID on Windows — with
+`system` pinned to `uid:0` / `S-1-5-18`. WSL Linux accounts and native Windows
+accounts are separate identity systems; role bindings must match the
+platform the daemon actually runs on.
+
+A durable, D(aemon)-owned floor prevents silent inventory rollback: restoring
+inventory below a surviving floor is rejected as `INVENTORY_STALE` and enters
+manual cleanup — the floor itself is never lowered automatically. Known
+limitation: a jointly restored, internally consistent old inventory-and-floor
+pair (both rolled back together) is accepted, an availability-cost caveat —
+while the daemon is offline, management cannot advance until the floor
+catches up.
+
+Observability: the bot's `/hosts` projection exposes a `reconnectCount`
+churn counter, advanced only for binding-capable v3 reconnects. Structured
+bind/receipt/socket observability events are sanitized before emission
+(opaque ids redacted, fingerprints truncated to a safe prefix) and have no
+production sink wired by default.
+
 ## Security notes
 
 - `bot/`'s WS port only needs to be reachable from daemon hosts on your
