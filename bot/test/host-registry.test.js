@@ -4024,3 +4024,64 @@ test("unbinding a bound managed route emits an unbind-phase receipt.invalidate",
     await server.close();
   }
 });
+
+test("a v3 socket replacement advances reconnect churn while an off-mode replacement holds it", async () => {
+  const server = await startRegistry();
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const first = await connectV3(server);
+    await first.nextFrame(); // drain the initial BIND_WORKSPACE so the socket is live
+    assert.equal(server.registry.getHostReadiness("host-a").reconnectCount, 0);
+
+    // A binding-capable (v3) registration replacing the live socket is churn.
+    const second = await connectV3(server);
+    await waitFor(
+      () => server.registry.getHostReadiness("host-a").reconnectCount === 1
+    );
+    await second.nextFrame();
+
+    // An off-mode (v2) registration replacing the live v3 socket must NOT advance it.
+    const { socket: third } = await connectV2(server);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(server.registry.getHostReadiness("host-a").reconnectCount, 1);
+
+    third.terminate();
+    second.socket.terminate();
+    first.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("a bind-deadline retirement emits exactly one socket.retire in the deadline phase", async () => {
+  const events = [];
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    await connection.nextFrame(); // BIND_WORKSPACE arms the bind deadline
+    await waitFor(() => timers.timeoutDelays.includes(10_000));
+    const closed = once(connection.socket, "close");
+    timers.runTimeoutByDelay(10_000);
+    await closed;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const retires = events.filter((e) => e.event === "socket.retire");
+    assert.equal(retires.length, 1, "exactly one socket.retire for one physical retirement");
+    assert.equal(retires[0].phase, "deadline");
+    assert.equal(retires[0].code, "BINDING_DEADLINE");
+    assert.equal(
+      events.filter((e) => e.event === "socket.retire" && e.phase === "offline").length,
+      0,
+      "the offline-phase retire is suppressed after a deadline retirement"
+    );
+  } finally {
+    await server.close();
+  }
+});
