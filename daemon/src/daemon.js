@@ -333,6 +333,180 @@ let shutdownExitCode = null;
 let readinessSocketGeneration = 0;
 const readinessByConnection = new WeakMap();
 
+// --- Live provider refresh and atomic invalidation (verify mode) ---------
+// The daemon proves each positive receipt against a durable inventory snapshot
+// at bind time. A background poll re-verifies that the snapshot has not drifted,
+// expired, or become unreadable. Any change performs an ordered atomic cascade
+// that retires every derived binding, lease, and in-flight request and closes
+// the socket. Serving stays hard-false, so these fences prepare rather than
+// authorize serving; no SDK session is ever created while the gate is closed.
+const INVENTORY_SNAPSHOT_TTL_MS = Math.min(10_000, INVENTORY_RECEIPT_TTL_MS);
+const INVENTORY_POLL_DEFAULT_MS = 5_000;
+
+function parseInventoryPollMs(value) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 60_000) {
+    throw new RangeError("GJC_INVENTORY_POLL_MS must be an integer in [1, 60000]");
+  }
+  return parsed;
+}
+
+let INVENTORY_POLL_MS = INVENTORY_POLL_DEFAULT_MS;
+if (READINESS_TEST_INJECTION_ENABLED && process.env.GJC_INVENTORY_POLL_MS !== undefined) {
+  try {
+    INVENTORY_POLL_MS = parseInventoryPollMs(process.env.GJC_INVENTORY_POLL_MS);
+  } catch (error) {
+    console.error(`daemon: invalid GJC_INVENTORY_POLL_MS: ${sanitizeDaemonError(error)}`);
+    process.exit(1);
+  }
+}
+
+// Serialize boot/read-before-bind/poll/read-before-admission provider reads
+// under one mutex so concurrent operations never observe a torn read.
+let inventoryReadMutex = Promise.resolve();
+function serializedInventoryRead() {
+  const result = inventoryReadMutex.then(() => inventoryProvider.read());
+  inventoryReadMutex = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+// Monotonic epoch bumped once per atomic cascade. A session-creation recheck
+// compares the epoch it captured before creation against the current epoch.
+let providerEpoch = 0;
+let inventoryCascading = false;
+let inventoryPollTimer = undefined;
+let inventoryPollInFlight = false;
+let inventorySnapshot = undefined;
+
+function hasReceiptCommittedConnection() {
+  for (const connection of connections) {
+    if (readinessByConnection.get(connection)?.receiptCommitted) return true;
+  }
+  return false;
+}
+
+function hasActiveReceiptBindings() {
+  for (const connection of connections) {
+    const state = readinessByConnection.get(connection);
+    if (state?.committed && state.receiptCommitted && state.bindings.size > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ensureInventoryPollStarted() {
+  if (!inventoryReceiptAdvertised || inventoryPollTimer || shuttingDown) return;
+  inventoryPollTimer = setInterval(() => {
+    void runInventoryPoll();
+  }, INVENTORY_POLL_MS);
+  inventoryPollTimer.unref?.();
+}
+
+function stopInventoryPoll() {
+  if (inventoryPollTimer) {
+    clearInterval(inventoryPollTimer);
+    inventoryPollTimer = undefined;
+  }
+  inventorySnapshot = undefined;
+}
+
+function maybeStopInventoryPoll() {
+  if (!hasReceiptCommittedConnection()) stopInventoryPoll();
+}
+
+async function runInventoryPoll() {
+  if (inventoryPollInFlight || inventoryCascading || shuttingDown) return;
+  if (!hasActiveReceiptBindings()) {
+    inventorySnapshot = undefined;
+    return;
+  }
+  inventoryPollInFlight = true;
+  try {
+    const now = Date.now();
+    if (inventorySnapshot && now - inventorySnapshot.verifiedAt > INVENTORY_SNAPSHOT_TTL_MS) {
+      await cascadeInventoryInvalidation(PROTOCOL_ERROR_CODES.INVENTORY_STALE);
+      return;
+    }
+    let read;
+    try {
+      read = await serializedInventoryRead();
+    } catch {
+      await cascadeInventoryInvalidation(PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED);
+      return;
+    }
+    if (read?.status !== "present") {
+      await cascadeInventoryInvalidation(
+        receiptInventoryError(read) ?? PROTOCOL_ERROR_CODES.INVENTORY_STALE
+      );
+      return;
+    }
+    const fingerprint = {
+      epoch: read.epoch,
+      inventoryGeneration: read.inventory.inventoryGeneration,
+      inventoryFingerprint: read.inventory.inventoryFingerprint,
+    };
+    if (
+      inventorySnapshot &&
+      (inventorySnapshot.epoch !== fingerprint.epoch ||
+        inventorySnapshot.inventoryGeneration !== fingerprint.inventoryGeneration ||
+        inventorySnapshot.inventoryFingerprint !== fingerprint.inventoryFingerprint)
+    ) {
+      await cascadeInventoryInvalidation(PROTOCOL_ERROR_CODES.INVENTORY_STALE);
+      return;
+    }
+    inventorySnapshot = { ...fingerprint, verifiedAt: Date.now() };
+  } finally {
+    inventoryPollInFlight = false;
+  }
+}
+
+// Atomic invalidation cascade. Order (per plan section 7): set provider
+// invalidating; invalidate the WorkspaceLeaseRegistry; dispose each binding's
+// in-flight requests; await exact-bound session disposal; emit one bounded
+// negative frame if safe; close the socket and require fresh registration.
+async function cascadeInventoryInvalidation(code) {
+  if (inventoryCascading) return;
+  inventoryCascading = true;
+  providerEpoch += 1;
+  inventorySnapshot = undefined;
+  try {
+    workspaceLeases.invalidateAll();
+    const disposals = [];
+    for (const connection of [...connections]) {
+      const state = readinessByConnection.get(connection);
+      if (!state) continue;
+      clearReadinessTimer(state);
+      for (const [, bindingState] of state.bindings) {
+        invalidateBindingRequests(state, bindingState);
+        disposals.push(
+          Promise.resolve(retireReceiptSession(state, bindingState)).catch(() => {})
+        );
+        bindingState.ready = false;
+        bindingState.phase = "negative";
+        bindingState.proof = undefined;
+        bindingState.lastError = makeReadinessError(code);
+      }
+    }
+    await Promise.all(disposals);
+    for (const connection of [...connections]) {
+      const state = readinessByConnection.get(connection);
+      if (!state) continue;
+      try {
+        publishReadiness(state);
+      } catch {}
+      state.committed = false;
+      state.receiptCommitted = false;
+      try {
+        connection.close(1013, "inventory retired");
+      } catch {}
+    }
+  } finally {
+    inventoryCascading = false;
+    stopInventoryPoll();
+  }
+}
+
 function bindingFingerprint(binding) {
   return createHash("sha256")
     .update(
@@ -675,7 +849,7 @@ async function acceptReceiptBinding(state, message) {
 
   let first;
   try {
-    first = await inventoryProvider.read();
+    first = await serializedInventoryRead();
   } catch (error) {
     if (!currentReceiptBinding(state, bindingState)) return true;
     bindingState.phase = "negative";
@@ -702,7 +876,7 @@ async function acceptReceiptBinding(state, message) {
     if (inventoryWorkspace) {
       let second;
       try {
-        second = await inventoryProvider.read();
+        second = await serializedInventoryRead();
       } catch (error) {
         if (!currentReceiptBinding(state, bindingState)) return true;
         second = {
@@ -743,7 +917,7 @@ async function acceptReceiptBinding(state, message) {
     } else {
       let second;
       try {
-        second = await inventoryProvider.read();
+        second = await serializedInventoryRead();
       } catch (error) {
         if (!currentReceiptBinding(state, bindingState)) return true;
         second = {
@@ -1199,6 +1373,34 @@ async function admitReadyWorkload(state, workDir, message) {
   if (effectiveWorkDir === undefined) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED) };
   }
+  // Read-before-admission fence: re-verify the durable snapshot the positive
+  // receipt was proved against. Any drift, unreadable object, or in-progress
+  // cascade retires the binding before admission rather than serving a session
+  // against a snapshot that has since changed.
+  const admissionEpoch = providerEpoch;
+  if (bindingState?.receipt && bindingState.proof) {
+    let admissionRead;
+    try {
+      admissionRead = await serializedInventoryRead();
+    } catch {
+      admissionRead = undefined;
+    }
+    const stale =
+      inventoryCascading ||
+      admissionEpoch !== providerEpoch ||
+      admissionRead?.status !== "present" ||
+      admissionRead.inventory.inventoryGeneration !== bindingState.proof.inventoryGeneration ||
+      admissionRead.inventory.inventoryFingerprint !== bindingState.proof.inventoryFingerprint;
+    if (stale) {
+      invalidateBindingRequests(state, bindingState);
+      bindingState.ready = false;
+      bindingState.phase = "negative";
+      bindingState.proof = undefined;
+      bindingState.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.INVENTORY_STALE);
+      publishReadiness(state);
+      return { error: bindingState.lastError };
+    }
+  }
   if (!NATIVE_WORKSPACE_SERVING_ENABLED) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
   }
@@ -1221,6 +1423,28 @@ async function admitReadyWorkload(state, workDir, message) {
         managedIdentity: bindingFingerprintValue,
       }),
     });
+    // Session-creation epoch recheck: a snapshot rotation between admission and
+    // publication disposes the just-created session and returns no admission.
+    if (bindingState?.receipt) {
+      let publishRead;
+      try {
+        publishRead = await serializedInventoryRead();
+      } catch {
+        publishRead = undefined;
+      }
+      const rotated =
+        inventoryCascading ||
+        admissionEpoch !== providerEpoch ||
+        publishRead?.status !== "present" ||
+        publishRead.inventory.inventoryFingerprint !== bindingState.proof?.inventoryFingerprint;
+      if (rotated) {
+        await Promise.resolve(session.dispose()).catch(() => {});
+        activityLease?.release();
+        return {
+          error: makeReadinessError(PROTOCOL_ERROR_CODES.INVENTORY_STALE),
+        };
+      }
+    }
     if (
       bindingState &&
       (!activityLease.isCurrent() ||
@@ -1351,6 +1575,7 @@ function connectToBot() {
     readinessState.status.connection = "offline";
     readinessState.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.CONNECTION_LOST);
     connections.delete(connection);
+    maybeStopInventoryPoll();
     if (shuttingDown) return;
     retryScheduler.onClose({ deniedForConnection });
   });
@@ -1416,6 +1641,7 @@ async function handleMessage(
     if (readinessState.committed) {
       publishReadiness(readinessState);
       scheduleReadinessPublication(readinessState);
+      if (readinessState.receiptCommitted) ensureInventoryPollStarted();
       void probeReadiness(readinessState);
     } else {
       clearReadinessTimer(readinessState);
@@ -1631,6 +1857,7 @@ function toRpcCommand(command) {
 }
 
 function closeConnections() {
+  stopInventoryPoll();
   for (const connection of connections) {
     const readinessState = readinessByConnection.get(connection);
     clearReadinessTimer(readinessState);
