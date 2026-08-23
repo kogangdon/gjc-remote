@@ -234,6 +234,68 @@ Every verification-matrix evidence layer and non-negotiable gate must close befo
 
 Any missing or failed gate is a hard no-promotion result; interim feature flags are rejected.
 
+## Native workspace inventory - as-built status (fa68941)
+
+This section reconciles this phase contract with the observed AS-BUILT native inventory
+implementation at main HEAD fa68941 (D:/dev/gjc-remote). Every claim below is grounded in
+`artifacts/g017-as-built-reference.md`. It documents implementation status only and does not
+authorize any behavior more permissive than the phase contracts above.
+
+**Serving remains disabled.** The native inventory contract (config modes, five-role bindings, the
+durable D floor, the live invalidation cascade, and the bot receipt binding/observability surface) is
+implemented as capability scaffolding, but native workspace serving itself remains DISABLED: the
+daemon defines `const NATIVE_WORKSPACE_SERVING_ENABLED = false` (daemon/src/daemon.js:199, a const
+literal with no env/config override anywhere in the repo), and its sole read site inside
+`admitReadyWorkload` returns `RUNTIME_INCOMPATIBLE` when off. On the bot side, `host-registry.js`
+defaults the equivalent flag to false and `bot.js` does not override it. A proven verify-mode
+receipt binding is fenced and cryptographically proved but still fails this hard serving gate with
+`RUNTIME_INCOMPATIBLE`.
+
+**Config mode and capability gate.** `GJC_NATIVE_INVENTORY_MODE` is parsed at daemon boot, defaults
+to `off`, and is trimmed/lowercased; any value other than `off` or `verify` causes a fail-closed
+`process.exit(1)`. The `WORKSPACE_INVENTORY_RECEIPT` capability, and protocol version bump to V3, is
+advertised only when mode is `verify` AND `GJC_READINESS_V2` is enabled AND the inventory provider
+reports `receiptCapable === true`.
+
+**Five-role config.** `GJC_INVENTORY_ROLE_BINDINGS` is a strict-JSON payload (<=32KiB) with the
+exact keys `management`, `bot`, `recovery`, `daemon`, `system`. Each principal is `{kind, value}`
+where `kind` is `uid` (Linux, grammar `/^uid:(0|[1-9][0-9]{0,9})$/`, bounded to 2^32-1) or `sid`
+(win32, canonical SID string); other platforms are rejected as `CONFIG_INVALID`. All five values
+must be pairwise distinct, and `system` must be pinned exactly to `uid:0` (Linux) or `S-1-5-18`
+(win32).
+
+**Durable D floor.** The floor is genesis-seeded (only `inventoryGeneration === 1` is accepted with
+no prior floor); an exact replay of the current generation/fingerprint against the prior floor is a
+read-only success; a `+1` monotonic generation advance with a differing fingerprint atomically
+replaces the floor under a fence keyed to the prior floor's identity. Rollback, generation jumps
+greater than one, same-generation fingerprint mismatch, or a missing floor at a generation other than
+1 are all rejected as `INVENTORY_STALE`. Known limitation: a jointly restored, internally consistent
+old inventory+floor pair is accepted via the exact-replay branch (coupled restore is not detected);
+cold rollback is detected only once the inventory is restored below a still-surviving floor. This has
+an availability cost: the management role cannot advance while the D role is offline, until the
+floor catches up.
+
+**Live invalidation cascade.** On invalidation, the daemon guards against re-entrancy, advances the
+provider epoch, clears the cached inventory snapshot, invalidates all workspace leases, then per
+connection synchronously clears the readiness timer and sets `receiptCommitted = false` (the receipt
+fence), invalidates in-flight bind/invoke requests and queues receipt-session disposal, awaits those
+disposals, emits one bounded negative readiness frame, and closes the socket with code 1013. A
+test-only `GJC_INVENTORY_POLL_MS` override on the default 5-second poll interval is honored only
+under test injection.
+
+**Key as-built gap.** `initializeInventoryConfig` (daemon/src/inventory-config.js) is NOT imported by
+daemon boot, so the production daemon never constructs a native inventory reader; the production
+native-reader path is not yet wired. Consequently, verify-mode `WORKSPACE_INVENTORY_RECEIPT`
+advertisement is reachable in production only under `GJC_READINESS_TEST_INJECTION=1` test-injected
+inventory. Daemon-boot native-reader wiring, and native serving itself, are FUTURE work gated behind
+the existing native-serving boundary defined earlier in this document; this section does not bring
+either into scope early.
+
+This is as-built status reconciliation only. It does not authorize native workspace serving, does not
+weaken any Phase 1-4 gate above, and does not make local inventory a route or mapping authority: the
+#44 mapping envelope remains the sole route authority, and local inventory is capability evidence
+only.
+
 ## Issue decomposition
 
 The design issue #43 is complete after ADR 0002 and its contract documents. Implementation is tracked

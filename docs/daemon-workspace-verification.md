@@ -72,3 +72,63 @@ key version, and restart count. Release evidence includes path/secret/control se
 
 Illustrative values such as 60-second readiness maximum and 8/8/64/4 admission are not final
 approvals until their owners close the corresponding gates. TTL alone never authorizes takeover.
+
+## Native inventory verification evidence (as-built)
+
+This section records the observed automated evidence for the native workspace inventory epic
+(G001-G016) on main HEAD `fa68941`. The landed coverage below lives in the in-repo suites
+`daemon/test/`, `native-control/test/`, `bot/test/`, and `shared/test/`; run them with
+`npm test --workspaces` (plus `npm run test:scripts` at the root) and `npm run smoke:local`. It
+supplements, and does not replace, the design-only matrix above.
+
+**Landed automated coverage.**
+
+- Daemon `GJC_NATIVE_INVENTORY_MODE` config parsing and five-role `GJC_INVENTORY_ROLE_BINDINGS`
+  parsing/validation fail closed at boot (invalid mode or config -> `console.error` +
+  `process.exit(1)` / `CONFIG_INVALID`).
+- Durable D floor genesis (generation 1 only, atomic publish), exact replay (0 writes),
+  `+1` fenced advance, and rejection of rollback/jump/same-generation-mismatch/missing-floor
+  cases as `INVENTORY_STALE`.
+- Live invalidation cascade: re-entrancy-guarded epoch bump, lease invalidation, synchronous
+  per-connection receipt fence, in-flight bind/invoke invalidation, exactly one bounded negative
+  readiness frame, and socket close(1013) -- proving no `bind_ok` and no ready frame is emitted
+  under drift.
+- Bot receipt binding lifecycle (`bind.request` / `bind.ok` / `bind.negative` /
+  `receipt.invalidate` / `socket.retire`) across arm, fingerprint match, drift, deadline, and
+  offline transitions.
+- Reconnect churn counter gating: increments only for binding-capable v3 replacements
+  (protocolVersion >= 3 with both `WORKSPACE_READINESS` and `WORKSPACE_INVENTORY_RECEIPT`
+  capabilities); off-mode (v0/v2) replacements keep the counter at 0.
+- Sanitized observability allowlist: emitted fields are limited to `event`, `phase`, `code`,
+  redacted `bindingId`/`workspaceId`, safe integer `generation`, and a 12-character
+  `fingerprintPrefix`; no token, workDir, ACL, or full-fingerprint bytes can pass through the
+  sink.
+
+**Observed green baseline (main HEAD fa68941).**
+
+- Full workspace suite: root 46 / bot 273 / daemon 240 / native-control 135 pass plus 3
+  platform-gated skips / shared 65, with 0 failures.
+- `npm run smoke:local` completes with `SMOKE_OK`.
+- `git diff --check` is clean.
+
+**Native-control skips are legitimate platform gates, not hidden failures.** The 3
+native-control skips correspond to a Windows owned-user fixture and Linux-only POSIX ACL probes
+that require a distinct-principal host and cannot run on a shared CI runner account; they are not
+masking implementation gaps.
+
+**Multi-principal ACL and durable-floor evidence.** Owned distinct-principal Linux and Windows
+fixtures (separate from hosted CI) proved the five-principal M/B/R/D/SYSTEM ACL allow/deny and
+ownership behavior, plus the D durable-floor genesis and `+1` advance behavior, under a
+release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-arm` leg) supplies
+only one effective runner principal and cannot itself prove multi-principal deployment behavior.
+
+**Native workspace serving verification remains N/A.** Native workspace serving is disabled by a
+const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon.js:199), with no env/config
+override anywhere in the repository; the bot side defaults to false as well and is not overridden
+at startup. Separately, the production native-reader path is not yet wired:
+`initializeInventoryConfig` is not imported by daemon boot, so the production daemon never
+constructs a native reader, and verify-mode `WORKSPACE_INVENTORY_RECEIPT` advertisement is
+reachable in production only under `GJC_READINESS_TEST_INJECTION=1` test injection. Both the
+native-serving enablement and the native-reader daemon-boot wiring are future slices; their
+verification belongs to that future reader-wiring / native-serving boundary, not to this epic's
+landed evidence.
