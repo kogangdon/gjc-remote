@@ -163,20 +163,20 @@ remediation is retained. Error taxonomy does not authorize bypassing containment
 
 ## v3 inventory receipt capability (as-built)
 
-This section records the as-built shape of the protocol v3 `WORKSPACE_INVENTORY_RECEIPT`
+This section records the as-built shape of the protocol v3 `workspace_inventory_receipt_v2`
 capability against the current daemon/bot implementation, without altering the contract prose
 above.
 
 Capability advertisement is additive negotiation, not a mixed ABI or compatibility shim: the
 daemon computes `inventoryReceiptAdvertised` only when `GJC_NATIVE_INVENTORY_MODE=verify` AND
 `GJC_READINESS_V2=1` (readinessV2Advertised) AND the configured inventory provider reports
-`receiptCapable===true`. Only when all three hold does the daemon set `DAEMON_PROTOCOL_VERSION` to
-v3 and append `WORKSPACE_INVENTORY_RECEIPT` to its advertised capabilities. `off` mode never
+`receiptCapable === true`. Only when all three hold does the daemon set `DAEMON_PROTOCOL_VERSION` to
+v3 and append `workspace_inventory_receipt_v2` to its advertised capabilities. `off` mode never
 advertises the receipt capability and a daemon in `off` mode advertises at most v2.
 
 The receipt binding lifecycle rides the existing v3 bind frames: the bot sends
-`BIND_WORKSPACE`, arming a 10-second `BINDING_DEADLINE`. A daemon observation that matches host,
-workspace, source platform, and inventory returns `BIND_OK` carrying the positive proof
+`bind_workspace`, arming a 10-second `BINDING_DEADLINE`. A daemon observation that matches host,
+workspace, source platform, and inventory returns `bind_ok` carrying the positive proof
 `{inventoryGeneration, inventoryFingerprint, bindingFingerprint}`. A non-matching or not-yet-ready
 observation yields negative readiness (surfaced by the bot-side `bind.negative` observability
 event) or `INVENTORY_PENDING` instead. A previously bound receipt that drifts, or a binding whose
@@ -191,19 +191,19 @@ Off vs verify behavior matrix, as observed:
   without a bound v3 binding returns `PROTOCOL_INCOMPATIBLE`; a v2 readiness route with native
   serving off returns `RUNTIME_INCOMPATIBLE`.
 - `verify` (plus readinessV2 and a receiptCapable provider): the daemon issues a positive receipt
-  proof and `BIND_OK` as above, but invoking on that proven receipt still returns
+  proof and `bind_ok` as above, but invoking on that proven receipt still returns
   `RUNTIME_INCOMPATIBLE`, because native workspace serving is hard-disabled at the invoke-time
   serving gate independent of receipt state.
 `PROTOCOL_INCOMPATIBLE` and `RUNTIME_INCOMPATIBLE` are both non-retryable, action `contact_admin`,
 consistent with the error taxonomy above.
 
-`BIND_OK` is an acknowledgement and capability receipt only; it is never route authority. #44's
+`bind_ok` is an acknowledgement and capability receipt only; it is never route authority. #44's
 mapping envelope remains the sole route authority for every managed and legacy path described in
 this document; the inventory receipt gates only workspace readiness promotion.
 
 Native workspace serving itself stays disabled in this build (a fixed daemon constant, no
 env/config override), and the production wiring that constructs a real native inventory reader at
-daemon boot has not landed yet. As implemented today, the `WORKSPACE_INVENTORY_RECEIPT` capability
+daemon boot has not landed yet. As implemented today, the `workspace_inventory_receipt_v2` capability
 and its receipt bindings are reachable in production only when the daemon is started under test
 injection (`GJC_READINESS_TEST_INJECTION=1`); this section documents the capability contract as
 implemented scaffolding, not a claim that verify-mode receipts are live in an unmodified production

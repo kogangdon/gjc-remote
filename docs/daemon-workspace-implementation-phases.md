@@ -237,9 +237,10 @@ Any missing or failed gate is a hard no-promotion result; interim feature flags 
 ## Native workspace inventory - as-built status (fa68941)
 
 This section reconciles this phase contract with the observed AS-BUILT native inventory
-implementation at main HEAD fa68941 (D:/dev/gjc-remote). Every claim below is grounded in
-`artifacts/g017-as-built-reference.md`. It documents implementation status only and does not
-authorize any behavior more permissive than the phase contracts above.
+implementation at main HEAD `fa68941`. Every claim below is grounded in the in-repo source
+(`daemon/src/daemon.js`, `daemon/src/inventory-config.js`, `native-control/src/inventory.js`,
+`shared/protocol.js`, `bot/src/host-registry.js`). It documents implementation status only and does
+not authorize any behavior more permissive than the phase contracts above.
 
 **Serving remains disabled.** The native inventory contract (config modes, five-role bindings, the
 durable D floor, the live invalidation cascade, and the bot receipt binding/observability surface) is
@@ -253,7 +254,7 @@ receipt binding is fenced and cryptographically proved but still fails this hard
 
 **Config mode and capability gate.** `GJC_NATIVE_INVENTORY_MODE` is parsed at daemon boot, defaults
 to `off`, and is trimmed/lowercased; any value other than `off` or `verify` causes a fail-closed
-`process.exit(1)`. The `WORKSPACE_INVENTORY_RECEIPT` capability, and protocol version bump to V3, is
+`process.exit(1)`. The `workspace_inventory_receipt_v2` capability, and protocol version bump to V3, is
 advertised only when mode is `verify` AND `GJC_READINESS_V2` is enabled AND the inventory provider
 reports `receiptCapable === true`.
 
@@ -285,7 +286,7 @@ under test injection.
 
 **Key as-built gap.** `initializeInventoryConfig` (daemon/src/inventory-config.js) is NOT imported by
 daemon boot, so the production daemon never constructs a native inventory reader; the production
-native-reader path is not yet wired. Consequently, verify-mode `WORKSPACE_INVENTORY_RECEIPT`
+native-reader path is not yet wired. Consequently, verify-mode `workspace_inventory_receipt_v2`
 advertisement is reachable in production only under `GJC_READINESS_TEST_INJECTION=1` test-injected
 inventory. Daemon-boot native-reader wiring, and native serving itself, are FUTURE work gated behind
 the existing native-serving boundary defined earlier in this document; this section does not bring

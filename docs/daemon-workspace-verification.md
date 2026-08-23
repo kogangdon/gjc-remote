@@ -97,7 +97,7 @@ supplements, and does not replace, the design-only matrix above.
   `receipt.invalidate` / `socket.retire`) across arm, fingerprint match, drift, deadline, and
   offline transitions.
 - Reconnect churn counter gating: increments only for binding-capable v3 replacements
-  (protocolVersion >= 3 with both `WORKSPACE_READINESS` and `WORKSPACE_INVENTORY_RECEIPT`
+  (protocolVersion >= 3 with both `workspace_readiness_v2` and `workspace_inventory_receipt_v2`
   capabilities); off-mode (v0/v2) replacements keep the counter at 0.
 - Sanitized observability allowlist: emitted fields are limited to `event`, `phase`, `code`,
   redacted `bindingId`/`workspaceId`, safe integer `generation`, and a 12-character
@@ -123,11 +123,11 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving verification remains N/A.** Native workspace serving is disabled by a
-const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon.js:199), with no env/config
+const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon/src/daemon.js:199), with no env/config
 override anywhere in the repository; the bot side defaults to false as well and is not overridden
 at startup. Separately, the production native-reader path is not yet wired:
 `initializeInventoryConfig` is not imported by daemon boot, so the production daemon never
-constructs a native reader, and verify-mode `WORKSPACE_INVENTORY_RECEIPT` advertisement is
+constructs a native reader, and verify-mode `workspace_inventory_receipt_v2` advertisement is
 reachable in production only under `GJC_READINESS_TEST_INJECTION=1` test injection. Both the
 native-serving enablement and the native-reader daemon-boot wiring are future slices; their
 verification belongs to that future reader-wiring / native-serving boundary, not to this epic's
