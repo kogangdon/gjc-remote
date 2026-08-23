@@ -505,6 +505,10 @@ async function cascadeInventoryInvalidation(code) {
       const state = readinessByConnection.get(connection);
       if (!state) continue;
       clearReadinessTimer(state);
+      // Fence receipt commits synchronously (before the disposal await) so a
+      // bind resuming mid-cascade fails its currentReceiptBinding() re-check
+      // and never commits a proof/BIND_OK against retired inventory.
+      state.receiptCommitted = false;
       for (const [, bindingState] of state.bindings) {
         invalidateBindingRequests(state, bindingState);
         disposals.push(
