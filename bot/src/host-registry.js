@@ -50,6 +50,14 @@ const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
 const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
 const BINDING_DEADLINE_MS = 10_000;
+// Observability: bounded inventory-lifecycle events for the /hosts and E2E
+// surfaces. Only these names are allowed, and every field is passed through a
+// strict allowlist so tokens, workDir, raw identities, ACLs, and inventory
+// bytes can never leak. Fingerprints are truncated to a short prefix.
+const OBSERVABILITY_EVENTS = Object.freeze(
+  new Set(["bind.request", "bind.ok", "bind.negative", "receipt.invalidate", "socket.retire"])
+);
+const OBSERVABILITY_FINGERPRINT_PREFIX_LENGTH = 12;
 const PING_PAYLOAD = JSON.stringify(PING);
 const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
 const V3_CAPABILITIES = Object.freeze([
@@ -157,6 +165,7 @@ export class HostRegistry {
    *   now?: () => number,
    *   monotonicNow?: () => number,
    *   onError?: (error: unknown) => void,
+   *   onObservabilityEvent?: (event: object) => void,
    * }} opts
    */
   constructor({
@@ -174,6 +183,7 @@ export class HostRegistry {
         ? performance.now()
         : Number(process.hrtime.bigint()) / 1e6,
     onError,
+    onObservabilityEvent,
   }) {
     if (!isPositiveDuration(heartbeatIntervalMs)) {
       throw new Error("heartbeatIntervalMs must be a positive duration");
@@ -220,6 +230,10 @@ export class HostRegistry {
     this.wss = new WebSocketServer({ port, maxPayload: MAX_WS_PAYLOAD_BYTES });
     this.wss.on("connection", (socket) => this.#handleConnection(socket));
     this.onError = onError;
+    this.onObservabilityEvent =
+      typeof onObservabilityEvent === "function" ? onObservabilityEvent : undefined;
+    /** @type {Map<string, number>} Socket replacements observed per host; stays 0 in off mode. */
+    this.reconnectCounts = new Map();
     this.wss.on("error", (error) => {
       if (typeof this.onError === "function") this.onError(error);
       else console.error(`HostRegistry: WS server error: ${error?.message ?? String(error)}`);
@@ -257,18 +271,27 @@ export class HostRegistry {
       }
 
       hostId = msg.hostId;
-      const previous = this.connections.get(hostId);
-      if (previous && previous !== socket) {
-        this.#dropConnection(hostId, previous, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
-        previous.terminate();
-      }
-      this.connections.set(hostId, socket);
-      this.heartbeatStates.set(socket, { hostId });
       const wantsInventoryReceipt =
         (msg.protocolVersion ?? 0) >= PROTOCOL_VERSION_V3 &&
         Array.isArray(msg.capabilities) &&
         msg.capabilities.includes(WORKSPACE_READINESS_CAPABILITY) &&
         msg.capabilities.includes(WORKSPACE_INVENTORY_RECEIPT_CAPABILITY);
+      const previous = this.connections.get(hostId);
+      if (previous && previous !== socket) {
+        // Only binding-capable (v3) registrations count as reconnect churn;
+        // off-mode (v0/v2) socket replacements leave the counter at rest.
+        if (wantsInventoryReceipt) {
+          this.reconnectCounts.set(hostId, (this.reconnectCounts.get(hostId) ?? 0) + 1);
+        } else if (!this.reconnectCounts.has(hostId)) {
+          this.reconnectCounts.set(hostId, 0);
+        }
+        this.#dropConnection(hostId, previous, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
+        previous.terminate();
+      } else if (!this.reconnectCounts.has(hostId)) {
+        this.reconnectCounts.set(hostId, 0);
+      }
+      this.connections.set(hostId, socket);
+      this.heartbeatStates.set(socket, { hostId });
       const wantsReadiness =
         !wantsInventoryReceipt &&
         (msg.protocolVersion ?? 0) >= PROTOCOL_VERSION_V2 &&
@@ -493,10 +516,52 @@ export class HostRegistry {
       : undefined;
   }
 
+  /**
+   * Emits a bounded inventory-lifecycle event to the optional observer. Only
+   * allowlisted, sanitized fields are forwarded: identities are redacted with
+   * the same grammar as /hosts projections and fingerprints are truncated to a
+   * short prefix, so tokens, workDir, raw identities, ACLs, and inventory bytes
+   * can never leak. Observer failures never disrupt the registry.
+   */
+  #emitObservability(event, fields = {}) {
+    const sink = this.onObservabilityEvent;
+    if (typeof sink !== "function" || !OBSERVABILITY_EVENTS.has(event)) return;
+    const payload = { event };
+    if (typeof fields.phase === "string") payload.phase = fields.phase;
+    if (typeof fields.code === "string") payload.code = fields.code;
+    if (typeof fields.bindingId === "string") {
+      payload.bindingId = redactOpaqueId(fields.bindingId);
+    }
+    if (typeof fields.workspaceId === "string") {
+      payload.workspaceId = redactOpaqueId(fields.workspaceId);
+    }
+    if (Number.isSafeInteger(fields.generation)) payload.generation = fields.generation;
+    if (typeof fields.fingerprint === "string" && fields.fingerprint.length > 0) {
+      payload.fingerprintPrefix = fields.fingerprint.slice(
+        0,
+        OBSERVABILITY_FINGERPRINT_PREFIX_LENGTH
+      );
+    }
+    try {
+      sink(Object.freeze(payload));
+    } catch {
+      // Observers must never disrupt host bookkeeping.
+    }
+  }
+
   #armBindingDeadline(socket, binding) {
     const deadline = this.timers.setTimeout(() => {
       if (binding.deadline === deadline) {
         binding.deadline = undefined;
+        this.#emitObservability("socket.retire", {
+          phase: "deadline",
+          code: "BINDING_DEADLINE",
+          bindingId: binding.bindingId,
+        });
+        // The ensuing close would otherwise emit a second, offline-phase
+        // socket.retire for the same physical retirement; suppress it.
+        const state = this.#bindingState(socket);
+        if (state) state.socketRetired = true;
         socket.terminate();
       }
     }, this.bindingDeadlineMs);
@@ -545,6 +610,13 @@ export class HostRegistry {
         inventoryFingerprint: msg.inventoryFingerprint,
         bindingFingerprint: msg.bindingFingerprint,
       });
+      this.#emitObservability("bind.ok", {
+        phase: "bound",
+        bindingId: binding.bindingId,
+        workspaceId: binding.authority?.workspaceId,
+        generation: msg.inventoryGeneration,
+        fingerprint: msg.inventoryFingerprint,
+      });
       return true;
     }
     if (!isUnbindOkMessage(msg)) return false;
@@ -559,6 +631,7 @@ export class HostRegistry {
 
   #unbindBinding(state, binding) {
     if (binding.status === "unbinding" || binding.status === "tombstone") return;
+    const hadReceipt = binding.status === "bound" && binding.receipt !== undefined;
     binding.status = "unbinding";
     binding.receipt = undefined;
     binding.readiness = undefined;
@@ -570,6 +643,14 @@ export class HostRegistry {
       type: MSG_TYPES.UNBIND_WORKSPACE,
       bindingId: binding.bindingId,
     }));
+    if (hadReceipt) {
+      this.#emitObservability("receipt.invalidate", {
+        phase: "unbind",
+        code: "WORKSPACE_UNBOUND",
+        bindingId: binding.bindingId,
+        workspaceId: binding.authority?.workspaceId,
+      });
+    }
   }
 
   #receiptMatchesReadiness(receipt, readiness) {
@@ -608,11 +689,28 @@ export class HostRegistry {
     if (msg.lastError !== undefined) {
       const pending =
         msg.lastError.code === PROTOCOL_ERROR_CODES.INVENTORY_PENDING;
+      const hadReceipt = binding.status === "bound" && binding.receipt !== undefined;
       if (!pending) this.#clearBindingDeadline(binding);
       binding.status = pending ? "pending" : "negative";
       binding.receipt = undefined;
       binding.readiness = Object.freeze({ ...msg });
       binding.heldReadiness = undefined;
+      if (hadReceipt) {
+        this.#emitObservability("receipt.invalidate", {
+          phase: "drift",
+          code: msg.lastError.code,
+          bindingId: binding.bindingId,
+          workspaceId: binding.authority?.workspaceId,
+        });
+      }
+      if (!pending) {
+        this.#emitObservability("bind.negative", {
+          phase: "negative",
+          code: msg.lastError.code,
+          bindingId: binding.bindingId,
+          workspaceId: binding.authority?.workspaceId,
+        });
+      }
       return true;
     }
     if (binding.status === "binding" || binding.status === "pending") {
@@ -663,6 +761,12 @@ export class HostRegistry {
         bindingId: binding.bindingId,
         ...binding.authority,
       }));
+      this.#emitObservability("bind.request", {
+        phase: "request",
+        bindingId: binding.bindingId,
+        workspaceId: binding.authority?.workspaceId,
+        generation: binding.authority?.workspaceGeneration,
+      });
     }
   }
 
@@ -1086,6 +1190,7 @@ export class HostRegistry {
       lastErrorAt: state.lastErrorAt ?? null,
       revision: state.revision,
       socketGeneration: state.socketGeneration ?? null,
+      reconnectCount: this.reconnectCounts.get(hostId) ?? 0,
     };
     if (state.readinessEnabled) {
       projection.dimensions = { ...this.#effectiveDimensions(state) };
@@ -1266,9 +1371,23 @@ export class HostRegistry {
     state.workspaceMonoExpiresAt = undefined;
     for (const binding of state.bindingsById?.values() ?? []) {
       this.#clearBindingDeadline(binding);
+      if (binding.status === "bound" && binding.receipt !== undefined) {
+        this.#emitObservability("receipt.invalidate", {
+          phase: "offline",
+          code: "CONNECTION_LOST",
+          bindingId: binding.bindingId,
+          workspaceId: binding.authority?.workspaceId,
+        });
+      }
     }
     state.bindingsById?.clear();
     state.bindingsByDescriptor?.clear();
+    if (state.bindingEnabled && !state.socketRetired) {
+      this.#emitObservability("socket.retire", {
+        phase: "offline",
+        code: "CONNECTION_LOST",
+      });
+    }
     state.connected = false;
     state.hostDimensions = { ...state.hostDimensions, connection: "offline" };
     if (state.workspaceDimensions) {
@@ -1400,6 +1519,7 @@ export class HostRegistry {
       }
     }
     this.readinessStates.clear();
+    this.reconnectCounts.clear();
     for (const authority of this.readinessAuthorities.values()) {
       if (authority.retirementTimer) {
         this.timers.clearTimeout(authority.retirementTimer);
