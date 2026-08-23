@@ -54,9 +54,13 @@ const BINDING_DEADLINE_MS = 10_000;
 // surfaces. Only these names are allowed, and every field is passed through a
 // strict allowlist so tokens, workDir, raw identities, ACLs, and inventory
 // bytes can never leak. Fingerprints are truncated to a short prefix.
-const OBSERVABILITY_EVENTS = Object.freeze(
-  new Set(["bind.request", "bind.ok", "bind.negative", "receipt.invalidate", "socket.retire"])
-);
+const OBSERVABILITY_EVENTS = Object.freeze([
+  "bind.request",
+  "bind.ok",
+  "bind.negative",
+  "receipt.invalidate",
+  "socket.retire",
+]);
 const OBSERVABILITY_FINGERPRINT_PREFIX_LENGTH = 12;
 const PING_PAYLOAD = JSON.stringify(PING);
 const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
@@ -525,7 +529,7 @@ export class HostRegistry {
    */
   #emitObservability(event, fields = {}) {
     const sink = this.onObservabilityEvent;
-    if (typeof sink !== "function" || !OBSERVABILITY_EVENTS.has(event)) return;
+    if (typeof sink !== "function" || !OBSERVABILITY_EVENTS.includes(event)) return;
     const payload = { event };
     if (typeof fields.phase === "string") payload.phase = fields.phase;
     if (typeof fields.code === "string") payload.code = fields.code;
