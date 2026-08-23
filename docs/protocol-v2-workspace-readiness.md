@@ -175,7 +175,8 @@ v3 and append `workspace_inventory_receipt_v2` to its advertised capabilities. `
 advertises the receipt capability and a daemon in `off` mode advertises at most v2.
 
 The receipt binding lifecycle rides the existing v3 bind frames: the bot sends
-`bind_workspace`, arming a 10-second `BINDING_DEADLINE`. A daemon observation that matches host,
+`bind_workspace`, arming a 10-second binding deadline (the `BINDING_DEADLINE_MS` timer;
+retirement on expiry emits the string code `BINDING_DEADLINE`). A daemon observation that matches host,
 workspace, source platform, and inventory returns `bind_ok` carrying the positive proof
 `{inventoryGeneration, inventoryFingerprint, bindingFingerprint}`. A non-matching or not-yet-ready
 observation yields negative readiness (surfaced by the bot-side `bind.negative` observability
@@ -183,7 +184,8 @@ event) or `INVENTORY_PENDING` instead. A previously bound receipt that drifts, o
 host disconnects, is invalidated (surfaced by the bot-side `receipt.invalidate` observability
 event, phase `drift` or `offline`) rather than silently kept alive. Every issued
 receipt is subject to the shared `INVENTORY_RECEIPT_TTL_MS` of 10000ms; the bot enforces this TTL
-per binding against its own monotonic clock, independent of the 10-second `BINDING_DEADLINE` that
+per binding against its own monotonic clock, independent of the 10-second binding deadline
+(`BINDING_DEADLINE_MS`) that
 bounds the bind round-trip itself.
 
 Off vs verify behavior matrix, as observed:
