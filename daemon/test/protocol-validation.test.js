@@ -669,6 +669,59 @@ test("live inventory epoch drift retires the receipt socket without creating a s
   }
 });
 
+test("stable inventory keeps a positive receipt binding alive across poll ticks", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_INVENTORY_POLL_MS: "40",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    let closedCode;
+    daemon.peer.on("close", (code) => {
+      closedCode = code;
+    });
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const bindOk = onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    daemon.peer.send(JSON.stringify(receiptBinding));
+    const positive = await bindOk;
+    // The binding proved against the stable inventory and went positive.
+    assert.ok(positive.bindingFingerprint);
+    // Across many poll ticks a stable read must never falsely cascade: the
+    // proof-based drift check keeps matching, so no negative frame is emitted
+    // and the socket is never retired.
+    const negativeFrame = waitForMessage(
+      daemon.peer,
+      (f) =>
+        f.type === MSG_TYPES.READINESS &&
+        f.bindingId === receiptBinding.bindingId &&
+        f.lastError?.code === PROTOCOL_ERROR_CODES.INVENTORY_STALE
+    );
+    const settled = await Promise.race([
+      negativeFrame.then(() => "cascaded"),
+      new Promise((resolve) => setTimeout(() => resolve("stable"), 300)),
+    ]);
+    assert.equal(settled, "stable");
+    assert.equal(closedCode, undefined);
+  } finally {
+    await daemon.close();
+  }
+});
+
 test("native inventory off mode withholds v3 receipt capability", async () => {
   const inventory = serializedTestInventory({
     inventoryGeneration: 4,

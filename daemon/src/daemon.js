@@ -395,6 +395,22 @@ function hasActiveReceiptBindings() {
   return false;
 }
 
+// Every committed positive receipt binding proved against a specific inventory
+// generation/fingerprint. The poll re-verifies the live read against these
+// authoritative proofs so drift that landed before the poll's own baseline was
+// taken (e.g. between a positive bind and the first tick) is still caught.
+function collectCommittedReceiptProofs() {
+  const proofs = [];
+  for (const connection of connections) {
+    const state = readinessByConnection.get(connection);
+    if (!state?.committed || !state.receiptCommitted) continue;
+    for (const [, bindingState] of state.bindings) {
+      if (bindingState.proof) proofs.push(bindingState.proof);
+    }
+  }
+  return proofs;
+}
+
 function ensureInventoryPollStarted() {
   if (!inventoryReceiptAdvertised || inventoryPollTimer || shuttingDown) return;
   inventoryPollTimer = setInterval(() => {
@@ -440,6 +456,18 @@ async function runInventoryPoll() {
         receiptInventoryError(read) ?? PROTOCOL_ERROR_CODES.INVENTORY_STALE
       );
       return;
+    }
+    // Authoritative drift: the live read must still match every committed
+    // positive binding's proof. This closes the window where drift occurs
+    // between a positive bind and the poll's first baseline tick.
+    for (const proof of collectCommittedReceiptProofs()) {
+      if (
+        read.inventory.inventoryGeneration !== proof.inventoryGeneration ||
+        read.inventory.inventoryFingerprint !== proof.inventoryFingerprint
+      ) {
+        await cascadeInventoryInvalidation(PROTOCOL_ERROR_CODES.INVENTORY_STALE);
+        return;
+      }
     }
     const fingerprint = {
       epoch: read.epoch,
@@ -970,6 +998,17 @@ async function acceptReceiptBinding(state, message) {
     proof = undefined;
   }
   if (proof) {
+    // Seed the poll baseline from the read this binding proved against so the
+    // very first poll tick compares the live read against the proven state
+    // rather than against a self-referential re-read.
+    if (!inventorySnapshot) {
+      inventorySnapshot = {
+        epoch: first.epoch,
+        inventoryGeneration: proof.inventoryGeneration,
+        inventoryFingerprint: proof.inventoryFingerprint,
+        verifiedAt: Date.now(),
+      };
+    }
     connectionSendBindOk(state.connection, message.bindingId, proof);
     // Receipt bindings always expose the pre-probe observation, even when a
     // probe completed between registration and bind delivery.
