@@ -343,6 +343,14 @@ const readinessByConnection = new WeakMap();
 const INVENTORY_SNAPSHOT_TTL_MS = Math.min(10_000, INVENTORY_RECEIPT_TTL_MS);
 const INVENTORY_POLL_DEFAULT_MS = 5_000;
 
+// Snapshot-age comparisons use a monotonic clock so a forward wall-clock jump
+// (NTP step, host suspend/resume) larger than the TTL cannot spuriously age a
+// still-fresh verified snapshot and trigger an unnecessary cascade. The stamp
+// and the age comparison MUST share this source to stay coherent.
+function monotonicNowMs() {
+  return performance.now();
+}
+
 function parseInventoryPollMs(value) {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 60_000) {
@@ -439,7 +447,7 @@ async function runInventoryPoll() {
   }
   inventoryPollInFlight = true;
   try {
-    const now = Date.now();
+    const now = monotonicNowMs();
     if (inventorySnapshot && now - inventorySnapshot.verifiedAt > INVENTORY_SNAPSHOT_TTL_MS) {
       await cascadeInventoryInvalidation(PROTOCOL_ERROR_CODES.INVENTORY_STALE);
       return;
@@ -483,7 +491,7 @@ async function runInventoryPoll() {
       await cascadeInventoryInvalidation(PROTOCOL_ERROR_CODES.INVENTORY_STALE);
       return;
     }
-    inventorySnapshot = { ...fingerprint, verifiedAt: Date.now() };
+    inventorySnapshot = { ...fingerprint, verifiedAt: monotonicNowMs() };
   } finally {
     inventoryPollInFlight = false;
   }
@@ -1010,7 +1018,7 @@ async function acceptReceiptBinding(state, message) {
         epoch: first.epoch,
         inventoryGeneration: proof.inventoryGeneration,
         inventoryFingerprint: proof.inventoryFingerprint,
-        verifiedAt: Date.now(),
+        verifiedAt: monotonicNowMs(),
       };
     }
     connectionSendBindOk(state.connection, message.bindingId, proof);
