@@ -4,6 +4,10 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
+  WORKSPACE_READINESS_CAPABILITY,
+  WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+} from "@gjc-remote/shared";
+import {
   buildWorkspaceInventory,
   workspaceInventoryBytes,
 } from "@gjc-remote/shared/workspace-inventory";
@@ -660,6 +664,77 @@ test("failed current-run readiness probes stay non-ready and expose only bounded
     assert.equal(failed.status.workspace, "unknown");
     assert.equal(JSON.stringify(failed).includes(secret), false);
     assert.equal(JSON.stringify(failed).includes("private"), false);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+const RECEIPT_HOST = "readiness-test-host";
+const RECEIPT_INVENTORY = workspaceInventoryBytes(buildWorkspaceInventory({
+  hostId: RECEIPT_HOST,
+  inventoryGeneration: 4,
+  workspaces: [{
+    hostId: RECEIPT_HOST,
+    workspaceId: "workspace-test",
+    sourcePlatform: "windows-drive",
+    workDir: "C:\\workspace",
+    rootIdentityFingerprint: "1".repeat(64),
+    storageIdentityFingerprint: "2".repeat(64),
+  }],
+})).toString("utf8");
+const RECEIPT_BIND = {
+  type: "bind_workspace",
+  bindingId: "receipt-binding-1",
+  authorityEpoch: 1,
+  fenceGeneration: 1,
+  hostId: RECEIPT_HOST,
+  mappingId: "mapping-test",
+  mappingGeneration: 1,
+  mappingVersion: 1,
+  workspaceId: "workspace-test",
+  workspaceGeneration: 1,
+  sourcePlatform: "windows-drive",
+  authorityFingerprint: "b".repeat(64),
+};
+
+test("live inventory drift drains receipt bindings and retires the socket without a stale ready", async () => {
+  let bound = false;
+  const daemon = await startReadinessDaemon({
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    },
+    envOverrides: {
+      GJC_NATIVE_INVENTORY_MODE: "verify",
+      GJC_WORKSPACE_INVENTORY: RECEIPT_INVENTORY,
+      GJC_WORKSPACE_INVENTORY_TEST_EPOCH_MISMATCH: "1",
+      GJC_INVENTORY_POLL_MS: "40",
+    },
+    onMessage(message, socket) {
+      if (message.type === "readiness" && !bound) {
+        bound = true;
+        socket.send(JSON.stringify(RECEIPT_BIND));
+      }
+    },
+  });
+  try {
+    // The atomic cascade retires the socket once the background poll observes
+    // provider epoch drift under the live receipt binding.
+    await waitForLength(daemon.sockets, 1, "daemon websocket connection");
+    await once(daemon.sockets[0], "close");
+    // Serving is hard-false: the binding never promoted, so no positive
+    // receipt, no ready workspace frame, and no session was ever created.
+    assert.equal(daemon.frames.some((f) => f.type === "bind_ok"), false);
+    assert.equal(
+      daemon.frames.some(
+        (f) => f.type === "readiness" && f.status?.workspace === "ready"
+      ),
+      false
+    );
   } finally {
     await daemon.stop();
   }

@@ -46,6 +46,7 @@ import {
 import { WebSocket, WebSocketServer } from "ws";
 import { findWorkspaceInventory, parseWorkspaceInventory } from "../src/workspace-inventory.js";
 import { invalidateBindingRequests } from "../src/binding-fence.js";
+import { WorkspaceLeaseRegistry } from "../src/workspace-lease-registry.js";
 
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const CHILD_EXIT_TIMEOUT_MS = 2_000;
@@ -581,6 +582,176 @@ test("v3 receipt refuses provider epoch drift without acknowledging", async () =
     assert.equal(frame.lastError?.code, PROTOCOL_ERROR_CODES.INVENTORY_PENDING);
     assert.equal(Object.hasOwn(frame, "bindingFingerprint"), false);
     assert.equal(Object.hasOwn(frame, "inventoryFingerprint"), false);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("live cascade bulk-invalidates the workspace lease registry", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  const candidate = {
+    authorityEpoch: 1,
+    fenceGeneration: 1,
+    hostId: "test-host",
+    mappingId: "mapping-1",
+    mappingGeneration: 2,
+    mappingVersion: 1,
+    workspaceId: "workspace-1",
+    workspaceGeneration: 3,
+    sourcePlatform: "posix",
+    authorityFingerprint: "b".repeat(64),
+    inventoryGeneration: 4,
+    inventoryFingerprint: "c".repeat(64),
+    socketGeneration: 1,
+    bindingId: "receipt-binding-1",
+    bindingFingerprint: "d".repeat(64),
+  };
+  assert.equal(registry.adoptBinding(candidate), true);
+  const lease = registry.acquireActivity(candidate);
+  assert.equal(lease.isCurrent(), true);
+
+  const invalidated = registry.invalidateAll();
+  assert.deepEqual([...invalidated], ["workspace-1"]);
+  // A held lease immediately reports non-current after a cascade.
+  assert.equal(lease.isCurrent(), false);
+  // Authorities are cleared, so a fresh acquire fails closed until a new adopt.
+  assert.throws(
+    () => registry.acquireActivity(candidate),
+    (error) => error.code === PROTOCOL_ERROR_CODES.LEASE_CONFLICT
+  );
+  assert.equal(registry.snapshot().length, 0);
+  // Releasing the stale holder is safe and drops the invalidated activity.
+  lease.release();
+  assert.equal(registry.snapshot().length, 0);
+});
+
+test("live cascade reports adopted authorities with no active activity holder", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  const candidate = {
+    authorityEpoch: 1,
+    fenceGeneration: 1,
+    hostId: "test-host",
+    mappingId: "mapping-1",
+    mappingGeneration: 2,
+    mappingVersion: 1,
+    workspaceId: "workspace-authority-only",
+    workspaceGeneration: 3,
+    sourcePlatform: "posix",
+    authorityFingerprint: "b".repeat(64),
+    inventoryGeneration: 4,
+    inventoryFingerprint: "c".repeat(64),
+    socketGeneration: 1,
+    bindingId: "receipt-binding-authority-only",
+    bindingFingerprint: "d".repeat(64),
+  };
+  // Adopt an authority but never acquire an activity: the workspace has an
+  // authority and no activity holder.
+  assert.equal(registry.adoptBinding(candidate), true);
+
+  const invalidated = registry.invalidateAll();
+  // The returned set must include the authority-only workspace even though it
+  // never appeared in the activities map.
+  assert.deepEqual([...invalidated], ["workspace-authority-only"]);
+  assert.equal(registry.snapshot().length, 0);
+  // Authority cleared: a fresh acquire fails closed until a new adopt.
+  assert.throws(
+    () => registry.acquireActivity(candidate),
+    (error) => error.code === PROTOCOL_ERROR_CODES.LEASE_CONFLICT
+  );
+});
+
+test("live inventory epoch drift retires the receipt socket without creating a session", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY_TEST_EPOCH_MISMATCH: "1",
+    GJC_INVENTORY_POLL_MS: "40",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    const frames = [];
+    daemon.peer.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify(receiptBinding));
+    const [code] = await closed;
+    // The atomic cascade retires the socket with the dedicated close code.
+    assert.equal(code, 1013);
+    // Serving is hard-false: no positive receipt, no ready frame, no session.
+    assert.equal(frames.some((f) => f.type === MSG_TYPES.BIND_OK), false);
+    assert.equal(
+      frames.some(
+        (f) => f.type === MSG_TYPES.READINESS && f.status?.workspace === "ready"
+      ),
+      false
+    );
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("stable inventory keeps a positive receipt binding alive across poll ticks", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_INVENTORY_POLL_MS: "40",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    let closedCode;
+    daemon.peer.on("close", (code) => {
+      closedCode = code;
+    });
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    const bindOk = onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
+    daemon.peer.send(JSON.stringify(receiptBinding));
+    const positive = await bindOk;
+    // The binding proved against the stable inventory and went positive.
+    assert.ok(positive.bindingFingerprint);
+    // Across many poll ticks a stable read must never falsely cascade: the
+    // proof-based drift check keeps matching, so no negative frame is emitted
+    // and the socket is never retired.
+    const negativeFrame = waitForMessage(
+      daemon.peer,
+      (f) =>
+        f.type === MSG_TYPES.READINESS &&
+        f.bindingId === receiptBinding.bindingId &&
+        f.lastError?.code === PROTOCOL_ERROR_CODES.INVENTORY_STALE
+    );
+    const settled = await Promise.race([
+      negativeFrame.then(() => "cascaded"),
+      new Promise((resolve) => setTimeout(() => resolve("stable"), 300)),
+    ]);
+    assert.equal(settled, "stable");
+    assert.equal(closedCode, undefined);
   } finally {
     await daemon.close();
   }

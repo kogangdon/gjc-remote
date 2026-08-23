@@ -157,6 +157,33 @@ export class WorkspaceLeaseRegistry {
     return true;
   }
 
+  /**
+   * Bulk-invalidate every managed authority and activity.
+   *
+   * Used by the live-inventory cascade: once the durable inventory snapshot the
+   * daemon proved against has drifted, expired, or become unreadable, no prior
+   * authority or in-flight activity may remain current. Clearing authorities
+   * fails every subsequent adopt/acquire closed until a fresh bind re-proves
+   * against the new snapshot, and marking live activities invalidated forces
+   * every held lease's isCurrent() to report false. Returns the workspaceIds
+   * that were invalidated.
+   */
+  invalidateAll() {
+    const invalidatedIds = new Set();
+    for (const [workspaceId, activity] of this.activities) {
+      activity.invalidated = true;
+      invalidatedIds.add(workspaceId);
+      if (activity.holders === 0) this.activities.delete(workspaceId);
+    }
+    // Adopted authorities with no active activity holder are still cleared
+    // below, so they belong in the returned set to keep the contract honest.
+    for (const workspaceId of this.authorities.keys()) {
+      invalidatedIds.add(workspaceId);
+    }
+    this.authorities.clear();
+    return Object.freeze([...invalidatedIds]);
+  }
+
   retireBinding(candidate) {
     const authority = requireAuthority(candidate);
     const current = this.authorities.get(authority.workspaceId);
