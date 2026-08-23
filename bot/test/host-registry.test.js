@@ -2290,6 +2290,7 @@ test("register handshake negotiates protocol version and shared capabilities", a
       lastErrorAt: null,
       revision: 0,
       socketGeneration: null,
+      reconnectCount: 0,
     });
 
     const closed = once(socket, "close");
@@ -2325,6 +2326,7 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
       lastErrorAt: null,
       revision: 0,
       socketGeneration: null,
+      reconnectCount: 0,
     });
   } finally {
     socket.terminate();
@@ -2740,6 +2742,7 @@ test("phase 1 accepts bounded readiness, keeps ping/pong from refreshing TTL, an
       lastErrorAt: null,
       revision: 0,
       socketGeneration: null,
+      reconnectCount: 0,
     });
     replacement.socket.terminate();
   } finally {
@@ -3729,6 +3732,355 @@ test("bind deadline terminates a v3 socket that remains pending", async () => {
     const closed = once(connection.socket, "close");
     timers.runTimeoutByDelay(10_000);
     await closed;
+  } finally {
+    await server.close();
+  }
+});
+
+test("inventory bind lifecycle emits sanitized, path/native-fact-free observability events", async () => {
+  const events = [];
+  const server = await startRegistry(undefined, {
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    await waitFor(() => events.some((e) => e.event === "bind.request"));
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "d".repeat(64);
+    const bindingFingerprint = workspaceBindingFingerprint({
+      authority: route.authority,
+      inventoryGeneration,
+      inventoryFingerprint,
+    });
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    }));
+    await waitFor(() => events.some((e) => e.event === "bind.ok"));
+
+    const bindRequest = events.find((e) => e.event === "bind.request");
+    assert.equal(bindRequest.phase, "request");
+    assert.equal(bindRequest.workspaceId, "workspace-a");
+    assert.equal(bindRequest.generation, 1);
+    assert.ok(
+      typeof bindRequest.bindingId === "string" && bindRequest.bindingId.length > 0
+    );
+
+    const bindOk = events.find((e) => e.event === "bind.ok");
+    assert.equal(bindOk.generation, inventoryGeneration);
+    assert.equal(bindOk.fingerprintPrefix, inventoryFingerprint.slice(0, 12));
+    assert.equal(bindOk.fingerprintPrefix.length, 12);
+
+    // Sentinel: only the bounded allowlist ever appears, and no full fingerprint,
+    // token, workDir, or inventory bytes leak into any event.
+    const allowedKeys = new Set([
+      "event",
+      "phase",
+      "code",
+      "bindingId",
+      "workspaceId",
+      "generation",
+      "fingerprintPrefix",
+    ]);
+    const allowedEvents = new Set([
+      "bind.request",
+      "bind.ok",
+      "bind.negative",
+      "receipt.invalidate",
+      "socket.retire",
+    ]);
+    const serialized = JSON.stringify(events);
+    assert.ok(!serialized.includes(inventoryFingerprint), "full fingerprint never leaks");
+    assert.ok(!serialized.includes("token-a"), "token never leaks");
+    for (const event of events) {
+      assert.ok(allowedEvents.has(event.event), `unexpected event ${event.event}`);
+      for (const key of Object.keys(event)) {
+        assert.ok(allowedKeys.has(key), `unexpected observability key ${key}`);
+      }
+    }
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("connection loss invalidates inventory receipts and retires the v3 socket", async () => {
+  const events = [];
+  const server = await startRegistry(undefined, {
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "e".repeat(64);
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint: workspaceBindingFingerprint({
+        authority: route.authority,
+        inventoryGeneration,
+        inventoryFingerprint,
+      }),
+    }));
+    await waitFor(() => events.some((e) => e.event === "bind.ok"));
+
+    connection.socket.terminate();
+    await waitFor(() =>
+      events.some((e) => e.event === "receipt.invalidate" && e.phase === "offline")
+    );
+    await waitFor(() =>
+      events.some((e) => e.event === "socket.retire" && e.phase === "offline")
+    );
+
+    const invalidate = events.find(
+      (e) => e.event === "receipt.invalidate" && e.phase === "offline"
+    );
+    assert.equal(invalidate.code, "CONNECTION_LOST");
+    assert.ok(typeof invalidate.bindingId === "string" && invalidate.bindingId.length > 0);
+    const retire = events.find(
+      (e) => e.event === "socket.retire" && e.phase === "offline"
+    );
+    assert.equal(retire.code, "CONNECTION_LOST");
+  } finally {
+    await server.close();
+  }
+});
+
+test("a negative inventory readiness emits a bind.negative observability event", async () => {
+  const events = [];
+  const server = await startRegistry(undefined, {
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    connection.socket.send(JSON.stringify(readinessFrame({
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "WORKSPACE_NOT_FOUND",
+        at: Date.now(),
+        remediation: {
+          code: "WORKSPACE_NOT_FOUND",
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      },
+    })));
+    await waitFor(() => events.some((e) => e.event === "bind.negative"));
+    const negative = events.find((e) => e.event === "bind.negative");
+    assert.equal(negative.code, "WORKSPACE_NOT_FOUND");
+    assert.equal(negative.phase, "negative");
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("off-mode managed routes stay incompatible with zero binds and zero reconnect churn", async () => {
+  const events = [];
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const { socket } = await connectV2(server); // receipt capability withheld (off mode)
+    assert.deepEqual(server.registry.getManagedRouteBinding("channel-a"), {
+      compatible: false,
+    });
+    assert.equal(timers.timeoutCount, 0, "no bind deadline timers armed in off mode");
+    assert.equal(server.registry.getHostReadiness("host-a").reconnectCount, 0);
+    assert.ok(
+      !events.some((e) => e.event.startsWith("bind.")),
+      "no bind traffic emitted in off mode"
+    );
+    socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("a bound binding drifting negative emits a drift-phase receipt.invalidate", async () => {
+  const events = [];
+  const server = await startRegistry(undefined, {
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "f".repeat(64);
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint: workspaceBindingFingerprint({
+        authority: route.authority,
+        inventoryGeneration,
+        inventoryFingerprint,
+      }),
+    }));
+    await waitFor(() => events.some((e) => e.event === "bind.ok"));
+    connection.socket.send(JSON.stringify(readinessFrame({
+      revision: 2,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "WORKSPACE_NOT_FOUND",
+        at: Date.now(),
+        remediation: {
+          code: "WORKSPACE_NOT_FOUND",
+          retryable: false,
+          action: "refresh_workspace",
+        },
+      },
+    })));
+    await waitFor(() =>
+      events.some((e) => e.event === "receipt.invalidate" && e.phase === "drift")
+    );
+    const drift = events.find(
+      (e) => e.event === "receipt.invalidate" && e.phase === "drift"
+    );
+    assert.equal(drift.code, "WORKSPACE_NOT_FOUND");
+    assert.ok(typeof drift.bindingId === "string" && drift.bindingId.length > 0);
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("unbinding a bound managed route emits an unbind-phase receipt.invalidate", async () => {
+  const events = [];
+  const server = await startRegistry(undefined, {
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "a".repeat(64);
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint: workspaceBindingFingerprint({
+        authority: route.authority,
+        inventoryGeneration,
+        inventoryFingerprint,
+      }),
+    }));
+    await waitFor(() => events.some((e) => e.event === "bind.ok"));
+    server.registry.setManagedRoutes({});
+    await waitFor(() =>
+      events.some((e) => e.event === "receipt.invalidate" && e.phase === "unbind")
+    );
+    const unbind = events.find(
+      (e) => e.event === "receipt.invalidate" && e.phase === "unbind"
+    );
+    assert.equal(unbind.code, "WORKSPACE_UNBOUND");
+    assert.ok(typeof unbind.bindingId === "string" && unbind.bindingId.length > 0);
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("a v3 socket replacement advances reconnect churn while an off-mode replacement holds it", async () => {
+  const server = await startRegistry();
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const first = await connectV3(server);
+    await first.nextFrame(); // drain the initial BIND_WORKSPACE so the socket is live
+    assert.equal(server.registry.getHostReadiness("host-a").reconnectCount, 0);
+
+    // A binding-capable (v3) registration replacing the live socket is churn.
+    const second = await connectV3(server);
+    await waitFor(
+      () => server.registry.getHostReadiness("host-a").reconnectCount === 1
+    );
+    await second.nextFrame();
+
+    // An off-mode (v2) registration replacing the live v3 socket must NOT advance it.
+    const { socket: third } = await connectV2(server);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(server.registry.getHostReadiness("host-a").reconnectCount, 1);
+
+    third.terminate();
+    second.socket.terminate();
+    first.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("a bind-deadline retirement emits exactly one socket.retire in the deadline phase", async () => {
+  const events = [];
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    await connection.nextFrame(); // BIND_WORKSPACE arms the bind deadline
+    await waitFor(() => timers.timeoutDelays.includes(10_000));
+    const closed = once(connection.socket, "close");
+    timers.runTimeoutByDelay(10_000);
+    await closed;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const retires = events.filter((e) => e.event === "socket.retire");
+    assert.equal(retires.length, 1, "exactly one socket.retire for one physical retirement");
+    assert.equal(retires[0].phase, "deadline");
+    assert.equal(retires[0].code, "BINDING_DEADLINE");
+    assert.equal(
+      events.filter((e) => e.event === "socket.retire" && e.phase === "offline").length,
+      0,
+      "the offline-phase retire is suppressed after a deadline retirement"
+    );
   } finally {
     await server.close();
   }
