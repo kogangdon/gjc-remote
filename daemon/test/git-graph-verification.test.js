@@ -156,17 +156,22 @@ test("preflight refuses a git older than the floor", async () => {
 test("preflight refuses when the git binary cannot spawn", async () => {
   const spawnErr = new Error("spawn ENOENT");
   spawnErr.code = "ENOENT";
-  const { execFileFn } = makeGit({ version: spawnErr });
-  // version is a value; convert to a throwing fake by wrapping:
   const throwing = {
     async execFileFn(file, args) {
       if (subcommandOf(args) === "--version") throw spawnErr;
       throw new Error("unreached");
     },
   };
-  void execFileFn;
   const verifier = createGitGraphVerifier({ execFileFn: throwing.execFileFn, gitPath: GITPATH });
   await expectRefusal(verifier.verifyRepositoryGraph(REPO), "GIT_PREFLIGHT_FAILED");
+});
+
+test("maxBuffer overflow is classified as GIT_OUTPUT_OVERFLOW", async () => {
+  const overflow = new Error("stdout maxBuffer length exceeded");
+  overflow.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+  const { execFileFn } = makeGit({ revList: () => overflow });
+  const verifier = createGitGraphVerifier({ execFileFn, gitPath: GITPATH });
+  await expectRefusal(verifier.verifyRepositoryGraph(REPO), "GIT_OUTPUT_OVERFLOW");
 });
 
 test("refuses a path that is not a git repository", async () => {

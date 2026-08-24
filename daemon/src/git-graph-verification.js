@@ -27,9 +27,10 @@
 //     subprocess cap (#33, cap 4) is enforced by the daemon at the S4f/S4g
 //     wiring seam, not here.
 //
-// Every refusal is a deterministic, module-owned structured error
-// { code, operation: "verify_git_graph", reason } — a raw git/exec error object
-// is never allowed to escape.
+//   GIT_PREFLIGHT_FAILED, GIT_REPOSITORY_INVALID, GIT_GRAPH_INCOMPLETE,
+//   GIT_OID_INTEGRITY_FAILED, GIT_GENERATION_MISMATCH, GIT_VERIFICATION_TIMEOUT,
+//   GIT_OUTPUT_OVERFLOW
+// a raw git/exec error object is never allowed to escape.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -43,11 +44,12 @@ const NULL_CONFIG = process.platform === "win32" ? "NUL" : "/dev/null";
 
 const OPERATION = "verify_git_graph";
 
-// Minimum git that supports the flags relied on here (--missing=error on
-// rev-list is 2.16+, --no-dangling on fsck is 1.7+; we floor conservatively at
-// 2.20 which every currently supported git satisfies).
+// Minimum git. GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM (used to neutralise
+// ambient config) were introduced in git 2.32, so we floor there rather than at
+// the flag-level minimum (2.16). Fail-closed below 2.32: a security primitive
+// must not run where its config-neutralisation is a silent no-op.
 const MIN_GIT_MAJOR = 2;
-const MIN_GIT_MINOR = 20;
+const MIN_GIT_MINOR = 32;
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_BUFFER = 64 * 1024 * 1024; // 64 MiB of object-name output
@@ -95,11 +97,9 @@ function buildScrubbedEnv(gitPath) {
   // git.exe on Windows is self-locating, but keeping the git install directory
   // on PATH lets it find its bundled helpers deterministically. We deliberately
   // do NOT inherit the caller's PATH.
-  const sep = process.platform === "win32" ? ";" : ":";
   const gitDir = gitPath.replace(/[\\/][^\\/]*$/, "");
   env.PATH = gitDir;
   env.Path = gitDir; // Windows env var casing safety
-  void sep;
   return env;
 }
 
@@ -165,6 +165,12 @@ export function createGitGraphVerifier(deps = {}) {
           stderr: truncate(error.stderr),
         });
       }
+      // Captured stdout/stderr exceeded maxBuffer: fail closed with a dedicated
+      // code rather than tripping the spawn-failure heuristic below (the code is
+      // a string, ERR_CHILD_PROCESS_STDIO_MAXBUFFER, not an errno).
+      if (error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+        refuse("GIT_OUTPUT_OVERFLOW", `git ${args[0]} output exceeded ${maxBuffer} bytes`);
+      }
       // Non-zero exit: surface exit code + captured streams, but let callers
       // classify (fsck failure vs invalid repo) via the returned shape.
       const err = new Error("git non-zero exit");
@@ -229,6 +235,11 @@ export function createGitGraphVerifier(deps = {}) {
   // fsck --full --strict is the authoritative connectivity + OID hash-integrity
   // + ref-validity proof. --no-dangling suppresses non-fatal dangling notices
   // (dangling objects are unreachable but present, not corruption).
+  // NOTE: GIT_GRAPH_INCOMPLETE vs GIT_OID_INTEGRITY_FAILED is an ADVISORY
+  // sub-label derived from heuristic stderr matching; corrupt-object wording
+  // varies across git versions, so the two codes are sub-labels of ONE blocking
+  // failure class. Downstream (S4f/S4g) must treat both as "graph unusable" and
+  // must NOT branch on the distinction.
   async function assertGraphIntegrity(repoPath) {
     try {
       await run(repoPath, ["fsck", "--full", "--strict", "--no-progress", "--no-dangling"]);
@@ -306,8 +317,16 @@ export function createGitGraphVerifier(deps = {}) {
       return oid.length > 0 && OID_RE.test(oid) ? oid : null;
     } catch (error) {
       if (isRefusal(error)) throw error;
-      // Unborn HEAD (fresh repo with no commit) is a legitimate empty state.
-      return null;
+      if (error?.spawnFailed) {
+        refuse("GIT_PREFLIGHT_FAILED", `git binary is not executable: ${error.spawnCode}`);
+      }
+      // rev-parse --verify --quiet HEAD exits 1 with empty stdout on an unborn
+      // HEAD (fresh repo, no commit) — a legitimate empty state. Any other exit
+      // (e.g. 128) is a real fault and must NOT be silently treated as empty.
+      if (error?.exitCode === 1) return null;
+      refuse("GIT_REPOSITORY_INVALID", "unable to resolve HEAD", {
+        stderr: truncate(error?.stderr),
+      });
     }
   }
 
