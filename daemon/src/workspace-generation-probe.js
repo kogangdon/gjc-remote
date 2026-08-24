@@ -81,43 +81,64 @@ const hasExactKeys = (value, keys) =>
 // Every dimension carries { state, source }; the workspace dimension also
 // carries { generation, expected }. A non-live source is rejected up front so
 // dev/test-injected evidence can never pass, regardless of its declared state.
+// A non-live source is a shape/configuration fault (CONFIG_INVALID), NOT a
+// runtime incompatibility: reusing RUNTIME_INCOMPATIBLE here would make the
+// daemon seam mislabel the runtime dimension as incompatible for any
+// non-runtime dimension whose source is wrong.
 function assertLiveSource(dimension, value) {
   if (!isPlainObject(value)) {
     refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, `${dimension} evidence must be an object`, { dimension });
   }
+  // The four simple dimensions must be exactly { state, source }; the workspace
+  // dimension's fuller shape is validated in assertGenerationBinding.
+  if (dimension !== "workspace" && !hasExactKeys(value, ["state", "source"])) {
+    refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, `${dimension} evidence must have exactly {state,source}`, { dimension });
+  }
   if (value.source !== LIVE_SOURCE) {
     // Fail closed: an injected/dev/test/unknown source cannot satisfy the probe.
-    refuse(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE, `${dimension} evidence is not live (source=${String(value.source)})`, {
+    refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, `${dimension} evidence is not live (source=${String(value.source)})`, {
       dimension,
       rejectedSource: String(value.source),
     });
   }
 }
 
+// Validate the workspace generation binding and return a frozen snapshot of the
+// four live fingerprints, read EXACTLY ONCE. Returning a snapshot (rather than
+// re-reading workspace.generation later) closes a getter-based TOCTOU: a
+// property getter could otherwise return a validated value here and a different,
+// unverified value when the attestation is fingerprinted.
 function assertGenerationBinding(workspace) {
   if (!hasExactKeys(workspace, ["state", "source", "generation", "expected"])) {
     refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "workspace evidence must have {state,source,generation,expected}", { dimension: "workspace" });
   }
+  const snapshot = {};
   for (const side of ["generation", "expected"]) {
-    if (!hasExactKeys(workspace[side], GENERATION_FINGERPRINTS)) {
+    const container = workspace[side];
+    if (!hasExactKeys(container, GENERATION_FINGERPRINTS)) {
       refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, `workspace.${side} must carry exactly the four generation fingerprints`, { dimension: "workspace", side });
     }
+    const values = {};
     for (const key of GENERATION_FINGERPRINTS) {
-      if (!isHex64(workspace[side][key])) {
+      const value = container[key]; // read once
+      if (!isHex64(value)) {
         refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, `workspace.${side}.${key} must be a 64-char lowercase hex digest`, { dimension: "workspace", side, field: key });
       }
+      values[key] = value;
     }
+    snapshot[side] = values;
   }
   // The live generation binding must match the expected generation on every
   // fingerprint; the first divergence decides the reported failure mode.
   for (const key of GENERATION_FINGERPRINTS) {
-    if (workspace.generation[key] !== workspace.expected[key]) {
+    if (snapshot.generation[key] !== snapshot.expected[key]) {
       refuse(FINGERPRINT_MISMATCH_CODE[key], `workspace generation ${key} does not match the expected generation`, {
         dimension: "workspace",
         field: key,
       });
     }
   }
+  return Object.freeze(snapshot.generation);
 }
 
 /**
@@ -183,35 +204,47 @@ export function evaluateGenerationReadiness(evidence) {
     refuse(code, `model profile is not ready (state=${String(evidence.modelProfile.state)})`, { dimension: "modelProfile" });
   }
 
-  // Dimension 5 — workspace + generation binding.
+  // Dimension 5 — workspace + generation binding. assertGenerationBinding
+  // returns a snapshot of the four live fingerprints read exactly once, so the
+  // attestation below is fingerprinted over the same values that were validated
+  // and compared (no getter-based re-read).
   if (evidence.workspace.state !== "ready") {
     refuse(PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND, `workspace is not ready (state=${String(evidence.workspace.state)})`, { dimension: "workspace" });
   }
-  assertGenerationBinding(evidence.workspace);
+  const generation = assertGenerationBinding(evidence.workspace);
 
   // Freshness / anti-replay: the caller supplies both timestamps and the bound;
   // the probe holds no clock so it stays pure and deterministically testable.
+  // SEAM CONTRACT (owned by the S4f/S4g wiring, not this module): the timestamp
+  // window here bounds staleness but is NOT by itself sufficient anti-replay.
+  // The wiring MUST (a) source nowMs from a trusted monotonic clock, not the
+  // requester; (b) own maxAgeMs from daemon config, never from requester input;
+  // and (c) enforce single-use of each readinessFingerprint via a seen-set,
+  // emitting READINESS_REPLAYED on reuse within the window.
   const { freshness } = evidence;
   if (!hasExactKeys(freshness, ["probedAtMs", "nowMs", "maxAgeMs"])) {
     refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "freshness must have {probedAtMs,nowMs,maxAgeMs}");
   }
-  for (const key of ["probedAtMs", "nowMs", "maxAgeMs"]) {
-    if (!Number.isSafeInteger(freshness[key]) || freshness[key] < 0) {
+  const probedAtMs = freshness.probedAtMs; // read once each
+  const nowMs = freshness.nowMs;
+  const maxAgeMs = freshness.maxAgeMs;
+  for (const [key, value] of [["probedAtMs", probedAtMs], ["nowMs", nowMs], ["maxAgeMs", maxAgeMs]]) {
+    if (!Number.isSafeInteger(value) || value < 0) {
       refuse(PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID, `freshness.${key} must be a non-negative safe integer`, { field: key });
     }
   }
-  if (freshness.maxAgeMs < 1) {
+  if (maxAgeMs < 1) {
     refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "freshness.maxAgeMs must be >= 1");
   }
-  if (freshness.nowMs < freshness.probedAtMs) {
+  if (nowMs < probedAtMs) {
     // A probe stamped in the future is invalid, not merely expired.
     refuse(PROTOCOL_ERROR_CODES.READINESS_TIMESTAMP_INVALID, "freshness.nowMs precedes probedAtMs");
   }
-  if (freshness.nowMs - freshness.probedAtMs > freshness.maxAgeMs) {
+  if (nowMs - probedAtMs > maxAgeMs) {
     refuse(PROTOCOL_ERROR_CODES.READINESS_EXPIRED, "readiness evidence is older than maxAgeMs");
   }
 
-  const generationPointerFingerprint = evidence.workspace.generation.pointerFingerprint;
+  const generationPointerFingerprint = generation.pointerFingerprint;
   const attestationBody = {
     version: VERSION,
     kind: KIND,
@@ -221,10 +254,10 @@ export function evaluateGenerationReadiness(evidence) {
     modelProfile: "ready",
     workspace: "ready",
     generationPointerFingerprint,
-    rootIdentityFingerprint: evidence.workspace.generation.rootIdentityFingerprint,
-    gitGenerationFingerprint: evidence.workspace.generation.gitGenerationFingerprint,
-    manifestFingerprint: evidence.workspace.generation.manifestFingerprint,
-    probedAtMs: freshness.probedAtMs,
+    rootIdentityFingerprint: generation.rootIdentityFingerprint,
+    gitGenerationFingerprint: generation.gitGenerationFingerprint,
+    manifestFingerprint: generation.manifestFingerprint,
+    probedAtMs,
   };
   let readinessFingerprint;
   try {
