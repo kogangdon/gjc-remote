@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PROTOCOL_ERROR_CODES } from "@gjc-remote/shared";
-import { WorkspaceLeaseRegistry } from "../src/workspace-lease-registry.js";
+import {
+  WorkspaceLeaseRegistry,
+  assertQuiescent,
+} from "../src/workspace-lease-registry.js";
 
 const authority = Object.freeze({
   hostId: "host-a",
@@ -157,6 +160,7 @@ test("activity leases share one fence for the same immutable binding identity", 
       inventoryGeneration: authority.inventoryGeneration,
       fence: first.fence,
       holders: 2,
+      exclusive: false,
       invalidated: false,
     },
   ]);
@@ -440,4 +444,186 @@ test("invalidateAll frees active-workspace slots once holders drain", () => {
   const next = registry.acquireActivity(distinct(1));
   assert.equal(next.isCurrent(), true);
   next.release();
+});
+
+// --- S5b exclusive-mode lease + workload quiescence (#53, reset/delete) ------
+//
+// Exclusive mode is the destruction-authorization primitive: a reset/delete
+// orchestrator (S5e) acquires the activity fence with { exclusive: true } so
+// that no other holder -- and no re-entrant same-identity holder -- can touch
+// the workspace while the destructive step runs. assertQuiescent is the
+// separate, pure workload-idleness guard. Both refuse WORKSPACE_BUSY, kept
+// distinct from the LEASE_CONFLICT raised for fence-succession / identity races.
+
+test("an exclusive lease is admitted at zero holders and marks the entry", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  registry.adoptBinding(authority);
+  const lease = registry.acquireActivity(activity(), { exclusive: true });
+  assert.equal(lease.isCurrent(), true);
+  assert.equal(registry.snapshot()[0].exclusive, true);
+  assert.equal(registry.snapshot()[0].holders, 1);
+  lease.release();
+  // Releasing the exclusive holder drains the entry entirely.
+  assert.equal(registry.activities.size, 0);
+});
+
+test("an exclusive acquisition is refused WORKSPACE_BUSY when a non-exclusive holder is live", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  registry.adoptBinding(authority);
+  const nonExclusive = registry.acquireActivity(activity());
+  assert.throws(
+    () => registry.acquireActivity(activity(), { exclusive: true }),
+    (error) => error.code === PROTOCOL_ERROR_CODES.WORKSPACE_BUSY
+  );
+  // The refusal did not mutate the live entry into exclusive mode.
+  assert.equal(registry.snapshot()[0].exclusive, false);
+  assert.equal(registry.snapshot()[0].holders, 1);
+  nonExclusive.release();
+});
+
+test("a live exclusive holder refuses every subsequent acquisition WORKSPACE_BUSY", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  registry.adoptBinding(authority);
+  const exclusive = registry.acquireActivity(activity(), { exclusive: true });
+
+  // Non-exclusive re-entry of the SAME identity is refused (the deliberate
+  // behavioral delta from ordinary same-identity holder-stacking).
+  assert.throws(
+    () => registry.acquireActivity(activity()),
+    (error) => error.code === PROTOCOL_ERROR_CODES.WORKSPACE_BUSY
+  );
+  // A second exclusive acquisition is likewise refused.
+  assert.throws(
+    () => registry.acquireActivity(activity(), { exclusive: true }),
+    (error) => error.code === PROTOCOL_ERROR_CODES.WORKSPACE_BUSY
+  );
+  // The original exclusive holder stays alone and current throughout.
+  assert.equal(exclusive.isCurrent(), true);
+  assert.equal(registry.snapshot()[0].holders, 1);
+  exclusive.release();
+});
+
+test("releasing an exclusive holder frees the workspace for ordinary use", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  registry.adoptBinding(authority);
+  const exclusive = registry.acquireActivity(activity(), { exclusive: true });
+  exclusive.release();
+
+  const shared1 = registry.acquireActivity(activity());
+  const shared2 = registry.acquireActivity(activity());
+  assert.equal(shared1.fence, shared2.fence);
+  assert.equal(registry.snapshot()[0].exclusive, false);
+  assert.equal(registry.snapshot()[0].holders, 2);
+  shared1.release();
+  shared2.release();
+});
+
+test("the default single-arg acquire path keeps ordinary non-exclusive stacking", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  registry.adoptBinding(authority);
+  // No options object at all: the S4g acquireFence seam is unaffected.
+  const first = registry.acquireActivity(activity());
+  const second = registry.acquireActivity(activity());
+  assert.equal(first.fence, second.fence);
+  assert.equal(registry.snapshot()[0].exclusive, false);
+  assert.equal(registry.snapshot()[0].holders, 2);
+  first.release();
+  second.release();
+});
+
+test("a fence-succession race under an exclusive holder still raises LEASE_CONFLICT", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  registry.adoptBinding(authority);
+  const exclusive = registry.acquireActivity(activity(), { exclusive: true });
+
+  // Advance the authority: the live exclusive activity is invalidated but
+  // retained while its holder is outstanding.
+  const advanced = {
+    ...authority,
+    mappingGeneration: authority.mappingGeneration + 1,
+  };
+  assert.equal(registry.adoptBinding(advanced), true);
+  assert.equal(exclusive.isCurrent(), false);
+
+  // Re-acquiring against the new authority while the stale holder is live is a
+  // succession race -> LEASE_CONFLICT, NOT WORKSPACE_BUSY.
+  assert.throws(
+    () =>
+      registry.acquireActivity(
+        { ...advanced, bindingFingerprint: "binding-fingerprint-b" },
+        { exclusive: true }
+      ),
+    (error) => error.code === PROTOCOL_ERROR_CODES.LEASE_CONFLICT
+  );
+  exclusive.release();
+});
+
+test("assertQuiescent succeeds only when no invoke and no session is pending", () => {
+  const result = assertQuiescent({ pendingInvokes: 0, pendingSessions: 0 });
+  assert.deepEqual(result, { quiescent: true });
+  assert.equal(Object.isFrozen(result), true);
+});
+
+test("assertQuiescent refuses WORKSPACE_BUSY on any non-zero workload count", () => {
+  assert.throws(
+    () => assertQuiescent({ pendingInvokes: 1, pendingSessions: 0 }),
+    (error) => error.code === PROTOCOL_ERROR_CODES.WORKSPACE_BUSY
+  );
+  assert.throws(
+    () => assertQuiescent({ pendingInvokes: 0, pendingSessions: 3 }),
+    (error) => error.code === PROTOCOL_ERROR_CODES.WORKSPACE_BUSY
+  );
+  assert.throws(
+    () => assertQuiescent({ pendingInvokes: 2, pendingSessions: 5 }),
+    (error) => error.code === PROTOCOL_ERROR_CODES.WORKSPACE_BUSY
+  );
+});
+
+test("assertQuiescent rejects malformed counts before deciding quiescence", () => {
+  for (const bad of [-1, 1.5, Number.NaN, "0", undefined, null]) {
+    assert.throws(
+      () => assertQuiescent({ pendingInvokes: bad, pendingSessions: 0 }),
+      /assertQuiescent pendingInvokes must be a non-negative safe integer/
+    );
+    assert.throws(
+      () => assertQuiescent({ pendingInvokes: 0, pendingSessions: bad }),
+      /assertQuiescent pendingSessions must be a non-negative safe integer/
+    );
+  }
+});
+
+
+test("a different binding identity under a live exclusive holder is LEASE_CONFLICT, not WORKSPACE_BUSY", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  registry.adoptBinding(authority);
+  const exclusive = registry.acquireActivity(activity(), { exclusive: true });
+  // Same workspace + same authority, but a different binding identity: this is
+  // an identity race, refused earlier as LEASE_CONFLICT -- the exclusive
+  // WORKSPACE_BUSY guard is never reached for a mismatched identity.
+  assert.throws(
+    () =>
+      registry.acquireActivity(
+        { ...activity(), bindingFingerprint: "binding-fingerprint-z" },
+        { exclusive: true }
+      ),
+    (error) => error.code === PROTOCOL_ERROR_CODES.LEASE_CONFLICT
+  );
+  assert.equal(exclusive.isCurrent(), true);
+  exclusive.release();
+});
+
+test("an exclusive acquire at the active-workspace ceiling is admission-refused without a phantom entry", () => {
+  const registry = new WorkspaceLeaseRegistry({ maxActiveWorkspaces: 1 });
+  registry.adoptBinding(distinct(0));
+  const held = registry.acquireActivity(distinct(0));
+  registry.adoptBinding(distinct(1));
+  // The #43 admission ceiling is checked before entry creation, so it takes
+  // precedence over the S5b exclusive guards and leaves no phantom entry.
+  assert.throws(
+    () => registry.acquireActivity(distinct(1), { exclusive: true }),
+    (error) =>
+      error.code === PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED
+  );
+  assert.equal(registry.activities.size, 1);
+  held.release();
 });
