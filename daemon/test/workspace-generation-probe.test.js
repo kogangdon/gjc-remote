@@ -56,14 +56,52 @@ test("a non-live source on ANY dimension fails closed — a dev/test-injected pr
       : { state: { connection: "online", runtime: "ready", providerAuth: "configured", modelProfile: "ready" }[dimension], source: "dev-injection" };
     const evidence = baseEvidence({ [dimension]: affirmative });
     assert.throws(() => evaluateGenerationReadiness(evidence), (e) =>
-      e.code === "RUNTIME_INCOMPATIBLE" && e.dimension === dimension && e.rejectedSource === "dev-injection");
+      e.code === "CONFIG_INVALID" && e.dimension === dimension && e.rejectedSource === "dev-injection");
   }
 });
 
-test("a missing source, wrong type, or unknown source is refused as not live", () => {
-  rejectsCode(baseEvidence({ connection: { state: "online" } }), "RUNTIME_INCOMPATIBLE");
-  rejectsCode(baseEvidence({ runtime: { state: "ready", source: "test" } }), "RUNTIME_INCOMPATIBLE");
+test("a missing source, wrong type, literal true/undefined source, or unknown source is refused as not live", () => {
+  rejectsCode(baseEvidence({ connection: { state: "online" } }), "CONFIG_INVALID");
+  rejectsCode(baseEvidence({ runtime: { state: "ready", source: "test" } }), "CONFIG_INVALID");
+  rejectsCode(baseEvidence({ providerAuth: { state: "configured", source: true } }), "CONFIG_INVALID");
+  rejectsCode(baseEvidence({ modelProfile: { state: "ready", source: undefined } }), "CONFIG_INVALID");
   rejectsCode(baseEvidence({ modelProfile: "ready" }), "CONFIG_INVALID");
+});
+
+test("a simple dimension with an extra key is refused (exact-shape discipline)", () => {
+  rejectsCode(baseEvidence({ connection: { state: "online", source: LIVE_SOURCE, extra: 1 } }), "CONFIG_INVALID");
+});
+
+test("a null-prototype or own-__proto__ evidence object fails closed", () => {
+  const nullProto = Object.assign(Object.create(null), baseEvidence());
+  rejectsCode(nullProto, "CONFIG_INVALID");
+  const polluted = JSON.parse('{"__proto__":{"x":1}}');
+  rejectsCode(baseEvidence({ workspace: { state: "ready", source: LIVE_SOURCE, generation: Object.assign({ ...FP }, polluted), expected: { ...FP } } }), "CONFIG_INVALID");
+});
+
+test("NaN / Infinity / string freshness timestamps are refused", () => {
+  rejectsCode(baseEvidence({ freshness: { probedAtMs: NaN, nowMs: 2, maxAgeMs: 5_000 } }), "READINESS_TIMESTAMP_INVALID");
+  rejectsCode(baseEvidence({ freshness: { probedAtMs: 1_000, nowMs: Infinity, maxAgeMs: 5_000 } }), "READINESS_TIMESTAMP_INVALID");
+  rejectsCode(baseEvidence({ freshness: { probedAtMs: "1000", nowMs: 1_500, maxAgeMs: 5_000 } }), "READINESS_TIMESTAMP_INVALID");
+});
+
+test("a getter that swaps a fingerprint after validation cannot poison the attestation", () => {
+  // The live pointer getter returns the expected value on first read (validation
+  // + comparison) and a forged value on any later read. Because the module
+  // snapshots each fingerprint exactly once, the forged value is never observed:
+  // the probe still succeeds and the fingerprint reflects the validated value.
+  let reads = 0;
+  const generation = { ...FP };
+  Object.defineProperty(generation, "pointerFingerprint", {
+    enumerable: true,
+    get() { return reads++ === 0 ? FP.pointerFingerprint : "e".repeat(64); },
+  });
+  const forgedFirst = evaluateGenerationReadiness(baseEvidence({
+    workspace: { state: "ready", source: LIVE_SOURCE, generation, expected: { ...FP } },
+  }));
+  const clean = evaluateGenerationReadiness(baseEvidence());
+  assert.equal(forgedFirst.generationPointerFingerprint, FP.pointerFingerprint);
+  assert.equal(forgedFirst.readinessFingerprint, clean.readinessFingerprint);
 });
 
 test("connection dimension maps to CONNECTION_LOST when not online", () => {
