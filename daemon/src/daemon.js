@@ -58,7 +58,10 @@ import {
   initializeInventoryConfig,
   inventoryConfigDiagnostic,
 } from "./inventory-config.js";
-import { WorkspaceLeaseRegistry } from "./workspace-lease-registry.js";
+import {
+  WorkspaceLeaseRegistry,
+  DEFAULT_MAX_ACTIVE_WORKSPACES,
+} from "./workspace-lease-registry.js";
 import { isLeaseBoundaryRejection } from "./readiness-classification.js";
 import { RequestIdFence } from "./request-id-fence.js";
 
@@ -338,7 +341,9 @@ try {
 
 const pool = new SessionPool({ sensitiveValues: daemonSensitiveValues });
 const admissionBudget = new AdmissionBudget();
-const workspaceLeases = new WorkspaceLeaseRegistry({ maxActiveWorkspaces: 8 });
+const workspaceLeases = new WorkspaceLeaseRegistry({
+  maxActiveWorkspaces: DEFAULT_MAX_ACTIVE_WORKSPACES,
+});
 const requestIds = new RequestIdFence();
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
