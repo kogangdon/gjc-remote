@@ -101,6 +101,9 @@ test("lineageFingerprint changes when a bound field changes", () => {
 
 test("buildPromotionLineage rejects a malformed or non-exact input as CONFIG_INVALID", () => {
   const cases = [
+    null,
+    [],
+    Object.assign(Object.create(null), LINEAGE_INPUT),
     { restoredFromWorkspaceId: "", restoredFromGeneration: 1 },
     { restoredFromWorkspaceId: "w", restoredFromGeneration: 0 },
     { restoredFromWorkspaceId: "w", restoredFromGeneration: 1.5 },
