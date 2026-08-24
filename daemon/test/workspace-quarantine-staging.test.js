@@ -167,6 +167,57 @@ test("assertQuarantined: a candidate outside its workspace root is CONFIG_INVALI
   });
 });
 
+test("assertQuarantined: staging that is an ANCESTOR of the live candidate is refused", () => {
+  // staging === workDir would let a delete-of-staging destroy the live tree.
+  for (const stagingPath of [
+    "/srv/workspaces/workspace-a",
+    "/srv/workspaces/workspace-a/generations",
+  ]) {
+    assert.throws(() => assertQuarantined({
+      stagingPath,
+      candidatePath: "/srv/workspaces/workspace-a/generations/3",
+      workDir: "/srv/workspaces/workspace-a",
+      sourcePlatform: "posix",
+    }), (error) => {
+      assert.equal(error.code, PROTOCOL_ERROR_CODES.WORKSPACE_STAGING_NOT_QUARANTINED, stagingPath);
+      return true;
+    }, stagingPath);
+  }
+});
+
+test("build/guard reject windows aliasing in a path (ADS, trailing dot/space, reserved name)", () => {
+  for (const bad of [
+    "D:\\workspaces\\ws\\stream:extra",
+    "D:\\workspaces\\ws\\trailingdot.",
+    "D:\\workspaces\\ws\\trailingspace ",
+    "D:\\workspaces\\ws\\CON",
+    "D:\\workspaces\\ws\\nul.txt",
+  ]) {
+    assert.throws(() => buildQuarantineStagingDescriptor({
+      hostId: "host-a",
+      workspaceId: "workspace-a",
+      sourcePlatform: "windows-drive",
+      stagingPath: bad,
+      sourceKind: "dirty-backup",
+    }), (error) => {
+      assert.equal(error.code, PROTOCOL_ERROR_CODES.CONFIG_INVALID, bad);
+      return true;
+    }, bad);
+  }
+});
+
+test("assertQuarantined: windows-unc rejects an aliased share component", () => {
+  assert.throws(() => assertQuarantined({
+    stagingPath: "\\\\srv\\share\\ws\\.quarantine",
+    candidatePath: "\\\\srv\\bad:share\\ws\\generations\\3",
+    workDir: "\\\\srv\\bad:share\\ws",
+    sourcePlatform: "windows-unc",
+  }), (error) => {
+    assert.equal(error.code, PROTOCOL_ERROR_CODES.CONFIG_INVALID);
+    return true;
+  });
+});
+
 // ---------- assertQuarantined (windows case folding) ------------------------
 
 test("assertQuarantined: windows nesting folds case (fail-closed) and is refused", () => {
