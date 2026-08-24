@@ -90,6 +90,14 @@ function assertFn(container, name, path) {
  *   replaySeen,    // { has(fp), add(fp) } single-use seen-set for readinessFingerprint
  *   hashIdentity?, // optional (identity)=>hex64; defaults to canonicalJsonHash
  * }
+ *
+ * replaySeen bounding contract (owned by the S7 daemon wiring, not this seam):
+ * the injected seen-set is grow-only here and MUST be bounded/evicted by the
+ * wiring in step with the freshness window (e.g. drop fingerprints older than
+ * maxAgeMs), so an attestation can never be replayed WITHIN the window while the
+ * set stays bounded across the daemon lifetime. add-before-publish means a
+ * failed publish permanently burns its attestation, which is the fail-closed
+ * (safe) direction.
  */
 export function createWorkspaceCreateOperation(deps = {}) {
   if (!isPlainObject(deps)) {
@@ -127,13 +135,15 @@ export function createWorkspaceCreateOperation(deps = {}) {
     if (!SUPPORTED_OPERATIONS.has(request.operation)) {
       refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, `operation must be one of ${[...SUPPORTED_OPERATIONS].join("/")}`);
     }
-    for (const key of ["hostId", "workspaceId", "sourcePlatform", "workDir", "candidateGenerationPath", "gitDir"]) {
+    for (const key of ["hostId", "workspaceId", "sourcePlatform", "workDir", "generationPath", "candidatePath", "gitDir"]) {
       if (typeof request[key] !== "string" || request[key].length === 0) {
         refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, `request.${key} must be a non-empty string`);
       }
     }
-    if (!Array.isArray(request.manifestPaths)) {
-      refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "request.manifestPaths must be an array");
+    if (!Array.isArray(request.manifestPaths) || request.manifestPaths.length === 0) {
+      // Fail closed: the backup/manifest Final-obligation binds real content, so
+      // a vacuous zero-entry manifest is not accepted as create-time evidence.
+      refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "request.manifestPaths must be a non-empty array");
     }
     if (!Number.isSafeInteger(request.activeGeneration) || request.activeGeneration < 1) {
       refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "request.activeGeneration must be a safe integer >= 1");
@@ -161,12 +171,18 @@ export function createWorkspaceCreateOperation(deps = {}) {
     assertRequest(request);
     const {
       operation, hostId, workspaceId, sourcePlatform, workDir,
-      candidateGenerationPath, gitDir, manifestPaths, activeGeneration,
+      generationPath, candidatePath, gitDir, manifestPaths, activeGeneration,
       probedAtMs, readiness,
     } = request;
     const priorGeneration = request.priorGeneration ?? null;
     const priorPointerFingerprint = request.priorPointerFingerprint ?? null;
     const expectedGraph = isPlainObject(request.expectedGraph) ? request.expectedGraph : {};
+
+    // `generationPath` is the workspace-RELATIVE POSIX path recorded in the
+    // pointer (S4d's separator convention). `candidatePath` and `gitDir` are the
+    // platform-native paths S4a/S4b operate on. They are validated against the
+    // SAME containment-proven root below, so the git graph can never attest a
+    // repository outside the proven workspace.
 
     // Step 0 (precondition) — identify + prove the workspace root itself before
     // materialising anything. Captures the root/storage identity used both to
@@ -177,15 +193,22 @@ export function createWorkspaceCreateOperation(deps = {}) {
     // The actual git clone / init subprocess lives behind this injected seam.
     await materialize({
       operation, hostId, workspaceId, sourcePlatform, workDir,
-      candidateGenerationPath, gitDir, activeGeneration,
+      generationPath, candidatePath, gitDir, activeGeneration,
     });
 
-    // Step 1b — no-follow containment proof of the materialised candidate. Runs
-    // the shallow-to-deep reparse-free prefix walk and re-anchors the root
-    // identity to catch a swap between step 0 and now.
+    // Step 1b — no-follow containment proof of the materialised candidate AND of
+    // the git directory the graph proof will read. Both run the shallow-to-deep
+    // reparse-free prefix walk and re-anchor the root identity (captured in
+    // step 0) to catch a swap between step 0 and now. Proving gitDir here binds
+    // S4b's repository path to the proven root (S4b precondition).
     await containment.verifyContained({
       workDir, sourcePlatform,
-      candidate: candidateGenerationPath,
+      candidate: candidatePath,
+      expectedRootIdentity: rootProof.rootIdentity,
+    });
+    await containment.verifyContained({
+      workDir, sourcePlatform,
+      candidate: gitDir,
       expectedRootIdentity: rootProof.rootIdentity,
     });
 
@@ -213,7 +236,7 @@ export function createWorkspaceCreateOperation(deps = {}) {
     const pointer = buildGenerationPointer({
       hostId, workspaceId, sourcePlatform,
       activeGeneration,
-      generationPath: candidateGenerationPath,
+      generationPath,
       rootIdentityFingerprint, storageIdentityFingerprint, gitGenerationFingerprint,
       manifestFingerprint,
       priorGeneration, priorPointerFingerprint,
