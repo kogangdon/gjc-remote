@@ -171,20 +171,22 @@ Phase 2 implements mapping/containment, lifecycle, persistence, Git, backup, and
 
 ### MVP interim subset
 
-A single-writer durable lock may be used only in a development-only native mode guarded by the
-exact feature flag `GJC_DEV_NATIVE_SINGLE_WRITER_LOCK=1`, default off. It records owner identity
-and rejects a second writer. It never authorizes stale-owner takeover or resumed writes: process
-absence evidence permits only inspection/cleanup, while ambiguity enters `manual-cleanup`. A negative
-fixture must prove Docker and production paths cannot select this mode. A named removal gate is the
-Phase 2 acceptance `FINAL_LEASE_FENCE_TESTS_PASS`; Phase 4 is blocked while the flag exists.
+A single-writer durable lock was, in the MVP interim, gated by the development-only feature flag
+`GJC_DEV_NATIVE_SINGLE_WRITER_LOCK`. That flag is REMOVED as of slice S6e: native single-writer
+lease/fence enforcement is now unconditional. It records owner identity and rejects a second writer.
+It never authorizes stale-owner takeover or resumed writes: process absence evidence permits only
+inspection/cleanup, while ambiguity enters `manual-cleanup`. The removal gate
+`FINAL_LEASE_FENCE_TESTS_PASS` is retired; the flag name is now rejected at daemon startup
+(presence-based fail-closed, see `daemon/src/workspace-removed-flags.js`).
 
-A development-only `connectivity-only` Git probe may run only in an isolated benchmark command with
-`GJC_DEV_CONNECTIVITY_PROBE=1`, default off, no bot socket, no serving daemon, and no writable
-candidate/prior generation. It cannot publish a ready or release generation, satisfy a current-run
-publication probe, or pass Phase 2/release evidence. Its removal gate is
-`FULL_GRAPH_PUBLICATION_TESTS_PASS` before the native-serving boundary; the flag must then be
-rejected at startup. Full connectivity/ref/OID/all-reachable verification is required at every
-create/clone and refresh generation publication.
+A development-only `connectivity-only` Git probe was, in the MVP interim, gated by
+`GJC_DEV_CONNECTIVITY_PROBE`. That flag is REMOVED as of slice S6e: full connectivity/ref/OID/
+all-reachable verification is now unconditional at every create/clone and refresh generation
+publication. The removal gate `FULL_GRAPH_PUBLICATION_TESTS_PASS` is retired; the flag name is now
+rejected at daemon startup (presence-based fail-closed, see `daemon/src/workspace-removed-flags.js`).
+Removing these interim flags does NOT cross the native-serving boundary
+(`NATIVE_WORKSPACE_SERVING_ENABLED` stays false) - that flip is the separate human-approved decision
+tracked by issue #81 / slice S6f.
 
 Docker session-volume migration is disabled with an internal diagnostic
 `DOCKER_SESSION_MIGRATION_DISABLED` that is never sent as a public protocol/remediation code; public
