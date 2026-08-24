@@ -211,3 +211,70 @@ test("verifyManifestAgainst fails when a manifested file is missing", async () =
   const m = buildWorkspaceManifest({ ...BASE, entries });
   await expectRefusal(verifyManifestAgainst(fakeIo(new Map()), m), "WORKSPACE_MANIFEST_MISMATCH");
 });
+
+test("rejects a path segment carrying an NTFS ':' alternate-data-stream alias", () => {
+  for (const bad of ["a/b:stream", "file.txt:$DATA", "x:y"]) {
+    assert.throws(
+      () => buildWorkspaceManifest({ ...BASE, entries: [{ path: bad, size: 0, sha256: "0".repeat(64) }] }),
+      (e) => e.code === "WORKSPACE_MANIFEST_PATH_REJECTED",
+      `path ${JSON.stringify(bad)} should be rejected`,
+    );
+  }
+});
+
+test("rejects a Windows reserved device name or a trailing dot/space segment", () => {
+  for (const bad of ["CON", "nul.txt", "a/PRN", "lpt1", "trailing.", "trailing ", "dir/space "]) {
+    assert.throws(
+      () => buildWorkspaceManifest({ ...BASE, entries: [{ path: bad, size: 0, sha256: "0".repeat(64) }] }),
+      (e) => e.code === "WORKSPACE_MANIFEST_PATH_REJECTED",
+      `path ${JSON.stringify(bad)} should be rejected`,
+    );
+  }
+});
+
+test("rejects a control character or unpaired surrogate in an entry path", () => {
+  for (const bad of ["a\u0001b", "tab\there", "line\u2028sep", "lead\uD800half"]) {
+    assert.throws(
+      () => buildWorkspaceManifest({ ...BASE, entries: [{ path: bad, size: 0, sha256: "0".repeat(64) }] }),
+      (e) => e.code === "WORKSPACE_MANIFEST_PATH_REJECTED",
+      `path ${JSON.stringify(bad)} should be rejected`,
+    );
+  }
+});
+
+test("rejects an uppercase / non-lowercase hex sha256", () => {
+  assert.throws(
+    () => buildWorkspaceManifest({ ...BASE, entries: [{ path: "a", size: 1, sha256: "A".repeat(64) }] }),
+    (e) => e.code === "WORKSPACE_MANIFEST_INVALID",
+  );
+});
+
+test("refuses an entry count over the module limit before any hashing", () => {
+  const overrun = new Array(100_001).fill({ path: "a", size: 0, sha256: "0".repeat(64) });
+  assert.throws(
+    () => buildWorkspaceManifest({ ...BASE, entries: overrun }),
+    (e) => e.code === "WORKSPACE_MANIFEST_INVALID" && /exceeds the limit/.test(e.reason),
+  );
+});
+
+test("parse rejects a prototype-polluting __proto__ key", () => {
+  assert.throws(
+    () => parseWorkspaceManifest(Buffer.from('{"__proto__":{"polluted":true}}', "utf8")),
+    (e) => e.code === "WORKSPACE_MANIFEST_INVALID",
+  );
+  assert.equal({}.polluted, undefined);
+});
+
+test("computeManifestEntries rethrows a module refusal from the reader unchanged", async () => {
+  const io = {
+    readBytes: async () => {
+      const err = new Error("workspace_backup_manifest: injected refusal");
+      err.code = "WORKSPACE_MANIFEST_PATH_REJECTED";
+      err.operation = "workspace_backup_manifest";
+      err.reason = "injected refusal";
+      throw err;
+    },
+  };
+  const err = await expectRefusal(computeManifestEntries(io, ["a"]), "WORKSPACE_MANIFEST_PATH_REJECTED");
+  assert.equal(err.reason, "injected refusal");
+});

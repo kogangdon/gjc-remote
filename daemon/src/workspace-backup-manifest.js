@@ -29,6 +29,7 @@
 
 import { createHash } from "node:crypto";
 import {
+  assertStrictText,
   canonicalJsonBytes,
   canonicalJsonHash,
   isHex64,
@@ -39,6 +40,24 @@ import {
 const OPERATION = "workspace_backup_manifest";
 const KIND = "workspace-backup-manifest";
 const VERSION = 1;
+
+// Module-owned limits. The shared STRICT_JSON_LIMITS (10k nodes / 1 MiB) is
+// sized for small control envelopes and would cap a manifest at ~2k entries;
+// this primitive owns its boundary explicitly instead of inheriting that cap.
+// The manifest describes the bounded control/session file set of a generation
+// (not the entire git working tree — object-graph integrity is S4b's fsck job),
+// but we still size generously and refuse overruns with a structured code.
+const MAX_ENTRIES = 100_000;
+const MAX_PATH_BYTES = 4096;
+const WORKSPACE_MANIFEST_LIMITS = Object.freeze({
+  maxBytes: 64 * 1024 * 1024,
+  maxDepth: 8,
+  maxNodes: MAX_ENTRIES * 6 + 64,
+});
+
+// Windows reserved device names (rejected as a whole segment, optionally with an
+// extension), matched case-insensitively.
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 
 // Same platform vocabulary as shared/workspace-binding.js and
 // shared/workspace-inventory.js. Kept inline (each envelope declares its own)
@@ -89,12 +108,21 @@ const isSafeCount = (value) => Number.isSafeInteger(value) && value >= 0;
 // A manifest entry path is a workspace-RELATIVE POSIX path: '/' separators, no
 // leading separator, no drive/UNC prefix, no '.'/'..' segment, no NUL, no
 // backslash (callers normalise Windows separators before building), non-empty.
+// It must also survive the strict-JSON character rules (no control chars /
+// unpaired surrogates) and must not carry Windows path aliases (':' alternate
+// data streams, reserved device names, trailing dot/space) that could let a
+// lexically-safe path resolve to an unexpected object on a windows-drive host.
 function assertRelativePath(path) {
   if (typeof path !== "string" || path.length === 0) {
     refuse("WORKSPACE_MANIFEST_PATH_REJECTED", "entry path must be a non-empty string");
   }
   if (path.includes("\0")) {
     refuse("WORKSPACE_MANIFEST_PATH_REJECTED", "entry path contains a NUL byte");
+  }
+  try {
+    assertStrictText(path, "entry path", MAX_PATH_BYTES);
+  } catch (error) {
+    refuse("WORKSPACE_MANIFEST_PATH_REJECTED", `entry path rejected: ${error?.message ?? "invalid text"}`);
   }
   if (path.includes("\\")) {
     refuse("WORKSPACE_MANIFEST_PATH_REJECTED", `entry path must use '/' separators: ${path}`);
@@ -111,6 +139,15 @@ function assertRelativePath(path) {
     }
     if (segment === "." || segment === "..") {
       refuse("WORKSPACE_MANIFEST_PATH_REJECTED", `entry path has a dot segment: ${path}`);
+    }
+    if (segment.includes(":")) {
+      refuse("WORKSPACE_MANIFEST_PATH_REJECTED", `entry path segment contains ':' (NTFS ADS alias): ${path}`);
+    }
+    if (/[ .]$/.test(segment)) {
+      refuse("WORKSPACE_MANIFEST_PATH_REJECTED", `entry path segment has a trailing dot or space: ${path}`);
+    }
+    if (WINDOWS_RESERVED.test(segment)) {
+      refuse("WORKSPACE_MANIFEST_PATH_REJECTED", `entry path segment is a Windows reserved name: ${path}`);
     }
   }
 }
@@ -133,7 +170,14 @@ function manifestFingerprintOf(record) {
   for (const key of MANIFEST_KEYS) {
     if (key !== "manifestFingerprint") withoutFingerprint[key] = record[key];
   }
-  return canonicalJsonHash(withoutFingerprint);
+  try {
+    return canonicalJsonHash(withoutFingerprint, WORKSPACE_MANIFEST_LIMITS);
+  } catch (error) {
+    // strict-json throws raw SyntaxError/RangeError/TypeError on a forbidden
+    // character or a limits overrun; convert to a structured refusal so no raw
+    // error ever escapes.
+    refuse("WORKSPACE_MANIFEST_INVALID", `manifest body is not canonicalizable: ${error?.message ?? "invalid"}`);
+  }
 }
 
 /**
@@ -161,6 +205,9 @@ export function validateWorkspaceManifest(manifest) {
   if (!isHex64(manifest.gitGenerationFingerprint)) refuse("WORKSPACE_MANIFEST_INVALID", "gitGenerationFingerprint must be hex64");
 
   if (!Array.isArray(manifest.entries)) refuse("WORKSPACE_MANIFEST_INVALID", "entries must be an array");
+  if (manifest.entries.length > MAX_ENTRIES) {
+    refuse("WORKSPACE_MANIFEST_INVALID", `entry count ${manifest.entries.length} exceeds the limit of ${MAX_ENTRIES}`);
+  }
   let totalSize = 0;
   let previousPath = null;
   manifest.entries.forEach((entry, index) => {
@@ -199,6 +246,9 @@ export function buildWorkspaceManifest(input) {
   if (!isPlainObject(input)) refuse("WORKSPACE_MANIFEST_INVALID", "manifest input must be an object");
   const rawEntries = input.entries;
   if (!Array.isArray(rawEntries)) refuse("WORKSPACE_MANIFEST_INVALID", "entries must be an array");
+  if (rawEntries.length > MAX_ENTRIES) {
+    refuse("WORKSPACE_MANIFEST_INVALID", `entry count ${rawEntries.length} exceeds the limit of ${MAX_ENTRIES}`);
+  }
 
   const entries = rawEntries.map((entry, index) => {
     assertEntry(entry, index);
@@ -236,14 +286,18 @@ export function buildWorkspaceManifest(input) {
 /** Canonical bytes of a validated manifest (validates first). */
 export function workspaceManifestBytes(manifest) {
   validateWorkspaceManifest(manifest);
-  return canonicalJsonBytes(manifest);
+  try {
+    return canonicalJsonBytes(manifest, WORKSPACE_MANIFEST_LIMITS);
+  } catch (error) {
+    refuse("WORKSPACE_MANIFEST_INVALID", `manifest is not serializable: ${error?.message ?? "invalid"}`);
+  }
 }
 
 /** Parse canonical manifest bytes and validate the result. */
 export function parseWorkspaceManifest(bytes) {
   let value;
   try {
-    value = parseCanonicalJsonBytes(bytes);
+    value = parseCanonicalJsonBytes(bytes, WORKSPACE_MANIFEST_LIMITS);
   } catch (error) {
     refuse("WORKSPACE_MANIFEST_INVALID", `manifest bytes are not canonical JSON: ${error?.message ?? "parse error"}`);
   }
@@ -278,7 +332,7 @@ export async function computeManifestEntries(io, relativePaths) {
     } catch (error) {
       if (error?.operation === OPERATION) throw error;
       refuse("WORKSPACE_MANIFEST_READ_FAILED", `unable to read ${path}`, {
-        cause: String(error?.code ?? error?.message ?? "unknown"),
+        cause: String(error?.code ?? "unknown"),
       });
     }
     if (!(bytes instanceof Uint8Array)) {
@@ -293,9 +347,14 @@ export async function computeManifestEntries(io, relativePaths) {
 
 /**
  * Verify a directory's current content matches a manifest by re-reading and
- * re-hashing every entry through the injected reader. Returns
- * { ok:true, verifiedCount } or throws WORKSPACE_MANIFEST_MISMATCH on the first
- * size/digest divergence (checksum verification for restore/migration).
+ * re-hashing every entry through the injected reader. This is a SUBSET (allow-
+ * list) proof: it proves every manifested entry is present with the exact size
+ * and sha256, but does NOT detect EXTRA files not named in the manifest. That
+ * matches the create/clone + restore "checksum verification" obligation; an
+ * equality (no-extra-files) mode, if a future reversible-promotion step needs
+ * it, is deferred to the S4d publication seam. Returns { ok:true,
+ * verifiedCount } or throws WORKSPACE_MANIFEST_MISMATCH on the first
+ * size/digest/missing divergence.
  *
  * @param {{ readBytes:(relPath:string)=>Promise<Uint8Array> }} io
  * @param {object} manifest
@@ -313,7 +372,7 @@ export async function verifyManifestAgainst(io, manifest) {
     } catch (error) {
       refuse("WORKSPACE_MANIFEST_MISMATCH", `unable to read ${entry.path} during verification`, {
         path: entry.path,
-        cause: String(error?.code ?? error?.message ?? "unknown"),
+        cause: String(error?.code ?? "unknown"),
       });
     }
     if (!(bytes instanceof Uint8Array)) {
