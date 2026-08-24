@@ -153,6 +153,14 @@ function assertAbsolutePath(label, value, sourcePlatform) {
   if (!/^\\\\[^\\]+\\[^\\]+/.test(normalized)) {
     refuse("CONFIG_INVALID", `${label} must be an absolute windows-unc path (e.g. \\\\server\\share\\...)`);
   }
+  // Validate the server and share components with the same aliasing guards as
+  // the tail (a trailing dot/space or ':' in a share name is a windows alias).
+  const uncPrefixMatch = /^\\\\([^\\]+)\\([^\\]+)/.exec(normalized);
+  for (const component of [uncPrefixMatch[1], uncPrefixMatch[2]]) {
+    if (component === "." || component === "..") refuse("CONFIG_INVALID", `${label} has a '.'/'..' server/share component`);
+    if (component.includes(":")) refuse("CONFIG_INVALID", `${label} server/share component contains ':'`);
+    if (/[ .]$/.test(component)) refuse("CONFIG_INVALID", `${label} server/share component has a trailing dot or space`);
+  }
   const afterShare = normalized.replace(/^\\\\[^\\]+\\[^\\]+/, "");
   assertWindowsTail(label, afterShare.startsWith("\\") ? afterShare.slice(1) : afterShare);
   return normalized;
@@ -271,6 +279,18 @@ export function assertQuarantined({ stagingPath, candidatePath, workDir, sourceP
     refuse(
       "WORKSPACE_STAGING_NOT_QUARANTINED",
       "stagingPath equals or nests under the live workspace candidate path",
+      { stagingPath: canonicalStaging, candidatePath: canonicalCandidate },
+    );
+  }
+
+  // Symmetric guard: a staging path that is an ANCESTOR of the live candidate
+  // (e.g. stagingPath === workDir) is equally unquarantined -- destroying the
+  // staging tree would take the live candidate with it. The equal case is
+  // already caught above; this closes the strict-ancestor direction.
+  if (nestsUnderOrEquals(canonicalCandidate, canonicalStaging, sourcePlatform)) {
+    refuse(
+      "WORKSPACE_STAGING_NOT_QUARANTINED",
+      "stagingPath is an ancestor of the live workspace candidate path",
       { stagingPath: canonicalStaging, candidatePath: canonicalCandidate },
     );
   }
