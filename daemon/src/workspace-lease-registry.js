@@ -54,6 +54,38 @@ function workspaceAdmissionExceeded() {
   return error;
 }
 
+function workspaceBusy() {
+  const error = new Error(PROTOCOL_ERROR_CODES.WORKSPACE_BUSY);
+  error.code = PROTOCOL_ERROR_CODES.WORKSPACE_BUSY;
+  return error;
+}
+
+/**
+ * Pure workload-quiescence guard (S5b, #53).
+ *
+ * A destructive lifecycle op (reset/delete/restore/migration) may only proceed
+ * once the workspace is genuinely idle: no invoke is in flight and no coding
+ * session is live against it. This is a distinct condition from the activity
+ * fence -- the fence proves *authority currency*, this proves *workload
+ * idleness* -- so it fails closed with `WORKSPACE_BUSY` on any non-zero count
+ * rather than `LEASE_CONFLICT`. Pure and injected-count based: the caller
+ * supplies the live counts it observed, keeping this unit free of daemon state.
+ */
+export function assertQuiescent({ pendingInvokes, pendingSessions } = {}) {
+  for (const [name, value] of [
+    ["pendingInvokes", pendingInvokes],
+    ["pendingSessions", pendingSessions],
+  ]) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new TypeError(`assertQuiescent ${name} must be a non-negative safe integer`);
+    }
+  }
+  if (pendingInvokes > 0 || pendingSessions > 0) {
+    throw workspaceBusy();
+  }
+  return Object.freeze({ quiescent: true });
+}
+
 function requireAuthority(candidate) {
   const fields = candidate?.authorityEpoch === undefined
     ? V2_AUTHORITY_FIELDS
@@ -226,7 +258,7 @@ export class WorkspaceLeaseRegistry {
     return true;
   }
 
-  acquireActivity(candidate) {
+  acquireActivity(candidate, { exclusive = false } = {}) {
     const authority = requireAuthority(candidate);
     const receipt = authority.socketGeneration !== undefined;
     const legacyBindingFingerprint = candidate?.bindingFingerprint;
@@ -280,9 +312,35 @@ export class WorkspaceLeaseRegistry {
           : legacyBindingFingerprint,
         fence: this.nextFence,
         holders: 0,
+        exclusive: false,
         invalidated: false,
       };
       this.activities.set(authority.workspaceId, entry);
+    }
+
+    // Exclusive-mode gating (S5b, #53). Two fail-closed, synchronous
+    // check-then-reserve rules, evaluated after stale entries were pruned above
+    // so `entry.holders` counts only live holders of this exact identity:
+    //   1. While an exclusive holder is live, EVERY same-identity acquisition
+    //      (exclusive or not) is refused WORKSPACE_BUSY here. This is the
+    //      deliberate behavioral delta from ordinary same-identity holder-
+    //      stacking: exclusivity forbids re-entrant stacking too. A DIFFERENT
+    //      binding identity for the same workspace never reaches this guard --
+    //      it is refused earlier as LEASE_CONFLICT by the identity-mismatch
+    //      block above -- so authority/identity races stay LEASE_CONFLICT while
+    //      workload-not-idle stays WORKSPACE_BUSY.
+    //   2. A new exclusive acquisition requires zero existing holders; any live
+    //      non-exclusive holder refuses it WORKSPACE_BUSY.
+    // WORKSPACE_BUSY (workload-not-idle) is intentionally distinct from the
+    // LEASE_CONFLICT raised above for fence-succession / identity races.
+    if (entry.exclusive && entry.holders > 0) {
+      throw workspaceBusy();
+    }
+    if (exclusive && entry.holders > 0) {
+      throw workspaceBusy();
+    }
+    if (exclusive) {
+      entry.exclusive = true;
     }
 
     entry.holders += 1;
@@ -314,6 +372,7 @@ export class WorkspaceLeaseRegistry {
           inventoryGeneration: authority.inventoryGeneration,
           fence: activity?.fence,
           holders: activity?.holders ?? 0,
+          exclusive: activity?.exclusive ?? false,
           invalidated: activity?.invalidated ?? false,
         });
       })
