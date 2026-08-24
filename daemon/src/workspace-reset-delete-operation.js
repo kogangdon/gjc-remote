@@ -245,6 +245,14 @@ export function createWorkspaceResetDeleteOperation(deps = {}) {
     assertRequest(request);
     const { operation, hostId, workspaceId, sourcePlatform } = request;
 
+    // Build the manual-cleanup checkpoint record EAGERLY, before any fence or io
+    // (A6, pure): a semantically-invalid injected authority is a fail-closed
+    // CONFIG_INVALID rejection here with zero side effects, so the step-7 catch
+    // can never discover a bad authority AFTER the tombstone may already be live
+    // (which would lose the checkpoint and mislabel a live-slot state). The
+    // frozen record is reused verbatim on the manual_cleanup path.
+    const manualCleanup = buildManualCleanup(request.lifecycleAuthority);
+
     // Step 1 -- acquire the EXCLUSIVE prompt/read fence. Throws WORKSPACE_BUSY /
     // LEASE_CONFLICT / WORKSPACE_ADMISSION_EXCEEDED on acquisition failure (no
     // fence to release, no io touched -> zero fs mutation).
@@ -257,7 +265,10 @@ export function createWorkspaceResetDeleteOperation(deps = {}) {
 
       // A4 idempotent re-delete -- if the live slot ALREADY holds a tombstone
       // chaining onto the caller's expected base, this destruction already
-      // happened: short-circuit with zero CAS and zero mutation.
+      // happened: short-circuit with zero CAS and zero mutation. The prior read
+      // is a benign read-only probe that precedes the step-2 quiescence gate.
+      // Host/workspace need not be re-checked: priorPointerFingerprint is a
+      // globally-unique canonical hash, so an exact match already pins identity.
       const priorLive = await readLiveDisposition(tombstoneIo);
       if (
         priorLive !== null &&
@@ -299,13 +310,27 @@ export function createWorkspaceResetDeleteOperation(deps = {}) {
 
       // Step 7 -- build and publish the terminal tombstone, CAS onto the exact
       // currently-live record read via the dual-kind reader. The disposed
-      // generation is DERIVED from the live record, never the requester. A null
-      // slot, malformed record, or stale CAS base is a clean rejection (no
-      // mutation); only a failure of the ordered publication io itself is
-      // converted into a manual_cleanup disposition.
+      // generation, priorKind, and priorPointerFingerprint are all DERIVED from
+      // the live record, never the requester. A null slot, a live record that
+      // diverged from the caller's expected base (a concurrent generation
+      // publication that raced this operation before or during it), or a stale
+      // intra-publish CAS base is a clean rejection (no mutation); only a failure
+      // of the ordered publication io itself is converted into manual_cleanup.
       const live = await readLiveDisposition(tombstoneIo);
       if (live === null) {
         refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "no live record to tombstone");
+      }
+      // Optimistic expected-base gate (mirrors S4g assertExpectedBase): the
+      // requester pins the exact live record it intends to tombstone. A mismatch
+      // means the generation advanced before the fence closed the window, so the
+      // enumerated dirty backup describes a stale generation -- refuse rather
+      // than tombstone a base the caller never saw. Clean rejection, no mutation.
+      if (live.fingerprint !== request.expected.priorPointerFingerprint) {
+        refuse("WORKSPACE_GENERATION_CAS_CONFLICT", "live record diverged from the expected base before publication", {
+          step: "cas",
+          expectedPriorPointerFingerprint: request.expected.priorPointerFingerprint,
+          liveFingerprint: live.fingerprint,
+        });
       }
       const tombstonedGeneration = live.kind === POINTER_KIND
         ? live.record.activeGeneration
@@ -331,7 +356,6 @@ export function createWorkspaceResetDeleteOperation(deps = {}) {
         // unproven. Any other throw (stale CAS base, malformed record) means no
         // mutation happened -- re-throw it as a clean rejection.
         if (!TOMBSTONE_STEPS.includes(error?.step)) throw error;
-        const manualCleanup = buildManualCleanup(request.lifecycleAuthority);
         return Object.freeze({
           operation,
           published: false,
@@ -355,10 +379,9 @@ export function createWorkspaceResetDeleteOperation(deps = {}) {
         dirtyBackupFingerprint,
         disposition: "committed",
       });
-      // Steps 1-3 failures propagate as structured rejections (workspace intact).
-      // A malformed manual-cleanup authority discovered while building the
-      // checkpoint throws out of the inner catch and stays a fail-closed
-      // CONFIG_INVALID rejection -- never a silent commit.
+      // Steps 1-6 failures propagate as structured rejections (workspace intact).
+      // The manual-cleanup authority was already validated eagerly above, so the
+      // step-7 catch only ever reuses a proven-good frozen record.
     } finally {
       if (lease && typeof lease.release === "function") lease.release();
     }

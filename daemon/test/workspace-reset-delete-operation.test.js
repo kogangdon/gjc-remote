@@ -387,8 +387,9 @@ test("crash-sim: a publication io failure at each step yields disposition manual
     const tombstoneIo = makeTombstoneIo(priorBytes);
     tombstoneIo.throwAt.add(step);
 
+    const lease = makeLease();
     const op = createWorkspaceResetDeleteOperation({
-      acquireFence: () => makeLease(),
+      acquireFence: () => lease,
       probeQuiescence: () => ({ pendingInvokes: 0, pendingSessions: 0 }),
       backupIo: makeBackupIo(),
       residualIo: makeResidualIo(),
@@ -399,6 +400,7 @@ test("crash-sim: a publication io failure at each step yields disposition manual
     assert.equal(result.disposition, "manual_cleanup", `step ${step}`);
     assert.equal(result.published, false, `step ${step}`);
     assert.equal(result.cause.step, step, `step ${step}`);
+    assert.equal(lease.released, true, `step ${step}: fence released`);
 
     // The manual-cleanup record is real shared vocabulary and classifies right.
     validateManualCleanup(result.manualCleanup);
@@ -504,17 +506,23 @@ test("request guards: bad operation / missing lifecycleAuthority key refuse CONF
   });
 });
 
-test("malformed lifecycleAuthority value: manual_cleanup path fails closed CONFIG_INVALID (never a silent commit)", async () => {
+test("malformed lifecycleAuthority value: fails closed CONFIG_INVALID eagerly, before any fence or io", async () => {
   const { request, pointer } = baseRequest();
   // A structurally-present but semantically-invalid authority (non-hex anchor).
   request.lifecycleAuthority.anchorFingerprint = "not-hex";
-  const tombstoneIo = makeTombstoneIo(generationPointerBytes(pointer));
-  tombstoneIo.throwAt.add("replace"); // force the manual_cleanup path
+  const priorBytes = generationPointerBytes(pointer);
+  const tombstoneIo = makeTombstoneIo(priorBytes);
+  tombstoneIo.throwAt.add("replace"); // would force manual_cleanup IF reached
+  const backupIo = makeBackupIo();
+  let fenceAcquired = false;
 
   const op = createWorkspaceResetDeleteOperation({
-    acquireFence: () => makeLease(),
+    acquireFence: () => {
+      fenceAcquired = true;
+      return makeLease();
+    },
     probeQuiescence: () => ({ pendingInvokes: 0, pendingSessions: 0 }),
-    backupIo: makeBackupIo(),
+    backupIo,
     residualIo: makeResidualIo(),
     tombstoneIo,
   });
@@ -523,6 +531,41 @@ test("malformed lifecycleAuthority value: manual_cleanup path fails closed CONFI
     assert.equal(error.code, PROTOCOL_ERROR_CODES.CONFIG_INVALID);
     return true;
   });
+  // A6 eager validation: rejected before fence acquisition, zero io, slot intact.
+  assert.equal(fenceAcquired, false);
+  assert.equal(backupIo.calls, 0);
+  assert.equal(tombstoneIo.state.slot, priorBytes);
+});
+
+test("pre-operation divergence: a live slot that does not match expected base refuses WORKSPACE_GENERATION_CAS_CONFLICT with zero mutation", async () => {
+  // The live slot holds a DIFFERENT generation pointer than the request's
+  // expected base (a concurrent refresh published before the fence closed). The
+  // step-7 expected-base gate must refuse before any tombstone is built/written.
+  const expectedPointer = livePointer();
+  const divergedPointer = livePointer({ activeGeneration: 5, priorGeneration: 4 });
+  const divergedBytes = generationPointerBytes(divergedPointer);
+  const order = [];
+  const tombstoneIo = makeTombstoneIo(divergedBytes, order);
+  const backupIo = makeBackupIo(order);
+  // Request expects the ORIGINAL pointer, not the diverged live one.
+  const { request } = baseRequest({ pointer: expectedPointer });
+
+  const op = createWorkspaceResetDeleteOperation({
+    acquireFence: () => makeLease(),
+    probeQuiescence: () => ({ pendingInvokes: 0, pendingSessions: 0 }),
+    backupIo,
+    residualIo: makeResidualIo(order),
+    tombstoneIo,
+  });
+
+  await assert.rejects(op.runResetDelete(request), (error) => {
+    assert.equal(error.code, "WORKSPACE_GENERATION_CAS_CONFLICT");
+    assert.equal(error.step, "cas");
+    return true;
+  });
+  // No manual_cleanup, no mutation: the divergence is detected before publication.
+  assert.equal(tombstoneIo.state.slot, divergedBytes);
+  assert.ok(!order.some((entry) => entry === "tombstone.writeTemp"));
 });
 
 test("stale CAS base: a diverged live slot refuses without a manual_cleanup disposition", async () => {
