@@ -34,9 +34,9 @@ const VERSION = 1;
 // The trusted authority anchor and the staged record are compared field for
 // field on this exact identity set. Fingerprints are hex64; hostId is a bounded
 // opaque id.
-const IDENTITY_FIELDS = ["hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"];
-const EXPECTED_AUTHORITY_KEYS = [...IDENTITY_FIELDS];
-const PROVENANCE_RECORD_KEYS = ["version", "kind", ...IDENTITY_FIELDS];
+const IDENTITY_FIELDS = Object.freeze(["hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"]);
+const EXPECTED_AUTHORITY_KEYS = Object.freeze([...IDENTITY_FIELDS]);
+const PROVENANCE_RECORD_KEYS = Object.freeze(["version", "kind", ...IDENTITY_FIELDS]);
 
 function refuse(code, reason, extra) {
   const error = new Error(`${OPERATION}: ${code}: ${reason}`);
@@ -126,12 +126,16 @@ export async function verifyRestoreProvenance(io, request) {
     }
   }
 
+  // Return the identity from the TRUSTED authority, not the staged record: the
+  // equality proof above established they match field-for-field, and copying
+  // from the anchor makes the authority-derivation invariant literal (a
+  // getter-bearing staged record cannot influence the returned value).
   return Object.freeze({
     verified: true,
-    hostId: record.hostId,
-    roleFingerprint: record.roleFingerprint,
-    volumeIdentityFingerprint: record.volumeIdentityFingerprint,
-    keyFingerprint: record.keyFingerprint,
+    hostId: expectedAuthority.hostId,
+    roleFingerprint: expectedAuthority.roleFingerprint,
+    volumeIdentityFingerprint: expectedAuthority.volumeIdentityFingerprint,
+    keyFingerprint: expectedAuthority.keyFingerprint,
   });
 }
 
