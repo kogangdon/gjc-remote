@@ -22,12 +22,25 @@
 // prior generation number and the prior pointer's fingerprint so that rollback
 // is verifiable.
 //
-// Promotion is a compare-and-swap: a new pointer may only be published as the
-// immediate successor of the exact pointer currently live (matching prior
-// generation number + prior pointer fingerprint, host/workspace stable,
-// activeGeneration = prior + 1). This makes concurrent/torn promotion and
-// lost-update publication impossible, mirroring the lifecycle journal's
-// compareAndSetHead.
+// Promotion is a compare-and-swap over the currently-live pointer: a new pointer
+// may only be published as the immediate successor of the exact pointer
+// currently live (matching prior generation number + prior pointer fingerprint,
+// host/workspace stable, activeGeneration = prior + 1). This rejects a STALE
+// successor — one that chains onto a pointer that is no longer live — and
+// hash-links the generation chain so a caller cannot skip a generation or fork
+// the chain undetectably.
+//
+// SCOPE OF THE CAS: this module reads the live pointer and then replaces it; the
+// native replace_existing_atomic is unconditional (it takes no expected-identity
+// precondition), so there is a time-of-check/time-of-use window between the read
+// and the replace. Two publishers that both observe the same live pointer can
+// both pass the CAS and both replace — this module does NOT by itself provide
+// concurrent-writer exclusion. Serialising publication per workspace is the
+// caller's obligation at the S4f/S4g wiring seam (a per-workspace mutex /
+// acquire_native_lock, or an identity-conditioned replace in the style of the
+// native publish_inventory_object_atomic). Even under such a race the on-disk
+// atomicity invariant below still holds: the live pointer is always exactly one
+// valid generation pointer, never torn.
 //
 // This module is a PURE, dependency-injected primitive. It performs NO
 // filesystem I/O itself and does NOT wire into the daemon or flip the native-
@@ -39,6 +52,17 @@
 // io IS the only I/O surface, crash simulation is deterministic: a test injects
 // an io whose op throws at a chosen step and asserts the live-pointer slot,
 // with no sleep/timing.
+//
+// SEAM CONTRACT (owned by the S4f/S4g wiring, not this module):
+//   - The exclusive temp and the live pointer MUST share a volume, so that
+//     replace_existing_atomic is a true atomic rename (a cross-volume move
+//     degrades to a non-atomic copy+delete and would violate the invariant).
+//   - A publication that fails at flushTemp/replace may leave the exclusive temp
+//     on disk; the wiring MUST sweep leftover files under its temp prefix (they
+//     never occupy the live pointer path, so they cannot masquerade as live).
+//   - flushParent makes the completed rename durable across power loss; if it is
+//     skipped or lost, a power-loss crash may revert the live pointer to the
+//     prior valid generation — never to a torn pointer.
 
 import {
   canonicalJsonBytes,
@@ -306,6 +330,9 @@ function assertSuccession(next, current) {
   // A successor publication must chain onto the exact live pointer: same host
   // and workspace, prior generation == current active generation, prior pointer
   // fingerprint == current pointer fingerprint, and next active == current + 1.
+  // This rejects a STALE successor (one chaining onto a no-longer-live pointer);
+  // it is not a concurrent-writer lock -- see the module header on the TOCTOU
+  // window closed by the S4f wiring seam.
   if (next.hostId !== current.hostId || next.workspaceId !== current.workspaceId) {
     refuse("WORKSPACE_GENERATION_CAS_CONFLICT", "pointer host/workspace does not match the live pointer", {
       step: "cas",
@@ -335,8 +362,11 @@ function assertSuccession(next, current) {
  *     pointer is live yet;
  *   - successor publication: requires that the live pointer is exactly the one
  *     newPointer chains onto (see assertSuccession).
- * The prior generation directory is NOT touched, so promotion is reversible by
- * a later publish that re-points at it.
+ * The CAS rejects a stale successor but is not a concurrent-writer lock (the
+ * live-pointer read and the replace are not one atomic step); per-workspace
+ * publication serialization is the S4f/S4g wiring's obligation. The prior
+ * generation directory is NOT touched, so promotion is reversible by a later
+ * publish that re-points at it.
  *
  * Injected io (all async):
  *   - readLivePointer(): Promise<Uint8Array|null> — current live pointer bytes

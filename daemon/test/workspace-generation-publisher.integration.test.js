@@ -167,3 +167,26 @@ test("crash at every publication step leaves the on-disk pointer as exactly the 
     });
   }
 });
+
+test("a leftover temp file from a crashed publish does not affect the next publish", async () => {
+  await withTempDir(async (dir) => {
+    // Establish p1, then crash a p2 promotion at flushTemp so an exclusive temp
+    // is left on disk next to the live pointer.
+    await publishGeneration(realIo(dir), mkPointer(1, null));
+    const p1 = mkPointer(1, null);
+    const p2 = mkPointer(2, p1);
+    await assert.rejects(publishGeneration(realIo(dir, { failAt: "flushTemp" }), p2),
+      (e) => e.code === "WORKSPACE_GENERATION_IO_FAILED" && e.step === "flushTemp");
+
+    // A temp file is present and the live pointer is still p1.
+    const leftovers = readdirSync(dir).filter((name) => name.startsWith("pointer.json.tmp."));
+    assert.ok(leftovers.length >= 1, "expected a leftover temp from the crashed publish");
+    assert.deepEqual({ ...(await readLiveGeneration(realIo(dir))) }, { ...p1 });
+
+    // Retrying the same promotion succeeds (writeTemp uses a fresh unique name,
+    // and the CAS still sees p1 as live) and lands p2 as the live pointer.
+    const proof = await publishGeneration(realIo(dir), p2);
+    assert.equal(proof.activeGeneration, 2);
+    assert.deepEqual({ ...(await readLiveGeneration(realIo(dir))) }, { ...p2 });
+  });
+});
