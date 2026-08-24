@@ -298,3 +298,146 @@ test("invalid lease identities fail before registry mutation", () => {
   );
   assert.deepEqual(registry.snapshot(), []);
 });
+
+// --- #43 host-wide active-workspace admission (maxActiveWorkspaces) ---------
+//
+// These tests prove the new bound entirely at the WorkspaceLeaseRegistry API
+// surface. They construct ONLY a WorkspaceLeaseRegistry: no SessionPool and no
+// AdmissionBudget exist in this object graph, so independence from the
+// 8-session bound is structural (there is nothing to call), not merely observed
+// via a spy. The bound is forward-scaffolding — dormant on the live invoke wire
+// under the hard-disabled serving gate — and is exercised here, not via a live
+// serving invoke.
+
+function distinct(i) {
+  return {
+    ...authority,
+    mappingId: `mapping-${i}`,
+    workspaceId: `workspace-${i}`,
+    bindingFingerprint: `binding-fingerprint-${i}`,
+  };
+}
+
+test("maxActiveWorkspaces must be a positive safe integer", () => {
+  for (const bad of [0, -1, 1.5, Number.NaN, "8"]) {
+    assert.throws(
+      () => new WorkspaceLeaseRegistry({ maxActiveWorkspaces: bad }),
+      /maxActiveWorkspaces must be a positive safe integer/
+    );
+  }
+  const registry = new WorkspaceLeaseRegistry();
+  assert.equal(registry.maxActiveWorkspaces, 8);
+});
+
+test("host-wide active workspaces are bounded at exactly maxActiveWorkspaces", () => {
+  const registry = new WorkspaceLeaseRegistry();
+  const leases = [];
+  for (let i = 0; i < 8; i += 1) {
+    registry.adoptBinding(distinct(i));
+    leases.push(registry.acquireActivity(distinct(i)));
+  }
+  assert.equal(registry.activities.size, 8);
+
+  registry.adoptBinding(distinct(8));
+  assert.throws(
+    () => registry.acquireActivity(distinct(8)),
+    (error) =>
+      error.code === PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED
+  );
+  // The rejection did not create a phantom entry.
+  assert.equal(registry.activities.size, 8);
+  for (const lease of leases) lease.release();
+});
+
+test("releasing an active workspace frees exactly one admission slot", () => {
+  const registry = new WorkspaceLeaseRegistry({ maxActiveWorkspaces: 2 });
+  registry.adoptBinding(distinct(0));
+  registry.adoptBinding(distinct(1));
+  const first = registry.acquireActivity(distinct(0));
+  registry.acquireActivity(distinct(1));
+
+  registry.adoptBinding(distinct(2));
+  assert.throws(
+    () => registry.acquireActivity(distinct(2)),
+    (error) =>
+      error.code === PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED
+  );
+
+  first.release();
+  const admitted = registry.acquireActivity(distinct(2));
+  assert.equal(admitted.isCurrent(), true);
+  assert.equal(registry.activities.size, 2);
+});
+
+test("re-acquiring an already-active workspace never consults the bound", () => {
+  const registry = new WorkspaceLeaseRegistry({ maxActiveWorkspaces: 1 });
+  registry.adoptBinding(distinct(0));
+  const first = registry.acquireActivity(distinct(0));
+  // Same workspaceId, same identity: an additional holder, not a new entry.
+  const second = registry.acquireActivity(distinct(0));
+  assert.equal(first.fence, second.fence);
+  assert.equal(registry.activities.size, 1);
+
+  // A genuinely distinct workspace is still fail-closed at capacity.
+  registry.adoptBinding(distinct(1));
+  assert.throws(
+    () => registry.acquireActivity(distinct(1)),
+    (error) =>
+      error.code === PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED
+  );
+  first.release();
+  second.release();
+});
+
+test("a stale same-workspace rotation is re-admissible at capacity", () => {
+  // The stale-entry delete in acquireActivity runs BEFORE the size check, so a
+  // legitimate re-admission of a workspace whose prior lease has drained is not
+  // spuriously fail-closed by maxActiveWorkspaces.
+  const registry = new WorkspaceLeaseRegistry({ maxActiveWorkspaces: 1 });
+  registry.adoptBinding(distinct(0));
+  const stale = registry.acquireActivity(distinct(0));
+  // Rotate the same workspace's authority; the live activity is invalidated but
+  // retained while the prior holder is outstanding.
+  const rotated = {
+    ...distinct(0),
+    workspaceGeneration: authority.workspaceGeneration + 1,
+    bindingFingerprint: "binding-fingerprint-0b",
+  };
+  assert.equal(registry.adoptBinding(rotated), true);
+  assert.equal(stale.isCurrent(), false);
+  // Prior holder drains -> zero-holder invalidated entry is removed.
+  stale.release();
+  // Re-admitting the same workspace at capacity 1 succeeds (size is 0 now).
+  const fresh = registry.acquireActivity(rotated);
+  assert.equal(fresh.isCurrent(), true);
+  assert.equal(registry.activities.size, 1);
+  fresh.release();
+});
+
+test("double-release under the bound is an idempotent no-op", () => {
+  const registry = new WorkspaceLeaseRegistry({ maxActiveWorkspaces: 1 });
+  registry.adoptBinding(distinct(0));
+  const lease = registry.acquireActivity(distinct(0));
+  lease.release();
+  lease.release();
+  assert.equal(registry.activities.size, 0);
+  // The slot is genuinely free after the redundant release, not double-counted.
+  registry.adoptBinding(distinct(1));
+  const next = registry.acquireActivity(distinct(1));
+  assert.equal(next.isCurrent(), true);
+  next.release();
+});
+
+test("invalidateAll frees active-workspace slots once holders drain", () => {
+  const registry = new WorkspaceLeaseRegistry({ maxActiveWorkspaces: 1 });
+  registry.adoptBinding(distinct(0));
+  const held = registry.acquireActivity(distinct(0));
+  registry.invalidateAll();
+  assert.equal(held.isCurrent(), false);
+  // Holder still outstanding -> slot not yet free.
+  held.release();
+  registry.adoptBinding(distinct(1));
+  const next = registry.acquireActivity(distinct(1));
+  assert.equal(next.isCurrent(), true);
+  next.release();
+});

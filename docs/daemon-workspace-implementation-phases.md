@@ -302,6 +302,41 @@ test-injected inventory. Native serving itself remains FUTURE work gated behind 
 native-serving boundary defined earlier in this document (`NATIVE_WORKSPACE_SERVING_ENABLED = false`
 is unchanged); this wiring does not bring serving into scope.
 
+**Host-wide active-workspace admission (#53 Phase 2, #43 ownership).** Of the three #43 host-wide
+bounds, two were already implemented and boundary-tested before this slice: 64 in-flight invokes per
+host (`daemon/src/admission-budget.js` `AdmissionBudget`, `DEFAULT_MAX_IN_FLIGHT_INVOKES = 64`) and 8
+in-process SDK sessions (`daemon/src/session-pool.js` `SessionPool`, `DEFAULT_MAX_SESSIONS = 8`). This
+slice closes the remaining gap -- **8 active workspaces** -- inside `WorkspaceLeaseRegistry`
+(`daemon/src/workspace-lease-registry.js`): a new `maxActiveWorkspaces` bound (default
+`DEFAULT_MAX_ACTIVE_WORKSPACES = 8`) is enforced inside `acquireActivity` for new distinct-workspace
+admission only, fail-closed with the new `WORKSPACE_ADMISSION_EXCEEDED` protocol error code (added to
+`PROTOCOL_ERROR_CODES`, its `resourceSession` taxonomy grouping, and a `retry_later` remediation
+tuple). The daemon invoke handler classifies this synchronous acquisition refusal through the
+lease-boundary early-return branch (`daemon/src/readiness-classification.js`), parallel to
+`LEASE_CONFLICT`, without mutating readiness state. Authoritative host-wide admission lives solely in
+the daemon process; the bot's per-socket `V0_LIMITS.MAX_PENDING_PER_HOST` (64) is retained unchanged
+as a thin network-backpressure guard (two-layer, not two-authorities) and is held equal to the daemon
+ceiling by an in-slice constant-reconciliation test.
+
+**Forward-scaffolding / dormancy.** `acquireActivity` is reached from the invoke handler only AFTER
+the `NATIVE_WORKSPACE_SERVING_ENABLED` serving gate (source order: mapping/route -> read-before-
+admission fence -> serving-disabled gate -> workspace-admission -> session creation), which is
+hard-disabled. The new active-workspace bound is therefore dormant on the live invoke wire today --
+exactly like the existing 8-session bound -- and is proven at the `WorkspaceLeaseRegistry`
+component/unit surface, not via a live serving invoke. Only the 64-invoke `AdmissionBudget` (which
+runs upstream of the serving gate) is load-bearing end-to-end today. This slice does not enable native
+serving.
+
+**cgroup headroom (contract + Linux-guarded test; enforcement deferred to Phase 3/#42).** The daemon
+performs no runtime cgroup manipulation. `daemon/src/admission-headroom.js` declares the memory
+headroom relationship as real constants: the minimum cgroup memory limit must satisfy
+`ceil(((maxSessions * PER_SESSION_MEMORY_ESTIMATE_MB) + (maxInFlightInvokes *
+PER_INVOKE_MEMORY_ESTIMATE_MB) + FIXED_DAEMON_BASELINE_MB) * CGROUP_MEMORY_HEADROOM_RATIO)` with the
+ceilings sourced from their single points of definition. `daemon/test/cgroup-headroom.linux.test.js`
+asserts this arithmetic inequality unconditionally on every platform and, on Linux only, additionally
+reads the process's actual cgroup memory limit and asserts it meets the declared minimum (or skips
+with a diagnostic when unbounded/absent). Runtime cgroup enforcement remains Phase 3 / #42 scope.
+
 This is as-built status reconciliation only. It does not authorize native workspace serving, does not
 weaken any Phase 1-4 gate above, and does not make local inventory a route or mapping authority: the
 #44 mapping envelope remains the sole route authority, and local inventory is capability evidence
