@@ -106,7 +106,8 @@ function baseRequest(over = {}) {
     workspaceId: "workspace-1",
     sourcePlatform: "windows-drive",
     workDir: "C:\\ws\\root",
-    candidateGenerationPath: "generations/000001",
+    generationPath: "generations/000001",
+    candidatePath: "C:\\ws\\root\\generations\\000001",
     gitDir: "C:\\ws\\root\\generations\\000001",
     manifestPaths: ["a.txt", "b.txt"],
     activeGeneration: 1,
@@ -167,7 +168,9 @@ test("clone: publishes a successor chained onto the live prior generation", asyn
 
   const result = await op.runCreateClone(baseRequest({
     operation: "clone",
-    candidateGenerationPath: "generations/000002",
+    generationPath: "generations/000002",
+    candidatePath: "C:\\ws\\root\\generations\\000002",
+    gitDir: "C:\\ws\\root\\generations\\000002",
     activeGeneration: 2,
     priorGeneration: 1,
     priorPointerFingerprint: prior.pointerFingerprint,
@@ -190,7 +193,7 @@ test("materialize runs after root identification and before containment proof", 
   });
   const { deps } = makeDeps({ containment, gitVerifier, materialize: async () => { order.push("materialize"); } });
   await createWorkspaceCreateOperation(deps).runCreateClone(baseRequest());
-  assert.deepEqual(order, ["identifyRoot", "materialize", "verifyContained", "git"]);
+  assert.deepEqual(order, ["identifyRoot", "materialize", "verifyContained", "verifyContained", "git"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -291,7 +294,9 @@ test("crash at atomic replace preserves the prior live pointer (deterministic)",
   const publishIo = fakePublishIo(priorBytes, { fail: "replace" });
   const { deps } = makeDeps({ publishIo });
   const req = baseRequest({
-    operation: "clone", candidateGenerationPath: "generations/000002",
+    operation: "clone", generationPath: "generations/000002",
+    candidatePath: "C:\\ws\\root\\generations\\000002",
+    gitDir: "C:\\ws\\root\\generations\\000002",
     activeGeneration: 2, priorGeneration: 1, priorPointerFingerprint: prior.pointerFingerprint,
   });
   const err = await expectRefusal(createWorkspaceCreateOperation(deps).runCreateClone(req), "WORKSPACE_GENERATION_IO_FAILED");
@@ -331,4 +336,64 @@ test("request validation rejects a missing readiness dimension", async () => {
   const req = baseRequest();
   delete req.readiness.providerAuth;
   await expectRefusal(createWorkspaceCreateOperation(deps).runCreateClone(req), "CONFIG_INVALID");
+});
+
+test("request validation rejects an empty manifestPaths (no vacuous manifest)", async () => {
+  const { deps } = makeDeps();
+  await expectRefusal(createWorkspaceCreateOperation(deps).runCreateClone(baseRequest({ manifestPaths: [] })), "CONFIG_INVALID");
+});
+
+// ---------------------------------------------------------------------------
+// Adversarial coverage (S4f review finding 3)
+// ---------------------------------------------------------------------------
+
+test("a caller-forged readiness.workspace dimension is ignored (orchestrator assembles it)", async () => {
+  const { deps } = makeDeps();
+  // Attach a bogus workspace dimension bound to junk fingerprints. The
+  // orchestrator only reads the four CALLER_DIMENSIONS from request.readiness
+  // and assembles the workspace dimension from its own proofs, so this forged
+  // field is never consulted and the operation still succeeds normally.
+  const req = baseRequest();
+  req.readiness.workspace = { state: "ready", source: "injected", generation: { junk: true }, expected: { junk: true } };
+  const result = await createWorkspaceCreateOperation(deps).runCreateClone(req);
+  assert.equal(result.published.published, true);
+});
+
+test("an invalid POSIX generationPath refuses before publish", async () => {
+  const publishIo = fakePublishIo(null);
+  const { deps } = makeDeps({ publishIo });
+  // A drive-prefixed / backslash generationPath is rejected by the publisher's
+  // relative-POSIX guard while building the pointer, before any publish.
+  const req = baseRequest({ generationPath: "C:\\generations\\1" });
+  await expectRefusal(createWorkspaceCreateOperation(deps).runCreateClone(req), "WORKSPACE_GENERATION_PATH_REJECTED");
+  assert.deepEqual(publishIo.state.order, []);
+});
+
+test("a stale priorPointerFingerprint refuses via CAS and preserves the live pointer", async () => {
+  const prior = buildGenerationPointer({
+    hostId: "host-1", workspaceId: "workspace-1", sourcePlatform: "windows-drive",
+    activeGeneration: 1, generationPath: "generations/000001",
+    rootIdentityFingerprint: "1".repeat(64), storageIdentityFingerprint: "2".repeat(64),
+    gitGenerationFingerprint: "3".repeat(64), manifestFingerprint: "4".repeat(64),
+    priorGeneration: null, priorPointerFingerprint: null,
+  });
+  const priorBytes = generationPointerBytes(prior);
+  const publishIo = fakePublishIo(priorBytes);
+  const { deps } = makeDeps({ publishIo });
+  const req = baseRequest({
+    operation: "clone", generationPath: "generations/000002",
+    candidatePath: "C:\\ws\\root\\generations\\000002",
+    gitDir: "C:\\ws\\root\\generations\\000002",
+    activeGeneration: 2, priorGeneration: 1, priorPointerFingerprint: "9".repeat(64),
+  });
+  await expectRefusal(createWorkspaceCreateOperation(deps).runCreateClone(req), "WORKSPACE_GENERATION_CAS_CONFLICT");
+  assert.deepEqual(publishIo.state.live, priorBytes);
+});
+
+test("a manifest read failure propagates and never publishes", async () => {
+  const publishIo = fakePublishIo(null);
+  const failingManifestIo = { readBytes: async () => { const e = new Error("read denied"); e.code = "EACCES"; throw e; } };
+  const { deps } = makeDeps({ publishIo, manifestIo: failingManifestIo });
+  await expectRefusal(createWorkspaceCreateOperation(deps).runCreateClone(baseRequest()), "WORKSPACE_MANIFEST_READ_FAILED");
+  assert.deepEqual(publishIo.state.order, []);
 });
