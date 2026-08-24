@@ -121,6 +121,42 @@ test("verifyRestoreProvenance: a reader failure is a mismatch, not a soft error"
   );
 });
 
+test("verifyRestoreProvenance: an array or null-prototype staged record is a mismatch", async () => {
+  const nullProto = Object.assign(Object.create(null), matchingRecord());
+  for (const bad of [[matchingRecord()], nullProto, matchingRecord({ keyFingerprint: undefined })]) {
+    await expectRefusal(
+      verifyRestoreProvenance(provenanceIo(bad), { expectedAuthority: AUTHORITY, staged: {} }),
+      PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
+    );
+  }
+});
+
+test("verifyRestoreProvenance: a staged record missing an identity key is a mismatch", async () => {
+  const { keyFingerprint, ...missing } = matchingRecord();
+  await expectRefusal(
+    verifyRestoreProvenance(provenanceIo(missing), { expectedAuthority: AUTHORITY, staged: {} }),
+    PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
+  );
+});
+
+test("verifyRestoreProvenance: an over-long hostId is CONFIG_INVALID on the authority and a mismatch on the record", async () => {
+  const tooLong = "h".repeat(257);
+  await expectRefusal(
+    verifyRestoreProvenance(provenanceIo(matchingRecord()), {
+      expectedAuthority: { ...AUTHORITY, hostId: tooLong },
+      staged: {},
+    }),
+    PROTOCOL_ERROR_CODES.CONFIG_INVALID,
+  );
+  await expectRefusal(
+    verifyRestoreProvenance(provenanceIo(matchingRecord({ hostId: tooLong })), {
+      expectedAuthority: AUTHORITY,
+      staged: {},
+    }),
+    PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
+  );
+});
+
 // ---------- verifyRestoreProvenance: caller contract violations --------------
 
 test("verifyRestoreProvenance: a malformed expectedAuthority is CONFIG_INVALID (caller bug)", async () => {
@@ -154,6 +190,8 @@ test("verifyRestoreProvenance: a bad io/reader or staged shape is CONFIG_INVALID
 test("exported key sets are frozen and exact", () => {
   assert.deepEqual(EXPECTED_AUTHORITY_KEYS, ["hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"]);
   assert.deepEqual(PROVENANCE_RECORD_KEYS, ["version", "kind", "hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"]);
+  assert.ok(Object.isFrozen(EXPECTED_AUTHORITY_KEYS));
+  assert.ok(Object.isFrozen(PROVENANCE_RECORD_KEYS));
 });
 
 // ---------- verifyRestoreChecksum: pass-through to S4c -----------------------
