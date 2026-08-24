@@ -103,6 +103,26 @@ function assertFn(container, name, path) {
  *   replaySeen,    // { has(fp), add(fp) } single-use seen-set for readinessFingerprint
  *   hashIdentity?, // optional (identity)=>hex64; defaults to canonicalJsonHash
  * }
+ *
+ * replaySeen bounding contract (owned by the S7 daemon wiring, not this seam):
+ * the injected seen-set is grow-only here and MUST be bounded/evicted by the
+ * wiring in step with the freshness window. add-before-publish means a failed
+ * publish permanently burns its attestation (fail-closed).
+ *
+ * probedAtMs contract (owned by the S7 daemon wiring): request.probedAtMs is
+ * validated here only as a non-negative safe integer, but the wiring seam MUST
+ * source it from the daemon's own current-run probe, NEVER accept it from the
+ * WS client. Freshness is only meaningful when probedAtMs and the trusted
+ * clock.now()/maxAgeMs share the daemon's monotonic time base.
+ *
+ * Same-quarantined-staging-scope contract (owned by the S7 daemon wiring):
+ * provenanceIo.readProvenanceRecord and checksumIo.readBytes MUST both be
+ * rooted in the SAME quarantined stagingPath that step 1 proves quarantined.
+ * This orchestrator verifies provenance (authority identity) and checksum
+ * (content integrity) independently; the guarantee that the verified bytes
+ * came from the proven authority rests on both readers addressing one and the
+ * same staged source. Binding manifestFingerprint into the provenance record
+ * is a possible future hardening, deferred to a later slice.
  */
 export function createWorkspaceRestoreMigrationOperation(deps = {}) {
   if (!isPlainObject(deps)) {
