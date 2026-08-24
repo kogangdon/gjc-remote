@@ -2030,3 +2030,31 @@ test("WORKSPACE_ADMISSION_EXCEEDED is a first-class, classification-safe protoco
     true
   );
 });
+
+
+test("WORKSPACE_RESIDUAL_PROCESS is a first-class, classification-safe protocol code", () => {
+  const code = PROTOCOL_ERROR_CODES.WORKSPACE_RESIDUAL_PROCESS;
+  assert.equal(code, "WORKSPACE_RESIDUAL_PROCESS");
+
+  // Membership in PROTOCOL_ERROR_CODES is what makes classifyReadinessError
+  // PRESERVE this S5 lifecycle code rather than collapse it to a generic
+  // fallback. Mirror the WORKSPACE_ADMISSION_EXCEEDED first-class guard.
+  const codeSet = new Set(Object.values(PROTOCOL_ERROR_CODES));
+  assert.equal(codeSet.has(code), true);
+
+  // Canonical remediation tuple: retryable, retry_later, frozen -- the residual
+  // processes can be terminated / waited out, then the destructive op retried.
+  assert.deepEqual(READINESS_REMEDIATIONS[code], {
+    code,
+    retryable: true,
+    action: "retry_later",
+  });
+  assert.equal(Object.isFrozen(READINESS_REMEDIATIONS[code]), true);
+
+  // Grouped with the workspace/mapping/lease taxonomy, next to LEASE_CONFLICT.
+  assert.equal(READINESS_ERROR_TAXONOMY.workspaceMappingLease.includes(code), true);
+  assert.equal(
+    READINESS_ERROR_TAXONOMY.workspaceMappingLease.includes(PROTOCOL_ERROR_CODES.LEASE_CONFLICT),
+    true
+  );
+});
