@@ -58,7 +58,11 @@ import {
   initializeInventoryConfig,
   inventoryConfigDiagnostic,
 } from "./inventory-config.js";
-import { WorkspaceLeaseRegistry } from "./workspace-lease-registry.js";
+import {
+  WorkspaceLeaseRegistry,
+  DEFAULT_MAX_ACTIVE_WORKSPACES,
+} from "./workspace-lease-registry.js";
+import { isLeaseBoundaryRejection } from "./readiness-classification.js";
 import { RequestIdFence } from "./request-id-fence.js";
 
 import {
@@ -337,7 +341,9 @@ try {
 
 const pool = new SessionPool({ sensitiveValues: daemonSensitiveValues });
 const admissionBudget = new AdmissionBudget();
-const workspaceLeases = new WorkspaceLeaseRegistry();
+const workspaceLeases = new WorkspaceLeaseRegistry({
+  maxActiveWorkspaces: DEFAULT_MAX_ACTIVE_WORKSPACES,
+});
 const requestIds = new RequestIdFence();
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
@@ -1536,7 +1542,12 @@ async function admitReadyWorkload(state, workDir, message) {
       error,
       PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
     );
-    if (errorCode === PROTOCOL_ERROR_CODES.LEASE_CONFLICT) {
+    // WORKSPACE_ADMISSION_EXCEEDED, like LEASE_CONFLICT, is a synchronous
+    // rejection at the lease-acquisition boundary itself (acquireActivity threw
+    // fail-closed at the host-wide active-workspace ceiling), not a downstream
+    // session/readiness-state fault. Return the distinct fail-closed error
+    // directly without polluting the binding's readiness state.
+    if (isLeaseBoundaryRejection(errorCode)) {
       return { error: makeReadinessError(errorCode) };
     }
     setReadinessError(state, error, PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);

@@ -1,5 +1,8 @@
 import { PROTOCOL_ERROR_CODES } from "@gjc-remote/shared";
 
+/** Host-wide active-workspace admission ceiling (#43). */
+export const DEFAULT_MAX_ACTIVE_WORKSPACES = 8;
+
 const V3_AUTHORITY_FIELDS = [
   "authorityEpoch",
   "fenceGeneration",
@@ -42,6 +45,12 @@ const RECEIPT_IDENTITY_FIELDS = [
 function leaseConflict() {
   const error = new Error(PROTOCOL_ERROR_CODES.LEASE_CONFLICT);
   error.code = PROTOCOL_ERROR_CODES.LEASE_CONFLICT;
+  return error;
+}
+
+function workspaceAdmissionExceeded() {
+  const error = new Error(PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED);
+  error.code = PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED;
   return error;
 }
 
@@ -113,16 +122,36 @@ function authorityChanged(previous, candidate) {
  * This registry deliberately does not claim durable crash recovery. It closes
  * live-process replay and admission races while the final durable lifecycle
  * journal remains a separate Phase 2 gate.
+ *
+ * Two distinct, independently-configured bounds live here:
+ *   - `maxWorkspaces` (default 64) caps how many workspace *authorities* a
+ *     socket may register via `adoptBinding` (binding/authority retention),
+ *     matching `MAX_BINDINGS_PER_SOCKET`.
+ *   - `maxActiveWorkspaces` (default 8) caps how many *distinct* workspaces may
+ *     simultaneously hold an activity lease host-wide (the #43 active-workspace
+ *     admission bound). Enforced inside `acquireActivity` for new-entry
+ *     creation only, fail-closed with `WORKSPACE_ADMISSION_EXCEEDED`.
+ *
+ * Forward-scaffolding / dormancy note: `acquireActivity` is reached from the
+ * daemon invoke handler only after the `NATIVE_WORKSPACE_SERVING_ENABLED`
+ * serving gate, which is hard-disabled today. The `maxActiveWorkspaces` bound
+ * is therefore dormant on the live invoke wire (exactly like the existing
+ * 8-session `SessionPool` bound) and is proven at this registry's own API
+ * surface, not via a live serving invoke, until a later serving-enable slice.
  */
 export class WorkspaceLeaseRegistry {
-  constructor({ maxWorkspaces = 64 } = {}) {
+  constructor({ maxWorkspaces = 64, maxActiveWorkspaces = DEFAULT_MAX_ACTIVE_WORKSPACES } = {}) {
     if (!Number.isSafeInteger(maxWorkspaces) || maxWorkspaces < 1) {
       throw new TypeError("maxWorkspaces must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(maxActiveWorkspaces) || maxActiveWorkspaces < 1) {
+      throw new TypeError("maxActiveWorkspaces must be a positive safe integer");
     }
     this.authorities = new Map();
     this.activities = new Map();
     this.nextFence = 0;
     this.maxWorkspaces = maxWorkspaces;
+    this.maxActiveWorkspaces = maxActiveWorkspaces;
   }
 
   adoptBinding(candidate) {
@@ -231,6 +260,15 @@ export class WorkspaceLeaseRegistry {
     }
 
     if (!entry) {
+      // Host-wide active-workspace admission (#43): a brand-new distinct active
+      // workspace may only be admitted while under the ceiling. Stale entries
+      // were already deleted above, so `activities.size` reflects only live
+      // holders; re-admitting a stale workspaceId at capacity therefore still
+      // succeeds. Fail-closed, synchronous check-then-reserve (no await between
+      // the size check and entry creation), matching SessionPool/AdmissionBudget.
+      if (this.activities.size >= this.maxActiveWorkspaces) {
+        throw workspaceAdmissionExceeded();
+      }
       this.nextFence =
         this.nextFence >= Number.MAX_SAFE_INTEGER ? 1 : this.nextFence + 1;
       entry = {

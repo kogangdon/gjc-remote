@@ -12,6 +12,7 @@ import {
   PROTOCOL_VERSION_V3,
   PROTOCOL_ERROR_CODES,
   READINESS_REMEDIATIONS,
+  READINESS_ERROR_TAXONOMY,
   V0_LIMITS,
   READINESS_DEFAULT_TTL_MS,
   READINESS_DIMENSIONS,
@@ -2002,4 +2003,30 @@ test("readiness remediation tuples are canonical and stable", () => {
     assert.deepEqual(READINESS_REMEDIATIONS[code], tuple);
     assert.equal(Object.isFrozen(READINESS_REMEDIATIONS[code]), true);
   }
+});
+
+test("WORKSPACE_ADMISSION_EXCEEDED is a first-class, classification-safe protocol code", () => {
+  const code = PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED;
+  assert.equal(code, "WORKSPACE_ADMISSION_EXCEEDED");
+
+  // Blocking guard (#43): membership in the taxonomy value set is exactly what
+  // makes daemon.classifyReadinessError PRESERVE this code rather than collapse
+  // it to UNKNOWN_RUNTIME / a generic fallback. Mirror that membership check.
+  const codeSet = new Set(Object.values(PROTOCOL_ERROR_CODES));
+  assert.equal(codeSet.has(code), true);
+
+  // Canonical remediation tuple: retryable, retry_later, frozen.
+  assert.deepEqual(READINESS_REMEDIATIONS[code], {
+    code,
+    retryable: true,
+    action: "retry_later",
+  });
+  assert.equal(Object.isFrozen(READINESS_REMEDIATIONS[code]), true);
+
+  // Grouped with the resource/session admission taxonomy, next to SESSION_LIMIT.
+  assert.equal(READINESS_ERROR_TAXONOMY.resourceSession.includes(code), true);
+  assert.equal(
+    READINESS_ERROR_TAXONOMY.resourceSession.includes(PROTOCOL_ERROR_CODES.SESSION_LIMIT),
+    true
+  );
 });

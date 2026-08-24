@@ -1763,6 +1763,15 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       });
     }
 
+    // Bot-side network backpressure guard, NOT host-wide resource admission
+    // authority. This per-socket pending cap bounds how many invokes the bot
+    // will forward to a single daemon connection before applying flow control;
+    // it is a thin, two-layer safeguard that intentionally mirrors (by
+    // convention, asserted equal in test) the daemon's authoritative
+    // AdmissionBudget in-flight-invoke ceiling. The single source of truth for
+    // host-wide admission (8 active workspaces / 8 SDK sessions / 64 in-flight
+    // invokes) is the daemon process; this is layer-two, not a second
+    // authority.
     const pendingForSocket = this.pendingCountBySocket.get(socket) ?? 0;
     if (pendingForSocket >= V0_LIMITS.MAX_PENDING_PER_HOST) {
       return Promise.resolve({
