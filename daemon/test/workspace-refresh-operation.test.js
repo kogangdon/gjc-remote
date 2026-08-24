@@ -354,6 +354,15 @@ test("a caller-forged readiness.workspace dimension is ignored", async () => {
   assert.equal(result.published.published, true);
 });
 
+test("a malformed lease (missing isCurrent) is refused CONFIG_INVALID but still released", async () => {
+  const base = baseGenerationPointer();
+  let released = 0;
+  const acquireFence = () => ({ fence: 1, release: () => { released++; } });
+  const { deps } = makeDeps({ publishIo: fakePublishIo(generationPointerBytes(base)), acquireFence });
+  await expectRefusal(createWorkspaceRefreshOperation(deps).runRefresh(baseRequest(base)), "CONFIG_INVALID");
+  assert.equal(released, 1);
+});
+
 test("construction rejects a missing acquireFence", () => {
   const base = baseGenerationPointer();
   const { deps } = makeDeps({ publishIo: fakePublishIo(generationPointerBytes(base)) });

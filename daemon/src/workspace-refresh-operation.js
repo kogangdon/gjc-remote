@@ -101,6 +101,12 @@ function assertFn(container, name, path) {
  * the injected seen-set is grow-only here and MUST be bounded/evicted by the
  * wiring in step with the freshness window. add-before-publish means a failed
  * publish permanently burns its attestation (fail-closed).
+ *
+ * probedAtMs contract (owned by the S7 daemon wiring): request.probedAtMs is
+ * validated here only as a non-negative safe integer, but the wiring seam MUST
+ * source it from the daemon's own current-run probe, NEVER accept it from the
+ * WS client. Freshness is only meaningful when probedAtMs and the trusted
+ * clock.now()/maxAgeMs share the daemon's monotonic time base.
  */
 export function createWorkspaceRefreshOperation(deps = {}) {
   if (!isPlainObject(deps)) {
@@ -213,10 +219,12 @@ export function createWorkspaceRefreshOperation(deps = {}) {
     // Step 1 -- acquire the prompt/read activity fence. Throws LEASE_CONFLICT /
     // WORKSPACE_ADMISSION_EXCEEDED on acquisition failure (no fence to release).
     const lease = acquireFence(request.leaseCandidate);
-    if (!lease || typeof lease.isCurrent !== "function" || typeof lease.release !== "function") {
-      refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "acquireFence must return a lease with { isCurrent, release }");
-    }
     try {
+      // Shape guard runs INSIDE the try so a malformed-but-releasable lease is
+      // still released by the finally below.
+      if (!lease || typeof lease.isCurrent !== "function" || typeof lease.release !== "function") {
+        refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "acquireFence must return a lease with { isCurrent, release }");
+      }
       // Step 2 -- expected mapping / workspace-generation check against the live
       // pointer (the base the refresh builds on). Read the live pointer once.
       const live = await readLiveGeneration(publishIo);
@@ -325,7 +333,7 @@ export function createWorkspaceRefreshOperation(deps = {}) {
         manifestFingerprint,
       });
     } finally {
-      lease.release();
+      if (lease && typeof lease.release === "function") lease.release();
     }
   }
 
