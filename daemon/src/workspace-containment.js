@@ -39,8 +39,9 @@
 // junction cannot be silently traversed. `read_identity` on the fully verified
 // leaf yields the object identity. A residual same-process TOCTOU window
 // between successive prefix checks is unavoidable with path-based primitives;
-// the shallow-to-deep ordering minimises it and callers that need a stronger
-// guarantee pass `expectedRootIdentity` for post-operation swap detection.
+// the shallow-to-deep ordering minimises it. `expectedRootIdentity` detects a
+// replacement of the ROOT directory only (not an intermediate-component swap
+// mid-walk); intermediate races remain the caller protocol's concern.
 
 const OPERATION = "verify_workspace_containment";
 const SUPPORTED_PLATFORMS = new Set(["posix", "windows-drive"]);
@@ -140,6 +141,10 @@ function relativeComponents(workDir, candidate, sourcePlatform) {
 
   const posix = sourcePlatform === "posix";
   const sep = separatorFor(sourcePlatform);
+  // Windows path comparison is case-insensitive. toLowerCase() is an
+  // approximation of NTFS $UpCase folding, but the direction is fail-closed:
+  // the walked path is always reconstructed from workDir + verified components,
+  // so a folding mismatch can only over-refuse, never admit an escape.
   const insensitive = !posix;
   // On Windows tolerate a forward slash in the incoming candidate by
   // normalising to the native separator before any comparison or split.
@@ -283,10 +288,13 @@ export function createWorkspaceContainment({ lowLevel, platform = process.platfo
       if (isNoFollowRefusal(error)) {
         refuse("REPARSE_POINT_REJECTED", "candidate leaf cannot be read without following a reparse point");
       }
-      refuse("CANDIDATE_NOT_FOUND", "candidate leaf identity is unavailable");
+      // Fail closed; fold the native code into the reason so an unexpected
+      // condition (EACCES/EIO) is diagnosable rather than silently ENOENT-like.
+      refuse("CANDIDATE_NOT_FOUND", `candidate leaf identity is unavailable: ${error?.code ?? "unknown"}`);
     }
-    if (identity === null || typeof identity !== "object" || Array.isArray(identity)) {
-      refuse("CANDIDATE_NOT_FOUND", "candidate leaf identity is unavailable");
+    if (identity === null || typeof identity !== "object" || Array.isArray(identity) ||
+        Object.keys(identity).length === 0) {
+      refuse("CANDIDATE_NOT_FOUND", "candidate leaf identity is empty or malformed");
     }
 
     return Object.freeze({

@@ -271,6 +271,32 @@ test("verifyContained rejects a reparse point at a middle component", async () =
   assert.ok(!fake.calls.some((call) => call[1] === "/srv/ws/proj/link/deep"));
 });
 
+test("verifyContained refuses a same-drive sibling that shares the root's string prefix", async () => {
+  const posixFake = makeFake({ facts: posixFacts() });
+  const posixContainment = createWorkspaceContainment({ lowLevel: posixFake });
+  await expectRefusal(
+    posixContainment.verifyContained({
+      workDir: "/srv/ws/proj",
+      sourcePlatform: "posix",
+      candidate: "/srv/ws/proj-evil/secret",
+    }),
+    "WORKSPACE_ROOT_ESCAPE",
+  );
+  assert.equal(posixFake.calls.length, 0);
+
+  const winFake = makeFake({ facts: windowsFacts() });
+  const winContainment = createWorkspaceContainment({ lowLevel: winFake, platform: "win32" });
+  await expectRefusal(
+    winContainment.verifyContained({
+      workDir: "C:\\ws\\proj",
+      sourcePlatform: "windows-drive",
+      candidate: "C:\\ws\\projevil\\secret",
+    }),
+    "WORKSPACE_ROOT_ESCAPE",
+  );
+  assert.equal(winFake.calls.length, 0);
+});
+
 test("verifyContained maps a missing component to CANDIDATE_NOT_FOUND", async () => {
   const fake = makeFake({ facts: posixFacts(), nodes: new Map() });
   const containment = createWorkspaceContainment({ lowLevel: fake });
