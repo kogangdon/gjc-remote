@@ -284,13 +284,23 @@ disposals, emits one bounded negative readiness frame, and closes the socket wit
 test-only `GJC_INVENTORY_POLL_MS` override on the default 5-second poll interval is honored only
 under test injection.
 
-**Key as-built gap.** `initializeInventoryConfig` (daemon/src/inventory-config.js) is NOT imported by
-daemon boot, so the production daemon never constructs a native inventory reader; the production
-native-reader path is not yet wired. Consequently, verify-mode `workspace_inventory_receipt_v2`
-advertisement is reachable in production only under `GJC_READINESS_TEST_INJECTION=1` test-injected
-inventory. Daemon-boot native-reader wiring, and native serving itself, are FUTURE work gated behind
-the existing native-serving boundary defined earlier in this document; this section does not bring
-either into scope early.
+**Daemon-boot native-reader wiring (#53 Phase 2).** `initializeInventoryConfig`
+(daemon/src/inventory-config.js) is now wired into daemon boot through a pure, DI-testable helper
+`resolveInventoryProviderConfig` (daemon/src/inventory-boot-wiring.js). At boot the helper applies a
+single mutually-exclusive precedence: test injection (`GJC_READINESS_TEST_INJECTION=1`) is checked
+FIRST and short-circuits to the unchanged legacy test-injection provider options; only when test
+injection is disabled AND `GJC_NATIVE_INVENTORY_MODE` is exactly `verify` does the daemon construct
+and self-test the production native reader via `initializeInventoryConfig` and thread it into
+`createWorkspaceInventoryProvider({reader})`; otherwise (`off`/unset) it forwards the same legacy
+options as before, preserving the fail-closed misconfig guard for a stray `GJC_WORKSPACE_INVENTORY`.
+Verify-mode configuration/self-test failure is dispatched through a dedicated catch that maps the
+error to a structured, path-free, secret-free `inventoryConfigDiagnostic` and `process.exit(1)` (never
+`sanitizeDaemonError`); provider construction/read failures keep their existing `sanitizeDaemonError`
+catch. The `workspace_inventory_receipt_v2` advertisement keying is unchanged, so a production
+verify-mode receipt now depends on a genuinely self-tested native reader rather than requiring
+test-injected inventory. Native serving itself remains FUTURE work gated behind the existing
+native-serving boundary defined earlier in this document (`NATIVE_WORKSPACE_SERVING_ENABLED = false`
+is unchanged); this wiring does not bring serving into scope.
 
 This is as-built status reconciliation only. It does not authorize native workspace serving, does not
 weaken any Phase 1-4 gate above, and does not make local inventory a route or mapping authority: the

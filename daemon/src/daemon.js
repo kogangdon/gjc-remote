@@ -53,6 +53,11 @@ import {
 import { serializeEventFrame } from "./event-frame.js";
 import { findWorkspaceInventory } from "./workspace-inventory.js";
 import { createWorkspaceInventoryProvider } from "./workspace-inventory-provider.js";
+import { resolveInventoryProviderConfig } from "./inventory-boot-wiring.js";
+import {
+  initializeInventoryConfig,
+  inventoryConfigDiagnostic,
+} from "./inventory-config.js";
 import { WorkspaceLeaseRegistry } from "./workspace-lease-registry.js";
 import { RequestIdFence } from "./request-id-fence.js";
 
@@ -102,18 +107,30 @@ if (nativeInventoryMode !== "off" && nativeInventoryMode !== "verify") {
   console.error("daemon: GJC_NATIVE_INVENTORY_MODE must be off or verify");
   process.exit(1);
 }
+// Dedicated config resolution: verify-mode failures map to a structured,
+// path-free, secret-free diagnostic and terminate boot (never sanitizeDaemonError).
+const inventoryConfigResult = await resolveInventoryProviderConfig(
+  {
+    testInjectionEnabled: READINESS_TEST_INJECTION_ENABLED,
+    nativeInventoryMode,
+    hostId: HOST_ID,
+    platform: process.platform,
+  },
+  { initializeInventoryConfig, inventoryConfigDiagnostic },
+);
+if (inventoryConfigResult.ok !== true) {
+  console.error(
+    `daemon: native inventory verify configuration failed: ${JSON.stringify(inventoryConfigResult.diagnostic)}`,
+  );
+  process.exit(1);
+}
 let inventoryProvider;
 let initialInventoryRead;
 try {
-  inventoryProvider = createWorkspaceInventoryProvider({
-    testInjectionEnabled: READINESS_TEST_INJECTION_ENABLED,
-    serializedTestInventory: process.env.GJC_WORKSPACE_INVENTORY,
-    testStatus: process.env.GJC_WORKSPACE_INVENTORY_TEST_STATUS,
-    testEpochMismatch: process.env.GJC_WORKSPACE_INVENTORY_TEST_EPOCH_MISMATCH === "1",
-  });
+  inventoryProvider = createWorkspaceInventoryProvider(inventoryConfigResult.providerOptions);
   initialInventoryRead = await inventoryProvider.read();
 } catch (error) {
-  console.error(`daemon: invalid GJC_WORKSPACE_INVENTORY: ${sanitizeDaemonError(error)}`);
+  console.error(`daemon: workspace inventory provider failed: ${sanitizeDaemonError(error)}`);
   process.exit(1);
 }
 const inventoryReceiptAdvertised =
