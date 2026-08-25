@@ -7,8 +7,10 @@
 // that a development flag CANNOT satisfy. Today that seam trusts an injected
 // dev-probe token (READINESS_TEST_INJECTION_ENABLED / readinessTestEvidence);
 // this module is the real probe that replaces the dev-probe role. The literal
-// GJC_DEV_CONNECTIVITY_PROBE removal is deferred to the S6 gate; S4e supplies
-// the primitive so S4f/S4g can wire it.
+// GJC_DEV_CONNECTIVITY_PROBE flag was removed in slice S6e (retired gate
+// FULL_GRAPH_PUBLICATION_TESTS_PASS); its presence now fails the daemon closed
+// at boot (see workspace-removed-flags.js). This module supplies the primitive
+// that S4f/S4g wire so connectivity probing is unconditional.
 //
 // The five dimensions mirror the daemon readiness status vocabulary
 // (state.status): connection, runtime, providerAuth, modelProfile, workspace.

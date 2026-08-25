@@ -73,6 +73,7 @@ import {
   sanitizeErrorMessage,
   createReconnectScheduler,
 } from "./reconnect.js";
+import { assertNoRemovedDevFlags } from "./workspace-removed-flags.js";
 
 const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
 
@@ -80,6 +81,12 @@ if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
   console.error("Missing HOST_ID, HOST_TOKEN, or BOT_WS_URL in environment (.env).");
   process.exit(1);
 }
+
+// Fail closed at boot if a retired interim dev flag lingers in the environment
+// (GJC_DEV_NATIVE_SINGLE_WRITER_LOCK / GJC_DEV_CONNECTIVITY_PROBE). Presence-based
+// rejection, per-retired-gate unique diagnostic. This does NOT flip the
+// native-serving boundary (that remains the human-approved S6f decision).
+assertNoRemovedDevFlags(process.env);
 function readBotWsUrlCredentials(value) {
   try {
     const url = new URL(value);
