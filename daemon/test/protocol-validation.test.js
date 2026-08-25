@@ -1152,6 +1152,107 @@ test("daemon rejects a stale workspace binding replayed on a new socket", async 
   }
 });
 
+test("daemon rejects a cross-host workspace binding before acknowledging", async () => {
+  const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    let acknowledged = false;
+    daemon.peer.on("message", (raw) => {
+      if (JSON.parse(raw.toString()).type === MSG_TYPES.BIND_OK) acknowledged = true;
+    });
+    const closed = once(daemon.peer, "close");
+    // Structurally valid, but the hostId does not match this daemon's identity.
+    // A foreign-host bind must fail closed before any acknowledgement.
+    daemon.peer.send(JSON.stringify({
+      ...validBinding,
+      bindingId: "binding-foreign-host",
+      hostId: "other-host",
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+    assert.equal(acknowledged, false);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("daemon rejects a malformed workspace binding closed without acknowledging", async () => {
+  const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V2,
+      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    let acknowledged = false;
+    daemon.peer.on("message", (raw) => {
+      if (JSON.parse(raw.toString()).type === MSG_TYPES.BIND_OK) acknowledged = true;
+    });
+    const closed = once(daemon.peer, "close");
+    // routeFingerprint is not a 64-hex digest: the bind fails shape validation
+    // and the daemon serving boundary must close fail-closed, never acknowledge.
+    daemon.peer.send(JSON.stringify({
+      ...validBinding,
+      bindingId: "binding-malformed",
+      routeFingerprint: "not-a-fingerprint",
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+    assert.equal(acknowledged, false);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("v3 rejects a cross-host receipt binding before acknowledging", async () => {
+  const inventory = serializedTestInventory({
+    inventoryGeneration: 4,
+    workspaces: [capabilityWorkspace(receiptBinding, "/srv/workspace")],
+  });
+  const daemon = await startDaemon({
+    GJC_READINESS_V2: "1",
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_TEST_PROBE: "pass",
+    GJC_NATIVE_INVENTORY_MODE: "verify",
+    GJC_WORKSPACE_INVENTORY: inventory,
+  });
+  try {
+    assert.equal(daemon.register.protocolVersion, PROTOCOL_VERSION_V3);
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await onceMessage(daemon.peer, MSG_TYPES.READINESS);
+    let acknowledged = false;
+    daemon.peer.on("message", (raw) => {
+      if (JSON.parse(raw.toString()).type === MSG_TYPES.BIND_OK) acknowledged = true;
+    });
+    const closed = once(daemon.peer, "close");
+    // The receipt path also authenticates hostId identity: a foreign-host
+    // receipt bind fails closed before deriving any proof or acknowledgement.
+    daemon.peer.send(JSON.stringify({
+      ...receiptBinding,
+      bindingId: "receipt-foreign-host",
+      hostId: "other-host",
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+    assert.equal(acknowledged, false);
+  } finally {
+    await daemon.close();
+  }
+});
+
 test("daemon rejects a second binding for the same workspace without a generation advance", async () => {
   const daemon = await startDaemon({ GJC_READINESS_V2: "1" });
   try {
