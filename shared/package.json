@@ -21,6 +21,7 @@
     "./successor-envelope": "./successor-envelope.js",
     "./workspace-binding": "./workspace-binding.js",
     "./workspace-inventory": "./workspace-inventory.js",
+    "./workspace-lifecycle-envelope": "./workspace-lifecycle-envelope.js",
     "./*": "./*"
   }
 }
