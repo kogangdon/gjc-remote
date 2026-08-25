@@ -123,12 +123,15 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving verification remains N/A.** Native workspace serving is disabled by a
-const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon/src/daemon.js:199), with no env/config
-override anywhere in the repository; the bot side defaults to false as well and is not overridden
-at startup. Separately, the production native-reader path is not yet wired:
-`initializeInventoryConfig` is not imported by daemon boot, so the production daemon never
-constructs a native reader, and verify-mode `workspace_inventory_receipt_v2` advertisement is
-reachable in production only under `GJC_READINESS_TEST_INJECTION=1` test injection. Both the
-native-serving enablement and the native-reader daemon-boot wiring are future slices; their
-verification belongs to that future reader-wiring / native-serving boundary, not to this epic's
-landed evidence.
+const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon/src/daemon.js:227), with no env/config
+override anywhere in the repository; its sole read site is inside `admitReadyWorkload`, which returns
+`RUNTIME_INCOMPATIBLE` while the gate is off; the bot side defaults to false as well and is not
+overridden at startup. The production native-reader daemon-boot wiring is now landed (commit
+e62b7b5, #141): `daemon/src/daemon.js` imports `initializeInventoryConfig` and, when
+`GJC_NATIVE_INVENTORY_MODE === 'verify'` and outside test injection, constructs and self-tests the
+production native reader via `daemon/src/inventory-boot-wiring.js`, threading it into
+`createWorkspaceInventoryProvider({reader})`; verify-mode config or self-test failure hard-exits with
+a sanitized diagnostic. That reader wiring explicitly does not bring serving into scope. The
+native-serving enablement is the sole remaining future slice (issue #81, S6f): it stays gated behind
+the unchanged `NATIVE_WORKSPACE_SERVING_ENABLED = false`, and its verification belongs to that future
+native-serving boundary, not to this epic's landed evidence.
