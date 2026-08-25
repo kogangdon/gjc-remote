@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -38,7 +38,14 @@ function loadAddonOrSkip(t) {
 }
 
 async function withWorkspace(run) {
-  const root = await mkdtemp(join(tmpdir(), "gjc-containment-"));
+  // The native read_workspace_root_facts always returns the fully canonical
+  // long-form workDir (GetFinalPathNameByHandle, \\?\ stripped), and
+  // identifyRoot's strict facts.workDir === workDir integrity check requires
+  // the injected workDir to already be canonical. os.tmpdir() can hand back an
+  // 8.3 short-name path (e.g. C:\Users\RUNNER~1\... on GitHub-hosted Windows
+  // runners) whose long form the native resolves, so canonicalize the created
+  // root here to feed identifyRoot the same canonical path it will echo back.
+  const root = realpathSync.native(await mkdtemp(join(tmpdir(), "gjc-containment-")));
   try {
     return await run(root);
   } finally {
