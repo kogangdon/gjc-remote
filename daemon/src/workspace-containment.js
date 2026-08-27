@@ -131,7 +131,7 @@ const separatorFor = (sourcePlatform) => (sourcePlatform === "posix" ? "/" : "\\
 // refusing any lexical escape (NUL byte, "..", absolute path outside the root,
 // or a drive/root-prefix mismatch) BEFORE any filesystem access. Returns [] when
 // the candidate denotes the root itself.
-function relativeComponents(workDir, candidate, sourcePlatform) {
+export function relativeComponents(workDir, candidate, sourcePlatform) {
   if (typeof candidate !== "string" || candidate.length === 0) {
     refuse("WORKSPACE_ROOT_ESCAPE", "candidate is empty");
   }
