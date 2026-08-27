@@ -88,6 +88,26 @@ test("containment refusal: a NUL byte in relPath is refused", async () => {
   });
 });
 
+test("hardening: sourcePlatform must be 'posix' or 'windows'", async () => {
+  await withTempRoot(async (root) => {
+    assert.throws(() => createContainedByteReader({ root, sourcePlatform: "win32" }), TypeError);
+    assert.throws(() => createContainedByteReader({ root, sourcePlatform: "linux" }), TypeError);
+  });
+});
+
+test("hardening: a posix-mode component carrying a foreign backslash separator is refused (no cross-vocabulary escape)", async () => {
+  await withTempRoot(async (root) => {
+    // In 'posix' mode relativeComponents splits on '/' only, so "..\\secret"
+    // survives as one opaque segment; the host FS would still resolve the
+    // backslash as a traversal on win32. The embedded-separator guard refuses it.
+    const reader = createContainedByteReader({ root, sourcePlatform: "posix" });
+    await assert.rejects(
+      reader.readBytes("..\\secret"),
+      (error) => error.code === "WORKSPACE_ROOT_ESCAPE"
+    );
+  });
+});
+
 test("leaf reparse refusal: a symlink leaf is refused", async (t) => {
   await withTempRoot(async (root) => {
     await writeFile(path.join(root, "real.txt"), "real bytes");

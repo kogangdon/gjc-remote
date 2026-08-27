@@ -65,6 +65,9 @@ export function createContainedByteReader({
   if (typeof root !== "string" || root.length === 0) {
     throw new TypeError("createContainedByteReader requires a non-empty root string");
   }
+  if (sourcePlatform !== "posix" && sourcePlatform !== "windows") {
+    throw new TypeError("createContainedByteReader sourcePlatform must be 'posix' or 'windows'");
+  }
 
   const containmentPlatform = sourcePlatform === "windows" ? "windows-drive" : "posix";
   const sep = sourcePlatform === "windows" ? "\\" : "/";
@@ -74,11 +77,26 @@ export function createContainedByteReader({
     // WORKSPACE_ROOT_ESCAPE on NUL byte / absolute-outside-root / "."/".."
     // traversal segments.
     const components = relativeComponents(root, relPath, containmentPlatform);
+    // Defense in depth against a platform-vocabulary mismatch: relativeComponents
+    // splits on the sourcePlatform separator only, so in 'posix' mode a component
+    // like "..\\secret" survives as one opaque segment that the host filesystem
+    // would still resolve as a traversal. Refuse ANY verified component that
+    // carries a foreign path separator, so no relPath can escape root regardless
+    // of the sourcePlatform vs host-platform combination.
+    for (const component of components) {
+      if (component.includes("/") || component.includes("\\")) {
+        refuseReparseLeaf("byte-reader refuses a path component with an embedded separator");
+      }
+    }
     const resolvedPath = components.length === 0 ? root : `${root}${sep}${components.join(sep)}`;
 
     if (process.platform === "win32") {
       // O_NOFOLLOW has no effect on Windows fs.open; use lstat on the
       // resolved leaf to detect and refuse a symlink leaf before reading.
+      // NOTE: the lstat -> readFile pair has an inherent leaf-swap TOCTOU window
+      // on win32 (readFile follows a symlink); full per-component reparse
+      // verification is the containment dep's responsibility, deferred to S7
+      // (#171). This is a cheap best-effort leaf guard, not full protection.
       const stats = await lstat(resolvedPath);
       if (stats.isSymbolicLink()) {
         refuseReparseLeaf("byte-reader refuses a reparse-point leaf");
