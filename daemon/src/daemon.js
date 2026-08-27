@@ -35,6 +35,7 @@ import {
   isReadinessTtl,
   isRegisterDeniedMessage,
   isRegisterOkMessage,
+  isWorkspaceLifecycleMessage,
   negotiateCapabilities,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
@@ -1821,6 +1822,39 @@ async function handleMessage(
       return;
     }
     connection.send(JSON.stringify({ type: MSG_TYPES.UNBIND_OK, bindingId: msg.bindingId }));
+    return;
+  }
+  if (
+    msg?.type === MSG_TYPES.WORKSPACE_CREATE ||
+    msg?.type === MSG_TYPES.WORKSPACE_REFRESH ||
+    msg?.type === MSG_TYPES.WORKSPACE_RESET_DELETE ||
+    msg?.type === MSG_TYPES.WORKSPACE_RESTORE_MIGRATION
+  ) {
+    if (!isWorkspaceLifecycleMessage(msg)) {
+      connection.close(1008, "invalid workspace lifecycle message");
+      return;
+    }
+    // S6f.1b contract stub (#81): message types are recognized and
+    // shape-validated here, but no orchestrator is wired until
+    // S6f.2-S6f.5, and serving stays gated off
+    // (NATIVE_WORKSPACE_SERVING_ENABLED=false). Refuse with
+    // RUNTIME_INCOMPATIBLE using the same readiness-rejection shape the
+    // INVOKE path uses for a gated/unready operation.
+    connection.send(
+      JSON.stringify({
+        type: MSG_TYPES.EVENT,
+        requestId: msg.idempotencyFingerprint,
+        event: {
+          type: "workspace_lifecycle_refused",
+          operation: msg.operation,
+          workspaceId: msg.workspaceId,
+        },
+        error: formatReadinessRejection(
+          makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE)
+        ),
+        done: true,
+      })
+    );
     return;
   }
   const hasV2RouteField = [
