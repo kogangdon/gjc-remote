@@ -35,7 +35,21 @@ test("happy path: readBytes returns the exact bytes written at a nested relative
   });
 });
 
-test("windows-style separators: a forward-slash relPath is tolerated in windows mode", async () => {
+test("windows-style separators: a forward-slash relPath normalizes like a backslash one in windows mode", async (t) => {
+  // The reader tolerates a forward-slash relPath in windows mode by normalizing
+  // to '\' before the containment split, so 'a/b.txt' verifies to the same
+  // components as 'a\b.txt'. Asserting the containment normalization is
+  // platform-independent; a real read joins with '\', which only resolves on a
+  // Windows filesystem, so the read itself is exercised only on win32.
+  assert.deepEqual(relativeComponents("C:\\root", "a/b.txt", "windows-drive"), ["a", "b.txt"]);
+  assert.deepEqual(
+    relativeComponents("C:\\root", "a/b.txt", "windows-drive"),
+    relativeComponents("C:\\root", "a\\b.txt", "windows-drive")
+  );
+  if (process.platform !== "win32") {
+    t.skip("windows-mode real read requires a Windows filesystem");
+    return;
+  }
   await withTempRoot(async (root) => {
     await mkdir(path.join(root, "a"), { recursive: true });
     const expected = Buffer.from("windows mode forward slash", "utf8");
