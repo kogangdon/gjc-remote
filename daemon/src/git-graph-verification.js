@@ -40,7 +40,7 @@ import { isAbsolute } from "node:path";
 // git accepts the platform null device as a config path and reads it as empty;
 // os.devNull (\\.\nul on Windows) is NOT accepted by git ("Invalid argument"),
 // so we use the config-safe spelling explicitly.
-const NULL_CONFIG = process.platform === "win32" ? "NUL" : "/dev/null";
+export const NULL_CONFIG = process.platform === "win32" ? "NUL" : "/dev/null";
 
 const OPERATION = "verify_git_graph";
 
@@ -48,8 +48,8 @@ const OPERATION = "verify_git_graph";
 // ambient config) were introduced in git 2.32, so we floor there rather than at
 // the flag-level minimum (2.16). Fail-closed below 2.32: a security primitive
 // must not run where its config-neutralisation is a silent no-op.
-const MIN_GIT_MAJOR = 2;
-const MIN_GIT_MINOR = 32;
+export const MIN_GIT_MAJOR = 2;
+export const MIN_GIT_MINOR = 32;
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_BUFFER = 64 * 1024 * 1024; // 64 MiB of object-name output
@@ -78,7 +78,7 @@ function refuse(code, reason, extra) {
 // Build the scrubbed environment once. Redirecting global/system config to the
 // OS null device is the modern robust way to guarantee no ambient git config
 // (aliases, hooksPath, includeIf, credential helpers) influences verification.
-function buildScrubbedEnv(gitPath) {
+export function buildScrubbedEnv(gitPath) {
   // GIT_CONFIG_GLOBAL overrides ~/.gitconfig AND ~/.config/git/config (and thus
   // XDG), so pointing it plus GIT_CONFIG_SYSTEM at the null device, together
   // with GIT_CONFIG_NOSYSTEM=1, fully neutralises ambient config without any
@@ -105,7 +105,7 @@ function buildScrubbedEnv(gitPath) {
 
 // Config overrides applied to every invocation. These harden the process
 // against hostile repository config and reparse tricks.
-const HARDENING_CONFIG = [
+export const HARDENING_CONFIG = [
   "-c", "core.hooksPath=",
   "-c", "core.fsmonitor=false",
   "-c", "core.symlinks=false",
@@ -116,7 +116,7 @@ const HARDENING_CONFIG = [
   "-c", "advice.detachedHead=false",
 ];
 
-function resolveDefaultGitPath() {
+export function resolveDefaultGitPath() {
   const fromEnv = process.env.GJC_GIT_PATH;
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim();
   if (process.platform === "win32") return "C:\\Program Files\\Git\\cmd\\git.exe";
