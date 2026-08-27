@@ -54,6 +54,7 @@ import { serializeEventFrame } from "./event-frame.js";
 import { findWorkspaceInventory } from "./workspace-inventory.js";
 import { createWorkspaceInventoryProvider } from "./workspace-inventory-provider.js";
 import { resolveInventoryProviderConfig } from "./inventory-boot-wiring.js";
+import { resolveWorkspaceRecoveryConfig, runBootRecovery } from "./workspace-recovery-boot-wiring.js";
 import {
   initializeInventoryConfig,
   inventoryConfigDiagnostic,
@@ -225,6 +226,8 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
 }
 
 const NATIVE_WORKSPACE_SERVING_ENABLED = false;
+// S6f.1: workspaces barred by boot crash-recovery; consulted by the serving-admission gate (dead code until S6f.7). Empty until GJC_NATIVE_WORKSPACE_ROOT is set.
+let barredWorkspaceIds = new Set();
 const MAX_BINDINGS_PER_SOCKET = 64;
 const localWorkspaceInventory =
   initialInventoryRead?.status === "present" ? initialInventoryRead.inventory : undefined;
@@ -1485,6 +1488,12 @@ async function admitReadyWorkload(state, workDir, message) {
   if (!NATIVE_WORKSPACE_SERVING_ENABLED) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
   }
+  // S6f.1/ARCH-F6: a workspace barred by boot crash-recovery stays unservable
+  // even once the gate flips (S6f.7). Dead code until NATIVE_WORKSPACE_SERVING_ENABLED is true.
+  const barredWorkspaceId = bindingState?.binding?.workspaceId;
+  if (barredWorkspaceId !== undefined && barredWorkspaceIds.has(barredWorkspaceId)) {
+    return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
+  }
   const receiptIdentity = receiptActivityIdentity(state, bindingState);
   const bindingFingerprintValue = receiptIdentity?.bindingFingerprint ??
     (bindingState ? bindingFingerprint(bindingState.binding) : undefined);
@@ -2025,6 +2034,21 @@ process.on("uncaughtException", (error) => {
   console.error(`daemon: uncaught exception: ${sanitizeDaemonError(error)}`);
   void shutdownAndExit(1);
 });
+
+const workspaceRecoveryConfig = resolveWorkspaceRecoveryConfig({ env: process.env });
+if (workspaceRecoveryConfig.ok !== true) {
+  console.error(`daemon: native workspace recovery configuration failed: ${JSON.stringify(workspaceRecoveryConfig.diagnostic)}`);
+  process.exit(1);
+}
+if (workspaceRecoveryConfig.enabled) {
+  try {
+    const recoveryResult = await runBootRecovery({ workspaceRoot: workspaceRecoveryConfig.workspaceRoot });
+    barredWorkspaceIds = new Set(recoveryResult.barredWorkspaceIds);
+  } catch (error) {
+    console.error(`daemon: boot workspace recovery failed: ${sanitizeDaemonError(error)}`);
+    process.exit(1);
+  }
+}
 
 connectToBot();
 
