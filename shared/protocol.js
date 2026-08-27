@@ -554,6 +554,13 @@ export const MSG_TYPES = Object.freeze({
   ANSWER: "answer",
   GATE_REQUEST: "gate_request",
   READINESS: "readiness",
+  // S6f.1b (#81): workspace-lifecycle wire message contract. These are
+  // CONTRACT-ONLY additions here; no orchestrator wiring lands until
+  // S6f.2-S6f.5 and native workspace serving stays gated off.
+  WORKSPACE_CREATE: "workspace_create",
+  WORKSPACE_REFRESH: "workspace_refresh",
+  WORKSPACE_RESET_DELETE: "workspace_reset_delete",
+  WORKSPACE_RESTORE_MIGRATION: "workspace_restore_migration",
 });
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -1349,3 +1356,165 @@ export function isPongMessage(value) {
 
 /** 1 hour, matches the daemon's idle GJC-RPC-process reap timeout. */
 export const IDLE_TIMEOUT_MS = 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// S6f.1b (#81, epic #53): workspace-lifecycle wire message contract.
+//
+// This section DEFINES the four lifecycle WIRE message types consumed by the
+// (not-yet-wired) S6f.2-S6f.5 orchestrator slices. It mirrors the existing
+// bind-authorization shape (isBindingIdentity/isBindWorkspaceMessage above): a
+// lifecycle message carries a mapping-envelope-derived AUTHORITY tuple plus
+// an `operation` discriminator and a client `idempotencyFingerprint`. It
+// deliberately carries NO `bindingId`: a lifecycle op is not scoped to an
+// active bind, and no orchestrator/durable-record fields (staged, lease
+// candidates, etc.) ride the wire -- the host derives those itself.
+// ---------------------------------------------------------------------------
+
+/**
+ * The mapping-envelope-derived AUTHORITY subset: the binding identity fields
+ * minus `bindingId` (not applicable -- lifecycle ops are unscoped).
+ */
+const WORKSPACE_LIFECYCLE_AUTHORITY_FIELDS = Object.freeze([
+  "hostId",
+  "mappingId",
+  "mappingGeneration",
+  "mappingVersion",
+  "workspaceId",
+  "workspaceGeneration",
+  "sourcePlatform",
+  "routeFingerprint",
+  "authorityFingerprint",
+]);
+
+/** Full lifecycle wire-message field set: authority tuple + inventoryGeneration + discriminators. */
+const WORKSPACE_LIFECYCLE_MESSAGE_FIELDS = Object.freeze([
+  "type",
+  "operation",
+  ...WORKSPACE_LIFECYCLE_AUTHORITY_FIELDS,
+  "inventoryGeneration",
+  "idempotencyFingerprint",
+]);
+
+/**
+ * Per-type allowed `operation` subsets, mapped onto the durable lifecycle
+ * operations set (shared/workspace-lifecycle-envelope.js): create, clone,
+ * refresh, reset, delete, restore, migration.
+ */
+export const WORKSPACE_LIFECYCLE_OPERATIONS = Object.freeze({
+  [MSG_TYPES.WORKSPACE_CREATE]: new Set(["create", "clone"]),
+  [MSG_TYPES.WORKSPACE_REFRESH]: new Set(["refresh"]),
+  [MSG_TYPES.WORKSPACE_RESET_DELETE]: new Set(["reset", "delete"]),
+  [MSG_TYPES.WORKSPACE_RESTORE_MIGRATION]: new Set(["restore", "migration"]),
+});
+
+/**
+ * Validate the 9-field mapping-envelope-derived authority shape shared by all
+ * four lifecycle message types, plus the carried `inventoryGeneration`.
+ * Mirrors isBindingIdentity() above, minus `bindingId`.
+ */
+function isWorkspaceLifecycleAuthorityShape(value) {
+  return (
+    isObject(value) &&
+    isBoundedString(value.hostId, V0_LIMITS.HOST_ID) &&
+    isMappingId(value.mappingId) &&
+    isMappingGeneration(value.mappingGeneration) &&
+    isMappingVersion(value.mappingVersion) &&
+    isWorkspaceId(value.workspaceId) &&
+    isReadinessWorkspaceGeneration(value.workspaceGeneration) &&
+    BINDING_SOURCE_PLATFORMS.has(value.sourcePlatform) &&
+    isHex64(value.routeFingerprint) &&
+    isHex64(value.authorityFingerprint) &&
+    isReadinessWorkspaceGeneration(value.inventoryGeneration)
+  );
+}
+
+function isWorkspaceLifecycleMessageShape(value, type) {
+  if (
+    !isWorkspaceLifecycleAuthorityShape(value) ||
+    value.type !== type ||
+    !isHex64(value.idempotencyFingerprint) ||
+    typeof value.operation !== "string" ||
+    !WORKSPACE_LIFECYCLE_OPERATIONS[type].has(value.operation)
+  ) {
+    return false;
+  }
+  return hasExactFields(value, WORKSPACE_LIFECYCLE_MESSAGE_FIELDS);
+}
+
+/** bot -> host, create/clone a workspace under mapping-envelope authority. */
+export function isWorkspaceCreateMessage(value) {
+  return isWorkspaceLifecycleMessageShape(value, MSG_TYPES.WORKSPACE_CREATE);
+}
+
+/** bot -> host, refresh an existing workspace under mapping-envelope authority. */
+export function isWorkspaceRefreshMessage(value) {
+  return isWorkspaceLifecycleMessageShape(value, MSG_TYPES.WORKSPACE_REFRESH);
+}
+
+/** bot -> host, reset or delete a workspace under mapping-envelope authority. */
+export function isWorkspaceResetDeleteMessage(value) {
+  return isWorkspaceLifecycleMessageShape(value, MSG_TYPES.WORKSPACE_RESET_DELETE);
+}
+
+/** bot -> host, restore or migrate a workspace under mapping-envelope authority. */
+export function isWorkspaceRestoreMigrationMessage(value) {
+  return isWorkspaceLifecycleMessageShape(value, MSG_TYPES.WORKSPACE_RESTORE_MIGRATION);
+}
+
+/** Umbrella dispatch: true iff `value` is any one of the four lifecycle messages. */
+export function isWorkspaceLifecycleMessage(value) {
+  if (!isObject(value)) return false;
+  switch (value.type) {
+    case MSG_TYPES.WORKSPACE_CREATE:
+      return isWorkspaceCreateMessage(value);
+    case MSG_TYPES.WORKSPACE_REFRESH:
+      return isWorkspaceRefreshMessage(value);
+    case MSG_TYPES.WORKSPACE_RESET_DELETE:
+      return isWorkspaceResetDeleteMessage(value);
+    case MSG_TYPES.WORKSPACE_RESTORE_MIGRATION:
+      return isWorkspaceRestoreMigrationMessage(value);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Extract ONLY the 9-field mapping-envelope authority tuple from a lifecycle
+ * message (no bindingId; no inventoryGeneration; no idempotencyFingerprint).
+ * Returns a frozen plain object. Does NOT validate `message` -- callers MUST
+ * validate with isWorkspaceLifecycleMessage() first.
+ */
+export function workspaceLifecycleAuthority(message) {
+  const authority = {};
+  for (const field of WORKSPACE_LIFECYCLE_AUTHORITY_FIELDS) {
+    authority[field] = message?.[field];
+  }
+  return Object.freeze(authority);
+}
+
+/**
+ * SECURITY CORE (#44): the mapping envelope is the SOLE route authority. A
+ * lifecycle wire message MUST NOT be able to self-authorize -- its authority
+ * fields are only ever a claim. This verifies that claim against
+ * `trustedAuthority`, the host-held mapping-envelope/inventory-derived tuple,
+ * field-by-field. Returns true IFF `message` is a valid lifecycle message AND
+ * every one of the 9 authority fields strictly matches `trustedAuthority`
+ * (no missing field, no extra field, no divergent value). Any tampering --
+ * a swapped workspaceId, a stale/forged routeFingerprint or
+ * authorityFingerprint, a generation mismatch -- fails closed to false.
+ */
+export function verifyWorkspaceLifecycleAuthority(message, trustedAuthority) {
+  if (!isWorkspaceLifecycleMessage(message)) return false;
+  if (!isObject(trustedAuthority)) return false;
+  const trustedKeys = Object.keys(trustedAuthority);
+  if (trustedKeys.length !== WORKSPACE_LIFECYCLE_AUTHORITY_FIELDS.length) return false;
+  // Snapshot the message authority ONCE (defense-in-depth: a getter-bearing
+  // non-plain caller cannot diverge between the validate and compare reads;
+  // the JSON-parsed wire path is already plain).
+  const claimed = workspaceLifecycleAuthority(message);
+  for (const field of WORKSPACE_LIFECYCLE_AUTHORITY_FIELDS) {
+    if (!hasOwn(trustedAuthority, field)) return false;
+    if (claimed[field] !== trustedAuthority[field]) return false;
+  }
+  return true;
+}
