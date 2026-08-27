@@ -38,11 +38,15 @@
 //      always same-volume (a cross-volume "rename" degrades to a non-atomic
 //      copy+delete and would violate obligation 1). A publication that fails
 //      at/after `writeTemp` but before `replace` may leave the exclusive temp
-//      on disk; `sweepLeftoverTemps()` removes every sibling matching this
-//      pointer's temp pattern (`<basename>.<pid>.*.tmp`) so orphans never
-//      accumulate. `writeTemp` sweeps before creating a new temp so recovery
-//      is automatic on the next publication attempt, without requiring the
-//      caller to invoke the sweep explicitly.
+//      on disk (the temp name is `<basename>.<pid>.<counter>.<hex>.tmp`).
+//      `sweepLeftoverTemps()` removes EVERY leftover sibling matching this
+//      pointer's `<basename>.*.tmp` pattern -- across all pids, so it reclaims
+//      orphans left by a CRASHED prior process, not just this one. It is an
+//      EXPLICIT boot-recovery operation the wiring seam invokes once at startup
+//      BEFORE any writer is active; `writeTemp` deliberately does NOT sweep,
+//      so a concurrent in-flight publish can never have its temp unlinked out
+//      from under it (per-workspace publication serialization remains the
+//      caller's obligation per the publishers' header).
 //
 // WIN32 HONESTY (documented no-op): `flushParent` fsyncs the pointer's parent
 // directory to make a completed rename durable across power loss, which is a
@@ -136,7 +140,9 @@ export function createAtomicPointerIo({ pointerPath }) {
   }
 
   async function writeTemp(bytes) {
-    await sweepLeftoverTemps();
+    // No sweep here: sweeping on every writeTemp could unlink a concurrent
+    // writer's in-flight temp. Orphan reclamation is the explicit
+    // boot-recovery responsibility of sweepLeftoverTemps() (seam obligation 3).
     const tempPath = path.join(dir, `${tempPrefix}${nextTempSuffix()}${tempSuffix}`);
     // 'wx' == O_CREAT | O_EXCL | O_WRONLY: exclusive create, rejects EEXIST
     // rather than truncating/overwriting an existing file (seam obligation 2).
@@ -151,8 +157,14 @@ export function createAtomicPointerIo({ pointerPath }) {
   }
 
   async function flushTemp(tempRef) {
-    await tempRef.handle.sync();
-    await tempRef.handle.close();
+    // Close ALWAYS runs, even if sync() rejects, so a failed publication step
+    // never leaks the open temp fd (on win32 a leaked handle also blocks the
+    // temp's later deletion). The sync() error is the one that propagates.
+    try {
+      await tempRef.handle.sync();
+    } finally {
+      await tempRef.handle.close().catch(() => {});
+    }
   }
 
   async function replace(tempRef) {
@@ -169,16 +181,18 @@ export function createAtomicPointerIo({ pointerPath }) {
     try {
       handle = await open(dir, fsConstants.O_RDONLY);
     } catch (error) {
-      if (error?.code === "EISDIR" || error?.code === "EPERM" || error?.code === "EBADF") return;
+      // A permission/access failure is a real misconfiguration and MUST surface;
+      // only "this platform/FS cannot fsync a directory fd" degrades to a no-op.
+      if (error?.code === "EISDIR" || error?.code === "EBADF" || error?.code === "EINVAL") return;
       throw error;
     }
     try {
       await handle.sync();
     } catch (error) {
-      if (error?.code === "EISDIR" || error?.code === "EPERM" || error?.code === "EBADF") return;
+      if (error?.code === "EISDIR" || error?.code === "EBADF" || error?.code === "EINVAL") return;
       throw error;
     } finally {
-      await handle.close();
+      await handle.close().catch(() => {});
     }
   }
 
@@ -287,7 +301,13 @@ export async function enumerateRecoverableWorkspaces({ workspaceRoot }) {
 
   const workspaceIds = [];
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+    // A workspace root MAY be a symlink/junction to a directory; follow it via
+    // stat so such roots are not silently excluded from boot enumeration.
+    let isDir = entry.isDirectory();
+    if (!isDir && entry.isSymbolicLink()) {
+      isDir = await isDirectory(path.join(workspaceRoot, entry.name));
+    }
+    if (!isDir) continue;
     const workspaceId = entry.name;
     const root = path.join(workspaceRoot, workspaceId);
     const [hasLivePointer, hasTombstone, hasLifecycle] = await Promise.all([

@@ -172,23 +172,25 @@ test("exclusive temp create: two concurrent writeTemp calls get distinct temp pa
   }
 });
 
-test("exclusive temp create: a pre-existing temp file with the same name rejects with EEXIST", async () => {
+test("exclusive temp create: writeTemp creates a real exclusive file whose path rejects a second wx open", async () => {
   const root = await makeTmpRoot();
   try {
-    const workspaceId = "ws-1";
-    const genDir = path.join(root, workspaceId, "generation");
-    await mkdir(genDir, { recursive: true });
-    const collidingPath = path.join(genDir, "live.ptr.1.1.deadbeefcafe.tmp");
-    await writeFile(collidingPath, "pre-existing");
-
-    let sawEexist = false;
-    try {
-      const handle = await open(collidingPath, "wx");
-      await handle.close();
-    } catch (error) {
-      sawEexist = error?.code === "EEXIST";
-    }
-    assert.equal(sawEexist, true, "the 'wx' open flag must reject an existing path with EEXIST");
+    const io = await createGenerationPublisherIo({ workspaceRoot: root, workspaceId: "ws-1" });
+    const bytes = new TextEncoder().encode("payload");
+    // Exercise the module's own exclusive-create path: the temp it returns is a
+    // real, already-exclusively-held file, so a second 'wx' open of that exact
+    // path MUST reject with EEXIST (proves obligation 2 through module code,
+    // not raw fs semantics on a hand-built path).
+    const ref = await io.writeTemp(bytes);
+    await assert.rejects(
+      (async () => {
+        const handle = await open(ref.tempPath, "wx");
+        await handle.close();
+      })(),
+      (error) => error?.code === "EEXIST",
+      "the module-created temp must be an exclusive file that a second wx open rejects"
+    );
+    await io.flushTemp(ref);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -213,7 +215,8 @@ test("leftover-temp sweep: an orphan *.tmp from a simulated crash is removed and
     const afterSweep = (await readdir(genDir)).filter((name) => name.endsWith(".tmp"));
     assert.equal(afterSweep.length, 0, "sweepLeftoverTemps must remove the orphan");
 
-    // A subsequent full publish still succeeds (writeTemp also sweeps internally).
+    // A subsequent full publish still succeeds (writeTemp no longer sweeps
+    // internally; orphan reclamation is the explicit sweepLeftoverTemps above).
     await publishGeneration(io, gen1);
     const live = await readLiveGeneration(io);
     assert.equal(live.pointerFingerprint, gen1.pointerFingerprint);
@@ -382,4 +385,23 @@ test("win32 honesty: flushParent never throws on the current platform", async ()
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("flushTemp closes the temp fd even when sync() rejects (no fd leak), and rethrows the sync error", async () => {
+  const io = createAtomicPointerIo({ pointerPath: path.join(tmpdir(), "unused-live.ptr") });
+  let closed = false;
+  const syncError = Object.assign(new Error("simulated fsync failure"), { code: "EIO" });
+  const fakeRef = {
+    tempPath: "unused.tmp",
+    handle: {
+      async sync() {
+        throw syncError;
+      },
+      async close() {
+        closed = true;
+      },
+    },
+  };
+  await assert.rejects(io.flushTemp(fakeRef), (error) => error === syncError);
+  assert.equal(closed, true, "the temp fd must be closed even when sync() rejects");
 });
