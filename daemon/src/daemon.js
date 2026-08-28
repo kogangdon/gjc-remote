@@ -58,6 +58,7 @@ import { resolveInventoryProviderConfig } from "./inventory-boot-wiring.js";
 import { resolveWorkspaceRecoveryConfig, runBootRecovery } from "./workspace-recovery-boot-wiring.js";
 import { resolveLifecycleCreateDispatcher, resolveTrustedCreateBinding, projectServingReadiness } from "./workspace-create-boot-wiring.js";
 import { resolveLifecycleRefreshDispatcher, buildRefreshLeaseCandidate } from "./workspace-refresh-boot-wiring.js";
+import { resolveLifecycleResetDeleteDispatcher, buildResetDeleteLeaseCandidate } from "./workspace-reset-delete-boot-wiring.js";
 import {
   initializeInventoryConfig,
   inventoryConfigDiagnostic,
@@ -1965,16 +1966,92 @@ async function handleMessage(
     );
     return;
   }
-  if (
-    msg?.type === MSG_TYPES.WORKSPACE_RESET_DELETE ||
-    msg?.type === MSG_TYPES.WORKSPACE_RESTORE_MIGRATION
-  ) {
+  if (msg?.type === MSG_TYPES.WORKSPACE_RESET_DELETE) {
     if (!isWorkspaceLifecycleMessage(msg)) {
       connection.close(1008, "invalid workspace lifecycle message");
       return;
     }
-    // S6f.1b contract stub (#81): reset/restore-migration remain unwired until
-    // S6f.4-S6f.5, and serving stays gated off
+    // S6f.4 (#81): the reviewed reset/delete security core
+    // (workspace-reset-delete-dispatch.js) runs via the boot-singleton
+    // lifecycleResetDeleteDispatcher. It is null until the serving gate flips
+    // (S6f.7) AND native serving low-level deps land (S7 #171), so today this
+    // branch fails closed identically to the S6f.1b contract stub. When served,
+    // resolve the trusted per-connection accepted binding + local inventory +
+    // live readiness + the adopted EXCLUSIVE fence identity + the host-held
+    // manual-cleanup authority (never the message's own claims); the base being
+    // destroyed is read from the live disposition by the dispatcher, gated by a
+    // dirty-backup capture, workload quiescence, and residual-process absence.
+    if (NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleResetDeleteDispatcher) {
+      const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
+      const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
+      const readiness = projectServingReadiness(readinessState?.status);
+      // S7 PLACEHOLDER (issue #182): fence identity must be sourced from the
+      // adopted WorkspaceLeaseRegistry candidate before S6f.7; the legacy
+      // bindingFingerprint recompute below fails closed for receipt bindings.
+      const leaseCandidate = buildResetDeleteLeaseCandidate(trustedBinding, bindingFingerprint);
+      // S7 PLACEHOLDER (issue #171): the manual-cleanup tx-context authority is
+      // host-held serving state not yet tracked; a null candidate makes the
+      // dispatcher refuse fail-closed until S7 wires it.
+      const lifecycleAuthority = null;
+      const result = await lifecycleResetDeleteDispatcher.dispatchResetDelete({
+        message: msg,
+        trustedBinding,
+        trustedInventoryWorkspace,
+        leaseCandidate,
+        lifecycleAuthority,
+        readiness,
+      });
+      // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
+      // protocol code, never the raw internal reason/path fragments. Unknown or
+      // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
+      connection.send(
+        JSON.stringify({
+          type: MSG_TYPES.EVENT,
+          requestId: msg.idempotencyFingerprint,
+          event: {
+            type: result.ok ? "workspace_lifecycle_committed" : "workspace_lifecycle_refused",
+            operation: msg.operation,
+            workspaceId: msg.workspaceId,
+            ...(result.ok ? { receipt: result.receipt } : {}),
+          },
+          ...(result.ok
+            ? {}
+            : {
+                error: formatReadinessRejection(
+                  makeReadinessError(
+                    PROTOCOL_ERROR_CODES[result.code] ?? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+                  )
+                ),
+              }),
+          done: true,
+        })
+      );
+      return;
+    }
+    connection.send(
+      JSON.stringify({
+        type: MSG_TYPES.EVENT,
+        requestId: msg.idempotencyFingerprint,
+        event: {
+          type: "workspace_lifecycle_refused",
+          operation: msg.operation,
+          workspaceId: msg.workspaceId,
+        },
+        error: formatReadinessRejection(
+          makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE)
+        ),
+        done: true,
+      })
+    );
+    return;
+  }
+  if (msg?.type === MSG_TYPES.WORKSPACE_RESTORE_MIGRATION) {
+    if (!isWorkspaceLifecycleMessage(msg)) {
+      connection.close(1008, "invalid workspace lifecycle message");
+      return;
+    }
+    // S6f.1b contract stub (#81): restore-migration remains unwired until
+    // S6f.5, and serving stays gated off
     // (NATIVE_WORKSPACE_SERVING_ENABLED=false). Refuse with RUNTIME_INCOMPATIBLE
     // using the same readiness-rejection shape the INVOKE path uses for a
     // gated/unready operation.
@@ -2236,6 +2313,15 @@ const lifecycleCreateDispatcher = resolveLifecycleCreateDispatcher({
 // (S7, issue #171); a null dispatcher keeps WORKSPACE_REFRESH fail-closed
 // (RUNTIME_INCOMPATIBLE), identical to the S6f.1b contract stub.
 const lifecycleRefreshDispatcher = resolveLifecycleRefreshDispatcher({
+  enabled: workspaceRecoveryConfig.enabled,
+  workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+});
+
+// S6f.4 (#81): the boot-singleton reset/delete dispatcher stays null until the
+// serving gate flips (S6f.7) AND a native serving low-level deps bundle is
+// supplied (S7, issue #171); a null dispatcher keeps WORKSPACE_RESET_DELETE
+// fail-closed (RUNTIME_INCOMPATIBLE), identical to the S6f.1b contract stub.
+const lifecycleResetDeleteDispatcher = resolveLifecycleResetDeleteDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
 });
