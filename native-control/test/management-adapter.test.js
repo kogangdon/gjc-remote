@@ -21,6 +21,7 @@ test('production package surface excludes the low-level test adapter', () => {
     Object.keys(publicApi).sort(),
     [
       'buildManifest',
+      'createContainmentLowLevel',
       'createInventoryPublisher',
       'createInventoryReader',
       'createManagementNative',
