@@ -101,6 +101,14 @@ test("resolveTrustedCreateBinding: rejects an empty workspaceId", () => {
   assert.equal(resolveTrustedCreateBinding(bindings, ""), null);
 });
 
+test("resolveTrustedCreateBinding: ambiguous multi-binding for one workspaceId fails closed", () => {
+  const bindings = bindingsMap([
+    { bindingId: "b1", workspaceId: "workspace-1" },
+    { bindingId: "b2", workspaceId: "workspace-1" },
+  ]);
+  assert.equal(resolveTrustedCreateBinding(bindings, "workspace-1"), null);
+});
+
 // --- projectServingReadiness: four dimensions, live source, fail-closed ---
 
 test("projectServingReadiness: maps each live status dimension", () => {

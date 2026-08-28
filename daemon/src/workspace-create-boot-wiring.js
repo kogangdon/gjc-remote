@@ -36,15 +36,23 @@ export function resolveLifecycleCreateDispatcher({ enabled, workspaceRoot, nativ
  * whose `.binding` carries the 9 authority fields). Returns the binding record
  * or null. This is the SOLE trusted authority source for the create dispatch;
  * the wire message can never supply it.
+ *
+ * Fail-closed on ambiguity (review S6f.2 MEDIUM): if more than one accepted
+ * binding claims the same workspaceId, no single trusted tuple is unambiguous,
+ * so return null (create then refuses) rather than pinning an arbitrary one.
  */
 export function resolveTrustedCreateBinding(bindings, workspaceId) {
   if (!bindings || typeof bindings[Symbol.iterator] !== "function") return null;
   if (typeof workspaceId !== "string" || workspaceId.length === 0) return null;
+  let match = null;
   for (const [, bindingState] of bindings) {
     const binding = bindingState?.binding;
-    if (binding && binding.workspaceId === workspaceId) return binding;
+    if (binding && binding.workspaceId === workspaceId) {
+      if (match !== null) return null; // ambiguous: two bindings, one workspaceId
+      match = binding;
+    }
   }
-  return null;
+  return match;
 }
 
 const SERVING_READINESS_DIMENSIONS = Object.freeze([

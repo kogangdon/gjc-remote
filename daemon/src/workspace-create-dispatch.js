@@ -193,6 +193,15 @@ export function createLifecycleCreateDispatcher(config = {}) {
         trustedInventoryWorkspace.workDir.length === 0) {
       return refuse(RUNTIME_INCOMPATIBLE, "no trusted inventory workspace for source workDir");
     }
+    // Defense-in-depth (review S6f.2 LOW): the inventory record's identity must
+    // agree with the already-verified message identity before its workDir is
+    // trusted for derivation. The current caller resolves inventory by these
+    // same fields, so this only fails closed on a future mis-wired caller.
+    if (trustedInventoryWorkspace.hostId !== message.hostId ||
+        trustedInventoryWorkspace.workspaceId !== message.workspaceId ||
+        trustedInventoryWorkspace.sourcePlatform !== message.sourcePlatform) {
+      return refuse(RUNTIME_INCOMPATIBLE, "trusted inventory identity does not match the verified message");
+    }
 
     if (!isPlainObject(readiness)) {
       return refuse(RUNTIME_INCOMPATIBLE, "missing live readiness dimensions");
@@ -261,6 +270,10 @@ export function createLifecycleCreateDispatcher(config = {}) {
       const receipt = await createWorkspaceCreateOperation(deps).runCreateClone(request);
       return Object.freeze({ ok: true, receipt });
     } catch (error) {
+      // error.code / reason are INTERNAL diagnostics only: the daemon wire
+      // boundary whitelists the code against PROTOCOL_ERROR_CODES and never
+      // serializes the reason (review S6f.2 F2). Kept precise here for tests
+      // and internal logs.
       return refuse(
         typeof error?.code === "string" ? error.code : RUNTIME_INCOMPATIBLE,
         typeof error?.reason === "string" ? error.reason : (error?.message ?? "create dispatch failed"),

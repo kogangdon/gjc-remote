@@ -286,6 +286,20 @@ test("create: missing trusted inventory workspace is refused", async () => {
   assert.equal(materializeCalls.count, 0);
 });
 
+test("create: inventory whose identity disagrees with the verified message is refused", async () => {
+  const { dispatcher, materializeCalls } = makeHarness();
+  const result = await dispatcher.dispatchCreate({
+    message: createMessage(),
+    trustedBinding: baseAuthority(),
+    // workDir present but the identity fields point at a different workspace.
+    trustedInventoryWorkspace: { ...inventoryWorkspace, workspaceId: "workspace-2" },
+    readiness: liveReadiness(),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "RUNTIME_INCOMPATIBLE");
+  assert.equal(materializeCalls.count, 0);
+});
+
 // ---------------------------------------------------------------------------
 // Fail-closed durability (CRIT-F2): a publish/containment failure never
 // corrupts the live pointer and never returns ok.
