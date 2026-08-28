@@ -1,5 +1,6 @@
 export {
   buildManifest,
+  createContainmentLowLevel,
   createInventoryPublisher,
   createInventoryReader,
   createManagementNative,

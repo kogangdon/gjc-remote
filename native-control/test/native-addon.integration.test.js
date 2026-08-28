@@ -101,11 +101,13 @@ test("contract-4 inventory ABI exposes only the frozen seven primitive signature
 test("staged public inventory adapters do not change the native ABI or expose low-level helpers", () => {
   assert.deepEqual(Object.keys(publicApi).sort(), [
     "buildManifest",
+    "createContainmentLowLevel",
     "createInventoryPublisher",
     "createInventoryReader",
     "createManagementNative",
     "validateBuildManifest",
   ]);
+  assert.equal(typeof publicApi.createContainmentLowLevel, "function");
   assert.equal(typeof publicApi.createInventoryPublisher, "function");
   assert.equal(typeof publicApi.createInventoryReader, "function");
   assert.equal("createInventoryPublisherAdapter" in publicApi, false);

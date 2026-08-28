@@ -205,3 +205,32 @@ export function createInventoryPublisher(options) {
 export function createInventoryReader(options) {
   return createInventoryReaderAdapter(() => loadVerifiedAddon(), options);
 }
+
+// Least-privilege workspace-serving containment surface (slice S7.1). Exposes
+// ONLY the three read-only, no-follow identity capabilities that
+// createWorkspaceContainment consumes - read_workspace_root_facts (canonical
+// reparse-free root identity), read_identity (no-follow leaf identity), and
+// path_exists_no_follow. None of these take an auth/role/profile argument, so
+// the projection is a thin positional passthrough over the fully verified
+// addon. Every management and inventory mutation capability is deliberately
+// withheld: a serving-path caller can prove workspace root/leaf identity but
+// can reach no capability that writes, ACLs, or publishes. The result is frozen
+// so the surface cannot be widened after construction.
+const CONTAINMENT_LOW_LEVEL_CAPABILITIES = Object.freeze([
+  'read_workspace_root_facts',
+  'read_identity',
+  'path_exists_no_follow',
+]);
+export function createContainmentLowLevel({ loadAddon = loadVerifiedAddon } = {}) {
+  const addon = loadAddon();
+  for (const name of CONTAINMENT_LOW_LEVEL_CAPABILITIES) {
+    if (typeof addon?.[name] !== 'function') {
+      refused('create_containment_low_level', `verified addon is missing native capability: ${name}`);
+    }
+  }
+  return Object.freeze({
+    read_workspace_root_facts: (path, sourcePlatform) => addon.read_workspace_root_facts(path, sourcePlatform),
+    read_identity: (path) => addon.read_identity(path),
+    path_exists_no_follow: (path) => addon.path_exists_no_follow(path),
+  });
+}
