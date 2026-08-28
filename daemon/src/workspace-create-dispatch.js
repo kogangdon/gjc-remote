@@ -57,10 +57,14 @@ const SUPPORTED_CREATE_OPERATIONS = new Set(["create", "clone"]);
 // {posix, windows-drive, windows-unc}. The git materializer and the contained
 // byte reader speak {posix, windows}. windows-unc is not containment-verifiable
 // and is refused up front.
-const MATERIALIZER_PLATFORM = Object.freeze({
-  posix: "posix",
-  "windows-drive": "windows",
-});
+// null-prototype map (issue #184): a wire sourcePlatform can never resolve an
+// inherited Object.prototype key (constructor/__proto__) to a truthy non-string.
+const MATERIALIZER_PLATFORM = Object.freeze(
+  Object.assign(Object.create(null), {
+    posix: "posix",
+    "windows-drive": "windows",
+  }),
+);
 
 const isPlainObject = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
