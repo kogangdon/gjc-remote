@@ -256,10 +256,14 @@ export function createLifecycleResetDeleteDispatcher(config = {}) {
         storageIdentityFingerprint = live.record.storageIdentityFingerprint;
         gitGenerationFingerprint = live.record.gitGenerationFingerprint;
       } else if (live.kind === TOMBSTONE_KIND) {
-        // Idempotent re-delete: the orchestrator A4-short-circuits to
+        // Idempotent re-delete: the orchestrator normally A4-short-circuits to
         // already_tombstoned BEFORE computeDirtyBackup, so this descriptor is
-        // shape-only and never consumed. Fill it from the tombstone's own real
-        // fields (distinct 64-hex hashes) rather than fabricating values.
+        // usually shape-only. In a narrow race (a pointer re-published between
+        // this read and the orchestrator's own A4 probe) computeDirtyBackup DOES
+        // run and reads these fields, but that path is a non-destructive read
+        // and the step-7 CAS gate (live.fingerprint !== expected) refuses before
+        // any mutation. Fill from the tombstone's own real fields (distinct
+        // 64-hex hashes) rather than fabricating values.
         generation = live.record.tombstonedGeneration;
         rootIdentityFingerprint = live.record.priorPointerFingerprint;
         storageIdentityFingerprint = live.record.dirtyBackupFingerprint ?? live.record.tombstoneFingerprint;
