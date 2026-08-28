@@ -58,9 +58,10 @@ import { createWorkspaceInventoryProvider } from "./workspace-inventory-provider
 import { resolveInventoryProviderConfig } from "./inventory-boot-wiring.js";
 import { resolveWorkspaceRecoveryConfig, runBootRecovery } from "./workspace-recovery-boot-wiring.js";
 import { resolveLifecycleCreateDispatcher, resolveTrustedCreateBinding, projectServingReadiness } from "./workspace-create-boot-wiring.js";
-import { resolveLifecycleRefreshDispatcher, buildRefreshLeaseCandidate } from "./workspace-refresh-boot-wiring.js";
-import { resolveLifecycleResetDeleteDispatcher, buildResetDeleteLeaseCandidate } from "./workspace-reset-delete-boot-wiring.js";
-import { resolveLifecycleRestoreMigrationDispatcher, buildRestoreMigrationLeaseCandidate } from "./workspace-restore-migration-boot-wiring.js";
+import { resolveLifecycleRefreshDispatcher } from "./workspace-refresh-boot-wiring.js";
+import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-boot-wiring.js";
+import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
+import { projectReceiptAuthority, resolveReceiptActivityIdentity, resolveAdoptedLeaseCandidateForWorkspace } from "./workspace-adopted-lease-candidate.js";
 import {
   initializeInventoryConfig,
   inventoryConfigDiagnostic,
@@ -665,22 +666,12 @@ function currentBindingState(state, bindingState, fingerprint) {
   );
 }
 
+// Fence identity (issue #182) is single-sourced in workspace-adopted-lease-
+// candidate.js so the INVOKE admission path and the lifecycle dispatchers adopt
+// one definition. This thin adapter preserves the (state, bindingState) call
+// shape used across the daemon's reachable retire/invoke sites.
 function receiptActivityIdentity(state, bindingState) {
-  const bindingFingerprintValue = bindingState?.proof?.bindingFingerprint;
-  if (
-    !bindingState?.receipt ||
-    !Number.isSafeInteger(state?.socketGeneration) ||
-    state.socketGeneration < 1 ||
-    typeof bindingState.binding.bindingId !== "string" ||
-    !/^[0-9a-f]{64}$/.test(bindingFingerprintValue ?? "")
-  ) {
-    return undefined;
-  }
-  return Object.freeze({
-    socketGeneration: state.socketGeneration,
-    bindingId: bindingState.binding.bindingId,
-    bindingFingerprint: bindingFingerprintValue,
-  });
+  return resolveReceiptActivityIdentity(state?.socketGeneration, bindingState);
 }
 
 function retireReceiptSession(state, bindingState) {
@@ -760,32 +751,8 @@ function createReadinessState(connection) {
   return state;
 }
 
-function receiptAuthority(message) {
-  const {
-    authorityEpoch,
-    fenceGeneration,
-    hostId,
-    mappingId,
-    mappingGeneration,
-    mappingVersion,
-    workspaceId,
-    workspaceGeneration,
-    sourcePlatform,
-    authorityFingerprint,
-  } = message;
-  return {
-    authorityEpoch,
-    fenceGeneration,
-    hostId,
-    mappingId,
-    mappingGeneration,
-    workspaceGeneration,
-    mappingVersion,
-    sourcePlatform,
-    workspaceId,
-    authorityFingerprint,
-  };
-}
+// Single-sourced with the fence-identity module (issue #182).
+const receiptAuthority = projectReceiptAuthority;
 
 function sameReceiptBinding(left, right) {
   return JSON.stringify(receiptAuthority(left)) === JSON.stringify(receiptAuthority(right));
@@ -1922,10 +1889,16 @@ async function handleMessage(
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
-      // S7 PLACEHOLDER (issue #182): fence identity must be sourced from the
-      // adopted WorkspaceLeaseRegistry candidate before S6f.7; the legacy
-      // bindingFingerprint recompute below fails closed for receipt bindings.
-      const leaseCandidate = buildRefreshLeaseCandidate(trustedBinding, bindingFingerprint);
+      // Fence identity (issue #182): sourced from the adopted lease candidate the
+      // registry matches by ((V3 authority | flat binding) + fingerprint +
+      // socketGeneration), mirroring the INVOKE admission path -- never a legacy
+      // bindingFingerprint recompute (which fails closed for receipt bindings).
+      const leaseCandidate = resolveAdoptedLeaseCandidateForWorkspace({
+        bindings: readinessState?.bindings,
+        socketGeneration: readinessState?.socketGeneration,
+        workspaceId: msg.workspaceId,
+        computeLegacyBindingFingerprint: bindingFingerprint,
+      });
       const result = await lifecycleRefreshDispatcher.dispatchRefresh({
         message: msg,
         trustedBinding,
@@ -1996,10 +1969,16 @@ async function handleMessage(
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
-      // S7 PLACEHOLDER (issue #182): fence identity must be sourced from the
-      // adopted WorkspaceLeaseRegistry candidate before S6f.7; the legacy
-      // bindingFingerprint recompute below fails closed for receipt bindings.
-      const leaseCandidate = buildResetDeleteLeaseCandidate(trustedBinding, bindingFingerprint);
+      // Fence identity (issue #182): sourced from the adopted lease candidate the
+      // registry matches by ((V3 authority | flat binding) + fingerprint +
+      // socketGeneration), mirroring the INVOKE admission path -- never a legacy
+      // bindingFingerprint recompute (which fails closed for receipt bindings).
+      const leaseCandidate = resolveAdoptedLeaseCandidateForWorkspace({
+        bindings: readinessState?.bindings,
+        socketGeneration: readinessState?.socketGeneration,
+        workspaceId: msg.workspaceId,
+        computeLegacyBindingFingerprint: bindingFingerprint,
+      });
       // S7 PLACEHOLDER (issue #171): the manual-cleanup tx-context authority is
       // host-held serving state not yet tracked; a null candidate makes the
       // dispatcher refuse fail-closed until S7 wires it.
@@ -2077,10 +2056,16 @@ async function handleMessage(
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
-      // S7 PLACEHOLDER (issue #182): fence identity must be sourced from the
-      // adopted WorkspaceLeaseRegistry candidate before S6f.7; the legacy
-      // bindingFingerprint recompute below fails closed for receipt bindings.
-      const leaseCandidate = buildRestoreMigrationLeaseCandidate(trustedBinding, bindingFingerprint);
+      // Fence identity (issue #182): sourced from the adopted lease candidate the
+      // registry matches by ((V3 authority | flat binding) + fingerprint +
+      // socketGeneration), mirroring the INVOKE admission path -- never a legacy
+      // bindingFingerprint recompute (which fails closed for receipt bindings).
+      const leaseCandidate = resolveAdoptedLeaseCandidateForWorkspace({
+        bindings: readinessState?.bindings,
+        socketGeneration: readinessState?.socketGeneration,
+        workspaceId: msg.workspaceId,
+        computeLegacyBindingFingerprint: bindingFingerprint,
+      });
       // S7 PLACEHOLDER (issue #171): the quarantined staged-source payload
       // (stagingPath, provenance authority, manifest, lineage) is host-held
       // serving state not yet tracked; a null context makes the dispatcher

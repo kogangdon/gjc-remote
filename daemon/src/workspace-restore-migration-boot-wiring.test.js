@@ -3,10 +3,8 @@ import test from "node:test";
 
 import {
   resolveLifecycleRestoreMigrationDispatcher,
-  buildRestoreMigrationLeaseCandidate,
 } from "../src/workspace-restore-migration-boot-wiring.js";
 
-const HEX64 = "a".repeat(64);
 
 function fullNativeServingDeps() {
   return {
@@ -69,34 +67,4 @@ test("dispatcher is constructed when enabled + workspaceRoot + full native deps"
 
 test("resolveLifecycleRestoreMigrationDispatcher tolerates no arguments", () => {
   assert.equal(resolveLifecycleRestoreMigrationDispatcher(), null);
-});
-
-// ---------------------------------------------------------------------------
-// buildRestoreMigrationLeaseCandidate: reconstruct the adopted exclusive-fence identity.
-// ---------------------------------------------------------------------------
-
-test("lease candidate augments the binding with its recomputed fingerprint", () => {
-  const binding = { workspaceId: "workspace-1", mappingId: "mapping-1" };
-  const candidate = buildRestoreMigrationLeaseCandidate(binding, () => HEX64);
-  assert.deepEqual(candidate, { workspaceId: "workspace-1", mappingId: "mapping-1", bindingFingerprint: HEX64 });
-  assert.ok(Object.isFrozen(candidate));
-});
-
-test("lease candidate is null when the binding is missing or not an object", () => {
-  assert.equal(buildRestoreMigrationLeaseCandidate(null, () => HEX64), null);
-  assert.equal(buildRestoreMigrationLeaseCandidate("nope", () => HEX64), null);
-  assert.equal(buildRestoreMigrationLeaseCandidate([], () => HEX64), null);
-});
-
-test("lease candidate is null when the fingerprint fn is missing or throws", () => {
-  const binding = { workspaceId: "workspace-1" };
-  assert.equal(buildRestoreMigrationLeaseCandidate(binding, undefined), null);
-  assert.equal(buildRestoreMigrationLeaseCandidate(binding, () => { throw new Error("boom"); }), null);
-});
-
-test("lease candidate is null when the recomputed fingerprint is not hex64", () => {
-  const binding = { workspaceId: "workspace-1" };
-  assert.equal(buildRestoreMigrationLeaseCandidate(binding, () => "short"), null);
-  assert.equal(buildRestoreMigrationLeaseCandidate(binding, () => "Z".repeat(64)), null);
-  assert.equal(buildRestoreMigrationLeaseCandidate(binding, () => 12345), null);
 });
