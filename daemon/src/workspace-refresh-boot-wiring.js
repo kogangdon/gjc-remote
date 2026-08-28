@@ -2,7 +2,7 @@
 // security core (issue #81 / #53 Phase 2).
 //
 // The reviewed security substance lives in workspace-refresh-dispatch.js. This
-// This module is the thin, unit-testable wiring the daemon uses to construct
+// module is the thin, unit-testable wiring the daemon uses to construct
 // the boot-singleton refresh dispatcher. The adopted fence identity
 // (leaseCandidate) is sourced by the daemon from the shared fence-identity
 // module (workspace-adopted-lease-candidate.js, issue #182).
