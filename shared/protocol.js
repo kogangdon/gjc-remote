@@ -1481,8 +1481,16 @@ export function isWorkspaceLifecycleMessage(value) {
 /**
  * Extract ONLY the 9-field mapping-envelope authority tuple from a lifecycle
  * message (no bindingId; no inventoryGeneration; no idempotencyFingerprint).
- * Returns a frozen plain object. Does NOT validate `message` -- callers MUST
- * validate with isWorkspaceLifecycleMessage() first.
+ * Returns a frozen plain object. Does NOT validate its argument.
+ *
+ * Two sanctioned callers:
+ *  - on a lifecycle WIRE message (the untrusted claim): callers MUST validate
+ *    with isWorkspaceLifecycleMessage() first (verifyWorkspaceLifecycleAuthority
+ *    does this internally);
+ *  - on a trusted ACCEPTED BIND_WORKSPACE binding record (to build the
+ *    host-held trusted tuple to compare against): the binding carries the same
+ *    9 field names, and any missing field projects to undefined and fails
+ *    closed at the strict per-field verify.
  */
 export function workspaceLifecycleAuthority(message) {
   const authority = {};
@@ -1496,8 +1504,12 @@ export function workspaceLifecycleAuthority(message) {
  * SECURITY CORE (#44): the mapping envelope is the SOLE route authority. A
  * lifecycle wire message MUST NOT be able to self-authorize -- its authority
  * fields are only ever a claim. This verifies that claim against
- * `trustedAuthority`, the host-held mapping-envelope/inventory-derived tuple,
- * field-by-field. Returns true IFF `message` is a valid lifecycle message AND
+ * `trustedAuthority`, the host-held authority tuple the daemon derives from the
+ * ACCEPTED BIND_WORKSPACE binding record for that workspaceId (itself fenced by
+ * WorkspaceLeaseRegistry.adoptBinding at bind time; the daemon never sees the
+ * mapping envelope -- envelope verification is bot-side, so this is a
+ * trust-on-first-use continuity check, not independent envelope verification;
+ * see issue #179), field-by-field. Returns true IFF `message` is a valid lifecycle message AND
  * every one of the 9 authority fields strictly matches `trustedAuthority`
  * (no missing field, no extra field, no divergent value). Any tampering --
  * a swapped workspaceId, a stale/forged routeFingerprint or

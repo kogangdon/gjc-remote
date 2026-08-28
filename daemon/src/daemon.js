@@ -56,6 +56,7 @@ import { findWorkspaceInventory } from "./workspace-inventory.js";
 import { createWorkspaceInventoryProvider } from "./workspace-inventory-provider.js";
 import { resolveInventoryProviderConfig } from "./inventory-boot-wiring.js";
 import { resolveWorkspaceRecoveryConfig, runBootRecovery } from "./workspace-recovery-boot-wiring.js";
+import { resolveLifecycleCreateDispatcher, resolveTrustedCreateBinding, projectServingReadiness } from "./workspace-create-boot-wiring.js";
 import {
   initializeInventoryConfig,
   inventoryConfigDiagnostic,
@@ -1824,8 +1825,73 @@ async function handleMessage(
     connection.send(JSON.stringify({ type: MSG_TYPES.UNBIND_OK, bindingId: msg.bindingId }));
     return;
   }
+  if (msg?.type === MSG_TYPES.WORKSPACE_CREATE) {
+    if (!isWorkspaceLifecycleMessage(msg)) {
+      connection.close(1008, "invalid workspace lifecycle message");
+      return;
+    }
+    // S6f.2 (#81): the reviewed create/clone security core
+    // (workspace-create-dispatch.js) runs via the boot-singleton
+    // lifecycleCreateDispatcher. It is null until the serving gate flips
+    // (S6f.7) AND native serving low-level deps land (S7 #171), so today this
+    // branch fails closed identically to the S6f.1b contract stub. When served,
+    // resolve the trusted per-connection accepted binding + local inventory +
+    // live readiness (never the message's own claims) and run the dispatcher.
+    if (NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleCreateDispatcher) {
+      const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
+      const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
+      const readiness = projectServingReadiness(readinessState?.status);
+      const result = await lifecycleCreateDispatcher.dispatchCreate({
+        message: msg,
+        trustedBinding,
+        trustedInventoryWorkspace,
+        readiness,
+      });
+      // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
+      // protocol code, never the raw internal reason/path fragments. Unknown or
+      // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
+      connection.send(
+        JSON.stringify({
+          type: MSG_TYPES.EVENT,
+          requestId: msg.idempotencyFingerprint,
+          event: {
+            type: result.ok ? "workspace_lifecycle_committed" : "workspace_lifecycle_refused",
+            operation: msg.operation,
+            workspaceId: msg.workspaceId,
+            ...(result.ok ? { receipt: result.receipt } : {}),
+          },
+          ...(result.ok
+            ? {}
+            : {
+                error: formatReadinessRejection(
+                  makeReadinessError(
+                    PROTOCOL_ERROR_CODES[result.code] ?? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+                  )
+                ),
+              }),
+          done: true,
+        })
+      );
+      return;
+    }
+    connection.send(
+      JSON.stringify({
+        type: MSG_TYPES.EVENT,
+        requestId: msg.idempotencyFingerprint,
+        event: {
+          type: "workspace_lifecycle_refused",
+          operation: msg.operation,
+          workspaceId: msg.workspaceId,
+        },
+        error: formatReadinessRejection(
+          makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE)
+        ),
+        done: true,
+      })
+    );
+    return;
+  }
   if (
-    msg?.type === MSG_TYPES.WORKSPACE_CREATE ||
     msg?.type === MSG_TYPES.WORKSPACE_REFRESH ||
     msg?.type === MSG_TYPES.WORKSPACE_RESET_DELETE ||
     msg?.type === MSG_TYPES.WORKSPACE_RESTORE_MIGRATION
@@ -1834,12 +1900,11 @@ async function handleMessage(
       connection.close(1008, "invalid workspace lifecycle message");
       return;
     }
-    // S6f.1b contract stub (#81): message types are recognized and
-    // shape-validated here, but no orchestrator is wired until
-    // S6f.2-S6f.5, and serving stays gated off
-    // (NATIVE_WORKSPACE_SERVING_ENABLED=false). Refuse with
-    // RUNTIME_INCOMPATIBLE using the same readiness-rejection shape the
-    // INVOKE path uses for a gated/unready operation.
+    // S6f.1b contract stub (#81): refresh/reset/restore-migration remain
+    // unwired until S6f.3-S6f.5, and serving stays gated off
+    // (NATIVE_WORKSPACE_SERVING_ENABLED=false). Refuse with RUNTIME_INCOMPATIBLE
+    // using the same readiness-rejection shape the INVOKE path uses for a
+    // gated/unready operation.
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.EVENT,
@@ -2083,6 +2148,15 @@ if (workspaceRecoveryConfig.enabled) {
     process.exit(1);
   }
 }
+
+// S6f.2 (#81): boot-singleton create/clone dispatcher. Stays null until the
+// serving gate flips (S6f.7) AND a native serving low-level deps bundle is
+// supplied (S7, issue #171); a null dispatcher keeps WORKSPACE_CREATE
+// fail-closed (RUNTIME_INCOMPATIBLE), identical to the S6f.1b contract stub.
+const lifecycleCreateDispatcher = resolveLifecycleCreateDispatcher({
+  enabled: workspaceRecoveryConfig.enabled,
+  workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+});
 
 connectToBot();
 
