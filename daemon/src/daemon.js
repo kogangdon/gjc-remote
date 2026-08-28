@@ -40,6 +40,7 @@ import {
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
+import { whitelistProtocolCode, formatManualCleanupLog } from "./lifecycle-wire-sanitizers.js";
 import { SessionPool } from "./session-pool.js";
 import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
 import {
@@ -236,6 +237,15 @@ let barredWorkspaceIds = new Set();
 const MAX_BINDINGS_PER_SOCKET = 64;
 const localWorkspaceInventory =
   initialInventoryRead?.status === "present" ? initialInventoryRead.inventory : undefined;
+
+// issue #184: emit the sanitized manual_cleanup checkpoint log (partial-CAS
+// operator reconciliation signal) when a lifecycle result carries one. The
+// formatting is a pure, unit-tested helper; only the console.error side effect
+// lives here.
+function surfaceManualCleanup(msg, result) {
+  const line = formatManualCleanupLog(msg, result);
+  if (line) console.error(line);
+}
 
 function readReadinessTestEvidence() {
   if (!READINESS_TEST_INJECTION_ENABLED) return undefined;
@@ -1868,7 +1878,7 @@ async function handleMessage(
             : {
                 error: formatReadinessRejection(
                   makeReadinessError(
-                    PROTOCOL_ERROR_CODES[result.code] ?? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+                    whitelistProtocolCode(result.code)
                   )
                 ),
               }),
@@ -1941,7 +1951,7 @@ async function handleMessage(
             : {
                 error: formatReadinessRejection(
                   makeReadinessError(
-                    PROTOCOL_ERROR_CODES[result.code] ?? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+                    whitelistProtocolCode(result.code)
                   )
                 ),
               }),
@@ -2002,6 +2012,7 @@ async function handleMessage(
         lifecycleAuthority,
         readiness,
       });
+      surfaceManualCleanup(msg, result);
       // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
       // protocol code, never the raw internal reason/path fragments. Unknown or
       // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
@@ -2020,7 +2031,7 @@ async function handleMessage(
             : {
                 error: formatReadinessRejection(
                   makeReadinessError(
-                    PROTOCOL_ERROR_CODES[result.code] ?? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+                    whitelistProtocolCode(result.code)
                   )
                 ),
               }),
@@ -2083,6 +2094,7 @@ async function handleMessage(
         restoreContext,
         readiness,
       });
+      surfaceManualCleanup(msg, result);
       // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
       // protocol code, never the raw internal reason/path fragments. Unknown or
       // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
@@ -2101,7 +2113,7 @@ async function handleMessage(
             : {
                 error: formatReadinessRejection(
                   makeReadinessError(
-                    PROTOCOL_ERROR_CODES[result.code] ?? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+                    whitelistProtocolCode(result.code)
                   )
                 ),
               }),

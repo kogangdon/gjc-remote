@@ -62,10 +62,14 @@ const SUPPORTED_RESTORE_OPERATIONS = new Set(["restore", "migration"]);
 
 // Wire sourcePlatform {posix, windows-drive, windows-unc} vs materializer/
 // byte-reader {posix, windows}. windows-unc is not containment-verifiable.
-const MATERIALIZER_PLATFORM = Object.freeze({
-  posix: "posix",
-  "windows-drive": "windows",
-});
+// null-prototype map (issue #184): a wire sourcePlatform can never resolve an
+// inherited Object.prototype key (constructor/__proto__) to a truthy non-string.
+const MATERIALIZER_PLATFORM = Object.freeze(
+  Object.assign(Object.create(null), {
+    posix: "posix",
+    "windows-drive": "windows",
+  }),
+);
 
 const isPlainObject = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
