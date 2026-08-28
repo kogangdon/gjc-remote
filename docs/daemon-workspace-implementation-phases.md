@@ -247,7 +247,7 @@ not authorize any behavior more permissive than the phase contracts above.
 **Serving remains disabled.** The native inventory contract (config modes, five-role bindings, the
 durable D floor, the live invalidation cascade, and the bot receipt binding/observability surface) is
 implemented as capability scaffolding, but native workspace serving itself remains DISABLED: the
-daemon defines `const NATIVE_WORKSPACE_SERVING_ENABLED = false` (daemon/src/daemon.js:231, a const
+daemon defines `const NATIVE_WORKSPACE_SERVING_ENABLED = false` (daemon/src/daemon.js:232, a const
 literal with no env/config override anywhere in the repo), and its sole read site inside
 `admitReadyWorkload` returns `RUNTIME_INCOMPATIBLE` when off. On the bot side, `host-registry.js`
 defaults the equivalent flag to false and `bot.js` does not override it. A proven verify-mode
