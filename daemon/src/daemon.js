@@ -59,6 +59,7 @@ import { resolveWorkspaceRecoveryConfig, runBootRecovery } from "./workspace-rec
 import { resolveLifecycleCreateDispatcher, resolveTrustedCreateBinding, projectServingReadiness } from "./workspace-create-boot-wiring.js";
 import { resolveLifecycleRefreshDispatcher, buildRefreshLeaseCandidate } from "./workspace-refresh-boot-wiring.js";
 import { resolveLifecycleResetDeleteDispatcher, buildResetDeleteLeaseCandidate } from "./workspace-reset-delete-boot-wiring.js";
+import { resolveLifecycleRestoreMigrationDispatcher, buildRestoreMigrationLeaseCandidate } from "./workspace-restore-migration-boot-wiring.js";
 import {
   initializeInventoryConfig,
   inventoryConfigDiagnostic,
@@ -2050,11 +2051,69 @@ async function handleMessage(
       connection.close(1008, "invalid workspace lifecycle message");
       return;
     }
-    // S6f.1b contract stub (#81): restore-migration remains unwired until
-    // S6f.5, and serving stays gated off
-    // (NATIVE_WORKSPACE_SERVING_ENABLED=false). Refuse with RUNTIME_INCOMPATIBLE
-    // using the same readiness-rejection shape the INVOKE path uses for a
-    // gated/unready operation.
+    // S6f.5 (#81): the reviewed restore/migration security core
+    // (workspace-restore-migration-dispatch.js) runs via the boot-singleton
+    // lifecycleRestoreMigrationDispatcher. It is null until the serving gate
+    // flips (S6f.7) AND native serving low-level deps land (S7 #171), so today
+    // this branch fails closed identically to the S6f.1b contract stub. When
+    // served, resolve the trusted per-connection accepted binding + local
+    // inventory + live readiness + the adopted EXCLUSIVE fence identity + the
+    // host-held restore context (the quarantined staged source, provenance
+    // authority, manifest, and lineage the thin wire message cannot carry).
+    // The base being promoted onto is read from the live pointer by the
+    // dispatcher; the promotion is a reversible successor generation.
+    if (NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleRestoreMigrationDispatcher) {
+      const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
+      const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
+      const readiness = projectServingReadiness(readinessState?.status);
+      // S7 PLACEHOLDER (issue #182): fence identity must be sourced from the
+      // adopted WorkspaceLeaseRegistry candidate before S6f.7; the legacy
+      // bindingFingerprint recompute below fails closed for receipt bindings.
+      const leaseCandidate = buildRestoreMigrationLeaseCandidate(trustedBinding, bindingFingerprint);
+      // S7 PLACEHOLDER (issue #171): the quarantined staged-source payload
+      // (stagingPath, provenance authority, manifest, lineage) is host-held
+      // serving state not yet tracked; a null context makes the dispatcher
+      // refuse fail-closed until S7 wires it.
+      const restoreContext = null;
+      const result = await lifecycleRestoreMigrationDispatcher.dispatchRestoreMigration({
+        message: msg,
+        trustedBinding,
+        trustedInventoryWorkspace,
+        leaseCandidate,
+        restoreContext,
+        readiness,
+      });
+      // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
+      // protocol code, never the raw internal reason/path fragments. Unknown or
+      // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
+      connection.send(
+        JSON.stringify({
+          type: MSG_TYPES.EVENT,
+          requestId: msg.idempotencyFingerprint,
+          event: {
+            type: result.ok ? "workspace_lifecycle_committed" : "workspace_lifecycle_refused",
+            operation: msg.operation,
+            workspaceId: msg.workspaceId,
+            ...(result.ok ? { receipt: result.receipt } : {}),
+          },
+          ...(result.ok
+            ? {}
+            : {
+                error: formatReadinessRejection(
+                  makeReadinessError(
+                    PROTOCOL_ERROR_CODES[result.code] ?? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+                  )
+                ),
+              }),
+          done: true,
+        })
+      );
+      return;
+    }
+    // S6f.1b contract stub fallback (#81): serving stays gated off
+    // (NATIVE_WORKSPACE_SERVING_ENABLED=false) or the dispatcher is null.
+    // Refuse with RUNTIME_INCOMPATIBLE using the same readiness-rejection shape
+    // the INVOKE path uses for a gated/unready operation.
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.EVENT,
@@ -2322,6 +2381,16 @@ const lifecycleRefreshDispatcher = resolveLifecycleRefreshDispatcher({
 // supplied (S7, issue #171); a null dispatcher keeps WORKSPACE_RESET_DELETE
 // fail-closed (RUNTIME_INCOMPATIBLE), identical to the S6f.1b contract stub.
 const lifecycleResetDeleteDispatcher = resolveLifecycleResetDeleteDispatcher({
+  enabled: workspaceRecoveryConfig.enabled,
+  workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+});
+
+// S6f.5 (#81): the restore/migration boot-singleton. Null until the serving
+// gate flips (S6f.7) AND the native serving low-level deps bundle lands
+// (S7 #171); no nativeServingDeps are supplied today, so the resolver returns
+// null and the WORKSPACE_RESTORE_MIGRATION served branch stays inert, failing
+// closed (RUNTIME_INCOMPATIBLE) identically to the S6f.1b contract stub.
+const lifecycleRestoreMigrationDispatcher = resolveLifecycleRestoreMigrationDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
 });
