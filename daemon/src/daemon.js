@@ -1910,6 +1910,9 @@ async function handleMessage(
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
+      // S7 PLACEHOLDER (issue #182): fence identity must be sourced from the
+      // adopted WorkspaceLeaseRegistry candidate before S6f.7; the legacy
+      // bindingFingerprint recompute below fails closed for receipt bindings.
       const leaseCandidate = buildRefreshLeaseCandidate(trustedBinding, bindingFingerprint);
       const result = await lifecycleRefreshDispatcher.dispatchRefresh({
         message: msg,

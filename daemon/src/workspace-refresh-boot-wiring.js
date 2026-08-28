@@ -50,6 +50,14 @@ export function resolveLifecycleRefreshDispatcher({ enabled, workspaceRoot, nati
  * `computeBindingFingerprint` function. This is trusted host-held state; the
  * wire message can never supply it.
  *
+ * S7 PLACEHOLDER (issue #182): recomputing the legacy 11-field
+ * `bindingFingerprint` here does NOT match a receipt-mode binding adopted as
+ * V3 authority + proof.bindingFingerprint + socketGeneration. It fails CLOSED
+ * (the registry refuses -> dispatcher catches -> RUNTIME_INCOMPATIBLE), which
+ * is safe while serving is gated off and the dispatcher is null. When the
+ * native serving path is wired (S7 #171 / before S6f.7), source leaseCandidate
+ * from the actual adopted WorkspaceLeaseRegistry candidate instead.
+ *
  * Fail-closed: returns null when the binding is missing/not an object, or when
  * the recomputed fingerprint is not a hex64 string (refresh then refuses).
  */

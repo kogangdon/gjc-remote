@@ -286,6 +286,16 @@ test("refresh: a missing fence lease candidate is refused before the fence", asy
   assert.equal(fence.state.acquired, 0);
 });
 
+for (const bad of ["not-an-object", 42, true]) {
+  test(`refresh: a non-object (${typeof bad}) fence lease candidate is refused before the fence`, async () => {
+    const { dispatcher, fence } = makeHarness();
+    const result = await dispatcher.dispatchRefresh(callArgs({ leaseCandidate: bad }));
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "RUNTIME_INCOMPATIBLE");
+    assert.equal(fence.state.acquired, 0);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Optimistic concurrency + fence currency (orchestrator seams forwarded).
 // ---------------------------------------------------------------------------
