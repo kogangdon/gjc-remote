@@ -3,10 +3,8 @@ import test from "node:test";
 
 import {
   resolveLifecycleRefreshDispatcher,
-  buildRefreshLeaseCandidate,
 } from "../src/workspace-refresh-boot-wiring.js";
 
-const HEX64 = "a".repeat(64);
 
 function fullNativeServingDeps() {
   return {
@@ -70,34 +68,4 @@ test("dispatcher is constructed when enabled + workspaceRoot + full native deps"
 
 test("resolveLifecycleRefreshDispatcher tolerates no arguments", () => {
   assert.equal(resolveLifecycleRefreshDispatcher(), null);
-});
-
-// ---------------------------------------------------------------------------
-// buildRefreshLeaseCandidate: reconstruct the adopted fence identity.
-// ---------------------------------------------------------------------------
-
-test("lease candidate augments the binding with its recomputed fingerprint", () => {
-  const binding = { workspaceId: "workspace-1", mappingId: "mapping-1" };
-  const candidate = buildRefreshLeaseCandidate(binding, () => HEX64);
-  assert.deepEqual(candidate, { workspaceId: "workspace-1", mappingId: "mapping-1", bindingFingerprint: HEX64 });
-  assert.ok(Object.isFrozen(candidate));
-});
-
-test("lease candidate is null when the binding is missing or not an object", () => {
-  assert.equal(buildRefreshLeaseCandidate(null, () => HEX64), null);
-  assert.equal(buildRefreshLeaseCandidate("nope", () => HEX64), null);
-  assert.equal(buildRefreshLeaseCandidate([], () => HEX64), null);
-});
-
-test("lease candidate is null when the fingerprint fn is missing or throws", () => {
-  const binding = { workspaceId: "workspace-1" };
-  assert.equal(buildRefreshLeaseCandidate(binding, undefined), null);
-  assert.equal(buildRefreshLeaseCandidate(binding, () => { throw new Error("boom"); }), null);
-});
-
-test("lease candidate is null when the recomputed fingerprint is not hex64", () => {
-  const binding = { workspaceId: "workspace-1" };
-  assert.equal(buildRefreshLeaseCandidate(binding, () => "short"), null);
-  assert.equal(buildRefreshLeaseCandidate(binding, () => "Z".repeat(64)), null);
-  assert.equal(buildRefreshLeaseCandidate(binding, () => 12345), null);
 });

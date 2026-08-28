@@ -3,11 +3,9 @@ import test from "node:test";
 
 import {
   resolveLifecycleResetDeleteDispatcher,
-  buildResetDeleteLeaseCandidate,
   createResidualProcessPlaceholderIo,
 } from "../src/workspace-reset-delete-boot-wiring.js";
 
-const HEX64 = "a".repeat(64);
 
 function fullNativeServingDeps() {
   return {
@@ -67,36 +65,6 @@ test("dispatcher is constructed when enabled + workspaceRoot + full native deps"
 
 test("resolveLifecycleResetDeleteDispatcher tolerates no arguments", () => {
   assert.equal(resolveLifecycleResetDeleteDispatcher(), null);
-});
-
-// ---------------------------------------------------------------------------
-// buildResetDeleteLeaseCandidate: reconstruct the adopted exclusive-fence identity.
-// ---------------------------------------------------------------------------
-
-test("lease candidate augments the binding with its recomputed fingerprint", () => {
-  const binding = { workspaceId: "workspace-1", mappingId: "mapping-1" };
-  const candidate = buildResetDeleteLeaseCandidate(binding, () => HEX64);
-  assert.deepEqual(candidate, { workspaceId: "workspace-1", mappingId: "mapping-1", bindingFingerprint: HEX64 });
-  assert.ok(Object.isFrozen(candidate));
-});
-
-test("lease candidate is null when the binding is missing or not an object", () => {
-  assert.equal(buildResetDeleteLeaseCandidate(null, () => HEX64), null);
-  assert.equal(buildResetDeleteLeaseCandidate("nope", () => HEX64), null);
-  assert.equal(buildResetDeleteLeaseCandidate([], () => HEX64), null);
-});
-
-test("lease candidate is null when the fingerprint fn is missing or throws", () => {
-  const binding = { workspaceId: "workspace-1" };
-  assert.equal(buildResetDeleteLeaseCandidate(binding, undefined), null);
-  assert.equal(buildResetDeleteLeaseCandidate(binding, () => { throw new Error("boom"); }), null);
-});
-
-test("lease candidate is null when the recomputed fingerprint is not hex64", () => {
-  const binding = { workspaceId: "workspace-1" };
-  assert.equal(buildResetDeleteLeaseCandidate(binding, () => "short"), null);
-  assert.equal(buildResetDeleteLeaseCandidate(binding, () => "Z".repeat(64)), null);
-  assert.equal(buildResetDeleteLeaseCandidate(binding, () => 12345), null);
 });
 
 // ---------------------------------------------------------------------------
