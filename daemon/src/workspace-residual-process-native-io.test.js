@@ -66,7 +66,7 @@ test("refuses a request for a different host without scanning", async () => {
 test("refuses a traversing or non-segment workspaceId without scanning", async () => {
   const enumerator = fakeEnumerator();
   const io = createResidualProcessNativeIo({ ...identity, enumerator });
-  for (const workspaceId of ["..", ".", "../other", "a/b", "a\\b", "C:evil", "with\0nul", ""]) {
+  for (const workspaceId of ["..", ".", "../other", "a/b", "a\\b", "/x", "C:evil", "ws:stream", "ws.", "ws ", "with\0nul", ""]) {
     await assert.rejects(
       () => io.listResidualProcesses({ hostId: "host-A", workspaceId }),
       (e) => e.code === "CONFIG_INVALID",

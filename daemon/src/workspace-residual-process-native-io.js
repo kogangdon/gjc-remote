@@ -46,9 +46,11 @@ function configError(reason) {
 const isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
 
 // A workspaceId safe to join into a filesystem path: a single segment with no
-// path separators, not '.'/'..', no NUL, and not drive-qualified. This is
-// defence in depth over the authenticated binding, on the destruction-
-// authorising path.
+// path separators, not '.'/'..', no NUL, no colon (drive prefix or NTFS
+// alternate-data-stream 'ws:stream' syntax), and no trailing '.'/' ' (Windows
+// strips these, aliasing 'ws.' -> 'ws'). This is defence in depth over the
+// authenticated binding, on the destruction-authorising path, and is pinned
+// now so it is already tight when S7.2b enables the windows-drive scan.
 const isSafeWorkspaceSegment = (value) =>
   isNonEmptyString(value) &&
   value !== "." &&
@@ -56,7 +58,9 @@ const isSafeWorkspaceSegment = (value) =>
   !value.includes("/") &&
   !value.includes("\\") &&
   !value.includes("\0") &&
-  !/^[a-zA-Z]:/.test(value);
+  !value.includes(":") &&
+  !value.endsWith(".") &&
+  !value.endsWith(" ");
 
 /**
  * Build the native residual-process enumeration IO for the reset/delete deps
