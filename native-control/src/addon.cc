@@ -5120,7 +5120,16 @@ napi_value EnumerateWorkspaceProcessHolders(napi_env env, napi_callback_info inf
     InventoryError(env, "INVENTORY_INVALID", "enumerate_workspace_process_holders"); return nullptr;
   }
 #ifdef __linux__
-  if (platform != "posix" || workDir[0] != '/' || workDir == "/" || workDir.back() == '/') {
+  // workDir must already be canonical: any '//', '/./', '/../', '/.' or '/..'
+  // segment can never match a kernel-canonical /proc symlink target, so a
+  // non-canonical root would silently enumerate zero holders and falsely
+  // authorise destruction. Reject it here rather than fail open.
+  if (platform != "posix" || workDir[0] != '/' || workDir == "/" || workDir.back() == '/' ||
+      workDir.find("//") != std::string::npos ||
+      workDir.find("/./") != std::string::npos ||
+      workDir.find("/../") != std::string::npos ||
+      (workDir.size() >= 2 && workDir.compare(workDir.size() - 2, 2, "/.") == 0) ||
+      (workDir.size() >= 3 && workDir.compare(workDir.size() - 3, 3, "/..") == 0)) {
     InventoryError(env, "INVENTORY_INVALID", "enumerate_workspace_process_holders"); return nullptr;
   }
   DIR* proc = opendir("/proc");
@@ -5129,7 +5138,21 @@ napi_value EnumerateWorkspaceProcessHolders(napi_env env, napi_callback_info inf
   }
   std::vector<uint32_t> holders;
   struct dirent* entry;
-  while ((entry = readdir(proc)) != nullptr) {
+  // readdir returning nullptr means end-of-stream ONLY when errno is still 0; a
+  // non-zero errno is a real read error, and continuing would emit a truncated
+  // holder list (a false absence). Reset errno before every readdir - including
+  // over the `continue` paths and after strtoul clobbers it - and treat a
+  // non-zero errno on a null return as a scan failure.
+  while (true) {
+    errno = 0;
+    entry = readdir(proc);
+    if (entry == nullptr) {
+      if (errno != 0) {
+        closedir(proc);
+        InventoryError(env, "WORKSPACE_RESIDUAL_SCAN_FAILED", "enumerate_workspace_process_holders"); return nullptr;
+      }
+      break;
+    }
     const char* name = entry->d_name;
     if (name[0] < '1' || name[0] > '9') continue;
     bool allDigits = true;
@@ -5153,7 +5176,18 @@ napi_value EnumerateWorkspaceProcessHolders(napi_env env, napi_callback_info inf
       DIR* fds = opendir(fdDir.c_str());
       if (fds != nullptr) {
         struct dirent* fd;
-        while (!holds && (fd = readdir(fds)) != nullptr) {
+        // Same errno discipline for the per-process fd stream: a read error here
+        // could hide the descriptor that proves this pid is a holder.
+        while (!holds) {
+          errno = 0;
+          fd = readdir(fds);
+          if (fd == nullptr) {
+            if (errno != 0) {
+              closedir(fds); closedir(proc);
+              InventoryError(env, "WORKSPACE_RESIDUAL_SCAN_FAILED", "enumerate_workspace_process_holders"); return nullptr;
+            }
+            break;
+          }
           if (fd->d_name[0] == '.') continue;
           if (ResidualReadLink(fdDir + "/" + fd->d_name, &target) &&
               ResidualTargetUnderRoot(target, workDir)) {
