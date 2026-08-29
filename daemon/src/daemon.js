@@ -61,6 +61,7 @@ import { resolveLifecycleCreateDispatcher, resolveTrustedCreateBinding, projectS
 import { resolveLifecycleRefreshDispatcher } from "./workspace-refresh-boot-wiring.js";
 import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-boot-wiring.js";
 import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
+import { resolveNativeServingBundles } from "./native-serving-boot-wiring.js";
 import { projectReceiptAuthority, resolveReceiptActivityIdentity, resolveAdoptedLeaseCandidateForWorkspace } from "./workspace-adopted-lease-candidate.js";
 import {
   initializeInventoryConfig,
@@ -2355,6 +2356,24 @@ if (workspaceRecoveryConfig.enabled) {
   }
 }
 
+// S6f.7d (#81): resolve the CREATE + REFRESH native serving deps bundles
+// (Option C-narrow: only these two lifecycle ops serve; reset/delete and
+// restore/migration stay fail-closed with null dispatchers). This sits behind
+// the still-false NATIVE_WORKSPACE_SERVING_ENABLED gate, so today it resolves
+// to inert null bundles - the S6f.7f flip activates it. resolveNativeServingBundles
+// degrades to fail-closed null bundles on any config/assembly fault instead of
+// taking the daemon down (pre-mortem #1); the fault is logged, serving stays off.
+const nativeServingBundles = resolveNativeServingBundles({
+  gateEnabled: NATIVE_WORKSPACE_SERVING_ENABLED,
+  recoveryEnabled: workspaceRecoveryConfig.enabled,
+  workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+  workspaceLeases,
+  env: process.env,
+});
+if (nativeServingBundles.degraded) {
+  console.error(`daemon: native serving disabled (fail-closed): ${JSON.stringify(nativeServingBundles.diagnostic)}`);
+}
+
 // S6f.2 (#81): boot-singleton create/clone dispatcher. Stays null until the
 // serving gate flips (S6f.7) AND a native serving low-level deps bundle is
 // supplied (S7, issue #171); a null dispatcher keeps WORKSPACE_CREATE
@@ -2362,6 +2381,7 @@ if (workspaceRecoveryConfig.enabled) {
 const lifecycleCreateDispatcher = resolveLifecycleCreateDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+  nativeServingDeps: nativeServingBundles.create,
 });
 
 // S6f.3 (#81): boot-singleton refresh dispatcher. Stays null until the serving
@@ -2371,6 +2391,7 @@ const lifecycleCreateDispatcher = resolveLifecycleCreateDispatcher({
 const lifecycleRefreshDispatcher = resolveLifecycleRefreshDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+  nativeServingDeps: nativeServingBundles.refresh,
 });
 
 // S6f.4 (#81): the boot-singleton reset/delete dispatcher stays null until the
