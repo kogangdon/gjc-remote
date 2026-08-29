@@ -27,13 +27,20 @@ const GATE_DEFINITION_PREFIX = `const ${GATE_CONST} =`;
 
 function gateDefinitionLine() {
   const lines = readFileSync(daemonSrc, "utf8").split(/\r?\n/);
-  const idx = lines.findIndex((line) => line.trim().startsWith(GATE_DEFINITION_PREFIX));
+  const matches = lines
+    .map((line, i) => (line.trim().startsWith(GATE_DEFINITION_PREFIX) ? i : -1))
+    .filter((i) => i !== -1);
   assert.notEqual(
-    idx,
-    -1,
+    matches.length,
+    0,
     `serving-gate definition "${GATE_DEFINITION_PREFIX} ..." not found in daemon/src/daemon.js`,
   );
-  return idx + 1;
+  assert.equal(
+    matches.length,
+    1,
+    `expected exactly one "${GATE_DEFINITION_PREFIX} ..." definition line in daemon/src/daemon.js, found ${matches.length}`,
+  );
+  return matches[0] + 1;
 }
 
 test("docs cite the current NATIVE_WORKSPACE_SERVING_ENABLED definition line", () => {
