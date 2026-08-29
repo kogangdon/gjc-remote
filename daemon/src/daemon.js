@@ -62,6 +62,7 @@ import { resolveLifecycleRefreshDispatcher } from "./workspace-refresh-boot-wiri
 import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-boot-wiring.js";
 import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
 import { resolveNativeServingBundles } from "./native-serving-boot-wiring.js";
+import { resolveNativeServingEnabled } from "./native-serving-gate.js";
 import { projectReceiptAuthority, resolveReceiptActivityIdentity, resolveAdoptedLeaseCandidateForWorkspace } from "./workspace-adopted-lease-candidate.js";
 import {
   initializeInventoryConfig,
@@ -233,8 +234,17 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
     : PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
 }
 
-const NATIVE_WORKSPACE_SERVING_ENABLED = false;
-// S6f.1: workspaces barred by boot crash-recovery; consulted by the serving-admission gate (dead code until S6f.7). Empty until GJC_NATIVE_WORKSPACE_ROOT is set.
+// S6f.7f (#81): human-approved native-serving-boundary flip. Native workspace
+// serving is now an env-gated, fail-closed runtime decision instead of a hard
+// false. resolveNativeServingEnabled requires BOTH the operator opt-in
+// GJC_NATIVE_WORKSPACE_SERVING === "1" AND inventoryReceiptAdvertised === true;
+// with the env var unset (the default) serving stays OFF exactly as before.
+// This gate is only the outermost AND term - each lifecycle op keeps its own
+// per-operation dispatcher-null / bundle-completeness check (Option C-narrow:
+// only CREATE and REFRESH assemble bundles; reset/delete + restore/migration
+// stay fail-closed null) and the per-workspace INV-6 barred check is separate.
+const NATIVE_WORKSPACE_SERVING_ENABLED = resolveNativeServingEnabled({ env: process.env, inventoryReceiptAdvertised });
+// S6f.1: workspaces barred by boot crash-recovery; consulted by the serving-admission gate (dormant unless serving is enabled by GJC_NATIVE_WORKSPACE_SERVING=1). Empty until GJC_NATIVE_WORKSPACE_ROOT is set.
 let barredWorkspaceIds = new Set();
 const MAX_BINDINGS_PER_SOCKET = 64;
 const localWorkspaceInventory =
@@ -1472,7 +1482,7 @@ async function admitReadyWorkload(state, workDir, message) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
   }
   // S6f.1/ARCH-F6: a workspace barred by boot crash-recovery stays unservable
-  // even once the gate flips (S6f.7). Dead code until NATIVE_WORKSPACE_SERVING_ENABLED is true.
+  // even when serving is enabled (S6f.7f flipped the gate to an env opt-in).
   const barredWorkspaceId = bindingState?.binding?.workspaceId;
   if (barredWorkspaceId !== undefined && barredWorkspaceIds.has(barredWorkspaceId)) {
     return { error: makeReadinessError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE) };
@@ -1813,9 +1823,9 @@ async function handleMessage(
     }
     // S6f.2 (#81): the reviewed create/clone security core
     // (workspace-create-dispatch.js) runs via the boot-singleton
-    // lifecycleCreateDispatcher. It is null until the serving gate flips
-    // (S6f.7) AND native serving low-level deps land (S7 #171), so today this
-    // branch fails closed identically to the S6f.1b contract stub. When served,
+    // lifecycleCreateDispatcher. It is null unless serving is enabled
+    // (GJC_NATIVE_WORKSPACE_SERVING=1, S6f.7f) AND its create bundle assembles
+    // (S6f.7d); otherwise this branch fails closed. When served,
     // resolve the trusted per-connection accepted binding + local inventory +
     // live readiness (never the message's own claims) and run the dispatcher.
     //
@@ -1885,9 +1895,9 @@ async function handleMessage(
     }
     // S6f.3 (#81): the reviewed refresh security core
     // (workspace-refresh-dispatch.js) runs via the boot-singleton
-    // lifecycleRefreshDispatcher. It is null until the serving gate flips
-    // (S6f.7) AND native serving low-level deps land (S7 #171), so today this
-    // branch fails closed identically to the S6f.1b contract stub. When served,
+    // lifecycleRefreshDispatcher. It is null unless serving is enabled
+    // (GJC_NATIVE_WORKSPACE_SERVING=1, S6f.7f) AND its refresh bundle assembles
+    // (S6f.7d); otherwise this branch fails closed. When served,
     // resolve the trusted per-connection accepted binding + local inventory +
     // live readiness + the adopted fence identity (never the message's own
     // claims); the base generation is read from the live pointer by the
@@ -1968,9 +1978,10 @@ async function handleMessage(
     }
     // S6f.4 (#81): the reviewed reset/delete security core
     // (workspace-reset-delete-dispatch.js) runs via the boot-singleton
-    // lifecycleResetDeleteDispatcher. It is null until the serving gate flips
-    // (S6f.7) AND native serving low-level deps land (S7 #171), so today this
-    // branch fails closed identically to the S6f.1b contract stub. When served,
+    // lifecycleResetDeleteDispatcher. Under Option C-narrow (S6f.7) this stays
+    // null even when serving is enabled - reset/delete does not assemble a
+    // bundle (follow-up #196), so this branch always fails closed today. If a
+    // reset/delete serving-state subsystem lands, when served it would
     // resolve the trusted per-connection accepted binding + local inventory +
     // live readiness + the adopted EXCLUSIVE fence identity + the host-held
     // manual-cleanup authority (never the message's own claims); the base being
@@ -2057,10 +2068,11 @@ async function handleMessage(
     }
     // S6f.5 (#81): the reviewed restore/migration security core
     // (workspace-restore-migration-dispatch.js) runs via the boot-singleton
-    // lifecycleRestoreMigrationDispatcher. It is null until the serving gate
-    // flips (S6f.7) AND native serving low-level deps land (S7 #171), so today
-    // this branch fails closed identically to the S6f.1b contract stub. When
-    // served, resolve the trusted per-connection accepted binding + local
+    // lifecycleRestoreMigrationDispatcher. Under Option C-narrow (S6f.7) this
+    // stays null even when serving is enabled - restore/migration does not
+    // assemble a bundle (follow-up #197), so this branch always fails closed
+    // today. If a restore/migration serving-state subsystem lands, when
+    // served it would resolve the trusted per-connection accepted binding + local
     // inventory + live readiness + the adopted EXCLUSIVE fence identity + the
     // host-held restore context (the quarantined staged source, provenance
     // authority, manifest, and lineage the thin wire message cannot carry).
@@ -2375,8 +2387,9 @@ if (workspaceRecoveryConfig.enabled) {
 // S6f.7d (#81): resolve the CREATE + REFRESH native serving deps bundles
 // (Option C-narrow: only these two lifecycle ops serve; reset/delete and
 // restore/migration stay fail-closed with null dispatchers). This sits behind
-// the still-false NATIVE_WORKSPACE_SERVING_ENABLED gate, so today it resolves
-// to inert null bundles - the S6f.7f flip activates it. resolveNativeServingBundles
+// the env-gated NATIVE_WORKSPACE_SERVING_ENABLED gate (S6f.7f): with the
+// operator opt-in unset it resolves to inert null bundles; with it set it
+// assembles live create/refresh bundles. resolveNativeServingBundles
 // degrades to fail-closed null bundles on any config/assembly fault instead of
 // taking the daemon down (pre-mortem #1); the fault is logged, serving stays off.
 const nativeServingBundles = resolveNativeServingBundles({
@@ -2390,40 +2403,40 @@ if (nativeServingBundles.degraded) {
   console.error(`daemon: native serving disabled (fail-closed): ${JSON.stringify(nativeServingBundles.diagnostic)}`);
 }
 
-// S6f.2 (#81): boot-singleton create/clone dispatcher. Stays null until the
-// serving gate flips (S6f.7) AND a native serving low-level deps bundle is
-// supplied (S7, issue #171); a null dispatcher keeps WORKSPACE_CREATE
-// fail-closed (RUNTIME_INCOMPATIBLE), identical to the S6f.1b contract stub.
+// S6f.2 (#81): boot-singleton create/clone dispatcher. Null unless serving is
+// enabled (GJC_NATIVE_WORKSPACE_SERVING=1, S6f.7f) AND a create bundle is
+// assembled (S6f.7d); a null dispatcher keeps WORKSPACE_CREATE fail-closed
+// (RUNTIME_INCOMPATIBLE).
 const lifecycleCreateDispatcher = resolveLifecycleCreateDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
   nativeServingDeps: nativeServingBundles.create,
 });
 
-// S6f.3 (#81): boot-singleton refresh dispatcher. Stays null until the serving
-// gate flips (S6f.7) AND a native serving low-level deps bundle is supplied
-// (S7, issue #171); a null dispatcher keeps WORKSPACE_REFRESH fail-closed
-// (RUNTIME_INCOMPATIBLE), identical to the S6f.1b contract stub.
+// S6f.3 (#81): boot-singleton refresh dispatcher. Null unless serving is
+// enabled (GJC_NATIVE_WORKSPACE_SERVING=1, S6f.7f) AND a refresh bundle is
+// assembled (S6f.7d); a null dispatcher keeps WORKSPACE_REFRESH fail-closed
+// (RUNTIME_INCOMPATIBLE).
 const lifecycleRefreshDispatcher = resolveLifecycleRefreshDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
   nativeServingDeps: nativeServingBundles.refresh,
 });
 
-// S6f.4 (#81): the boot-singleton reset/delete dispatcher stays null until the
-// serving gate flips (S6f.7) AND a native serving low-level deps bundle is
-// supplied (S7, issue #171); a null dispatcher keeps WORKSPACE_RESET_DELETE
-// fail-closed (RUNTIME_INCOMPATIBLE), identical to the S6f.1b contract stub.
+// S6f.4 (#81): the boot-singleton reset/delete dispatcher stays null under
+// Option C-narrow - no nativeServingDeps are supplied even when serving is
+// enabled (follow-up #196), so WORKSPACE_RESET_DELETE stays fail-closed
+// (RUNTIME_INCOMPATIBLE).
 const lifecycleResetDeleteDispatcher = resolveLifecycleResetDeleteDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
 });
 
-// S6f.5 (#81): the restore/migration boot-singleton. Null until the serving
-// gate flips (S6f.7) AND the native serving low-level deps bundle lands
-// (S7 #171); no nativeServingDeps are supplied today, so the resolver returns
-// null and the WORKSPACE_RESTORE_MIGRATION served branch stays inert, failing
-// closed (RUNTIME_INCOMPATIBLE) identically to the S6f.1b contract stub.
+// S6f.5 (#81): the restore/migration boot-singleton stays null under Option
+// C-narrow - no nativeServingDeps are supplied even when serving is enabled
+// (follow-up #197), so the resolver returns null and the
+// WORKSPACE_RESTORE_MIGRATION served branch stays inert, failing closed
+// (RUNTIME_INCOMPATIBLE).
 const lifecycleRestoreMigrationDispatcher = resolveLifecycleRestoreMigrationDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
