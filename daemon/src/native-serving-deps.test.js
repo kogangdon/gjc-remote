@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { assembleNativeServingDeps } from "./native-serving-deps.js";
+import { createReadinessReplayWindow } from "./workspace-readiness-replay-window.js";
 
 function fakeFactories(spy = {}) {
   const marker = (name) => ({ __marker: name });
@@ -78,6 +79,19 @@ test("the SAME replaySeen instance is shared across create and refresh (caveat C
   const { create, refresh } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories({}) });
   assert.equal(create.replaySeen, refresh.replaySeen);
   assert.equal(create.replaySeen.__marker, "replaySeen");
+});
+
+test("C1 cross-op: a fingerprint burned via the create bundle is already seen via refresh", () => {
+  // Use the REAL replay window so the shared-instance guarantee is behavioral,
+  // not just referential: burning through one bundle must block the other.
+  const { create, refresh } = assembleNativeServingDeps({
+    ...baseArgs(),
+    factories: { ...fakeFactories({}), makeReplayWindow: createReadinessReplayWindow },
+  });
+  assert.equal(create.replaySeen, refresh.replaySeen);
+  assert.equal(refresh.replaySeen.has("fp-x"), false);
+  create.replaySeen.add("fp-x"); // create burns it
+  assert.equal(refresh.replaySeen.has("fp-x"), true); // refresh sees it as replayed
 });
 
 test("containment is built from the verified native low-level, replay window from clock+maxAgeMs", () => {
