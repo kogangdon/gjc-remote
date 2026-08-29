@@ -14,6 +14,7 @@
 // RUNTIME_INCOMPATIBLE, identical to the S6f.1b contract stub.
 
 import { createLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-dispatch.js";
+import { createResidualProcessNativeIo } from "./workspace-residual-process-native-io.js";
 
 /**
  * Construct the boot-singleton reset/delete dispatcher, or null when serving is
@@ -56,4 +57,30 @@ export function createResidualProcessPlaceholderIo() {
       throw error;
     },
   });
+}
+
+/**
+ * Select the residual-process enumeration IO for the reset/delete deps bundle
+ * at the single swap seam the placeholder promises (S7.3 #171).
+ *
+ * When a verified native enumerator projection (S7.2
+ * createResidualProcessEnumerator) is available, return the real native adapter
+ * bound to this host's serving identity (createResidualProcessNativeIo);
+ * otherwise fall back to the Option-A placeholder that refuses to certify
+ * absence. The native adapter, not this selector, enforces the fail-closed
+ * hostId/workspaceId/platform checks. This selector is inert while the serving
+ * gate is false: the full nativeServingDeps bundle stays absent, so the
+ * dispatcher is null and neither branch executes in production today.
+ *
+ * @param {object} params
+ * @param {?object} params.enumerator native enumerator projection, or null/undefined.
+ * @param {string} params.hostId this daemon's own bound host id.
+ * @param {string} params.workspaceRoot the contained serving root.
+ * @param {"posix"|"windows-drive"} params.sourcePlatform the host path format.
+ */
+export function resolveResidualProcessIo({ enumerator, hostId, workspaceRoot, sourcePlatform } = {}) {
+  if (enumerator === null || enumerator === undefined) {
+    return createResidualProcessPlaceholderIo();
+  }
+  return createResidualProcessNativeIo({ enumerator, hostId, workspaceRoot, sourcePlatform });
 }
