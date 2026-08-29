@@ -23,13 +23,25 @@ test("a fresh fingerprint is unseen, then seen after add", () => {
   assert.equal(window.has("fp-1"), true);
 });
 
-test("a fingerprint aged past maxAgeMs is evicted and reads as unseen", () => {
+test("a fingerprint at exactly maxAgeMs is still fresh; only past it is evicted", () => {
   const clock = fakeClock(1000);
   const window = createReadinessReplayWindow({ maxAgeMs: 5000, clock });
   window.add("fp-1");
   clock.advance(4999);
-  assert.equal(window.has("fp-1"), true); // still inside the window
-  clock.advance(1); // now exactly maxAgeMs old -> evicted
+  assert.equal(window.has("fp-1"), true); // inside the window
+  clock.advance(1); // age == maxAgeMs -> STILL fresh (mirrors probe > maxAgeMs)
+  assert.equal(window.has("fp-1"), true);
+  clock.advance(1); // age == maxAgeMs + 1 -> evicted
+  assert.equal(window.has("fp-1"), false);
+});
+
+test("a backward clock step never prematurely evicts a fresh fingerprint", () => {
+  const clock = fakeClock(10000);
+  const window = createReadinessReplayWindow({ maxAgeMs: 5000, clock });
+  window.add("fp-1");
+  clock.set(0); // NTP slew backwards; monotonic clamp holds the internal clock
+  assert.equal(window.has("fp-1"), true);
+  clock.set(10000 + 5001); // real forward progress past the window
   assert.equal(window.has("fp-1"), false);
 });
 
@@ -69,7 +81,7 @@ test("re-adding a still-fresh fingerprint preserves its original expiry", () => 
   window.add("fp-1");
   clock.advance(3000);
   window.add("fp-1"); // must NOT refresh the expiry
-  clock.advance(2000); // original insert now 5000ms old -> evicted
+  clock.advance(2001); // original insert now maxAgeMs+1 old -> evicted
   assert.equal(window.has("fp-1"), false);
 });
 

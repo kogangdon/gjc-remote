@@ -79,10 +79,20 @@ export function createCandidateManifestResolver({ readdir = fsReaddir } = {}) {
     async function walk(dirAbs, relSegments) {
       const entries = await readdir(dirAbs, { withFileTypes: true });
       for (const dirent of entries) {
+        // Fail closed on a malformed readdir dep: a dirent MUST expose the
+        // classification methods, otherwise a symlink could be silently
+        // treated as a regular file (fail-open escape).
+        if (
+          typeof dirent?.isSymbolicLink !== "function" ||
+          typeof dirent?.isDirectory !== "function" ||
+          typeof dirent?.isFile !== "function"
+        ) {
+          refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "readdir must yield dirents with type predicates");
+        }
         // Skip reparse leaves / reparse directories: a symlinked subdirectory
         // is never descended, a symlink file leaf is never emitted. Deep
         // per-component reparse verification is the containment dep's job (S7).
-        if (typeof dirent?.isSymbolicLink === "function" && dirent.isSymbolicLink()) {
+        if (dirent.isSymbolicLink()) {
           continue;
         }
         const childRel = [...relSegments, dirent.name];

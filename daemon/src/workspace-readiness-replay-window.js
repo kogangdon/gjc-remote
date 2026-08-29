@@ -17,12 +17,14 @@
 // Bounding mechanism
 // ------------------
 // Each fingerprint is stamped with the trusted clock time at insertion. An
-// entry is evicted once it is at least `maxAgeMs` old - the SAME freshness
-// bound the orchestrators enforce on `probedAtMs` - so the live set can never
-// outlive the window in which a fingerprint could still be replayed. Eviction
-// runs on every `has` and `add`, so `has(fp)` returns false for an entry that
-// has aged out (its attestation is already stale and independently rejected by
-// the orchestrator's freshness check).
+// entry is evicted once it is STRICTLY older than `maxAgeMs` - matching the
+// probe freshness predicate exactly (workspace-generation-probe.js refuses
+// only `nowMs - probedAtMs > maxAgeMs`, so an attestation at age == maxAgeMs is
+// still fresh and MUST still be blocked as a replay). Evicting at age >=
+// maxAgeMs would drop a still-fresh fingerprint at the exact boundary and
+// reopen a one-tick replay window. Eviction runs on every `has` and `add`, so
+// `has(fp)` returns false only for an entry that has aged out past the window
+// (its attestation is by then independently rejected by the freshness check).
 //
 // Memory is bounded by construction: only fully-verified attestations reach
 // `add` (add-before-publish, after signature/authority checks), each distinct
@@ -31,11 +33,13 @@
 // ONLY - it never drops an un-aged fingerprint, which would reopen a replay
 // window inside the freshness bound.
 //
-// The clock is injected (defaults to Date.now) so it shares the daemon's
-// monotonic time base with the orchestrators' clock and so tests can advance
-// time deterministically. Insertion order equals chronological order (clock is
-// non-decreasing and each fingerprint is added at most once), so eviction can
-// stop at the first still-fresh entry.
+// The clock is injected (defaults to Date.now) so it shares the daemon's time
+// base with the orchestrators' clock and so tests can advance time
+// deterministically. Date.now is wall-time and can step backward (NTP slew), so
+// the module clamps every reading to the last observed value: time is treated
+// as monotonic non-decreasing internally. Combined with each fingerprint being
+// added at most once, insertion order equals chronological order, so eviction
+// can stop at the first still-fresh entry.
 //
 // This module never wires into daemon.js; it is landed-but-unwired foundation
 // consumed by the S6f.7d create/refresh bundle assembly (a single shared
@@ -69,9 +73,21 @@ export function createReadinessReplayWindow({ maxAgeMs, clock = { now: () => Dat
   // fingerprint -> insertion time (ms). Insertion order == chronological order.
   const seen = new Map();
 
+  // Monotonic clamp: a backward clock step must never make a fresh fingerprint
+  // look older nor break the insertion-order == chronological-order invariant.
+  let lastNowMs = Number.NEGATIVE_INFINITY;
+  function readClock() {
+    const raw = clock.now();
+    if (!Number.isFinite(raw)) {
+      refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "clock.now() must return a finite number");
+    }
+    lastNowMs = raw > lastNowMs ? raw : lastNowMs;
+    return lastNowMs;
+  }
+
   function evict(nowMs) {
     for (const [fingerprint, insertedAtMs] of seen) {
-      if (nowMs - insertedAtMs >= maxAgeMs) {
+      if (nowMs - insertedAtMs > maxAgeMs) {
         seen.delete(fingerprint);
       } else {
         // Every later entry was inserted no earlier, so it is still fresh too.
@@ -88,13 +104,13 @@ export function createReadinessReplayWindow({ maxAgeMs, clock = { now: () => Dat
 
   function has(fp) {
     assertFingerprint(fp);
-    evict(clock.now());
+    evict(readClock());
     return seen.has(fp);
   }
 
   function add(fp) {
     assertFingerprint(fp);
-    const nowMs = clock.now();
+    const nowMs = readClock();
     evict(nowMs);
     // Single-use: re-adding an existing (still-fresh) fingerprint keeps its
     // original insertion slot, preserving chronological Map order.

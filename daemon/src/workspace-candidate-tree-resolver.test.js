@@ -115,3 +115,9 @@ test("invalid candidatePath and platform fail closed with CONFIG_INVALID", async
 test("non-function readdir injection fails closed", () => {
   assert.throws(() => createCandidateManifestResolver({ readdir: 123 }), (e) => e.code === "CONFIG_INVALID");
 });
+
+test("a dirent lacking type predicates fails closed (no fail-open symlink)", async () => {
+  const badReaddir = async () => [{ name: "x.txt" }]; // missing isSymbolicLink/isDirectory/isFile
+  const resolve = createCandidateManifestResolver({ readdir: badReaddir });
+  await assert.rejects(resolve("/root", "posix"), (e) => e.code === "CONFIG_INVALID");
+});
