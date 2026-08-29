@@ -123,7 +123,7 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving verification remains N/A.** Native workspace serving is disabled by a
-const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon/src/daemon.js:235), with no env/config
+const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon/src/daemon.js:237), with no env/config
 override anywhere in the repository; its sole read site is inside `admitReadyWorkload`, which returns
 `RUNTIME_INCOMPATIBLE` while the gate is off; the bot side defaults to false as well and is not
 overridden at startup. The production native-reader daemon-boot wiring is now landed (commit

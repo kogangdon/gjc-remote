@@ -61,6 +61,8 @@ import { resolveLifecycleCreateDispatcher, resolveTrustedCreateBinding, projectS
 import { resolveLifecycleRefreshDispatcher } from "./workspace-refresh-boot-wiring.js";
 import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-boot-wiring.js";
 import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
+import { assembleNativeServingDeps } from "./native-serving-deps.js";
+import { resolveReadinessMaxAgeMs } from "./native-serving-config.js";
 import { projectReceiptAuthority, resolveReceiptActivityIdentity, resolveAdoptedLeaseCandidateForWorkspace } from "./workspace-adopted-lease-candidate.js";
 import {
   initializeInventoryConfig,
@@ -2355,6 +2357,39 @@ if (workspaceRecoveryConfig.enabled) {
   }
 }
 
+// S6f.7d (#81): assemble the CREATE + REFRESH native serving deps bundles
+// (Option C-narrow: only these two lifecycle ops serve; reset/delete and
+// restore/migration stay fail-closed with null dispatchers). This sits behind
+// the still-false NATIVE_WORKSPACE_SERVING_ENABLED const, so today it never
+// runs and both bundles stay null - the S6f.7f flip activates it. Assembly is
+// wrapped so a construction fault degrades serving to fail-closed (null
+// dispatchers) instead of taking the daemon down (pre-mortem #1).
+let nativeServingCreateDeps = null;
+let nativeServingRefreshDeps = null;
+if (NATIVE_WORKSPACE_SERVING_ENABLED && workspaceRecoveryConfig.enabled) {
+  try {
+    const readinessMaxAge = resolveReadinessMaxAgeMs({ env: process.env });
+    if (readinessMaxAge.ok !== true) {
+      throw Object.assign(new Error("native serving readiness config invalid"), {
+        code: readinessMaxAge.diagnostic.code,
+      });
+    }
+    const nativeServingBundles = assembleNativeServingDeps({
+      workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+      workspaceLeases,
+      maxAgeMs: readinessMaxAge.maxAgeMs,
+    });
+    nativeServingCreateDeps = nativeServingBundles.create;
+    nativeServingRefreshDeps = nativeServingBundles.refresh;
+  } catch (error) {
+    // Fail closed: serving stays off (null dispatchers) with a sanitized
+    // diagnostic; the daemon keeps running for every non-serving path.
+    console.error(`daemon: native serving deps assembly failed, serving disabled: ${sanitizeDaemonError(error)}`);
+    nativeServingCreateDeps = null;
+    nativeServingRefreshDeps = null;
+  }
+}
+
 // S6f.2 (#81): boot-singleton create/clone dispatcher. Stays null until the
 // serving gate flips (S6f.7) AND a native serving low-level deps bundle is
 // supplied (S7, issue #171); a null dispatcher keeps WORKSPACE_CREATE
@@ -2362,6 +2397,7 @@ if (workspaceRecoveryConfig.enabled) {
 const lifecycleCreateDispatcher = resolveLifecycleCreateDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+  nativeServingDeps: nativeServingCreateDeps,
 });
 
 // S6f.3 (#81): boot-singleton refresh dispatcher. Stays null until the serving
@@ -2371,6 +2407,7 @@ const lifecycleCreateDispatcher = resolveLifecycleCreateDispatcher({
 const lifecycleRefreshDispatcher = resolveLifecycleRefreshDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+  nativeServingDeps: nativeServingRefreshDeps,
 });
 
 // S6f.4 (#81): the boot-singleton reset/delete dispatcher stays null until the
