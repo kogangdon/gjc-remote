@@ -62,6 +62,7 @@ import { resolveLifecycleRefreshDispatcher } from "./workspace-refresh-boot-wiri
 import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-boot-wiring.js";
 import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
 import { resolveNativeServingBundles } from "./native-serving-boot-wiring.js";
+import { resolveNativeServingEnabled } from "./native-serving-gate.js";
 import { projectReceiptAuthority, resolveReceiptActivityIdentity, resolveAdoptedLeaseCandidateForWorkspace } from "./workspace-adopted-lease-candidate.js";
 import {
   initializeInventoryConfig,
@@ -233,7 +234,16 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
     : PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
 }
 
-const NATIVE_WORKSPACE_SERVING_ENABLED = false;
+// S6f.7f (#81): human-approved native-serving-boundary flip. Native workspace
+// serving is now an env-gated, fail-closed runtime decision instead of a hard
+// false. resolveNativeServingEnabled requires BOTH the operator opt-in
+// GJC_NATIVE_WORKSPACE_SERVING === "1" AND inventoryReceiptAdvertised === true;
+// with the env var unset (the default) serving stays OFF exactly as before.
+// This gate is only the outermost AND term - each lifecycle op keeps its own
+// per-operation dispatcher-null / bundle-completeness check (Option C-narrow:
+// only CREATE and REFRESH assemble bundles; reset/delete + restore/migration
+// stay fail-closed null) and the per-workspace INV-6 barred check is separate.
+const NATIVE_WORKSPACE_SERVING_ENABLED = resolveNativeServingEnabled({ env: process.env, inventoryReceiptAdvertised });
 // S6f.1: workspaces barred by boot crash-recovery; consulted by the serving-admission gate (dead code until S6f.7). Empty until GJC_NATIVE_WORKSPACE_ROOT is set.
 let barredWorkspaceIds = new Set();
 const MAX_BINDINGS_PER_SOCKET = 64;

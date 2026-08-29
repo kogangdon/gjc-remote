@@ -122,16 +122,19 @@ ownership behavior, plus the D durable-floor genesis and `+1` advance behavior, 
 release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-arm` leg) supplies
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
-**Native workspace serving verification remains N/A.** Native workspace serving is disabled by a
-const literal (`NATIVE_WORKSPACE_SERVING_ENABLED = false`, daemon/src/daemon.js:236), with no env/config
-override anywhere in the repository; its sole read site is inside `admitReadyWorkload`, which returns
-`RUNTIME_INCOMPATIBLE` while the gate is off; the bot side defaults to false as well and is not
-overridden at startup. The production native-reader daemon-boot wiring is now landed (commit
-e62b7b5, #141): `daemon/src/daemon.js` imports `initializeInventoryConfig` and, when
-`GJC_NATIVE_INVENTORY_MODE === 'verify'` and outside test injection, constructs and self-tests the
-production native reader via `daemon/src/inventory-boot-wiring.js`, threading it into
-`createWorkspaceInventoryProvider({reader})`; verify-mode config or self-test failure hard-exits with
-a sanitized diagnostic. That reader wiring explicitly does not bring serving into scope. The
-native-serving enablement is the sole remaining future slice (issue #81, S6f): it stays gated behind
-the unchanged `NATIVE_WORKSPACE_SERVING_ENABLED = false`, and its verification belongs to that future
-native-serving boundary, not to this epic's landed evidence.
+**Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:246, an
+`= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
+is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
+default) the gate reads `false` and its read site inside `admitReadyWorkload` returns
+`RUNTIME_INCOMPATIBLE`, exactly as before the S6f.7 flip; the bot side defaults to false as well and
+is not overridden at startup. When enabled, serving is Option C-narrow: only CREATE and REFRESH
+assemble native serving deps; reset/delete and restore/migration keep null dispatchers and stay
+fail-closed, and any INV-6 boot-crash-recovery-barred workspace is refused on every lifecycle op. The
+production native-reader daemon-boot wiring is landed (commit e62b7b5, #141): `daemon/src/daemon.js`
+imports `initializeInventoryConfig` and, when `GJC_NATIVE_INVENTORY_MODE === 'verify'` and outside
+test injection, constructs and self-tests the production native reader via
+`daemon/src/inventory-boot-wiring.js`, threading it into `createWorkspaceInventoryProvider({reader})`;
+verify-mode config or self-test failure hard-exits with a sanitized diagnostic. Native-serving
+enablement (issue #81, S6f.7) is landed as an opt-in boundary; live serving-ON evidence belongs to a
+deployment that sets `GJC_NATIVE_WORKSPACE_SERVING=1`.

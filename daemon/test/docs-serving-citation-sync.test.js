@@ -20,15 +20,18 @@ const docPaths = [
 ];
 
 const GATE_CONST = "NATIVE_WORKSPACE_SERVING_ENABLED";
-const GATE_DEFINITION = `const ${GATE_CONST} = false;`;
+// S6f.7f: the gate is now an env-gated resolveNativeServingEnabled(...) call, not
+// a `= false` literal. Anchor on the `const <GATE_CONST> =` definition prefix so
+// the docs-sync guard survives the RHS flip and any future RHS reshaping.
+const GATE_DEFINITION_PREFIX = `const ${GATE_CONST} =`;
 
 function gateDefinitionLine() {
   const lines = readFileSync(daemonSrc, "utf8").split(/\r?\n/);
-  const idx = lines.findIndex((line) => line.trim() === GATE_DEFINITION);
+  const idx = lines.findIndex((line) => line.trim().startsWith(GATE_DEFINITION_PREFIX));
   assert.notEqual(
     idx,
     -1,
-    `serving-gate definition "${GATE_DEFINITION}" not found in daemon/src/daemon.js`,
+    `serving-gate definition "${GATE_DEFINITION_PREFIX} ..." not found in daemon/src/daemon.js`,
   );
   return idx + 1;
 }
