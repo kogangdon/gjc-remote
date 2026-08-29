@@ -41,6 +41,7 @@
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <sys/random.h>
+#include <dirent.h>
 #endif
 #endif
 
@@ -5057,6 +5058,162 @@ napi_value PublishInventoryObjectAtomic(napi_env env, napi_callback_info info) {
   return PublishInventoryObjectAtomicPosix(env, info);
 #endif
 }
+#ifdef __linux__
+// Returns true when `target` denotes the workspace root itself or any object
+// strictly inside it. `root` is a canonical absolute path with no trailing
+// slash (validated by the caller). The kernel appends " (deleted)" to a
+// readlink of an unlinked object; that suffix is stripped before comparison so
+// a process still holding a now-deleted workspace file is counted as a holder.
+bool ResidualTargetUnderRoot(std::string target, const std::string& root) {
+  static const char kDeleted[] = " (deleted)";
+  const size_t deletedLen = sizeof(kDeleted) - 1;
+  if (target.size() >= deletedLen &&
+      target.compare(target.size() - deletedLen, deletedLen, kDeleted) == 0) {
+    target.resize(target.size() - deletedLen);
+  }
+  if (target.empty() || target[0] != '/') return false;
+  if (target == root) return true;
+  return target.size() > root.size() &&
+         target.compare(0, root.size(), root) == 0 &&
+         target[root.size()] == '/';
+}
+
+// readlink a single /proc magic symlink into `out`. Returns false on any error
+// (ENOENT/ESRCH when the process exited mid-scan, EACCES when the link belongs
+// to a different security context) or on an over-long / truncated target, so an
+// unreadable link never contributes a false holder and never aborts the scan.
+bool ResidualReadLink(const std::string& link, std::string* out) {
+  std::array<char, 4097> buffer{};
+  const ssize_t size = readlink(link.c_str(), buffer.data(), buffer.size() - 1);
+  if (size <= 0 || size >= static_cast<ssize_t>(buffer.size() - 1)) return false;
+  out->assign(buffer.data(), static_cast<size_t>(size));
+  return true;
+}
+#endif
+
+// enumerate_workspace_process_holders(workDir, sourcePlatform) -> [{ pid }]
+//
+// Returns the set of process ids that still hold the workspace open before a
+// reset/delete generation teardown. A process is a holder when its current
+// working directory, root, main executable, or ANY open file descriptor
+// resolves (no-follow, via the kernel /proc magic symlinks) to the workspace
+// root or an object strictly inside it. The list is the residual-process
+// absence proof consumed by workspace-residual-process.js: an EMPTY array
+// authorises destruction, a non-empty array blocks it.
+//
+// Scope and fail-closed posture (Linux, the Compose/WSL serving target chosen
+// for this slice): the scan mirrors lsof/fuser semantics over same-namespace
+// processes. A /proc entry that cannot be inspected (the process exited, or its
+// links belong to a different uid/security context) is skipped rather than
+// counted, because a coding-session child sharing the workspace mount always
+// runs in this namespace and uid and is therefore inspectable; a link we cannot
+// read provably is not such a child. mmap-only holders (a workspace file mapped
+// with its descriptor already closed, visible only in /proc/<pid>/maps) are a
+// documented non-goal of this slice. The Windows handle-scan is slice S7.2b;
+// until then the capability is registered on every platform - so the native ABI
+// contract is identical - but only Linux performs a real scan.
+napi_value EnumerateWorkspaceProcessHolders(napi_env env, napi_callback_info info) {
+  napi_value args[2]; std::string workDir, platform;
+  if (!InventoryArgs(env, info, 2, args) || !InventoryString(env, args[0], &workDir) ||
+      workDir.empty() || workDir.size() > 4096 ||
+      !InventoryString(env, args[1], &platform)) {
+    InventoryError(env, "INVENTORY_INVALID", "enumerate_workspace_process_holders"); return nullptr;
+  }
+#ifdef __linux__
+  // workDir must already be canonical: any '//', '/./', '/../', '/.' or '/..'
+  // segment can never match a kernel-canonical /proc symlink target, so a
+  // non-canonical root would silently enumerate zero holders and falsely
+  // authorise destruction. Reject it here rather than fail open.
+  if (platform != "posix" || workDir[0] != '/' || workDir == "/" || workDir.back() == '/' ||
+      workDir.find("//") != std::string::npos ||
+      workDir.find("/./") != std::string::npos ||
+      workDir.find("/../") != std::string::npos ||
+      (workDir.size() >= 2 && workDir.compare(workDir.size() - 2, 2, "/.") == 0) ||
+      (workDir.size() >= 3 && workDir.compare(workDir.size() - 3, 3, "/..") == 0)) {
+    InventoryError(env, "INVENTORY_INVALID", "enumerate_workspace_process_holders"); return nullptr;
+  }
+  DIR* proc = opendir("/proc");
+  if (proc == nullptr) {
+    InventoryError(env, "WORKSPACE_RESIDUAL_SCAN_FAILED", "enumerate_workspace_process_holders"); return nullptr;
+  }
+  std::vector<uint32_t> holders;
+  struct dirent* entry;
+  // readdir returning nullptr means end-of-stream ONLY when errno is still 0; a
+  // non-zero errno is a real read error, and continuing would emit a truncated
+  // holder list (a false absence). Reset errno before every readdir - including
+  // over the `continue` paths and after strtoul clobbers it - and treat a
+  // non-zero errno on a null return as a scan failure.
+  while (true) {
+    errno = 0;
+    entry = readdir(proc);
+    if (entry == nullptr) {
+      if (errno != 0) {
+        closedir(proc);
+        InventoryError(env, "WORKSPACE_RESIDUAL_SCAN_FAILED", "enumerate_workspace_process_holders"); return nullptr;
+      }
+      break;
+    }
+    const char* name = entry->d_name;
+    if (name[0] < '1' || name[0] > '9') continue;
+    bool allDigits = true;
+    for (const char* c = name; *c != '\0'; ++c) {
+      if (*c < '0' || *c > '9') { allDigits = false; break; }
+    }
+    if (!allDigits) continue;
+    errno = 0;
+    const unsigned long pidLong = strtoul(name, nullptr, 10);
+    if (errno != 0 || pidLong == 0 || pidLong > 0x7fffffffUL) continue;
+    const std::string base = std::string("/proc/") + name;
+    bool holds = false;
+    std::string target;
+    for (const char* leaf : {"/cwd", "/root", "/exe"}) {
+      if (ResidualReadLink(base + leaf, &target) && ResidualTargetUnderRoot(target, workDir)) {
+        holds = true; break;
+      }
+    }
+    if (!holds) {
+      const std::string fdDir = base + "/fd";
+      DIR* fds = opendir(fdDir.c_str());
+      if (fds != nullptr) {
+        struct dirent* fd;
+        // Same errno discipline for the per-process fd stream: a read error here
+        // could hide the descriptor that proves this pid is a holder.
+        while (!holds) {
+          errno = 0;
+          fd = readdir(fds);
+          if (fd == nullptr) {
+            if (errno != 0) {
+              closedir(fds); closedir(proc);
+              InventoryError(env, "WORKSPACE_RESIDUAL_SCAN_FAILED", "enumerate_workspace_process_holders"); return nullptr;
+            }
+            break;
+          }
+          if (fd->d_name[0] == '.') continue;
+          if (ResidualReadLink(fdDir + "/" + fd->d_name, &target) &&
+              ResidualTargetUnderRoot(target, workDir)) {
+            holds = true;
+          }
+        }
+        closedir(fds);
+      }
+    }
+    if (holds) holders.push_back(static_cast<uint32_t>(pidLong));
+  }
+  closedir(proc);
+  napi_value result, element, value;
+  napi_create_array_with_length(env, holders.size(), &result);
+  for (uint32_t i = 0; i < holders.size(); ++i) {
+    napi_create_object(env, &element);
+    napi_create_uint32(env, holders[i], &value);
+    napi_set_named_property(env, element, "pid", value);
+    napi_set_element(env, result, i, element);
+  }
+  return result;
+#else
+  (void)platform;
+  InventoryError(env, "CONTAINMENT_UNSUPPORTED", "enumerate_workspace_process_holders"); return nullptr;
+#endif
+}
 napi_value NativeControlContract(napi_env env, napi_callback_info) {
   const char* capabilities[] = {
     "open_verified_parent", "open_no_follow", "read_identity", "read_acl", "path_exists_no_follow",
@@ -5068,11 +5225,12 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
     "resolve_native_state_root", "read_workspace_root_facts", "ensure_inventory_directory",
     "verify_inventory_acl", "acquire_inventory_fence", "read_inventory_object",
     "publish_inventory_object_atomic",
+    "enumerate_workspace_process_holders",
   };
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
   napi_create_uint32(env, 4, &value); napi_set_named_property(env, result, "contractVersion", value);
-  napi_create_uint32(env, 2, &value); napi_set_named_property(env, result, "contractRevision", value);
+  napi_create_uint32(env, 3, &value); napi_set_named_property(env, result, "contractRevision", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
@@ -5118,6 +5276,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("acquire_inventory_fence", {"path", "roles"});
   signature("read_inventory_object", {"path", "maxBytes", "roles", "profile"});
   signature("publish_inventory_object_atomic", {"path", "tempPrefix", "bytes", "expectedIdentity", "roles", "profile"});
+  signature("enumerate_workspace_process_holders", {"workDir", "sourcePlatform"});
   napi_set_named_property(env, result, "capabilitySignatures", signatures);
   return result;
 }
@@ -5162,7 +5321,8 @@ napi_value Init(napi_env env, napi_value exports) {
     {"verify_inventory_acl", nullptr, VerifyInventoryAcl, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"acquire_inventory_fence", nullptr, AcquireInventoryFence, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"read_inventory_object", nullptr, ReadInventoryObject, nullptr, nullptr, nullptr, napi_default, nullptr},
-    {"publish_inventory_object_atomic", nullptr, PublishInventoryObjectAtomic, nullptr, nullptr, nullptr, napi_default, nullptr}
+    {"publish_inventory_object_atomic", nullptr, PublishInventoryObjectAtomic, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"enumerate_workspace_process_holders", nullptr, EnumerateWorkspaceProcessHolders, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
   napi_define_properties(env, exports, sizeof(methods) / sizeof(methods[0]), methods);
   return exports;

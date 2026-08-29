@@ -4,5 +4,6 @@ export {
   createInventoryPublisher,
   createInventoryReader,
   createManagementNative,
+  createResidualProcessEnumerator,
   validateBuildManifest,
 } from "./index.js";

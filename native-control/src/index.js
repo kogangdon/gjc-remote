@@ -104,7 +104,7 @@ export function verifyManifestSignature(manifestBytes, sidecar, trustStore) {
 }
 
 export function validateBuildManifest(manifest, packageJson, addonBytes, platform = process.platform, arch = process.arch) {
-  if (contractRevision !== 2 || !manifest ||
+  if (contractRevision !== 3 || !manifest ||
       Object.getPrototypeOf(manifest) !== Object.prototype || !packageJson ||
       Object.getPrototypeOf(packageJson) !== Object.prototype ||
       !Buffer.isBuffer(addonBytes)) return false;
@@ -232,5 +232,25 @@ export function createContainmentLowLevel({ loadAddon = loadVerifiedAddon } = {}
     read_workspace_root_facts: (path, sourcePlatform) => addon.read_workspace_root_facts(path, sourcePlatform),
     read_identity: (path) => addon.read_identity(path),
     path_exists_no_follow: (path) => addon.path_exists_no_follow(path),
+  });
+}
+
+// Least-privilege residual-process enumerator surface (slice S7.2). Exposes ONLY
+// enumerate_workspace_process_holders(workDir, sourcePlatform) -> [{ pid }], the
+// read-only scan that proves whether any process still holds a workspace open
+// before a reset/delete generation teardown. Like the containment surface it is
+// a thin positional passthrough over the fully verified addon with every other
+// capability withheld and the result frozen, so a teardown caller can read the
+// residual-holder set but reach no capability that signals, writes, or
+// destroys. The scan is Linux-only in this slice; on other platforms the native
+// capability throws (Windows handle-scan is slice S7.2b).
+export function createResidualProcessEnumerator({ loadAddon = loadVerifiedAddon } = {}) {
+  const addon = loadAddon();
+  if (typeof addon?.enumerate_workspace_process_holders !== 'function') {
+    refused('create_residual_process_enumerator', 'verified addon is missing native capability: enumerate_workspace_process_holders');
+  }
+  return Object.freeze({
+    enumerate_workspace_process_holders: (workDir, sourcePlatform) =>
+      addon.enumerate_workspace_process_holders(workDir, sourcePlatform),
   });
 }

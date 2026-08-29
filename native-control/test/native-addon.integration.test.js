@@ -86,7 +86,12 @@ test("contract-4 inventory ABI exposes only the frozen seven primitive signature
     "read_inventory_object",
     "publish_inventory_object_atomic",
   ];
-  assert.deepEqual(capabilities.slice(-inventory.length), inventory);
+  // The seven inventory primitives now sit directly before the serving block
+  // (enumerate_workspace_process_holders), so they are the 7 capabilities ending
+  // one slot from the tail rather than the final 7.
+  assert.deepEqual(capabilities.slice(-inventory.length - 1, -1), inventory);
+  assert.equal(capabilities.at(-1), "enumerate_workspace_process_holders");
+  assert.deepEqual(capabilitySignatures.enumerate_workspace_process_holders, ["workDir", "sourcePlatform"]);
   assert.deepEqual(Object.fromEntries(inventory.map((name) => [name, capabilitySignatures[name]])), {
     resolve_native_state_root: ["hostKey", "rootKind"],
     read_workspace_root_facts: ["path", "sourcePlatform"],
@@ -105,15 +110,17 @@ test("staged public inventory adapters do not change the native ABI or expose lo
     "createInventoryPublisher",
     "createInventoryReader",
     "createManagementNative",
+    "createResidualProcessEnumerator",
     "validateBuildManifest",
   ]);
   assert.equal(typeof publicApi.createContainmentLowLevel, "function");
+  assert.equal(typeof publicApi.createResidualProcessEnumerator, "function");
   assert.equal(typeof publicApi.createInventoryPublisher, "function");
   assert.equal(typeof publicApi.createInventoryReader, "function");
   assert.equal("createInventoryPublisherAdapter" in publicApi, false);
   assert.equal("createInventoryReaderAdapter" in publicApi, false);
   assert.equal(publicApi.buildManifest.contractVersion, 4);
-  assert.equal(publicApi.buildManifest.contractRevision, 2);
+  assert.equal(publicApi.buildManifest.contractRevision, 3);
   assert.deepEqual(publicApi.buildManifest.capabilities, capabilities);
   assert.deepEqual(publicApi.buildManifest.capabilitySignatures, capabilitySignatures);
 });
