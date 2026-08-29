@@ -783,9 +783,11 @@ test('public module exposes only management plus staged inventory and containmen
     'createInventoryPublisher',
     'createInventoryReader',
     'createManagementNative',
+    'createResidualProcessEnumerator',
     'validateBuildManifest',
   ]);
   assert.equal(typeof publicApi.createContainmentLowLevel, 'function');
+  assert.equal(typeof publicApi.createResidualProcessEnumerator, 'function');
   assert.equal(typeof publicApi.createInventoryPublisher, 'function');
   assert.equal(typeof publicApi.createInventoryReader, 'function');
   assert.equal('createInventoryPublisherAdapter' in publicApi, false);

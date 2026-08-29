@@ -159,8 +159,8 @@ function loadOptions(fixture, extra) {
   };
 }
 
-test('contract revision 2 is the fence write-receipt provenance boundary', () => {
-  assert.equal(contractRevision, 2);
+test('contract revision 3 is the fence write-receipt provenance boundary', () => {
+  assert.equal(contractRevision, 3);
   assert.deepEqual(capabilitySignatures.acquire_inventory_fence, ['path', 'roles']);
 });
 

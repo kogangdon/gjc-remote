@@ -1,4 +1,4 @@
-export const contractRevision = 2;
+export const contractRevision = 3;
 export const managementCapabilities = Object.freeze(['open_verified_parent', 'open_no_follow', 'read_identity', 'read_acl', 'path_exists_no_follow', 'set_exact_role_acl', 'verify_exact_role_acl', 'read_verified_bytes', 'create_exclusive_temp', 'flush_file', 'flush_directory_or_volume', 'replace_existing_atomic', 'create_absent_exclusive', 'ensure_control_directory', 'acquire_native_lock', 'current_os_principal', 'principal_access_check', 'remove_verified_file', 'open_verified_parent_handle', 'open_verified_object_handle', 'read_handle_identity', 'read_handle_bytes', 'write_handle_bytes', 'remove_verified_handle', 'verify_role_sid_not_group']);
 export const inventoryCapabilities = Object.freeze([
   'resolve_native_state_root',
@@ -9,7 +9,14 @@ export const inventoryCapabilities = Object.freeze([
   'read_inventory_object',
   'publish_inventory_object_atomic',
 ]);
-export const capabilities = Object.freeze([...managementCapabilities, ...inventoryCapabilities]);
+// Workspace-serving low-level capabilities (slice S7.2). enumerate_workspace_
+// process_holders backs the residual-process absence proof consumed before a
+// reset/delete generation teardown. Real scan is Linux-only in this slice; the
+// Windows handle-scan is registered but unsupported until slice S7.2b.
+export const servingCapabilities = Object.freeze([
+  'enumerate_workspace_process_holders',
+]);
+export const capabilities = Object.freeze([...managementCapabilities, ...inventoryCapabilities, ...servingCapabilities]);
 export const capabilitySignatures = Object.freeze({
   open_verified_parent: ['path'], open_no_follow: ['path'], read_identity: ['path'], read_acl: ['path'], path_exists_no_follow: ['path'],
   set_exact_role_acl: ['path', 'managementSid', 'botSid', 'recoverySid', 'systemSid', 'profile'],
@@ -32,5 +39,6 @@ export const capabilitySignatures = Object.freeze({
   acquire_inventory_fence: ['path', 'roles'],
   read_inventory_object: ['path', 'maxBytes', 'roles', 'profile'],
   publish_inventory_object_atomic: ['path', 'tempPrefix', 'bytes', 'expectedIdentity', 'roles', 'profile'],
+  enumerate_workspace_process_holders: ['workDir', 'sourcePlatform'],
 });
 for (const signature of Object.values(capabilitySignatures)) Object.freeze(signature);
