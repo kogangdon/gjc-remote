@@ -1818,7 +1818,13 @@ async function handleMessage(
     // branch fails closed identically to the S6f.1b contract stub. When served,
     // resolve the trusted per-connection accepted binding + local inventory +
     // live readiness (never the message's own claims) and run the dispatcher.
-    if (NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleCreateDispatcher) {
+    //
+    // S6f.7e (#81): INV-6 serving-time bar - a workspace barred by boot crash-
+    // recovery stays unservable on this lifecycle op even after the gate flips
+    // (S6f.7f). Evaluated before the gate/dispatcher check; a barred workspace
+    // short-circuits and falls through to the identical RUNTIME_INCOMPATIBLE
+    // refusal below (mirrors the INVOKE-path bar at the readiness gate).
+    if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleCreateDispatcher) {
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
@@ -1886,7 +1892,11 @@ async function handleMessage(
     // live readiness + the adopted fence identity (never the message's own
     // claims); the base generation is read from the live pointer by the
     // dispatcher, and the successor is chained under a non-exclusive fence.
-    if (NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleRefreshDispatcher) {
+    //
+    // S6f.7e (#81): INV-6 serving-time bar - see WORKSPACE_CREATE. A barred
+    // workspace short-circuits before the gate/dispatcher check and falls
+    // through to the identical RUNTIME_INCOMPATIBLE refusal below.
+    if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleRefreshDispatcher) {
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
@@ -1966,7 +1976,10 @@ async function handleMessage(
     // manual-cleanup authority (never the message's own claims); the base being
     // destroyed is read from the live disposition by the dispatcher, gated by a
     // dirty-backup capture, workload quiescence, and residual-process absence.
-    if (NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleResetDeleteDispatcher) {
+    // S6f.7e (#81): INV-6 serving-time bar - see WORKSPACE_CREATE. A barred
+    // workspace short-circuits before the gate/dispatcher check and falls
+    // through to the identical RUNTIME_INCOMPATIBLE refusal below.
+    if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleResetDeleteDispatcher) {
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
@@ -2053,7 +2066,10 @@ async function handleMessage(
     // authority, manifest, and lineage the thin wire message cannot carry).
     // The base being promoted onto is read from the live pointer by the
     // dispatcher; the promotion is a reversible successor generation.
-    if (NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleRestoreMigrationDispatcher) {
+    // S6f.7e (#81): INV-6 serving-time bar - see WORKSPACE_CREATE. A barred
+    // workspace short-circuits before the gate/dispatcher check and falls
+    // through to the identical RUNTIME_INCOMPATIBLE refusal below.
+    if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleRestoreMigrationDispatcher) {
       const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
       const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
