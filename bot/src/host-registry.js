@@ -15,6 +15,7 @@ import {
   V0_LIMITS,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+  WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   isAnswerMessage,
   isEventMessage,
   isGateRequestEvent,
@@ -67,6 +68,7 @@ const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPA
 const V3_CAPABILITIES = Object.freeze([
   ...V2_CAPABILITIES,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+  WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
 ]);
 const SYSTEM_TIMERS = {
   setInterval: (callback, delay) => setInterval(callback, delay),
@@ -226,7 +228,7 @@ export class HostRegistry {
     this.readinessStates = new Map();
     /** @type {Map<string, { hostId: string, descriptorKey: string }>} */
     this.managedRoutes = new Map();
-    /** @type {Map<string, { hostId: string, authority: object, channelIds: Set<string> }>} */
+    /** @type {Map<string, { hostId: string, authority: object, mapping: object, channelIds: Set<string> }>} */
     this.managedDescriptors = new Map();
     this.closed = false;
     this.closePromise = undefined;
@@ -323,6 +325,26 @@ export class HostRegistry {
         return;
       }
       const bindingEnabled = isInventoryReceiptCapabilityGate(msg, registerOk);
+      if (
+        bindingEnabled &&
+        !(Array.isArray(msg.capabilities) &&
+          msg.capabilities.includes(WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY))
+      ) {
+        console.error(
+          `HostRegistry: host '${hostId}' rejected -- binding-enabled peer missing required ` +
+            `capability '${WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY}' ` +
+            `(BIND_AUTHORITY_VERIFICATION_REQUIRED)`
+        );
+        socket.send(
+          JSON.stringify({
+            type: MSG_TYPES.REGISTER_DENIED,
+            reason: PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED,
+            code: PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED,
+          })
+        );
+        socket.close(1008, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
+        return;
+      }
       const readinessEnabled =
         isReadinessCapabilityGate(msg, registerOk) || bindingEnabled;
       const protocolVersion = Math.min(
@@ -751,6 +773,7 @@ export class HostRegistry {
         bindingId: randomUUID(),
         descriptorKey,
         authority: descriptor.authority,
+        mapping: descriptor.mapping,
         status: "binding",
         deadline: undefined,
         receipt: undefined,
@@ -764,6 +787,7 @@ export class HostRegistry {
         type: MSG_TYPES.BIND_WORKSPACE,
         bindingId: binding.bindingId,
         ...binding.authority,
+        mapping: binding.mapping,
       }));
       this.#emitObservability("bind.request", {
         phase: "request",
@@ -1553,7 +1577,7 @@ export class HostRegistry {
       const descriptorKey = canonicalJsonHash(authority);
       let descriptor = nextDescriptors.get(descriptorKey);
       if (!descriptor) {
-        descriptor = { hostId: authority.hostId, authority, channelIds: new Set() };
+        descriptor = { hostId: authority.hostId, authority, mapping: route.mapping, channelIds: new Set() };
         nextDescriptors.set(descriptorKey, descriptor);
       }
       descriptor.channelIds.add(channelId);
