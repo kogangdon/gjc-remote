@@ -18,6 +18,9 @@ const AUTHORITY = Object.freeze({
   roleFingerprint: "d".repeat(64),
   volumeIdentityFingerprint: "e".repeat(64),
   keyFingerprint: "c".repeat(64),
+  manifestFingerprint: null,
+  restoredFromWorkspaceId: "workspace-0",
+  restoredFromGeneration: 3,
 });
 
 function fakeContainment(overrides = {}) {
@@ -40,12 +43,15 @@ function fakeGitVerifier(overrides = {}) {
 function fakeProvenanceIo(overrides = {}) {
   return {
     readProvenanceRecord: overrides.readProvenanceRecord ?? (async () => ({
-      version: 1,
+      version: 2,
       kind: "workspace-restore-provenance",
       hostId: AUTHORITY.hostId,
       roleFingerprint: AUTHORITY.roleFingerprint,
       volumeIdentityFingerprint: AUTHORITY.volumeIdentityFingerprint,
       keyFingerprint: AUTHORITY.keyFingerprint,
+      manifestFingerprint: FIXTURE_MANIFEST.manifestFingerprint,
+      restoredFromWorkspaceId: "workspace-0",
+      restoredFromGeneration: 3,
     })),
   };
 }
@@ -123,14 +129,34 @@ function newSeen() {
 
 function makeDeps(over = {}) {
   const fence = over.fence ?? fakeFence();
+  const provenanceIo = over.provenanceIo ?? fakeProvenanceIo();
+  const stagedChecksumIo = over.checksumIo ?? checksumIo;
   return {
     fence,
     deps: {
       containment: over.containment ?? fakeContainment(),
       gitVerifier: over.gitVerifier ?? fakeGitVerifier(),
-      provenanceIo: over.provenanceIo ?? fakeProvenanceIo(),
-      checksumIo: over.checksumIo ?? checksumIo,
-      publishIo: over.publishIo,
+      stagePromotion: over.stagePromotion ?? {
+        async materializeAndVerify() {
+          return Object.freeze({
+            manifestFingerprint: FIXTURE_MANIFEST.manifestFingerprint,
+            verifiedCount: FIXTURE_MANIFEST.entries.length,
+          });
+        },
+        async cleanup() {},
+      },
+      makeStageReader: over.makeStageReader ?? (async () => ({
+        async readBytes(relPath) {
+          if (relPath === "restore-provenance.json") {
+            const record = await provenanceIo.readProvenanceRecord({
+              provenancePath: relPath,
+            });
+            return Buffer.from(JSON.stringify(record));
+          }
+          return stagedChecksumIo.readBytes(relPath);
+        },
+      })),
+      makePublisherIo: over.makePublisherIo ?? (async () => over.publishIo),
       acquireFence: over.acquireFence ?? fence.acquireFence,
       clock: over.clock ?? { now: () => 1_000 },
       maxAgeMs: over.maxAgeMs ?? 5_000,
@@ -146,15 +172,18 @@ function baseRequest(base, over = {}) {
     hostId: "host-1",
     workspaceId: "workspace-1",
     sourcePlatform: "windows-drive",
+    workspaceRoot: "C:\\ws\\root",
     workDir: "C:\\ws\\root",
     generationPath: "generations/000002",
     candidatePath: "C:\\ws\\root\\generations\\000002",
     gitDir: "C:\\ws\\root\\generations\\000002",
     stagingPath: "C:\\ws\\staging\\restore-1",
     leaseCandidate: { workspaceId: "workspace-1", bindingFingerprint: "f".repeat(64) },
-    expected: { pointerFingerprint: base.pointerFingerprint },
-    expectedAuthority: { ...AUTHORITY },
-    staged: { ref: "staged-1" },
+    expectedWorkspaceGeneration: base.activeGeneration,
+    expectedAuthority: {
+      ...AUTHORITY,
+      manifestFingerprint: FIXTURE_MANIFEST.manifestFingerprint,
+    },
     manifest: FIXTURE_MANIFEST,
     restoredFromWorkspaceId: "workspace-0",
     restoredFromGeneration: 3,
@@ -221,9 +250,12 @@ test("restore: composes the steps in the fixed order quarantine->provenance->che
   const base = baseGenerationPointer();
   const order = [];
   const provenanceIo = fakeProvenanceIo({ readProvenanceRecord: async () => { order.push("provenance"); return {
-    version: 1, kind: "workspace-restore-provenance",
+    version: 2, kind: "workspace-restore-provenance",
     hostId: AUTHORITY.hostId, roleFingerprint: AUTHORITY.roleFingerprint,
     volumeIdentityFingerprint: AUTHORITY.volumeIdentityFingerprint, keyFingerprint: AUTHORITY.keyFingerprint,
+    manifestFingerprint: FIXTURE_MANIFEST.manifestFingerprint,
+    restoredFromWorkspaceId: "workspace-0",
+    restoredFromGeneration: 3,
   }; } });
   const orderChecksumIo = { readBytes: async (relPath) => { order.push("checksum"); return Buffer.from(`content:${relPath}`); } };
   const containment = fakeContainment({
@@ -286,6 +318,28 @@ test("a staging path nested under the live candidate is refused before provenanc
   assert.ok(!publishIo.state.order.includes("replace"));
   assert.deepEqual(publishIo.state.live, generationPointerBytes(base));
   assert.equal(fence.state.releases, 1);
+});
+
+test("a workspace-internal sibling stage is not quarantined", async () => {
+  const base = baseGenerationPointer();
+  const publishIo = fakePublishIo(generationPointerBytes(base));
+  let stageReads = 0;
+  const { deps } = makeDeps({
+    publishIo,
+    makeStageReader: async () => ({
+      async readBytes() { stageReads++; return new Uint8Array(); },
+    }),
+  });
+  await expectRefusal(
+    createWorkspaceRestoreMigrationOperation(deps).runRestoreMigration(
+      baseRequest(base, {
+        stagingPath: "C:\\ws\\root\\staging-sibling",
+      })
+    ),
+    "WORKSPACE_STAGING_NOT_QUARANTINED"
+  );
+  assert.equal(stageReads, 0);
+  assert.ok(!publishIo.state.order.includes("replace"));
 });
 
 // ---------------------------------------------------------------------------
@@ -361,6 +415,54 @@ test("an OID/graph incompleteness on the staged repo refuses before promotion, l
   assert.equal(fence.state.releases, 1);
 });
 
+test("a candidate graph fingerprint divergent from the manifest refuses", async () => {
+  const base = baseGenerationPointer();
+  const publishIo = fakePublishIo(generationPointerBytes(base));
+  const gitVerifier = fakeGitVerifier({
+    verifyRepositoryGraph: async () => ({
+      generationFingerprint: "9".repeat(64),
+    }),
+  });
+  const { deps } = makeDeps({ publishIo, gitVerifier });
+  await expectRefusal(
+    createWorkspaceRestoreMigrationOperation(deps).runRestoreMigration(
+      baseRequest(base)
+    ),
+    "WORKSPACE_MANIFEST_MISMATCH"
+  );
+  assert.ok(!publishIo.state.order.includes("replace"));
+});
+
+test("retained stage close failure prevents publication and cleans candidate", async () => {
+  const base = baseGenerationPointer();
+  const publishIo = fakePublishIo(generationPointerBytes(base));
+  let cleanupCalls = 0;
+  const { deps } = makeDeps({
+    publishIo,
+    stagePromotion: {
+      async materializeAndVerify() {},
+      async cleanup() { cleanupCalls++; },
+    },
+  });
+  const makeStageReader = deps.makeStageReader;
+  deps.makeStageReader = async (...args) => ({
+    ...await makeStageReader(...args),
+    async close() {
+      const error = new Error("retained root close failed");
+      error.code = "EIO";
+      throw error;
+    },
+  });
+  await assert.rejects(
+    createWorkspaceRestoreMigrationOperation(deps).runRestoreMigration(
+      baseRequest(base)
+    ),
+    (error) => error.code === "EIO"
+  );
+  assert.equal(cleanupCalls, 1);
+  assert.ok(!publishIo.state.order.includes("replace"));
+});
+
 // ---------------------------------------------------------------------------
 // Expected-base / stale generation
 // ---------------------------------------------------------------------------
@@ -379,7 +481,7 @@ test("restore whose expected base mismatches the live pointer refuses as stale, 
   const baseBytes = generationPointerBytes(base);
   const publishIo = fakePublishIo(baseBytes);
   const { deps, fence } = makeDeps({ publishIo });
-  const req = baseRequest(base, { expected: { pointerFingerprint: "9".repeat(64) } });
+  const req = baseRequest(base, { expectedWorkspaceGeneration: 99 });
   await expectRefusal(createWorkspaceRestoreMigrationOperation(deps).runRestoreMigration(req), "WORKSPACE_GENERATION_STALE");
   assert.equal(fence.state.releases, 1);
   assert.deepEqual(publishIo.state.live, baseBytes);
@@ -451,10 +553,18 @@ test("crash at atomic replace preserves the prior live pointer (deterministic)",
   const base = baseGenerationPointer();
   const baseBytes = generationPointerBytes(base);
   const publishIo = fakePublishIo(baseBytes, { fail: "replace" });
-  const { deps, fence } = makeDeps({ publishIo });
+  let cleanupCalls = 0;
+  const { deps, fence } = makeDeps({
+    publishIo,
+    stagePromotion: {
+      async materializeAndVerify() {},
+      async cleanup() { cleanupCalls++; },
+    },
+  });
   const err = await expectRefusal(createWorkspaceRestoreMigrationOperation(deps).runRestoreMigration(baseRequest(base)), "WORKSPACE_GENERATION_IO_FAILED");
   assert.equal(err.step, "replace");
   assert.deepEqual(publishIo.state.live, baseBytes);
+  assert.equal(cleanupCalls, 1);
   assert.equal(fence.state.releases, 1);
 });
 
@@ -462,11 +572,19 @@ test("crash at flushParent (after replace committed) leaves the NEW pointer live
   const base = baseGenerationPointer();
   const baseBytes = generationPointerBytes(base);
   const publishIo = fakePublishIo(baseBytes, { fail: "flushParent" });
-  const { deps, fence } = makeDeps({ publishIo });
+  let cleanupCalls = 0;
+  const { deps, fence } = makeDeps({
+    publishIo,
+    stagePromotion: {
+      async materializeAndVerify() {},
+      async cleanup() { cleanupCalls++; },
+    },
+  });
   const err = await expectRefusal(createWorkspaceRestoreMigrationOperation(deps).runRestoreMigration(baseRequest(base)), "WORKSPACE_GENERATION_IO_FAILED");
   assert.equal(err.step, "flushParent");
   // replace already committed the new pointer bytes -> slot holds the NEW value
   assert.notDeepEqual(publishIo.state.live, baseBytes);
+  assert.equal(cleanupCalls, 0, "a possibly-live generation candidate must be retained");
   assert.equal(fence.state.releases, 1);
 });
 
@@ -497,9 +615,9 @@ test("construction rejects a missing acquireFence", () => {
   assert.throws(() => createWorkspaceRestoreMigrationOperation({ ...deps, acquireFence: undefined }), (e) => e.code === "CONFIG_INVALID");
 });
 
-test("construction rejects a missing provenanceIo", () => {
+test("construction rejects a missing stage reader factory", () => {
   const { deps } = makeDeps({ publishIo: fakePublishIo(null) });
-  assert.throws(() => createWorkspaceRestoreMigrationOperation({ ...deps, provenanceIo: undefined }), (e) => e.code === "CONFIG_INVALID");
+  assert.throws(() => createWorkspaceRestoreMigrationOperation({ ...deps, makeStageReader: undefined }), (e) => e.code === "CONFIG_INVALID");
 });
 
 test("a malformed lease (missing isCurrent) is refused CONFIG_INVALID but still released", async () => {

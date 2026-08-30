@@ -69,6 +69,8 @@ import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-
 import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
 import { createResetDeleteLifecycleContext } from "./workspace-lifecycle-transaction-context.js";
 import { createManualCleanupPublisherIo } from "./workspace-generation-storage-io.js";
+import { createRestoreContextRegistry } from "./workspace-restore-context-registry.js";
+import { resolveRestoreContextClaims } from "./workspace-restore-context-config.js";
 import { resolveNativeServingBundles } from "./native-serving-boot-wiring.js";
 import { resolveNativeServingEnabled } from "./native-serving-gate.js";
 import { projectReceiptAuthority, resolveReceiptActivityIdentity, resolveAdoptedLeaseCandidateForWorkspace } from "./workspace-adopted-lease-candidate.js";
@@ -256,6 +258,7 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
 const NATIVE_WORKSPACE_SERVING_ENABLED = resolveNativeServingEnabled({ env: process.env, inventoryReceiptAdvertised });
 // S6f.1: workspaces barred by boot crash-recovery; consulted by the serving-admission gate (dormant unless serving is enabled by GJC_NATIVE_WORKSPACE_SERVING=1). Empty until GJC_NATIVE_WORKSPACE_ROOT is set.
 let barredWorkspaceIds = new Set();
+let restoreContextRegistry = null;
 const MAX_BINDINGS_PER_SOCKET = 64;
 const localWorkspaceInventory =
   initialInventoryRead?.status === "present" ? initialInventoryRead.inventory : undefined;
@@ -669,6 +672,7 @@ function sameBindingFields(previous, candidate, fields = BINDING_IDENTITY_FIELDS
 function invalidateBindingRequests(state, bindingState) {
   if (!bindingState) return;
   bindingState.invalidated = true;
+  restoreContextRegistry?.invalidateAuthority(bindingState.binding);
   disposeReplacedBindingRequests(
     inFlightByRequestId,
     state.connection,
@@ -2172,18 +2176,9 @@ async function handleMessage(
       connection.close(1008, "invalid workspace lifecycle message");
       return;
     }
-    // S6f.5 (#81): the reviewed restore/migration security core
-    // (workspace-restore-migration-dispatch.js) runs via the boot-singleton
-    // lifecycleRestoreMigrationDispatcher. Under Option C-narrow (S6f.7) this
-    // stays null even when serving is enabled - restore/migration does not
-    // assemble a bundle (follow-up #197), so this branch always fails closed
-    // today. If a restore/migration serving-state subsystem lands, when
-    // served it would resolve the trusted per-connection accepted binding + local
-    // inventory + live readiness + the adopted EXCLUSIVE fence identity + the
-    // host-held restore context (the quarantined staged source, provenance
-    // authority, manifest, and lineage the thin wire message cannot carry).
-    // The base being promoted onto is read from the live pointer by the
-    // dispatcher; the promotion is a reversible successor generation.
+    // #197: restore/migration serves only with a complete Linux native bundle
+    // and a single-use host-held sealed staging claim bound to this exact
+    // receipt authority, operation, and idempotency fingerprint.
     // S6f.7e (#81): INV-6 serving-time bar - see WORKSPACE_CREATE. A barred
     // workspace short-circuits before the gate/dispatcher check and falls
     // through to the identical RUNTIME_INCOMPATIBLE refusal below.
@@ -2201,11 +2196,26 @@ async function handleMessage(
         workspaceId: msg.workspaceId,
         computeLegacyBindingFingerprint: bindingFingerprint,
       });
-      // S7 PLACEHOLDER (issue #171): the quarantined staged-source payload
-      // (stagingPath, provenance authority, manifest, lineage) is host-held
-      // serving state not yet tracked; a null context makes the dispatcher
-      // refuse fail-closed until S7 wires it.
-      const restoreContext = null;
+      const restorePreflightReady =
+        readiness.connection?.state === "online" &&
+        readiness.runtime?.state === "ready" &&
+        readiness.providerAuth?.state === "configured" &&
+        readiness.modelProfile?.state === "ready" &&
+        (msg.sourcePlatform === "posix" ||
+          msg.sourcePlatform === "windows-drive");
+      const restoreContext =
+        trustedBinding &&
+        trustedInventoryWorkspace &&
+        leaseCandidate &&
+        restorePreflightReady &&
+        restoreContextRegistry
+        ? restoreContextRegistry.resolve({
+            trustedBinding,
+            message: msg,
+            operation: msg.operation,
+            idempotencyFingerprint: msg.idempotencyFingerprint,
+          })
+        : null;
       const result = await lifecycleRestoreMigrationDispatcher.dispatchRestoreMigration({
         message: msg,
         trustedBinding,
@@ -2510,8 +2520,9 @@ const BIND_VERIFICATION_CONTEXT = Object.freeze({
 });
 
 // S6f.7d (#81): resolve the CREATE + REFRESH native serving deps bundles
-// CREATE, REFRESH, and RESET_DELETE receive independently complete bundles;
-// restore/migration remains fail-closed with a null bundle. This sits behind
+// CREATE, REFRESH, RESET_DELETE, and RESTORE_MIGRATION receive independently
+// complete bundles. Optional destructive bundles remain null when their
+// platform-specific capability floor is unavailable. This sits behind
 // the env-gated NATIVE_WORKSPACE_SERVING_ENABLED gate (S6f.7f): with the
 // operator opt-in unset it resolves to inert null bundles; with it set it
 // assembles live operation bundles. resolveNativeServingBundles
@@ -2528,6 +2539,30 @@ const nativeServingBundles = resolveNativeServingBundles({
 });
 if (nativeServingBundles.degraded) {
   console.error(`daemon: native serving disabled (fail-closed): ${JSON.stringify(nativeServingBundles.diagnostic)}`);
+}
+const restoreContextConfig = resolveRestoreContextClaims({ env: process.env });
+if (!restoreContextConfig.ok) {
+  console.error(
+    `daemon: restore/migration serving disabled (fail-closed): ${JSON.stringify(
+      restoreContextConfig.diagnostic
+    )}`
+  );
+} else if (
+  restoreContextConfig.enabled &&
+  nativeServingBundles.restoreMigration
+) {
+  try {
+    restoreContextRegistry = createRestoreContextRegistry({
+      claims: restoreContextConfig.claims,
+      clock: nativeServingBundles.restoreMigration.clock,
+      maxAgeMs: nativeServingBundles.restoreMigration.maxAgeMs,
+    });
+  } catch {
+    console.error(
+      "daemon: restore/migration serving disabled (fail-closed): " +
+      '{"code":"RESTORE_CONTEXT_CONFIG_INVALID","reason":"sealed restore claims are invalid"}'
+    );
+  }
 }
 
 // S6f.2 (#81): boot-singleton create/clone dispatcher. Null unless serving is
@@ -2559,14 +2594,14 @@ const lifecycleResetDeleteDispatcher = resolveLifecycleResetDeleteDispatcher({
   nativeServingDeps: nativeServingBundles.resetDelete,
 });
 
-// S6f.5 (#81): the restore/migration boot-singleton stays null under Option
-// C-narrow - no nativeServingDeps are supplied even when serving is enabled
-// (follow-up #197), so the resolver returns null and the
-// WORKSPACE_RESTORE_MIGRATION served branch stays inert, failing closed
-// (RUNTIME_INCOMPATIBLE).
+// #197: restore/migration becomes reachable only with both a complete Linux
+// native bundle and at least one validated host-held sealed restore claim.
 const lifecycleRestoreMigrationDispatcher = resolveLifecycleRestoreMigrationDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+  nativeServingDeps: restoreContextRegistry
+    ? nativeServingBundles.restoreMigration
+    : null,
 });
 
 connectToBot();

@@ -247,7 +247,7 @@ not authorize any behavior more permissive than the phase contracts above.
 **Serving is env-gated and OFF by default.** The native inventory contract (config modes, five-role
 bindings, the durable D floor, the live invalidation cascade, and the bot receipt binding/observability
 surface) is implemented as capability scaffolding. Native workspace serving is now a fail-closed
-runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:256)
+runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:258)
 as an `= resolveNativeServingEnabled({ env, inventoryReceiptAdvertised })`
 call, which is `true` only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 equals `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the default)
@@ -255,8 +255,11 @@ the gate is `false` and its sole read site inside `admitReadyWorkload` returns `
 unchanged from before the S6f.7 flip. On the bot side, `host-registry.js` defaults the equivalent flag
 to false and `bot.js` does not override it. When enabled, CREATE and REFRESH assemble native serving
 deps; reset/delete additionally requires the verified residual-process capability and an exact
-receipt-bound lifecycle transaction context; restore/migration keeps a null dispatcher and stays
-fail-closed. Any INV-6 boot-crash-recovery-barred workspace is refused on every lifecycle op. A
+receipt-bound lifecycle transaction context. Restore/migration additionally requires Linux native
+no-follow support and a single-use sealed claim from `GJC_RESTORE_CONTEXTS_JSON`, bound to the exact
+receipt-v3 destination authority, operation, idempotency fingerprint, provenance-v2 content, and
+restore lineage; absent or invalid claims leave only that dispatcher null. Any INV-6
+boot-crash-recovery-barred workspace is refused on every lifecycle op. A
 proven verify-mode receipt binding that is fenced and cryptographically proved still fails the serving
 gate with `RUNTIME_INCOMPATIBLE` unless the operator opt-in is set.
 

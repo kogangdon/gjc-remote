@@ -4,11 +4,12 @@
 // (#53 Phase 2). Two exports:
 //
 //   1. verifyRestoreProvenance(io, { expectedAuthority, staged }) - proves the
-//      role / volume / key / host identity of a STAGED restore source matches a
-//      caller-supplied `expectedAuthority`. The authority is the trusted anchor:
-//      it is NEVER derived from staged content. The staged provenance record is
-//      read through the injected `io.readProvenanceRecord(staged)` and every
-//      identity field is compared; any divergence refuses the NEW
+//      role / volume / key / host identity, manifest content, and restore
+//      lineage of a STAGED restore source matches a caller-supplied
+//      `expectedAuthority`. The authority is the trusted anchor: it is NEVER
+//      derived from staged content. The staged provenance record is read through
+//      the injected `io.readProvenanceRecord(staged)` and every authority field
+//      is compared; any divergence refuses the NEW
 //      WORKSPACE_PROVENANCE_MISMATCH. A malformed/absent staged record is a
 //      mismatch (fail closed: unverifiable provenance is not trusted), while a
 //      malformed `expectedAuthority` is a caller bug (CONFIG_INVALID).
@@ -29,14 +30,22 @@ import { verifyManifestAgainst } from "./workspace-backup-manifest.js";
 
 const OPERATION = "workspace_restore_provenance";
 const PROVENANCE_KIND = "workspace-restore-provenance";
-const VERSION = 1;
+const VERSION = 2;
 
 // The trusted authority anchor and the staged record are compared field for
-// field on this exact identity set. Fingerprints are hex64; hostId is a bounded
-// opaque id.
-const IDENTITY_FIELDS = Object.freeze(["hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"]);
-const EXPECTED_AUTHORITY_KEYS = Object.freeze([...IDENTITY_FIELDS]);
-const PROVENANCE_RECORD_KEYS = Object.freeze(["version", "kind", ...IDENTITY_FIELDS]);
+// field on this exact v2 set. Fingerprints are hex64; ids are bounded opaque
+// strings; generation is a positive safe integer.
+const AUTHORITY_FIELDS = Object.freeze([
+  "hostId",
+  "roleFingerprint",
+  "volumeIdentityFingerprint",
+  "keyFingerprint",
+  "manifestFingerprint",
+  "restoredFromWorkspaceId",
+  "restoredFromGeneration",
+]);
+const EXPECTED_AUTHORITY_KEYS = Object.freeze([...AUTHORITY_FIELDS]);
+const PROVENANCE_RECORD_KEYS = Object.freeze(["version", "kind", ...AUTHORITY_FIELDS]);
 
 function refuse(code, reason, extra) {
   const error = new Error(`${OPERATION}: ${code}: ${reason}`);
@@ -61,19 +70,20 @@ const hasExactKeys = (value, keys) =>
 
 const isId = (value) => typeof value === "string" && value.length > 0 && value.length <= 256;
 
-// hostId is a bounded id; the other three identity fields are hex64 fingerprints.
-function isValidIdentityField(field, value) {
-  return field === "hostId" ? isId(value) : isHex64(value);
+function isValidAuthorityField(field, value) {
+  if (field === "hostId" || field === "restoredFromWorkspaceId") return isId(value);
+  if (field === "restoredFromGeneration") return Number.isSafeInteger(value) && value >= 1;
+  return isHex64(value);
 }
 
 // Validate the caller-supplied trusted authority. A malformed authority is a
 // caller contract violation, not a provenance decision -> CONFIG_INVALID.
 function assertExpectedAuthority(expectedAuthority) {
   if (!hasExactKeys(expectedAuthority, EXPECTED_AUTHORITY_KEYS)) {
-    refuse("CONFIG_INVALID", "expectedAuthority must have the exact identity key set");
+    refuse("CONFIG_INVALID", "expectedAuthority must have the exact v2 authority key set");
   }
-  for (const field of IDENTITY_FIELDS) {
-    if (!isValidIdentityField(field, expectedAuthority[field])) {
+  for (const field of AUTHORITY_FIELDS) {
+    if (!isValidAuthorityField(field, expectedAuthority[field])) {
       refuse("CONFIG_INVALID", `expectedAuthority.${field} is malformed`);
     }
   }
@@ -81,8 +91,8 @@ function assertExpectedAuthority(expectedAuthority) {
 
 /**
  * Verify the provenance of a staged restore source against a trusted authority.
- * Resolves to a frozen { verified:true, ...identity } on an exact identity
- * match; refuses WORKSPACE_PROVENANCE_MISMATCH on any field mismatch or a
+ * Resolves to frozen trusted-authority values on an exact v2 authority match;
+ * refuses WORKSPACE_PROVENANCE_MISMATCH on any field mismatch or a
  * malformed/absent staged record; refuses CONFIG_INVALID on a malformed
  * `expectedAuthority` or a bad io/reader contract.
  *
@@ -115,8 +125,8 @@ export async function verifyRestoreProvenance(io, request) {
       record.kind !== PROVENANCE_KIND) {
     refuse("WORKSPACE_PROVENANCE_MISMATCH", "staged provenance record is malformed or of an unexpected kind");
   }
-  for (const field of IDENTITY_FIELDS) {
-    if (!isValidIdentityField(field, record[field])) {
+  for (const field of AUTHORITY_FIELDS) {
+    if (!isValidAuthorityField(field, record[field])) {
       refuse("WORKSPACE_PROVENANCE_MISMATCH", `staged provenance ${field} is malformed`, { field });
     }
     if (record[field] !== expectedAuthority[field]) {
@@ -126,16 +136,19 @@ export async function verifyRestoreProvenance(io, request) {
     }
   }
 
-  // Return the identity from the TRUSTED authority, not the staged record: the
-  // equality proof above established they match field-for-field, and copying
-  // from the anchor makes the authority-derivation invariant literal (a
-  // getter-bearing staged record cannot influence the returned value).
+  // Return values exclusively from the TRUSTED authority, not the staged
+  // record: the equality proof above established they match field-for-field,
+  // and copying from the anchor makes the authority-derivation invariant
+  // literal (a getter-bearing staged record cannot influence the result).
   return Object.freeze({
     verified: true,
     hostId: expectedAuthority.hostId,
     roleFingerprint: expectedAuthority.roleFingerprint,
     volumeIdentityFingerprint: expectedAuthority.volumeIdentityFingerprint,
     keyFingerprint: expectedAuthority.keyFingerprint,
+    manifestFingerprint: expectedAuthority.manifestFingerprint,
+    restoredFromWorkspaceId: expectedAuthority.restoredFromWorkspaceId,
+    restoredFromGeneration: expectedAuthority.restoredFromGeneration,
   });
 }
 

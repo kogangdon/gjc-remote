@@ -27,6 +27,7 @@ import {
   createContainmentLowLevel,
   createResidualProcessEnumerator,
 } from "@gjc-remote/native-control";
+import * as fs from "node:fs/promises";
 
 import { createWorkspaceContainment } from "./workspace-containment.js";
 import { createGitGraphVerifier } from "./git-graph-verification.js";
@@ -36,6 +37,8 @@ import { createGenerationPublisherIo } from "./workspace-generation-storage-io.j
 import { createCandidateManifestResolver } from "./workspace-candidate-tree-resolver.js";
 import { createReadinessReplayWindow } from "./workspace-readiness-replay-window.js";
 import { createActivityFence, createExclusiveFence } from "./workspace-lease-fence.js";
+import { createRestoreStagePromotion } from "./workspace-restore-stage-promotion.js";
+import { createLinuxRetainedByteReader } from "./workspace-linux-retained-byte-reader.js";
 import { resolveResidualProcessIo } from "./workspace-reset-delete-boot-wiring.js";
 
 const DEFAULT_CLOCK = Object.freeze({ now: () => Date.now() });
@@ -50,7 +53,7 @@ const DEFAULT_CLOCK = Object.freeze({ now: () => Date.now() });
  * @param {object} [options.factories] - injectable factory overrides (tests).
  * @param {string} options.hostId - this daemon's bound host identity.
  * @param {"posix"|"windows-drive"} options.sourcePlatform - host path format.
- * @returns {{ create: object, refresh: object, resetDelete: object|null }}
+ * @returns {{ create: object, refresh: object, resetDelete: object|null, restoreMigration: object|null }}
  */
 export function assembleNativeServingDeps({
   workspaceRoot,
@@ -88,6 +91,7 @@ export function assembleNativeServingDeps({
     makeExclusiveFence = createExclusiveFence,
     makeResidualEnumerator = createResidualProcessEnumerator,
     makeResidualIo = resolveResidualProcessIo,
+    makeRetainedByteReader = createLinuxRetainedByteReader,
   } = factories;
 
   const containment = makeContainment({ lowLevel: makeContainmentLowLevel() });
@@ -133,8 +137,21 @@ export function assembleNativeServingDeps({
     sourcePlatform,
     runtimePlatform,
   });
+  const restoreMigration = assembleRestoreMigration({
+    makeRetainedByteReader,
+    makeManifestResolver,
+    makePublisherIo,
+    makeExclusiveFence,
+    workspaceLeases,
+    containment,
+    gitVerifier,
+    clock,
+    maxAgeMs,
+    replaySeen,
+    runtimePlatform,
+  });
 
-  return Object.freeze({ create, refresh, resetDelete });
+  return Object.freeze({ create, refresh, resetDelete, restoreMigration });
 }
 
 function assembleResetDelete({
@@ -173,6 +190,60 @@ function assembleResetDelete({
       resolveManifestPaths,
       acquireFence,
       residualIo,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function assembleRestoreMigration({
+  makeRetainedByteReader,
+  makeManifestResolver,
+  makePublisherIo,
+  makeExclusiveFence,
+  workspaceLeases,
+  containment,
+  gitVerifier,
+  clock,
+  maxAgeMs,
+  replaySeen,
+  runtimePlatform,
+}) {
+  try {
+    // Native no-follow evidence is production-supported only on Linux.
+    if (runtimePlatform !== "linux") return null;
+    const makeStageReader = (stagingPath, sourcePlatform) =>
+      makeRetainedByteReader({ root: stagingPath, sourcePlatform });
+    const makeCandidateReader = (candidatePath, sourcePlatform) =>
+      makeRetainedByteReader({ root: candidatePath, sourcePlatform });
+    const stagePromotion = createRestoreStagePromotion({
+      makeStageReader,
+      makeCandidateReader,
+      resolveManifestPaths: makeManifestResolver({
+        rejectUnsupported: true,
+      }),
+      fs,
+    });
+    const acquireFence = makeExclusiveFence(workspaceLeases);
+    if (
+      typeof makePublisherIo !== "function" ||
+      typeof makeStageReader !== "function" ||
+      typeof acquireFence !== "function" ||
+      typeof stagePromotion?.materializeAndVerify !== "function" ||
+      typeof stagePromotion?.cleanup !== "function"
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      containment,
+      gitVerifier,
+      stagePromotion,
+      makeStageReader,
+      makePublisherIo,
+      acquireFence,
+      clock,
+      maxAgeMs,
+      replaySeen,
     });
   } catch {
     return null;

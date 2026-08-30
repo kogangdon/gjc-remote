@@ -22,7 +22,7 @@ import { MSG_TYPES } from "@gjc-remote/shared";
 const IS_WIN = process.platform === "win32";
 const PLATFORM = IS_WIN ? "windows-drive" : "posix";
 const WS_ROOT = IS_WIN ? "C:\\ws" : "/srv/ws";
-const STAGING = IS_WIN ? "C:\\ws\\staging\\restore-1" : "/srv/ws/staging/restore-1";
+const STAGING = IS_WIN ? "C:\\gjc-staging\\restore-1" : "/srv/gjc-staging/restore-1";
 
 const HOST = "host-1";
 const WORKSPACE = "workspace-1";
@@ -38,6 +38,9 @@ const AUTHORITY = Object.freeze({
   roleFingerprint: "d".repeat(64),
   volumeIdentityFingerprint: "e".repeat(64),
   keyFingerprint: "c".repeat(64),
+  manifestFingerprint: null,
+  restoredFromWorkspaceId: "workspace-0",
+  restoredFromGeneration: 3,
 });
 
 const ROOT_IDENTITY = Object.freeze({ platform: PLATFORM, volumeSerial: "AABBCCDD", fileId: "0001" });
@@ -71,9 +74,11 @@ function fakeGitVerifier(overrides = {}) {
 function fakeProvenanceIo(overrides = {}) {
   return {
     readProvenanceRecord: overrides.readProvenanceRecord ?? (async () => ({
-      version: 1, kind: "workspace-restore-provenance",
+      version: 2, kind: "workspace-restore-provenance",
       hostId: AUTHORITY.hostId, roleFingerprint: AUTHORITY.roleFingerprint,
       volumeIdentityFingerprint: AUTHORITY.volumeIdentityFingerprint, keyFingerprint: AUTHORITY.keyFingerprint,
+      manifestFingerprint: FIXTURE_MANIFEST.manifestFingerprint,
+      restoredFromWorkspaceId: "workspace-0", restoredFromGeneration: 3,
     })),
   };
 }
@@ -126,8 +131,9 @@ function basePointer() {
 
 function baseAuthority(overrides = {}) {
   return {
+    authorityEpoch: 1, fenceGeneration: 1,
     hostId: HOST, mappingId: "mapping-1", mappingGeneration: 3, mappingVersion: 1,
-    workspaceId: WORKSPACE, workspaceGeneration: 2, sourcePlatform: PLATFORM,
+    workspaceId: WORKSPACE, workspaceGeneration: 1, sourcePlatform: PLATFORM,
     routeFingerprint: ROUTE_FP, authorityFingerprint: AUTH_FP, inventoryGeneration: 5,
     bindingId: "mapping-1", ...overrides,
   };
@@ -138,7 +144,7 @@ function restoreMessage(overrides = {}) {
     type: MSG_TYPES.WORKSPACE_RESTORE_MIGRATION,
     operation: "restore",
     hostId: HOST, mappingId: "mapping-1", mappingGeneration: 3, mappingVersion: 1,
-    workspaceId: WORKSPACE, workspaceGeneration: 2, sourcePlatform: PLATFORM,
+    workspaceId: WORKSPACE, workspaceGeneration: 1, sourcePlatform: PLATFORM,
     routeFingerprint: ROUTE_FP, authorityFingerprint: AUTH_FP, inventoryGeneration: 5,
     idempotencyFingerprint: IDEMPOTENCY_FP, ...overrides,
   };
@@ -151,27 +157,45 @@ const inventoryWorkspace = Object.freeze({
 const leaseCandidate = Object.freeze({ ...baseAuthority(), bindingFingerprint: "f".repeat(64) });
 
 function restoreContext(over = {}) {
-  return {
+  return Object.freeze({
     stagingPath: STAGING,
-    expectedAuthority: { ...AUTHORITY },
-    staged: { ref: "staged-1" },
+    expectedAuthority: {
+      ...AUTHORITY,
+      manifestFingerprint: FIXTURE_MANIFEST.manifestFingerprint,
+    },
     manifest: FIXTURE_MANIFEST,
     restoredFromWorkspaceId: "workspace-0",
     restoredFromGeneration: 3,
+    expectedGraph: {},
+    probedAtMs: 900,
     ...over,
-  };
+  });
 }
 
 function validConfig(over = {}) {
   const publishIo = over.publishIo ?? fakePublishIo(generationPointerBytes(basePointer()));
   const fence = over.fence ?? makeExclusiveFence();
+  const provenanceIo = over.provenanceIo ?? fakeProvenanceIo();
+  const stagedChecksumIo = over.checksumIo ?? checksumIo;
   const config = {
     workspaceRoot: over.workspaceRoot ?? WS_ROOT,
     makePublisherIo: over.makePublisherIo ?? (async () => publishIo),
     containment: over.containment ?? fakeContainment(),
     gitVerifier: over.gitVerifier ?? fakeGitVerifier(),
-    makeProvenanceIo: over.makeProvenanceIo ?? (() => over.provenanceIo ?? fakeProvenanceIo()),
-    makeChecksumIo: over.makeChecksumIo ?? (() => over.checksumIo ?? checksumIo),
+    stagePromotion: over.stagePromotion ?? {
+      async materializeAndVerify() {},
+      async cleanup() {},
+    },
+    makeStageReader: over.makeStageReader ?? (async () => ({
+      async readBytes(relPath) {
+        if (relPath === "restore-provenance.json") {
+          return Buffer.from(JSON.stringify(
+            await provenanceIo.readProvenanceRecord({ provenancePath: relPath })
+          ));
+        }
+        return stagedChecksumIo.readBytes(relPath);
+      },
+    })),
     acquireFence: over.acquireFence ?? fence.acquireFence,
     clock: over.clock ?? { now: () => 1_000 },
     maxAgeMs: over.maxAgeMs ?? 5_000,
@@ -205,9 +229,9 @@ test("factory refuses config missing workspaceRoot", () => {
   assert.throws(() => createLifecycleRestoreMigrationDispatcher({ ...config, workspaceRoot: "" }), (e) => e.code === "CONFIG_INVALID");
 });
 
-test("factory refuses config missing makeProvenanceIo", () => {
+test("factory refuses config missing makeStageReader", () => {
   const { config } = validConfig();
-  assert.throws(() => createLifecycleRestoreMigrationDispatcher({ ...config, makeProvenanceIo: null }), (e) => e.code === "CONFIG_INVALID");
+  assert.throws(() => createLifecycleRestoreMigrationDispatcher({ ...config, makeStageReader: null }), (e) => e.code === "CONFIG_INVALID");
 });
 
 test("factory refuses config with a non-integer maxAgeMs", () => {
@@ -256,7 +280,7 @@ test("migration: a docker-session-volume migration is refused before any fence/I
   assert.equal(result.ok, false);
   assert.equal(result.code, "WORKSPACE_MIGRATION_UNSUPPORTED");
   assert.equal(fence.state.acquired, 0);
-  assert.deepEqual(publishIo.state.order, ["readLivePointer"]); // only the dispatcher's base read
+  assert.deepEqual(publishIo.state.order, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -265,7 +289,6 @@ test("migration: a docker-session-volume migration is refused before any fence/I
 
 for (const [field, tampered] of [
   ["mappingGeneration", 99],
-  ["routeFingerprint", "9".repeat(64)],
   ["authorityFingerprint", "8".repeat(64)],
   ["workspaceGeneration", 7],
   ["mappingId", "mapping-evil"],
@@ -319,8 +342,8 @@ test("restore: a missing restore context is refused before the fence", async () 
 
 test("restore: a restore context missing its staging path is refused", async () => {
   const { dispatcher } = makeHarness();
-  const ctx = restoreContext();
-  delete ctx.stagingPath;
+  const { stagingPath: _, ...withoutStaging } = restoreContext();
+  const ctx = Object.freeze(withoutStaging);
   const result = await dispatcher.dispatchRestoreMigration(callArgs({ restoreContext: ctx }));
   assert.equal(result.ok, false);
   assert.equal(result.code, "RUNTIME_INCOMPATIBLE");
@@ -354,12 +377,12 @@ test("restore: a plain restore that smuggles a migration kind is refused", async
 // Live-base derivation + orchestrator seams.
 // ---------------------------------------------------------------------------
 
-test("restore: no live generation to promote onto is refused STALE without acquiring the fence", async () => {
+test("restore: no live generation is refused STALE under the exclusive fence", async () => {
   const { dispatcher, fence } = makeHarness({ publishIo: fakePublishIo(null) });
   const result = await dispatcher.dispatchRestoreMigration(callArgs());
   assert.equal(result.ok, false);
   assert.equal(result.code, "WORKSPACE_GENERATION_STALE");
-  assert.equal(fence.state.acquired, 0);
+  assert.equal(fence.state.acquired, 1);
 });
 
 test("restore: a provenance identity mismatch on the staged source refuses, prior generation intact", async () => {

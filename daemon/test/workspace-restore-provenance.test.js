@@ -19,10 +19,13 @@ const AUTHORITY = Object.freeze({
   roleFingerprint: "a".repeat(64),
   volumeIdentityFingerprint: "b".repeat(64),
   keyFingerprint: "c".repeat(64),
+  manifestFingerprint: "d".repeat(64),
+  restoredFromWorkspaceId: "source-workspace-1",
+  restoredFromGeneration: 7,
 });
 
 function matchingRecord(overrides = {}) {
-  return { version: 1, kind: PROVENANCE_KIND, ...AUTHORITY, ...overrides };
+  return { version: 2, kind: PROVENANCE_KIND, ...AUTHORITY, ...overrides };
 }
 
 // io whose reader returns a fixed record (or throws when record is an Error).
@@ -45,7 +48,7 @@ async function expectRefusal(promise, code) {
 
 // ---------- verifyRestoreProvenance: happy path -----------------------------
 
-test("verifyRestoreProvenance: an exact identity match resolves frozen verified:true", async () => {
+test("verifyRestoreProvenance: an exact v2 authority match resolves frozen trusted values", async () => {
   const result = await verifyRestoreProvenance(provenanceIo(matchingRecord()), {
     expectedAuthority: AUTHORITY,
     staged: { path: "/staging/x" },
@@ -67,9 +70,19 @@ test("verifyRestoreProvenance: never derives authority from staged content (extr
 
 // ---------- verifyRestoreProvenance: per-field mismatch (parameterized) ------
 
-for (const field of ["hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"]) {
+for (const field of [
+  "hostId",
+  "roleFingerprint",
+  "volumeIdentityFingerprint",
+  "keyFingerprint",
+  "manifestFingerprint",
+  "restoredFromWorkspaceId",
+  "restoredFromGeneration",
+]) {
   test(`verifyRestoreProvenance: a mismatched ${field} refuses WORKSPACE_PROVENANCE_MISMATCH`, async () => {
-    const tampered = field === "hostId" ? "other-host" : "f".repeat(64);
+    const tampered = field === "hostId" || field === "restoredFromWorkspaceId"
+      ? `other-${field}`
+      : field === "restoredFromGeneration" ? AUTHORITY.restoredFromGeneration + 1 : "f".repeat(64);
     await assert.rejects(
       verifyRestoreProvenance(provenanceIo(matchingRecord({ [field]: tampered })), {
         expectedAuthority: AUTHORITY,
@@ -93,8 +106,8 @@ test("verifyRestoreProvenance: a null staged record is a mismatch (fail closed)"
   );
 });
 
-test("verifyRestoreProvenance: an unexpected record kind/version is a mismatch", async () => {
-  for (const bad of [matchingRecord({ kind: "other" }), matchingRecord({ version: 2 })]) {
+test("verifyRestoreProvenance: v1 and unexpected record kinds refuse", async () => {
+  for (const bad of [matchingRecord({ kind: "other" }), matchingRecord({ version: 1 })]) {
     await expectRefusal(
       verifyRestoreProvenance(provenanceIo(bad), { expectedAuthority: AUTHORITY, staged: {} }),
       PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
@@ -102,14 +115,24 @@ test("verifyRestoreProvenance: an unexpected record kind/version is a mismatch",
   }
 });
 
-test("verifyRestoreProvenance: a malformed record fingerprint field is a mismatch", async () => {
-  await expectRefusal(
-    verifyRestoreProvenance(provenanceIo(matchingRecord({ keyFingerprint: "not-hex" })), {
-      expectedAuthority: AUTHORITY,
-      staged: {},
-    }),
-    PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
-  );
+test("verifyRestoreProvenance: malformed record authority fields are mismatches", async () => {
+  for (const [field, value] of [
+    ["hostId", ""],
+    ["roleFingerprint", "not-hex"],
+    ["volumeIdentityFingerprint", "not-hex"],
+    ["keyFingerprint", "not-hex"],
+    ["manifestFingerprint", "not-hex"],
+    ["restoredFromWorkspaceId", ""],
+    ["restoredFromGeneration", 0],
+  ]) {
+    await expectRefusal(
+      verifyRestoreProvenance(provenanceIo(matchingRecord({ [field]: value })), {
+        expectedAuthority: AUTHORITY,
+        staged: {},
+      }),
+      PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
+    );
+  }
 });
 
 test("verifyRestoreProvenance: a reader failure is a mismatch, not a soft error", async () => {
@@ -131,12 +154,14 @@ test("verifyRestoreProvenance: an array or null-prototype staged record is a mis
   }
 });
 
-test("verifyRestoreProvenance: a staged record missing an identity key is a mismatch", async () => {
-  const { keyFingerprint, ...missing } = matchingRecord();
-  await expectRefusal(
-    verifyRestoreProvenance(provenanceIo(missing), { expectedAuthority: AUTHORITY, staged: {} }),
-    PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
-  );
+test("verifyRestoreProvenance: a staged record missing any v2 authority key is a mismatch", async () => {
+  for (const field of EXPECTED_AUTHORITY_KEYS) {
+    const { [field]: unused, ...missing } = matchingRecord();
+    await expectRefusal(
+      verifyRestoreProvenance(provenanceIo(missing), { expectedAuthority: AUTHORITY, staged: {} }),
+      PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
+    );
+  }
 });
 
 test("verifyRestoreProvenance: an over-long hostId is CONFIG_INVALID on the authority and a mismatch on the record", async () => {
@@ -159,10 +184,15 @@ test("verifyRestoreProvenance: an over-long hostId is CONFIG_INVALID on the auth
 
 // ---------- verifyRestoreProvenance: caller contract violations --------------
 
-test("verifyRestoreProvenance: a malformed expectedAuthority is CONFIG_INVALID (caller bug)", async () => {
+test("verifyRestoreProvenance: malformed expectedAuthority fields are CONFIG_INVALID (caller bug)", async () => {
   const cases = [
-    { ...AUTHORITY, roleFingerprint: "short" },
     { ...AUTHORITY, hostId: "" },
+    { ...AUTHORITY, roleFingerprint: "short" },
+    { ...AUTHORITY, volumeIdentityFingerprint: "short" },
+    { ...AUTHORITY, keyFingerprint: "short" },
+    { ...AUTHORITY, manifestFingerprint: "short" },
+    { ...AUTHORITY, restoredFromWorkspaceId: "" },
+    { ...AUTHORITY, restoredFromGeneration: 0 },
     { hostId: "h", roleFingerprint: "a".repeat(64) }, // missing keys
     { ...AUTHORITY, extra: 1 }, // extra key
   ];
@@ -172,6 +202,16 @@ test("verifyRestoreProvenance: a malformed expectedAuthority is CONFIG_INVALID (
       PROTOCOL_ERROR_CODES.CONFIG_INVALID,
     );
   }
+});
+
+test("verifyRestoreProvenance: a staged self-declared key never replaces the trusted key", async () => {
+  await expectRefusal(
+    verifyRestoreProvenance(provenanceIo(matchingRecord({ keyFingerprint: "f".repeat(64) })), {
+      expectedAuthority: AUTHORITY,
+      staged: {},
+    }),
+    PROTOCOL_ERROR_CODES.WORKSPACE_PROVENANCE_MISMATCH,
+  );
 });
 
 test("verifyRestoreProvenance: a bad io/reader or staged shape is CONFIG_INVALID", async () => {
@@ -188,8 +228,26 @@ test("verifyRestoreProvenance: a bad io/reader or staged shape is CONFIG_INVALID
 // ---------- exported constants ----------------------------------------------
 
 test("exported key sets are frozen and exact", () => {
-  assert.deepEqual(EXPECTED_AUTHORITY_KEYS, ["hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"]);
-  assert.deepEqual(PROVENANCE_RECORD_KEYS, ["version", "kind", "hostId", "roleFingerprint", "volumeIdentityFingerprint", "keyFingerprint"]);
+  assert.deepEqual(EXPECTED_AUTHORITY_KEYS, [
+    "hostId",
+    "roleFingerprint",
+    "volumeIdentityFingerprint",
+    "keyFingerprint",
+    "manifestFingerprint",
+    "restoredFromWorkspaceId",
+    "restoredFromGeneration",
+  ]);
+  assert.deepEqual(PROVENANCE_RECORD_KEYS, [
+    "version",
+    "kind",
+    "hostId",
+    "roleFingerprint",
+    "volumeIdentityFingerprint",
+    "keyFingerprint",
+    "manifestFingerprint",
+    "restoredFromWorkspaceId",
+    "restoredFromGeneration",
+  ]);
   assert.ok(Object.isFrozen(EXPECTED_AUTHORITY_KEYS));
   assert.ok(Object.isFrozen(PROVENANCE_RECORD_KEYS));
 });

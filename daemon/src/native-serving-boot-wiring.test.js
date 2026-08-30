@@ -14,7 +14,22 @@ const okBundles = () => ({
     acquireFence() {},
     residualIo: { listResidualProcesses() {} },
   },
+  restoreMigration: restoreMigrationBundle(),
 });
+function restoreMigrationBundle(overrides = {}) {
+  return Object.freeze({
+    containment: { identifyRoot() {}, verifyContained() {} },
+    gitVerifier: { verifyRepositoryGraph() {} },
+    stagePromotion: { materializeAndVerify() {}, cleanup() {} },
+    makeStageReader() {},
+    makePublisherIo() {},
+    acquireFence() {},
+    clock: { now() { return 1; } },
+    maxAgeMs: 30_000,
+    replaySeen: { has() {}, add() {} },
+    ...overrides,
+  });
+}
 const baseArgs = {
   gateEnabled: true,
   recoveryEnabled: true,
@@ -59,7 +74,7 @@ test("gate + recovery on with valid config -> assembled bundles", () => {
   assert.deepEqual(result.create, { __c: 1 });
   assert.deepEqual(result.refresh, { __r: 1 });
   assert.equal(result.resetDelete.__d, 1);
-  assert.equal(result.restoreMigration, null);
+  assert.ok(result.restoreMigration);
   assert.deepEqual(assembleArgs, {
     workspaceRoot: "/ws/root",
     workspaceLeases: baseArgs.workspaceLeases,
@@ -130,6 +145,23 @@ test("an incomplete reset/delete bundle stays inert without regressing create or
   assert.deepEqual(result.create, { __c: 1 });
   assert.deepEqual(result.refresh, { __r: 1 });
   assert.equal(result.resetDelete, null);
+});
+
+test("a malformed restore-only bundle stays inert without degrading other operations", () => {
+  const result = resolveNativeServingBundles({
+    ...baseArgs,
+    resolveMaxAge: () => ({ ok: true, maxAgeMs: 30000 }),
+    assemble: () => ({
+      create: { __c: 1 },
+      refresh: { __r: 1 },
+      resetDelete: null,
+      restoreMigration: { makePublisherIo() {} },
+    }),
+  });
+  assert.equal(result.degraded, false);
+  assert.deepEqual(result.create, { __c: 1 });
+  assert.deepEqual(result.refresh, { __r: 1 });
+  assert.equal(result.restoreMigration, null);
 });
 
 test("assembly throw without a code -> generic fail-closed code", () => {

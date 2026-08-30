@@ -18,15 +18,21 @@ const HOST_ID = "host-alpha";
 const ROLE_FP = "a".repeat(64);
 const VOLUME_FP = "b".repeat(64);
 const KEY_FP = "c".repeat(64);
+const MANIFEST_FP = "d".repeat(64);
+const SOURCE_WORKSPACE_ID = "workspace-source";
+const SOURCE_GENERATION = 3;
 
 function validRecord() {
   return {
-    version: 1,
+    version: 2,
     kind: PROVENANCE_KIND,
     hostId: HOST_ID,
     roleFingerprint: ROLE_FP,
     volumeIdentityFingerprint: VOLUME_FP,
     keyFingerprint: KEY_FP,
+    manifestFingerprint: MANIFEST_FP,
+    restoredFromWorkspaceId: SOURCE_WORKSPACE_ID,
+    restoredFromGeneration: SOURCE_GENERATION,
   };
 }
 
@@ -69,6 +75,9 @@ test("reader output is consumable by verifyRestoreProvenance", async () => {
       roleFingerprint: ROLE_FP,
       volumeIdentityFingerprint: VOLUME_FP,
       keyFingerprint: KEY_FP,
+      manifestFingerprint: MANIFEST_FP,
+      restoredFromWorkspaceId: SOURCE_WORKSPACE_ID,
+      restoredFromGeneration: SOURCE_GENERATION,
     };
     const result = await verifyRestoreProvenance(provenanceIo, {
       expectedAuthority,

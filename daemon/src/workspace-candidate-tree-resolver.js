@@ -59,7 +59,10 @@ function refuse(code, reason) {
  *   symlink exclusion, and escape refusal without real reparse points.
  * @returns {(candidatePath: string, platform: "posix"|"windows") => Promise<string[]>}
  */
-export function createCandidateManifestResolver({ readdir = fsReaddir } = {}) {
+export function createCandidateManifestResolver({
+  readdir = fsReaddir,
+  rejectUnsupported = false,
+} = {}) {
   if (typeof readdir !== "function") {
     refuse(PROTOCOL_ERROR_CODES.CONFIG_INVALID, "readdir must be a function");
   }
@@ -93,6 +96,12 @@ export function createCandidateManifestResolver({ readdir = fsReaddir } = {}) {
         // is never descended, a symlink file leaf is never emitted. Deep
         // per-component reparse verification is the containment dep's job (S7).
         if (dirent.isSymbolicLink()) {
+          if (rejectUnsupported) {
+            refuse(
+              "WORKSPACE_MANIFEST_MISMATCH",
+              "candidate contains a symbolic link"
+            );
+          }
           continue;
         }
         const childRel = [...relSegments, dirent.name];
@@ -104,6 +113,12 @@ export function createCandidateManifestResolver({ readdir = fsReaddir } = {}) {
           continue;
         }
         if (!dirent.isFile()) {
+          if (rejectUnsupported) {
+            refuse(
+              "WORKSPACE_MANIFEST_MISMATCH",
+              "candidate contains an unsupported filesystem entry"
+            );
+          }
           // sockets / fifos / block+char devices are not manifest content.
           continue;
         }
@@ -112,7 +127,11 @@ export function createCandidateManifestResolver({ readdir = fsReaddir } = {}) {
         // WORKSPACE_ROOT_ESCAPE on a "."/".."/absolute-escape segment. Also
         // refuse any component carrying an embedded separator (a dirent name
         // must be a single path component).
-        const components = relativeComponents(candidatePath, relPath, containmentPlatform);
+        const components = relativeComponents(
+          candidatePath,
+          `${candidatePath}${sep}${relPath}`,
+          containmentPlatform
+        );
         for (const component of components) {
           if (component.includes("/") || component.includes("\\")) {
             refuse("WORKSPACE_ROOT_ESCAPE", "manifest path component carries an embedded separator");

@@ -7,7 +7,7 @@ import {
 
 
 function fullNativeServingDeps() {
-  return {
+  return Object.freeze({
     makePublisherIo: async () => ({
       readLivePointer: async () => null,
       writeTemp: async () => {},
@@ -17,13 +17,16 @@ function fullNativeServingDeps() {
     }),
     containment: { identifyRoot: async () => {}, verifyContained: async () => {} },
     gitVerifier: { verifyRepositoryGraph: async () => {} },
-    makeProvenanceIo: () => ({ readProvenanceRecord: async () => ({}) }),
-    makeChecksumIo: () => ({ readBytes: async () => Buffer.from("x") }),
+    stagePromotion: {
+      materializeAndVerify: async () => ({}),
+      cleanup: async () => {},
+    },
+    makeStageReader: () => ({ readBytes: async () => Buffer.from("x") }),
     acquireFence: () => ({ isCurrent: () => true, release: () => {} }),
     clock: { now: () => 1 },
     maxAgeMs: 5_000,
     replaySeen: { has: () => false, add: () => {} },
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -67,4 +70,22 @@ test("dispatcher is constructed when enabled + workspaceRoot + full native deps"
 
 test("resolveLifecycleRestoreMigrationDispatcher tolerates no arguments", () => {
   assert.equal(resolveLifecycleRestoreMigrationDispatcher(), null);
+});
+
+test("malformed static bundles fail closed", () => {
+  const deps = fullNativeServingDeps();
+  assert.equal(resolveLifecycleRestoreMigrationDispatcher({
+    enabled: true,
+    workspaceRoot: "/srv/ws",
+    nativeServingDeps: { ...deps },
+  }), null);
+});
+
+test("workspaceRoot is daemon-owned and cannot be overridden by static bundle data", () => {
+  const deps = Object.freeze({ ...fullNativeServingDeps(), workspaceRoot: "/attacker" });
+  assert.equal(resolveLifecycleRestoreMigrationDispatcher({
+    enabled: true,
+    workspaceRoot: "/srv/ws",
+    nativeServingDeps: deps,
+  }), null);
 });
