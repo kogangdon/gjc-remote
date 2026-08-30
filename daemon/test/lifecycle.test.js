@@ -8,7 +8,10 @@ import {
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
 } from "@gjc-remote/shared";
-import { fingerprintManagedMappingRecord } from "@gjc-remote/shared/mapping-envelope";
+import {
+  fingerprintManagedMappingRecord,
+  fingerprintManagedRouteRecord,
+} from "@gjc-remote/shared/mapping-envelope";
 import {
   buildWorkspaceInventory,
   workspaceInventoryBytes,
@@ -104,6 +107,56 @@ async function stopChild(child) {
     await exited;
   }
 }
+
+function readinessV2Bind() {
+  const mapping = fingerprintManagedMappingRecord({
+    mappingId: "mapping-test",
+    hostId: "readiness-test-host",
+    fenceGeneration: 1,
+    mappingGeneration: 1,
+    workspaceGeneration: 1,
+    mappingVersion: 1,
+    sourcePlatform: "windows-drive",
+    workspaceId: "workspace-test",
+    workDir: null,
+    sourceRoot: "C:\\native\\workspace-test",
+    containerRoot: null,
+    volumeIdentity: "volume-test",
+    casePolicy: "insensitive",
+    immutableDefault: false,
+    mappingFingerprint: null,
+  });
+  const route = fingerprintManagedRouteRecord({
+    channelId: "123",
+    hostId: mapping.hostId,
+    mappingId: mapping.mappingId,
+    fenceGeneration: mapping.fenceGeneration,
+    mappingGeneration: mapping.mappingGeneration,
+    workspaceGeneration: mapping.workspaceGeneration,
+    mappingVersion: mapping.mappingVersion,
+    sourcePlatform: mapping.sourcePlatform,
+    workspaceId: mapping.workspaceId,
+    workDir: null,
+    routeFingerprint: null,
+  }, mapping);
+  return {
+    type: "bind_workspace",
+    bindingId: "binding-test",
+    hostId: route.hostId,
+    mappingId: route.mappingId,
+    mappingGeneration: route.mappingGeneration,
+    mappingVersion: route.mappingVersion,
+    workspaceId: route.workspaceId,
+    workspaceGeneration: route.workspaceGeneration,
+    sourcePlatform: route.sourcePlatform,
+    routeFingerprint: route.routeFingerprint,
+    authorityFingerprint: mapping.mappingFingerprint,
+    inventoryGeneration: 1,
+    route,
+    mapping,
+  };
+}
+
 async function startReadinessDaemon({
   registerResponse = {
     type: "register_ok",
@@ -129,20 +182,7 @@ async function startReadinessDaemon({
         registrations.push(message);
         socket.send(JSON.stringify(registerResponse));
         if (autoBind && registerResponse.protocolVersion === 2) {
-          socket.send(JSON.stringify({
-            type: "bind_workspace",
-            bindingId: "binding-test",
-            hostId: "readiness-test-host",
-            mappingId: "mapping-test",
-            mappingGeneration: 1,
-            mappingVersion: 1,
-            workspaceId: "workspace-test",
-            workspaceGeneration: 1,
-            sourcePlatform: "windows-drive",
-            routeFingerprint: "a".repeat(64),
-            authorityFingerprint: "b".repeat(64),
-            inventoryGeneration: 1,
-          }));
+          socket.send(JSON.stringify(readinessV2Bind()));
         }
         return;
       }
