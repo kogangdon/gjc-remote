@@ -41,7 +41,10 @@ import {
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
-import { verifyReceiptBindAuthorityPreimage } from "@gjc-remote/shared/bind-authority-verification";
+import {
+  verifyBindAuthorityPreimage,
+  verifyReceiptBindAuthorityPreimage,
+} from "@gjc-remote/shared/bind-authority-verification";
 import { relativeComponents } from "./workspace-containment.js";
 import { whitelistProtocolCode, formatManualCleanupLog } from "./lifecycle-wire-sanitizers.js";
 import { SessionPool } from "./session-pool.js";
@@ -888,25 +891,30 @@ function retireSupersededReceiptBinding(state, bindingState) {
   state.retiredBindings.set(bindingState.binding.bindingId, bindingState);
 }
 
+const BIND_ACCEPTED = Object.freeze({ ok: true, code: null });
+const BIND_REJECTED = Object.freeze({ ok: false, code: null });
+
 async function acceptReceiptBinding(state, message) {
-  if (!state?.receiptCommitted || message.hostId !== HOST_ID) return false;
-  const verdict = verifyReceiptBindAuthorityPreimage(message, RECEIPT_BIND_VERIFICATION_CONTEXT);
+  if (!state?.receiptCommitted || message.hostId !== HOST_ID) return BIND_REJECTED;
+  const verdict = verifyReceiptBindAuthorityPreimage(message, BIND_VERIFICATION_CONTEXT);
   if (!verdict.ok) {
     console.warn(`daemon: receipt bind authority verification failed: ${verdict.code}`);
-    return false;
+    return Object.freeze({ ok: false, code: verdict.code });
   }
   const existing = state.bindings.get(message.bindingId) ??
     state.retiredBindings.get(message.bindingId);
   if (existing) {
-    if (state.retiredBindings.get(message.bindingId) === existing) return false;
-    if (!sameReceiptBinding(existing.binding, message)) return false;
+    if (state.retiredBindings.get(message.bindingId) === existing) return BIND_REJECTED;
+    if (!sameReceiptBinding(existing.binding, message)) return BIND_REJECTED;
     if (state.bindings.get(message.bindingId) === existing && existing.proof) {
       connectionSendBindOk(state.connection, message.bindingId, existing.proof);
     }
-    return true;
+    return BIND_ACCEPTED;
   }
-  if (state.bindings.size + state.retiredBindings.size >= MAX_BINDINGS_PER_SOCKET) return false;
-  if (!reserveReceiptAuthorityFloor(state, message)) return false;
+  if (state.bindings.size + state.retiredBindings.size >= MAX_BINDINGS_PER_SOCKET) {
+    return BIND_REJECTED;
+  }
+  if (!reserveReceiptAuthorityFloor(state, message)) return BIND_REJECTED;
 
   const binding = Object.freeze({ ...message });
   const bindingState = {
@@ -927,18 +935,18 @@ async function acceptReceiptBinding(state, message) {
   try {
     first = await serializedInventoryRead();
   } catch (error) {
-    if (!currentReceiptBinding(state, bindingState)) return true;
+    if (!currentReceiptBinding(state, bindingState)) return BIND_ACCEPTED;
     bindingState.phase = "negative";
     bindingState.lastError = makeReadinessError(
       classifyReadinessError(error, PROTOCOL_ERROR_CODES.INVENTORY_IO_FAILED)
     );
     publishReadiness(state);
-    return true;
+    return BIND_ACCEPTED;
   }
-  if (!currentReceiptBinding(state, bindingState)) return true;
+  if (!currentReceiptBinding(state, bindingState)) return BIND_ACCEPTED;
   if (!ownsReceiptAuthorityFloor(state, binding)) {
     retireSupersededReceiptBinding(state, bindingState);
-    return true;
+    return BIND_ACCEPTED;
   }
   let inventoryWorkspace;
   let proof;
@@ -954,7 +962,7 @@ async function acceptReceiptBinding(state, message) {
       try {
         second = await serializedInventoryRead();
       } catch (error) {
-        if (!currentReceiptBinding(state, bindingState)) return true;
+        if (!currentReceiptBinding(state, bindingState)) return BIND_ACCEPTED;
         second = {
           status: "error",
           code: classifyReadinessError(
@@ -963,10 +971,10 @@ async function acceptReceiptBinding(state, message) {
           ),
         };
       }
-      if (!currentReceiptBinding(state, bindingState)) return true;
+      if (!currentReceiptBinding(state, bindingState)) return BIND_ACCEPTED;
       if (!ownsReceiptAuthorityFloor(state, binding)) {
         retireSupersededReceiptBinding(state, bindingState);
-        return true;
+        return BIND_ACCEPTED;
       }
       if (second?.status !== "present") {
         errorCode = receiptInventoryError(second);
@@ -995,7 +1003,7 @@ async function acceptReceiptBinding(state, message) {
       try {
         second = await serializedInventoryRead();
       } catch (error) {
-        if (!currentReceiptBinding(state, bindingState)) return true;
+        if (!currentReceiptBinding(state, bindingState)) return BIND_ACCEPTED;
         second = {
           status: "error",
           code: classifyReadinessError(
@@ -1004,10 +1012,10 @@ async function acceptReceiptBinding(state, message) {
           ),
         };
       }
-      if (!currentReceiptBinding(state, bindingState)) return true;
+      if (!currentReceiptBinding(state, bindingState)) return BIND_ACCEPTED;
       if (!ownsReceiptAuthorityFloor(state, binding)) {
         retireSupersededReceiptBinding(state, bindingState);
-        return true;
+        return BIND_ACCEPTED;
       }
       if (second?.status !== "present") {
         errorCode = receiptInventoryError(second);
@@ -1022,10 +1030,10 @@ async function acceptReceiptBinding(state, message) {
       }
     }
   }
-  if (!currentReceiptBinding(state, bindingState)) return true;
+  if (!currentReceiptBinding(state, bindingState)) return BIND_ACCEPTED;
   if (!ownsReceiptAuthorityFloor(state, binding)) {
     retireSupersededReceiptBinding(state, bindingState);
-    return true;
+    return BIND_ACCEPTED;
   }
   bindingState.inventoryWorkspace = inventoryWorkspace;
   bindingState.proof = proof;
@@ -1069,7 +1077,7 @@ async function acceptReceiptBinding(state, message) {
   } else {
     publishReadiness(state);
   }
-  return true;
+  return BIND_ACCEPTED;
 }
 
 function connectionSendBindOk(connection, bindingId, proof) {
@@ -1114,25 +1122,32 @@ function acceptWorkspaceBinding(state, message) {
     message.hostId !== HOST_ID ||
     message.workspaceId === undefined
   ) {
-    return false;
+    return BIND_REJECTED;
+  }
+  const verdict = verifyBindAuthorityPreimage(message, BIND_VERIFICATION_CONTEXT);
+  if (!verdict.ok) {
+    console.warn(`daemon: bind authority verification failed: ${verdict.code}`);
+    return Object.freeze({ ok: false, code: verdict.code });
   }
   const previousState = state.bindings.get(message.bindingId);
   const previous = previousState?.binding;
   if (previous) {
-    if (sameBindingFields(previous, message)) return true;
+    if (sameBindingFields(previous, message)) return BIND_ACCEPTED;
     // A bindingId is immutable for the lifetime of a socket. Reusing it for
     // another identity would make replayed bind receipts indistinguishable
     // from an authorized remap.
-    return false;
+    return BIND_REJECTED;
   }
-  if (!previousState && state.bindings.size >= MAX_BINDINGS_PER_SOCKET) return false;
+  if (!previousState && state.bindings.size >= MAX_BINDINGS_PER_SOCKET) {
+    return BIND_REJECTED;
+  }
 
   const previousWorkspaceState = [...state.bindings.values()].find(
     (candidate) => candidate.binding.workspaceId === message.workspaceId
   );
   if (previousWorkspaceState) {
     const previousWorkspace = previousWorkspaceState.binding;
-    if (hasBindingGenerationRegression(previousWorkspace, message)) return false;
+    if (hasBindingGenerationRegression(previousWorkspace, message)) return BIND_REJECTED;
 
     const authorityChanged = !sameBindingFields(
       previousWorkspace,
@@ -1144,9 +1159,9 @@ function acceptWorkspaceBinding(state, message) {
       message.workspaceGeneration > previousWorkspace.workspaceGeneration;
     const inventoryGenerationAdvanced =
       message.inventoryGeneration > previousWorkspace.inventoryGeneration;
-    if (!mappingGenerationAdvanced && !inventoryGenerationAdvanced) return false;
-    if (authorityChanged && !mappingGenerationAdvanced) return false;
-    if (!workspaceLeases.adoptBinding(message)) return false;
+    if (!mappingGenerationAdvanced && !inventoryGenerationAdvanced) return BIND_REJECTED;
+    if (authorityChanged && !mappingGenerationAdvanced) return BIND_REJECTED;
+    if (!workspaceLeases.adoptBinding(message)) return BIND_REJECTED;
 
     // A workspace has one active binding per socket. Replace the old receipt
     // only after the new identity passes monotonic fencing; old invokes are
@@ -1154,7 +1169,7 @@ function acceptWorkspaceBinding(state, message) {
     state.bindings.delete(previousWorkspace.bindingId);
     invalidateBindingRequests(state, previousWorkspaceState);
   } else if (!workspaceLeases.adoptBinding(message)) {
-    return false;
+    return BIND_REJECTED;
   }
 
   const binding = Object.freeze({ ...message });
@@ -1172,7 +1187,7 @@ function acceptWorkspaceBinding(state, message) {
   // Binding acceptance is intentionally separate from readiness. The daemon
   // still needs a verified local inventory match before it can serve.
   promoteWorkspaceIfProven(state, state.bindings.get(message.bindingId));
-  return true;
+  return BIND_ACCEPTED;
 }
 
 function promoteWorkspaceIfProven(state, bindingState) {
@@ -1806,14 +1821,19 @@ async function handleMessage(
   }
   if (msg?.type === MSG_TYPES.BIND_WORKSPACE) {
     if (readinessState?.receiptCommitted) {
-      if (!isInventoryReceiptBindWorkspaceMessage(msg) ||
-          !(await acceptReceiptBinding(readinessState, msg))) {
-        connection.close(1008, "invalid workspace binding");
+      const acceptance = isInventoryReceiptBindWorkspaceMessage(msg)
+        ? await acceptReceiptBinding(readinessState, msg)
+        : BIND_REJECTED;
+      if (!acceptance.ok) {
+        connection.close(1008, acceptance.code ?? "invalid workspace binding");
       }
       return;
     }
-    if (!isBindWorkspaceMessage(msg) || !acceptWorkspaceBinding(readinessState, msg)) {
-      connection.close(1008, "invalid workspace binding");
+    const acceptance = isBindWorkspaceMessage(msg)
+      ? acceptWorkspaceBinding(readinessState, msg)
+      : BIND_REJECTED;
+    if (!acceptance.ok) {
+      connection.close(1008, acceptance.code ?? "invalid workspace binding");
       return;
     }
     connection.send(
@@ -2407,13 +2427,13 @@ if (workspaceRecoveryConfig.enabled) {
   }
 }
 
-// issue #179 Slice 2: the receipt bind-authority verifier's tier-2 lexical
-// containment is only active when the daemon has a configured, daemon-known
-// native workspace root (GJC_NATIVE_WORKSPACE_ROOT). Absent a configured
-// root, verifyReceiptBindAuthorityPreimage runs with containment omitted,
-// which is a documented no-op (see shared/bind-authority-verification.js).
+// Bind-authority tier-2 lexical containment is active for both receipt and
+// non-receipt verification only when the daemon has a configured,
+// daemon-known native workspace root (GJC_NATIVE_WORKSPACE_ROOT). Absent that
+// root, both verifiers run with containment omitted, which is a documented
+// no-op (see shared/bind-authority-verification.js).
 const DAEMON_SOURCE_PLATFORM = process.platform === "win32" ? "windows-drive" : "posix";
-const RECEIPT_BIND_VERIFICATION_CONTEXT = Object.freeze({
+const BIND_VERIFICATION_CONTEXT = Object.freeze({
   hostId: HOST_ID,
   containment: workspaceRecoveryConfig.enabled
     ? Object.freeze({

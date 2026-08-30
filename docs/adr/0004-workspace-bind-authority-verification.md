@@ -95,7 +95,9 @@ otherwise unchanged.
 `BIND_AUTHORITY_HASH_MISMATCH`, `BIND_AUTHORITY_HOSTID_MISMATCH`,
 `BIND_AUTHORITY_CONTAINMENT_ESCAPE`, `BIND_AUTHORITY_VERIFICATION_REQUIRED`. On a
 verification failure the daemon fails closed (returns false), logs the code, and
-dispatches `close(1008, "invalid workspace binding")`.
+dispatches `close(1008, <BIND_AUTHORITY_* code>)`. Shape, guard, capacity,
+fencing, and lease failures retain the generic
+`close(1008, "invalid workspace binding")` reason.
 
 ## Residual trust
 
@@ -107,11 +109,12 @@ absent no-follow (tier-3) reparse-point residual, the `authorityEpoch`/generatio
 channel-trust residual, and the permanently-out-of-scope valid-envelope-wrong-intent
 residual.
 
-Follow-up hardening (defense-in-depth wiring of the v2 `acceptWorkspaceBinding`
-path, a no-follow containment tier, `containerRoot` ground truth, and surfacing the
-`BIND_AUTHORITY_*` code in the socket close reason) is tracked in **#200**. These are
-hardening, not open live gaps: the v2 path cannot serve a managed workspace from a
-compliant bot.
+Issue **#200** adds defense-in-depth verification to the v2
+`acceptWorkspaceBinding` path and code-only close-reason observability. A
+no-follow containment tier, trusted `containerRoot` ground truth, and
+`authorityEpoch` authenticity remain explicitly out of this decision's closed
+scope because the current daemon has no operation-time filesystem handle or
+trusted container/epoch authority from which to establish them.
 
 ## References
 

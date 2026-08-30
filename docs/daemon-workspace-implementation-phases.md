@@ -247,7 +247,7 @@ not authorize any behavior more permissive than the phase contracts above.
 **Serving is env-gated and OFF by default.** The native inventory contract (config modes, five-role
 bindings, the durable D floor, the live invalidation cascade, and the bot receipt binding/observability
 surface) is implemented as capability scaffolding. Native workspace serving is now a fail-closed
-runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:251)
+runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:254)
 as an `= resolveNativeServingEnabled({ env, inventoryReceiptAdvertised })`
 call, which is `true` only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 equals `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the default)

@@ -291,6 +291,8 @@ test("isWorkspaceLifecycleMessage is false for a bind message and a plain invoke
     routeFingerprint: ROUTE_FP,
     authorityFingerprint: AUTH_FP,
     inventoryGeneration: 5,
+    route: { channelId: "123", routeFingerprint: ROUTE_FP },
+    mapping: { mappingId: "mapping-1", mappingFingerprint: AUTH_FP },
   };
   assert.equal(isBindWorkspaceMessage(bindMsg), true);
   assert.equal(isWorkspaceLifecycleMessage(bindMsg), false);
