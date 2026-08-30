@@ -178,6 +178,13 @@ export function validateManagedMappingRecord(mapping) {
   return mapping;
 }
 
+/**
+ * Verify a route record against its mapping: recompute the routeFingerprint
+ * and (via validateManagedMappingRecord) the mappingFingerprint, and enforce
+ * the 9 shared route<->mapping fields. Issue #179 reuses this verbatim as the
+ * daemon-side, per-bind preimage check that replaces trust-on-first-use
+ * fingerprint adoption (see shared/bind-authority-verification.js).
+ */
 export function validateManagedRouteRecord(route, mapping) {
   if (!exact(route, ROUTE_KEYS) || !DISCORD_ID.test(route.channelId) ||
       !isHex64(route.routeFingerprint)) throw new TypeError("MANAGED_ROUTE_INVALID");
