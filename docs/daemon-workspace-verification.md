@@ -123,14 +123,15 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
-fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:251, an
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:256, an
 `= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
 default) the gate reads `false` and its read site inside `admitReadyWorkload` returns
 `RUNTIME_INCOMPATIBLE`, exactly as before the S6f.7 flip; the bot side defaults to false as well and
-is not overridden at startup. When enabled, serving is Option C-narrow: only CREATE and REFRESH
-assemble native serving deps; reset/delete and restore/migration keep null dispatchers and stay
-fail-closed, and any INV-6 boot-crash-recovery-barred workspace is refused on every lifecycle op. The
+is not overridden at startup. When enabled, CREATE and REFRESH assemble native serving deps;
+reset/delete additionally requires the verified residual-process capability and an exact
+receipt-bound lifecycle transaction context; restore/migration keeps a null dispatcher and stays
+fail-closed. Any INV-6 boot-crash-recovery-barred workspace is refused on every lifecycle op. The
 production native-reader daemon-boot wiring is landed (commit e62b7b5, #141): `daemon/src/daemon.js`
 imports `initializeInventoryConfig` and, when `GJC_NATIVE_INVENTORY_MODE === 'verify'` and outside
 test injection, constructs and self-tests the production native reader via

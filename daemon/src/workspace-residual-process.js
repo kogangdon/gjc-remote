@@ -22,7 +22,12 @@ const { CONFIG_INVALID, WORKSPACE_RESIDUAL_PROCESS } = PROTOCOL_ERROR_CODES;
 // The exact identity a residual-process query must carry. Both fields are
 // required non-empty strings so the enumerator scopes its scan to one workspace
 // on one host and can never be invoked with a partial/ambiguous target.
-const RESIDUAL_PROCESS_REQUEST_KEYS = Object.freeze(["hostId", "workspaceId"]);
+const RESIDUAL_PROCESS_REQUEST_KEYS = Object.freeze([
+  "hostId",
+  "workspaceId",
+  "workDir",
+  "sourcePlatform",
+]);
 
 function refuse(code, reason, extra) {
   const error = new Error(`${OPERATION}: ${code}: ${reason}`);
@@ -78,8 +83,16 @@ export async function assertResidualProcessAbsence(io, request) {
       `residual-process request must carry exactly ${RESIDUAL_PROCESS_REQUEST_KEYS.join(", ")}`
     );
   }
-  if (!isNonEmptyString(request.hostId) || !isNonEmptyString(request.workspaceId)) {
-    refuse(CONFIG_INVALID, "hostId and workspaceId must be non-empty strings");
+  if (
+    !isNonEmptyString(request.hostId) ||
+    !isNonEmptyString(request.workspaceId) ||
+    !isNonEmptyString(request.workDir) ||
+    !isNonEmptyString(request.sourcePlatform)
+  ) {
+    refuse(
+      CONFIG_INVALID,
+      "hostId, workspaceId, workDir, and sourcePlatform must be non-empty strings"
+    );
   }
 
   // A rejecting enumerator is an unreadable result, not an empty one: wrap it in
@@ -90,6 +103,8 @@ export async function assertResidualProcessAbsence(io, request) {
     result = await io.listResidualProcesses({
       hostId: request.hostId,
       workspaceId: request.workspaceId,
+      workDir: request.workDir,
+      sourcePlatform: request.sourcePlatform,
     });
   } catch (cause) {
     refuse(CONFIG_INVALID, "listResidualProcesses failed", { cause });

@@ -6,7 +6,12 @@ import {
   RESIDUAL_PROCESS_REQUEST_KEYS,
 } from "../src/workspace-residual-process.js";
 
-const REQUEST = Object.freeze({ hostId: "host-a", workspaceId: "workspace-a" });
+const REQUEST = Object.freeze({
+  hostId: "host-a",
+  workspaceId: "workspace-a",
+  workDir: "/srv/ws/workspace-a",
+  sourcePlatform: "posix",
+});
 
 // Injected enumerator that returns a fixed result (array or otherwise), and
 // records the exact scope it was queried with so tests can prove the guard
@@ -36,8 +41,7 @@ test("an empty residual-process list certifies absence with a frozen certificate
   const result = await assertResidualProcessAbsence(io, REQUEST);
   assert.deepEqual(result, { absent: true });
   assert.equal(Object.isFrozen(result), true);
-  // The enumerator was scoped to exactly the requested host + workspace.
-  assert.deepEqual(io.calls, [{ hostId: "host-a", workspaceId: "workspace-a" }]);
+  assert.deepEqual(io.calls, [REQUEST]);
 });
 
 test("a non-empty residual-process list refuses WORKSPACE_RESIDUAL_PROCESS with pid context", async () => {
@@ -117,8 +121,13 @@ test("a request missing, extending, or mistyping identity is refused CONFIG_INVA
   assert.deepEqual(io.calls, []);
 });
 
-test("the request key set is exactly hostId + workspaceId", () => {
-  assert.deepEqual([...RESIDUAL_PROCESS_REQUEST_KEYS], ["hostId", "workspaceId"]);
+test("the request key set binds host, workspace, canonical path, and platform", () => {
+  assert.deepEqual(RESIDUAL_PROCESS_REQUEST_KEYS, [
+    "hostId",
+    "workspaceId",
+    "workDir",
+    "sourcePlatform",
+  ]);
   assert.equal(Object.isFrozen(RESIDUAL_PROCESS_REQUEST_KEYS), true);
 });
 

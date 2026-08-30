@@ -64,6 +64,8 @@ import { constants as fsConstants } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
+import { canonicalJsonBytes } from "@gjc-remote/shared/strict-json.js";
+import { validateManualCleanup } from "@gjc-remote/shared/recovery-envelope.js";
 import { parseGenerationPointer } from "./workspace-generation-publisher.js";
 
 let tempCounter = 0;
@@ -228,6 +230,53 @@ export async function createTombstonePublisherIo({ workspaceRoot, workspaceId })
   const dir = path.join(workspaceRoot, workspaceId, "tombstone");
   await ensureDir(dir);
   return createAtomicPointerIo({ pointerPath: path.join(dir, "live.tomb") });
+}
+
+/**
+ * Durable contingency record for a reset/delete publication. It is prepared
+ * before the ambiguous pointer-write window and removed only after a committed
+ * terminal transition. A crash while it exists makes boot recovery bar the
+ * workspace through the existing manual-cleanup snapshot field.
+ */
+export async function createManualCleanupPublisherIo({ workspaceRoot, workspaceId }) {
+  const dir = path.join(workspaceRoot, workspaceId, "lifecycle");
+  await ensureDir(dir);
+  const recordPath = path.join(dir, "manual-cleanup.json");
+  const io = createAtomicPointerIo({ pointerPath: recordPath });
+
+  async function publish(record) {
+    validateManualCleanup(record);
+    const bytes = canonicalJsonBytes(record);
+    const existing = await io.readLivePointer();
+    if (existing !== null) {
+      if (Buffer.from(existing).equals(Buffer.from(bytes))) return;
+      const error = new Error("manual-cleanup record already exists");
+      error.code = "WORKSPACE_LIFECYCLE_JOURNAL_CONFLICT";
+      throw error;
+    }
+    let replaced = false;
+    try {
+      const temp = await io.writeTemp(bytes);
+      await io.flushTemp(temp);
+      await io.replace(temp);
+      replaced = true;
+      await io.flushParent();
+    } catch (error) {
+      error.terminalPreparationAmbiguous = replaced;
+      throw error;
+    }
+  }
+
+  async function clear() {
+    try {
+      await unlink(recordPath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await io.flushParent();
+  }
+
+  return Object.freeze({ publish, clear });
 }
 
 /**

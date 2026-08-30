@@ -15,8 +15,9 @@ import { MSG_TYPES } from "@gjc-remote/shared";
 //
 // dispatchResetDelete mirrors the S6f.2/S6f.3 dispatchers; the base being
 // destroyed is read INTERNALLY from the live disposition, never the wire
-// message. `leaseCandidate` (exclusive-fence identity) and `lifecycleAuthority`
-// (manual-cleanup tx-context) are host-held per-call parameters.
+// message. `leaseCandidate` (exclusive-fence identity) and `lifecycleContext`
+// (manual-cleanup tx-context plus exact quiescence/terminal callbacks) are
+// host-held per-call parameters.
 // ---------------------------------------------------------------------------
 
 const ROUTE_FP = "a".repeat(64);
@@ -27,12 +28,14 @@ const WORKSPACE = "workspace-1";
 
 function baseAuthority(overrides = {}) {
   return {
+    authorityEpoch: 6,
+    fenceGeneration: 7,
     hostId: HOST,
     mappingId: "mapping-1",
     mappingGeneration: 3,
     mappingVersion: 1,
     workspaceId: WORKSPACE,
-    workspaceGeneration: 2,
+    workspaceGeneration: 3,
     sourcePlatform: "posix",
     routeFingerprint: ROUTE_FP,
     authorityFingerprint: AUTH_FP,
@@ -51,7 +54,7 @@ function resetDeleteMessage(overrides = {}) {
     mappingGeneration: 3,
     mappingVersion: 1,
     workspaceId: WORKSPACE,
-    workspaceGeneration: 2,
+    workspaceGeneration: 3,
     sourcePlatform: "posix",
     routeFingerprint: ROUTE_FP,
     authorityFingerprint: AUTH_FP,
@@ -80,6 +83,17 @@ const lifecycleAuthority = Object.freeze({
   expectedFloorFingerprint: null,
   observedFloorFingerprint: null,
 });
+
+function lifecycleContext(overrides = {}) {
+  return Object.freeze({
+    lifecycleAuthority: overrides.lifecycleAuthority ?? lifecycleAuthority,
+    probeQuiescence: overrides.probeQuiescence ??
+      (() => ({ pendingInvokes: 0, pendingSessions: 0 })),
+    prepareTerminal: overrides.prepareTerminal ?? (() => {}),
+    clearTerminalPreparation: overrides.clearTerminalPreparation ?? (() => {}),
+    commitTerminal: overrides.commitTerminal ?? (() => {}),
+  });
+}
 
 function liveReadiness() {
   return {
@@ -153,7 +167,6 @@ function validConfig(over = {}) {
     makeBackupIo: over.makeBackupIo ?? (() => backupIo),
     resolveManifestPaths: over.resolveManifestPaths ?? (async () => ["README.md", "src/a.js"]),
     acquireFence: over.acquireFence ?? fence.acquireFence,
-    probeQuiescence: over.probeQuiescence ?? (() => ({ pendingInvokes: 0, pendingSessions: 0 })),
     residualIo,
   };
   return { config, pointer, tombstoneIo, backupIo, residualIo, fence };
@@ -170,7 +183,9 @@ function callArgs(over = {}) {
     trustedBinding: over.trustedBinding === undefined ? baseAuthority() : over.trustedBinding,
     trustedInventoryWorkspace: over.trustedInventoryWorkspace === undefined ? inventoryWorkspace : over.trustedInventoryWorkspace,
     leaseCandidate: over.leaseCandidate === undefined ? leaseCandidate : over.leaseCandidate,
-    lifecycleAuthority: over.lifecycleAuthority === undefined ? lifecycleAuthority : over.lifecycleAuthority,
+    lifecycleContext: over.lifecycleContext === undefined
+      ? lifecycleContext()
+      : over.lifecycleContext,
     readiness: over.readiness ?? liveReadiness(),
   };
 }
@@ -224,6 +239,16 @@ test("reset/delete: a reset operation is also accepted", async () => {
   assert.equal(result.receipt.operation, "reset");
 });
 
+test("reset/delete: exact receipt binding shape authorizes without routeFingerprint", async () => {
+  const { dispatcher } = makeHarness();
+  const trusted = baseAuthority();
+  delete trusted.routeFingerprint;
+  const result = await dispatcher.dispatchResetDelete(callArgs({
+    trustedBinding: trusted,
+  }));
+  assert.equal(result.ok, true, JSON.stringify(result));
+});
+
 // ---------------------------------------------------------------------------
 // Negative authorization: message can NEVER self-authorize. A tampered field
 // fails closed BEFORE the fence is acquired, backup captured, or residual scan.
@@ -231,7 +256,6 @@ test("reset/delete: a reset operation is also accepted", async () => {
 
 for (const [field, tampered] of [
   ["mappingGeneration", 99],
-  ["routeFingerprint", "9".repeat(64)],
   ["authorityFingerprint", "8".repeat(64)],
   ["workspaceGeneration", 7],
   ["mappingId", "mapping-evil"],
@@ -275,11 +299,15 @@ test("reset/delete: a missing exclusive-fence lease candidate is refused before 
 
 test("reset/delete: a missing or malformed manual-cleanup authority is refused before the fence", async () => {
   const { dispatcher, fence } = makeHarness();
-  const missing = await dispatcher.dispatchResetDelete(callArgs({ lifecycleAuthority: null }));
+  const missing = await dispatcher.dispatchResetDelete(callArgs({ lifecycleContext: null }));
   assert.equal(missing.ok, false);
   assert.equal(missing.code, "RUNTIME_INCOMPATIBLE");
   // extra key -> not exact -> refused
-  const malformed = await dispatcher.dispatchResetDelete(callArgs({ lifecycleAuthority: { ...lifecycleAuthority, extra: 1 } }));
+  const malformed = await dispatcher.dispatchResetDelete(callArgs({
+    lifecycleContext: lifecycleContext({
+      lifecycleAuthority: { ...lifecycleAuthority, extra: 1 },
+    }),
+  }));
   assert.equal(malformed.ok, false);
   assert.equal(malformed.code, "RUNTIME_INCOMPATIBLE");
   assert.equal(fence.state.acquired, 0);
@@ -289,12 +317,13 @@ test("reset/delete: a missing or malformed manual-cleanup authority is refused b
 // Live-disposition derivation + destructive locks (orchestrator seams).
 // ---------------------------------------------------------------------------
 
-test("reset/delete: a null live slot is refused STALE without acquiring the fence", async () => {
+test("reset/delete: a null live slot is refused STALE under the exclusive fence", async () => {
   const { dispatcher, fence } = makeHarness({ slotBytes: null });
   const result = await dispatcher.dispatchResetDelete(callArgs());
   assert.equal(result.ok, false);
   assert.equal(result.code, "WORKSPACE_GENERATION_STALE");
-  assert.equal(fence.state.acquired, 0);
+  assert.equal(fence.state.acquired, 1);
+  assert.equal(fence.state.releases, 1);
 });
 
 test("reset/delete: a residual process still bound refuses WORKSPACE_RESIDUAL_PROCESS without a tombstone", async () => {
@@ -309,8 +338,12 @@ test("reset/delete: a residual process still bound refuses WORKSPACE_RESIDUAL_PR
 });
 
 test("reset/delete: an in-flight workload refuses WORKSPACE_BUSY (quiescence gate)", async () => {
-  const { dispatcher, tombstoneIo } = makeHarness({ probeQuiescence: () => ({ pendingInvokes: 1, pendingSessions: 0 }) });
-  const result = await dispatcher.dispatchResetDelete(callArgs());
+  const { dispatcher, tombstoneIo } = makeHarness();
+  const result = await dispatcher.dispatchResetDelete(callArgs({
+    lifecycleContext: lifecycleContext({
+      probeQuiescence: () => ({ pendingInvokes: 1, pendingSessions: 0 }),
+    }),
+  }));
   assert.equal(result.ok, false);
   assert.equal(result.code, "WORKSPACE_BUSY");
   const disposition = await readLiveDisposition(tombstoneIo);
@@ -333,7 +366,7 @@ test("reset/delete: a lost exclusive fence refuses LEASE_CONFLICT without a tomb
 // short-circuits to already_tombstoned with no second CAS.
 // ---------------------------------------------------------------------------
 
-test("reset/delete: an already-tombstoned matching slot short-circuits to already_tombstoned", async () => {
+test("reset/delete: an already-tombstoned slot without replay evidence refuses stale", async () => {
   const tombstone = buildTombstone({
     hostId: HOST, workspaceId: WORKSPACE, sourcePlatform: "posix",
     operation: "delete", tombstonedGeneration: 3,
@@ -342,8 +375,8 @@ test("reset/delete: an already-tombstoned matching slot short-circuits to alread
   });
   const { dispatcher, backupIo } = makeHarness({ slotBytes: tombstoneBytes(tombstone) });
   const result = await dispatcher.dispatchResetDelete(callArgs());
-  assert.equal(result.ok, true, JSON.stringify(result));
-  assert.equal(result.receipt.disposition, "already_tombstoned");
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.code, "WORKSPACE_GENERATION_STALE");
   assert.equal(backupIo.calls, 0, "no dirty backup is captured on the idempotent path");
 });
 
@@ -374,7 +407,7 @@ test("reset/delete: windows-unc source platform is refused CONTAINMENT_UNSUPPORT
     trustedBinding: baseAuthority({ sourcePlatform: "windows-unc" }),
     trustedInventoryWorkspace: { ...inventoryWorkspace, sourcePlatform: "windows-unc" },
     leaseCandidate,
-    lifecycleAuthority,
+    lifecycleContext: lifecycleContext(),
     readiness: liveReadiness(),
   });
   assert.equal(result.ok, false);

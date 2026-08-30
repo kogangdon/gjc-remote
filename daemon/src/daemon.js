@@ -67,6 +67,8 @@ import { resolveLifecycleCreateDispatcher, resolveTrustedCreateBinding, projectS
 import { resolveLifecycleRefreshDispatcher } from "./workspace-refresh-boot-wiring.js";
 import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-boot-wiring.js";
 import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
+import { createResetDeleteLifecycleContext } from "./workspace-lifecycle-transaction-context.js";
+import { createManualCleanupPublisherIo } from "./workspace-generation-storage-io.js";
 import { resolveNativeServingBundles } from "./native-serving-boot-wiring.js";
 import { resolveNativeServingEnabled } from "./native-serving-gate.js";
 import { projectReceiptAuthority, resolveReceiptActivityIdentity, resolveAdoptedLeaseCandidateForWorkspace } from "./workspace-adopted-lease-candidate.js";
@@ -248,9 +250,9 @@ function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_R
 // GJC_NATIVE_WORKSPACE_SERVING === "1" AND inventoryReceiptAdvertised === true;
 // with the env var unset (the default) serving stays OFF exactly as before.
 // This gate is only the outermost AND term - each lifecycle op keeps its own
-// per-operation dispatcher-null / bundle-completeness check (Option C-narrow:
-// only CREATE and REFRESH assemble bundles; reset/delete + restore/migration
-// stay fail-closed null) and the per-workspace INV-6 barred check is separate.
+// per-operation dispatcher-null / bundle-completeness check (CREATE, REFRESH,
+// and RESET_DELETE assemble independent bundles; RESTORE_MIGRATION remains
+// fail-closed null) and the per-workspace INV-6 barred check is separate.
 const NATIVE_WORKSPACE_SERVING_ENABLED = resolveNativeServingEnabled({ env: process.env, inventoryReceiptAdvertised });
 // S6f.1: workspaces barred by boot crash-recovery; consulted by the serving-admission gate (dormant unless serving is enabled by GJC_NATIVE_WORKSPACE_SERVING=1). Empty until GJC_NATIVE_WORKSPACE_ROOT is set.
 let barredWorkspaceIds = new Set();
@@ -706,6 +708,73 @@ function retireReceiptSession(state, bindingState) {
       return false;
     }
   );
+}
+
+function resolveResetDeleteLifecycleContext(state, trustedBinding, message) {
+  const bindingState = [...(state?.bindings?.values() ?? [])].find(
+    (candidate) =>
+      candidate?.binding === trustedBinding &&
+      candidate.receipt === true &&
+      candidate.proof?.bindingFingerprint
+  );
+  if (!bindingState) return null;
+
+  try {
+    return createResetDeleteLifecycleContext({
+      trustedBinding,
+      operation: message.operation,
+      idempotencyFingerprint: message.idempotencyFingerprint,
+      probeQuiescence: async () => {
+        const pendingInvokes = [...inFlightByRequestId.values()].filter(
+          (request) =>
+            request.connection === state.connection &&
+            request.bindingId === bindingState.binding.bindingId
+        ).length;
+        if (pendingInvokes > 0) {
+          return Object.freeze({ pendingInvokes, pendingSessions: 1 });
+        }
+        const retired = await retireReceiptSession(state, bindingState);
+        return Object.freeze({
+          pendingInvokes: 0,
+          pendingSessions: retired ? 0 : 1,
+        });
+      },
+      prepareTerminal: async (manualCleanup) => {
+        const io = await createManualCleanupPublisherIo({
+          workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+          workspaceId: message.workspaceId,
+        });
+        await io.publish(manualCleanup);
+      },
+      clearTerminalPreparation: async () => {
+        const io = await createManualCleanupPublisherIo({
+          workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+          workspaceId: message.workspaceId,
+        });
+        await io.clear();
+      },
+      commitTerminal: async () => {
+        // The negative serving authority is established synchronously before
+        // any fallible retirement work and before the operation releases its
+        // exclusive lease.
+        barredWorkspaceIds.add(message.workspaceId);
+        bindingState.ready = false;
+        bindingState.lastError = makeReadinessError(
+          PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+        );
+        if (!(await unbindReceiptBinding(state, bindingState.binding.bindingId))) {
+          const error = new Error("terminal reset/delete binding retirement failed");
+          error.code = PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE;
+          throw error;
+        }
+      },
+    });
+  } catch (error) {
+    console.error(
+      `daemon: reset/delete lifecycle context refused: ${sanitizeDaemonError(error)}`
+    );
+    return null;
+  }
 }
 
 function nextReadinessSocketGeneration() {
@@ -2019,17 +2088,10 @@ async function handleMessage(
       connection.close(1008, "invalid workspace lifecycle message");
       return;
     }
-    // S6f.4 (#81): the reviewed reset/delete security core
-    // (workspace-reset-delete-dispatch.js) runs via the boot-singleton
-    // lifecycleResetDeleteDispatcher. Under Option C-narrow (S6f.7) this stays
-    // null even when serving is enabled - reset/delete does not assemble a
-    // bundle (follow-up #196), so this branch always fails closed today. If a
-    // reset/delete serving-state subsystem lands, when served it would
-    // resolve the trusted per-connection accepted binding + local inventory +
-    // live readiness + the adopted EXCLUSIVE fence identity + the host-held
-    // manual-cleanup authority (never the message's own claims); the base being
-    // destroyed is read from the live disposition by the dispatcher, gated by a
-    // dirty-backup capture, workload quiescence, and residual-process absence.
+    // #196: reset/delete serves only with the complete production bundle and a
+    // receipt-bound, host-held transaction context. The context retires the
+    // exact session under the exclusive fence and installs the runtime no-route
+    // bar before that fence is released on every terminal disposition.
     // S6f.7e (#81): INV-6 serving-time bar - see WORKSPACE_CREATE. A barred
     // workspace short-circuits before the gate/dispatcher check and falls
     // through to the identical RUNTIME_INCOMPATIBLE refusal below.
@@ -2047,16 +2109,17 @@ async function handleMessage(
         workspaceId: msg.workspaceId,
         computeLegacyBindingFingerprint: bindingFingerprint,
       });
-      // S7 PLACEHOLDER (issue #171): the manual-cleanup tx-context authority is
-      // host-held serving state not yet tracked; a null candidate makes the
-      // dispatcher refuse fail-closed until S7 wires it.
-      const lifecycleAuthority = null;
+      const lifecycleContext = resolveResetDeleteLifecycleContext(
+        readinessState,
+        trustedBinding,
+        msg
+      );
       const result = await lifecycleResetDeleteDispatcher.dispatchResetDelete({
         message: msg,
         trustedBinding,
         trustedInventoryWorkspace,
         leaseCandidate,
-        lifecycleAuthority,
+        lifecycleContext,
         readiness,
       });
       surfaceManualCleanup(msg, result);
@@ -2447,11 +2510,11 @@ const BIND_VERIFICATION_CONTEXT = Object.freeze({
 });
 
 // S6f.7d (#81): resolve the CREATE + REFRESH native serving deps bundles
-// (Option C-narrow: only these two lifecycle ops serve; reset/delete and
-// restore/migration stay fail-closed with null dispatchers). This sits behind
+// CREATE, REFRESH, and RESET_DELETE receive independently complete bundles;
+// restore/migration remains fail-closed with a null bundle. This sits behind
 // the env-gated NATIVE_WORKSPACE_SERVING_ENABLED gate (S6f.7f): with the
 // operator opt-in unset it resolves to inert null bundles; with it set it
-// assembles live create/refresh bundles. resolveNativeServingBundles
+// assembles live operation bundles. resolveNativeServingBundles
 // degrades to fail-closed null bundles on any config/assembly fault instead of
 // taking the daemon down (pre-mortem #1); the fault is logged, serving stays off.
 const nativeServingBundles = resolveNativeServingBundles({
@@ -2459,6 +2522,8 @@ const nativeServingBundles = resolveNativeServingBundles({
   recoveryEnabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
   workspaceLeases,
+  hostId: HOST_ID,
+  sourcePlatform: DAEMON_SOURCE_PLATFORM,
   env: process.env,
 });
 if (nativeServingBundles.degraded) {
@@ -2485,13 +2550,13 @@ const lifecycleRefreshDispatcher = resolveLifecycleRefreshDispatcher({
   nativeServingDeps: nativeServingBundles.refresh,
 });
 
-// S6f.4 (#81): the boot-singleton reset/delete dispatcher stays null under
-// Option C-narrow - no nativeServingDeps are supplied even when serving is
-// enabled (follow-up #196), so WORKSPACE_RESET_DELETE stays fail-closed
-// (RUNTIME_INCOMPATIBLE).
+// #196: reset/delete becomes reachable only when its reset-specific native
+// bundle is complete. Unsupported residual-process platforms leave this one
+// dispatcher null without disabling CREATE/REFRESH.
 const lifecycleResetDeleteDispatcher = resolveLifecycleResetDeleteDispatcher({
   enabled: workspaceRecoveryConfig.enabled,
   workspaceRoot: workspaceRecoveryConfig.workspaceRoot,
+  nativeServingDeps: nativeServingBundles.resetDelete,
 });
 
 // S6f.5 (#81): the restore/migration boot-singleton stays null under Option

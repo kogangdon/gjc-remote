@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { join as joinPath } from "node:path";
+import { posix } from "node:path";
 
 import { createResidualProcessNativeIo } from "../src/workspace-residual-process-native-io.js";
 import { assertResidualProcessAbsence } from "../src/workspace-residual-process.js";
@@ -20,6 +20,13 @@ function fakeEnumerator(behavior = { returns: [] }) {
 }
 
 const identity = { hostId: "host-A", workspaceRoot: "/srv/ws", sourcePlatform: "posix" };
+const scope = (overrides = {}) => ({
+  hostId: "host-A",
+  workspaceId: "ws-42",
+  workDir: posix.join("/srv/ws", "ws-42"),
+  sourcePlatform: "posix",
+  ...overrides,
+});
 
 test("rejects a constructor without a usable native enumerator", () => {
   for (const enumerator of [undefined, null, {}, { enumerate_workspace_process_holders: true }]) {
@@ -38,26 +45,29 @@ test("rejects a constructor with a bad hostId, workspaceRoot, or sourcePlatform"
   assert.throws(() => createResidualProcessNativeIo({ ...identity, enumerator, sourcePlatform: "linux" }), (e) => e.code === "CONFIG_INVALID");
 });
 
-test("computes workDir = join(workspaceRoot, workspaceId) and forwards the host source platform", async () => {
+test("scans the exact trusted inventory workDir and host source platform", async () => {
   const enumerator = fakeEnumerator({ returns: [] });
   const io = createResidualProcessNativeIo({ ...identity, enumerator });
-  const result = await io.listResidualProcesses({ hostId: "host-A", workspaceId: "ws-42" });
+  const result = await io.listResidualProcesses(scope());
   assert.deepEqual(result, []);
-  assert.deepEqual(enumerator.calls, [{ workDir: joinPath("/srv/ws", "ws-42"), sourcePlatform: "posix" }]);
+  assert.deepEqual(enumerator.calls, [{
+    workDir: posix.join("/srv/ws", "ws-42"),
+    sourcePlatform: "posix",
+  }]);
 });
 
 test("passes the native holder set through unchanged", async () => {
   const holders = [{ pid: 100 }, { pid: 2048 }];
   const enumerator = fakeEnumerator({ returns: holders });
   const io = createResidualProcessNativeIo({ ...identity, enumerator });
-  assert.deepEqual(await io.listResidualProcesses({ hostId: "host-A", workspaceId: "ws-42" }), holders);
+  assert.deepEqual(await io.listResidualProcesses(scope()), holders);
 });
 
 test("refuses a request for a different host without scanning", async () => {
   const enumerator = fakeEnumerator();
   const io = createResidualProcessNativeIo({ ...identity, enumerator });
   await assert.rejects(
-    () => io.listResidualProcesses({ hostId: "host-B", workspaceId: "ws-42" }),
+    () => io.listResidualProcesses(scope({ hostId: "host-B" })),
     (e) => e.code === "CONFIG_INVALID",
   );
   assert.equal(enumerator.calls.length, 0);
@@ -68,7 +78,7 @@ test("refuses a traversing or non-segment workspaceId without scanning", async (
   const io = createResidualProcessNativeIo({ ...identity, enumerator });
   for (const workspaceId of ["..", ".", "../other", "a/b", "a\\b", "/x", "C:evil", "ws:stream", "ws.", "ws ", "with\0nul", ""]) {
     await assert.rejects(
-      () => io.listResidualProcesses({ hostId: "host-A", workspaceId }),
+      () => io.listResidualProcesses(scope({ workspaceId })),
       (e) => e.code === "CONFIG_INVALID",
       workspaceId,
     );
@@ -90,23 +100,23 @@ test("native refusals propagate unwrapped and become fail-closed CONFIG_INVALID 
   const io = createResidualProcessNativeIo({ ...identity, enumerator });
   // Raw: the native error propagates unchanged.
   await assert.rejects(
-    () => io.listResidualProcesses({ hostId: "host-A", workspaceId: "ws-42" }),
+    () => io.listResidualProcesses(scope()),
     (e) => e.code === "CONTAINMENT_UNSUPPORTED",
   );
   // Through the S5c guard: an unreadable scan is CONFIG_INVALID (never absent).
   await assert.rejects(
-    () => assertResidualProcessAbsence(io, { hostId: "host-A", workspaceId: "ws-42" }),
+    () => assertResidualProcessAbsence(io, scope()),
     (e) => e.code === "CONFIG_INVALID",
   );
 });
 
 test("integrates with assertResidualProcessAbsence: empty certifies absence, non-empty blocks destruction", async () => {
   const absentIo = createResidualProcessNativeIo({ ...identity, enumerator: fakeEnumerator({ returns: [] }) });
-  assert.deepEqual(await assertResidualProcessAbsence(absentIo, { hostId: "host-A", workspaceId: "ws-42" }), { absent: true });
+  assert.deepEqual(await assertResidualProcessAbsence(absentIo, scope()), { absent: true });
 
   const heldIo = createResidualProcessNativeIo({ ...identity, enumerator: fakeEnumerator({ returns: [{ pid: 7 }] }) });
   await assert.rejects(
-    () => assertResidualProcessAbsence(heldIo, { hostId: "host-A", workspaceId: "ws-42" }),
+    () => assertResidualProcessAbsence(heldIo, scope()),
     (e) => e.code === "WORKSPACE_RESIDUAL_PROCESS",
   );
 });

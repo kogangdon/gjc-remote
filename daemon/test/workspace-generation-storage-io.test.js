@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, open, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { recoveryRecordFingerprint } from "@gjc-remote/shared/recovery-envelope.js";
 
 import {
   buildGenerationPointer,
@@ -12,10 +13,34 @@ import {
 import {
   createAtomicPointerIo,
   createGenerationPublisherIo,
+  createManualCleanupPublisherIo,
   createTombstonePublisherIo,
   enumerateRecoverableWorkspaces,
   readSnapshotInputs,
 } from "../src/workspace-generation-storage-io.js";
+
+function manualCleanupRecord() {
+  const record = {
+    version: 1,
+    kind: "manual-cleanup",
+    anchorFingerprint: "a".repeat(64),
+    fenceGeneration: 1,
+    txId: "tx-reset-1",
+    reason: "reset-delete-terminal-publication-uncertain",
+    expectedFingerprint: null,
+    observedFingerprint: null,
+    expectedFloorFingerprint: null,
+    observedFloorFingerprint: null,
+    routeDisposition: "no-route",
+    blockedUntilOwnerAction: true,
+    manualCleanupFingerprint: null,
+  };
+  record.manualCleanupFingerprint = recoveryRecordFingerprint(
+    record,
+    "manualCleanupFingerprint"
+  );
+  return record;
+}
 
 const HEX = (byte) => byte.toString(16).padStart(2, "0");
 const hex64 = (seed) => {
@@ -250,6 +275,36 @@ test("tombstone io: createTombstonePublisherIo places live.tomb under tombstone/
     assert.equal(live, null);
     const dirents = await readdir(path.join(root, "ws-1"));
     assert.ok(dirents.includes("tombstone"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("manual-cleanup io publishes a boot-visible contingency and clears it", async () => {
+  const root = await makeTmpRoot();
+  try {
+    const io = await createManualCleanupPublisherIo({
+      workspaceRoot: root,
+      workspaceId: "ws-1",
+    });
+    const record = manualCleanupRecord();
+    await io.publish(record);
+    await io.publish(record);
+    assert.deepEqual(
+      (await readSnapshotInputs({
+        workspaceRoot: root,
+        workspaceId: "ws-1",
+      })).manualCleanup,
+      record
+    );
+    await io.clear();
+    assert.equal(
+      (await readSnapshotInputs({
+        workspaceRoot: root,
+        workspaceId: "ws-1",
+      })).manualCleanup,
+      null
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
