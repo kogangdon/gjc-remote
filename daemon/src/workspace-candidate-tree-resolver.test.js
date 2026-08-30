@@ -85,6 +85,21 @@ test("non-file non-dir entries (sockets/fifos) are skipped", async () => {
   assert.deepEqual(await resolve("/root", "posix"), ["keep.txt"]);
 });
 
+test("strict restore mode rejects symlinks and unsupported entries", async () => {
+  for (const kind of ["symlink", "other"]) {
+    const resolve = createCandidateManifestResolver({
+      readdir: fakeReaddir({
+        "/root": [{ name: "unexpected", kind }],
+      }),
+      rejectUnsupported: true,
+    });
+    await assert.rejects(
+      resolve("/root", "posix"),
+      (error) => error.code === "WORKSPACE_MANIFEST_MISMATCH"
+    );
+  }
+});
+
 test("a dirent name that would escape the root is refused", async () => {
   const tree = { "/root": [{ name: "..", kind: "file" }] };
   const resolve = createCandidateManifestResolver({ readdir: fakeReaddir(tree) });

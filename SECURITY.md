@@ -89,6 +89,18 @@ explicit residuals; the latter two require authority sources that do not exist
 in the current deployment model.
 See [`docs/adr/0004-workspace-bind-authority-verification.md`](docs/adr/0004-workspace-bind-authority-verification.md).
 
+Restore/migration serving is Linux-only and off unless the operator supplies a
+bounded `GJC_RESTORE_CONTEXTS_JSON` claim. Each claim is single-use, expires,
+and is bound to the exact accepted receipt-v3 destination authority, operation,
+idempotency fingerprint, provenance-v2 manifest fingerprint, and source
+lineage. Staging must be outside the configured workspace root. The daemon
+retains the exact Linux staging-root handle, verifies provenance and checksums
+through per-component no-follow traversal, copies only manifested regular-file
+bytes into a private candidate, fsyncs the candidate hierarchy, then
+re-verifies its strict entry set, bytes, containment, and Git graph before the
+exclusive-fenced CAS publication.
+Staging paths and lifecycle route metadata never select the destination.
+
 ## Built-in guardrails
 
 - Fail-closed authorization by default (`GJC_REMOTE_REQUIRE_ALLOWLIST=1`).

@@ -18,6 +18,10 @@ function fakeFactories(spy = {}) {
       spy.byteReaderArg = arg;
       return { readBytes() {}, __marker: "byteReader" };
     },
+    makeRetainedByteReader: (arg) => {
+      spy.retainedByteReaderArg = arg;
+      return { readBytes() {}, close() {}, __marker: "retainedByteReader" };
+    },
     makePublisher: (arg) => {
       spy.publisherArg = arg;
       return { __marker: "publisher" };
@@ -133,6 +137,40 @@ test("reset/delete uses an exclusive fence and a real residual-process adapter",
   });
 });
 
+test("restore/migration bundle is frozen and carries only its static dispatcher dependencies", () => {
+  const spy = {};
+  const args = baseArgs();
+  const { restoreMigration } = assembleNativeServingDeps({ ...args, factories: fakeFactories(spy) });
+  assert.ok(Object.isFrozen(restoreMigration));
+  assert.deepEqual(Object.keys(restoreMigration).sort(), [
+    "acquireFence",
+    "clock",
+    "containment",
+    "gitVerifier",
+    "makePublisherIo",
+    "makeStageReader",
+    "maxAgeMs",
+    "replaySeen",
+    "stagePromotion",
+  ]);
+  assert.equal(restoreMigration.acquireFence.__marker, "acquireExclusiveFence");
+  assert.equal(spy.exclusiveFenceRegistry, args.workspaceLeases);
+  assert.equal(typeof restoreMigration.stagePromotion.materializeAndVerify, "function");
+  assert.equal(typeof restoreMigration.stagePromotion.cleanup, "function");
+});
+
+test("restore/migration has a no-follow stage reader and shares the replay window", () => {
+  const spy = {};
+  const { create, restoreMigration } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories(spy) });
+  const stageIo = restoreMigration.makeStageReader("/ws/root/ws/staging/1", "posix");
+  assert.equal(stageIo.__marker, "retainedByteReader");
+  assert.deepEqual(spy.retainedByteReaderArg, {
+    root: "/ws/root/ws/staging/1",
+    sourcePlatform: "posix",
+  });
+  assert.equal(restoreMigration.replaySeen, create.replaySeen);
+});
+
 test("reset/delete backup IO is deferred and backed by the contained byte reader", () => {
   const spy = {};
   const { resetDelete } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories(spy) });
@@ -157,7 +195,7 @@ test("a missing or refusing residual capability leaves only reset/delete inert",
   }
 });
 
-test("non-Linux runtimes leave only reset/delete inert", () => {
+test("non-Linux runtimes leave reset/delete and restore/migration inert", () => {
   for (const runtimePlatform of ["win32", "darwin"]) {
     const bundles = assembleNativeServingDeps({
       ...baseArgs(),
@@ -165,6 +203,7 @@ test("non-Linux runtimes leave only reset/delete inert", () => {
       factories: fakeFactories({}),
     });
     assert.equal(bundles.resetDelete, null);
+    assert.equal(bundles.restoreMigration, null);
     assert.ok(bundles.create);
     assert.ok(bundles.refresh);
   }
@@ -223,7 +262,7 @@ test("invalid inputs fail closed", () => {
 });
 
 test("returned bundles are frozen", () => {
-  const { create, refresh, resetDelete } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories({}) });
+  const { create, refresh, resetDelete, restoreMigration } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories({}) });
   assert.throws(() => {
     create.maxAgeMs = 1;
   }, TypeError);
@@ -232,5 +271,8 @@ test("returned bundles are frozen", () => {
   }, TypeError);
   assert.throws(() => {
     resetDelete.acquireFence = null;
+  }, TypeError);
+  assert.throws(() => {
+    restoreMigration.acquireFence = null;
   }, TypeError);
 });

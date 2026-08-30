@@ -9,8 +9,8 @@
 // fault - an invalid readiness config or an assembly throw - degrades serving
 // to fail-closed (null bundles) with a sanitized diagnostic, so a serving
 // misconfiguration never takes the daemon down or regresses any non-serving
-// path. A reset/delete-only native capability fault leaves CREATE/REFRESH live
-// and reset/delete null; restore/migration remains intentionally null.
+// path. An optional-operation native capability fault leaves CREATE/REFRESH
+// live and the affected optional bundle null.
 
 import { assembleNativeServingDeps } from "./native-serving-deps.js";
 import { resolveReadinessMaxAgeMs } from "./native-serving-config.js";
@@ -29,6 +29,17 @@ const RESET_DELETE_KEYS = Object.freeze([
   "resolveManifestPaths",
   "acquireFence",
 ]);
+const RESTORE_MIGRATION_KEYS = Object.freeze([
+  "containment",
+  "gitVerifier",
+  "stagePromotion",
+  "makeStageReader",
+  "makePublisherIo",
+  "acquireFence",
+  "clock",
+  "maxAgeMs",
+  "replaySeen",
+]);
 
 /**
  * @param {object} options
@@ -41,7 +52,7 @@ const RESET_DELETE_KEYS = Object.freeze([
  * @param {Function} [options.resolveMaxAge] - injectable config resolver (tests).
  * @param {string} options.hostId - this daemon's bound host identity.
  * @param {"posix"|"windows-drive"} options.sourcePlatform - host path format.
- * @returns {{ create: object|null, refresh: object|null, resetDelete: object|null, restoreMigration: null, degraded: boolean, diagnostic: object|null }}
+ * @returns {{ create: object|null, refresh: object|null, resetDelete: object|null, restoreMigration: object|null, degraded: boolean, diagnostic: object|null }}
  */
 export function resolveNativeServingBundles({
   gateEnabled,
@@ -78,7 +89,9 @@ export function resolveNativeServingBundles({
       create: bundles.create,
       refresh: bundles.refresh,
       resetDelete: isCompleteResetDeleteBundle(bundles.resetDelete) ? bundles.resetDelete : null,
-      restoreMigration: null,
+      restoreMigration: isCompleteRestoreMigrationBundle(bundles.restoreMigration)
+        ? bundles.restoreMigration
+        : null,
       degraded: false,
       diagnostic: null,
     });
@@ -99,6 +112,35 @@ function isCompleteResetDeleteBundle(bundle) {
     typeof bundle === "object" &&
     RESET_DELETE_KEYS.every((key) => typeof bundle[key] === "function") &&
     typeof bundle.residualIo?.listResidualProcesses === "function";
+}
+
+function isCompleteRestoreMigrationBundle(bundle) {
+  if (
+    bundle === null ||
+    typeof bundle !== "object" ||
+    Object.getPrototypeOf(bundle) !== Object.prototype ||
+    !Object.isFrozen(bundle)
+  ) return false;
+  const keys = Object.keys(bundle).sort();
+  const allowed = bundle.hashIdentity === undefined
+    ? RESTORE_MIGRATION_KEYS
+    : [...RESTORE_MIGRATION_KEYS, "hashIdentity"];
+  if (keys.length !== allowed.length || !keys.every((key, index) => key === allowed.slice().sort()[index])) {
+    return false;
+  }
+  return typeof bundle.containment?.identifyRoot === "function" &&
+    typeof bundle.containment?.verifyContained === "function" &&
+    typeof bundle.gitVerifier?.verifyRepositoryGraph === "function" &&
+    typeof bundle.stagePromotion?.materializeAndVerify === "function" &&
+    typeof bundle.stagePromotion?.cleanup === "function" &&
+    typeof bundle.makeStageReader === "function" &&
+    typeof bundle.makePublisherIo === "function" &&
+    typeof bundle.acquireFence === "function" &&
+    typeof bundle.clock?.now === "function" &&
+    Number.isSafeInteger(bundle.maxAgeMs) && bundle.maxAgeMs >= 1 &&
+    typeof bundle.replaySeen?.has === "function" &&
+    typeof bundle.replaySeen?.add === "function" &&
+    (bundle.hashIdentity === undefined || typeof bundle.hashIdentity === "function");
 }
 
 function degrade(diagnostic) {
