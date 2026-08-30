@@ -1152,23 +1152,16 @@ function isBindingIdentity(value) {
  * served workspace from its own verified local inventory, never from the
  * preimage path fields.
  *
- * Slice 1 (issue #179) admits the preimage fields as OPTIONAL, both-or-neither,
- * solely so the daemon and its consumers keep passing while the verifier and
- * bot-side emission are not yet wired -- main stays green. Slice 2 flips both
- * sides atomically: the bot emits the preimage, the daemon requires and
- * verifies it, and this predicate is tightened to REJECT a preimage-less bind.
- * This is NOT the invalidated C2 tolerant-then-strict data-plane rollout: the
- * daemon performs no bind verification at all in Slice 1, so there is no
- * under-verified acceptance window -- the fields are simply not yet consumed.
+ * The route and mapping preimages are required. The daemon verifies them
+ * before consulting any mutable binding state; a preimage-less v2 bind is not
+ * an accepted compatibility shape.
  */
 export function isBindWorkspaceMessage(value) {
   if (!isBindingIdentity(value) || value.type !== MSG_TYPES.BIND_WORKSPACE) return false;
   const hasRoute = hasOwn(value, "route");
   const hasMapping = hasOwn(value, "mapping");
-  // Preimage fields travel together: presenting one without the other is
-  // never a valid shape.
-  if (hasRoute !== hasMapping) return false;
-  if (hasRoute && (!isObject(value.route) || !isObject(value.mapping))) return false;
+  if (!hasRoute || !hasMapping) return false;
+  if (!isObject(value.route) || !isObject(value.mapping)) return false;
   return Object.keys(value).every((key) => [
     "type",
     "bindingId",

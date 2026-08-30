@@ -87,19 +87,14 @@ function lexicalAssertContained(root, candidate, sourcePlatform) {
   return candidate.slice(prefix.length).split(sep).filter(Boolean);
 }
 
-test("schema (Slice 1): BIND_WORKSPACE admits an optional both-or-neither preimage", () => {
+test("BIND_WORKSPACE requires the complete route and mapping preimage", () => {
   const mapping = buildMapping();
   const route = buildRoute(mapping);
-  // with the full preimage present
   assert.equal(isBindWorkspaceMessage(buildBind(route, mapping)), true);
 
-  // Slice 1 keeps main green while the verifier is unwired: a preimage-less
-  // bind is still a valid shape. Slice 2 tightens this to REQUIRED atomically
-  // with bot emission and daemon verification.
   const { route: _r, mapping: _m, ...withoutPreimage } = buildBind(route, mapping);
-  assert.equal(isBindWorkspaceMessage(withoutPreimage), true);
+  assert.equal(isBindWorkspaceMessage(withoutPreimage), false);
 
-  // one half without the other is never a valid shape
   const { route: _r2, ...withoutRoute } = buildBind(route, mapping);
   assert.equal(isBindWorkspaceMessage(withoutRoute), false);
   const { mapping: _m2, ...withoutMapping } = buildBind(route, mapping);

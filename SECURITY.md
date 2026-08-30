@@ -68,7 +68,8 @@ resolution.
    cannot be containment-checked; this is a named, bounded residual.
 4. **No no-follow (tier-3) containment.** Where a root *is* configured, the
    absence of a no-follow tier still permits an intermediate reparse-point /
-   symlink swap between check and use; named and bounded, tracked in #200.
+   symlink swap between check and use. Closing this requires an operation-time,
+   handle-based filesystem design; bind preimage verification alone cannot do it.
 5. **`authorityEpoch` / generation counters are channel-trusted.** No
    daemon-local ground truth exists to independently verify the epoch/generation
    monotonic counters; they remain fence-checked but not authenticity-verified —
@@ -80,10 +81,12 @@ resolution.
    layer; conflating authenticity with authorization is a standing,
    permanently-open residual, not a phase-1 deferral.
 
-The defense-in-depth wiring of the legacy v2 `acceptWorkspaceBinding` path, the
-no-follow tier, `containerRoot` ground truth, and surfacing the `BIND_AUTHORITY_*`
-reject code in the socket close reason are tracked follow-ups (#200); they are hardening, not open live
-gaps, because the v2 path cannot serve a managed workspace from a compliant bot.
+Issue #200 wires the defense-in-depth verifier into the legacy v2
+`acceptWorkspaceBinding` path and surfaces verifier-produced
+`BIND_AUTHORITY_*` codes in the socket close reason. No-follow containment,
+trusted `containerRoot` ground truth, and `authorityEpoch` authenticity remain
+explicit residuals; the latter two require authority sources that do not exist
+in the current deployment model.
 See [`docs/adr/0004-workspace-bind-authority-verification.md`](docs/adr/0004-workspace-bind-authority-verification.md).
 
 ## Built-in guardrails

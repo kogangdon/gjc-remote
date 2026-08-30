@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   MSG_TYPES,
+  PROTOCOL_ERROR_CODES,
   PROTOCOL_VERSION_V3,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
@@ -247,8 +248,12 @@ test("acceptReceiptBinding rejects a hash-tampered mapping (mutated without reco
     });
     const closed = once(daemon.peer, "close");
     daemon.peer.send(JSON.stringify(tampered));
-    const [code] = await closed;
+    const [code, reason] = await closed;
     assert.equal(code, 1008);
+    assert.equal(
+      reason.toString(),
+      PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH,
+    );
     assert.equal(acknowledged, false);
   } finally {
     await daemon.close();
@@ -382,8 +387,12 @@ test("Finding-3 tier-2: forged mapping.sourceRoot escaping a configured root is 
       });
       const closed = once(daemon.peer, "close");
       daemon.peer.send(JSON.stringify(bind));
-      const [code] = await closed;
+      const [code, reason] = await closed;
       assert.equal(code, 1008);
+      assert.equal(
+        reason.toString(),
+        PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE,
+      );
       assert.equal(acknowledged, false);
     } finally {
       await daemon.close();

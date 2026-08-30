@@ -247,11 +247,11 @@ test("keeps old v2 bind shapes isolated from exact receipt binds", () => {
     authorityFingerprint: AUTHORITY_FINGERPRINT,
     inventoryGeneration: 11,
   };
-  assert.equal(isBindWorkspaceMessage(oldBind), true);
+  assert.equal(isBindWorkspaceMessage(oldBind), false);
   assert.equal(isInventoryReceiptBindWorkspaceMessage(oldBind), false);
 
-  // Issue #179 Slice 1: the route + mapping preimage is admitted as an
-  // optional, both-or-neither pair while the daemon verifier is unwired.
+  // The non-receipt v2 shape remains distinct, but now requires the authority
+  // preimage that the daemon verifies before accepting the bind.
   assert.equal(isBindWorkspaceMessage({
     ...oldBind,
     route: { channelId: "123", routeFingerprint: "c".repeat(64) },
