@@ -27,6 +27,7 @@ import {
   validateWorkspaceAuthorityDescriptor,
   workspaceBindingFingerprint,
 } from "../workspace-binding.js";
+import { fingerprintManagedMappingRecord } from "../mapping-envelope.js";
 
 const AUTHORITY_FINGERPRINT = "a".repeat(64);
 const INVENTORY_FINGERPRINT = "b".repeat(64);
@@ -186,14 +187,44 @@ test("gates receipt frames on protocol v3 and both capabilities", () => {
 });
 
 test("keeps old v2 bind shapes isolated from exact receipt binds", () => {
-  const receiptBind = bind();
+  const receiptMapping = fingerprintManagedMappingRecord({
+    mappingId: "mapping-1",
+    hostId: "host-1",
+    fenceGeneration: 5,
+    mappingGeneration: 3,
+    workspaceGeneration: 2,
+    mappingVersion: 1,
+    sourcePlatform: "posix",
+    workspaceId: "workspace-1",
+    workDir: null,
+    sourceRoot: "/srv/native/workspace-1",
+    containerRoot: null,
+    volumeIdentity: "volume-1",
+    casePolicy: "sensitive",
+    immutableDefault: false,
+    mappingFingerprint: null,
+  });
+  const receiptBind = bind({
+    authorityFingerprint: receiptMapping.mappingFingerprint,
+    mapping: receiptMapping,
+  });
   assert.equal(isInventoryReceiptBindWorkspaceMessage(receiptBind), true);
   assert.equal(isBindWorkspaceMessage(receiptBind), false);
+  // mapping is now REQUIRED on the receipt shape (issue #179 Slice 2)
+  {
+    const { mapping: _m, ...withoutMapping } = receiptBind;
+    assert.equal(isInventoryReceiptBindWorkspaceMessage(withoutMapping), false);
+  }
+  assert.equal(
+    isInventoryReceiptBindWorkspaceMessage({ ...receiptBind, mapping: "not-an-object" }),
+    false,
+  );
   for (const field of ["authorityEpoch", "fenceGeneration"]) {
     const invalid = { ...receiptBind };
     delete invalid[field];
     assert.equal(isInventoryReceiptBindWorkspaceMessage(invalid), false, field);
   }
+  // an UNKNOWN extra key is still rejected by the exact-field-set gate
   for (const extra of [
     { routeFingerprint: "c".repeat(64) },
     { inventoryGeneration: 11 },

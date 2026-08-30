@@ -6,7 +6,9 @@ import test from "node:test";
 import {
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+  WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
 } from "@gjc-remote/shared";
+import { fingerprintManagedMappingRecord } from "@gjc-remote/shared/mapping-envelope";
 import {
   buildWorkspaceInventory,
   workspaceInventoryBytes,
@@ -682,6 +684,23 @@ const RECEIPT_INVENTORY = workspaceInventoryBytes(buildWorkspaceInventory({
     storageIdentityFingerprint: "2".repeat(64),
   }],
 })).toString("utf8");
+const RECEIPT_MAPPING = fingerprintManagedMappingRecord({
+  mappingId: "mapping-test",
+  hostId: RECEIPT_HOST,
+  fenceGeneration: 1,
+  mappingGeneration: 1,
+  workspaceGeneration: 1,
+  mappingVersion: 1,
+  sourcePlatform: "windows-drive",
+  workspaceId: "workspace-test",
+  workDir: null,
+  sourceRoot: "C:\\native\\workspace-test",
+  containerRoot: null,
+  volumeIdentity: "volume-1",
+  casePolicy: "insensitive",
+  immutableDefault: false,
+  mappingFingerprint: null,
+});
 const RECEIPT_BIND = {
   type: "bind_workspace",
   bindingId: "receipt-binding-1",
@@ -694,7 +713,8 @@ const RECEIPT_BIND = {
   workspaceId: "workspace-test",
   workspaceGeneration: 1,
   sourcePlatform: "windows-drive",
-  authorityFingerprint: "b".repeat(64),
+  authorityFingerprint: RECEIPT_MAPPING.mappingFingerprint,
+  mapping: RECEIPT_MAPPING,
 };
 
 test("live inventory drift drains receipt bindings and retires the socket without a stale ready", async () => {
@@ -706,6 +726,7 @@ test("live inventory drift drains receipt bindings and retires the socket withou
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     },
     envOverrides: {

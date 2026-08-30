@@ -18,6 +18,7 @@ import {
   V0_LIMITS,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+  WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   INVENTORY_RECEIPT_TTL_MS,
   isWorkspaceId,
   isReadinessWorkspaceGeneration,
@@ -40,6 +41,8 @@ import {
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
+import { verifyReceiptBindAuthorityPreimage } from "@gjc-remote/shared/bind-authority-verification";
+import { relativeComponents } from "./workspace-containment.js";
 import { whitelistProtocolCode, formatManualCleanupLog } from "./lifecycle-wire-sanitizers.js";
 import { SessionPool } from "./session-pool.js";
 import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
@@ -168,7 +171,9 @@ const DAEMON_CAPABILITIES = Object.freeze(
     ? [...new Set([
         ...CAPABILITIES,
         WORKSPACE_READINESS_CAPABILITY,
-        ...(inventoryReceiptAdvertised ? [WORKSPACE_INVENTORY_RECEIPT_CAPABILITY] : []),
+        ...(inventoryReceiptAdvertised
+          ? [WORKSPACE_INVENTORY_RECEIPT_CAPABILITY, WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY]
+          : []),
       ])]
     : [...CAPABILITIES]
 );
@@ -885,6 +890,11 @@ function retireSupersededReceiptBinding(state, bindingState) {
 
 async function acceptReceiptBinding(state, message) {
   if (!state?.receiptCommitted || message.hostId !== HOST_ID) return false;
+  const verdict = verifyReceiptBindAuthorityPreimage(message, RECEIPT_BIND_VERIFICATION_CONTEXT);
+  if (!verdict.ok) {
+    console.warn(`daemon: receipt bind authority verification failed: ${verdict.code}`);
+    return false;
+  }
   const existing = state.bindings.get(message.bindingId) ??
     state.retiredBindings.get(message.bindingId);
   if (existing) {
@@ -1725,6 +1735,19 @@ async function handleMessage(
       readinessState.registration,
       msg
     );
+    if (
+      readinessState.receiptCommitted &&
+      !(Array.isArray(msg.capabilities) &&
+        msg.capabilities.includes(WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY))
+    ) {
+      console.warn(
+        `daemon: registration refused -- receipt-committed peer missing required ` +
+          `capability '${WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY}' ` +
+          `(${PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED})`
+      );
+      connection.close(1008, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
+      return;
+    }
     readinessState.committed =
       readinessV2Committed || readinessState.receiptCommitted;
     if (readinessState.committed) {
@@ -2383,6 +2406,25 @@ if (workspaceRecoveryConfig.enabled) {
     process.exit(1);
   }
 }
+
+// issue #179 Slice 2: the receipt bind-authority verifier's tier-2 lexical
+// containment is only active when the daemon has a configured, daemon-known
+// native workspace root (GJC_NATIVE_WORKSPACE_ROOT). Absent a configured
+// root, verifyReceiptBindAuthorityPreimage runs with containment omitted,
+// which is a documented no-op (see shared/bind-authority-verification.js).
+const DAEMON_SOURCE_PLATFORM = process.platform === "win32" ? "windows-drive" : "posix";
+const RECEIPT_BIND_VERIFICATION_CONTEXT = Object.freeze({
+  hostId: HOST_ID,
+  containment: workspaceRecoveryConfig.enabled
+    ? Object.freeze({
+        root: workspaceRecoveryConfig.workspaceRoot,
+        sourcePlatform: DAEMON_SOURCE_PLATFORM,
+        assertContained: (root, candidate, sourcePlatform) => {
+          relativeComponents(root, candidate, sourcePlatform);
+        },
+      })
+    : undefined,
+});
 
 // S6f.7d (#81): resolve the CREATE + REFRESH native serving deps bundles
 // (Option C-narrow: only these two lifecycle ops serve; reset/delete and
