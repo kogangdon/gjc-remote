@@ -340,6 +340,7 @@ export function projectManagedRoutes(target, validate = () => {}) {
           workspaceId: route.workspaceId,
           routeFingerprint: route.routeFingerprint,
           authority: Object.freeze(authority),
+          mapping: Object.freeze({ ...mapping }),
         }),
       ];
     })

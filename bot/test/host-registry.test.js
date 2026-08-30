@@ -20,6 +20,7 @@ import {
   isRegisterOkMessage,
   negotiateCapabilities,
   PROTOCOL_ERROR_CODES,
+  WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
 } from "@gjc-remote/shared";
@@ -45,6 +46,24 @@ function managedRoute(channelId, overrides = {}) {
     authorityFingerprint: "a".repeat(64),
     ...overrides.authority,
   };
+  const mapping = {
+    mappingId: authority.mappingId,
+    hostId: authority.hostId,
+    fenceGeneration: authority.fenceGeneration,
+    mappingGeneration: authority.mappingGeneration,
+    workspaceGeneration: authority.workspaceGeneration,
+    mappingVersion: authority.mappingVersion,
+    sourcePlatform: authority.sourcePlatform,
+    workspaceId: authority.workspaceId,
+    workDir: null,
+    sourceRoot: "/srv/repo",
+    containerRoot: "/workspace",
+    volumeIdentity: "volume-1",
+    casePolicy: "sensitive",
+    immutableDefault: false,
+    mappingFingerprint: authority.authorityFingerprint,
+    ...overrides.mapping,
+  };
   return Object.freeze({
     hostId: authority.hostId,
     workDir: null,
@@ -56,6 +75,7 @@ function managedRoute(channelId, overrides = {}) {
     workspaceGeneration: authority.workspaceGeneration,
     routeFingerprint: "b".repeat(64),
     authority: Object.freeze(authority),
+    mapping: Object.freeze(mapping),
     ...overrides,
   });
 }
@@ -213,6 +233,7 @@ async function connectV3(server, hostId = "host-a", token = "token-a", register 
       ...CAPABILITIES,
       WORKSPACE_READINESS_CAPABILITY,
       WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
     ],
     ...register,
   }));
@@ -2357,6 +2378,63 @@ test("future protocol versions fail closed", async () => {
     await server.close();
   }
 });
+
+test("Finding-1: a binding-enabled peer missing the bind-authority-verification capability is denied, not bound", async () => {
+  const server = await startRegistry();
+  try {
+    server.registry.setManagedRoutes({ "channel-a": managedRoute("a") });
+    const port = server.registry.wss.address().port;
+    const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+    await once(socket, "open");
+    const frames = [];
+    socket.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
+    const closed = once(socket, "close");
+    socket.send(JSON.stringify({
+      type: "register",
+      hostId: "host-a",
+      token: "token-a",
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: [
+        ...CAPABILITIES,
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      ],
+    }));
+    await waitFor(() => frames.length > 0);
+    assert.deepEqual(frames[0], {
+      type: "register_denied",
+      reason: PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED,
+      code: PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED,
+    });
+    await closed;
+    assert.equal(server.registry.getHostInfo("host-a"), undefined);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(frames.length, 1, "no managed bind is ever emitted to a denied peer");
+    assert.ok(
+      frames.every((frame) => frame.type !== "bind_workspace"),
+      "no BIND_WORKSPACE frame reaches a denied peer"
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("Finding-1: a non-binding peer missing the bind-authority-verification capability is unaffected", async () => {
+  const server = await startRegistry();
+  try {
+    const { socket, response } = await connectV2(server);
+    assert.equal(response.protocolVersion, 2);
+    assert.deepEqual(response.capabilities, [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
+    assert.equal(response.type, "register_ok");
+    assert.deepEqual(server.registry.getHostInfo("host-a"), {
+      protocolVersion: 2,
+      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+    });
+    socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
 // ---------------------------------------------------------------------------
 // #35: workflow gate answer channel
 // ---------------------------------------------------------------------------
@@ -3276,9 +3354,11 @@ test("v3 deduplicates shared descriptors and accepts only the exact receipt", as
     const bind = await connection.nextFrame();
     assert.deepEqual(Object.keys(bind).sort(), [
       "authorityEpoch", "authorityFingerprint", "bindingId", "fenceGeneration",
-      "hostId", "mappingGeneration", "mappingId", "mappingVersion",
+      "hostId", "mappingGeneration", "mappingId", "mappingVersion", "mapping",
       "sourcePlatform", "type", "workspaceGeneration", "workspaceId",
     ].sort());
+    assert.deepEqual(bind.mapping, shared.mapping);
+    assert.equal(bind.authorityFingerprint, bind.mapping.mappingFingerprint);
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(connection.frames.length, 0, "shared routes emit one bind");
     assert.deepEqual(server.registry.getManagedRouteBinding("channel-a"), {

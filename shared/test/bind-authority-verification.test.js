@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { verifyBindAuthorityPreimage } from "../bind-authority-verification.js";
+import { verifyBindAuthorityPreimage, verifyReceiptBindAuthorityPreimage } from "../bind-authority-verification.js";
 import {
   isBindWorkspaceMessage,
   MSG_TYPES,
@@ -270,4 +270,224 @@ test("malformed input (missing context.hostId) fails closed", () => {
   const route = buildRoute(mapping);
   assert.equal(verifyBindAuthorityPreimage(buildBind(route, mapping), {}).ok, false);
   assert.equal(verifyBindAuthorityPreimage(null, { hostId: HOST }).ok, false);
+});
+
+// -----------------------------------------------------------------------
+// verifyReceiptBindAuthorityPreimage (issue #179 Slice 2): the LIVE
+// managed-workspace receipt bind path. Commits to a SINGLE mapping-record
+// preimage (no routeFingerprint in the receipt shape).
+// -----------------------------------------------------------------------
+
+function buildReceiptMapping(overrides = {}) {
+  return fingerprintManagedMappingRecord({
+    mappingId: "mapping-1",
+    hostId: HOST,
+    fenceGeneration: 1,
+    mappingGeneration: 4,
+    workspaceGeneration: 7,
+    mappingVersion: 1,
+    sourcePlatform: "posix",
+    workspaceId: "workspace-1",
+    workDir: null,
+    sourceRoot: "/srv/native/workspace-1",
+    containerRoot: null,
+    volumeIdentity: "volume-1",
+    casePolicy: "sensitive",
+    immutableDefault: false,
+    mappingFingerprint: null,
+    ...overrides,
+  });
+}
+
+function buildReceiptBind(mapping, overrides = {}) {
+  return {
+    type: MSG_TYPES.BIND_WORKSPACE,
+    bindingId: "receipt-binding-1",
+    authorityEpoch: 1,
+    fenceGeneration: mapping.fenceGeneration,
+    hostId: mapping.hostId,
+    mappingId: mapping.mappingId,
+    mappingGeneration: mapping.mappingGeneration,
+    mappingVersion: mapping.mappingVersion,
+    workspaceId: mapping.workspaceId,
+    workspaceGeneration: mapping.workspaceGeneration,
+    sourcePlatform: mapping.sourcePlatform,
+    authorityFingerprint: mapping.mappingFingerprint,
+    mapping,
+    ...overrides,
+  };
+}
+
+test("receipt: valid preimage verifies (no containment configured)", () => {
+  const mapping = buildReceiptMapping();
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), { hostId: HOST });
+  assert.deepEqual(result, { ok: true, code: null });
+});
+
+test("receipt: hash-tampered mapping (mutate without recomputing fingerprint) is rejected", () => {
+  const mapping = buildReceiptMapping();
+  const tamperedMapping = { ...mapping, sourceRoot: "/srv/native/tampered" };
+  const result = verifyReceiptBindAuthorityPreimage(
+    buildReceiptBind(mapping, { mapping: tamperedMapping }),
+    { hostId: HOST },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+});
+
+test("receipt: top-level hostId mismatch (vs context.hostId) is rejected", () => {
+  const mapping = buildReceiptMapping();
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), { hostId: "other-host" });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HOSTID_MISMATCH);
+});
+
+test("receipt: authorityFingerprint not matching mapping.mappingFingerprint is rejected", () => {
+  const mapping = buildReceiptMapping();
+  const result = verifyReceiptBindAuthorityPreimage(
+    buildReceiptBind(mapping, { authorityFingerprint: "f".repeat(64) }),
+    { hostId: HOST },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+});
+
+test("receipt: each of the 8 cross-checked tuple fields is enforced", () => {
+  const mapping = buildReceiptMapping();
+  const fields = [
+    ["mappingId", "mapping-2"],
+    ["mappingGeneration", mapping.mappingGeneration + 1],
+    ["workspaceGeneration", mapping.workspaceGeneration + 1],
+    ["mappingVersion", 2],
+    ["sourcePlatform", "windows-drive"],
+    ["workspaceId", "workspace-2"],
+    ["fenceGeneration", mapping.fenceGeneration + 1],
+  ];
+  for (const [field, badValue] of fields) {
+    const message = buildReceiptBind(mapping, { [field]: badValue });
+    const result = verifyReceiptBindAuthorityPreimage(message, { hostId: HOST });
+    assert.equal(result.ok, false, `expected ${field} mismatch to fail`);
+    assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH, field);
+  }
+  // hostId tuple mismatch (top-level vs mapping) surfaces as HOSTID_MISMATCH
+  // via the ground-truth check, not the generic tuple loop, since hostId is
+  // checked against context.hostId first.
+});
+
+test("receipt: malformed mapping (fails validateManagedMappingRecord) is rejected", () => {
+  const mapping = buildReceiptMapping();
+  const { mappingFingerprint: _mf, ...brokenMapping } = mapping;
+  const message = buildReceiptBind(mapping, { mapping: brokenMapping });
+  const result = verifyReceiptBindAuthorityPreimage(message, { hostId: HOST });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+});
+
+test("receipt: missing/non-object mapping is rejected", () => {
+  const mapping = buildReceiptMapping();
+  const message = buildReceiptBind(mapping, { mapping: "not-an-object" });
+  const result = verifyReceiptBindAuthorityPreimage(message, { hostId: HOST });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+});
+
+test("receipt: mapping.hostId not matching context.hostId is rejected (defense in depth)", () => {
+  const mapping = buildReceiptMapping({ hostId: HOST });
+  // Forge a message whose top-level hostId matches context but whose mapping
+  // carries a foreign hostId (impossible to construct via a valid mapping
+  // fingerprint over a different hostId without recomputation, so we tamper
+  // post-fingerprinting to exercise the belt-and-suspenders hostId check in
+  // isolation -- this ALSO trips HASH_MISMATCH first since the fingerprint no
+  // longer matches; to isolate step 5 we recompute the fingerprint over the
+  // forged hostId, matching authorityFingerprint but diverging ground truth).
+  const forgedMapping = fingerprintManagedMappingRecord({ ...mapping, mappingFingerprint: null, hostId: "other-host" });
+  const message = {
+    ...buildReceiptBind(mapping, { mapping: forgedMapping, hostId: HOST }),
+    authorityFingerprint: forgedMapping.mappingFingerprint,
+  };
+  const result = verifyReceiptBindAuthorityPreimage(message, { hostId: HOST });
+  assert.equal(result.ok, false);
+  // hostId is part of the cross-checked tuple, so a genuine mapping-authored
+  // mismatch surfaces as HASH_MISMATCH via the tuple loop before step 5 runs.
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+});
+
+test("receipt: authorityEpoch is not cross-checked (residual trust, absent from mapping)", () => {
+  const mapping = buildReceiptMapping();
+  // authorityEpoch is not a MAPPING_KEYS field; an inflated top-level
+  // authorityEpoch cannot be verified against the mapping and must NOT cause
+  // a spurious rejection -- it is documented residual trust.
+  const message = buildReceiptBind(mapping, { authorityEpoch: 999 });
+  const result = verifyReceiptBindAuthorityPreimage(message, { hostId: HOST });
+  assert.deepEqual(result, { ok: true, code: null });
+});
+
+test("receipt: no-op tier-2 containment without a configured root", () => {
+  const mapping = buildReceiptMapping({ sourceRoot: "/etc/elsewhere" });
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), { hostId: HOST });
+  assert.deepEqual(result, { ok: true, code: null });
+});
+
+test("receipt: tier-2 containment passes a sourceRoot contained under the configured root", () => {
+  const mapping = buildReceiptMapping({ sourceRoot: "/srv/native/workspace-1" });
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), {
+    hostId: HOST,
+    containment: { root: "/srv/native", sourcePlatform: "posix", assertContained: lexicalAssertContained },
+  });
+  assert.deepEqual(result, { ok: true, code: null });
+});
+
+test("receipt: tier-2 containment rejects a forged sourceRoot escaping the configured root", () => {
+  const mapping = buildReceiptMapping({ sourceRoot: "/etc/evil" });
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), {
+    hostId: HOST,
+    containment: { root: "/srv/native", sourcePlatform: "posix", assertContained: lexicalAssertContained },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
+});
+
+test("receipt: tier-2 containment fails closed on a platform mismatch with the configured root", () => {
+  const mapping = buildReceiptMapping({ sourceRoot: "/srv/native/workspace-1" });
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), {
+    hostId: HOST,
+    containment: { root: "C:\\native", sourcePlatform: "windows-drive", assertContained: lexicalAssertContained },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
+});
+
+test("receipt: containerRoot===null under a configured containerRoot is a no-op, not an escape", () => {
+  const mapping = buildReceiptMapping({ containerRoot: null });
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), {
+    hostId: HOST,
+    containment: {
+      root: "/srv/native",
+      sourcePlatform: "posix",
+      containerRoot: "/workspace",
+      assertContained: lexicalAssertContained,
+    },
+  });
+  assert.deepEqual(result, { ok: true, code: null });
+});
+
+test("receipt: containerRoot is checked against an injected container root", () => {
+  const mapping = buildReceiptMapping({ containerRoot: "/other/tree" });
+  const result = verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), {
+    hostId: HOST,
+    containment: {
+      root: "/srv/native",
+      sourcePlatform: "posix",
+      containerRoot: "/workspace",
+      assertContained: lexicalAssertContained,
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
+});
+
+test("receipt: malformed input (missing context.hostId) fails closed", () => {
+  const mapping = buildReceiptMapping();
+  assert.equal(verifyReceiptBindAuthorityPreimage(buildReceiptBind(mapping), {}).ok, false);
+  assert.equal(verifyReceiptBindAuthorityPreimage(null, { hostId: HOST }).ok, false);
 });

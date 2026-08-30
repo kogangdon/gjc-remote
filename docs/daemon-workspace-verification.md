@@ -123,7 +123,7 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
-fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:246, an
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:251, an
 `= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
 default) the gate reads `false` and its read site inside `admitReadyWorkload` returns

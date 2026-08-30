@@ -31,9 +31,15 @@
 // This module never imports the daemon or the native addon. The daemon injects
 // its HOST_ID and (when a root is configured) a lexical containment predicate;
 // shared/test injects fakes.
+//
+// verifyReceiptBindAuthorityPreimage (below) is the SIBLING verifier for the
+// LIVE managed-workspace bind path (receipt-shaped BIND_WORKSPACE, dispatched
+// to daemon.js#acceptReceiptBinding). That path commits to a single mapping
+// record only (no routeFingerprint in the receipt shape), so it is verified
+// separately rather than by reusing this function.
 
 import { PROTOCOL_ERROR_CODES } from "./protocol.js";
-import { validateManagedRouteRecord } from "./mapping-envelope.js";
+import { validateManagedRouteRecord, validateManagedMappingRecord } from "./mapping-envelope.js";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -144,6 +150,136 @@ export function verifyBindAuthorityPreimage(message, context) {
     // containerRoot is always a POSIX container-namespace path (never a
     // daemon-host path), so it is only checked when the daemon injects a
     // separate container-root ground truth, against POSIX grammar.
+    if (typeof containment.containerRoot === "string" && typeof mapping.containerRoot === "string") {
+      try {
+        containment.assertContained(containment.containerRoot, mapping.containerRoot, "posix");
+      } catch {
+        return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
+      }
+    }
+  }
+
+  return Object.freeze({ ok: true, code: null });
+}
+
+// The daemon-servable top-level tuple whose value MUST equal the verified
+// mapping record, for the LIVE managed-workspace receipt bind path (issue
+// #179 Slice 2). authorityFingerprint binds to mapping.mappingFingerprint
+// separately (the bot derives it as authorityFingerprint = mapping
+// .mappingFingerprint, bot/src/host-registry.js). fenceGeneration IS included
+// (unlike the route tuple, which does not need it separately) because the
+// daemon fences receiptWorkspaceFloors on the top-level fenceGeneration: an
+// unverified, inflated top-level fenceGeneration would poison that floor even
+// though the mapping record itself never changed -- an availability DoS.
+// authorityEpoch is NOT in this list and CANNOT be cross-checked: it is
+// absent from MAPPING_KEYS in shared/mapping-envelope.js, so it remains
+// residual trust -- monotonic-fenced (the daemon still enforces authorityEpoch
+// ordering) and channel-trusted (carried only over the already-authenticated
+// bot<->daemon channel), not preimage-verified by this function.
+const RECEIPT_MAPPING_BOUND_TUPLE_FIELDS = Object.freeze([
+  "hostId",
+  "mappingId",
+  "mappingGeneration",
+  "workspaceGeneration",
+  "mappingVersion",
+  "sourcePlatform",
+  "workspaceId",
+  "fenceGeneration",
+]);
+
+/**
+ * Verify a receipt-shaped BIND_WORKSPACE preimage (issue #179 Slice 2). The
+ * live managed-workspace bind path is receipt-shaped
+ * (isInventoryReceiptBindWorkspaceMessage) and always dispatches to
+ * daemon.js#acceptReceiptBinding; this is the PRIMARY per-bind verifier for
+ * that path (verifyBindAuthorityPreimage above remains defense-in-depth for
+ * the non-receipt v2 acceptWorkspaceBinding shape). Unlike the route/mapping
+ * pair verified above, a receipt bind commits to a SINGLE mapping-record
+ * preimage: the receipt shape carries no routeFingerprint at all, so there is
+ * no route<->mapping pair to reconcile -- only
+ * message.authorityFingerprint === mapping.mappingFingerprint.
+ *
+ * Returns a frozen result: { ok: true, code: null } on success, or
+ * { ok: false, code } where code is a PROTOCOL_ERROR_CODES.BIND_AUTHORITY_*
+ * value. It never throws (validateManagedMappingRecord throws are caught and
+ * mapped to a code).
+ *
+ * @param {object} message  a shape-valid receipt BIND_WORKSPACE
+ *   (isInventoryReceiptBindWorkspaceMessage), which already requires an
+ *   object-shaped `mapping` field.
+ * @param {object} context
+ *   context.hostId      {string}  the daemon's own HOST_ID (ground truth)
+ *   context.containment {object=} optional; when present tier-2 containment is
+ *     applied over mapping.sourceRoot / mapping.containerRoot using the SAME
+ *     structure as verifyBindAuthorityPreimage's tier-2 check. Absent/null =>
+ *     tier-2 is a documented no-op (default deployment).
+ */
+export function verifyReceiptBindAuthorityPreimage(message, context) {
+  if (!isObject(message) || !isObject(context) || typeof context.hostId !== "string") {
+    return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+  }
+
+  // 1. Ground-truth hostId (top-level).
+  if (message.hostId !== context.hostId) {
+    return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HOSTID_MISMATCH);
+  }
+
+  const { mapping } = message;
+  if (!isObject(mapping)) {
+    return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+  }
+
+  // 2. Envelope authenticity: recompute mappingFingerprint + internal shape.
+  try {
+    validateManagedMappingRecord(mapping);
+  } catch {
+    return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+  }
+
+  // 3. Mapping authority commitment: the receipt shape has no routeFingerprint
+  //    -- the SOLE preimage commitment is authorityFingerprint over mapping.
+  if (mapping.mappingFingerprint !== message.authorityFingerprint) {
+    return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+  }
+
+  // 4. Identity binding: the daemon-servable top-level tuple must equal the
+  //    verified mapping preimage, so a genuine mapping for one workspace
+  //    cannot be re-presented under a different top-level identity.
+  for (const field of RECEIPT_MAPPING_BOUND_TUPLE_FIELDS) {
+    if (message[field] !== mapping[field]) {
+      return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
+    }
+  }
+
+  // 5. Ground-truth hostId bound to the mapping too, for defense in depth.
+  if (mapping.hostId !== context.hostId) {
+    return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HOSTID_MISMATCH);
+  }
+
+  // 6. Tier-2 lexical containment, ONLY when a daemon root is configured. Same
+  //    structure as verifyBindAuthorityPreimage's tier-2 check, over the
+  //    mapping's own sourceRoot/containerRoot. mapping.containerRoot may be
+  //    null; the typeof === "string" guard below makes that a no-op rather
+  //    than a false escape.
+  const containment = context.containment;
+  if (isObject(containment)) {
+    if (typeof containment.assertContained !== "function") {
+      return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
+    }
+    if (mapping.sourcePlatform !== containment.sourcePlatform) {
+      return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
+    }
+    const hostChecks = [];
+    if (typeof mapping.sourceRoot === "string") {
+      hostChecks.push(mapping.sourceRoot);
+    }
+    for (const candidate of hostChecks) {
+      try {
+        containment.assertContained(containment.root, candidate, containment.sourcePlatform);
+      } catch {
+        return fail(PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
+      }
+    }
     if (typeof containment.containerRoot === "string" && typeof mapping.containerRoot === "string") {
       try {
         containment.assertContained(containment.containerRoot, mapping.containerRoot, "posix");

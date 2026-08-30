@@ -22,6 +22,7 @@ import {
   WORKSPACE_ID_MAX_LENGTH,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+  WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   INVENTORY_RECEIPT_TTL_MS,
   isAnswerMessage,
   isBindOkMessage,
@@ -40,6 +41,7 @@ import {
   normalizeProtocolError,
 } from "@gjc-remote/shared";
 import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
+import { fingerprintManagedMappingRecord } from "@gjc-remote/shared/mapping-envelope";
 import {
   buildWorkspaceInventory,
   workspaceInventoryBytes,
@@ -68,20 +70,57 @@ const validBinding = {
 };
 const ROOT_IDENTITY_FINGERPRINT = "1".repeat(64);
 const STORAGE_IDENTITY_FINGERPRINT = "2".repeat(64);
-const receiptBinding = {
-  type: MSG_TYPES.BIND_WORKSPACE,
-  bindingId: "receipt-binding-1",
-  authorityEpoch: 1,
-  fenceGeneration: 1,
-  hostId: "test-host",
-  mappingId: "mapping-1",
-  mappingGeneration: 2,
-  mappingVersion: 1,
-  workspaceId: "workspace-1",
-  workspaceGeneration: 3,
-  sourcePlatform: "posix",
-  authorityFingerprint: "b".repeat(64),
-};
+
+function buildValidReceiptBind(overrides = {}) {
+  const {
+    bindingId = "receipt-binding-1",
+    authorityEpoch = 1,
+    fenceGeneration = 1,
+    hostId = "test-host",
+    mappingId = "mapping-1",
+    mappingGeneration = 2,
+    mappingVersion = 1,
+    workspaceId = "workspace-1",
+    workspaceGeneration = 3,
+    sourcePlatform = "posix",
+    sourceRoot = sourcePlatform === "posix" ? "/srv/native/workspace-1" : "C:\\native\\workspace-1",
+    ...rest
+  } = overrides;
+  const mapping = fingerprintManagedMappingRecord({
+    mappingId,
+    hostId,
+    fenceGeneration,
+    mappingGeneration,
+    workspaceGeneration,
+    mappingVersion,
+    sourcePlatform,
+    workspaceId,
+    workDir: null,
+    sourceRoot,
+    containerRoot: null,
+    volumeIdentity: "volume-1",
+    casePolicy: sourcePlatform === "posix" ? "sensitive" : "insensitive",
+    immutableDefault: false,
+    mappingFingerprint: null,
+  });
+  return {
+    type: MSG_TYPES.BIND_WORKSPACE,
+    bindingId,
+    authorityEpoch,
+    fenceGeneration,
+    hostId,
+    mappingId,
+    mappingGeneration,
+    mappingVersion,
+    workspaceId,
+    workspaceGeneration,
+    sourcePlatform,
+    authorityFingerprint: mapping.mappingFingerprint,
+    mapping,
+    ...rest,
+  };
+}
+const receiptBinding = buildValidReceiptBind();
 
 function capabilityWorkspace(binding, workDir) {
   return {
@@ -481,6 +520,7 @@ test("v3 receipt bind derives local proof and unbind is bindingId-only", async (
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
@@ -570,6 +610,7 @@ test("v3 receipt refuses provider epoch drift without acknowledging", async () =
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
@@ -684,6 +725,7 @@ test("live inventory epoch drift retires the receipt socket without creating a s
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
@@ -729,6 +771,7 @@ test("stable inventory keeps a positive receipt binding alive across poll ticks"
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
@@ -805,15 +848,15 @@ test("v3 retired authority floor rejects a lower descriptor under a fresh id", a
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
-    const newer = {
-      ...receiptBinding,
+    const newer = buildValidReceiptBind({
       bindingId: "receipt-newer",
       authorityEpoch: 2,
       fenceGeneration: 2,
-    };
+    });
     const bound = onceMessage(daemon.peer, MSG_TYPES.BIND_OK);
     daemon.peer.send(JSON.stringify(newer));
     await bound;
@@ -824,10 +867,9 @@ test("v3 retired authority floor rejects a lower descriptor under a fresh id", a
     }));
     await unbound;
     const closed = once(daemon.peer, "close");
-    daemon.peer.send(JSON.stringify({
-      ...receiptBinding,
-      bindingId: "receipt-regressed",
-    }));
+    daemon.peer.send(JSON.stringify(
+      buildValidReceiptBind({ bindingId: "receipt-regressed" })
+    ));
     const [code] = await closed;
     assert.equal(code, 1008);
   } finally {
@@ -854,6 +896,7 @@ test("v3 newer authority retires an already-positive older binding before pendin
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
@@ -872,12 +915,11 @@ test("v3 newer authority retires an already-positive older binding before pendin
     const observed = [];
     const collect = (raw) => observed.push(JSON.parse(raw.toString()));
     daemon.peer.on("message", collect);
-    const newer = {
-      ...receiptBinding,
+    const newer = buildValidReceiptBind({
       bindingId: "receipt-newer-negative",
       mappingGeneration: receiptBinding.mappingGeneration + 1,
       sourcePlatform: "windows-drive",
-    };
+    });
     const newerNegative = waitForMessage(
       daemon.peer,
       (frame) =>
@@ -925,17 +967,17 @@ test("v3 reserves the 64-id capacity before provider reads complete", async () =
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     const closed = once(daemon.peer, "close");
     for (let index = 0; index < 65; index += 1) {
-      daemon.peer.send(JSON.stringify({
-        ...receiptBinding,
+      daemon.peer.send(JSON.stringify(buildValidReceiptBind({
         bindingId: `receipt-capacity-${index}`,
         mappingId: `mapping-capacity-${index}`,
         workspaceId: `workspace-capacity-${index}`,
-      }));
+      })));
     }
     const [code] = await closed;
     assert.equal(code, 1008);
@@ -962,6 +1004,7 @@ test("v3 rejects an unknown bindingId-only unbind", async () => {
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
@@ -1230,6 +1273,7 @@ test("v3 rejects a cross-host receipt binding before acknowledging", async () =>
       capabilities: [
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
       ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
@@ -1240,11 +1284,9 @@ test("v3 rejects a cross-host receipt binding before acknowledging", async () =>
     const closed = once(daemon.peer, "close");
     // The receipt path also authenticates hostId identity: a foreign-host
     // receipt bind fails closed before deriving any proof or acknowledgement.
-    daemon.peer.send(JSON.stringify({
-      ...receiptBinding,
-      bindingId: "receipt-foreign-host",
-      hostId: "other-host",
-    }));
+    daemon.peer.send(JSON.stringify(
+      buildValidReceiptBind({ bindingId: "receipt-foreign-host", hostId: "other-host" })
+    ));
     const [code] = await closed;
     assert.equal(code, 1008);
     assert.equal(acknowledged, false);

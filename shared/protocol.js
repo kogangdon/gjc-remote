@@ -56,9 +56,13 @@ export const WORKSPACE_READINESS_V2 = WORKSPACE_READINESS_CAPABILITY;
  * deliberate deviation from the check-then-degrade precedent exists because
  * silent degrade-to-unverified is the exact TOFU failure mode #179 eliminates:
  * a security-relevant control must fail closed, never quietly off. The
- * constant is introduced here (Slice 1) but is not yet advertised or required
- * by either side; the daemon/bot wiring that makes it a hard floor lands in
- * Slice 2.
+ * constant was introduced in Slice 1; Slice 2 wires it as a hard floor on
+ * both sides. The PRIMARY per-bind verification site is
+ * daemon.js#acceptReceiptBinding (the live managed-workspace bind path, via
+ * shared/bind-authority-verification.js#verifyReceiptBindAuthorityPreimage);
+ * daemon.js#acceptWorkspaceBinding (the non-receipt v2 shape, via
+ * verifyBindAuthorityPreimage) is defense-in-depth for that no-longer-primary
+ * socket path.
  */
 export const WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY =
   "workspace_bind_authority_verification_v1";
@@ -1140,8 +1144,13 @@ function isBindingIdentity(value) {
  * first use (TOFU). This is only a SHAPE predicate: the hash recomputation and
  * ground-truth cross-checks live in shared/bind-authority-verification.js
  * (verifyBindAuthorityPreimage), which the daemon runs at the top of
- * acceptWorkspaceBinding. The daemon still resolves the served workspace from
- * its own verified local inventory, never from the preimage path fields.
+ * acceptWorkspaceBinding. This non-receipt v2 shape is NOT the primary bind
+ * path -- the live managed bind is receipt-shaped and always dispatches to
+ * acceptReceiptBinding (see isInventoryReceiptBindWorkspaceMessage below and
+ * verifyReceiptBindAuthorityPreimage), so verifyBindAuthorityPreimage here is
+ * defense-in-depth for this v2 socket shape. The daemon still resolves the
+ * served workspace from its own verified local inventory, never from the
+ * preimage path fields.
  *
  * Slice 1 (issue #179) admits the preimage fields as OPTIONAL, both-or-neither,
  * solely so the daemon and its consumers keep passing while the verifier and
@@ -1205,6 +1214,7 @@ const RECEIPT_BIND_KEYS = Object.freeze([
   "workspaceGeneration",
   "sourcePlatform",
   "authorityFingerprint",
+  "mapping",
 ]);
 const RECEIPT_BIND_OK_KEYS = Object.freeze([
   "type",
@@ -1234,7 +1244,8 @@ export function isInventoryReceiptBindWorkspaceMessage(value) {
   return hasExactFields(value, RECEIPT_BIND_KEYS) &&
     value.type === MSG_TYPES.BIND_WORKSPACE &&
     isMappingId(value.bindingId) &&
-    isWorkspaceAuthorityDescriptor(receiptAuthorityDescriptor(value));
+    isWorkspaceAuthorityDescriptor(receiptAuthorityDescriptor(value)) &&
+    isObject(value.mapping);
 }
 
 export function isInventoryReceiptBindOkMessage(value) {
