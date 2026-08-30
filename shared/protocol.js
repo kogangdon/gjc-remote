@@ -41,6 +41,29 @@ export const INVENTORY_RECEIPT_TTL_MS = 10_000;
 export const WORKSPACE_READINESS_V2 = WORKSPACE_READINESS_CAPABILITY;
 
 /**
+ * Bind-authority verification capability (issue #179).
+ *
+ * Unlike every prior capability gate in this file
+ * (isReadinessCapabilityGate / isInventoryReceiptCapabilityGate), which are
+ * check-then-DEGRADE -- a missing capability quietly narrows the shared
+ * feature set and the peers proceed on a lower tier -- this is the repo's
+ * FIRST check-then-REFUSE protocol floor. When a peer requires it (the daemon
+ * because it is the verifier, or a bot whose managed channels have
+ * bindingEnabled=true) and the negotiated shared set does NOT contain it, the
+ * requiring side REFUSES the connection outright (daemon closes with
+ * PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED; bot answers
+ * REGISTER_DENIED with the same code) rather than negotiating down. This
+ * deliberate deviation from the check-then-degrade precedent exists because
+ * silent degrade-to-unverified is the exact TOFU failure mode #179 eliminates:
+ * a security-relevant control must fail closed, never quietly off. The
+ * constant is introduced here (Slice 1) but is not yet advertised or required
+ * by either side; the daemon/bot wiring that makes it a hard floor lands in
+ * Slice 2.
+ */
+export const WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY =
+  "workspace_bind_authority_verification_v1";
+
+/**
  * Bounded v2 workspace/readiness fields. These limits are intentionally
  * independent from the legacy v0 limits so adding v2 fields cannot change
  * validation of existing frames.
@@ -160,6 +183,15 @@ export const PROTOCOL_ERROR_CODES = Object.freeze({
   WORKSPACE_NOT_FOUND: "WORKSPACE_NOT_FOUND",
   WORKSPACE_ROOT_ESCAPE: "WORKSPACE_ROOT_ESCAPE",
   CONTAINMENT_UNSUPPORTED: "CONTAINMENT_UNSUPPORTED",
+  // Bind-authority verification failures (issue #179). Emitted when the daemon
+  // independently recomputes the BIND_WORKSPACE preimage fingerprints and
+  // cross-checks preimage fields against daemon-local ground truth.
+  BIND_AUTHORITY_HASH_MISMATCH: "BIND_AUTHORITY_HASH_MISMATCH",
+  BIND_AUTHORITY_HOSTID_MISMATCH: "BIND_AUTHORITY_HOSTID_MISMATCH",
+  BIND_AUTHORITY_CONTAINMENT_ESCAPE: "BIND_AUTHORITY_CONTAINMENT_ESCAPE",
+  // REGISTER-time hard floor: a peer that requires bind-authority verification
+  // refuses a peer that does not advertise the capability (never degrades).
+  BIND_AUTHORITY_VERIFICATION_REQUIRED: "BIND_AUTHORITY_VERIFICATION_REQUIRED",
   MAPPING_ID_REQUIRED: "MAPPING_ID_REQUIRED",
   WORKSPACE_MAPPING_CHANGED: "WORKSPACE_MAPPING_CHANGED",
   MAPPING_GENERATION_STALE: "MAPPING_GENERATION_STALE",
@@ -1100,12 +1132,34 @@ function isBindingIdentity(value) {
 }
 
 /**
- * The management authority sends this path-free binding after registration.
- * It is deliberately only an identity/proof tuple: the daemon must resolve
- * the workspace from its own verified local inventory before serving it.
+ * The management authority sends this binding after registration. It carries
+ * the daemon-servable identity tuple AND (issue #179) the full route + mapping
+ * preimage records so the daemon can independently recompute the
+ * routeFingerprint / authorityFingerprint and cross-check preimage fields
+ * against daemon-local ground truth, instead of trusting the fingerprints on
+ * first use (TOFU). This is only a SHAPE predicate: the hash recomputation and
+ * ground-truth cross-checks live in shared/bind-authority-verification.js
+ * (verifyBindAuthorityPreimage), which the daemon runs at the top of
+ * acceptWorkspaceBinding. The daemon still resolves the served workspace from
+ * its own verified local inventory, never from the preimage path fields.
+ *
+ * Slice 1 (issue #179) admits the preimage fields as OPTIONAL, both-or-neither,
+ * solely so the daemon and its consumers keep passing while the verifier and
+ * bot-side emission are not yet wired -- main stays green. Slice 2 flips both
+ * sides atomically: the bot emits the preimage, the daemon requires and
+ * verifies it, and this predicate is tightened to REJECT a preimage-less bind.
+ * This is NOT the invalidated C2 tolerant-then-strict data-plane rollout: the
+ * daemon performs no bind verification at all in Slice 1, so there is no
+ * under-verified acceptance window -- the fields are simply not yet consumed.
  */
 export function isBindWorkspaceMessage(value) {
   if (!isBindingIdentity(value) || value.type !== MSG_TYPES.BIND_WORKSPACE) return false;
+  const hasRoute = hasOwn(value, "route");
+  const hasMapping = hasOwn(value, "mapping");
+  // Preimage fields travel together: presenting one without the other is
+  // never a valid shape.
+  if (hasRoute !== hasMapping) return false;
+  if (hasRoute && (!isObject(value.route) || !isObject(value.mapping))) return false;
   return Object.keys(value).every((key) => [
     "type",
     "bindingId",
@@ -1119,6 +1173,8 @@ export function isBindWorkspaceMessage(value) {
     "routeFingerprint",
     "authorityFingerprint",
     "inventoryGeneration",
+    "route",
+    "mapping",
   ].includes(key));
 }
 

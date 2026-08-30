@@ -218,6 +218,17 @@ test("keeps old v2 bind shapes isolated from exact receipt binds", () => {
   };
   assert.equal(isBindWorkspaceMessage(oldBind), true);
   assert.equal(isInventoryReceiptBindWorkspaceMessage(oldBind), false);
+
+  // Issue #179 Slice 1: the route + mapping preimage is admitted as an
+  // optional, both-or-neither pair while the daemon verifier is unwired.
+  assert.equal(isBindWorkspaceMessage({
+    ...oldBind,
+    route: { channelId: "123", routeFingerprint: "c".repeat(64) },
+    mapping: { mappingId: "mapping-1", mappingFingerprint: "d".repeat(64) },
+  }), true);
+  // one half of the preimage without the other is never a valid shape
+  assert.equal(isBindWorkspaceMessage({ ...oldBind, route: { channelId: "123" } }), false);
+  assert.equal(isBindWorkspaceMessage({ ...oldBind, mapping: { mappingId: "m" } }), false);
 });
 
 test("validates exact bind acknowledgements and total bindingId-only unbind", () => {
