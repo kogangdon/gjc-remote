@@ -1,8 +1,8 @@
 // Native serving deps assembly (slice S6f.7d).
 //
-// Assembles the production `nativeServingDeps` bundles the create and refresh
-// lifecycle dispatchers consume (Option C-narrow: CREATE and REFRESH serve;
-// reset/delete + restore/migration stay fail-closed with null dispatchers).
+// Assembles the production `nativeServingDeps` bundles the lifecycle
+// dispatchers consume. CREATE and REFRESH remain independently available when
+// reset/delete's native residual-process capability is unavailable.
 //
 // This is the S7/#171 "native serving low-level deps bundle" the boot wirings
 // (workspace-create-boot-wiring.js, workspace-refresh-boot-wiring.js) have been
@@ -23,7 +23,10 @@
 // so a readiness fingerprint burned by one operation cannot be replayed through
 // the other (architect caveat C1: pin one shared replay window).
 
-import { createContainmentLowLevel } from "@gjc-remote/native-control";
+import {
+  createContainmentLowLevel,
+  createResidualProcessEnumerator,
+} from "@gjc-remote/native-control";
 
 import { createWorkspaceContainment } from "./workspace-containment.js";
 import { createGitGraphVerifier } from "./git-graph-verification.js";
@@ -32,7 +35,8 @@ import { createContainedByteReader } from "./workspace-contained-byte-reader.js"
 import { createGenerationPublisherIo } from "./workspace-generation-storage-io.js";
 import { createCandidateManifestResolver } from "./workspace-candidate-tree-resolver.js";
 import { createReadinessReplayWindow } from "./workspace-readiness-replay-window.js";
-import { createActivityFence } from "./workspace-lease-fence.js";
+import { createActivityFence, createExclusiveFence } from "./workspace-lease-fence.js";
+import { resolveResidualProcessIo } from "./workspace-reset-delete-boot-wiring.js";
 
 const DEFAULT_CLOCK = Object.freeze({ now: () => Date.now() });
 
@@ -44,12 +48,17 @@ const DEFAULT_CLOCK = Object.freeze({ now: () => Date.now() });
  * @param {number} options.maxAgeMs - validated readiness freshness bound.
  * @param {{ now(): number }} [options.clock] - trusted monotonic ms clock.
  * @param {object} [options.factories] - injectable factory overrides (tests).
- * @returns {{ create: object, refresh: object }}
+ * @param {string} options.hostId - this daemon's bound host identity.
+ * @param {"posix"|"windows-drive"} options.sourcePlatform - host path format.
+ * @returns {{ create: object, refresh: object, resetDelete: object|null }}
  */
 export function assembleNativeServingDeps({
   workspaceRoot,
   workspaceLeases,
   maxAgeMs,
+  hostId,
+  sourcePlatform,
+  runtimePlatform = process.platform,
   clock = DEFAULT_CLOCK,
   factories = {},
 } = {}) {
@@ -76,6 +85,9 @@ export function assembleNativeServingDeps({
     makeManifestResolver = createCandidateManifestResolver,
     makeReplayWindow = createReadinessReplayWindow,
     makeActivityFence = createActivityFence,
+    makeExclusiveFence = createExclusiveFence,
+    makeResidualEnumerator = createResidualProcessEnumerator,
+    makeResidualIo = resolveResidualProcessIo,
   } = factories;
 
   const containment = makeContainment({ lowLevel: makeContainmentLowLevel() });
@@ -108,6 +120,61 @@ export function assembleNativeServingDeps({
   });
 
   const refresh = Object.freeze({ ...create, acquireFence });
+  const resetDelete = assembleResetDelete({
+    makePublisherIo,
+    makeBackupIo: makeManifestIo,
+    resolveManifestPaths,
+    makeExclusiveFence,
+    makeResidualEnumerator,
+    makeResidualIo,
+    workspaceLeases,
+    hostId,
+    workspaceRoot,
+    sourcePlatform,
+    runtimePlatform,
+  });
 
-  return Object.freeze({ create, refresh });
+  return Object.freeze({ create, refresh, resetDelete });
+}
+
+function assembleResetDelete({
+  makePublisherIo,
+  makeBackupIo,
+  resolveManifestPaths,
+  makeExclusiveFence,
+  makeResidualEnumerator,
+  makeResidualIo,
+  workspaceLeases,
+  hostId,
+  workspaceRoot,
+  sourcePlatform,
+  runtimePlatform,
+}) {
+  try {
+    if (runtimePlatform !== "linux") return null;
+    const acquireFence = makeExclusiveFence(workspaceLeases);
+    const enumerator = makeResidualEnumerator();
+    if (typeof enumerator?.enumerate_workspace_process_holders !== "function") {
+      return null;
+    }
+    const residualIo = makeResidualIo({ enumerator, hostId, workspaceRoot, sourcePlatform });
+    if (
+      typeof makePublisherIo !== "function" ||
+      typeof makeBackupIo !== "function" ||
+      typeof resolveManifestPaths !== "function" ||
+      typeof acquireFence !== "function" ||
+      typeof residualIo?.listResidualProcesses !== "function"
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      makePublisherIo,
+      makeBackupIo,
+      resolveManifestPaths,
+      acquireFence,
+      residualIo,
+    });
+  } catch {
+    return null;
+  }
 }

@@ -3,24 +3,46 @@ import assert from "node:assert/strict";
 
 import { resolveNativeServingBundles } from "./native-serving-boot-wiring.js";
 
-const okBundles = () => ({ create: { __c: 1 }, refresh: { __r: 1 } });
+const okBundles = () => ({
+  create: { __c: 1 },
+  refresh: { __r: 1 },
+  resetDelete: {
+    __d: 1,
+    makePublisherIo() {},
+    makeBackupIo() {},
+    resolveManifestPaths() {},
+    acquireFence() {},
+    residualIo: { listResidualProcesses() {} },
+  },
+});
 const baseArgs = {
   gateEnabled: true,
   recoveryEnabled: true,
   workspaceRoot: "/ws/root",
   workspaceLeases: { acquireActivity() {} },
+  hostId: "host-1",
+  sourcePlatform: "posix",
   env: {},
 };
 
 test("gate closed -> inert bundles, not a degradation", () => {
   const result = resolveNativeServingBundles({ ...baseArgs, gateEnabled: false, assemble: okBundles });
-  assert.deepEqual(result, { create: null, refresh: null, degraded: false, diagnostic: null });
+  assert.deepEqual(result, {
+    create: null,
+    refresh: null,
+    resetDelete: null,
+    restoreMigration: null,
+    degraded: false,
+    diagnostic: null,
+  });
 });
 
 test("recovery disabled -> inert bundles, not a degradation", () => {
   const result = resolveNativeServingBundles({ ...baseArgs, recoveryEnabled: false, assemble: okBundles });
   assert.equal(result.degraded, false);
   assert.equal(result.create, null);
+  assert.equal(result.resetDelete, null);
+  assert.equal(result.restoreMigration, null);
 });
 
 test("gate + recovery on with valid config -> assembled bundles", () => {
@@ -36,11 +58,19 @@ test("gate + recovery on with valid config -> assembled bundles", () => {
   assert.equal(result.degraded, false);
   assert.deepEqual(result.create, { __c: 1 });
   assert.deepEqual(result.refresh, { __r: 1 });
-  assert.deepEqual(assembleArgs, { workspaceRoot: "/ws/root", workspaceLeases: baseArgs.workspaceLeases, maxAgeMs: 30000 });
+  assert.equal(result.resetDelete.__d, 1);
+  assert.equal(result.restoreMigration, null);
+  assert.deepEqual(assembleArgs, {
+    workspaceRoot: "/ws/root",
+    workspaceLeases: baseArgs.workspaceLeases,
+    maxAgeMs: 30000,
+    hostId: "host-1",
+    sourcePlatform: "posix",
+  });
 });
 
-test("invalid readiness config -> degrade to null bundles with the config diagnostic", () => {
-  const diagnostic = { code: "NATIVE_SERVING_CONFIG_INVALID", env: "GJC_...", reason: "out of range" };
+test("invalid readiness config -> sanitized degradation with null bundles", () => {
+  const diagnostic = { code: "NATIVE_SERVING_CONFIG_INVALID", env: "GJC_...", reason: "out of range", secret: "nope" };
   const result = resolveNativeServingBundles({
     ...baseArgs,
     resolveMaxAge: () => ({ ok: false, diagnostic }),
@@ -51,11 +81,14 @@ test("invalid readiness config -> degrade to null bundles with the config diagno
   assert.equal(result.degraded, true);
   assert.equal(result.create, null);
   assert.equal(result.refresh, null);
+  assert.equal(result.resetDelete, null);
+  assert.equal(result.restoreMigration, null);
   assert.equal(result.diagnostic.code, "NATIVE_SERVING_CONFIG_INVALID");
   assert.equal(result.diagnostic.reason, "out of range");
+  assert.equal("secret" in result.diagnostic, false);
 });
 
-test("assembly throw -> degrade to null bundles with sanitized code+reason", () => {
+test("assembly throw -> degrades with a sanitized code and no raw error text", () => {
   const result = resolveNativeServingBundles({
     ...baseArgs,
     resolveMaxAge: () => ({ ok: true, maxAgeMs: 30000 }),
@@ -65,8 +98,38 @@ test("assembly throw -> degrade to null bundles with sanitized code+reason", () 
   });
   assert.equal(result.degraded, true);
   assert.equal(result.create, null);
+  assert.equal(result.refresh, null);
+  assert.equal(result.resetDelete, null);
   assert.equal(result.diagnostic.code, "NATIVE_ADDON_MISSING");
-  assert.equal(result.diagnostic.reason, "native low-level unavailable");
+  assert.equal(result.diagnostic.reason, "native serving deps assembly failed");
+});
+
+test("an unavailable reset/delete bundle leaves create and refresh serving", () => {
+  const result = resolveNativeServingBundles({
+    ...baseArgs,
+    resolveMaxAge: () => ({ ok: true, maxAgeMs: 30000 }),
+    assemble: () => ({ create: { __c: 1 }, refresh: { __r: 1 }, resetDelete: null }),
+  });
+  assert.equal(result.degraded, false);
+  assert.deepEqual(result.create, { __c: 1 });
+  assert.deepEqual(result.refresh, { __r: 1 });
+  assert.equal(result.resetDelete, null);
+});
+
+test("an incomplete reset/delete bundle stays inert without regressing create or refresh", () => {
+  const result = resolveNativeServingBundles({
+    ...baseArgs,
+    resolveMaxAge: () => ({ ok: true, maxAgeMs: 30000 }),
+    assemble: () => ({
+      create: { __c: 1 },
+      refresh: { __r: 1 },
+      resetDelete: { makePublisherIo() {} },
+    }),
+  });
+  assert.equal(result.degraded, false);
+  assert.deepEqual(result.create, { __c: 1 });
+  assert.deepEqual(result.refresh, { __r: 1 });
+  assert.equal(result.resetDelete, null);
 });
 
 test("assembly throw without a code -> generic fail-closed code", () => {

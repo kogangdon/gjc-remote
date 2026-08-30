@@ -22,14 +22,39 @@ function fakeFactories(spy = {}) {
       spy.publisherArg = arg;
       return { __marker: "publisher" };
     },
-    makeManifestResolver: () => marker("resolveManifestPaths"),
+    makeManifestResolver: () => {
+      const resolveManifestPaths = async () => [];
+      resolveManifestPaths.__marker = "resolveManifestPaths";
+      return resolveManifestPaths;
+    },
     makeReplayWindow: (arg) => {
       spy.replayArg = arg;
       return { has() {}, add() {}, __marker: "replaySeen" };
     },
     makeActivityFence: (registry) => {
       spy.fenceRegistry = registry;
-      return marker("acquireFence");
+      const acquireFence = () => marker("lease");
+      acquireFence.__marker = "acquireFence";
+      return acquireFence;
+    },
+    makeExclusiveFence: (registry) => {
+      spy.exclusiveFenceRegistry = registry;
+      const acquireFence = () => marker("exclusiveLease");
+      acquireFence.__marker = "acquireExclusiveFence";
+      return acquireFence;
+    },
+    makeResidualEnumerator: () => {
+      spy.residualEnumerator = {
+        enumerate_workspace_process_holders() {
+          return [];
+        },
+        __marker: "residualEnumerator",
+      };
+      return spy.residualEnumerator;
+    },
+    makeResidualIo: (arg) => {
+      spy.residualIoArg = arg;
+      return { listResidualProcesses() {}, __marker: "residualIo" };
     },
   };
 }
@@ -38,6 +63,9 @@ const baseArgs = () => ({
   workspaceRoot: "/ws/root",
   workspaceLeases: { acquireActivity() {} },
   maxAgeMs: 30000,
+  hostId: "host-1",
+  sourcePlatform: "posix",
+  runtimePlatform: "linux",
 });
 
 test("create bundle carries exactly the create dispatcher deps", () => {
@@ -72,6 +100,73 @@ test("refresh bundle is create + a non-exclusive activity fence", () => {
   // every create key is preserved on refresh
   for (const key of Object.keys(create)) {
     assert.equal(refresh[key], create[key], `refresh.${key} must equal create.${key}`);
+  }
+});
+
+test("reset/delete bundle is frozen and carries only its static dependencies", () => {
+  const spy = {};
+  const { create, resetDelete } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories(spy) });
+  assert.ok(Object.isFrozen(resetDelete));
+  assert.deepEqual(Object.keys(resetDelete).sort(), [
+    "acquireFence",
+    "makeBackupIo",
+    "makePublisherIo",
+    "residualIo",
+    "resolveManifestPaths",
+  ]);
+  assert.equal(resetDelete.makeBackupIo, create.makeManifestIo);
+  assert.equal(resetDelete.residualIo.__marker, "residualIo");
+  assert.equal("probeQuiescence" in resetDelete, false);
+});
+
+test("reset/delete uses an exclusive fence and a real residual-process adapter", () => {
+  const spy = {};
+  const args = baseArgs();
+  const { resetDelete } = assembleNativeServingDeps({ ...args, factories: fakeFactories(spy) });
+  assert.equal(resetDelete.acquireFence.__marker, "acquireExclusiveFence");
+  assert.equal(spy.exclusiveFenceRegistry, args.workspaceLeases);
+  assert.deepEqual(spy.residualIoArg, {
+    enumerator: spy.residualEnumerator,
+    hostId: "host-1",
+    workspaceRoot: "/ws/root",
+    sourcePlatform: "posix",
+  });
+});
+
+test("reset/delete backup IO is deferred and backed by the contained byte reader", () => {
+  const spy = {};
+  const { resetDelete } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories(spy) });
+  assert.equal(spy.byteReaderArg, undefined);
+  const io = resetDelete.makeBackupIo("/ws/root/ws/generations/1", "posix");
+  assert.equal(io.__marker, "byteReader");
+  assert.deepEqual(spy.byteReaderArg, {
+    root: "/ws/root/ws/generations/1",
+    sourcePlatform: "posix",
+  });
+});
+
+test("a missing or refusing residual capability leaves only reset/delete inert", () => {
+  for (const factories of [
+    { ...fakeFactories({}), makeResidualEnumerator: () => null },
+    { ...fakeFactories({}), makeResidualEnumerator: () => { throw new Error("native capability refused"); } },
+  ]) {
+    const bundles = assembleNativeServingDeps({ ...baseArgs(), factories });
+    assert.equal(bundles.resetDelete, null);
+    assert.ok(bundles.create);
+    assert.ok(bundles.refresh);
+  }
+});
+
+test("non-Linux runtimes leave only reset/delete inert", () => {
+  for (const runtimePlatform of ["win32", "darwin"]) {
+    const bundles = assembleNativeServingDeps({
+      ...baseArgs(),
+      runtimePlatform,
+      factories: fakeFactories({}),
+    });
+    assert.equal(bundles.resetDelete, null);
+    assert.ok(bundles.create);
+    assert.ok(bundles.refresh);
   }
 });
 
@@ -128,11 +223,14 @@ test("invalid inputs fail closed", () => {
 });
 
 test("returned bundles are frozen", () => {
-  const { create, refresh } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories({}) });
+  const { create, refresh, resetDelete } = assembleNativeServingDeps({ ...baseArgs(), factories: fakeFactories({}) });
   assert.throws(() => {
     create.maxAgeMs = 1;
   }, TypeError);
   assert.throws(() => {
     refresh.acquireFence = null;
+  }, TypeError);
+  assert.throws(() => {
+    resetDelete.acquireFence = null;
   }, TypeError);
 });

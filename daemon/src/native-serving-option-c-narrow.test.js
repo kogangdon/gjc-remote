@@ -7,11 +7,10 @@ import { resolveLifecycleResetDeleteDispatcher } from "./workspace-reset-delete-
 import { resolveLifecycleRestoreMigrationDispatcher } from "./workspace-restore-migration-boot-wiring.js";
 import { assembleNativeServingDeps } from "./native-serving-deps.js";
 
-// Option C-narrow serving boundary (S6f.7d): CREATE and REFRESH may serve; the
-// reset/delete and restore/migration lifecycle ops MUST stay fail-closed. The
-// daemon enforces this by ONLY assembling + passing nativeServingDeps to the
-// create/refresh resolvers, never to the excluded two. This test pins that
-// contract so a future accidental wiring of the excluded ops is caught.
+// Native serving boundary: each operation requires its own complete bundle.
+// CREATE and REFRESH always have production assembly; RESET_DELETE has an
+// additional residual-process capability floor; RESTORE_MIGRATION remains
+// fail-closed until issue #197 supplies sealed staging authority and promotion.
 
 // A minimal well-formed serving bundle (via the real assembler + fakes) that
 // satisfies the create/refresh dispatcher config assertions.
@@ -45,8 +44,7 @@ test("CREATE and REFRESH build a live dispatcher when a serving bundle is suppli
   assert.notEqual(refreshDispatcher, null);
 });
 
-test("reset/delete and restore/migration stay null with the SAME enabled+root but no deps (daemon wiring)", () => {
-  // This mirrors exactly how daemon.js wires the excluded two: no nativeServingDeps.
+test("reset/delete and restore/migration stay null with the SAME enabled+root but no deps", () => {
   assert.equal(resolveLifecycleResetDeleteDispatcher({ ...enabledRoot }), null);
   assert.equal(resolveLifecycleRestoreMigrationDispatcher({ ...enabledRoot }), null);
   assert.equal(resolveLifecycleResetDeleteDispatcher({ ...enabledRoot, nativeServingDeps: null }), null);

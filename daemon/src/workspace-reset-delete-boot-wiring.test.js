@@ -3,10 +3,8 @@ import test from "node:test";
 
 import {
   resolveLifecycleResetDeleteDispatcher,
-  createResidualProcessPlaceholderIo,
   resolveResidualProcessIo,
 } from "../src/workspace-reset-delete-boot-wiring.js";
-import { assertResidualProcessAbsence } from "../src/workspace-residual-process.js";
 
 
 function fullNativeServingDeps() {
@@ -21,8 +19,7 @@ function fullNativeServingDeps() {
     makeBackupIo: () => ({ readBytes: async () => Buffer.from("x") }),
     resolveManifestPaths: async () => ["a.txt"],
     acquireFence: () => ({ isCurrent: () => true, release: () => {} }),
-    probeQuiescence: () => ({ pendingInvokes: 0, pendingSessions: 0 }),
-    residualIo: createResidualProcessPlaceholderIo(),
+    residualIo: { listResidualProcesses: async () => [] },
   };
 }
 
@@ -65,41 +62,48 @@ test("dispatcher is constructed when enabled + workspaceRoot + full native deps"
   assert.equal(typeof dispatcher.dispatchResetDelete, "function");
 });
 
+test("dispatcher stays null for every incomplete static reset/delete bundle", () => {
+  for (const missing of [
+    "makePublisherIo",
+    "makeBackupIo",
+    "resolveManifestPaths",
+    "acquireFence",
+    "residualIo",
+  ]) {
+    const deps = fullNativeServingDeps();
+    delete deps[missing];
+    assert.equal(
+      resolveLifecycleResetDeleteDispatcher({ enabled: true, workspaceRoot: "/srv/ws", nativeServingDeps: deps }),
+      null,
+      `${missing} must be required`,
+    );
+  }
+});
+
+test("static reset/delete deps never carry global quiescence callbacks", () => {
+  const deps = fullNativeServingDeps();
+  assert.equal("probeQuiescence" in deps, false);
+  const dispatcher = resolveLifecycleResetDeleteDispatcher({
+    enabled: true,
+    workspaceRoot: "/srv/ws",
+    nativeServingDeps: deps,
+  });
+  assert.ok(dispatcher);
+});
+
 test("resolveLifecycleResetDeleteDispatcher tolerates no arguments", () => {
   assert.equal(resolveLifecycleResetDeleteDispatcher(), null);
 });
 
 // ---------------------------------------------------------------------------
-// createResidualProcessPlaceholderIo: Option-A fail-closed (S7 #171).
+// resolveResidualProcessIo: native residual-process adapter.
 // ---------------------------------------------------------------------------
 
-test("placeholder residual enumerator always refuses to certify absence", async () => {
-  const io = createResidualProcessPlaceholderIo();
-  assert.equal(typeof io.listResidualProcesses, "function");
-  await assert.rejects(
-    () => io.listResidualProcesses({ hostId: "h", workspaceId: "w" }),
-    (e) => e.code === "CONFIG_INVALID",
-  );
-});
-
-test("placeholder residual enumerator fails closed through assertResidualProcessAbsence", async () => {
-  const io = createResidualProcessPlaceholderIo();
-  await assert.rejects(
-    () => assertResidualProcessAbsence(io, { hostId: "h", workspaceId: "w" }),
-    (e) => e.code === "CONFIG_INVALID",
-  );
-});
-
-// ---------------------------------------------------------------------------
-// resolveResidualProcessIo: the single native/placeholder swap seam (S7.3 #171).
-// ---------------------------------------------------------------------------
-
-test("resolveResidualProcessIo returns the fail-closed placeholder when no native enumerator is present", async () => {
+test("resolveResidualProcessIo refuses a missing native enumerator", () => {
   for (const enumerator of [undefined, null]) {
-    const io = resolveResidualProcessIo({ enumerator, hostId: "h", workspaceRoot: "/srv/ws", sourcePlatform: "posix" });
-    await assert.rejects(
-      () => io.listResidualProcesses({ hostId: "h", workspaceId: "w" }),
-      (e) => e.code === "CONFIG_INVALID" && e.reason === "residual-process enumeration unavailable",
+    assert.throws(
+      () => resolveResidualProcessIo({ enumerator, hostId: "h", workspaceRoot: "/srv/ws", sourcePlatform: "posix" }),
+      (e) => e.code === "CONFIG_INVALID",
     );
   }
 });
@@ -113,12 +117,22 @@ test("resolveResidualProcessIo wires the real native adapter when an enumerator 
     },
   };
   const io = resolveResidualProcessIo({ enumerator, hostId: "host-A", workspaceRoot: "/srv/ws", sourcePlatform: "posix" });
-  assert.deepEqual(await assertResidualProcessAbsence(io, { hostId: "host-A", workspaceId: "ws-1" }), { absent: true });
+  assert.deepEqual(await io.listResidualProcesses({
+    hostId: "host-A",
+    workspaceId: "ws-1",
+    workDir: "/srv/ws/ws-1",
+    sourcePlatform: "posix",
+  }), []);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].sourcePlatform, "posix");
   // A cross-host request is refused by the native adapter without scanning.
   await assert.rejects(
-    () => io.listResidualProcesses({ hostId: "other", workspaceId: "ws-1" }),
+    () => io.listResidualProcesses({
+      hostId: "other",
+      workspaceId: "ws-1",
+      workDir: "/srv/ws/ws-1",
+      sourcePlatform: "posix",
+    }),
     (e) => e.code === "CONFIG_INVALID",
   );
   assert.equal(calls.length, 1);

@@ -29,7 +29,8 @@
 //     ProcessAbsence catches them as a fail-closed CONFIG_INVALID (an
 //     unreadable scan is never treated as an empty holder set).
 
-import { join as joinPath } from "node:path";
+import { posix, win32 } from "node:path";
+import { relativeComponents } from "./workspace-containment.js";
 
 // The host path formats the native scan understands. windows-unc is excluded:
 // it is not containment-verifiable, and the S7.2 scan is Linux-only ("posix")
@@ -100,8 +101,25 @@ export function createResidualProcessNativeIo({ enumerator, hostId, workspaceRoo
       if (!isSafeWorkspaceSegment(request.workspaceId)) {
         throw configError("workspaceId must be a single safe path segment");
       }
-      const workDir = joinPath(workspaceRoot, request.workspaceId);
-      return enumerator.enumerate_workspace_process_holders(workDir, sourcePlatform);
+      if (
+        request.sourcePlatform !== sourcePlatform ||
+        !isNonEmptyString(request.workDir)
+      ) {
+        throw configError("residual-process request path identity is invalid");
+      }
+      relativeComponents(workspaceRoot, request.workDir, sourcePlatform);
+      const expectedWorkDir = sourcePlatform === "posix"
+        ? posix.join(workspaceRoot, request.workspaceId)
+        : win32.join(workspaceRoot, request.workspaceId);
+      if (request.workDir !== expectedWorkDir) {
+        throw configError(
+          "trusted inventory workDir does not equal the native workspace path"
+        );
+      }
+      return enumerator.enumerate_workspace_process_holders(
+        request.workDir,
+        sourcePlatform
+      );
     },
   });
 }
