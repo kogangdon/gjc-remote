@@ -10,6 +10,7 @@
   "exports": {
     ".": "./protocol.js",
     "./admission-envelope": "./admission-envelope.js",
+    "./bind-authority-verification": "./bind-authority-verification.js",
     "./genesis-envelope": "./genesis-envelope.js",
     "./genesis-probe": "./genesis-probe.js",
     "./identity": "./identity.js",

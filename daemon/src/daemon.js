@@ -1772,6 +1772,12 @@ function connectToBot() {
   );
 }
 
+function closePolicyViolation(connection, reason) {
+  // RFC 6455 makes the status code authoritative. The UTF-8 reason is
+  // diagnostic only: Bun 1.3.14 can omit it on Linux arm64.
+  connection.close(1008, reason);
+}
+
 async function handleMessage(
   connection,
   raw,
@@ -1783,7 +1789,7 @@ async function handleMessage(
   try {
     payloadBytes = webSocketPayloadByteLength(raw);
   } catch {
-    connection.close(1008, "invalid frame");
+    closePolicyViolation(connection, "invalid frame");
     return;
   }
   if (payloadBytes > MAX_WS_PAYLOAD_BYTES) {
@@ -1791,7 +1797,7 @@ async function handleMessage(
     return;
   }
   if (isBinary) {
-    connection.close(1008, "invalid frame");
+    closePolicyViolation(connection, "invalid frame");
     return;
   }
 
@@ -1799,7 +1805,7 @@ async function handleMessage(
   try {
     msg = JSON.parse(webSocketPayloadToUtf8(raw));
   } catch {
-    connection.close(1008, "invalid json");
+    closePolicyViolation(connection, "invalid json");
     return;
   }
 
@@ -1833,7 +1839,7 @@ async function handleMessage(
           `capability '${WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY}' ` +
           `(${PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED})`
       );
-      connection.close(1008, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
+      closePolicyViolation(connection, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
       return;
     }
     readinessState.committed =
@@ -1862,7 +1868,7 @@ async function handleMessage(
       );
     }
     try {
-      connection.close(1008, "registration denied");
+      closePolicyViolation(connection, "registration denied");
     } catch (error) {
       console.error(
         `daemon: failed to close denied websocket: ${sanitizeDaemonError(error)}`
@@ -1898,7 +1904,7 @@ async function handleMessage(
         ? await acceptReceiptBinding(readinessState, msg)
         : BIND_REJECTED;
       if (!acceptance.ok) {
-        connection.close(1008, acceptance.code ?? "invalid workspace binding");
+        closePolicyViolation(connection, acceptance.code ?? "invalid workspace binding");
       }
       return;
     }
@@ -1906,7 +1912,7 @@ async function handleMessage(
       ? acceptWorkspaceBinding(readinessState, msg)
       : BIND_REJECTED;
     if (!acceptance.ok) {
-      connection.close(1008, acceptance.code ?? "invalid workspace binding");
+      closePolicyViolation(connection, acceptance.code ?? "invalid workspace binding");
       return;
     }
     connection.send(
@@ -1926,7 +1932,7 @@ async function handleMessage(
     if (!readinessState?.receiptCommitted ||
         !isUnbindWorkspaceMessage(msg) ||
         !(await unbindReceiptBinding(readinessState, msg.bindingId))) {
-      connection.close(1008, "invalid workspace unbind");
+      closePolicyViolation(connection, "invalid workspace unbind");
       return;
     }
     connection.send(JSON.stringify({ type: MSG_TYPES.UNBIND_OK, bindingId: msg.bindingId }));
@@ -1934,7 +1940,7 @@ async function handleMessage(
   }
   if (msg?.type === MSG_TYPES.WORKSPACE_CREATE) {
     if (!isWorkspaceLifecycleMessage(msg)) {
-      connection.close(1008, "invalid workspace lifecycle message");
+      closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
     // S6f.2 (#81): the reviewed create/clone security core
@@ -2006,7 +2012,7 @@ async function handleMessage(
   }
   if (msg?.type === MSG_TYPES.WORKSPACE_REFRESH) {
     if (!isWorkspaceLifecycleMessage(msg)) {
-      connection.close(1008, "invalid workspace lifecycle message");
+      closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
     // S6f.3 (#81): the reviewed refresh security core
@@ -2089,7 +2095,7 @@ async function handleMessage(
   }
   if (msg?.type === MSG_TYPES.WORKSPACE_RESET_DELETE) {
     if (!isWorkspaceLifecycleMessage(msg)) {
-      connection.close(1008, "invalid workspace lifecycle message");
+      closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
     // #196: reset/delete serves only with the complete production bundle and a
@@ -2173,7 +2179,7 @@ async function handleMessage(
   }
   if (msg?.type === MSG_TYPES.WORKSPACE_RESTORE_MIGRATION) {
     if (!isWorkspaceLifecycleMessage(msg)) {
-      connection.close(1008, "invalid workspace lifecycle message");
+      closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
     // #197: restore/migration serves only with a complete Linux native bundle
@@ -2283,7 +2289,7 @@ async function handleMessage(
     ? isInvokeMessage(msg, { v2: readinessState?.committed })
     : isInvokeMessage(msg);
   if (!invokeValid) {
-    connection.close(1008, "invalid message");
+    closePolicyViolation(connection, "invalid message");
     return;
   }
 
@@ -2292,7 +2298,7 @@ async function handleMessage(
     connection.send(serializeEventFrame(requestId, event, extra));
   const releaseRequestId = requestIds.tryAcquire(requestId);
   if (!releaseRequestId) {
-    connection.close(1008, "duplicate request id");
+    closePolicyViolation(connection, "duplicate request id");
     return;
   }
   const releaseAdmission = admissionBudget.tryAcquireInvoke();

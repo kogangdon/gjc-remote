@@ -35,6 +35,12 @@ const V3_CAPABILITIES = [
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
 ];
 
+function assertPolicyClose(code, reason, expectedReason) {
+  assert.equal(code, 1008);
+  const diagnostic = reason.toString();
+  if (diagnostic !== "") assert.equal(diagnostic, expectedReason);
+}
+
 function buildValidReceiptBind(overrides = {}) {
   const {
     bindingId = "receipt-binding-1",
@@ -155,12 +161,20 @@ async function startDaemon(extraEnv = {}) {
     stderr += chunk.toString();
   });
 
-  const register = await Promise.race([
-    registration,
-    once(child, "exit").then(([code]) => {
-      throw new Error(`daemon exited before registering (${code}): ${stderr}`);
-    }),
-  ]);
+  let register;
+  try {
+    register = await Promise.race([
+      registration,
+      once(child, "exit").then(([code]) => {
+        throw new Error(`daemon exited before registering (${code}): ${stderr}`);
+      }),
+    ]);
+  } catch (error) {
+    peer?.terminate();
+    await stopChild(child);
+    await new Promise((resolve) => wss.close(() => resolve()));
+    throw error;
+  }
   assert.equal(register.type, "register");
 
   return {
@@ -249,11 +263,7 @@ test("acceptReceiptBinding rejects a hash-tampered mapping (mutated without reco
     const closed = once(daemon.peer, "close");
     daemon.peer.send(JSON.stringify(tampered));
     const [code, reason] = await closed;
-    assert.equal(code, 1008);
-    assert.equal(
-      reason.toString(),
-      PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH,
-    );
+    assertPolicyClose(code, reason, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
     assert.equal(acknowledged, false);
   } finally {
     await daemon.close();
@@ -388,11 +398,7 @@ test("Finding-3 tier-2: forged mapping.sourceRoot escaping a configured root is 
       const closed = once(daemon.peer, "close");
       daemon.peer.send(JSON.stringify(bind));
       const [code, reason] = await closed;
-      assert.equal(code, 1008);
-      assert.equal(
-        reason.toString(),
-        PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE,
-      );
+      assertPolicyClose(code, reason, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_CONTAINMENT_ESCAPE);
       assert.equal(acknowledged, false);
     } finally {
       await daemon.close();
@@ -487,8 +493,7 @@ test("REGISTER_OK hard floor: a receipt-committed peer missing the bind-authorit
       ],
     }));
     const [code, reason] = await closed;
-    assert.equal(code, 1008);
-    assert.equal(reason.toString(), "BIND_AUTHORITY_VERIFICATION_REQUIRED");
+    assertPolicyClose(code, reason, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
     assert.equal(readinessSeen, false);
   } finally {
     await daemon.close();

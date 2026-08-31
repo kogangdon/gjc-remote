@@ -57,6 +57,12 @@ import { WorkspaceLeaseRegistry } from "../src/workspace-lease-registry.js";
 const daemonEntry = fileURLToPath(new URL("../src/daemon.js", import.meta.url));
 const CHILD_EXIT_TIMEOUT_MS = 2_000;
 
+function assertPolicyClose(code, reason, expectedReason) {
+  assert.equal(code, 1008);
+  const diagnostic = reason.toString();
+  if (diagnostic !== "") assert.equal(diagnostic, expectedReason);
+}
+
 function buildValidBinding(overrides = {}) {
   const identity = {
     bindingId: "binding-1",
@@ -482,11 +488,7 @@ test("v2 bind verifies the authority preimage before same-binding replay accepta
       },
     }));
     const [code, reason] = await closed;
-    assert.equal(code, 1008);
-    assert.equal(
-      reason.toString(),
-      PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH,
-    );
+    assertPolicyClose(code, reason, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
   } finally {
     await daemon.close();
   }
@@ -518,11 +520,7 @@ test("v2 bind verifies an advanced authority before lease adoption", async () =>
       },
     }));
     const [code, reason] = await closed;
-    assert.equal(code, 1008);
-    assert.equal(
-      reason.toString(),
-      PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH,
-    );
+    assertPolicyClose(code, reason, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_HASH_MISMATCH);
   } finally {
     await daemon.close();
   }
@@ -541,8 +539,7 @@ test("v2 bind rejects a missing authority preimage at the shape boundary", async
     const closed = once(daemon.peer, "close");
     daemon.peer.send(JSON.stringify(withoutPreimage));
     const [code, reason] = await closed;
-    assert.equal(code, 1008);
-    assert.equal(reason.toString(), "invalid workspace binding");
+    assertPolicyClose(code, reason, "invalid workspace binding");
   } finally {
     await daemon.close();
   }
