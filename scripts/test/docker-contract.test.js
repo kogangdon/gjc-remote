@@ -12,11 +12,15 @@ const composePath = fileURLToPath(
 );
 const dockerignorePath = fileURLToPath(new URL("../../.dockerignore", import.meta.url));
 
-const [dockerfile, compose, dockerignore] = await Promise.all([
+const [dockerfileRaw, composeRaw, dockerignoreRaw] = await Promise.all([
   readFile(dockerfilePath, "utf8"),
   readFile(composePath, "utf8"),
   readFile(dockerignorePath, "utf8"),
 ]);
+const normalizeLines = (value) => value.replaceAll("\r\n", "\n");
+const dockerfile = normalizeLines(dockerfileRaw);
+const compose = normalizeLines(composeRaw);
+const dockerignore = normalizeLines(dockerignoreRaw);
 
 test("bot image pins Bun and Node indexes and never rebuilds signed native code", () => {
   assert.match(dockerfile, /oven\/bun:1\.3\.14@sha256:[0-9a-f]{64}/);
