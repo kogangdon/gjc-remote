@@ -14,6 +14,10 @@ contain exactly the release artifacts used by the native verifier:
 - `native-control.manifest.json`
 - `native-control.manifest.json.sig`
 
+Dependencies are installed with lifecycle scripts disabled. Optional `ws`
+native accelerators (`bufferutil` and `utf-8-validate`) are therefore absent;
+the bot intentionally uses `ws`'s supported pure-JavaScript fallbacks.
+
 Set `GJC_NATIVE_CONTROL_BUNDLE_DIR` to that directory. The Docker build copies
 the bundle without rebuilding it and runs `verify-build.mjs
 --require-signature`; missing, wrong-platform, modified, self-signed, or
