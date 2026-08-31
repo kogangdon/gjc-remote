@@ -282,6 +282,16 @@ The phased implementation gates, readiness decisions, interim development bounda
 evidence checklist are documented in
 [`docs/daemon-workspace-implementation-phases.md`](docs/daemon-workspace-implementation-phases.md).
 
+### Optional bot container
+
+The hardened Linux bot-container contract and Compose candidate live in
+[`deploy/docker/bot/`](deploy/docker/bot/README.md). It requires an externally
+produced, production-signed, architecture-matched native-control bundle and
+fails the image build before startup when that bundle is absent or invalid.
+No supported image is claimed until signed amd64/arm64 bundles and live Linux
+container stop/restart/network/rollback evidence are available. Daemon Docker
+remains a separate phase.
+
 Shawl is the selected primary Windows supervisor: one `GJCRemoteBot` service and one
 `GJCRemoteDaemon-<instance-key>` per exact valid `HOST_ID`. Shawl v1.9.0 has
 passed local Windows checks for daemon and bot child replacement, daemon

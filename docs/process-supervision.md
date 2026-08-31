@@ -175,6 +175,22 @@ For startup-only host-token rotation:
 
 `GJC_BOT_ALLOWED_USERS`, `GJC_REMOTE_REQUIRE_ALLOWLIST`, and token settings are startup-only; restart the relevant component. `channels.json` remains hot-reloaded and an invalid replacement keeps the last valid map. Planned or forced stop may fail pending invokes and gates. That is bounded loss/failure evidence, not a drain, migration, or recovery claim.
 
+## Optional Linux bot container
+
+The candidate bot-only Compose contract is documented in
+[`deploy/docker/bot/README.md`](../deploy/docker/bot/README.md). It uses
+`on-failure:5`, a 30-second stop grace, the bot's existing SIGTERM teardown,
+TCP listener liveness, non-root/read-only execution, and private host
+publication. TCP health is not Discord, mapping, daemon, or provider readiness.
+
+The runtime image build requires an externally produced, production-signed,
+architecture-matched native-control bundle and verifies it before startup. CI
+has no production signing key and therefore builds only the pinned dependency
+stage. Until signed Linux amd64/arm64 bundles and live stop/restart/private-bind
+and digest-rollback evidence exist, this is a release candidate rather than a
+supported published image. It does not change daemon deployment or the native
+systemd/Shawl paths.
+
 ## Evidence and escalation
 
 The required evidence set is static contract coverage, pinned Shawl source/release

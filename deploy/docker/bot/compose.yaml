@@ -1,0 +1,59 @@
+services:
+  bot:
+    image: ${GJC_BOT_IMAGE:-gjc-remote-bot:0.3.1}
+    build:
+      context: ../../..
+      dockerfile: deploy/docker/bot/Dockerfile
+      additional_contexts:
+        native_control_bundle: ${GJC_NATIVE_CONTROL_BUNDLE_DIR:?set GJC_NATIVE_CONTROL_BUNDLE_DIR}
+      args:
+        VERSION: ${GJC_BOT_VERSION:-0.3.1}
+        REVISION: ${GJC_BOT_REVISION:-local}
+    restart: "on-failure:5"
+    stop_grace_period: 30s
+    read_only: true
+
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    environment:
+      NODE_ENV: production
+      HOST_WS_PORT: "7711"
+      CHANNELS_CONFIG: /var/lib/gjc-remote/channels.json
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      HOST_TOKENS_FILE: /run/secrets/host_tokens
+      GJC_BOT_ALLOWED_USERS: ${GJC_BOT_ALLOWED_USERS:?set GJC_BOT_ALLOWED_USERS}
+      GJC_MANAGEMENT_ROLE_BINDINGS: ${GJC_MANAGEMENT_ROLE_BINDINGS:?set GJC_MANAGEMENT_ROLE_BINDINGS}
+      GJC_REMOTE_REQUIRE_ALLOWLIST: "1"
+      GJC_REMOTE_DEBUG: ${GJC_REMOTE_DEBUG:-0}
+    secrets:
+      - discord_token
+      - host_tokens
+    volumes:
+      - type: bind
+        source: ${GJC_BOT_CONFIG_DIR:?set GJC_BOT_CONFIG_DIR}
+        target: /var/lib/gjc-remote
+    ports:
+      - name: host-websocket
+        target: 7711
+        published: ${GJC_BOT_HOST_PORT:-7711}
+        host_ip: ${GJC_BOT_BIND_ADDRESS:-127.0.0.1}
+        protocol: tcp
+    networks:
+      - bot-egress
+
+networks:
+  bot-egress:
+    driver: bridge
+
+secrets:
+  discord_token:
+    file: ${GJC_DISCORD_TOKEN_FILE:?set GJC_DISCORD_TOKEN_FILE}
+  host_tokens:
+    file: ${GJC_HOST_TOKENS_FILE:?set GJC_HOST_TOKENS_FILE}

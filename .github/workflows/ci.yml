@@ -61,16 +61,57 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
 
+  bot-container-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux/amd64
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Validate hardened Compose contract
+        env:
+          GJC_BOT_ALLOWED_USERS: "123456789012345678"
+          GJC_MANAGEMENT_ROLE_BINDINGS: '{"managementSid":"uid:1001","botSid":"uid:1000","recoverySid":"uid:1002","systemSid":"uid:0"}'
+          GJC_BOT_CONFIG_DIR: ${{ github.workspace }}/bot
+          GJC_NATIVE_CONTROL_BUNDLE_DIR: ${{ github.workspace }}/native-control/release-keys
+          GJC_DISCORD_TOKEN_FILE: ${{ github.workspace }}/bot/channels.example.json
+          GJC_HOST_TOKENS_FILE: ${{ github.workspace }}/bot/channels.example.json
+        run: docker compose -f deploy/docker/bot/compose.yaml config --quiet
+
+      # The release target intentionally requires an externally signed,
+      # architecture-matched native_control bundle. CI has no production key,
+      # so it builds only the reproducible dependency stage and cannot
+      # accidentally publish an unsigned managed-capable image.
+      - name: Build pinned bot dependency stage
+        run: >-
+          docker buildx build
+          --target deps
+          --platform ${{ matrix.platform }}
+          --build-context native_control_bundle=./native-control/release-keys
+          --output type=cacheonly
+          -f deploy/docker/bot/Dockerfile
+          .
+
   # Aggregate gate. `test` is the required status check on main, so it must stay a
   # single stable context name even though the suite now fans out across a matrix.
   # It fails unless every matrix leg succeeded, so a skipped or failed leg cannot
   # be merged past.
   test:
     if: always()
-    needs: [suite]
+    needs: [suite, bot-container-contract]
     runs-on: ubuntu-latest
     steps:
       - name: Require every matrix leg to succeed
         run: |
           echo "suite result: ${{ needs.suite.result }}"
+          echo "bot container contract result: ${{ needs.bot-container-contract.result }}"
           test "${{ needs.suite.result }}" = "success"
+          test "${{ needs.bot-container-contract.result }}" = "success"

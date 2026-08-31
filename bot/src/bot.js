@@ -46,18 +46,25 @@ import {
 } from "./tool-calls.js";
 
 import { createShutdown } from "./shutdown.js";
+import { resolveBotSecrets } from "./container-secrets.js";
 
 const {
-  DISCORD_TOKEN,
   GJC_BOT_ALLOWED_USERS,
   GJC_REMOTE_REQUIRE_ALLOWLIST,
   CHANNELS_CONFIG,
   HOST_WS_PORT,
-  HOST_TOKENS,
   GJC_INVOKE_IDLE_TIMEOUT_MS,
   GJC_INVOKE_HARD_CAP_MS,
   GJC_MANAGEMENT_ROLE_BINDINGS,
 } = process.env;
+let DISCORD_TOKEN;
+let HOST_TOKENS;
+try {
+  ({ DISCORD_TOKEN, HOST_TOKENS } = resolveBotSecrets());
+} catch (error) {
+  console.error(`Invalid bot environment configuration: ${error.message}`);
+  process.exit(1);
+}
 const DEBUG_REMOTE = process.env.GJC_REMOTE_DEBUG === "1";
 
 if (!DISCORD_TOKEN) {
