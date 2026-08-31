@@ -23,6 +23,24 @@ Source-built unsigned CI addons are not release bundles. Until signed Linux
 amd64 and arm64 bundles and live container evidence exist, this deployment is a
 release candidate rather than a supported published image.
 
+Each Linux CI leg uploads a seven-day
+`native-control-unsigned-{X64|ARM64}` signing-input artifact containing the
+addon and manifest. Sign the manifest bytes outside CI with the production key,
+extract the artifact into `native-control/build/Release`, then use the
+repository tooling to wrap the externally produced raw signature and verify
+the sidecar:
+
+```sh
+node native-control/scripts/verify-build.mjs --write-manifest \\
+  --signature /protected/native-control.signature \\
+  --key-id prod-2026-08-r2 --algorithm ed25519
+node native-control/scripts/verify-build.mjs --require-signature
+```
+
+The private key must never enter the repository, Docker build context, GitHub
+artifact, workflow secret, image layer, or CI runner. Preserve the verified
+three-file bundle as the `native_control_bundle` BuildKit context.
+
 ## Configuration
 
 Create two host files outside the repository and restrict them to the account

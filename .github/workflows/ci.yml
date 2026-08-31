@@ -49,6 +49,20 @@ jobs:
       - name: Build native-control addon
         run: npm run build --workspace @gjc-remote/native-control
 
+      # Offline release signing consumes these exact bytes. They are explicitly
+      # UNSIGNED CI artifacts and are never accepted by the runtime image until
+      # the external signer adds a trusted sidecar for the same manifest.
+      - name: Upload unsigned Linux native-control signing input
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-control-unsigned-${{ runner.arch }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            native-control/build/Release/native_control.node
+            native-control/build/Release/native-control.manifest.json
+
       - run: npm test
 
       # Guards released CHANGELOG.md history against silent deletion. Runs
