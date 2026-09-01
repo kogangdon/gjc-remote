@@ -1239,6 +1239,11 @@ napi_value ReadVerifiedBytes(napi_env env, napi_callback_info info) {
   int parent_fd = -1;
   std::string name;
   if (!OpenParentNoFollow(path, &parent_fd, &name)) {
+    if (errno == ENOENT) {
+      napi_value absent;
+      napi_get_null(env, &absent);
+      return absent;
+    }
     Throw(env, "ERR_NATIVE_CONTROL_READ", "unable to open verified parent");
     return nullptr;
   }

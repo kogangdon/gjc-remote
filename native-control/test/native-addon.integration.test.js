@@ -345,6 +345,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   const initial = Buffer.from('{"phase":"prepared"}');
   const replacement = Buffer.from('{"phase":"committed"}');
   try {
+    assert.equal(
+      await addon.read_verified_bytes(join(root, "missing-parent", "missing-record.json")),
+      null,
+      "a missing verified parent is an absent record, not an I/O failure",
+    );
     await addon.create_absent_exclusive(destination, initial, ...roles, "authority");
     await addon.flush_file(destination);
     await addon.flush_directory_or_volume(root);
