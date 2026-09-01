@@ -349,6 +349,15 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
     await addon.flush_file(destination);
     await addon.flush_directory_or_volume(root);
     assert.deepEqual(Buffer.from(await addon.read_verified_bytes(destination)), initial);
+    await assert.rejects(
+      async () => addon.create_absent_exclusive(destination, replacement, ...roles, "authority"),
+      (error) => error?.code === "EEXIST",
+    );
+    assert.deepEqual(
+      Buffer.from(await addon.read_verified_bytes(destination)),
+      initial,
+      "no-replace collision preserves the exact existing destination",
+    );
     const destinationIdentity = await addon.read_identity(destination);
     assert.equal(destinationIdentity.owner, roles[0], "native identity proves authority file ownership by M");
     assert.ok(await addon.open_no_follow(destination));

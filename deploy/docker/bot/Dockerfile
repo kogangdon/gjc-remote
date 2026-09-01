@@ -28,6 +28,10 @@ LABEL org.opencontainers.image.title="gjc-remote bot" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libacl1 tini \
+    && groupadd --gid 1001 gjc-management \
+    && useradd --uid 1001 --gid 1001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin gjc-management \
+    && groupadd --gid 1002 gjc-recovery \
+    && useradd --uid 1002 --gid 1002 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin gjc-recovery \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

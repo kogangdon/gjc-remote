@@ -37,6 +37,8 @@ test("bot image pins Bun and Node indexes and never rebuilds signed native code"
   );
   assert.match(dockerfile, /verify-build\.mjs --require-signature/);
   assert.doesNotMatch(dockerfile, /node-gyp|npm run build|bun run build/);
+  assert.match(dockerfile, /useradd --uid 1001 .* gjc-management/);
+  assert.match(dockerfile, /useradd --uid 1002 .* gjc-recovery/);
   assert.match(dockerfile, /USER node/);
   assert.match(dockerfile, /ENTRYPOINT \["\/usr\/bin\/tini", "--"\]/);
   assert.match(dockerfile, /container-healthcheck\.js/);

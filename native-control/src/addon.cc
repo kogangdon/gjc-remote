@@ -1624,10 +1624,14 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   const bool renamed = RenameWindowsRelative(temporary, parent, name, false);
+  const DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
   if (!renamed) {
     const bool clean = discard();
     CloseHandle(parent);
     if (!clean) Refuse(env, "create_absent_exclusive", "failed temporary cleanup is ambiguous");
+    else if (rename_error == ERROR_ALREADY_EXISTS || rename_error == ERROR_FILE_EXISTS) {
+      Throw(env, "EEXIST", "absent-file destination already exists");
+    }
     else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "atomic no-replace publication failed");
     return nullptr;
   }
@@ -1711,6 +1715,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
   const bool linked = same_identity(temporary.c_str()) &&
       linkat(parent_fd, temporary.c_str(), parent_fd, name.c_str(), 0) == 0;
 #endif
+  const int link_error = linked ? 0 : errno;
   struct stat published{};
   const bool publication_verified = linked &&
       fstatat(parent_fd, name.c_str(), &published, AT_SYMLINK_NOFOLLOW) == 0 &&
@@ -1719,6 +1724,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     const bool clean = discard();
     close(parent_fd);
     if (!clean) Refuse(env, "create_absent_exclusive", "failed absent-file publication cleanup is ambiguous");
+    else if (link_error == EEXIST) Throw(env, "EEXIST", "absent-file destination already exists");
     else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to atomically publish durable exact-ACL absent file");
     return nullptr;
   }
