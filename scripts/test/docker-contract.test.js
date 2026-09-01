@@ -24,8 +24,17 @@ const dockerignore = normalizeLines(dockerignoreRaw);
 
 test("bot image pins Bun and Node indexes and never rebuilds signed native code", () => {
   assert.match(dockerfile, /oven\/bun:1\.3\.14@sha256:[0-9a-f]{64}/);
-  assert.match(dockerfile, /node:26\.8\.1-bookworm-slim@sha256:[0-9a-f]{64}/);
+  assert.match(dockerfile, /node:26\.8\.1-trixie-slim@sha256:[0-9a-f]{64}/);
   assert.match(dockerfile, /FROM native_control_bundle AS signed-native/);
+  assert.equal(
+    dockerfile.match(/COPY --chmod=0444 --from=signed-native/g)?.length,
+    3,
+    "every signed bundle artifact must be readable by the non-root runtime",
+  );
+  assert.match(
+    dockerfile,
+    /RUN chmod 0555 \.\/native-control\/build \.\/native-control\/build\/Release/,
+  );
   assert.match(dockerfile, /verify-build\.mjs --require-signature/);
   assert.doesNotMatch(dockerfile, /node-gyp|npm run build|bun run build/);
   assert.match(dockerfile, /USER node/);

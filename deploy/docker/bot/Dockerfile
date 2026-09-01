@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG BUN_IMAGE=oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4
-ARG NODE_IMAGE=node:26.8.1-bookworm-slim@sha256:367679cf9792759492a486e4aa4b421764d71a9546a6dae8aab81a99eb797b3e
+ARG NODE_IMAGE=node:26.8.1-trixie-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146
 
 FROM ${BUN_IMAGE} AS deps
 WORKDIR /app
@@ -38,9 +38,10 @@ COPY native-control/src ./native-control/src
 COPY native-control/scripts ./native-control/scripts
 COPY native-control/release-keys ./native-control/release-keys
 COPY shared ./shared
-COPY --from=signed-native /native_control.node ./native-control/build/Release/native_control.node
-COPY --from=signed-native /native-control.manifest.json ./native-control/build/Release/native-control.manifest.json
-COPY --from=signed-native /native-control.manifest.json.sig ./native-control/build/Release/native-control.manifest.json.sig
+COPY --chmod=0444 --from=signed-native /native_control.node ./native-control/build/Release/native_control.node
+COPY --chmod=0444 --from=signed-native /native-control.manifest.json ./native-control/build/Release/native-control.manifest.json
+COPY --chmod=0444 --from=signed-native /native-control.manifest.json.sig ./native-control/build/Release/native-control.manifest.json.sig
+RUN chmod 0555 ./native-control/build ./native-control/build/Release
 
 # This loads the platform-matched addon and verifies its committed contract,
 # digest, manifest, and production signature. Unsigned/self-signed bundles fail
