@@ -748,7 +748,7 @@ bool SplitParent(const std::string& path, std::string* parent, std::string* name
   return SafeName(*name);
 }
 int OpenDirectoryNoFollow(const std::string& path) {
-  if (path.empty()) return -1;
+  if (path.empty()) { errno = EINVAL; return -1; }
   const bool absolute = path[0] == '/';
   int fd = open(absolute ? "/" : ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) return -1;
@@ -757,7 +757,7 @@ int OpenDirectoryNoFollow(const std::string& path) {
     size_t end = path.find('/', start);
     std::string component = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
     if (!component.empty() && component != ".") {
-      if (!SafeName(component)) { close(fd); return -1; }
+      if (!SafeName(component)) { close(fd); errno = EINVAL; return -1; }
       int next = openat(fd, component.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (next < 0) { close(fd); return -1; }
       close(fd); fd = next;
@@ -769,7 +769,7 @@ int OpenDirectoryNoFollow(const std::string& path) {
 }
 bool OpenParentNoFollow(const std::string& path, int* parent_fd, std::string* name) {
   std::string parent;
-  if (!SplitParent(path, &parent, name)) return false;
+  if (!SplitParent(path, &parent, name)) { errno = EINVAL; return false; }
   *parent_fd = OpenDirectoryNoFollow(parent);
   return *parent_fd >= 0;
 }

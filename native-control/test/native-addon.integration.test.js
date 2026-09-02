@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { chmod, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { basename, join } from "node:path";
+import { basename, join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
@@ -349,6 +349,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
       await addon.read_verified_bytes(join(root, "missing-parent", "missing-record.json")),
       null,
       "a missing verified parent is an absent record, not an I/O failure",
+    );
+    await assert.rejects(
+      async () => addon.read_verified_bytes(`${root}${sep}`),
+      (error) => error?.code === "ERR_NATIVE_CONTROL_READ",
+      "a malformed empty final component must not inherit ENOENT and masquerade as absent",
     );
     await addon.create_absent_exclusive(destination, initial, ...roles, "authority");
     await addon.flush_file(destination);
