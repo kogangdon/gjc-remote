@@ -2081,7 +2081,6 @@ export class ManagementRuntime {
         !/^[a-f0-9]{64}$/.test(candidateTargetFingerprint)) {
       throw new Error("CANDIDATE_TARGET_PROOF_REQUIRED");
     }
-    const candidateIdentityFingerprint = predecessor.identityFingerprint;
     const candidateAclFingerprint = predecessor.aclFingerprint;
     const previousFingerprint = predecessor.targetFingerprint;
     const candidateAttestationFingerprint = operation === "tokens-attest"
@@ -2302,7 +2301,10 @@ export class ManagementRuntime {
     const actualSnapshotFingerprint = candidate.snapshot?.configFingerprint ?? candidate.snapshotFingerprint;
     const actualTargetSemanticFingerprint = candidate.snapshot ? canonicalJsonHash(candidate.snapshot) : candidate.targetFingerprint;
     if (candidate.targetFingerprint !== (candidate.snapshot ? request.candidateTargetFingerprint : predecessor.targetFingerprint) ||
-        candidate.identityFingerprint !== candidateIdentityFingerprint ||
+        // Atomic replacement intentionally changes the target inode/file identity.
+        // mappingTargetProof has already rebound the new identity into the exact
+        // managed envelope; comparing it to the predecessor makes every real
+        // mapping publication fail after a successful replace.
         candidate.aclFingerprint !== candidateAclFingerprint ||
         actualTargetSemanticFingerprint !== request.candidateTargetFingerprint ||
         actualSnapshotFingerprint !== request.candidateSnapshotFingerprint) {
