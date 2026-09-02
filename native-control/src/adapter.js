@@ -3850,7 +3850,6 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
             admissionGrant,
             admissionAck,
             readerProjection.readerProjectionFingerprint,
-            Date.now(),
           );
           await admissionRecordPreflight(
             'read_bound_reader_proof',
