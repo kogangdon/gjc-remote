@@ -51,8 +51,10 @@ Create two host files outside the repository and restrict them to the account
 running Docker:
 
 - Discord token: one UTF-8 line.
-- Host tokens: legacy `host:token,...` or managed LF-delimited `host=token`
-  records, matching the selected mapping authority.
+- Host-authentication tokens: legacy `host:token,...` or managed LF-delimited
+  `host=token` records. These authenticate daemon transport identity only;
+  routing still resolves exclusively through the authenticated mapping
+  authority.
 
 Set:
 

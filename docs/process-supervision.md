@@ -5,6 +5,20 @@ approval because the distributed binary is unsigned, and signed provenance remai
 any supervisor. See [ADR 0001](adr/0001-process-supervision.md) for the decision
 and [the pre-mortem](pre-mortem-process-supervision.md) for failure scenarios.
 Platform evidence remains scoped to the checks explicitly recorded below.
+
+| Platform path | Status | Repository artifact/evidence boundary |
+| --- | --- | --- |
+| Linux foreground | Available | Node/Bun process behavior only; not boot-managed |
+| Linux systemd | Approved design path | No checked-in unit templates, renderer, installer, or production boot/readiness evidence |
+| Windows foreground | Available on x64 | Node/Bun process behavior only; not boot-managed |
+| Windows Shawl | Evaluated candidate | v1.9.0 functional checks; unsigned binary and production identity/ACL evidence remain open |
+| Windows `sc.exe` | Documented degraded fallback | No checked-in installer/update/remove implementation |
+| macOS launchd | Unsupported | No native-control target, plist, installer, or platform evidence |
+
+Component-specific guidance is indexed in
+[deployment documentation](deployment/README.md). The explicit macOS boundary
+is in [the macOS deployment status](deployment/platforms/macos.md).
+
 ## Windows host support boundary
 
 The supported Windows deployment model is a dedicated host owned by the operator, with
@@ -34,15 +48,16 @@ Run one bot service on the bot host and one daemon service for each exact valid 
 
 ## Before installing
 
-1. Use a disposable host or a documented maintenance window. Confirm Node for the bot and Bun `>=1.3.14` plus the locked SDK for each daemon.
-2. Create dedicated least-privilege service accounts (`gjc-bot-svc`, `gjc-daemon-svc`) with “Log on as a service”. Do not use `LocalSystem` for a daemon. Provider login and profile setup must be performed as that identity so `HOME`/`~/.gjc` and work-directory session data are readable without copying credentials.
-3. Keep secrets in the component-local `.env` (`bot/.env` or `daemon/.env`) loaded by the existing `dotenv/config`. Do not put tokens, Discord credentials, provider credentials, prompts, or credential-bearing URLs in service metadata, command lines, journals, manifests, or evidence. Reject arbitrary dotenv paths and `DOTENV_CONFIG_PATH`; reject `BOT_WS_URL` userinfo, query, and fragment components.
+1. Use a disposable host or a documented maintenance window. Confirm Node `>=26` for the bot and Bun `>=1.3.14` plus the locked SDK for each daemon.
+2. Create dedicated least-privilege service accounts. Windows uses `gjc-bot-svc` and `gjc-daemon-svc` with “Log on as a service”; Linux systemd uses `gjc-bot` and `gjc-daemon`. Do not use `LocalSystem` for a daemon. Provider login and profile setup must be performed as that identity so `HOME`/`~/.gjc` and work-directory session data are readable without copying credentials.
+3. Use exactly one protected secret source for the deployment mode: component-local `.env` for foreground/Shawl, mode-0600 `/etc/gjc-remote/*.env` files for systemd, or external secret files for the bot container. Do not put tokens, Discord credentials, provider credentials, prompts, or credential-bearing URLs in service metadata, command lines, journals, manifests, or evidence. Reject arbitrary dotenv paths and `DOTENV_CONFIG_PATH`; reject `BOT_WS_URL` userinfo, query, and fragment components.
 4. Protect profiles, `.gjc`, env/channels files, `.gjc-remote-session`, logs, manifests, and journals with the service account/SYSTEM and documented administrator recovery access. Remove inherited `Users`/`Everyone` access. Keep debug off (`GJC_REMOTE_DEBUG=0`).
 5. Record the pre-existing journald storage/retention/disk policy on Linux. The default operation does not edit global journald configuration.
 
-### Foreground rollback
+### Foreground operational fallback
 
-These are the existing, universal fallback and a useful evidence baseline:
+These are the existing operational fallback and a useful process-level evidence
+baseline:
 
 ```text
 # from the repository root
@@ -50,7 +65,9 @@ cd bot    && node src/bot.js
 cd daemon && bun src/daemon.js   # Bun >= 1.3.14
 ```
 
-A foreground process is intentionally not boot-managed. Use it when a supervisor cannot satisfy ownership, stop, readiness, or evidence gates.
+A foreground process is intentionally not boot-managed. Use it when a supervisor
+cannot satisfy ownership, stop, readiness, or evidence gates. This does not roll
+back an application artifact, runtime, mapping authority, or durable state.
 
 ## Windows supervision
 ### Shawl v1.9.0 (selected primary)
@@ -203,7 +220,12 @@ is not included. NSSM is discarded; no NSSM archive/executable hash evidence app
 to this repository.
 Redact secrets, prompts, local credential paths, and private tokens from every artifact.
 
-Platform evidence is pending. Escalate rather than waive any provenance mismatch, active-child survival, ambiguous ownership, missing manual-cleanup record, stale readiness marker, journald global mutation, secret hit, or missing fault boundary. Option A foreground commands remain the safe rollback.
+Platform evidence is pending. Escalate rather than waive any provenance
+mismatch, active-child survival, ambiguous ownership, missing manual-cleanup
+record, stale readiness marker, journald global mutation, secret hit, or
+missing fault boundary. Foreground commands remain an operational fallback
+only; they do not roll back application artifacts, runtimes, mapping authority,
+or durable state.
 
 ## References
 
