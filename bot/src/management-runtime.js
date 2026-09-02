@@ -2576,6 +2576,7 @@ export class ManagementRuntime {
       }
       requireOwner(authenticate(await this.#authenticatedState(state), actorPrincipal, input.actorSecret));
       if (command === "recover") return this.#recoverPublicSuccessor(state, input, actorPrincipal);
+      let mutationInput = input;
       if (command === "mapping-reconcile") {
         let candidate;
         try {
@@ -2584,8 +2585,26 @@ export class ManagementRuntime {
           throw new Error("MAPPING_INVALID");
         }
         if (!validMappingCandidate(candidate) || candidate.mappingId !== input.mappingId) throw new Error("MAPPING_INVALID");
+        if (input.expectedRevision === null) {
+          const predecessor = await this.native.readRetainedTargetProof();
+          const snapshot = predecessor?.snapshot;
+          const genesisEmpty =
+            input.expectedFingerprint === null &&
+            predecessor?.sourceKind === "managed-v1" &&
+            snapshot?.targetState === "genesis-empty" &&
+            snapshot.revision === null &&
+            snapshot.authorityEpoch === null &&
+            snapshot.mappingGeneration === 0 &&
+            Object.keys(snapshot.mappings ?? {}).length === 0 &&
+            Object.keys(snapshot.routes ?? {}).length === 0 &&
+            state.mappingGeneration === 0 &&
+            Object.keys(state.mappings ?? {}).length === 0 &&
+            Object.keys(state.routes ?? {}).length === 0;
+          if (!genesisEmpty) throw new Error("CAS_CONFLICT");
+          mutationInput = { ...input, expectedRevision: state.revision };
+        }
       }
-      return this.#reserveSuccessor(command, input, state, actorPrincipal);
+      return this.#reserveSuccessor(command, mutationInput, state, actorPrincipal);
     });
   }
 

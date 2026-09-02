@@ -3999,7 +3999,11 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
         validateFinalityProof(storedProof, storedRequest, storedFinality, storedAck, storedProjection?.readerProjectionFingerprint ?? null);
         validateGenesisReceipt(storedReceipt, storedRequest, storedFinality, storedProof);
         if (storedRequest.requestedReaderMode === 'handshake') {
-          validateAdmissionGrant(admissionGrant, admissionRequest, Date.now());
+          validateAdmissionGrant(
+            admissionGrant,
+            admissionRequest,
+            managementState?.recovery?.phase === 'terminal' ? null : Date.now(),
+          );
           validateReaderProjection(storedProjection, readerVersionFloor, tokenFloor, storedFinality.zFinalityFingerprint);
           validateAdmissionAck(storedAck, admissionGrant, storedProjection.readerProjectionFingerprint);
           validateReaderRelations(storedReaderState, readerVersionFloor);
@@ -4040,7 +4044,7 @@ const fail = () => refused('write_publication_graph', 'exact acyclic publication
           managementState?.admission?.phase !== 'closed' ||
           managementState?.recovery?.txId !== storedRequest.genesisTxId ||
           managementState?.recovery?.requestFingerprint !== storedRequest.requestFingerprint ||
-          managementState?.recovery?.phase !== 'replaced') {
+          !['replaced', 'terminal'].includes(managementState?.recovery?.phase)) {
         return false;
       }
       if (storedRequest.requestedReaderMode === 'no-reader') {
