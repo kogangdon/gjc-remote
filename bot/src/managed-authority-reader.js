@@ -7,7 +7,7 @@ import { validateManagedChannelsV2, validateManagementEnvelope } from "@gjc-remo
 import { validateManualCleanup } from "@gjc-remote/shared/recovery-envelope";
 import { validatePublicationC, validatePublicationGraph as validateSharedPublicationGraph, validatePublicationK, validatePublicationP, validatePublicationQ, validatePublicationS, validatePublicationState, validatePublicationTransaction, validatePublicationU, validatePublicationY, validatePublicationZp } from "@gjc-remote/shared/publication-envelope";
 import { canonicalJson, canonicalJsonHash, isHex64, parseCanonicalJsonBytes } from "@gjc-remote/shared/strict-json";
-import { authoritySuccessorPreviousLeaseBindingFingerprint, buildAuthoritySuccessorRecord, validateAuthoritySuccessorBundle, validateManagedHistoryMarkerSeal as validateSharedHistoryMarkerSeal } from "@gjc-remote/shared/successor-envelope";
+import { authoritySuccessorPreviousLeaseBindingFingerprint, buildAuthoritySuccessorRecord, validateAuthoritySuccessorBundle, validateAuthoritySuccessorFinality, validateAuthoritySuccessorRequest, validateManagedHistoryMarkerSeal as validateSharedHistoryMarkerSeal } from "@gjc-remote/shared/successor-envelope";
 
 const WRAPPER_NAMES = new Set(["managed-v1-wrapper.json", "legacy-retained.json"]);
 const CONTROL_ROOT_NAME = "control-root.json";

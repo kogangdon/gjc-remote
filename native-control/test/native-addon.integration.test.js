@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { chmod, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { basename, join } from "node:path";
+import { basename, join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
@@ -345,10 +345,29 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   const initial = Buffer.from('{"phase":"prepared"}');
   const replacement = Buffer.from('{"phase":"committed"}');
   try {
+    assert.equal(
+      await addon.read_verified_bytes(join(root, "missing-parent", "missing-record.json")),
+      null,
+      "a missing verified parent is an absent record, not an I/O failure",
+    );
+    await assert.rejects(
+      async () => addon.read_verified_bytes(`${root}${sep}`),
+      (error) => error?.code === "ERR_NATIVE_CONTROL_READ",
+      "a malformed empty final component must not inherit ENOENT and masquerade as absent",
+    );
     await addon.create_absent_exclusive(destination, initial, ...roles, "authority");
     await addon.flush_file(destination);
     await addon.flush_directory_or_volume(root);
     assert.deepEqual(Buffer.from(await addon.read_verified_bytes(destination)), initial);
+    await assert.rejects(
+      async () => addon.create_absent_exclusive(destination, replacement, ...roles, "authority"),
+      (error) => error?.code === "EEXIST",
+    );
+    assert.deepEqual(
+      Buffer.from(await addon.read_verified_bytes(destination)),
+      initial,
+      "no-replace collision preserves the exact existing destination",
+    );
     const destinationIdentity = await addon.read_identity(destination);
     assert.equal(destinationIdentity.owner, roles[0], "native identity proves authority file ownership by M");
     assert.ok(await addon.open_no_follow(destination));

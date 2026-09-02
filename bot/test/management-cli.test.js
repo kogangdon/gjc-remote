@@ -96,6 +96,19 @@ test("management CLI accepts idempotency keys for successor and auth mutations a
   assert.throws(() => parseManagementArgs(["tokens-attest", ...auth, "--host-tokens", "secret", ...key]), /USAGE_INVALID_ARGUMENT/);
   assert.throws(() => parseManagementArgs(["mapping-reconcile", ...auth, "--mapping-id", "map", "--expected-revision", "01", "--expected-fingerprint", "a".repeat(64), ...key]), /USAGE_EXPECTED_REVISION_INVALID/);
 });
+test("management CLI represents the Genesis-empty CAS boundary explicitly", () => {
+  const parsed = parseManagementArgs([
+    "mapping-reconcile",
+    "--actor-principal", "uid:1001",
+    "--actor-secret-stdin", "true",
+    "--mapping-id", "map",
+    "--expected-revision", "null",
+    "--expected-fingerprint", "null",
+    "--idempotency-key", "first-mapping",
+  ]);
+  assert.equal(parsed.input.expectedRevision, null);
+  assert.equal(parsed.input.expectedFingerprint, null);
+});
 test("management CLI requires an explicit bound reader tuple and rollback generation", () => {
   const auth = ["--actor-principal", "sid:S-1-5-18", "--actor-secret-stdin", "true"];
   assert.throws(() => parseManagementArgs(["genesis", ...auth, "--idempotency-key", "genesis-001", "--requested-reader-mode", "handshake"]), /USAGE_GENESIS_ROLES_REQUIRED|USAGE_READER_BINDING_INVALID/);

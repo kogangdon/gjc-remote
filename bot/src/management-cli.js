@@ -71,10 +71,15 @@ export function parseManagementArgs(argv) {
   if (input.botPrincipal) input.botPrincipal = parsePrincipal(input.botPrincipal, "BOT_PRINCIPAL");
   if (input.recoveryPrincipal) input.recoveryPrincipal = parsePrincipal(input.recoveryPrincipal, "RECOVERY_PRINCIPAL");
   if (input.expectedRevision !== undefined) {
-    if (!/^(0|[1-9][0-9]*)$/.test(input.expectedRevision)) throw new Error("USAGE_EXPECTED_REVISION_INVALID");
-    input.expectedRevision = Number(input.expectedRevision);
-    if (!Number.isSafeInteger(input.expectedRevision)) throw new Error("USAGE_EXPECTED_REVISION_INVALID");
+    if (input.expectedRevision === "null") {
+      input.expectedRevision = null;
+    } else {
+      if (!/^(0|[1-9][0-9]*)$/.test(input.expectedRevision)) throw new Error("USAGE_EXPECTED_REVISION_INVALID");
+      input.expectedRevision = Number(input.expectedRevision);
+      if (!Number.isSafeInteger(input.expectedRevision)) throw new Error("USAGE_EXPECTED_REVISION_INVALID");
+    }
   }
+  if (input.expectedFingerprint === "null") input.expectedFingerprint = null;
   if (input.priorGeneration !== undefined) {
     if (!/^[1-9][0-9]*$/.test(input.priorGeneration)) throw new Error("USAGE_PRIOR_GENERATION_INVALID");
     input.priorGeneration = Number(input.priorGeneration);

@@ -157,6 +157,27 @@ async function boundReaderRuntime({ complete = true } = {}) {
   }
   return { ...harness, runtime, input, request, floor, zFinality, grant, fence, lease, projection, readerState };
 }
+test('terminal Genesis proof remains reopenable after its admission grant expires', async () => {
+  const harness = await boundReaderRuntime({ complete: true });
+  const request = JSON.parse(fileEnding(harness.files, '/genesis-request.json'));
+  const grant = JSON.parse(fileEnding(harness.files, '/admission-grant.json'));
+  const evidence = {
+    request,
+    zFinality: JSON.parse(fileEnding(harness.files, '/z-finality.json')),
+    readerProjection: JSON.parse(fileEnding(harness.files, '/bot-state/reader-projection.json')),
+    admissionAck: JSON.parse(fileEnding(harness.files, '/bot-state/acknowledgement.json')),
+    finalityProof: JSON.parse(fileEnding(harness.files, '/rvf.json')),
+    receipt: JSON.parse(fileEnding(harness.files, '/receipt.json')),
+  };
+  harness.setPrincipal(owner);
+  const originalNow = Date.now;
+  Date.now = () => grant.expiresAt + 1;
+  try {
+    assert.equal(await harness.native.recheckAdmissionFinality(evidence), true);
+  } finally {
+    Date.now = originalNow;
+  }
+});
 test('bot write refuses fail-closed with zero writes when bot-state is absent after Genesis provisioning', async () => {
   const { native, setPrincipal, directories, writes, lease } = await boundReaderRuntime({ complete: false });
   // Genesis already provisioned bot-state as M (the control-root-adjacent directory). Simulate it
@@ -911,6 +932,24 @@ test('mapping reconcile creates successor authority rather than lifecycle refusa
     mappingId: candidate.mapping.mappingId, ...candidate, expectedRevision: beforeState.revision, expectedFingerprint: null,
   });
   assert.notEqual(result.error, 'MAPPING_LIFECYCLE_UNAVAILABLE');
+  assert.equal(result.routeDisposition, 'no-route');
+});
+test('first mapping resolves the explicit Genesis-empty CAS sentinel under the management lock', async () => {
+  const { native } = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+  const candidate = mappingInput('first-workspace-map');
+  const result = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'first-mapping-successor',
+    mappingId: candidate.mapping.mappingId,
+    ...candidate,
+    expectedRevision: null,
+    expectedFingerprint: null,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.pending, false);
   assert.equal(result.routeDisposition, 'no-route');
 });
 test('no-reader mapping successors reach the terminal graph with exact lineage and replay through recovery', async () => {

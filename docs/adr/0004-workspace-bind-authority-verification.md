@@ -97,7 +97,12 @@ otherwise unchanged.
 verification failure the daemon fails closed (returns false), logs the code, and
 dispatches `close(1008, <BIND_AUTHORITY_* code>)`. Shape, guard, capacity,
 fencing, and lease failures retain the generic
-`close(1008, "invalid workspace binding")` reason.
+`close(1008, "invalid workspace binding")` reason. The RFC 6455 policy status
+`1008` is the portable wire contract; the UTF-8 close reason is diagnostic.
+Bun 1.3.14 on Linux arm64 can deliver the status while omitting that reason, so
+integration tests require `1008` and validate the reason whenever the runtime
+preserves it. The verifier unit tests remain authoritative for the exact
+failure-code classification.
 
 ## Residual trust
 

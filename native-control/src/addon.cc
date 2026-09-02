@@ -748,7 +748,7 @@ bool SplitParent(const std::string& path, std::string* parent, std::string* name
   return SafeName(*name);
 }
 int OpenDirectoryNoFollow(const std::string& path) {
-  if (path.empty()) return -1;
+  if (path.empty()) { errno = EINVAL; return -1; }
   const bool absolute = path[0] == '/';
   int fd = open(absolute ? "/" : ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) return -1;
@@ -757,7 +757,7 @@ int OpenDirectoryNoFollow(const std::string& path) {
     size_t end = path.find('/', start);
     std::string component = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
     if (!component.empty() && component != ".") {
-      if (!SafeName(component)) { close(fd); return -1; }
+      if (!SafeName(component)) { close(fd); errno = EINVAL; return -1; }
       int next = openat(fd, component.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (next < 0) { close(fd); return -1; }
       close(fd); fd = next;
@@ -769,7 +769,7 @@ int OpenDirectoryNoFollow(const std::string& path) {
 }
 bool OpenParentNoFollow(const std::string& path, int* parent_fd, std::string* name) {
   std::string parent;
-  if (!SplitParent(path, &parent, name)) return false;
+  if (!SplitParent(path, &parent, name)) { errno = EINVAL; return false; }
   *parent_fd = OpenDirectoryNoFollow(parent);
   return *parent_fd >= 0;
 }
@@ -1239,6 +1239,11 @@ napi_value ReadVerifiedBytes(napi_env env, napi_callback_info info) {
   int parent_fd = -1;
   std::string name;
   if (!OpenParentNoFollow(path, &parent_fd, &name)) {
+    if (errno == ENOENT) {
+      napi_value absent;
+      napi_get_null(env, &absent);
+      return absent;
+    }
     Throw(env, "ERR_NATIVE_CONTROL_READ", "unable to open verified parent");
     return nullptr;
   }
@@ -1624,10 +1629,14 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   const bool renamed = RenameWindowsRelative(temporary, parent, name, false);
+  const DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
   if (!renamed) {
     const bool clean = discard();
     CloseHandle(parent);
     if (!clean) Refuse(env, "create_absent_exclusive", "failed temporary cleanup is ambiguous");
+    else if (rename_error == ERROR_ALREADY_EXISTS || rename_error == ERROR_FILE_EXISTS) {
+      Throw(env, "EEXIST", "absent-file destination already exists");
+    }
     else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "atomic no-replace publication failed");
     return nullptr;
   }
@@ -1711,6 +1720,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
   const bool linked = same_identity(temporary.c_str()) &&
       linkat(parent_fd, temporary.c_str(), parent_fd, name.c_str(), 0) == 0;
 #endif
+  const int link_error = linked ? 0 : errno;
   struct stat published{};
   const bool publication_verified = linked &&
       fstatat(parent_fd, name.c_str(), &published, AT_SYMLINK_NOFOLLOW) == 0 &&
@@ -1719,6 +1729,7 @@ napi_value CreateAbsentExclusive(napi_env env, napi_callback_info info) {
     const bool clean = discard();
     close(parent_fd);
     if (!clean) Refuse(env, "create_absent_exclusive", "failed absent-file publication cleanup is ambiguous");
+    else if (link_error == EEXIST) Throw(env, "EEXIST", "absent-file destination already exists");
     else Throw(env, "ERR_NATIVE_CONTROL_CREATE", "unable to atomically publish durable exact-ACL absent file");
     return nullptr;
   }
