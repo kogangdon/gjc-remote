@@ -11,16 +11,21 @@ const composePath = fileURLToPath(
   new URL("../../deploy/docker/bot/compose.yaml", import.meta.url)
 );
 const dockerignorePath = fileURLToPath(new URL("../../.dockerignore", import.meta.url));
+const deploymentReadmePath = fileURLToPath(
+  new URL("../../deploy/docker/bot/README.md", import.meta.url)
+);
 
-const [dockerfileRaw, composeRaw, dockerignoreRaw] = await Promise.all([
+const [dockerfileRaw, composeRaw, dockerignoreRaw, deploymentReadmeRaw] = await Promise.all([
   readFile(dockerfilePath, "utf8"),
   readFile(composePath, "utf8"),
   readFile(dockerignorePath, "utf8"),
+  readFile(deploymentReadmePath, "utf8"),
 ]);
 const normalizeLines = (value) => value.replaceAll("\r\n", "\n");
 const dockerfile = normalizeLines(dockerfileRaw);
 const compose = normalizeLines(composeRaw);
 const dockerignore = normalizeLines(dockerignoreRaw);
+const deploymentReadme = normalizeLines(deploymentReadmeRaw);
 
 test("bot image pins Bun and Node indexes and never rebuilds signed native code", () => {
   assert.match(dockerfile, /oven\/bun:1\.3\.14@sha256:[0-9a-f]{64}/);
@@ -68,6 +73,13 @@ test("Compose hardens only the bot and keeps control-plane publication private",
   assert.match(compose, /host_ip: \$\{GJC_BOT_BIND_ADDRESS:-127\.0\.0\.1\}/);
   assert.match(compose, /native_control_bundle: \$\{GJC_NATIVE_CONTROL_BUNDLE_DIR:\?/);
   assert.doesNotMatch(compose, /docker\.sock|privileged:\s*true|network_mode:\s*host/);
+});
+
+test("deployment rollback never rewinds committed authority state", () => {
+  assert.match(deploymentReadme, /only\s+when the recorded authority values and tree fingerprint are byte-for-byte\s+unchanged/);
+  assert.match(deploymentReadme, /Once the candidate commits an authority successor or advances any durable\s+floor, downgrade is closed/);
+  assert.match(deploymentReadme, /never restore an older volume snapshot to rewind monotonic\s+authority state/);
+  assert.match(deploymentReadme, /A native startup self-test is not rollback proof/);
 });
 
 test("contract fixture paths resolve inside the repository", () => {

@@ -114,10 +114,23 @@ bot process exposes its Discord and host tokens.
 1. Record the current image digest and signed native bundle fingerprints.
 2. Pull/build the candidate for the same architecture and verify the signature
    gate.
-3. Run `docker compose config --quiet`, then recreate only `bot`.
-4. Confirm TCP health, Discord login, mappings, and daemon registrations.
-5. On failure, restore the prior image digest and its matched signed native
-   bundle. Never combine an image with a different addon/manifest/signature.
+3. Quiesce management writes and record the authority head, revision, epoch,
+   fence generation, token and mapping generations, and a full-tree
+   fingerprint.
+4. Run `docker compose config --quiet`, then recreate only `bot`.
+5. Confirm TCP health, Discord login, mappings, and daemon registrations.
+6. Restore the prior image digest and its matched signed native bundle only
+   when the recorded authority values and tree fingerprint are byte-for-byte
+   unchanged, proving that the candidate committed no authority successor.
+   Never combine an image with a different addon/manifest/signature.
+
+Once the candidate commits an authority successor or advances any durable
+floor, downgrade is closed. Never start an older reader against that live
+volume and never restore an older volume snapshot to rewind monotonic
+authority state. Retain snapshots only for audit or isolated recovery, and
+roll forward to a current-or-newer image that validates the committed state.
+A native startup self-test is not rollback proof; the managed authority reader
+must validate before the prior image is considered safe to restore.
 
 Logs go to the Docker logging driver and must be collected by the operator.
 Secret values and host paths must not be copied into support bundles.
