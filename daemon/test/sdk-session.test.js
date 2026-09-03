@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import test from "node:test";
 
 import {
   SdkSession,
   applyConfiguredModelProfile,
   createSdkSession,
+  resolveSdkSessionDirectory,
 } from "../src/sdk-session.js";
 import { V0_LIMITS, isGateRequestEvent } from "@gjc-remote/shared";
 
@@ -212,6 +213,83 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.strictEqual(activateOptions.settings, agent.settings);
   assert.deepEqual(activateApplyOptions, { persistDefault: false });
   await session.dispose();
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("resolveSdkSessionDirectory preserves the native workDir session directory by default", () => {
+  assert.equal(
+    resolveSdkSessionDirectory("/workspace"),
+    join("/workspace", ".gjc-remote-session")
+  );
+});
+
+test("resolveSdkSessionDirectory derives opaque deterministic container directories", () => {
+  const sessionRoot = resolve("container-sessions");
+  const first = resolveSdkSessionDirectory("/workspace/one", sessionRoot);
+  const firstAgain = resolveSdkSessionDirectory("/workspace/one", sessionRoot);
+  const second = resolveSdkSessionDirectory("/workspace/two", sessionRoot);
+
+  assert.equal(first, firstAgain);
+  assert.notEqual(first, second);
+  assert.equal(isAbsolute(first), true);
+  assert.equal(relative(sessionRoot, first).startsWith(".."), false);
+  assert.equal(first.includes("workspace"), false);
+  assert.match(first.slice(sessionRoot.length + 1), /^[a-f0-9]{64}$/);
+});
+
+test("resolveSdkSessionDirectory rejects invalid container session roots", () => {
+  for (const sessionRoot of ["relative-sessions", "", null, 1]) {
+    assert.throws(
+      () => resolveSdkSessionDirectory("/workspace", sessionRoot),
+      /sessionRoot must be an absolute path/
+    );
+  }
+});
+
+test("createSdkSession passes the configured container session directory to SessionManager", async () => {
+  const agent = new FakeAgentSession();
+  const sessionRoot = resolve("container-sessions");
+  let sessionDir;
+  const sdk = {
+    Settings: {
+      async init() {
+        return { async cloneForCwd() { return agent.settings; } };
+      },
+    },
+    SessionManager: {
+      create(workDir, directory) {
+        sessionDir = directory;
+        return { workDir, sessionDir: directory };
+      },
+    },
+    async createAgentSession(options) {
+      agent.settings = options.settings;
+      return { session: agent };
+    },
+    async activateModelProfile() {},
+  };
+
+  const session = await createSdkSession("/workspace", async () => sdk, { sessionRoot });
+
+  assert.equal(sessionDir, resolveSdkSessionDirectory("/workspace", sessionRoot));
+  await session.dispose();
+});
+
+test("createSdkSession rejects invalid container session roots without loading the SDK", async () => {
+  let loadCalls = 0;
+
+  await assert.rejects(
+    createSdkSession(
+      "/workspace",
+      async () => {
+        loadCalls += 1;
+        throw new Error("SDK should not load");
+      },
+      { sessionRoot: "relative-sessions" }
+    ),
+    /sessionRoot must be an absolute path/
+  );
+  assert.equal(loadCalls, 0);
 });
 
 test("SDK adapter forwards prompt events and preserves model command receipts", async () => {

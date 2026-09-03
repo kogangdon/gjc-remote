@@ -84,6 +84,9 @@ import {
 } from "./workspace-lease-registry.js";
 import { isLeaseBoundaryRejection } from "./readiness-classification.js";
 import { RequestIdFence } from "./request-id-fence.js";
+import { resolveDaemonConnectionConfig } from "./daemon-config.js";
+import { ROLE_PATHS } from "./container-security-preflight.js";
+import { createSdkSession } from "./sdk-session.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -95,12 +98,21 @@ import {
 } from "./reconnect.js";
 import { assertNoRemovedDevFlags } from "./workspace-removed-flags.js";
 
-const { HOST_ID, HOST_TOKEN, HOST_LABEL, BOT_WS_URL } = process.env;
-
-if (!HOST_ID || !HOST_TOKEN || !BOT_WS_URL) {
-  console.error("Missing HOST_ID, HOST_TOKEN, or BOT_WS_URL in environment (.env).");
+let daemonConnectionConfig;
+try {
+  daemonConnectionConfig = await resolveDaemonConnectionConfig({
+    env: process.env,
+  });
+} catch {
+  console.error("daemon: connection configuration is invalid");
   process.exit(1);
 }
+const {
+  hostId: HOST_ID,
+  token: HOST_TOKEN,
+  hostLabel: HOST_LABEL,
+  botWsUrl: BOT_WS_URL,
+} = daemonConnectionConfig;
 
 // Fail closed at boot if a retired interim dev flag lingers in the environment
 // (GJC_DEV_NATIVE_SINGLE_WRITER_LOCK / GJC_DEV_CONNECTIVITY_PROBE). Presence-based
@@ -122,9 +134,12 @@ function readBotWsUrlCredentials(value) {
 }
 
 const daemonSensitiveValues = [
+  BOT_WS_URL,
   HOST_TOKEN,
   ...readBotWsUrlCredentials(BOT_WS_URL),
-].filter((value) => typeof value === "string" && value.length > 0);
+]
+  .filter((value) => typeof value === "string" && value.length > 0)
+  .sort((left, right) => right.length - left.length);
 
 function sanitizeDaemonError(error) {
   return sanitizeErrorMessage(error, daemonSensitiveValues);
@@ -389,7 +404,15 @@ try {
   process.exit(1);
 }
 
-const pool = new SessionPool({ sensitiveValues: daemonSensitiveValues });
+const containerSessionRoot =
+  process.env.GJC_CONTAINER_RUNTIME === "1" ? ROLE_PATHS.session : undefined;
+const pool = new SessionPool({
+  sensitiveValues: daemonSensitiveValues,
+  sessionFactory: (workDir) =>
+    createSdkSession(workDir, undefined, {
+      sessionRoot: containerSessionRoot,
+    }),
+});
 const admissionBudget = new AdmissionBudget();
 const workspaceLeases = new WorkspaceLeaseRegistry({
   maxActiveWorkspaces: DEFAULT_MAX_ACTIVE_WORKSPACES,

@@ -249,8 +249,40 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     capabilities,
     capabilitySignatures,
   };
+  let preverifiedManifest;
+  let preverifiedManifestBytes;
+  let preverifiedSignature;
+  if (process.argv.includes('--require-signature') &&
+      !process.argv.includes('--write-manifest')) {
+    if (!existsSync(manifestPath)) {
+      fail('native-control.manifest.json is missing');
+    } else {
+      try {
+        preverifiedManifestBytes = readFileSync(manifestPath);
+        preverifiedManifest = JSON.parse(preverifiedManifestBytes.toString('utf8'));
+      } catch {
+        fail('manifest is not valid JSON');
+      }
+      if (preverifiedManifest) {
+        if (JSON.stringify(Object.keys(preverifiedManifest).sort()) !==
+            JSON.stringify(Object.keys(expected).sort())) {
+          fail('manifest keys do not match the exact local contract');
+        }
+        for (const [key, value] of Object.entries(expected)) {
+          if (JSON.stringify(preverifiedManifest[key]) !== JSON.stringify(value)) {
+            fail(`manifest ${key} does not match the local addon`);
+          }
+        }
+        if (!process.exitCode) {
+          preverifiedSignature = enforceRequiredSignature(preverifiedManifestBytes);
+        }
+      }
+    }
+  }
   let loaded;
-  try { loaded = require(addon); } catch { fail('native_control.node could not be loaded'); }
+  if (!process.exitCode) {
+    try { loaded = require(addon); } catch { fail('native_control.node could not be loaded'); }
+  }
   if (loaded) {
     for (const name of capabilities) if (typeof loaded[name] !== 'function') fail(`native capability ${name} is missing`);
     let contract;
@@ -278,9 +310,11 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
   } else if (!existsSync(manifestPath)) {
     fail('native-control.manifest.json is missing');
   } else {
-    let actual;
-    let manifestBytes;
-    try { manifestBytes = readFileSync(manifestPath); actual = JSON.parse(manifestBytes.toString('utf8')); } catch { fail('manifest is not valid JSON'); process.exit(); }
+    let actual = preverifiedManifest;
+    let manifestBytes = preverifiedManifestBytes;
+    if (!actual) {
+      try { manifestBytes = readFileSync(manifestPath); actual = JSON.parse(manifestBytes.toString('utf8')); } catch { fail('manifest is not valid JSON'); process.exit(); }
+    }
     if (JSON.stringify(Object.keys(actual).sort()) !== JSON.stringify(Object.keys(expected).sort())) {
       fail('manifest keys do not match the exact local contract');
     }
@@ -288,7 +322,8 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
       if (JSON.stringify(actual[key]) !== JSON.stringify(value)) fail(`manifest ${key} does not match the local addon`);
     }
     const signInfo = writeSignatureSidecar(manifestBytes);
-    const verifyInfo = process.exitCode ? undefined : enforceRequiredSignature(manifestBytes);
+    const verifyInfo = preverifiedSignature ??
+      (process.exitCode ? undefined : enforceRequiredSignature(manifestBytes));
     printSuccessReceipt({ manifestRewritten: false, addonSha256: expected.sha256, signInfo, verifyInfo });
   }
 }

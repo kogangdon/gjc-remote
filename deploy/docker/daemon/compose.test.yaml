@@ -1,0 +1,97 @@
+# Test-only same-host fixture. This is not a production deployment topology.
+services:
+  bot-fixture:
+    build:
+      context: ../../..
+      dockerfile: deploy/docker/daemon/Dockerfile
+      target: fixture-relay
+    read_only: true
+    user: "1004:1004"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp.json
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=1777
+    environment:
+      FIXTURE_HOST_TOKEN_FILE: /run/secrets/host_token
+    secrets:
+      - source: host_token
+        target: host_token
+        uid: "1004"
+        gid: "1004"
+        mode: 0400
+    networks:
+      - control
+
+  daemon:
+    image: ${GJC_DAEMON_IMAGE:?set GJC_DAEMON_IMAGE to an independently built signed daemon image}
+    pull_policy: never
+    restart: "on-failure:5"
+    stop_grace_period: 30s
+    read_only: true
+    user: "1004:1004"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp.json
+    pids_limit: 256
+    mem_limit: 8g
+    cpus: 4.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    environment:
+      HOST_ID: daemon-compose-fixture
+      HOST_LABEL: daemon-compose-fixture
+      HOST_TOKEN_FILE: /run/secrets/host_token
+      BOT_WS_URL: ws://bot-fixture:7711
+      GJC_CONTAINER_RUNTIME: "1"
+      GJC_DAEMON_SESSION_ROOT: /var/lib/gjc-remote/sessions
+      GJC_DAEMON_STATE_ROOT: /var/lib/gjc-remote/state
+      GJC_NATIVE_WORKSPACE_ROOT: /workspaces
+      GJC_NATIVE_INVENTORY_MODE: "off"
+      GJC_NATIVE_WORKSPACE_SERVING: "0"
+      GJC_READINESS_V2: "1"
+      GJC_SHUTDOWN_TIMEOUT_MS: "15000"
+    secrets:
+      - source: host_token
+        target: host_token
+        uid: "1004"
+        gid: "1004"
+        mode: 0400
+    volumes:
+      - type: volume
+        source: workspace
+        target: /workspaces
+      - type: volume
+        source: sessions
+        target: /var/lib/gjc-remote/sessions
+      - type: volume
+        source: provider
+        target: /home/gjc/.gjc
+      - type: volume
+        source: state
+        target: /var/lib/gjc-remote/state
+    networks:
+      - control
+    depends_on:
+      - bot-fixture
+
+networks:
+  control:
+    internal: true
+
+volumes:
+  workspace:
+  sessions:
+  provider:
+  state:
+
+secrets:
+  host_token:
+    file: ${GJC_DAEMON_HOST_TOKEN_FILE:?set GJC_DAEMON_HOST_TOKEN_FILE}

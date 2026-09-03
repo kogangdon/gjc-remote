@@ -215,9 +215,20 @@ egress, provider/session/state persistence, `restart: on-failure`, and
 `stop_grace_period > GJC_SHUTDOWN_TIMEOUT_MS`. Unsupported engines/platforms or failed preflight
 refuse to start. Docker cannot claim tenant isolation.
 
-#42 owns rendered deployment documentation, grace/rollback/supervisor behavior, and platform
- evidence. #45 owns bot image/runtime/network/readiness-consumer guidance. Neither may redefine the
- daemon contract.
+#42 owns rendered deployment documentation and production
+rollback/supervisor/platform guidance. #54 owns fixture restart, grace,
+persistence, egress, and cleanup mechanics plus their executable tests. #45
+owns bot image/runtime/network/readiness-consumer guidance. None may redefine
+the daemon contract.
+
+The Phase 3 implementation is rooted at `deploy/docker/daemon/`: a digest-pinned
+Bun image requiring an externally signed native-control bundle, a hard
+container preflight, a checked-in seccomp profile, and a test-only Compose
+fixture. The fixture keeps inventory and serving off, stores new container
+sessions in the dedicated session role without migrating native histories, and
+uses an internal network for private registration plus denied external egress.
+Published image provenance, positive workspace-serving E2E, SBOM/scanning,
+attestation, and supported-platform promotion remain Phase 4 obligations.
 
 ## Phase 4 — release evidence checklist
 
@@ -228,11 +239,12 @@ Every verification-matrix evidence layer and non-negotiable gate must close befo
   provider recovery, remap fencing, and cleanup;
 - image/base/source/lock/SDK digests, SBOM, scan, signature/attestation, volume manifests, copied or
   hybrid receipt rejection, secret/control/path sentinel scans, and manual-cleanup evidence;
-- structured events/gauges, `/hosts` snapshots, supervisor/application timelines, and restart/grace
-  evidence including signal exit 0, fatal non-zero, no provider/registration restart storm, and
-  effective grace after overrides;
-- disposable Compose cleanup, Windows/UNC containment evidence, platform evidence from #42/#45,
-  protocol retirement decision, and explicit no-tenant-isolation boundary.
+- consume the Phase 3 restart/grace receipt, then add structured events/gauges, `/hosts` snapshots,
+  supervisor/application timelines, fatal non-zero and no provider/registration restart-storm
+  evidence, and effective production grace after overrides;
+- consume the Phase 3 disposable-Compose cleanup receipt, then add Windows/UNC containment evidence,
+  platform evidence from #42/#45, protocol retirement decisions, and the explicit
+  no-tenant-isolation promotion boundary.
 
 Any missing or failed gate is a hard no-promotion result; interim feature flags are rejected.
 
@@ -247,7 +259,7 @@ not authorize any behavior more permissive than the phase contracts above.
 **Serving is env-gated and OFF by default.** The native inventory contract (config modes, five-role
 bindings, the durable D floor, the live invalidation cascade, and the bot receipt binding/observability
 surface) is implemented as capability scaffolding. Native workspace serving is now a fail-closed
-runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:258)
+runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:273)
 as an `= resolveNativeServingEnabled({ env, inventoryReceiptAdvertised })`
 call, which is `true` only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 equals `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the default)
@@ -346,7 +358,8 @@ PER_INVOKE_MEMORY_ESTIMATE_MB) + FIXED_DAEMON_BASELINE_MB) * CGROUP_MEMORY_HEADR
 ceilings sourced from their single points of definition. `daemon/test/cgroup-headroom.linux.test.js`
 asserts this arithmetic inequality unconditionally on every platform and, on Linux only, additionally
 reads the process's actual cgroup memory limit and asserts it meets the declared minimum (or skips
-with a diagnostic when unbounded/absent). Runtime cgroup enforcement remains Phase 3 / #42 scope.
+with a diagnostic when unbounded/absent). The Phase 3 container preflight now
+enforces that minimum against the live cgroup before the daemon import.
 
 This is as-built status reconciliation only. It does not authorize native workspace serving, does not
 weaken any Phase 1-4 gate above, and does not make local inventory a route or mapping authority: the
