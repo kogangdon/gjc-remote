@@ -12,8 +12,9 @@ Discord-controlled remote GJC sessions.
 >
 > Management mapping control-plane operations are documented in
 > [`docs/management-mapping-envelope.md`](docs/management-mapping-envelope.md).
-> They require a verified native capability; native serving and readiness remain
-> blocked and are outside #44.
+> They require a verified native capability, but mapping verification alone
+> never enables serving. Native serving is a separate, default-off daemon
+> opt-in with additional receipt and lifecycle gates.
 
 ## Architecture
 
@@ -73,7 +74,20 @@ loop (current SDK 0.12.21)" for the full model and the subprocess option
 > major with a structured `unsupported_node_version` fatal instead of risking
 > that crash. Install Node 26+ before running the bot outside Bun.
 
-## Setup
+## Deployment
+
+| Component | Native Linux | Native Windows | macOS | Docker |
+| --- | --- | --- | --- | --- |
+| Bot | Documented | Documented with supervisor limitations | Unsupported native-control target | Linux release candidate |
+| Daemon | Documented | Documented for x64 with supervisor limitations | Unsupported native-control target | Design only; no runnable image |
+
+Start with the [deployment index](docs/deployment/README.md), then use the
+[bot](docs/deployment/bot.md), [daemon](docs/deployment/daemon.md), and
+[workspace/path](docs/deployment/workspaces-and-paths.md) guides. Platform and
+Docker status is recorded there without promoting design-only or unevidenced
+paths.
+
+## Local quick start
 
 Install the repository prerequisites before running `bun install`:
 
@@ -131,7 +145,10 @@ bun install   # installs all workspaces (bot, daemon, shared, native-control) fr
 
 # On the always-on bot host:
 cp bot/.env.example bot/.env        # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, HOST_TOKENS, GJC_BOT_ALLOWED_USERS
+# Isolated legacy/local quick start only:
 cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {hostId, workDir}
+# Production deployments use the authenticated management authority documented
+# in docs/management-mapping-envelope.md. Never hand-edit managed channels.json.
 # Windows only, management-mapping writes (issue #44): native-control's
 # assertConfigParentOwner refuses to write unless the directory holding
 # channels.json (bot/, or the CHANNELS_CONFIG target's directory) is owned by
@@ -188,10 +205,11 @@ shells out to the `node src/bot.js` package script on PATH.
   `GJC_READINESS_V2=1` enables the opt-in protocol v2 workspace-readiness
   advertisement. `GJC_READINESS_TTL_MS` sets the bounded readiness TTL from
   1,000 through 60,000 milliseconds (default 60,000); it has no effect on
-  whether v2 is advertised. Readiness remains a contract/test-scaffolding
-  feature and does not authorize native workspace serving. With this branch,
-  v2 readiness can report state but workspace invokes remain fail-closed with
-  `RUNTIME_INCOMPATIBLE` until the native-serving boundary is approved.
+  whether v2 is advertised. Readiness alone does not authorize native workspace
+  serving. Serving is default-off and requires the exact
+  `GJC_NATIVE_WORKSPACE_SERVING=1` opt-in plus a production inventory receipt;
+  each lifecycle operation keeps its own fail-closed dependency gates. See the
+  [daemon deployment guide](docs/deployment/daemon.md).
 
 ## Provider authentication (e.g. GitHub Copilot)
 
@@ -209,11 +227,14 @@ The saved token in `~/.gjc` is reused by every SDK session the daemon creates.
 Once authenticated, that provider's models appear in `/model` resolution and can
 be selected via exact `provider:modelId` or a unique name/ID fragment.
 
-Each `channels.json` route must contain exactly `hostId` and `workDir`.
+Each legacy/local `channels.json` route must contain exactly `hostId` and
+`workDir`.
 `hostId` must have a matching `HOST_TOKENS` entry, and `workDir` must be a
 fully-qualified path native to that daemon host (for example,
-`C:/projects/foo` on Windows or `/srv/apps/foo` on Linux/macOS). Relative paths
-and extra route fields are rejected.
+`C:/projects/foo` on Windows or `/srv/apps/foo` on Linux). Relative paths
+and extra route fields are rejected. Production managed routes are generated
+only by the authenticated management authority; do not create or repair them
+with ordinary file edits.
 
 **Windows hosts:** the SDK applies fail-closed owner-only security to each
 session's `<workDir>/.gjc-remote-session` storage. On Windows this can fail with
@@ -329,14 +350,18 @@ separation and protected secret/profile storage remain required for supervised d
 **Platform evidence is pending.** These links describe the current contract and
 evaluation results; they do not claim that a signed Windows primary wrapper,
 production Windows account/ACL behavior, Linux boot/readiness, relay behavior,
-or transaction fault-injection has been verified. Existing foreground commands
-remain the universal rollback:
+or transaction fault-injection has been verified.
+Existing foreground commands remain an operational fallback when a supervisor
+cannot satisfy its evidence gates:
 
 ```text
 # from the repository root
 cd bot    && node src/bot.js
 cd daemon && bun src/daemon.js   # Bun >= 1.3.14
 ```
+
+Foreground execution does not roll back an application artifact, runtime,
+mapping authority, or durable state.
 
 The daemon reconnects with equal-jitter exponential backoff after a
 disconnect; this is application behavior and is separate from supervisor
@@ -354,8 +379,10 @@ fails, while fatal shutdown exits non-zero.
   startup only. Rotate per host if one is compromised.
 - **Discord authorization** (`GJC_BOT_ALLOWED_USERS`,
   `GJC_REMOTE_REQUIRE_ALLOWLIST`): startup-only; restart the bot after changes.
-- **`channels.json`**: hot-reloaded on save. An invalid reload keeps the last
-  valid map (rollback is automatic); fix the file and save again.
+- **Legacy/local `channels.json`**: hot-reloaded on save. An invalid reload
+  keeps the last valid in-memory map; this is not authority rollback.
+  Production managed state changes only through authenticated management
+  operations.
 - **Tool logs**: kept in bot memory only — at most 100 entries, each expiring
   1 hour after creation. Nothing is written to disk; no cleanup needed.
 - **Session history**: each daemon workDir persists GJC session history under
@@ -377,19 +404,20 @@ readiness and a receipt-capable inventory provider). Any value other than
 `off`/`verify` fails the daemon closed at startup (`process.exit(1)`) — there
 is no silent fallback.
 
-Native workspace **serving stays disabled regardless of mode.** Even a proven
-`verify`-mode receipt binding cannot serve workspace invokes: the daemon's
-hard serving gate returns `RUNTIME_INCOMPATIBLE` unconditionally. The
-inventory contract is capability evidence only — the issue #44 management
-mapping envelope remains the sole route authority, never the local
-inventory.
+Native workspace serving is default-off. Production `verify` mode constructs
+and self-tests the signed native reader; configuration or proof failure exits
+the daemon with a sanitized diagnostic. Receipt advertisement additionally
+requires opt-in protocol readiness and a receipt-capable verified provider.
+Serving can enable only when `GJC_NATIVE_WORKSPACE_SERVING` is exactly `1` and
+that receipt capability is advertised. Each lifecycle operation retains its
+own fail-closed dependencies. This repository does not claim live
+serving-enabled deployment evidence.
 
-**Production wiring gap:** today the production daemon boot does not
-construct a native inventory reader, so the native-reader path is not yet
-wired end-to-end. `verify`-mode receipt capability is therefore only
-reachable under test injection (`GJC_READINESS_TEST_INJECTION=1`); enabling
-it in production is a future reader-wiring/native-serving milestone, not
-current behavior.
+The inventory contract is capability evidence only. The issue #44
+authenticated management mapping remains the sole route authority, never the
+local inventory. `GJC_READINESS_TEST_INJECTION` and
+`GJC_WORKSPACE_INVENTORY` are test fixtures and must not be set in deployment;
+enabling injection deliberately selects the fixture provider.
 
 Five-role access control (`GJC_INVENTORY_ROLE_BINDINGS`, strict JSON) binds
 exactly the `management`, `bot`, `recovery`, `daemon`, and `system` roles to
