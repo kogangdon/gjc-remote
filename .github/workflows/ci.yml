@@ -114,18 +114,201 @@ jobs:
           -f deploy/docker/bot/Dockerfile
           .
 
+  daemon-container-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux/amd64
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '26'
+
+      - name: Build unsigned native-control signing input
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libacl1-dev
+          bun install --frozen-lockfile
+          npm run build --workspace @gjc-remote/native-control
+
+      - name: Validate test-only daemon Compose contract
+        env:
+          GJC_DAEMON_IMAGE: gjc-remote-daemon:contract-only
+          GJC_DAEMON_HOST_TOKEN_FILE: ${{ github.workspace }}/bot/channels.example.json
+        run: docker compose -f deploy/docker/daemon/compose.test.yaml config --quiet
+
+      # Production daemon images require the external signed native-control
+      # bundle. CI proves the pinned dependency closure and fixture relay on
+      # both supported Linux architectures without creating an unsigned
+      # runtime image or weakening the signature gate.
+      - name: Build pinned daemon dependency stage
+        run: >-
+          docker buildx build
+          --target deps
+          --platform ${{ matrix.platform }}
+          --output type=cacheonly
+          -f deploy/docker/daemon/Dockerfile
+          .
+
+      - name: Build daemon registration fixture
+        run: >-
+          docker buildx build
+          --target fixture-relay
+          --platform ${{ matrix.platform }}
+          --output type=cacheonly
+          -f deploy/docker/daemon/Dockerfile
+          .
+
+      - name: Execute daemon container preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="gjc-remote-daemon-preflight:${GITHUB_RUN_ID}-${RUNNER_ARCH}"
+          prefix="gjc-preflight-${GITHUB_RUN_ID}-${RUNNER_ARCH,,}"
+          volumes=(
+            "${prefix}-workspace"
+            "${prefix}-sessions"
+            "${prefix}-provider"
+            "${prefix}-state"
+          )
+          cleanup() {
+            docker volume rm "${volumes[@]}" || true
+          }
+          trap cleanup EXIT
+          docker build --target preflight-probe --tag "$image" \
+            -f deploy/docker/daemon/Dockerfile .
+          for volume in "${volumes[@]}"; do docker volume create "$volume"; done
+          common=(
+            --rm
+            --read-only
+            --user 1004:1004
+            --cap-drop ALL
+            --security-opt seccomp=deploy/docker/daemon/seccomp.json
+            --pids-limit 256
+            --memory 8g
+            --cpus 4
+            --network none
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+            --mount "type=volume,source=${volumes[0]},target=/workspaces"
+            --mount "type=volume,source=${volumes[1]},target=/var/lib/gjc-remote/sessions"
+            --mount "type=volume,source=${volumes[2]},target=/home/gjc/.gjc"
+            --mount "type=volume,source=${volumes[3]},target=/var/lib/gjc-remote/state"
+          )
+          output="$(docker run "${common[@]}" --security-opt no-new-privileges "$image")"
+          test "$output" = "PREFLIGHT_OK"
+          output="$(docker run "${common[@]}" --security-opt no-new-privileges \
+            --entrypoint bun "$image" /app/persistence-probe.js write)"
+          test "$output" = "PERSISTENCE_WRITE_OK"
+          output="$(docker run "${common[@]}" --security-opt no-new-privileges \
+            --entrypoint bun "$image" /app/persistence-probe.js read)"
+          test "$output" = "PERSISTENCE_READ_OK"
+          if docker run "${common[@]}" "$image"; then
+            echo "preflight accepted a container without no-new-privileges" >&2
+            exit 1
+          fi
+
+      - name: Reject an untrusted final daemon image
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="${RUNNER_TEMP}/unsigned-native-control"
+          mkdir -p "$bundle"
+          cp native-control/build/Release/native_control.node "$bundle/"
+          cp native-control/build/Release/native-control.manifest.json "$bundle/"
+          printf '{}\n' > "${bundle}/native-control.manifest.json.sig"
+          log="${RUNNER_TEMP}/unsigned-final-build.log"
+          set +e
+          docker build --progress plain \
+            --target runtime \
+            --build-arg REVISION=unsigned-rejection \
+            --build-context "native_control_bundle=${bundle}" \
+            -f deploy/docker/daemon/Dockerfile . >"$log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "final daemon image accepted an untrusted native bundle" >&2
+            exit 1
+          fi
+          grep -F -- \
+            '--require-signature was set but signature verification failed: signature sidecar is missing or malformed' \
+            "$log"
+
+      - name: Exercise disposable same-host Compose topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="gjc-remote-daemon-compose-fixture:${GITHUB_RUN_ID}-${RUNNER_ARCH}"
+          project="gjc-daemon-${GITHUB_RUN_ID}-${RUNNER_ARCH,,}"
+          token_file="${RUNNER_TEMP}/${project}-token"
+          printf 'compose-fixture-secret\n' > "$token_file"
+          export GJC_DAEMON_HOST_TOKEN_FILE="$token_file"
+          compose=(docker compose -p "$project" -f deploy/docker/daemon/compose.test.yaml)
+          cleanup() {
+            "${compose[@]}" down --volumes --remove-orphans || true
+          }
+          trap cleanup EXIT
+          docker build --target compose-fixture-daemon --tag "$image" \
+            -f deploy/docker/daemon/Dockerfile .
+          export GJC_DAEMON_IMAGE
+          GJC_DAEMON_IMAGE="$(docker image inspect --format '{{.Id}}' "$image")"
+          test "${GJC_DAEMON_IMAGE#sha256:}" != "$GJC_DAEMON_IMAGE"
+          "${compose[@]}" up --detach --build
+          registered=
+          for _ in {1..30}; do
+            logs="$("${compose[@]}" logs --no-color)"
+            if [[ "$logs" == *"fixture-relay: daemon registered"* ]] &&
+               [[ "$logs" == *"daemon: registration accepted"* ]]; then
+              registered=1
+              break
+            fi
+            sleep 1
+          done
+          test "$registered" = 1
+          if "${compose[@]}" exec -T daemon bun -e \
+            'await fetch("https://example.com", {signal: AbortSignal.timeout(3000)})'; then
+            echo "internal-only daemon network allowed direct external egress" >&2
+            exit 1
+          fi
+          daemon_id="$("${compose[@]}" ps -q daemon)"
+          "${compose[@]}" stop --timeout 30 daemon
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$daemon_id")" = 0
+          test "$(docker inspect --format '{{.RestartCount}}' "$daemon_id")" = 0
+          "${compose[@]}" up --detach daemon
+          cleanup
+          trap - EXIT
+          test -z "$("${compose[@]}" ps --all --quiet)"
+          for volume in workspace sessions provider state; do
+            if docker volume inspect "${project}_${volume}"; then
+              echo "Compose cleanup retained ${volume}" >&2
+              exit 1
+            fi
+          done
+
   # Aggregate gate. `test` is the required status check on main, so it must stay a
   # single stable context name even though the suite now fans out across a matrix.
   # It fails unless every matrix leg succeeded, so a skipped or failed leg cannot
   # be merged past.
   test:
     if: always()
-    needs: [suite, bot-container-contract]
+    needs: [suite, bot-container-contract, daemon-container-contract]
     runs-on: ubuntu-latest
     steps:
       - name: Require every matrix leg to succeed
         run: |
           echo "suite result: ${{ needs.suite.result }}"
           echo "bot container contract result: ${{ needs.bot-container-contract.result }}"
+          echo "daemon container contract result: ${{ needs.daemon-container-contract.result }}"
           test "${{ needs.suite.result }}" = "success"
           test "${{ needs.bot-container-contract.result }}" = "success"
+          test "${{ needs.daemon-container-contract.result }}" = "success"

@@ -239,7 +239,9 @@ async function startReadinessDaemon({
 }
 
 test("denied registration uses one fixed retry and accepted recovery restores normal reconnects", async () => {
-  const token = "lifecycle-test-secret";
+  // Deliberately overlaps the credential-bearing BOT_WS_URL to prove the
+  // whole URL is redacted before shorter sensitive substrings.
+  const token = "url-user";
   const registrations = [];
   const sockets = [];
   const wss = new WebSocketServer({ port: 0 });
@@ -299,7 +301,7 @@ test("denied registration uses one fixed retry and accepted recovery restores no
     assert.equal(output.value.includes(token), false);
     assert.equal(output.value.includes("url-user"), false);
     assert.equal(output.value.includes("url-pass"), false);
-    assert.match(output.value, /connected to bot at ws:\/\/\[redacted\]@127\.0\.0\.1:/);
+    assert.match(output.value, /connected to bot at \[redacted\]/);
 
     sockets[1].close();
     await waitForOutput(output, "daemon: disconnected from bot, retrying in ");

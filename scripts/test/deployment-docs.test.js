@@ -114,17 +114,20 @@ test("Docker guidance preserves scope, authority, secrets, and rollback boundari
   assert.match(canonical, /never restore an older volume snapshot to rewind monotonic/);
   assert.doesNotMatch(canonical, /matching the selected mapping authority/);
 
-  assert.match(daemon, /No daemon Dockerfile or Compose fixture exists/);
-  assert.doesNotMatch(daemon, /`docker (?:build|compose|pull|run)/i);
+  assert.match(daemon, /Phase 3 daemon image source and a disposable/);
+  assert.match(daemon, /verification\s+artifacts, not a published image or production deployment/);
+  assert.match(daemon, /externally signed/);
+  assert.match(daemon, /fixed identity `1004:1004`/);
+  assert.match(daemon, /Docker Desktop on Windows is an unsupported target/);
+  assert.match(daemon, /Phase 4 \/ issue #55 still owns published image provenance/);
   assert.match(
     daemon,
-    /must contain exactly the distinct `management`, `bot`, `recovery`, `daemon`, and `system` native principals/,
+    /authenticated #44 mapping envelope remains the\s+sole route authority/,
   );
   assert.match(
     daemon,
-    /Native serving defaults off and requires both the exact `GJC_NATIVE_WORKSPACE_SERVING="1"` opt-in/,
+    /`GJC_NATIVE_WORKSPACE_SERVING="0"`/,
   );
-  assert.match(daemon, /advertised receipt capability/);
-  assert.match(daemon, /live serving-on evidence/);
-  assert.match(daemon, /inventory is not routing authority/);
+  assert.match(daemon, /not the production bot, mapping authority, or positive\s+workspace-serving evidence/);
+  assert.match(daemon, /does not establish tenant\s+isolation/);
 });

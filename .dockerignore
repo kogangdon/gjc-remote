@@ -15,6 +15,8 @@ node_modules
 bot/test
 daemon/*
 !daemon/package.json
+!daemon/src/
+!daemon/src/**
 native-control/build
 native-control/test
 native-control/release-keys/local-dev.json

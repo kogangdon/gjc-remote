@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { isAbsolute, join, resolve } from "node:path";
 import { V0_LIMITS, isGateRequestEvent } from "@gjc-remote/shared";
 
 const GATE_KINDS = new Set(["question", "approval", "execution"]);
@@ -112,13 +113,22 @@ async function loadCanonicalSdk() {
   return { createAgentSession, Settings, SessionManager, activateModelProfile };
 }
 
-export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
+export function resolveSdkSessionDirectory(workDir, sessionRoot) {
+  if (sessionRoot === undefined) {
+    return join(workDir, ".gjc-remote-session");
+  }
+  if (typeof sessionRoot !== "string" || !isAbsolute(sessionRoot)) {
+    throw new TypeError("sessionRoot must be an absolute path");
+  }
+  const workDirHash = createHash("sha256").update(resolve(workDir)).digest("hex");
+  return join(sessionRoot, workDirHash);
+}
+
+export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { sessionRoot } = {}) {
+  const sessionDir = resolveSdkSessionDirectory(workDir, sessionRoot);
   const { createAgentSession, Settings, SessionManager, activateModelProfile } =
     await loadSdk();
-  const sessionManager = SessionManager.create(
-    workDir,
-    join(workDir, ".gjc-remote-session")
-  );
+  const sessionManager = SessionManager.create(workDir, sessionDir);
   // `Settings.init()` returns a process-global singleton whose cwd is frozen at
   // first call, so it cannot scope per pooled session. Clone it per workDir so
   // each session reads that directory's merged config AND so profile activation
@@ -143,10 +153,9 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk) {
     // activation before propagating the failure.
     await Promise.resolve()
       .then(() => session.dispose())
-      .catch((disposeError) => {
+      .catch(() => {
         console.error(
-          `gjc-remote daemon: failed to dispose session after activation failure for ${workDir}:`,
-          disposeError
+          "gjc-remote daemon: failed to dispose session after activation failure."
         );
       });
     throw error;
@@ -604,8 +613,8 @@ export class SdkSession {
     }
     try {
       gateRun.onEvent(event);
-    } catch (error) {
-      console.error("gjc-remote daemon: failed to emit gate_request event:", error);
+    } catch {
+      console.error("gjc-remote daemon: failed to emit gate_request event.");
     }
   }
 

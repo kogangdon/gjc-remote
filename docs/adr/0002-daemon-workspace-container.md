@@ -1,6 +1,6 @@
 # ADR 0002: Persistent non-root daemon workspace container
 
-- **Status:** Proposed; implementation is blocked on the gates below.
+- **Status:** Accepted; Phase 3 implementation is tracked by issue #54.
 - **Scope:** Issue #43 design contract only.
 
 ## Decision
