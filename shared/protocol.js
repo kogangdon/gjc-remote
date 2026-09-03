@@ -50,9 +50,11 @@ export const WORKSPACE_READINESS_V2 = WORKSPACE_READINESS_CAPABILITY;
  * FIRST check-then-REFUSE protocol floor. When a peer requires it (the daemon
  * because it is the verifier, or a bot whose managed channels have
  * bindingEnabled=true) and the negotiated shared set does NOT contain it, the
- * requiring side REFUSES the connection outright (daemon closes with
- * PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED; bot answers
- * REGISTER_DENIED with the same code) rather than negotiating down. This
+ * requiring side REFUSES the connection outright rather than negotiating
+ * down. Managed serving applies ADR 0005's complete exact-v3 floor and returns
+ * PROTOCOL_INCOMPATIBLE for any missing term. The bind-specific
+ * BIND_AUTHORITY_VERIFICATION_REQUIRED code remains only for off-mode,
+ * non-serving receipt negotiation on the bot. This
  * deliberate deviation from the check-then-degrade precedent exists because
  * silent degrade-to-unverified is the exact TOFU failure mode #179 eliminates:
  * a security-relevant control must fail closed, never quietly off. The
@@ -193,8 +195,8 @@ export const PROTOCOL_ERROR_CODES = Object.freeze({
   BIND_AUTHORITY_HASH_MISMATCH: "BIND_AUTHORITY_HASH_MISMATCH",
   BIND_AUTHORITY_HOSTID_MISMATCH: "BIND_AUTHORITY_HOSTID_MISMATCH",
   BIND_AUTHORITY_CONTAINMENT_ESCAPE: "BIND_AUTHORITY_CONTAINMENT_ESCAPE",
-  // REGISTER-time hard floor: a peer that requires bind-authority verification
-  // refuses a peer that does not advertise the capability (never degrades).
+  // Off-mode/non-serving bot REGISTER-time floor retained for receipt
+  // negotiation outside ADR 0005's managed exact-v3 policy.
   BIND_AUTHORITY_VERIFICATION_REQUIRED: "BIND_AUTHORITY_VERIFICATION_REQUIRED",
   MAPPING_ID_REQUIRED: "MAPPING_ID_REQUIRED",
   WORKSPACE_MAPPING_CHANGED: "WORKSPACE_MAPPING_CHANGED",

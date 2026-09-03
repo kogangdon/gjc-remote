@@ -40,6 +40,7 @@ import {
   negotiateCapabilities,
   normalizeProtocolError,
 } from "@gjc-remote/shared";
+import { satisfiesManagedProtocolFloor } from "@gjc-remote/shared/managed-protocol-policy";
 import { workspaceBindingFingerprint } from "@gjc-remote/shared/workspace-binding";
 import {
   verifyBindAuthorityPreimage,
@@ -153,6 +154,9 @@ if (nativeInventoryMode !== "off" && nativeInventoryMode !== "verify") {
   console.error("daemon: GJC_NATIVE_INVENTORY_MODE must be off or verify");
   process.exit(1);
 }
+const MANAGED_PROTOCOL_FLOOR_REQUIRED =
+  nativeInventoryMode === "verify" ||
+  process.env.GJC_NATIVE_WORKSPACE_SERVING === "1";
 // Dedicated config resolution: verify-mode failures map to a structured,
 // path-free, secret-free diagnostic and terminate boot (never sanitizeDaemonError).
 const inventoryConfigResult = await resolveInventoryProviderConfig(
@@ -1834,6 +1838,13 @@ async function handleMessage(
 
   if (isRegisterOkMessage(msg)) {
     if (readinessState?.handshakeAccepted) return;
+    if (
+      MANAGED_PROTOCOL_FLOOR_REQUIRED &&
+      !satisfiesManagedProtocolFloor(readinessState?.registration, msg)
+    ) {
+      closePolicyViolation(connection, PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE);
+      return;
+    }
     readinessState.handshakeAccepted = true;
     // A denied registration remains denied across transport failures. Only a
     // successful registration clears the fixed-denial retry state.
@@ -1852,19 +1863,6 @@ async function handleMessage(
       readinessState.registration,
       msg
     );
-    if (
-      readinessState.receiptCommitted &&
-      !(Array.isArray(msg.capabilities) &&
-        msg.capabilities.includes(WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY))
-    ) {
-      console.warn(
-        `daemon: registration refused -- receipt-committed peer missing required ` +
-          `capability '${WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY}' ` +
-          `(${PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED})`
-      );
-      closePolicyViolation(connection, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
-      return;
-    }
     readinessState.committed =
       readinessV2Committed || readinessState.receiptCommitted;
     if (readinessState.committed) {
@@ -1899,6 +1897,10 @@ async function handleMessage(
     } finally {
       scheduleDeniedRetry();
     }
+    return;
+  }
+  if (!readinessState?.handshakeAccepted) {
+    closePolicyViolation(connection, PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE);
     return;
   }
   if (isPingMessage(msg)) {

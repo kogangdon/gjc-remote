@@ -469,7 +469,7 @@ test("Finding-3 tier-2 nit: mapping.containerRoot===null under a configured cont
   }
 });
 
-test("REGISTER_OK hard floor: a receipt-committed peer missing the bind-authority-verification capability is refused, not committed", async () => {
+test("managed REGISTER_OK floor rejects a peer missing bind-authority verification before commit", async () => {
   const inventory = serializedTestInventory({ workspaces: [] });
   const daemon = await startDaemon({
     GJC_READINESS_V2: "1",
@@ -493,7 +493,7 @@ test("REGISTER_OK hard floor: a receipt-committed peer missing the bind-authorit
       ],
     }));
     const [code, reason] = await closed;
-    assertPolicyClose(code, reason, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
+    assertPolicyClose(code, reason, PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE);
     assert.equal(readinessSeen, false);
   } finally {
     await daemon.close();

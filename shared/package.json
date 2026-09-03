@@ -15,6 +15,7 @@
     "./genesis-probe": "./genesis-probe.js",
     "./identity": "./identity.js",
     "./mapping-envelope": "./mapping-envelope.js",
+    "./managed-protocol-policy": "./managed-protocol-policy.js",
     "./protocol": "./protocol.js",
     "./publication-envelope": "./publication-envelope.js",
     "./recovery-envelope": "./recovery-envelope.js",

@@ -94,6 +94,18 @@ function waitForFrame(collection, predicate, description, timeoutMs = TEST_TIMEO
   });
 }
 
+function waitForDaemonOutput(daemon, text, timeoutMs = TEST_TIMEOUT_MS) {
+  return waitForOutput(
+    {
+      get value() {
+        return daemon.output();
+      },
+    },
+    text,
+    timeoutMs
+  );
+}
+
 async function stopChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exited = once(child, "exit");
@@ -165,22 +177,30 @@ async function startReadinessDaemon({
   },
   envOverrides = {},
   onMessage,
+  beforeRegisterResponse,
+  afterRegisterResponse,
   testInjection = true,
   autoBind = false,
 } = {}) {
   const frames = [];
   const registrations = [];
   const sockets = [];
+  const closes = [];
   const wss = new WebSocketServer({ port: 0 });
   await once(wss, "listening");
   const { port } = wss.address();
   wss.on("connection", (socket) => {
     sockets.push(socket);
+    socket.on("close", (code, reason) => {
+      closes.push({ code, reason: reason.toString() });
+    });
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString());
       if (message.type === "register") {
         registrations.push(message);
+        beforeRegisterResponse?.(socket);
         socket.send(JSON.stringify(registerResponse));
+        afterRegisterResponse?.(socket);
         if (autoBind && registerResponse.protocolVersion === 2) {
           socket.send(JSON.stringify(readinessV2Bind()));
         }
@@ -229,6 +249,7 @@ async function startReadinessDaemon({
     frames,
     registrations,
     sockets,
+    closes,
     output: () => output,
     async stop() {
       await stopChild(child);
@@ -798,6 +819,185 @@ test("live inventory drift drains receipt bindings and retires the socket withou
       ),
       false
     );
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("managed registration rejects omitted, v1, and v2 REGISTER_OK floors before readiness work", async (t) => {
+  const requiredCapabilities = [
+    WORKSPACE_READINESS_CAPABILITY,
+    WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+    WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+  ];
+  const responses = [
+    { name: "omitted", response: { type: "register_ok" } },
+    {
+      name: "v1",
+      response: {
+        type: "register_ok",
+        protocolVersion: 1,
+        capabilities: requiredCapabilities,
+      },
+    },
+    {
+      name: "v2",
+      response: {
+        type: "register_ok",
+        protocolVersion: 2,
+        capabilities: requiredCapabilities,
+      },
+    },
+  ];
+
+  for (const { name, response } of responses) {
+    await t.test(name, async () => {
+      const daemon = await startReadinessDaemon({
+        registerResponse: response,
+        envOverrides: {
+          GJC_NATIVE_INVENTORY_MODE: "verify",
+          GJC_WORKSPACE_INVENTORY: RECEIPT_INVENTORY,
+        },
+      });
+      try {
+        await waitForLength(daemon.registrations, 1, "managed registration");
+        await waitForLength(daemon.closes, 1, "managed protocol refusal");
+
+        assert.equal(daemon.closes[0].code, 1008);
+        assert.equal(
+          ["PROTOCOL_INCOMPATIBLE", ""].includes(daemon.closes[0].reason),
+          true,
+        );
+        assert.equal(daemon.frames.length, 0);
+        assert.equal(daemon.output().includes("daemon: registration accepted"), false);
+        await waitForDaemonOutput(
+          daemon,
+          "daemon: disconnected from bot, retrying in "
+        );
+      } finally {
+        await daemon.stop();
+      }
+    });
+  }
+});
+
+test("daemon rejects workload frames before and after an incompatible managed handshake", async (t) => {
+  const invoke = (requestId) => JSON.stringify({
+    type: "invoke",
+    requestId,
+    workDir: "C:\\private\\workspace",
+    command: { kind: "prompt", message: "must not run" },
+  });
+  for (const [name, hook] of [
+    ["before", { beforeRegisterResponse: (socket) => socket.send(invoke("before-handshake")) }],
+    ["after", { afterRegisterResponse: (socket) => socket.send(invoke("after-refusal")) }],
+  ]) {
+    await t.test(name, async () => {
+      const daemon = await startReadinessDaemon({
+        registerResponse: { type: "register_ok" },
+        envOverrides: {
+          GJC_NATIVE_INVENTORY_MODE: "verify",
+          GJC_WORKSPACE_INVENTORY: RECEIPT_INVENTORY,
+        },
+        ...hook,
+      });
+      try {
+        await waitForLength(daemon.closes, 1, "pre-handshake policy close");
+        assert.equal(daemon.closes[0].code, 1008);
+        assert.equal(
+          ["PROTOCOL_INCOMPATIBLE", ""].includes(daemon.closes[0].reason),
+          true,
+        );
+        assert.equal(daemon.frames.length, 0);
+        assert.equal(daemon.output().includes("must not run"), false);
+      } finally {
+        await daemon.stop();
+      }
+    });
+  }
+});
+
+test("exact native-serving opt-in rejects a v3 peer when the daemon registration is below the floor", async () => {
+  const daemon = await startReadinessDaemon({
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+      ],
+    },
+    envOverrides: {
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "1",
+    },
+  });
+  try {
+    await waitForLength(daemon.closes, 1, "managed protocol refusal");
+
+    assert.equal(daemon.closes[0].code, 1008);
+    assert.equal(
+      ["PROTOCOL_INCOMPATIBLE", ""].includes(daemon.closes[0].reason),
+      true,
+    );
+    assert.equal(daemon.frames.length, 0);
+    assert.equal(daemon.output().includes("daemon: registration accepted"), false);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("managed registration accepts only the exact v3 protocol floor", async () => {
+  const daemon = await startReadinessDaemon({
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+      ],
+    },
+    envOverrides: {
+      GJC_NATIVE_INVENTORY_MODE: "verify",
+      GJC_WORKSPACE_INVENTORY: RECEIPT_INVENTORY,
+    },
+  });
+  try {
+    await waitForDaemonOutput(daemon, "daemon: registration accepted");
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.type === "readiness",
+      "managed readiness publication"
+    );
+
+    assert.equal(daemon.registrations[0].protocolVersion, 3);
+    assert.equal(daemon.closes.length, 0);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("off-mode preserves legacy v1 REGISTER_OK acceptance", async () => {
+  const daemon = await startReadinessDaemon({
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: [],
+    },
+    envOverrides: {
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+      GJC_READINESS_V2: "0",
+    },
+  });
+  try {
+    await waitForDaemonOutput(daemon, "daemon: registration accepted");
+
+    assert.equal(daemon.registrations[0].protocolVersion, 1);
+    assert.equal(daemon.closes.length, 0);
+    assert.equal(daemon.frames.length, 0);
   } finally {
     await daemon.stop();
   }

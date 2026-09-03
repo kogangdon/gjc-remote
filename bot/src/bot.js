@@ -56,6 +56,7 @@ const {
   GJC_INVOKE_IDLE_TIMEOUT_MS,
   GJC_INVOKE_HARD_CAP_MS,
   GJC_MANAGEMENT_ROLE_BINDINGS,
+  GJC_NATIVE_WORKSPACE_SERVING,
 } = process.env;
 let DISCORD_TOKEN;
 let HOST_TOKENS;
@@ -253,6 +254,7 @@ try {
 registry = new HostRegistry({
   port: hostWsPort,
   tokensByHostId,
+  workspaceServingEnabled: GJC_NATIVE_WORKSPACE_SERVING === "1",
   ...invokeTimeoutOptions,
   onError: (error) => handleFatal("host_ws_listen_failed", error),
 });

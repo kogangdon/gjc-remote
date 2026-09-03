@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import {
   ALLOWED_STAGED_PATHS,
   checkFlagExclusivity,
@@ -10,6 +11,24 @@ import {
   parseCliArgs,
   promoteChangelog,
 } from "../release.js";
+
+test("tag workflow creates only a draft release", async () => {
+  const workflow = (
+    await readFile(new URL("../../.github/workflows/release.yml", import.meta.url), "utf8")
+  ).replaceAll("\r\n", "\n");
+  assert.equal(workflow.match(/\bgh release create\b/g)?.length, 1);
+  assert.match(workflow, /name: Create draft GitHub Release/);
+  const command = workflow.match(
+    /run: >-\n((?: {10}.+\n)+)/,
+  )?.[1];
+  assert.ok(command);
+  assert.match(command, /gh release create "\$GITHUB_REF_NAME"/);
+  assert.match(command, /--draft/);
+  assert.doesNotMatch(
+    workflow,
+    /\bgh release edit\b/,
+  );
+});
 
 // --- --no-verify / --push exclusivity ---------------------------------------
 

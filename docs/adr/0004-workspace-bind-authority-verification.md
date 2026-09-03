@@ -56,9 +56,10 @@ otherwise unchanged.
 1. **Finding 1 (hard-floor, not degrade).** The
    `WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY` is a genuine bidirectional
    hard floor. A version mismatch does not silently negotiate down to an unverified
-   handshake (which would reintroduce the exact TOFU gap): the daemon closes with
-   `BIND_AUTHORITY_VERIFICATION_REQUIRED` and the bot answers `REGISTER_DENIED` with
-   the same code. This is a deliberate deviation from the repo's prior
+   handshake (which would reintroduce the exact TOFU gap). ADR 0005 supersedes
+   the managed-serving registration taxonomy: any incomplete exact-v3 floor
+   returns `PROTOCOL_INCOMPATIBLE`. `BIND_AUTHORITY_VERIFICATION_REQUIRED`
+   remains only for off-mode/non-serving receipt negotiation on the bot. This is a deliberate deviation from the repo's prior
    check-then-degrade capability precedent \u2014 the repo's first check-then-refuse
    protocol gate. Non-binding v0/v2 peers are structurally unaffected.
 2. **Finding 2 (no bypass).** The verifier is the first verifying statement of

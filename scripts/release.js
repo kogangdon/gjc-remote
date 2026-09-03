@@ -6,7 +6,9 @@
 // full test suite before creating the release commit. Only when the test
 // gate actually ran does it also create an annotated `vX.Y.Z` tag; pushing
 // that tag triggers `.github/workflows/release.yml`, which re-runs the suite
-// on CI and cuts the GitHub Release. Every staged file this script checks is
+// on CI and prepares a draft GitHub Release. Publishing remains blocked until
+// the issue #55 evidence packet passes its protected promotion gate. Every
+// staged file this script checks is
 // re-read from the git index (not the working tree) right before the
 // commit, so the whitelist and content checks below apply to exactly what
 // will be committed, not to whatever happens to be on disk.
