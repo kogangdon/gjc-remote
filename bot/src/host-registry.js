@@ -39,6 +39,7 @@ import {
   READINESS_REMEDIATIONS,
 } from "@gjc-remote/shared";
 import { canonicalJsonHash } from "@gjc-remote/shared/strict-json";
+import { satisfiesManagedProtocolFloor } from "@gjc-remote/shared/managed-protocol-policy";
 import {
   validateWorkspaceAuthorityDescriptor,
   workspaceBindingFingerprint,
@@ -282,22 +283,6 @@ export class HostRegistry {
         Array.isArray(msg.capabilities) &&
         msg.capabilities.includes(WORKSPACE_READINESS_CAPABILITY) &&
         msg.capabilities.includes(WORKSPACE_INVENTORY_RECEIPT_CAPABILITY);
-      const previous = this.connections.get(hostId);
-      if (previous && previous !== socket) {
-        // Only binding-capable (v3) registrations count as reconnect churn;
-        // off-mode (v0/v2) socket replacements leave the counter at rest.
-        if (wantsInventoryReceipt) {
-          this.reconnectCounts.set(hostId, (this.reconnectCounts.get(hostId) ?? 0) + 1);
-        } else if (!this.reconnectCounts.has(hostId)) {
-          this.reconnectCounts.set(hostId, 0);
-        }
-        this.#dropConnection(hostId, previous, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
-        previous.terminate();
-      } else if (!this.reconnectCounts.has(hostId)) {
-        this.reconnectCounts.set(hostId, 0);
-      }
-      this.connections.set(hostId, socket);
-      this.heartbeatStates.set(socket, { hostId });
       const wantsReadiness =
         !wantsInventoryReceipt &&
         (msg.protocolVersion ?? 0) >= PROTOCOL_VERSION_V2 &&
@@ -324,6 +309,20 @@ export class HostRegistry {
         socket.close(1008, "invalid register response");
         return;
       }
+      if (
+        this.workspaceServingEnabled &&
+        !satisfiesManagedProtocolFloor(msg, registerOk)
+      ) {
+        socket.send(
+          JSON.stringify({
+            type: MSG_TYPES.REGISTER_DENIED,
+            reason: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+            code: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+          })
+        );
+        socket.close(1008, PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE);
+        return;
+      }
       const bindingEnabled = isInventoryReceiptCapabilityGate(msg, registerOk);
       if (
         bindingEnabled &&
@@ -345,6 +344,22 @@ export class HostRegistry {
         socket.close(1008, PROTOCOL_ERROR_CODES.BIND_AUTHORITY_VERIFICATION_REQUIRED);
         return;
       }
+      const previous = this.connections.get(hostId);
+      if (previous && previous !== socket) {
+        // Only binding-capable (v3) registrations count as reconnect churn;
+        // off-mode (v0/v2) socket replacements leave the counter at rest.
+        if (wantsInventoryReceipt) {
+          this.reconnectCounts.set(hostId, (this.reconnectCounts.get(hostId) ?? 0) + 1);
+        } else if (!this.reconnectCounts.has(hostId)) {
+          this.reconnectCounts.set(hostId, 0);
+        }
+        this.#dropConnection(hostId, previous, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
+        previous.terminate();
+      } else if (!this.reconnectCounts.has(hostId)) {
+        this.reconnectCounts.set(hostId, 0);
+      }
+      this.connections.set(hostId, socket);
+      this.heartbeatStates.set(socket, { hostId });
       const readinessEnabled =
         isReadinessCapabilityGate(msg, registerOk) || bindingEnabled;
       const protocolVersion = Math.min(

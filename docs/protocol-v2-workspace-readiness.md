@@ -61,7 +61,7 @@ Mapping identity and generations remain in the authenticated #44 descriptor; rou
 remain bot-local. The inventory's local `workDir` and root/storage identities are capability
 evidence and are never sent as route authority. Missing or drifted inventory remains non-ready.
 
-## Mapping and legacy fallback
+## Mapping and managed protocol floor
 
 A route references an opaque `mappingId`, `mappingGeneration`, `workspaceGeneration`,
 `mappingVersion`, `sourcePlatform`,
@@ -69,16 +69,21 @@ and optionally `workspaceId` or legacy `workDir`. #44 owns the exact envelope an
 daemon validates host ownership, source root/share/volume identity, generation, canonical equality,
 case policy, and containment. Workspace IDs are bounded safe-alphabet tokens and are looked up in
 authenticated state before any path interpolation.
-POSIX, Windows drive, and UNC mappings are explicit; no slash heuristic or bot-side filesystem
-stat is allowed. v0/v1 Docker fallback is permitted only when exactly one immutable host mapping
-exists, the #44 route mapping equals that host's immutable default, and that default identity and
-generation remain unchanged while the peer is connected. Multiple, missing, foreign, unknown-
-platform, or changed mappings return `MAPPING_ID_REQUIRED` or `WORKSPACE_MAPPING_CHANGED`; old
-peers never receive v2 frames.
-A legacy socket records the authenticated route mapping fingerprint and generation at registration.
-If #44 changes that mapping, mapping version, default identity, or generation, the socket is
-invalidated and must re-register; it is never silently remapped. A v2 mappingVersion change must
-bump generation or be rejected as stale.
+POSIX, Windows drive, and UNC mappings are explicit; no slash heuristic or
+bot-side filesystem stat is allowed. There is no v0/v1 #44 singleton-mapping
+fallback. Managed or workspace-serving operation requires exact protocol v3
+plus readiness, inventory-receipt, and bind-authority-verification capabilities
+on both registration frames. Lower or incomplete peers receive
+`PROTOCOL_INCOMPATIBLE` and policy close 1008 before managed state or workload
+admission; neither side retries at a lower protocol.
+
+The bounded workDir-only shape remains temporarily parser-compatible only for
+the isolated unmanaged `legacy-v0` local source on the 0.3.x line. Its source
+bytes, target identity, and absence of management markers are rechecked before
+every dispatch. It is not Docker fallback, mapping authority, or a production
+rollback route. See [ADR 0005](adr/0005-managed-protocol-floor.md) for the
+v0.4.0/2026-10-01 removal gate. A v2 mappingVersion change must bump generation
+or be rejected as stale.
 
 ## Readiness frame and freshness
 

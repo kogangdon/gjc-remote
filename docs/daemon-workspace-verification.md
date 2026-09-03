@@ -68,15 +68,16 @@ key version, and restart count. Release evidence includes path/secret/control se
 | SDK/package/lock reconciliation at 0.12.21 and evidence schedule | #42/#45 | Source/lock/version/provenance packet | Stop image/release work |
 | Docker production target and Windows-host primitive support | #42/#43 | Linux-engine matrix and Windows/UNC containment fixtures | Unsupported target refuses startup |
 | Singleton legacy fallback fence | #43/#44 | Live remap/invalidation and re-registration fixture | Invalidate socket; never silently remap |
-| Protocol v2 retirement and fallback timing | #43/#44 | Deprecation/version migration decision | Keep v0/v1 fallback or reject clearly; no implicit upgrade |
+| Protocol v0/v1 retirement | #43/#44/#55 | [ADR 0005](adr/0005-managed-protocol-floor.md): managed v3 floor now; remove local parsers by v0.4.0 RC or 2026-10-01 | Reject managed lower peers with `PROTOCOL_INCOMPATIBLE`; no inferred mapping or downgrade |
 
 Illustrative values such as 60-second readiness maximum and 8/8/64/4 admission are not final
 approvals until their owners close the corresponding gates. TTL alone never authorizes takeover.
 
 ## Native inventory verification evidence (as-built)
 
-This section records the observed automated evidence for the native workspace inventory epic
-(G001-G016) on main HEAD `fa68941`. The landed coverage below lives in the in-repo suites
+This section records the initial observed automated evidence for the native workspace inventory epic
+(G001-G016) on main HEAD `fa68941` and the current runtime contract added by
+later slices. Historical counts remain commit-pinned. The landed coverage lives in the in-repo suites
 `daemon/test/`, `native-control/test/`, `bot/test/`, and `shared/test/`; run them with
 `npm test --workspaces` (plus `npm run test:scripts` at the root) and `npm run smoke:local`. It
 supplements, and does not replace, the design-only matrix above.
@@ -104,7 +105,7 @@ supplements, and does not replace, the design-only matrix above.
   `fingerprintPrefix`; no token, workDir, ACL, or full-fingerprint bytes can pass through the
   sink.
 
-**Observed green baseline (main HEAD fa68941).**
+**Historical observed green baseline (main HEAD fa68941).**
 
 - Full workspace suite: root 46 / bot 273 / daemon 240 / native-control 135 pass plus 3
   platform-gated skips / shared 65, with 0 failures.
@@ -123,12 +124,14 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
-fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:273, an
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:277, an
 `= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
 default) the gate reads `false` and its read site inside `admitReadyWorkload` returns
-`RUNTIME_INCOMPATIBLE`, exactly as before the S6f.7 flip; the bot side defaults to false as well and
-is not overridden at startup. When enabled, CREATE and REFRESH assemble native serving deps;
+`RUNTIME_INCOMPATIBLE`, exactly as before the S6f.7 flip. The bot side also defaults false and now
+passes only the exact `GJC_NATIVE_WORKSPACE_SERVING="1"` opt-in to
+`HostRegistry`; when enabled, both peers require ADR 0005's complete managed-v3
+floor. CREATE and REFRESH then assemble native serving deps;
 reset/delete additionally requires the verified residual-process capability and an exact
 receipt-bound lifecycle transaction context. Restore/migration additionally requires Linux native
 no-follow support and a single-use, non-expired `GJC_RESTORE_CONTEXTS_JSON` claim bound to the exact

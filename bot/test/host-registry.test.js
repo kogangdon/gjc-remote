@@ -200,21 +200,31 @@ async function startRegistry(
   };
 }
 async function connectV2(server, hostId = "host-a", token = "token-a", register = {}) {
+  // v2 parser/readiness component tests remain useful below the Phase 4
+  // registration floor. Temporarily close serving while this helper performs
+  // the legacy handshake; production bot wiring has no equivalent bypass.
+  const servingEnabled = server.registry.workspaceServingEnabled;
+  server.registry.workspaceServingEnabled = false;
   const port = server.registry.wss.address().port;
   const socket = new WebSocket(`ws://127.0.0.1:${port}`);
-  await once(socket, "open");
-  const response = once(socket, "message");
-  socket.send(
-    JSON.stringify({
-      type: "register",
-      hostId,
-      token,
-      protocolVersion: 2,
-      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
-      ...register,
-    })
-  );
-  const [raw] = await response;
+  let raw;
+  try {
+    await once(socket, "open");
+    const response = once(socket, "message");
+    socket.send(
+      JSON.stringify({
+        type: "register",
+        hostId,
+        token,
+        protocolVersion: 2,
+        capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+        ...register,
+      })
+    );
+    [raw] = await response;
+  } finally {
+    server.registry.workspaceServingEnabled = servingEnabled;
+  }
   registryBySocket.set(socket, { registry: server.registry, hostId });
   return { socket, response: JSON.parse(raw.toString()) };
 }
@@ -2351,6 +2361,83 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
     });
   } finally {
     socket.terminate();
+    await server.close();
+  }
+});
+
+test("workspace serving admits only the exact managed v3 registration floor", async () => {
+  const server = await startRegistry(undefined, { workspaceServingEnabled: true });
+  const managedCapabilities = [
+    ...CAPABILITIES,
+    WORKSPACE_READINESS_CAPABILITY,
+    WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+    WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+  ];
+  const rejectedRegistrations = [
+    { name: "omitted protocol", register: {} },
+    {
+      name: "v1 protocol",
+      register: { protocolVersion: PROTOCOL_VERSION, capabilities: CAPABILITIES },
+    },
+    {
+      name: "v2 protocol",
+      register: {
+        protocolVersion: 2,
+        capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+      },
+    },
+    ...[
+      WORKSPACE_READINESS_CAPABILITY,
+      WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+      WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+    ].map((capability) => ({
+      name: `missing ${capability}`,
+      register: {
+        protocolVersion: PROTOCOL_VERSION_V3,
+        capabilities: managedCapabilities.filter((item) => item !== capability),
+      },
+    })),
+  ];
+  try {
+    for (const { name, register } of rejectedRegistrations) {
+      const socket = new WebSocket(`ws://127.0.0.1:${server.registry.wss.address().port}`);
+      await once(socket, "open");
+      const frames = [];
+      socket.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
+      const closed = once(socket, "close");
+      socket.send(JSON.stringify({
+        type: "register",
+        hostId: "host-a",
+        token: "token-a",
+        ...register,
+      }));
+      await waitFor(() => frames.length === 1);
+      assert.deepEqual(frames[0], {
+        type: "register_denied",
+        reason: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+        code: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+      }, name);
+      const [code] = await closed;
+      assert.equal(code, 1008, name);
+      assert.equal(server.registry.connections.has("host-a"), false, name);
+      assert.equal(server.registry.heartbeatStates.has(socket), false, name);
+      assert.equal(server.registry.getHostInfo("host-a"), undefined, name);
+      assert.equal(server.registry.getHostReadiness("host-a"), undefined, name);
+      assert.equal(server.registry.readinessStates.has("host-a"), false, name);
+    }
+
+    const connection = await connectV3(server);
+    assert.deepEqual(connection.response, {
+      type: "register_ok",
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: managedCapabilities,
+    });
+    assert.deepEqual(server.registry.getHostInfo("host-a"), {
+      protocolVersion: PROTOCOL_VERSION_V3,
+      capabilities: managedCapabilities,
+    });
+    connection.socket.terminate();
+  } finally {
     await server.close();
   }
 });

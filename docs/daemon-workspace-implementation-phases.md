@@ -248,10 +248,11 @@ Every verification-matrix evidence layer and non-negotiable gate must close befo
 
 Any missing or failed gate is a hard no-promotion result; interim feature flags are rejected.
 
-## Native workspace inventory - as-built status (fa68941)
+## Native workspace inventory - evolving as-built status
 
-This section reconciles this phase contract with the observed AS-BUILT native inventory
-implementation at main HEAD `fa68941`. Every claim below is grounded in the in-repo source
+This section began with the observed baseline at main HEAD `fa68941` and is
+updated when later slices change the runtime contract. Historical test counts
+remain tied to that commit; current behavior claims are grounded in the in-repo source
 (`daemon/src/daemon.js`, `daemon/src/inventory-config.js`, `native-control/src/inventory.js`,
 `shared/protocol.js`, `bot/src/host-registry.js`). It documents implementation status only and does
 not authorize any behavior more permissive than the phase contracts above.
@@ -259,13 +260,15 @@ not authorize any behavior more permissive than the phase contracts above.
 **Serving is env-gated and OFF by default.** The native inventory contract (config modes, five-role
 bindings, the durable D floor, the live invalidation cascade, and the bot receipt binding/observability
 surface) is implemented as capability scaffolding. Native workspace serving is now a fail-closed
-runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:273)
+runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:277)
 as an `= resolveNativeServingEnabled({ env, inventoryReceiptAdvertised })`
 call, which is `true` only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 equals `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the default)
 the gate is `false` and its sole read site inside `admitReadyWorkload` returns `RUNTIME_INCOMPATIBLE`,
 unchanged from before the S6f.7 flip. On the bot side, `host-registry.js` defaults the equivalent flag
-to false and `bot.js` does not override it. When enabled, CREATE and REFRESH assemble native serving
+to false and `bot.js` passes only the exact
+`GJC_NATIVE_WORKSPACE_SERVING="1"` opt-in. When enabled, both peers require
+ADR 0005's complete managed-v3 floor before CREATE and REFRESH assemble native serving
 deps; reset/delete additionally requires the verified residual-process capability and an exact
 receipt-bound lifecycle transaction context. Restore/migration additionally requires Linux native
 no-follow support and a single-use sealed claim from `GJC_RESTORE_CONTEXTS_JSON`, bound to the exact

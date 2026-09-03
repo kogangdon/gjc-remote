@@ -1,7 +1,9 @@
 name: release
 
-# Cut a GitHub Release when a vX.Y.Z tag is pushed. The tag is produced locally
-# by `node scripts/release.js <version>` (bumps workspace versions in lockstep).
+# Prepare a draft GitHub Release when a vX.Y.Z tag is pushed. The tag is
+# produced locally by `node scripts/release.js <version>` (bumps workspace
+# versions in lockstep). Issue #55 promotion evidence must be verified before a
+# separate protected action publishes the draft.
 on:
   push:
     tags:
@@ -47,10 +49,14 @@ jobs:
 
       - run: npm test
 
-      - name: Create GitHub Release
+      - name: Create draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --draft
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
 
       # npm publish is intentionally deferred: it will be added as a step here,
       # gated on a repository NPM_TOKEN secret and an owned @gjc-remote npm org,
