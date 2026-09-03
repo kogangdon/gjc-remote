@@ -231,7 +231,7 @@ Each legacy/local `channels.json` route must contain exactly `hostId` and
 `workDir`.
 `hostId` must have a matching `HOST_TOKENS` entry, and `workDir` must be a
 fully-qualified path native to that daemon host (for example,
-`C:/projects/foo` on Windows or `/srv/apps/foo` on Linux/macOS). Relative paths
+`C:/projects/foo` on Windows or `/srv/apps/foo` on Linux). Relative paths
 and extra route fields are rejected. Production managed routes are generated
 only by the authenticated management authority; do not create or repair them
 with ordinary file edits.
@@ -350,6 +350,7 @@ separation and protected secret/profile storage remain required for supervised d
 **Platform evidence is pending.** These links describe the current contract and
 evaluation results; they do not claim that a signed Windows primary wrapper,
 production Windows account/ACL behavior, Linux boot/readiness, relay behavior,
+or transaction fault-injection has been verified.
 Existing foreground commands remain an operational fallback when a supervisor
 cannot satisfy its evidence gates:
 

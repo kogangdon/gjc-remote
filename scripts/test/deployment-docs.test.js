@@ -21,6 +21,7 @@ const contractFiles = [
   "deploy/docker/bot/README.md",
 ];
 const realRoot = await realpath(root);
+const repositoryReadme = (await readFile(path.join(root, "README.md"), "utf8")).replaceAll("\r\n", "\n");
 
 const documents = new Map(
   await Promise.all(
@@ -45,6 +46,15 @@ test("deployment index links every component and platform guide", () => {
   ]) {
     assert.match(index, new RegExp(`\\(${expected.replaceAll(".", "\\.")}\\)`));
   }
+});
+
+test("repository deployment summary keeps evidence and platform boundaries intact", () => {
+  assert.match(
+    repositoryReadme,
+    /Linux boot\/readiness, relay behavior,\nor transaction fault-injection has been verified\.\nExisting foreground commands/,
+  );
+  assert.match(repositoryReadme, /`\/srv\/apps\/foo` on Linux\)/);
+  assert.doesNotMatch(repositoryReadme, /`\/srv\/apps\/foo` on Linux\/macOS/);
 });
 
 test("all local deployment links resolve", async () => {
