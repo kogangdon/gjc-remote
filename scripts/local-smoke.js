@@ -27,6 +27,23 @@ const modelQuery = process.env.SMOKE_MODEL_QUERY;
 const heartbeatIntervalMs = 100;
 const heartbeatTimeoutMs = 5000;
 const heartbeatTimers = createObservedHeartbeatTimers();
+const daemonEnvironment = { ...process.env };
+for (const key of Object.keys(daemonEnvironment)) {
+  if (
+    key.startsWith("GJC_READINESS_TEST_") ||
+    [
+      "GJC_READINESS_V2",
+      "GJC_NATIVE_WORKSPACE_SERVING",
+      "GJC_NATIVE_INVENTORY_MODE",
+      "GJC_WORKSPACE_INVENTORY",
+      "GJC_CONTAINER_RUNTIME",
+      "GJC_DAEMON_TEST_MODE",
+      "GJC_OBSERVABILITY_TEST_IPC",
+    ].includes(key)
+  ) {
+    delete daemonEnvironment[key];
+  }
+}
 
 const registry = new HostRegistry({
   port,
@@ -41,13 +58,13 @@ await once(registry.wss, "listening");
 const daemon = spawn(process.env.BUN_BIN || "bun", ["daemon/src/daemon.js"], {
   cwd: process.cwd(),
   env: {
-    ...process.env,
+    ...daemonEnvironment,
     HOST_ID: hostId,
     HOST_TOKEN: token,
     HOST_LABEL: "local smoke test",
     BOT_WS_URL: `ws://localhost:${port}`,
-    GJC_READINESS_TEST_INJECTION: "1",
-    GJC_READINESS_V2: "0",
+    GJC_DAEMON_TEST_MODE: "1",
+    GJC_OBSERVABILITY_TEST_IPC: "1",
   },
   stdio: ["ignore", "pipe", "pipe", "ipc"],
 });

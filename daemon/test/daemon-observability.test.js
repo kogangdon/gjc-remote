@@ -92,6 +92,190 @@ test("owner events are flat, frozen, schema-versioned, and isolate subscribers",
   }));
 });
 
+test("invoke transactions freeze admitted trusted correlation and omit request data", () => {
+  let now = 100;
+  const observability = new DaemonObservability({ now: () => now });
+  const events = [];
+  observability.subscribe(() => {
+    throw new Error("subscriber failure");
+  });
+  observability.subscribe((event) => events.push(event));
+  const connection = {};
+  const transaction = observability.createInvokeTransaction(
+    connection,
+    "request/with/non-opaque-id",
+  );
+  const trusted = {
+    socketGeneration: 7,
+    readinessRevision: 8,
+    mappingGeneration: 9,
+    workspaceGeneration: 10,
+    mappingId: "mapping-1",
+    workspaceId: "workspace-1",
+    fenceSequence: 11,
+    binding: { bindingId: "binding-secret" },
+    receipt: { receiptId: "receipt-secret" },
+    path: "/private/workspace",
+    prompt: "secret prompt",
+  };
+  assert.throws(
+    () => transaction.admit(trusted),
+    /invoke dispatch context has invalid fields/,
+  );
+  delete trusted.binding;
+  delete trusted.receipt;
+  delete trusted.path;
+  delete trusted.prompt;
+  const context = transaction.admit(trusted);
+  assert.equal(Object.isFrozen(context), true);
+  trusted.socketGeneration = 70;
+  trusted.readinessRevision = 80;
+  trusted.mappingGeneration = 90;
+  trusted.workspaceGeneration = 100;
+  trusted.mappingId = "mapping-2";
+  trusted.workspaceId = "workspace-2";
+  trusted.fenceSequence = 110;
+  trusted.path = "/changed/private/workspace";
+  trusted.prompt = "changed secret prompt";
+  now = 132.8;
+  transaction.finish("succeeded");
+  transaction.finish("failed", "UNKNOWN_RUNTIME");
+  assert.doesNotThrow(() => transaction.admit({
+    socketGeneration: 1,
+    readinessRevision: 1,
+    mappingGeneration: 1,
+    workspaceGeneration: 1,
+    mappingId: "mapping",
+    workspaceId: "workspace",
+    fenceSequence: 1,
+  }));
+  assert.deepEqual(events, [{
+    schemaVersion: 1,
+    name: "daemon",
+    action: "invoke",
+    outcome: "succeeded",
+    code: null,
+    cleanupState: null,
+    mappingId: "mapping-1",
+    workspaceId: "workspace-1",
+    transactionId: null,
+    fenceSequence: 11,
+    durationMs: 32,
+    socketGeneration: 7,
+    readinessRevision: 8,
+    mappingGeneration: 9,
+    workspaceGeneration: 10,
+  }]);
+  const serialized = JSON.stringify(events[0]);
+  for (const value of [
+    "request/with/non-opaque-id",
+    "binding-secret",
+    "receipt-secret",
+    "/private/workspace",
+    "secret prompt",
+  ]) {
+    assert.equal(serialized.includes(value), false);
+  }
+});
+
+test("invoke telemetry value failures fall back without changing invoke control flow", () => {
+  const observability = new DaemonObservability({ now: () => 1 });
+  const events = [];
+  observability.subscribe((event) => events.push(event));
+  const transaction = observability.createInvokeTransaction({}, "request");
+  const context = transaction.admit({
+    socketGeneration: 1,
+    readinessRevision: 1,
+    mappingGeneration: 1,
+    workspaceGeneration: 1,
+    mappingId: "/future-wire-id",
+    workspaceId: "workspace",
+    fenceSequence: 1,
+  });
+  assert.deepEqual(context, {
+    socketGeneration: null,
+    readinessRevision: null,
+    mappingGeneration: null,
+    workspaceGeneration: null,
+    mappingId: null,
+    workspaceId: null,
+    fenceSequence: null,
+  });
+  transaction.finish("succeeded");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].outcome, "succeeded");
+  assert.equal(events[0].mappingId, null);
+});
+
+test("invoke transactions preserve pre-admission nulls and finish each connection once", () => {
+  let now = 50;
+  const observability = new DaemonObservability({ now: () => now });
+  const events = [];
+  observability.subscribe((event) => events.push(event));
+  const connection = Symbol("connection");
+  const pending = observability.createInvokeTransaction(connection, "opaque-request");
+  const admitted = observability.createInvokeTransaction(connection, "opaque-request-2");
+  admitted.admit({
+    socketGeneration: 1,
+    readinessRevision: 2,
+    mappingGeneration: 3,
+    workspaceGeneration: 4,
+    mappingId: "mapping",
+    workspaceId: "workspace",
+    fenceSequence: 5,
+  });
+  now = 40;
+  observability.finishInvokeTransactionsForConnection(
+    connection,
+    "failed",
+    "CONNECTION_LOST",
+  );
+  observability.finishInvokeTransactionsForConnection(
+    connection,
+    "failed",
+    "CONNECTION_LOST",
+  );
+  assert.equal(events.length, 2);
+  assert.deepEqual(events[0], {
+    schemaVersion: 1,
+    name: "daemon",
+    action: "invoke",
+    outcome: "failed",
+    code: "CONNECTION_LOST",
+    cleanupState: null,
+    mappingId: null,
+    workspaceId: null,
+    transactionId: "opaque-request",
+    fenceSequence: null,
+    durationMs: 0,
+    socketGeneration: null,
+    readinessRevision: null,
+    mappingGeneration: null,
+    workspaceGeneration: null,
+  });
+  assert.equal(events[1].transactionId, "opaque-request-2");
+  assert.equal(events[1].durationMs, 0);
+  assert.equal(events[1].mappingId, "mapping");
+  assert.equal(events[1].fenceSequence, 5);
+  assert.equal(pending.finish("failed", "CONNECTION_LOST"), undefined);
+});
+
+test("invoke transaction durations are monotonic and bounded", () => {
+  let now = 100;
+  const observability = new DaemonObservability({ now: () => now });
+  const events = [];
+  observability.subscribe((event) => events.push(event));
+  const backwards = observability.createInvokeTransaction({}, "backwards");
+  now = 99;
+  backwards.finish("failed", "UNKNOWN_RUNTIME");
+  now = 0;
+  const bounded = observability.createInvokeTransaction({}, "bounded");
+  now = Number.MAX_SAFE_INTEGER + 1_000;
+  bounded.finish("failed", "UNKNOWN_RUNTIME");
+  assert.equal(events[0].durationMs, 0);
+  assert.equal(events[1].durationMs, Number.MAX_SAFE_INTEGER);
+});
+
 test("owner snapshots are authoritative, frozen, and attached once", () => {
   const observability = new DaemonObservability();
   const events = [];

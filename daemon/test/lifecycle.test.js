@@ -181,6 +181,8 @@ async function startReadinessDaemon({
   afterRegisterResponse,
   testInjection = true,
   autoBind = false,
+  observabilityDaemonTestMode = true,
+  observabilityTestIpc = false,
 } = {}) {
   const frames = [];
   const telemetry = [];
@@ -199,7 +201,7 @@ async function startReadinessDaemon({
       const message = JSON.parse(raw.toString());
       if (message.type === "register") {
         registrations.push(message);
-        beforeRegisterResponse?.(socket);
+        if (beforeRegisterResponse?.(socket) === false) return;
         socket.send(JSON.stringify(registerResponse));
         afterRegisterResponse?.(socket);
         if (autoBind && registerResponse.protocolVersion === 2) {
@@ -221,6 +223,8 @@ async function startReadinessDaemon({
       GJC_READINESS_TTL_MS: "1000",
       GJC_READINESS_V2: "1",
       GJC_READINESS_TEST_INJECTION: testInjection ? "1" : "0",
+      GJC_DAEMON_TEST_MODE: observabilityDaemonTestMode ? "1" : "0",
+      GJC_OBSERVABILITY_TEST_IPC: observabilityTestIpc ? "1" : "0",
       GJC_READINESS_TEST_PROBE: "pass",
       GJC_READINESS_TEST_WORKSPACE_ID: "workspace-test",
       GJC_READINESS_TEST_WORKSPACE_GENERATION: "1",
@@ -263,6 +267,105 @@ async function startReadinessDaemon({
     },
   };
 }
+
+test("observability IPC requires both dedicated test gate terms and stays out of WS frames", async () => {
+  for (const {
+    observabilityDaemonTestMode,
+    observabilityTestIpc,
+    expectTelemetry,
+  } of [
+    {
+      observabilityDaemonTestMode: false,
+      observabilityTestIpc: true,
+      expectTelemetry: false,
+    },
+    {
+      observabilityDaemonTestMode: true,
+      observabilityTestIpc: false,
+      expectTelemetry: false,
+    },
+    {
+      observabilityDaemonTestMode: true,
+      observabilityTestIpc: true,
+      expectTelemetry: true,
+    },
+  ]) {
+    let invoked = false;
+    const daemon = await startReadinessDaemon({
+      observabilityDaemonTestMode,
+      observabilityTestIpc,
+      envOverrides: {
+        GJC_READINESS_TEST_WORKSPACE_ID: "",
+        GJC_READINESS_TEST_WORKSPACE_GENERATION: "",
+        GJC_READINESS_TEST_MAPPING_ID: "",
+        GJC_READINESS_TEST_MAPPING_GENERATION: "",
+        GJC_READINESS_TEST_MAPPING_VERSION: "",
+        GJC_READINESS_TEST_WORK_DIR: "",
+      },
+      onMessage(message, socket) {
+        if (
+          message.type === "readiness" &&
+          message.lastError?.code === "MAPPING_ID_REQUIRED" &&
+          !invoked
+        ) {
+          invoked = true;
+          socket.send(JSON.stringify({
+            type: "invoke",
+            requestId: "ipc-gate-request",
+            workDir: "C:\\private\\workspace",
+            command: { kind: "prompt", message: "private prompt" },
+          }));
+        }
+      },
+    });
+    try {
+      await waitForFrame(
+        daemon.frames,
+        (message) =>
+          message.type === "event" &&
+          message.requestId === "ipc-gate-request",
+        "IPC-gated invoke rejection",
+      );
+      const frame = daemon.frames.find(
+        (message) =>
+          message.type === "event" &&
+          message.requestId === "ipc-gate-request",
+      );
+      for (const field of [
+        "transactionId",
+        "durationMs",
+        "fenceSequence",
+        "socketGeneration",
+        "readinessRevision",
+        "mappingGeneration",
+        "workspaceGeneration",
+      ]) {
+        assert.equal(Object.hasOwn(frame, field), false);
+      }
+      if (expectTelemetry) {
+        await waitForFrame(
+          daemon.telemetry,
+          (event) =>
+            event.name === "daemon" &&
+            event.action === "invoke" &&
+            event.transactionId === "ipc-gate-request",
+          "IPC-gated daemon telemetry",
+        );
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const terminals = daemon.telemetry.filter(
+        (event) =>
+          event.name === "daemon" &&
+          event.action === "invoke" &&
+          event.transactionId === "ipc-gate-request",
+      );
+      assert.equal(terminals.length, expectTelemetry ? 1 : 0);
+    } finally {
+      await daemon.stop();
+    }
+  }
+});
 
 test("denied registration uses one fixed retry and accepted recovery restores normal reconnects", async () => {
   // Deliberately overlaps the credential-bearing BOT_WS_URL to prove the
@@ -504,6 +607,7 @@ test("v2 probe success promotes all dimensions only with explicit mapping eviden
 test("missing authenticated mapping stays non-ready and rejects before session creation", async () => {
   let invoked = false;
   const daemon = await startReadinessDaemon({
+    observabilityTestIpc: true,
     envOverrides: {
       GJC_READINESS_TEST_WORKSPACE_ID: "",
       GJC_READINESS_TEST_WORKSPACE_GENERATION: "",
@@ -728,6 +832,7 @@ test("failed current-run readiness probes stay non-ready and expose only bounded
   const secret = "probe-secret-value";
   let invoked = false;
   const daemon = await startReadinessDaemon({
+    observabilityTestIpc: true,
     envOverrides: {
       GJC_READINESS_TEST_PROBE: "fail",
       GJC_READINESS_TEST_PROBE_ERROR_CODE: "UNKNOWN_RUNTIME",
@@ -955,7 +1060,12 @@ test("daemon rejects workload frames before and after an incompatible managed ha
     command: { kind: "prompt", message: "must not run" },
   });
   for (const [name, hook] of [
-    ["before", { beforeRegisterResponse: (socket) => socket.send(invoke("before-handshake")) }],
+    ["before", {
+      beforeRegisterResponse: (socket) => {
+        socket.send(invoke("before-handshake"));
+        return false;
+      },
+    }],
     ["after", { afterRegisterResponse: (socket) => socket.send(invoke("after-refusal")) }],
   ]) {
     await t.test(name, async () => {
@@ -976,6 +1086,8 @@ test("daemon rejects workload frames before and after an incompatible managed ha
         );
         assert.equal(daemon.frames.length, 0);
         assert.equal(daemon.output().includes("must not run"), false);
+        assert.equal(daemon.output().includes("fatal"), false);
+        assert.equal(daemon.output().includes("unhandled rejection"), false);
       } finally {
         await daemon.stop();
       }

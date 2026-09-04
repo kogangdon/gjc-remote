@@ -90,9 +90,14 @@ function optionalSafeInteger(value, field) {
 
 /** Emits process-local, privacy-bounded facts from daemon resource owners. */
 export class DaemonObservability {
-  constructor() {
+  constructor({ now = () => performance.now() } = {}) {
+    if (typeof now !== "function") {
+      throw new TypeError("observability clock must be a function");
+    }
     this.listeners = new Set();
     this.snapshotReaders = undefined;
+    this.now = now;
+    this.invokeTransactionsByConnection = new Map();
   }
 
   subscribe(listener) {
@@ -162,6 +167,127 @@ export class DaemonObservability {
       ...snapshots[2],
     });
   }
+
+  createInvokeTransaction(connection, requestId) {
+    if (typeof requestId !== "string") {
+      throw new TypeError("invoke transaction requires a validated request id");
+    }
+    const startedAt = this.now();
+    const tracked = this.invokeTransactionsByConnection.get(connection) ?? new Set();
+    this.invokeTransactionsByConnection.set(connection, tracked);
+    let completed = false;
+    let dispatchContext;
+    const transaction = Object.freeze({
+      admit: (candidate) => {
+        assertInvokeDispatchShape(candidate);
+        if (completed) return undefined;
+        if (dispatchContext) return dispatchContext;
+        try {
+          dispatchContext = projectInvokeDispatchContext(candidate);
+        } catch {
+          dispatchContext = EMPTY_INVOKE_DISPATCH_CONTEXT;
+        }
+        return dispatchContext;
+      },
+      finish: (outcome, code = null) => {
+        if (completed) return undefined;
+        completed = true;
+        tracked.delete(transaction);
+        if (tracked.size === 0) this.invokeTransactionsByConnection.delete(connection);
+        try {
+          return this.emitOwnerEvent({
+            name: "daemon",
+            action: "invoke",
+            outcome,
+            code,
+            transactionId: isOpaqueId(requestId) ? requestId : null,
+            durationMs: boundedMonotonicDuration(this.now(), startedAt),
+            ...(dispatchContext ?? EMPTY_INVOKE_DISPATCH_CONTEXT),
+          });
+        } catch {
+          // Local telemetry must not alter daemon invoke behavior.
+          return undefined;
+        }
+      },
+    });
+    tracked.add(transaction);
+    return transaction;
+  }
+
+  finishInvokeTransactionsForConnection(connection, outcome, code = null) {
+    for (const transaction of [
+      ...(this.invokeTransactionsByConnection.get(connection) ?? []),
+    ]) {
+      transaction.finish(outcome, code);
+    }
+  }
+}
+
+const EMPTY_INVOKE_DISPATCH_CONTEXT = Object.freeze({
+  socketGeneration: null,
+  readinessRevision: null,
+  mappingGeneration: null,
+  workspaceGeneration: null,
+  mappingId: null,
+  workspaceId: null,
+  fenceSequence: null,
+});
+const INVOKE_DISPATCH_FIELDS = new Set(Object.keys(
+  EMPTY_INVOKE_DISPATCH_CONTEXT,
+));
+
+function projectInvokeDispatchContext(candidate) {
+  assertInvokeDispatchShape(candidate);
+  const {
+    socketGeneration,
+    readinessRevision,
+    mappingGeneration,
+    workspaceGeneration,
+    mappingId,
+    workspaceId,
+    fenceSequence,
+  } = candidate;
+  const projected = projectOwnerEvent({
+    name: "daemon",
+    action: "invoke",
+    outcome: "started",
+    code: null,
+    durationMs: 0,
+    socketGeneration,
+    readinessRevision,
+    mappingGeneration,
+    workspaceGeneration,
+    mappingId,
+    workspaceId,
+    fenceSequence,
+  });
+  return Object.freeze({
+    socketGeneration: projected.socketGeneration,
+    readinessRevision: projected.readinessRevision,
+    mappingGeneration: projected.mappingGeneration,
+    workspaceGeneration: projected.workspaceGeneration,
+    mappingId: projected.mappingId,
+    workspaceId: projected.workspaceId,
+    fenceSequence: projected.fenceSequence,
+  });
+}
+
+function assertInvokeDispatchShape(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new TypeError("invoke dispatch context must be an object");
+  }
+  if (
+    Object.keys(candidate).length !== INVOKE_DISPATCH_FIELDS.size ||
+    Object.keys(candidate).some((key) => !INVOKE_DISPATCH_FIELDS.has(key))
+  ) {
+    throw new TypeError("invoke dispatch context has invalid fields");
+  }
+}
+
+function boundedMonotonicDuration(now, startedAt) {
+  const duration = Math.floor(now - startedAt);
+  if (!Number.isFinite(duration) || duration <= 0) return 0;
+  return Math.min(duration, Number.MAX_SAFE_INTEGER);
 }
 
 export function projectOwnerEvent(candidate) {
