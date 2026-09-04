@@ -117,10 +117,17 @@ supplements, and does not replace, the design-only matrix above.
   while event IDs use one shared opaque-ID grammar at projection/emission time. Composite
   snapshots reject duplicate/reserved keys rather than
   silently shadowing one owner's gauge. Focused tests pin every owner capacity/busy/retire/create
-  and bounded receipt-cleanup terminal. This foundation is not wired into daemon orchestration
-  and is not release evidence.
-- Deferred: daemon invoke/lifecycle transaction correlation and manual-cleanup telemetry;
-  supervisor restart proof; and
+  and bounded receipt-cleanup terminal. This owner foundation is wired into daemon orchestration:
+  one process-local composite attaches the three owner snapshots and emits one correlated,
+  bounded daemon `invoke` terminal after each valid invoke. Invoke records use only admitted
+  local readiness/mapping/workspace generations and a registry-issued activity fence; they carry
+  no wire fields, paths, prompts, errors, credentials, or sender fence. On the deployed Bun
+  runtime, `succeeded` means the final frame was queued while the socket was OPEN; Bun's `ws`
+  callback does not prove peer receipt or network flush. Flush/receipt evidence remains outside
+  this local telemetry claim. The local smoke keeps the
+  v1 wire contract, opens test-only IPC, and requires exactly three successful bounded terminals
+  for its three real SDK invokes without request-data leakage.
+- Deferred: daemon lifecycle/manual-cleanup transaction telemetry, supervisor restart proof, and
   exporter/evidence ingestion remain separate daemon/supervisor slices. Bot callback/snapshot
   records are local API telemetry, not wire protocol or release evidence.
 
@@ -143,7 +150,7 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
-fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:277, an
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:278, an
 `= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
 default) the gate reads `false` and its read site inside `admitReadyWorkload` returns

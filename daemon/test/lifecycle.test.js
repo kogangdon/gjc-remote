@@ -183,6 +183,7 @@ async function startReadinessDaemon({
   autoBind = false,
 } = {}) {
   const frames = [];
+  const telemetry = [];
   const registrations = [];
   const sockets = [];
   const closes = [];
@@ -234,7 +235,7 @@ async function startReadinessDaemon({
         : {}),
       ...envOverrides,
     },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
     windowsHide: true,
   });
   let output = "";
@@ -244,9 +245,13 @@ async function startReadinessDaemon({
   child.stderr.on("data", (chunk) => {
     output += chunk.toString();
   });
+  child.on("message", (message) => {
+    if (message?.type === "daemon_observability") telemetry.push(message.event);
+  });
 
   return {
     frames,
+    telemetry,
     registrations,
     sockets,
     closes,
@@ -541,6 +546,47 @@ test("missing authenticated mapping stays non-ready and rejects before session c
     const error = JSON.parse(event.error);
     assert.equal(error.code, "MAPPING_ID_REQUIRED");
     assert.equal(event.error.includes("private"), false);
+    await waitForFrame(
+      daemon.telemetry,
+      (record) =>
+        record.name === "daemon" &&
+        record.action === "invoke" &&
+        record.transactionId === "missing-mapping-request",
+      "daemon invoke telemetry",
+    );
+    const records = daemon.telemetry.filter(
+      (record) =>
+        record.name === "daemon" &&
+        record.action === "invoke" &&
+        record.transactionId === "missing-mapping-request",
+    );
+    assert.equal(records.length, 1);
+    assert.deepEqual(Object.keys(records[0]), [
+      "schemaVersion", "name", "action", "outcome", "code", "cleanupState",
+      "mappingId", "workspaceId", "transactionId", "fenceSequence", "durationMs",
+      "socketGeneration", "readinessRevision", "mappingGeneration", "workspaceGeneration",
+    ]);
+    assert.deepEqual(records[0], {
+      schemaVersion: 1,
+      name: "daemon",
+      action: "invoke",
+      outcome: "refused",
+      code: "MAPPING_ID_REQUIRED",
+      cleanupState: null,
+      mappingId: null,
+      workspaceId: null,
+      transactionId: "missing-mapping-request",
+      fenceSequence: null,
+      durationMs: records[0].durationMs,
+      socketGeneration: null,
+      readinessRevision: null,
+      mappingGeneration: null,
+      workspaceGeneration: null,
+    });
+    assert.equal(Number.isSafeInteger(records[0].durationMs), true);
+    assert.equal(records[0].durationMs >= 0, true);
+    assert.equal(JSON.stringify(records[0]).includes("private"), false);
+    assert.equal(JSON.stringify(records[0]).includes("hello"), false);
   } finally {
     await daemon.stop();
   }
@@ -698,7 +744,7 @@ test("failed current-run readiness probes stay non-ready and expose only bounded
           socket.send(
             JSON.stringify({
               type: "invoke",
-              requestId: "probe-request",
+              requestId: "probe/request",
               workDir: "C:\\private\\workspace",
               command: { kind: "prompt", message: "hello" },
             })
@@ -710,11 +756,11 @@ test("failed current-run readiness probes stay non-ready and expose only bounded
   try {
     await waitForFrame(
       daemon.frames,
-      (message) => message.type === "event" && message.requestId === "probe-request",
+      (message) => message.type === "event" && message.requestId === "probe/request",
       "probe rejection event"
     );
     const rejection = daemon.frames.find(
-      (message) => message.type === "event" && message.requestId === "probe-request"
+      (message) => message.type === "event" && message.requestId === "probe/request"
     );
     const error = JSON.parse(rejection.error);
     assert.equal(error.code, "UNKNOWN_RUNTIME");
@@ -729,6 +775,26 @@ test("failed current-run readiness probes stay non-ready and expose only bounded
     assert.equal(failed.status.workspace, "unknown");
     assert.equal(JSON.stringify(failed).includes(secret), false);
     assert.equal(JSON.stringify(failed).includes("private"), false);
+    await waitForFrame(
+      daemon.telemetry,
+      (record) =>
+        record.name === "daemon" &&
+        record.action === "invoke" &&
+        record.code === "UNKNOWN_RUNTIME",
+      "non-opaque invoke telemetry",
+    );
+    const telemetry = daemon.telemetry.find(
+      (record) =>
+        record.name === "daemon" &&
+        record.action === "invoke" &&
+        record.code === "UNKNOWN_RUNTIME",
+    );
+    assert.equal(telemetry.transactionId, null);
+    assert.equal(telemetry.mappingId, null);
+    assert.equal(telemetry.workspaceId, null);
+    assert.equal(JSON.stringify(telemetry).includes("probe/request"), false);
+    assert.equal(JSON.stringify(telemetry).includes("private"), false);
+    assert.equal(JSON.stringify(telemetry).includes("hello"), false);
   } finally {
     await daemon.stop();
   }

@@ -88,6 +88,7 @@ import { RequestIdFence } from "./request-id-fence.js";
 import { resolveDaemonConnectionConfig } from "./daemon-config.js";
 import { ROLE_PATHS } from "./container-security-preflight.js";
 import { createSdkSession } from "./sdk-session.js";
+import { DaemonObservability, isOpaqueId } from "./daemon-observability.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -408,24 +409,66 @@ try {
   process.exit(1);
 }
 
-const containerSessionRoot =
+const containerSessionStatePath =
   process.env.GJC_CONTAINER_RUNTIME === "1" ? ROLE_PATHS.session : undefined;
+const daemonObservability = new DaemonObservability();
 const pool = new SessionPool({
   sensitiveValues: daemonSensitiveValues,
   sessionFactory: (workDir) =>
     createSdkSession(workDir, undefined, {
-      sessionRoot: containerSessionRoot,
+      sessionRoot: containerSessionStatePath,
     }),
+  observer: daemonObservability,
 });
-const admissionBudget = new AdmissionBudget();
+const admissionBudget = new AdmissionBudget({ observer: daemonObservability });
 const workspaceLeases = new WorkspaceLeaseRegistry({
   maxActiveWorkspaces: DEFAULT_MAX_ACTIVE_WORKSPACES,
+  observer: daemonObservability,
 });
+daemonObservability.attachOwners({
+  admissionBudget,
+  sessionPool: pool,
+  workspaceLeaseRegistry: workspaceLeases,
+});
+if (READINESS_TEST_INJECTION_ENABLED) {
+  const testFacade = Object.freeze({
+    subscribe: (listener) => daemonObservability.subscribe(listener),
+    getSnapshot: () => daemonObservability.getSnapshot(),
+  });
+  const subscribe = globalThis[Symbol.for("gjc.remote.daemon.observability.subscribe")];
+  if (typeof subscribe === "function") {
+    try {
+      subscribe(testFacade);
+    } catch {
+      // Test-only observers cannot affect daemon startup.
+    }
+  }
+  if (typeof process.send === "function") {
+    let ipcAvailable = process.connected === true;
+    process.once("disconnect", () => {
+      ipcAvailable = false;
+    });
+    daemonObservability.subscribe((event) => {
+      if (!ipcAvailable || process.connected !== true) return;
+      try {
+        process.send(
+          { type: "daemon_observability", event },
+          (error) => {
+            if (error) ipcAvailable = false;
+          },
+        );
+      } catch {
+        ipcAvailable = false;
+      }
+    });
+  }
+}
 const requestIds = new RequestIdFence();
 // #35: map an in-flight invoke's requestId to its SdkSession so an ANSWER frame
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
 const inFlightByRequestId = new Map();
+const activeInvokeTelemetry = new Map();
 const connections = new Set();
 let shuttingDown = false;
 let shutdownPromise = null;
@@ -1763,6 +1806,9 @@ function connectToBot() {
   );
 
   connection.on("close", () => {
+    for (const telemetry of activeInvokeTelemetry.get(connection) ?? []) {
+      telemetry.finish("failed", PROTOCOL_ERROR_CODES.CONNECTION_LOST);
+    }
     clearReadinessTimer(readinessState);
     readinessState.committed = false;
     if (readinessState.receiptCommitted) {
@@ -1803,6 +1849,65 @@ function closePolicyViolation(connection, reason) {
   // RFC 6455 makes the status code authoritative. The UTF-8 reason is
   // diagnostic only: Bun 1.3.14 can omit it on Linux arm64.
   connection.close(1008, reason);
+}
+
+function invokeDurationMs(start) {
+  const duration = Math.floor(performance.now() - start);
+  if (!Number.isFinite(duration) || duration <= 0) return 0;
+  return Math.min(duration, Number.MAX_SAFE_INTEGER);
+}
+
+function trustedTelemetryInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function createInvokeTelemetry(connection, requestId) {
+  const start = performance.now();
+  let completed = false;
+  const fields = {
+    socketGeneration: null,
+    readinessRevision: null,
+    mappingGeneration: null,
+    workspaceGeneration: null,
+    mappingId: null,
+    workspaceId: null,
+    fenceSequence: null,
+  };
+  const tracked = activeInvokeTelemetry.get(connection) ?? new Set();
+  activeInvokeTelemetry.set(connection, tracked);
+  const telemetry = {
+    admit(state, admission) {
+      const identity = admission.bindingState?.binding ?? state;
+      fields.socketGeneration = trustedTelemetryInteger(state.socketGeneration);
+      fields.readinessRevision = trustedTelemetryInteger(state.revision);
+      fields.mappingGeneration = trustedTelemetryInteger(identity.mappingGeneration);
+      fields.workspaceGeneration = trustedTelemetryInteger(identity.workspaceGeneration);
+      fields.mappingId = isOpaqueId(identity.mappingId) ? identity.mappingId : null;
+      fields.workspaceId = isOpaqueId(identity.workspaceId) ? identity.workspaceId : null;
+      fields.fenceSequence = trustedTelemetryInteger(admission.activityLease?.fence);
+    },
+    finish(outcome, code = null) {
+      if (completed) return;
+      completed = true;
+      tracked.delete(telemetry);
+      if (tracked.size === 0) activeInvokeTelemetry.delete(connection);
+      try {
+        daemonObservability.emitOwnerEvent({
+          name: "daemon",
+          action: "invoke",
+          outcome,
+          code,
+          transactionId: isOpaqueId(requestId) ? requestId : null,
+          durationMs: invokeDurationMs(start),
+          ...fields,
+        });
+      } catch {
+        // Local telemetry must not alter daemon invoke behavior.
+      }
+    },
+  };
+  tracked.add(telemetry);
+  return telemetry;
 }
 
 async function handleMessage(
@@ -2319,10 +2424,50 @@ async function handleMessage(
   }
 
   const { requestId, workDir, command } = msg;
-  const send = (event, extra = {}) =>
-    connection.send(serializeEventFrame(requestId, event, extra));
+  const invokeTelemetry = createInvokeTelemetry(connection, requestId);
+  let sendQueue = Promise.resolve();
+  const send = (event, extra = {}) => {
+    const frame = serializeEventFrame(requestId, event, extra);
+    const operation = sendQueue.then(() => new Promise((resolve, reject) => {
+      if (connection.readyState !== WebSocket.OPEN) {
+        invokeTelemetry.finish(
+          "failed",
+          PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+        );
+        reject(new Error("websocket is not open"));
+        return;
+      }
+      try {
+        connection.send(frame, (error) => {
+          if (error) {
+            invokeTelemetry.finish(
+              "failed",
+              PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+            );
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      } catch (error) {
+        invokeTelemetry.finish(
+          "failed",
+          PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+        );
+        reject(error);
+      }
+    }));
+    // SDK event callbacks are synchronous and do not await this promise. Attach
+    // an observer immediately so a transport failure cannot become a process-
+    // fatal unhandled rejection; keep the original rejected queue as the
+    // barrier returned to callers and awaited by the final done frame.
+    void operation.catch(() => {});
+    sendQueue = operation;
+    return operation;
+  };
   const releaseRequestId = requestIds.tryAcquire(requestId);
   if (!releaseRequestId) {
+    invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.LEASE_CONFLICT);
     closePolicyViolation(connection, "duplicate request id");
     return;
   }
@@ -2330,22 +2475,31 @@ async function handleMessage(
   if (!releaseAdmission) {
     releaseRequestId();
     const exhausted = makeReadinessError(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
-    send(undefined, {
-      error: readinessState?.committed
-        ? formatReadinessRejection(exhausted)
-        : LEGACY_RESOURCE_EXHAUSTED_ERROR,
-      done: true,
-    });
+    try {
+      await send(undefined, {
+        error: readinessState?.committed
+          ? formatReadinessRejection(exhausted)
+          : LEGACY_RESOURCE_EXHAUSTED_ERROR,
+        done: true,
+      });
+    } catch (error) {
+      throw error;
+    }
+    invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
     return;
   }
   let session;
   let activityLease;
+  let invokeOutcome = "failed";
+  let invokeCode = PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
 
   try {
     if (readinessState?.committed) {
       const admission = await admitReadyWorkload(readinessState, workDir, msg);
       if (admission.error) {
-        send(undefined, {
+        invokeOutcome = "refused";
+        invokeCode = admission.error.code;
+        await send(undefined, {
           error: formatReadinessRejection(admission.error),
           done: true,
         });
@@ -2362,7 +2516,9 @@ async function handleMessage(
             admission.bindingFingerprint
           ))
       ) {
-        send(undefined, {
+        invokeOutcome = "refused";
+        invokeCode = PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED;
+        await send(undefined, {
           error: formatReadinessRejection(
             makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED)
           ),
@@ -2370,6 +2526,7 @@ async function handleMessage(
         });
         return;
       }
+      invokeTelemetry.admit(readinessState, admission);
     } else {
       session = await pool.ensureSession(workDir);
     }
@@ -2386,7 +2543,9 @@ async function handleMessage(
       await session.send(rpcCommand, (event) => send(event));
     }
 
-    send(undefined, { done: true });
+    await send(undefined, { done: true });
+    invokeOutcome = "succeeded";
+    invokeCode = null;
   } catch (err) {
     const modelDiagnostic =
       command.kind === "set_model" ? modelCommandDiagnostic(err) : undefined;
@@ -2396,19 +2555,27 @@ async function handleMessage(
       );
     }
     if (readinessState?.committed) {
-      send(undefined, {
+      invokeOutcome = "failed";
+      invokeCode = classifyReadinessError(
+        err,
+        PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+      );
+      await send(undefined, {
         error: formatReadinessRejection(
-          makeReadinessError(classifyReadinessError(err, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME))
+          makeReadinessError(invokeCode)
         ),
         done: true,
       });
     } else {
-      send(undefined, {
+      invokeOutcome = "failed";
+      invokeCode = PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
+      await send(undefined, {
         error: sanitizeDaemonError(normalizeProtocolError(err)),
         done: true,
       });
     }
   } finally {
+    invokeTelemetry.finish(invokeOutcome, invokeCode);
     releaseRequestId();
     activityLease?.release();
     releaseAdmission();

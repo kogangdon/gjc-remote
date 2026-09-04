@@ -1,3 +1,5 @@
+import { PROTOCOL_ERROR_CODES } from "@gjc-remote/shared";
+
 const EVENT_FIELDS = [
   "name",
   "action",
@@ -9,12 +11,17 @@ const EVENT_FIELDS = [
   "transactionId",
   "fenceSequence",
   "durationMs",
+  "socketGeneration",
+  "readinessRevision",
+  "mappingGeneration",
+  "workspaceGeneration",
 ];
 const REQUIRED_EVENT_FIELDS = ["name", "action", "outcome"];
 const CLOSED_NAMES = new Set([
   "admission_budget",
   "session_pool",
   "workspace_lease_registry",
+  "daemon",
 ]);
 const CLOSED_ACTIONS = new Set([
   "invoke_capacity",
@@ -25,15 +32,17 @@ const CLOSED_ACTIONS = new Set([
   "release",
   "invalidate",
   "retire",
+  "invoke",
 ]);
-const CLOSED_OUTCOMES = new Set(["started", "succeeded", "denied", "settled"]);
-const CLOSED_CODES = new Set([
-  "RESOURCE_EXHAUSTED",
-  "SESSION_LIMIT",
-  "LEASE_CONFLICT",
-  "WORKSPACE_ADMISSION_EXCEEDED",
-  "WORKSPACE_BUSY",
+const CLOSED_OUTCOMES = new Set([
+  "started",
+  "succeeded",
+  "denied",
+  "settled",
+  "refused",
+  "failed",
 ]);
+const CLOSED_CODES = new Set(Object.values(PROTOCOL_ERROR_CODES));
 const CLOSED_CLEANUP_STATES = new Set(["started", "fulfilled", "rejected", "timed_out"]);
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SNAPSHOT_KEY_CONFIGURATION_ERROR =
@@ -187,6 +196,22 @@ export function projectOwnerEvent(candidate) {
       "fenceSequence",
     ),
     durationMs: optionalSafeInteger(candidate.durationMs, "durationMs"),
+    socketGeneration: optionalSafeInteger(
+      candidate.socketGeneration,
+      "socketGeneration",
+    ),
+    readinessRevision: optionalSafeInteger(
+      candidate.readinessRevision,
+      "readinessRevision",
+    ),
+    mappingGeneration: optionalSafeInteger(
+      candidate.mappingGeneration,
+      "mappingGeneration",
+    ),
+    workspaceGeneration: optionalSafeInteger(
+      candidate.workspaceGeneration,
+      "workspaceGeneration",
+    ),
   };
   return Object.freeze(event);
 }
