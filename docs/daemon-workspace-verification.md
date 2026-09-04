@@ -124,8 +124,13 @@ supplements, and does not replace, the design-only matrix above.
   no wire fields, paths, prompts, errors, credentials, or sender fence. On the deployed Bun
   runtime, `succeeded` means the final frame was queued while the socket was OPEN; Bun's `ws`
   callback does not prove peer receipt or network flush. Flush/receipt evidence remains outside
-  this local telemetry claim. The local smoke keeps the
-  v1 wire contract, opens test-only IPC, and requires exactly three successful bounded terminals
+  this local telemetry claim. Invoke transaction correlation is owned and directly tested by the
+  observability module: admitted local generations/IDs and registry-issued fence are frozen,
+  non-null when present, and cannot be changed after admission. The local smoke keeps the
+  production-shaped v1 readiness/inventory path, opens only the double-gated
+  (`GJC_DAEMON_TEST_MODE=1` plus `GJC_OBSERVABILITY_TEST_IPC=1`) daemon-private test IPC channel,
+  without changing the embedded SDK's `NODE_ENV`, and requires exactly
+  three successful bounded terminals
   for its three real SDK invokes without request-data leakage.
 - Deferred: daemon lifecycle/manual-cleanup transaction telemetry, supervisor restart proof, and
   exporter/evidence ingestion remain separate daemon/supervisor slices. Bot callback/snapshot
@@ -150,7 +155,7 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
-fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:278, an
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:281, an
 `= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
 default) the gate reads `false` and its read site inside `admitReadyWorkload` returns

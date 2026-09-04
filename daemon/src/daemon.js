@@ -88,7 +88,7 @@ import { RequestIdFence } from "./request-id-fence.js";
 import { resolveDaemonConnectionConfig } from "./daemon-config.js";
 import { ROLE_PATHS } from "./container-security-preflight.js";
 import { createSdkSession } from "./sdk-session.js";
-import { DaemonObservability, isOpaqueId } from "./daemon-observability.js";
+import { DaemonObservability } from "./daemon-observability.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -149,6 +149,9 @@ function sanitizeDaemonError(error) {
 const readinessV2Advertised = process.env.GJC_READINESS_V2 === "1";
 const READINESS_TEST_INJECTION_ENABLED =
   process.env.GJC_READINESS_TEST_INJECTION === "1";
+const OBSERVABILITY_TEST_IPC_ENABLED =
+  process.env.GJC_DAEMON_TEST_MODE === "1" &&
+  process.env.GJC_OBSERVABILITY_TEST_IPC === "1";
 const nativeInventoryMode =
   `${process.env.GJC_NATIVE_INVENTORY_MODE ?? "off"}`.trim().toLowerCase();
 if (nativeInventoryMode !== "off" && nativeInventoryMode !== "verify") {
@@ -430,19 +433,7 @@ daemonObservability.attachOwners({
   sessionPool: pool,
   workspaceLeaseRegistry: workspaceLeases,
 });
-if (READINESS_TEST_INJECTION_ENABLED) {
-  const testFacade = Object.freeze({
-    subscribe: (listener) => daemonObservability.subscribe(listener),
-    getSnapshot: () => daemonObservability.getSnapshot(),
-  });
-  const subscribe = globalThis[Symbol.for("gjc.remote.daemon.observability.subscribe")];
-  if (typeof subscribe === "function") {
-    try {
-      subscribe(testFacade);
-    } catch {
-      // Test-only observers cannot affect daemon startup.
-    }
-  }
+if (OBSERVABILITY_TEST_IPC_ENABLED) {
   if (typeof process.send === "function") {
     let ipcAvailable = process.connected === true;
     process.once("disconnect", () => {
@@ -468,7 +459,6 @@ const requestIds = new RequestIdFence();
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
 const inFlightByRequestId = new Map();
-const activeInvokeTelemetry = new Map();
 const connections = new Set();
 let shuttingDown = false;
 let shutdownPromise = null;
@@ -1806,9 +1796,11 @@ function connectToBot() {
   );
 
   connection.on("close", () => {
-    for (const telemetry of activeInvokeTelemetry.get(connection) ?? []) {
-      telemetry.finish("failed", PROTOCOL_ERROR_CODES.CONNECTION_LOST);
-    }
+    daemonObservability.finishInvokeTransactionsForConnection(
+      connection,
+      "failed",
+      PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+    );
     clearReadinessTimer(readinessState);
     readinessState.committed = false;
     if (readinessState.receiptCommitted) {
@@ -1849,65 +1841,6 @@ function closePolicyViolation(connection, reason) {
   // RFC 6455 makes the status code authoritative. The UTF-8 reason is
   // diagnostic only: Bun 1.3.14 can omit it on Linux arm64.
   connection.close(1008, reason);
-}
-
-function invokeDurationMs(start) {
-  const duration = Math.floor(performance.now() - start);
-  if (!Number.isFinite(duration) || duration <= 0) return 0;
-  return Math.min(duration, Number.MAX_SAFE_INTEGER);
-}
-
-function trustedTelemetryInteger(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
-function createInvokeTelemetry(connection, requestId) {
-  const start = performance.now();
-  let completed = false;
-  const fields = {
-    socketGeneration: null,
-    readinessRevision: null,
-    mappingGeneration: null,
-    workspaceGeneration: null,
-    mappingId: null,
-    workspaceId: null,
-    fenceSequence: null,
-  };
-  const tracked = activeInvokeTelemetry.get(connection) ?? new Set();
-  activeInvokeTelemetry.set(connection, tracked);
-  const telemetry = {
-    admit(state, admission) {
-      const identity = admission.bindingState?.binding ?? state;
-      fields.socketGeneration = trustedTelemetryInteger(state.socketGeneration);
-      fields.readinessRevision = trustedTelemetryInteger(state.revision);
-      fields.mappingGeneration = trustedTelemetryInteger(identity.mappingGeneration);
-      fields.workspaceGeneration = trustedTelemetryInteger(identity.workspaceGeneration);
-      fields.mappingId = isOpaqueId(identity.mappingId) ? identity.mappingId : null;
-      fields.workspaceId = isOpaqueId(identity.workspaceId) ? identity.workspaceId : null;
-      fields.fenceSequence = trustedTelemetryInteger(admission.activityLease?.fence);
-    },
-    finish(outcome, code = null) {
-      if (completed) return;
-      completed = true;
-      tracked.delete(telemetry);
-      if (tracked.size === 0) activeInvokeTelemetry.delete(connection);
-      try {
-        daemonObservability.emitOwnerEvent({
-          name: "daemon",
-          action: "invoke",
-          outcome,
-          code,
-          transactionId: isOpaqueId(requestId) ? requestId : null,
-          durationMs: invokeDurationMs(start),
-          ...fields,
-        });
-      } catch {
-        // Local telemetry must not alter daemon invoke behavior.
-      }
-    },
-  };
-  tracked.add(telemetry);
-  return telemetry;
 }
 
 async function handleMessage(
@@ -2424,7 +2357,10 @@ async function handleMessage(
   }
 
   const { requestId, workDir, command } = msg;
-  const invokeTelemetry = createInvokeTelemetry(connection, requestId);
+  const invokeTelemetry = daemonObservability.createInvokeTransaction(
+    connection,
+    requestId,
+  );
   let sendQueue = Promise.resolve();
   const send = (event, extra = {}) => {
     const frame = serializeEventFrame(requestId, event, extra);
@@ -2526,7 +2462,16 @@ async function handleMessage(
         });
         return;
       }
-      invokeTelemetry.admit(readinessState, admission);
+      const identity = admission.bindingState?.binding ?? readinessState;
+      invokeTelemetry.admit({
+        socketGeneration: readinessState.socketGeneration,
+        readinessRevision: readinessState.revision,
+        mappingGeneration: identity.mappingGeneration,
+        workspaceGeneration: identity.workspaceGeneration,
+        mappingId: identity.mappingId,
+        workspaceId: identity.workspaceId,
+        fenceSequence: admission.activityLease?.fence,
+      });
     } else {
       session = await pool.ensureSession(workDir);
     }
