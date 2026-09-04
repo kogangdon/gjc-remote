@@ -113,7 +113,11 @@ supplements, and does not replace, the design-only matrix above.
   pending receipt-cleanup gauge deliberately excludes idle, replacement, late-created, and shutdown
   disposal; the failed managed-cleanup gauge includes every managed disposal class already fenced
   by the pool. Broader pending classification remains deferred. The composite snapshot samples each owner
-  directly but is not cross-owner atomic. This foundation is not wired into daemon orchestration
+  directly but is not cross-owner atomic. Owner observer types are validated at construction,
+  while event IDs use one shared opaque-ID grammar at projection/emission time. Composite
+  snapshots reject duplicate/reserved keys rather than
+  silently shadowing one owner's gauge. Focused tests pin every owner capacity/busy/retire/create
+  and bounded receipt-cleanup terminal. This foundation is not wired into daemon orchestration
   and is not release evidence.
 - Deferred: daemon invoke/lifecycle transaction correlation and manual-cleanup telemetry;
   supervisor restart proof; and

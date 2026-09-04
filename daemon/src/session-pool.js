@@ -3,7 +3,7 @@ import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
 import { createSdkSession } from "./sdk-session.js";
 import { validateNativeWorkDir } from "./work-dir.js";
 import { sanitizeErrorMessage } from "./reconnect.js";
-import { emitOwnerEvent } from "./daemon-observability.js";
+import { emitOwnerEvent, validateOwnerObserver } from "./daemon-observability.js";
 
 const SESSION_DISPOSE_TIMEOUT_MS = 5_000;
 export const DEFAULT_MAX_SESSIONS = 8;
@@ -77,6 +77,7 @@ export class SessionPool {
     if (!Number.isSafeInteger(maxSessions) || maxSessions < 1) {
       throw new TypeError("maxSessions must be a positive safe integer");
     }
+    const validatedObserver = validateOwnerObserver(observer);
     /** @type {Map<string, { session?: object, creation?: Promise<object>, lastUsed: number }>} */
     this.sessions = new Map();
     this.sessionFactory = sessionFactory;
@@ -90,7 +91,7 @@ export class SessionPool {
     this.clearIntervalFn = clearIntervalFn;
     this.nowFn = nowFn;
     this.monotonicNowFn = monotonicNowFn;
-    this.observer = observer;
+    this.observer = validatedObserver;
     this.closed = false;
     this.sensitiveValues = [...sensitiveValues];
     this.maxSessions = maxSessions;

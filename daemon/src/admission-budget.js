@@ -1,4 +1,4 @@
-import { emitOwnerEvent } from "./daemon-observability.js";
+import { emitOwnerEvent, validateOwnerObserver } from "./daemon-observability.js";
 
 export const DEFAULT_MAX_IN_FLIGHT_INVOKES = 64;
 export const LEGACY_RESOURCE_EXHAUSTED_ERROR =
@@ -12,9 +12,10 @@ export class AdmissionBudget {
     if (!Number.isSafeInteger(maxInFlightInvokes) || maxInFlightInvokes < 1) {
       throw new TypeError("maxInFlightInvokes must be a positive safe integer");
     }
+    const validatedObserver = validateOwnerObserver(observer);
     this.maxInFlightInvokes = maxInFlightInvokes;
     this.inFlightInvokes = 0;
-    this.observer = observer;
+    this.observer = validatedObserver;
   }
 
   tryAcquireInvoke() {
