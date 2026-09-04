@@ -88,7 +88,10 @@ import { RequestIdFence } from "./request-id-fence.js";
 import { resolveDaemonConnectionConfig } from "./daemon-config.js";
 import { ROLE_PATHS } from "./container-security-preflight.js";
 import { createSdkSession } from "./sdk-session.js";
-import { DaemonObservability } from "./daemon-observability.js";
+import {
+  DaemonObservability,
+  isDestructiveLifecycleAction,
+} from "./daemon-observability.js";
 
 import {
   parseRegisterDeniedRetryMs,
@@ -293,6 +296,29 @@ const localWorkspaceInventory =
 function surfaceManualCleanup(msg, result) {
   const line = formatManualCleanupLog(msg, result);
   if (line) console.error(line);
+}
+
+function lifecycleTelemetryContext(readinessState, trustedBinding) {
+  return {
+    socketGeneration: readinessState?.socketGeneration ?? null,
+    readinessRevision: readinessState?.revision ?? null,
+    mappingGeneration: trustedBinding?.mappingGeneration ?? null,
+    workspaceGeneration: trustedBinding?.workspaceGeneration ?? null,
+    mappingId: trustedBinding?.mappingId ?? null,
+    workspaceId: trustedBinding?.workspaceId ?? null,
+    fenceSequence: null,
+  };
+}
+
+function lifecycleCleanupState(operation, disposition) {
+  if (!isDestructiveLifecycleAction(operation)) {
+    return "not_applicable";
+  }
+  return ["not_required", "manual_required", "indeterminate"].includes(
+    disposition,
+  )
+    ? disposition
+    : "indeterminate";
 }
 
 function readReadinessTestEvidence() {
@@ -1801,6 +1827,11 @@ function connectToBot() {
       "failed",
       PROTOCOL_ERROR_CODES.CONNECTION_LOST,
     );
+    daemonObservability.finishWorkspaceLifecycleTransactionsForConnection(
+      connection,
+      "failed",
+      PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+    );
     clearReadinessTimer(readinessState);
     readinessState.committed = false;
     if (readinessState.receiptCommitted) {
@@ -1840,6 +1871,20 @@ function connectToBot() {
 function closePolicyViolation(connection, reason) {
   // RFC 6455 makes the status code authoritative. The UTF-8 reason is
   // diagnostic only: Bun 1.3.14 can omit it on Linux arm64.
+  if (
+    OBSERVABILITY_TEST_IPC_ENABLED &&
+    typeof process.send === "function" &&
+    process.connected === true
+  ) {
+    try {
+      process.send(
+        { type: "daemon_policy_close", code: 1008, reason },
+        () => {},
+      );
+    } catch {
+      // Test-only policy-close evidence cannot affect connection handling.
+    }
+  }
   connection.close(1008, reason);
 }
 
@@ -2006,6 +2051,16 @@ async function handleMessage(
       closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
+    const lifecycleTelemetry = daemonObservability.createWorkspaceLifecycleTransaction(
+      connection, msg.operation, msg.idempotencyFingerprint,
+    );
+    const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
+    const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
+    if (trustedBinding && trustedInventoryWorkspace) {
+      lifecycleTelemetry.admit(
+        lifecycleTelemetryContext(readinessState, trustedBinding),
+      );
+    }
     // S6f.2 (#81): the reviewed create/clone security core
     // (workspace-create-dispatch.js) runs via the boot-singleton
     // lifecycleCreateDispatcher. It is null unless serving is enabled
@@ -2020,15 +2075,21 @@ async function handleMessage(
     // short-circuits and falls through to the identical RUNTIME_INCOMPATIBLE
     // refusal below (mirrors the INVOKE-path bar at the readiness gate).
     if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleCreateDispatcher) {
-      const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
-      const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
-      const result = await lifecycleCreateDispatcher.dispatchCreate({
-        message: msg,
-        trustedBinding,
-        trustedInventoryWorkspace,
-        readiness,
-      });
+      let result;
+      try {
+        result = await lifecycleCreateDispatcher.dispatchCreate({
+          message: msg, trustedBinding, trustedInventoryWorkspace, readiness,
+        });
+      } catch (error) {
+        lifecycleTelemetry.finish("failed", PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+        throw error;
+      }
+      lifecycleTelemetry.finish(
+        result.ok ? "committed" : "refused",
+        result.ok ? null : whitelistProtocolCode(result.code),
+        lifecycleCleanupState(msg.operation),
+      );
       // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
       // protocol code, never the raw internal reason/path fragments. Unknown or
       // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
@@ -2056,6 +2117,11 @@ async function handleMessage(
       );
       return;
     }
+    lifecycleTelemetry.finish(
+      "refused",
+      PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+      lifecycleCleanupState(msg.operation),
+    );
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.EVENT,
@@ -2078,6 +2144,16 @@ async function handleMessage(
       closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
+    const lifecycleTelemetry = daemonObservability.createWorkspaceLifecycleTransaction(
+      connection, msg.operation, msg.idempotencyFingerprint,
+    );
+    const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
+    const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
+    if (trustedBinding && trustedInventoryWorkspace) {
+      lifecycleTelemetry.admit(
+        lifecycleTelemetryContext(readinessState, trustedBinding),
+      );
+    }
     // S6f.3 (#81): the reviewed refresh security core
     // (workspace-refresh-dispatch.js) runs via the boot-singleton
     // lifecycleRefreshDispatcher. It is null unless serving is enabled
@@ -2092,8 +2168,6 @@ async function handleMessage(
     // workspace short-circuits before the gate/dispatcher check and falls
     // through to the identical RUNTIME_INCOMPATIBLE refusal below.
     if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleRefreshDispatcher) {
-      const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
-      const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
       // Fence identity (issue #182): sourced from the adopted lease candidate the
       // registry matches by ((V3 authority | flat binding) + fingerprint +
@@ -2105,13 +2179,20 @@ async function handleMessage(
         workspaceId: msg.workspaceId,
         computeLegacyBindingFingerprint: bindingFingerprint,
       });
-      const result = await lifecycleRefreshDispatcher.dispatchRefresh({
-        message: msg,
-        trustedBinding,
-        trustedInventoryWorkspace,
-        leaseCandidate,
-        readiness,
-      });
+      let result;
+      try {
+        result = await lifecycleRefreshDispatcher.dispatchRefresh({
+          message: msg, trustedBinding, trustedInventoryWorkspace, leaseCandidate, readiness,
+        });
+      } catch (error) {
+        lifecycleTelemetry.finish("failed", PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+        throw error;
+      }
+      lifecycleTelemetry.finish(
+        result.ok ? "committed" : "refused",
+        result.ok ? null : whitelistProtocolCode(result.code),
+        lifecycleCleanupState(msg.operation),
+      );
       // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
       // protocol code, never the raw internal reason/path fragments. Unknown or
       // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
@@ -2139,6 +2220,11 @@ async function handleMessage(
       );
       return;
     }
+    lifecycleTelemetry.finish(
+      "refused",
+      PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+      lifecycleCleanupState(msg.operation),
+    );
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.EVENT,
@@ -2161,6 +2247,16 @@ async function handleMessage(
       closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
+    const lifecycleTelemetry = daemonObservability.createWorkspaceLifecycleTransaction(
+      connection, msg.operation, msg.idempotencyFingerprint,
+    );
+    const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
+    const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
+    if (trustedBinding && trustedInventoryWorkspace) {
+      lifecycleTelemetry.admit(
+        lifecycleTelemetryContext(readinessState, trustedBinding),
+      );
+    }
     // #196: reset/delete serves only with the complete production bundle and a
     // receipt-bound, host-held transaction context. The context retires the
     // exact session under the exclusive fence and installs the runtime no-route
@@ -2169,8 +2265,6 @@ async function handleMessage(
     // workspace short-circuits before the gate/dispatcher check and falls
     // through to the identical RUNTIME_INCOMPATIBLE refusal below.
     if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleResetDeleteDispatcher) {
-      const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
-      const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
       // Fence identity (issue #182): sourced from the adopted lease candidate the
       // registry matches by ((V3 authority | flat binding) + fingerprint +
@@ -2187,15 +2281,29 @@ async function handleMessage(
         trustedBinding,
         msg
       );
-      const result = await lifecycleResetDeleteDispatcher.dispatchResetDelete({
-        message: msg,
-        trustedBinding,
-        trustedInventoryWorkspace,
-        leaseCandidate,
-        lifecycleContext,
-        readiness,
-      });
+      let result;
+      try {
+        result = await lifecycleResetDeleteDispatcher.dispatchResetDelete({
+          message: msg, trustedBinding, trustedInventoryWorkspace, leaseCandidate,
+          lifecycleContext, readiness,
+        });
+      } catch (error) {
+        lifecycleTelemetry.finish("failed", PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+        throw error;
+      }
       surfaceManualCleanup(msg, result);
+      const cleanupState = lifecycleCleanupState(
+        msg.operation,
+        result.cleanupState,
+      );
+      lifecycleTelemetry.finish(
+        result.ok ? "committed" : "refused",
+        result.ok ? null : whitelistProtocolCode(result.code),
+        cleanupState,
+      );
+      if (cleanupState === "manual_required") {
+        lifecycleTelemetry.emitManualCleanupRequired();
+      }
       // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
       // protocol code, never the raw internal reason/path fragments. Unknown or
       // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
@@ -2223,6 +2331,11 @@ async function handleMessage(
       );
       return;
     }
+    lifecycleTelemetry.finish(
+      "refused",
+      PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+      lifecycleCleanupState(msg.operation, "not_required"),
+    );
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.EVENT,
@@ -2245,6 +2358,16 @@ async function handleMessage(
       closePolicyViolation(connection, "invalid workspace lifecycle message");
       return;
     }
+    const lifecycleTelemetry = daemonObservability.createWorkspaceLifecycleTransaction(
+      connection, msg.operation, msg.idempotencyFingerprint,
+    );
+    const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
+    const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
+    if (trustedBinding && trustedInventoryWorkspace) {
+      lifecycleTelemetry.admit(
+        lifecycleTelemetryContext(readinessState, trustedBinding),
+      );
+    }
     // #197: restore/migration serves only with a complete Linux native bundle
     // and a single-use host-held sealed staging claim bound to this exact
     // receipt authority, operation, and idempotency fingerprint.
@@ -2252,8 +2375,6 @@ async function handleMessage(
     // workspace short-circuits before the gate/dispatcher check and falls
     // through to the identical RUNTIME_INCOMPATIBLE refusal below.
     if (!barredWorkspaceIds.has(msg.workspaceId) && NATIVE_WORKSPACE_SERVING_ENABLED && lifecycleRestoreMigrationDispatcher) {
-      const trustedBinding = resolveTrustedCreateBinding(readinessState?.bindings, msg.workspaceId);
-      const trustedInventoryWorkspace = findWorkspaceInventory(localWorkspaceInventory, msg);
       const readiness = projectServingReadiness(readinessState?.status);
       // Fence identity (issue #182): sourced from the adopted lease candidate the
       // registry matches by ((V3 authority | flat binding) + fingerprint +
@@ -2285,15 +2406,29 @@ async function handleMessage(
             idempotencyFingerprint: msg.idempotencyFingerprint,
           })
         : null;
-      const result = await lifecycleRestoreMigrationDispatcher.dispatchRestoreMigration({
-        message: msg,
-        trustedBinding,
-        trustedInventoryWorkspace,
-        leaseCandidate,
-        restoreContext,
-        readiness,
-      });
+      let result;
+      try {
+        result = await lifecycleRestoreMigrationDispatcher.dispatchRestoreMigration({
+          message: msg, trustedBinding, trustedInventoryWorkspace, leaseCandidate,
+          restoreContext, readiness,
+        });
+      } catch (error) {
+        lifecycleTelemetry.finish("failed", PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+        throw error;
+      }
       surfaceManualCleanup(msg, result);
+      const cleanupState = lifecycleCleanupState(
+        msg.operation,
+        result.cleanupState,
+      );
+      lifecycleTelemetry.finish(
+        result.ok ? "committed" : "refused",
+        result.ok ? null : whitelistProtocolCode(result.code),
+        cleanupState,
+      );
+      if (cleanupState === "manual_required") {
+        lifecycleTelemetry.emitManualCleanupRequired();
+      }
       // Trust-boundary sanitization (review F2): serialize ONLY a whitelisted
       // protocol code, never the raw internal reason/path fragments. Unknown or
       // orchestrator-internal codes collapse to RUNTIME_INCOMPATIBLE.
@@ -2325,6 +2460,11 @@ async function handleMessage(
     // (NATIVE_WORKSPACE_SERVING_ENABLED=false) or the dispatcher is null.
     // Refuse with RUNTIME_INCOMPATIBLE using the same readiness-rejection shape
     // the INVOKE path uses for a gated/unready operation.
+    lifecycleTelemetry.finish(
+      "refused",
+      PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+      lifecycleCleanupState(msg.operation, "not_required"),
+    );
     connection.send(
       JSON.stringify({
         type: MSG_TYPES.EVENT,

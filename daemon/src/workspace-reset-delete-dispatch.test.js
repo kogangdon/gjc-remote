@@ -218,6 +218,7 @@ test("reset/delete: authorized delete captures a backup then publishes a committ
   const result = await dispatcher.dispatchResetDelete(callArgs());
 
   assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.cleanupState, "not_required");
   assert.equal(result.receipt.disposition, "committed");
   assert.equal(result.receipt.operation, "delete");
   assert.equal(result.receipt.published.published, true);
@@ -377,6 +378,7 @@ test("reset/delete: an already-tombstoned slot without replay evidence refuses s
   const result = await dispatcher.dispatchResetDelete(callArgs());
   assert.equal(result.ok, false, JSON.stringify(result));
   assert.equal(result.code, "WORKSPACE_GENERATION_STALE");
+  assert.equal(result.cleanupState, "indeterminate");
   assert.equal(backupIo.calls, 0, "no dirty backup is captured on the idempotent path");
 });
 
@@ -392,6 +394,7 @@ test("reset/delete: a crash during the tombstone publish yields manual_cleanup s
   const result = await dispatcher.dispatchResetDelete(callArgs());
   assert.equal(result.ok, false);
   assert.equal(result.code, "RUNTIME_INCOMPATIBLE");
+  assert.equal(result.cleanupState, "manual_required");
   assert.equal(result.receipt.disposition, "manual_cleanup");
   assert.ok(result.receipt.manualCleanup, "the manual-cleanup checkpoint record is preserved internally");
 });
@@ -412,5 +415,6 @@ test("reset/delete: windows-unc source platform is refused CONTAINMENT_UNSUPPORT
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, "CONTAINMENT_UNSUPPORTED");
+  assert.equal(result.cleanupState, "not_required");
   assert.equal(fence.state.acquired, 0);
 });

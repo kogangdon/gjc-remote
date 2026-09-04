@@ -1,4 +1,7 @@
-import { PROTOCOL_ERROR_CODES } from "@gjc-remote/shared";
+import {
+  PROTOCOL_ERROR_CODES,
+  WORKSPACE_LIFECYCLE_OPERATIONS,
+} from "@gjc-remote/shared";
 
 const EVENT_FIELDS = [
   "name",
@@ -33,6 +36,10 @@ const CLOSED_ACTIONS = new Set([
   "invalidate",
   "retire",
   "invoke",
+  ...Object.values(WORKSPACE_LIFECYCLE_OPERATIONS).flatMap((operations) => [
+    ...operations,
+  ]),
+  "manual_cleanup",
 ]);
 const CLOSED_OUTCOMES = new Set([
   "started",
@@ -41,9 +48,23 @@ const CLOSED_OUTCOMES = new Set([
   "settled",
   "refused",
   "failed",
+  "committed",
+  "required",
 ]);
-const CLOSED_CODES = new Set(Object.values(PROTOCOL_ERROR_CODES));
-const CLOSED_CLEANUP_STATES = new Set(["started", "fulfilled", "rejected", "timed_out"]);
+const CLOSED_CODES = new Set([
+  ...Object.values(PROTOCOL_ERROR_CODES),
+  "MANUAL_CLEANUP_REQUIRED",
+]);
+const CLOSED_CLEANUP_STATES = new Set([
+  "started",
+  "fulfilled",
+  "rejected",
+  "timed_out",
+  "not_applicable",
+  "not_required",
+  "manual_required",
+  "indeterminate",
+]);
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SNAPSHOT_KEY_CONFIGURATION_ERROR =
   "observability owner snapshots contain duplicate keys";
@@ -98,6 +119,7 @@ export class DaemonObservability {
     this.snapshotReaders = undefined;
     this.now = now;
     this.invokeTransactionsByConnection = new Map();
+    this.workspaceLifecycleTransactionsByConnection = new Map();
   }
 
   subscribe(listener) {
@@ -221,6 +243,89 @@ export class DaemonObservability {
       transaction.finish(outcome, code);
     }
   }
+
+  createWorkspaceLifecycleTransaction(connection, operation, transactionId) {
+    if (!WORKSPACE_LIFECYCLE_ACTIONS.has(operation)) {
+      throw new TypeError("workspace lifecycle transaction requires a validated operation");
+    }
+    if (typeof transactionId !== "string") {
+      throw new TypeError("workspace lifecycle transaction requires a validated idempotency fingerprint");
+    }
+    const startedAt = this.now();
+    const tracked =
+      this.workspaceLifecycleTransactionsByConnection.get(connection) ?? new Set();
+    this.workspaceLifecycleTransactionsByConnection.set(connection, tracked);
+    let completed = false;
+    let manualCleanupEmitted = false;
+    let dispatchContext;
+    const transaction = Object.freeze({
+      admit: (candidate) => {
+        assertWorkspaceLifecycleDispatchShape(candidate);
+        if (completed) return undefined;
+        if (dispatchContext) return dispatchContext;
+        try {
+          dispatchContext = projectWorkspaceLifecycleDispatchContext(candidate);
+        } catch {
+          dispatchContext = EMPTY_WORKSPACE_LIFECYCLE_DISPATCH_CONTEXT;
+        }
+        return dispatchContext;
+      },
+      finish: (
+        outcome,
+        code = null,
+        cleanupState = defaultLifecycleCleanupState(operation, outcome),
+      ) => {
+        if (completed) return undefined;
+        completed = true;
+        tracked.delete(transaction);
+        if (tracked.size === 0) {
+          this.workspaceLifecycleTransactionsByConnection.delete(connection);
+        }
+        try {
+          return this.emitOwnerEvent({
+            name: "daemon",
+            action: operation,
+            outcome,
+            code,
+            cleanupState,
+            transactionId: isOpaqueId(transactionId) ? transactionId : null,
+            durationMs: boundedMonotonicDuration(this.now(), startedAt),
+            ...(dispatchContext ?? EMPTY_WORKSPACE_LIFECYCLE_DISPATCH_CONTEXT),
+          });
+        } catch {
+          return undefined;
+        }
+      },
+      emitManualCleanupRequired: () => {
+        if (manualCleanupEmitted) return undefined;
+        manualCleanupEmitted = true;
+        try {
+          return this.emitOwnerEvent({
+            name: "daemon",
+            action: "manual_cleanup",
+            outcome: "required",
+            code: "MANUAL_CLEANUP_REQUIRED",
+            cleanupState: "manual_required",
+            transactionId: isOpaqueId(transactionId) ? transactionId : null,
+            durationMs: boundedMonotonicDuration(this.now(), startedAt),
+            ...(dispatchContext ?? EMPTY_WORKSPACE_LIFECYCLE_DISPATCH_CONTEXT),
+          });
+        } catch {
+          return undefined;
+        }
+      },
+    });
+    tracked.add(transaction);
+    return transaction;
+  }
+
+  finishWorkspaceLifecycleTransactionsForConnection(connection, outcome, code = null) {
+    for (const transaction of [
+      ...(this.workspaceLifecycleTransactionsByConnection.get(connection) ?? []),
+    ]) {
+      transaction.finish(outcome, code);
+    }
+  }
 }
 
 const EMPTY_INVOKE_DISPATCH_CONTEXT = Object.freeze({
@@ -235,6 +340,30 @@ const EMPTY_INVOKE_DISPATCH_CONTEXT = Object.freeze({
 const INVOKE_DISPATCH_FIELDS = new Set(Object.keys(
   EMPTY_INVOKE_DISPATCH_CONTEXT,
 ));
+const EMPTY_WORKSPACE_LIFECYCLE_DISPATCH_CONTEXT = EMPTY_INVOKE_DISPATCH_CONTEXT;
+const WORKSPACE_LIFECYCLE_DISPATCH_FIELDS = INVOKE_DISPATCH_FIELDS;
+const WORKSPACE_LIFECYCLE_ACTIONS = new Set(
+  Object.values(WORKSPACE_LIFECYCLE_OPERATIONS).flatMap((operations) => [
+    ...operations,
+  ]),
+);
+const DESTRUCTIVE_LIFECYCLE_ACTIONS = new Set([
+  "reset",
+  "delete",
+  "restore",
+  "migration",
+]);
+
+export function isDestructiveLifecycleAction(operation) {
+  return DESTRUCTIVE_LIFECYCLE_ACTIONS.has(operation);
+}
+
+function defaultLifecycleCleanupState(operation, outcome) {
+  return isDestructiveLifecycleAction(operation) &&
+    outcome !== "committed"
+    ? "indeterminate"
+    : "not_applicable";
+}
 
 function projectInvokeDispatchContext(candidate) {
   assertInvokeDispatchShape(candidate);
@@ -281,6 +410,42 @@ function assertInvokeDispatchShape(candidate) {
     Object.keys(candidate).some((key) => !INVOKE_DISPATCH_FIELDS.has(key))
   ) {
     throw new TypeError("invoke dispatch context has invalid fields");
+  }
+}
+
+function projectWorkspaceLifecycleDispatchContext(candidate) {
+  assertWorkspaceLifecycleDispatchShape(candidate);
+  const projected = projectOwnerEvent({
+    name: "daemon",
+    action: "create",
+    outcome: "committed",
+    code: null,
+    cleanupState: "not_applicable",
+    durationMs: 0,
+    ...candidate,
+  });
+  return Object.freeze({
+    socketGeneration: projected.socketGeneration,
+    readinessRevision: projected.readinessRevision,
+    mappingGeneration: projected.mappingGeneration,
+    workspaceGeneration: projected.workspaceGeneration,
+    mappingId: projected.mappingId,
+    workspaceId: projected.workspaceId,
+    fenceSequence: projected.fenceSequence,
+  });
+}
+
+function assertWorkspaceLifecycleDispatchShape(candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new TypeError("workspace lifecycle dispatch context must be an object");
+  }
+  if (
+    Object.keys(candidate).length !== WORKSPACE_LIFECYCLE_DISPATCH_FIELDS.size ||
+    Object.keys(candidate).some(
+      (key) => !WORKSPACE_LIFECYCLE_DISPATCH_FIELDS.has(key),
+    )
+  ) {
+    throw new TypeError("workspace lifecycle dispatch context has invalid fields");
   }
 }
 

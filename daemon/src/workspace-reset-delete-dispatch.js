@@ -46,7 +46,14 @@ function configError(reason) {
   error.reason = reason;
   return error;
 }
-function refuse(code, reason) { return Object.freeze({ ok: false, code, reason }); }
+function refuse(code, reason, cleanupState = "not_required") {
+  return Object.freeze({
+    ok: false,
+    code,
+    reason,
+    cleanupState,
+  });
+}
 function assertFn(value, name) { if (typeof value !== "function") throw configError(`${name} must be a function`); }
 function assertMethods(container, methods, name) {
   for (const method of methods) if (!container || typeof container[method] !== "function") {
@@ -173,12 +180,27 @@ export function createLifecycleResetDeleteDispatcher(config = {}) {
         tombstoneIo: () => makePublisherIo(message.workspaceId),
       }).runResetDelete(request);
       if (receipt.disposition === "committed") {
-        return Object.freeze({ ok: true, receipt });
+        return Object.freeze({
+          ok: true,
+          receipt,
+          cleanupState: "not_required",
+        });
       }
-      return Object.freeze({ ok: false, code: RUNTIME_INCOMPATIBLE, reason: "reset/delete requires manual cleanup", receipt });
+      return Object.freeze({
+        ok: false,
+        code: RUNTIME_INCOMPATIBLE,
+        reason: "reset/delete requires manual cleanup",
+        receipt,
+        cleanupState: "manual_required",
+      });
     } catch (error) {
-      return refuse(typeof error?.code === "string" ? error.code : RUNTIME_INCOMPATIBLE,
-        typeof error?.reason === "string" ? error.reason : "reset/delete operation failed");
+      return refuse(
+        typeof error?.code === "string" ? error.code : RUNTIME_INCOMPATIBLE,
+        typeof error?.reason === "string"
+          ? error.reason
+          : "reset/delete operation failed",
+        "indeterminate",
+      );
     }
   }
   return Object.freeze({ dispatchResetDelete });

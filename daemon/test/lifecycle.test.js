@@ -186,6 +186,7 @@ async function startReadinessDaemon({
 } = {}) {
   const frames = [];
   const telemetry = [];
+  const policyCloses = [];
   const registrations = [];
   const sockets = [];
   const closes = [];
@@ -251,11 +252,13 @@ async function startReadinessDaemon({
   });
   child.on("message", (message) => {
     if (message?.type === "daemon_observability") telemetry.push(message.event);
+    if (message?.type === "daemon_policy_close") policyCloses.push(message);
   });
 
   return {
     frames,
     telemetry,
+    policyCloses,
     registrations,
     sockets,
     closes,
@@ -364,6 +367,84 @@ test("observability IPC requires both dedicated test gate terms and stays out of
     } finally {
       await daemon.stop();
     }
+  }
+});
+
+test("lifecycle gate refusals emit local-only terminals for every frame family", async () => {
+  const requests = [
+    ["workspace_create", "create", "1".repeat(64)],
+    ["workspace_create", "clone", "2".repeat(64)],
+    ["workspace_refresh", "refresh", "3".repeat(64)],
+    ["workspace_reset_delete", "reset", "4".repeat(64)],
+    ["workspace_reset_delete", "delete", "5".repeat(64)],
+    ["workspace_restore_migration", "restore", "6".repeat(64)],
+    ["workspace_restore_migration", "migration", "7".repeat(64)],
+  ];
+  const daemon = await startReadinessDaemon({
+    observabilityTestIpc: true,
+    afterRegisterResponse(socket) {
+      for (const [type, operation, transactionId] of requests) {
+        socket.send(JSON.stringify({
+          type,
+          operation,
+          hostId: "readiness-test-host",
+          mappingId: "mapping-test",
+          mappingGeneration: 1,
+          mappingVersion: 1,
+          workspaceId: "workspace-test",
+          workspaceGeneration: 1,
+          sourcePlatform: "windows-drive",
+          routeFingerprint: "a".repeat(64),
+          authorityFingerprint: "b".repeat(64),
+          inventoryGeneration: 1,
+          idempotencyFingerprint: transactionId,
+        }));
+      }
+    },
+  });
+  try {
+    for (const [, operation, transactionId] of requests) {
+      await waitForFrame(
+        daemon.frames,
+        (frame) => frame.type === "event" && frame.requestId === transactionId,
+        `${operation} lifecycle gate refusal`,
+      );
+      await waitForFrame(
+        daemon.telemetry,
+        (event) => event.action === operation && event.transactionId === transactionId,
+        `${operation} lifecycle telemetry`,
+      );
+      const frame = daemon.frames.find((candidate) => candidate.requestId === transactionId);
+      assert.equal(Object.hasOwn(frame, "transactionId"), false);
+      const terminals = daemon.telemetry.filter(
+        (event) => event.action === operation && event.transactionId === transactionId,
+      );
+      assert.equal(terminals.length, 1);
+      assert.deepEqual(
+        {
+          outcome: terminals[0].outcome,
+          code: terminals[0].code,
+          mappingId: terminals[0].mappingId,
+          workspaceId: terminals[0].workspaceId,
+          fenceSequence: terminals[0].fenceSequence,
+          cleanupState: terminals[0].cleanupState,
+        },
+        {
+          outcome: "refused",
+          code: "RUNTIME_INCOMPATIBLE",
+          mappingId: null,
+          workspaceId: null,
+          fenceSequence: null,
+          cleanupState: ["reset", "delete", "restore", "migration"].includes(
+            operation,
+          )
+            ? "not_required"
+            : "not_applicable",
+        },
+      );
+    }
+  } finally {
+    await daemon.stop();
   }
 });
 
@@ -1061,16 +1142,21 @@ test("daemon rejects workload frames before and after an incompatible managed ha
   });
   for (const [name, hook] of [
     ["before", {
-      beforeRegisterResponse: (socket) => {
+      beforeRegisterResponse(socket) {
         socket.send(invoke("before-handshake"));
         return false;
       },
     }],
-    ["after", { afterRegisterResponse: (socket) => socket.send(invoke("after-refusal")) }],
+    ["after", {
+      afterRegisterResponse(socket) {
+        socket.send(invoke("after-refusal"));
+      },
+    }],
   ]) {
     await t.test(name, async () => {
       const daemon = await startReadinessDaemon({
         registerResponse: { type: "register_ok" },
+        observabilityTestIpc: true,
         envOverrides: {
           GJC_NATIVE_INVENTORY_MODE: "verify",
           GJC_WORKSPACE_INVENTORY: RECEIPT_INVENTORY,
@@ -1078,13 +1164,27 @@ test("daemon rejects workload frames before and after an incompatible managed ha
         ...hook,
       });
       try {
-        await waitForLength(daemon.closes, 1, "pre-handshake policy close");
-        assert.equal(daemon.closes[0].code, 1008);
-        assert.equal(
-          ["PROTOCOL_INCOMPATIBLE", ""].includes(daemon.closes[0].reason),
-          true,
+        await waitForLength(daemon.closes, 1, "managed policy close");
+        await waitForFrame(
+          daemon.policyCloses,
+          (entry) =>
+            entry.code === 1008 &&
+            entry.reason === "PROTOCOL_INCOMPATIBLE",
+          "daemon-side managed policy close",
         );
+        if (name === "before") {
+          assert.equal(daemon.closes[0].code, 1008);
+        } else {
+          assert.equal(
+            [1008, 1006].includes(daemon.closes[0].code),
+            true,
+          );
+        }
         assert.equal(daemon.frames.length, 0);
+        assert.equal(
+          daemon.telemetry.some((event) => event.action === "invoke"),
+          false,
+        );
         assert.equal(daemon.output().includes("must not run"), false);
         assert.equal(daemon.output().includes("fatal"), false);
         assert.equal(daemon.output().includes("unhandled rejection"), false);
