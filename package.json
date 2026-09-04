@@ -8,6 +8,8 @@
     "node": ">=26.0.0"
   },
   "scripts": {
+    "evidence:issue55": "node scripts/issue55-evidence.js snapshot",
+    "evidence:issue55:verify": "node scripts/issue55-evidence.js verify",
     "smoke:local": "node scripts/local-smoke.js",
     "release": "node scripts/release.js",
     "test:scripts": "node --test scripts/test/*.test.js",
