@@ -46,13 +46,21 @@ const daemon = spawn(process.env.BUN_BIN || "bun", ["daemon/src/daemon.js"], {
     HOST_TOKEN: token,
     HOST_LABEL: "local smoke test",
     BOT_WS_URL: `ws://localhost:${port}`,
+    GJC_READINESS_TEST_INJECTION: "1",
+    GJC_READINESS_V2: "0",
   },
-  stdio: ["ignore", "pipe", "pipe"],
+  stdio: ["ignore", "pipe", "pipe", "ipc"],
 });
 
 // Capture daemon output so the smoke can assert profile activation actually ran
 // (see the profile-activation check below), while still forwarding it live.
 let daemonOutput = "";
+const daemonTelemetry = [];
+daemon.on("message", (message) => {
+  if (message?.type === "daemon_observability") {
+    daemonTelemetry.push(message.event);
+  }
+});
 const captureDaemon = (chunk) => {
   daemonOutput += chunk.toString();
   process.stderr.write(chunk);
@@ -100,6 +108,44 @@ try {
   // cross-session breakage (see the workDir2 note above for its limits).
   await promptExact(workDir2);
   await promptExact(workDir);
+  await waitForTelemetry(
+    daemonTelemetry,
+    (event) =>
+      event?.name === "daemon" &&
+      event.action === "invoke" &&
+      event.outcome === "succeeded",
+    3,
+    3_000,
+  );
+  const invokeTerminals = daemonTelemetry.filter(
+    (event) =>
+      event?.name === "daemon" &&
+      event.action === "invoke" &&
+      event.outcome === "succeeded",
+  );
+  if (invokeTerminals.length !== 3) {
+    throw new Error(
+      `expected 3 successful daemon invoke terminals, got ${invokeTerminals.length}`,
+    );
+  }
+  for (const event of invokeTerminals) {
+    if (
+      event.code !== null ||
+      event.transactionId === null ||
+      !Number.isSafeInteger(event.durationMs) ||
+      event.durationMs < 0
+    ) {
+      throw new Error("daemon invoke terminal failed its bounded success contract");
+    }
+    const serialized = JSON.stringify(event);
+    if (
+      serialized.includes(workDir) ||
+      serialized.includes(workDir2) ||
+      serialized.includes(expected)
+    ) {
+      throw new Error("daemon invoke terminal leaked smoke request data");
+    }
+  }
   // Prove profile activation ran against the real SDK rather than silently
   // falling back to the SDK default model. applyConfiguredModelProfile warns
   // and skips when it finds no usable profile; if that warning appears, the
@@ -142,6 +188,15 @@ try {
   daemon.kill();
   await closeRegistry(registry);
 }
+
+async function waitForTelemetry(events, predicate, count, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (events.filter(predicate).length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 function createObservedHeartbeatTimers() {
   const activeTimeouts = new Set();
   let scheduledTimeouts = 0;

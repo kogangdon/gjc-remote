@@ -31,6 +31,13 @@ function receiptIdentity() {
   };
 }
 
+const OWNER_EVENT_KEYS = [
+  "schemaVersion", "name", "action", "outcome", "code", "cleanupState",
+  "mappingId", "workspaceId", "transactionId", "fenceSequence", "durationMs",
+  "socketGeneration", "readinessRevision", "mappingGeneration",
+  "workspaceGeneration",
+];
+
 function authority(workspaceId, generation = 1) {
   return {
     authorityEpoch: generation,
@@ -64,10 +71,7 @@ test("owner events are flat, frozen, schema-versioned, and isolate subscribers",
     outcome: "denied",
     code: "RESOURCE_EXHAUSTED",
   });
-  assert.deepEqual(Object.keys(event), [
-    "schemaVersion", "name", "action", "outcome", "code", "cleanupState",
-    "mappingId", "workspaceId", "transactionId", "fenceSequence", "durationMs",
-  ]);
+  assert.deepEqual(Object.keys(event), OWNER_EVENT_KEYS);
   assert.equal(Object.isFrozen(event), true);
   assert.equal(events.length, 1);
   unsubscribe();
@@ -112,6 +116,10 @@ test("owner snapshots are authoritative, frozen, and attached once", () => {
       transactionId: null,
       fenceSequence: null,
       durationMs: null,
+      socketGeneration: null,
+      readinessRevision: null,
+      mappingGeneration: null,
+      workspaceGeneration: null,
     }],
   );
   const snapshot = observability.getSnapshot();
@@ -138,10 +146,7 @@ test("object observers receive only projected frozen owner events", () => {
   });
   assert.equal(received.length, 1);
   assert.equal(Object.isFrozen(received[0]), true);
-  assert.deepEqual(Object.keys(received[0]), [
-    "schemaVersion", "name", "action", "outcome", "code", "cleanupState",
-    "mappingId", "workspaceId", "transactionId", "fenceSequence", "durationMs",
-  ]);
+  assert.deepEqual(Object.keys(received[0]), OWNER_EVENT_KEYS);
   emitOwnerEvent(observer, {
     name: "admission_budget",
     action: "invoke_capacity",
