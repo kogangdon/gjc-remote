@@ -1549,10 +1549,12 @@ test("invoke idle timer resets on each streamed event", async () => {
 
 test("invoke idle expiry fires with zero events", async () => {
   const timers = createManualTimers();
+  const observability = [];
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 20,
     invokeHardCapMs: 5000,
     timers: timers.api,
+    onObservabilityEvent: (event) => observability.push(event),
   });
   try {
     await server.connect("host-a", "token-a");
@@ -1570,6 +1572,10 @@ test("invoke idle expiry fires with zero events", async () => {
       error: "timed out waiting for host response",
     });
     assert.equal(server.registry.pendingRequests.size, 0);
+    const finishes = observability.filter((event) => event.event === "invoke.finish");
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].phase, "idle_timeout");
+    assert.equal(finishes[0].code, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
   } finally {
     await server.close();
   }
@@ -1577,10 +1583,12 @@ test("invoke idle expiry fires with zero events", async () => {
 
 test("invoke hard cap fires despite continuous activity", async () => {
   const timers = createManualTimers();
+  const observability = [];
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 1000,
     invokeHardCapMs: 40,
     timers: timers.api,
+    onObservabilityEvent: (event) => observability.push(event),
   });
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -1610,6 +1618,10 @@ test("invoke hard cap fires despite continuous activity", async () => {
       ok: false,
       error: "invoke exceeded absolute hard-cap",
     });
+    const finishes = observability.filter((entry) => entry.event === "invoke.finish");
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].phase, "hard_cap");
+    assert.equal(finishes[0].code, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
   } finally {
     await server.close();
   }
@@ -1967,7 +1979,11 @@ test("heartbeat pong keeps a registered host online", async () => {
 
 test("heartbeat timeout disconnects a host and fails its pending invoke", async () => {
   const timers = createManualTimers();
-  const server = await startRegistry(undefined, { timers: timers.api });
+  const observability = [];
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    onObservabilityEvent: (event) => observability.push(event),
+  });
   try {
     const socket = await server.connect("host-a", "token-a");
     const registeredSocket = server.registry.connections.get("host-a");
@@ -1999,6 +2015,10 @@ test("heartbeat timeout disconnects a host and fails its pending invoke", async 
     });
     assert.equal(server.registry.isOnline("host-a"), false);
     assert.equal(server.registry.pendingRequests.size, 0);
+    const finishes = observability.filter((event) => event.event === "invoke.finish");
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].phase, "disconnect");
+    assert.equal(finishes[0].code, PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT);
     registeredSocket.emit("message", Buffer.from(JSON.stringify(PONG)), false);
     assert.equal(server.registry.isOnline("host-a"), false);
     assert.equal(server.registry.heartbeatStates.has(registeredSocket), false);
@@ -2090,7 +2110,10 @@ test("registry shutdown clears heartbeat state and settles pending invokes", asy
 });
 
 test("per-host in-flight invokes are capped and freed on completion", async () => {
-  const server = await startRegistry();
+  const events = [];
+  const server = await startRegistry(undefined, {
+    onObservabilityEvent: (event) => events.push(event),
+  });
   try {
     const socket = await server.connect("host-a", "token-a");
     const cap = V0_LIMITS.MAX_PENDING_PER_HOST;
@@ -2118,6 +2141,15 @@ test("per-host in-flight invokes are capped and freed on completion", async () =
       error: { code: "RESOURCE_EXHAUSTED", retryable: true, action: "retry_later" },
     });
     assert.equal(server.registry.pendingRequests.size, cap);
+    let snapshot = server.registry.getObservabilitySnapshot();
+    assert.equal(snapshot.gauges["invokes.inFlight"], cap);
+    assert.equal(snapshot.gauges["resourceDenials.total"], 1);
+    const denial = events.find(
+      (event) =>
+        event.event === "invoke.deny" &&
+        event.code === PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED,
+    );
+    assert.equal(denial.phase, "bot_admission");
     const incompatibleManaged = await server.registry.invoke(
       "host-a",
       null,
@@ -2142,6 +2174,20 @@ test("per-host in-flight invokes are capped and freed on completion", async () =
       },
     });
     assert.equal(server.registry.pendingRequests.size, cap);
+    snapshot = server.registry.getObservabilitySnapshot();
+    assert.equal(snapshot.gauges["resourceDenials.total"], 1);
+    server.registry.resourceDenials = Number.MAX_SAFE_INTEGER;
+    await server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "saturated" },
+      () => {},
+      10_000,
+    );
+    assert.equal(
+      server.registry.getObservabilitySnapshot().gauges["resourceDenials.total"],
+      Number.MAX_SAFE_INTEGER,
+    );
 
     const [freedRequestId] = [...server.registry.pendingRequests.keys()];
     socket.send(
@@ -3667,6 +3713,110 @@ test("v3 host and binding readiness share one revision fence", async () => {
   }
 });
 
+test("v3 connection-wide readiness fence rejects binding-to-host regression", async () => {
+  const server = await startRegistry();
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    connection.socket.send(JSON.stringify(readinessFrame({
+      socketGeneration: 9,
+      revision: 2,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "INVENTORY_PENDING",
+        at: Date.now(),
+        remediation: {
+          code: "INVENTORY_PENDING",
+          retryable: true,
+          action: "retry_later",
+        },
+      },
+    })));
+    await waitFor(() =>
+      server.registry.readinessStates.get("host-a")?.receiptPrevious?.revision === 2
+    );
+    const closed = once(connection.socket, "close");
+    connection.socket.send(JSON.stringify(readinessFrame({
+      socketGeneration: 9,
+      revision: 1,
+      workspaceId: undefined,
+      workspaceGeneration: undefined,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+    })));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await server.close();
+  }
+});
+
+test("v3 connection-wide readiness fence rejects cross-binding regression", async () => {
+  const server = await startRegistry();
+  try {
+    const firstRoute = managedRoute("a");
+    const secondRoute = managedRoute("b");
+    server.registry.setManagedRoutes({
+      "channel-a": firstRoute,
+      "channel-b": secondRoute,
+    });
+    const connection = await connectV3(server);
+    const firstBind = await connection.nextFrame();
+    const secondBind = await connection.nextFrame();
+    const pending = (bind, route, revision) => readinessFrame({
+      socketGeneration: 9,
+      revision,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+      lastError: {
+        code: "INVENTORY_PENDING",
+        at: Date.now(),
+        remediation: {
+          code: "INVENTORY_PENDING",
+          retryable: true,
+          action: "retry_later",
+        },
+      },
+    });
+    connection.socket.send(JSON.stringify(pending(firstBind, firstRoute, 2)));
+    await waitFor(() =>
+      server.registry.readinessStates.get("host-a")?.receiptPrevious?.revision === 2
+    );
+    const closed = once(connection.socket, "close");
+    connection.socket.send(JSON.stringify(pending(secondBind, secondRoute, 1)));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await server.close();
+  }
+});
+
 test("negative readiness ends the bind deadline and remains totally unbindable", async () => {
   const timers = createManualTimers();
   const server = await startRegistry(undefined, { timers: timers.api });
@@ -3934,26 +4084,38 @@ test("inventory bind lifecycle emits sanitized, path/native-fact-free observabil
     const bindRequest = events.find((e) => e.event === "bind.request");
     assert.equal(bindRequest.phase, "request");
     assert.equal(bindRequest.workspaceId, "workspace-a");
-    assert.equal(bindRequest.generation, 1);
+    assert.equal(bindRequest.schemaVersion, 1);
+    assert.equal(bindRequest.component, "bot");
     assert.ok(
       typeof bindRequest.bindingId === "string" && bindRequest.bindingId.length > 0
     );
 
     const bindOk = events.find((e) => e.event === "bind.ok");
-    assert.equal(bindOk.generation, inventoryGeneration);
-    assert.equal(bindOk.fingerprintPrefix, inventoryFingerprint.slice(0, 12));
-    assert.equal(bindOk.fingerprintPrefix.length, 12);
+    assert.equal(bindOk.phase, "bound");
+    assert.equal(Object.isFrozen(bindOk), true);
 
     // Sentinel: only the bounded allowlist ever appears, and no full fingerprint,
     // token, workDir, or inventory bytes leak into any event.
     const allowedKeys = new Set([
       "event",
       "phase",
+      "schemaVersion",
+      "component",
+      "observedAt",
+      "requestAt",
+      "deadlineAt",
       "code",
+      "hostId",
+      "mappingId",
       "bindingId",
       "workspaceId",
-      "generation",
-      "fingerprintPrefix",
+      "fenceSequence",
+      "socketGeneration",
+      "revision",
+      "receivedAt",
+      "expiresAt",
+      "transactionId",
+      "durationMs",
     ]);
     const allowedEvents = new Set([
       "bind.request",
@@ -3961,6 +4123,11 @@ test("inventory bind lifecycle emits sanitized, path/native-fact-free observabil
       "bind.negative",
       "receipt.invalidate",
       "socket.retire",
+      "readiness.accept",
+      "readiness.expire",
+      "invoke.start",
+      "invoke.finish",
+      "invoke.deny",
     ]);
     const serialized = JSON.stringify(events);
     assert.ok(!serialized.includes(inventoryFingerprint), "full fingerprint never leaks");
@@ -4248,6 +4415,569 @@ test("a bind-deadline retirement emits exactly one socket.retire in the deadline
       0,
       "the offline-phase retire is suppressed after a deadline retirement"
     );
+  } finally {
+    await server.close();
+  }
+});
+
+test("observability uses receiver-local readiness time and monotonic expiry", async () => {
+  const events = [];
+  const timers = createManualTimers();
+  let wall = 10_000;
+  let monotonic = 100;
+  let monotonicSequence = [];
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    now: () => wall,
+    monotonicNow: () =>
+      monotonicSequence.length > 0
+        ? monotonicSequence.shift()
+        : monotonic,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      observedAt: 9_000,
+      expiresAt: 10_000,
+      ttlMs: 1_000,
+    }));
+    const accepted = events.find((event) => event.event === "readiness.accept");
+    assert.equal(accepted.receivedAt, 10_000);
+    assert.equal(accepted.expiresAt, 11_000);
+    assert.equal(accepted.code, null);
+    assert.equal(Object.isFrozen(accepted), true);
+    assert.equal(server.registry.getObservabilitySnapshot().gauges["hosts.ready"], 1);
+
+    wall = 1;
+    monotonic = 1_099.5;
+    monotonicSequence = [1_099.5, 1_100.5];
+    timers.runTimeoutByDelay(1_000);
+    assert.equal(
+      events.filter((event) => event.event === "readiness.expire").length,
+      0,
+    );
+    assert.equal(timers.timeoutDelays.includes(1), true);
+    monotonicSequence = [];
+    monotonic = 1_100.5;
+    timers.runTimeoutByDelay(1);
+    const expiredSnapshot = server.registry.getObservabilitySnapshot();
+    const expired = events.filter((event) => event.event === "readiness.expire");
+    assert.deepEqual(
+      expired.map((event) => event.phase).sort(),
+      ["host", "workspace"],
+    );
+    for (const event of expired) {
+      assert.equal(event.code, PROTOCOL_ERROR_CODES.READINESS_EXPIRED);
+      assert.equal(event.receivedAt, 10_000);
+      assert.equal(event.expiresAt, 11_000);
+      assert.equal(event.durationMs, 1_000);
+    }
+    assert.equal(
+      expiredSnapshot.gauges["hosts.expired"],
+      1,
+      "one host is expired",
+    );
+    assert.equal(
+      events.filter((event) => event.event === "readiness.expire").length,
+      2,
+      "one event is emitted for each armed host/workspace expiry",
+    );
+    socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("invoke observability settles exactly once and exposes constant-shape gauges", async () => {
+  const events = [];
+  let monotonic = 50;
+  const server = await startRegistry(undefined, {
+    monotonicNow: () => monotonic,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace/private",
+      { kind: "prompt", message: "secret-prompt" },
+      () => {},
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    const pending = server.registry.pendingRequests.get(requestId);
+    assert.equal(server.registry.getObservabilitySnapshot().gauges["invokes.inFlight"], 1);
+    const start = events.find((event) => event.event === "invoke.start");
+    assert.equal(start.phase, "dispatch");
+    assert.equal(start.code, null);
+    assert.ok(/^[0-9a-f-]{36}$/.test(start.transactionId));
+
+    monotonic = 75;
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    pending.settle({ ok: false, error: "late-secret-error" }, "hard_cap");
+    const finishes = events.filter((event) => event.event === "invoke.finish");
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].phase, "success");
+    assert.equal(finishes[0].code, null);
+    assert.equal(finishes[0].durationMs, 25);
+    assert.equal(server.registry.getObservabilitySnapshot().gauges["invokes.inFlight"], 0);
+    const serialized = JSON.stringify(events);
+    assert.equal(serialized.includes("/workspace/private"), false);
+    assert.equal(serialized.includes("secret-prompt"), false);
+    assert.equal(serialized.includes("late-secret-error"), false);
+
+    const remoteFrame = once(socket, "message");
+    const remoteResult = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "remote-error" },
+      () => {},
+    );
+    const [remoteRaw] = await remoteFrame;
+    const remoteInvoke = JSON.parse(remoteRaw.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId: remoteInvoke.requestId,
+      error: JSON.stringify({
+        code: PROTOCOL_ERROR_CODES.CONFIG_INVALID,
+        retryable: false,
+        action: "contact_admin",
+      }),
+    }));
+    assert.deepEqual(await remoteResult, {
+      ok: false,
+      error: {
+        code: PROTOCOL_ERROR_CODES.CONFIG_INVALID,
+        retryable: false,
+        action: "contact_admin",
+      },
+    });
+    const remoteFinish = events.filter(
+      (event) => event.event === "invoke.finish",
+    )[1];
+    assert.equal(remoteFinish.phase, "remote_error");
+    assert.equal(remoteFinish.code, PROTOCOL_ERROR_CODES.CONFIG_INVALID);
+
+    const unknownFrame = once(socket, "message");
+    const unknownResult = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "unknown-error" },
+      () => {},
+    );
+    const [unknownRaw] = await unknownFrame;
+    const unknownInvoke = JSON.parse(unknownRaw.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId: unknownInvoke.requestId,
+      error: JSON.stringify({
+        code: "ARBITRARY_AUTHENTICATED_CODE",
+        retryable: false,
+        action: "contact_admin",
+      }),
+    }));
+    assert.equal((await unknownResult).ok, false);
+    const unknownFinish = events.filter(
+      (event) => event.event === "invoke.finish",
+    )[2];
+    assert.equal(unknownFinish.code, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+    assert.equal(
+      JSON.stringify(events).includes("ARBITRARY_AUTHENTICATED_CODE"),
+      false,
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("observability sink failures cannot disrupt readiness, invoke, or snapshots", async () => {
+  const server = await startRegistry(undefined, {
+    onObservabilityEvent: () => {
+      throw new Error("sink-secret");
+    },
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const result = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    assert.deepEqual(await result, { ok: true, text: undefined });
+    const snapshot = server.registry.getObservabilitySnapshot();
+    assert.equal(Object.isFrozen(snapshot), true);
+    assert.equal(Object.isFrozen(snapshot.gauges), true);
+    assert.deepEqual(Object.keys(snapshot.gauges), [
+      "hosts.connected",
+      "hosts.ready",
+      "hosts.degraded",
+      "hosts.expired",
+      "invokes.inFlight",
+      "resourceDenials.total",
+      "socketReplacements.total",
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("v3 receipt readiness retains local freshness and expires once", async () => {
+  const events = [];
+  const timers = createManualTimers();
+  let wall = 20_000;
+  let monotonic = 200;
+  let monotonicSequence = [];
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    now: () => wall,
+    monotonicNow: () =>
+      monotonicSequence.length > 0
+        ? monotonicSequence.shift()
+        : monotonic,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "b".repeat(64);
+    const bindingFingerprint = workspaceBindingFingerprint({
+      authority: route.authority,
+      inventoryGeneration,
+      inventoryFingerprint,
+    });
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    }));
+    await waitFor(() => events.some((event) => event.event === "bind.ok"));
+    connection.socket.send(JSON.stringify(readinessFrame({
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      observedAt: 10_000,
+      expiresAt: 20_000,
+      ttlMs: 10_000,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    })));
+    await waitFor(() =>
+      events.some(
+        (event) =>
+          event.event === "readiness.accept" && event.phase === "receipt",
+      )
+    );
+    const accepted = events.find(
+      (event) =>
+        event.event === "readiness.accept" && event.phase === "receipt",
+    );
+    assert.equal(accepted.receivedAt, 20_000);
+    assert.equal(accepted.expiresAt, 30_000);
+    assert.equal(accepted.code, null);
+
+    wall = 0;
+    monotonic = 10_199.5;
+    monotonicSequence = [10_199.5, 10_200.5];
+    timers.runTimeoutByDelay(10_000);
+    assert.equal(
+      events.filter(
+        (event) =>
+          event.event === "readiness.expire" && event.phase === "receipt",
+      ).length,
+      0,
+    );
+    assert.equal(timers.timeoutDelays.includes(1), true);
+    monotonicSequence = [];
+    monotonic = 10_200.5;
+    const snapshot = server.registry.getObservabilitySnapshot();
+    const expired = events.filter(
+      (event) =>
+        event.event === "readiness.expire" && event.phase === "receipt",
+    );
+    assert.equal(expired.length, 1);
+    assert.equal(expired[0].code, PROTOCOL_ERROR_CODES.READINESS_EXPIRED);
+    assert.equal(expired[0].durationMs, 10_000);
+    assert.equal(snapshot.gauges["hosts.expired"], 1);
+    assert.equal(timers.timeoutDelays.includes(10_000), false);
+    assert.equal(
+      events.filter(
+        (event) =>
+          event.event === "readiness.expire" && event.phase === "receipt",
+      ).length,
+      1,
+    );
+    connection.socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("bound v3 receipt events retain receipt-local fences and reject mismatched proof", async () => {
+  const events = [];
+  const server = await startRegistry(undefined, {
+    workspaceServingEnabled: true,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "c".repeat(64);
+    const bindingFingerprint = workspaceBindingFingerprint({
+      authority: route.authority,
+      inventoryGeneration,
+      inventoryFingerprint,
+    });
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    }));
+    await waitFor(() => events.some((event) => event.event === "bind.ok"));
+    connection.socket.send(JSON.stringify(readinessFrame({
+      socketGeneration: 9,
+      revision: 4,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    })));
+    await waitFor(() => events.some(
+      (event) => event.event === "readiness.accept" && event.phase === "receipt"
+    ));
+    const accepted = events.find(
+      (event) => event.event === "readiness.accept" && event.phase === "receipt"
+    );
+    assert.equal(accepted.socketGeneration, 9);
+    assert.equal(accepted.revision, 4);
+
+    const invokeFrame = once(connection.socket, "message");
+    const invokeRoute = {
+      bindingId: bind.bindingId,
+      mappingId: route.mappingId,
+      mappingGeneration: route.mappingGeneration,
+      mappingVersion: route.mappingVersion,
+      sourcePlatform: route.sourcePlatform,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      authority: route.authority,
+    };
+    const invokeResult = server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "correlated" },
+      () => {},
+      1_000,
+      undefined,
+      invokeRoute,
+    );
+    const [invokeRaw] = await invokeFrame;
+    const invoke = JSON.parse(invokeRaw.toString());
+    assert.equal(Object.hasOwn(invoke, "transactionId"), false);
+    const start = events.find((event) => event.event === "invoke.start");
+    assert.equal(start.socketGeneration, 9);
+    assert.equal(start.revision, 4);
+    connection.socket.send(JSON.stringify(readinessFrame({
+      socketGeneration: 9,
+      revision: 5,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    })));
+    await waitFor(() =>
+      events.filter(
+        (event) =>
+          event.event === "readiness.accept" && event.phase === "receipt",
+      ).length === 2
+    );
+    invokeRoute.mappingId = "attacker-mutated";
+    invokeRoute.workspaceId = "attacker-mutated";
+    connection.socket.send(JSON.stringify({
+      type: "event",
+      requestId: invoke.requestId,
+      done: true,
+    }));
+    assert.deepEqual(await invokeResult, { ok: true, text: undefined });
+    const finish = events.find((event) => event.event === "invoke.finish");
+    for (const key of [
+      "bindingId",
+      "mappingId",
+      "workspaceId",
+      "fenceSequence",
+      "socketGeneration",
+      "revision",
+    ]) {
+      assert.equal(finish[key], start[key], `${key} is frozen at dispatch`);
+    }
+    assert.equal(finish.revision, 4);
+
+    const closed = once(connection.socket, "close");
+    connection.socket.send(JSON.stringify(readinessFrame({
+      socketGeneration: 9,
+      revision: 6,
+      bindingId: bind.bindingId,
+      workspaceId: route.workspaceId,
+      workspaceGeneration: route.workspaceGeneration,
+      ttlMs: 10_000,
+      inventoryGeneration,
+      inventoryFingerprint: "d".repeat(64),
+      bindingFingerprint,
+    })));
+    await closed;
+    assert.equal(
+      events.filter((event) => event.event === "readiness.accept" && event.phase === "receipt").length,
+      2,
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("managed invoke never borrows host fences before binding readiness", async () => {
+  const events = [];
+  const server = await startRegistry(undefined, {
+    workspaceServingEnabled: true,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const route = managedRoute("a");
+    server.registry.setManagedRoutes({ "channel-a": route });
+    const connection = await connectV3(server);
+    const bind = await connection.nextFrame();
+    connection.socket.send(JSON.stringify(readinessFrame({
+      socketGeneration: 9,
+      revision: 2,
+      workspaceId: undefined,
+      workspaceGeneration: undefined,
+      status: {
+        connection: "online",
+        runtime: "ready",
+        providerAuth: "configured",
+        modelProfile: "ready",
+        workspace: "unknown",
+      },
+    })));
+    await waitFor(() =>
+      server.registry.getHostReadiness("host-a")?.revision === 2
+    );
+    const inventoryGeneration = 1;
+    const inventoryFingerprint = "e".repeat(64);
+    const bindingFingerprint = workspaceBindingFingerprint({
+      authority: route.authority,
+      inventoryGeneration,
+      inventoryFingerprint,
+    });
+    connection.socket.send(JSON.stringify({
+      type: "bind_ok",
+      bindingId: bind.bindingId,
+      inventoryGeneration,
+      inventoryFingerprint,
+      bindingFingerprint,
+    }));
+    await waitFor(() =>
+      server.registry.getManagedRouteBinding("channel-a")?.state === "bound"
+    );
+
+    const invokeFrame = once(connection.socket, "message");
+    const result = server.registry.invoke(
+      "host-a",
+      null,
+      { kind: "prompt", message: "no borrowed fence" },
+      () => {},
+      1_000,
+      undefined,
+      {
+        bindingId: bind.bindingId,
+        mappingId: route.mappingId,
+        mappingGeneration: route.mappingGeneration,
+        mappingVersion: route.mappingVersion,
+        sourcePlatform: route.sourcePlatform,
+        workspaceId: route.workspaceId,
+        workspaceGeneration: route.workspaceGeneration,
+        authority: route.authority,
+      },
+    );
+    const [raw] = await invokeFrame;
+    const invoke = JSON.parse(raw.toString());
+    const start = events.find((event) => event.event === "invoke.start");
+    assert.equal(Object.hasOwn(start, "socketGeneration"), false);
+    assert.equal(Object.hasOwn(start, "revision"), false);
+    connection.socket.send(JSON.stringify({
+      type: "event",
+      requestId: invoke.requestId,
+      done: true,
+    }));
+    await result;
+  } finally {
+    await server.close();
+  }
+});
+
+test("host-only readiness does not replace workspace freshness metadata", async () => {
+  const events = [];
+  const timers = createManualTimers();
+  let wall = 10_000;
+  let monotonic = 100;
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    now: () => wall,
+    monotonicNow: () => monotonic,
+    onObservabilityEvent: (event) => events.push(event),
+  });
+  try {
+    const { socket } = await connectV2(server);
+    await sendReadiness(socket, readinessFrame({
+      socketGeneration: 1,
+      revision: 1,
+      observedAt: 10_000,
+      ttlMs: 1_000,
+      workspaceId: "workspace-a",
+      workspaceGeneration: 1,
+    }));
+    wall = 10_100;
+    monotonic = 200;
+    await sendReadiness(socket, readinessFrame({
+      socketGeneration: 1,
+      revision: 2,
+      observedAt: 10_100,
+      ttlMs: 5_000,
+      workspaceId: undefined,
+      workspaceGeneration: undefined,
+    }));
+    monotonic = 1_100;
+    server.registry.getObservabilitySnapshot();
+    const workspaceExpiry = events.find(
+      (event) => event.event === "readiness.expire" && event.phase === "workspace"
+    );
+    assert.equal(workspaceExpiry.workspaceId, "workspace-a");
+    assert.equal(workspaceExpiry.revision, 1);
+    assert.equal(workspaceExpiry.receivedAt, 10_000);
+    socket.terminate();
   } finally {
     await server.close();
   }

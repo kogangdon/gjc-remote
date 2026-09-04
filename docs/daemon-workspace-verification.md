@@ -94,16 +94,20 @@ supplements, and does not replace, the design-only matrix above.
   per-connection receipt fence, in-flight bind/invoke invalidation, exactly one bounded negative
   readiness frame, and socket close(1013) -- proving no `bind_ok` and no ready frame is emitted
   under drift.
-- Bot receipt binding lifecycle (`bind.request` / `bind.ok` / `bind.negative` /
-  `receipt.invalidate` / `socket.retire`) across arm, fingerprint match, drift, deadline, and
-  offline transitions.
+- Bot-owned local observability is schema-v1 only: deeply frozen flat callback records cover
+  bind/receipt/socket transitions, receiver-local v2/v3 readiness acceptance and expiry, and
+  invoke start/finish/deny. Records use a fixed allowlist of bounded opaque IDs/codes and local
+  wall/monotonic times; they do not carry prompts, paths, labels, tokens, raw errors, or
+  fingerprints. The constant-shape bot snapshot reports connected/ready/degraded/expired hosts,
+  in-flight invokes, bot pending-cap denials, and v3 socket replacements.
 - Reconnect churn counter gating: increments only for binding-capable v3 replacements
   (protocolVersion >= 3 with both `workspace_readiness_v2` and `workspace_inventory_receipt_v2`
-  capabilities); off-mode (v0/v2) replacements keep the counter at 0.
-- Sanitized observability allowlist: emitted fields are limited to `event`, `phase`, `code`,
-  redacted `bindingId`/`workspaceId`, safe integer `generation`, and a 12-character
-  `fingerprintPrefix`; no token, workDir, ACL, or full-fingerprint bytes can pass through the
-  sink.
+  capabilities); an off-mode (v0/v2) replacement does not increment it, and a host that has
+  remained entirely off-mode stays at 0. Prior v3 churn can remain nonzero. Replacements are not
+  process restart evidence.
+- Deferred: daemon lifecycle, cleanup, and resource telemetry; supervisor restart proof; and
+  exporter/evidence ingestion remain separate daemon/supervisor slices. Bot callback/snapshot
+  records are local API telemetry, not wire protocol or release evidence.
 
 **Historical observed green baseline (main HEAD fa68941).**
 

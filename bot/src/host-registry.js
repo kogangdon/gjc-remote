@@ -52,18 +52,33 @@ const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
 const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
 const BINDING_DEADLINE_MS = 10_000;
-// Observability: bounded inventory-lifecycle events for the /hosts and E2E
-// surfaces. Only these names are allowed, and every field is passed through a
-// strict allowlist so tokens, workDir, raw identities, ACLs, and inventory
-// bytes can never leak. Fingerprints are truncated to a short prefix.
+// Local-only observability. The schema deliberately has no extensibility
+// fields: this callback must never become a path, prompt, token, error, or
+// fingerprint transport.
 const OBSERVABILITY_EVENTS = Object.freeze([
   "bind.request",
   "bind.ok",
   "bind.negative",
   "receipt.invalidate",
   "socket.retire",
+  "readiness.accept",
+  "readiness.expire",
+  "invoke.start",
+  "invoke.finish",
+  "invoke.deny",
 ]);
-const OBSERVABILITY_FINGERPRINT_PREFIX_LENGTH = 12;
+const OBSERVABILITY_KEYS = Object.freeze(new Set([
+  "schemaVersion", "component", "event", "phase", "observedAt", "receivedAt",
+  "expiresAt", "requestAt", "deadlineAt", "durationMs", "hostId", "mappingId",
+  "workspaceId", "bindingId", "fenceSequence", "socketGeneration", "revision",
+  "transactionId", "code",
+]));
+const OBSERVABILITY_CODES = Object.freeze(new Set([
+  ...Object.values(PROTOCOL_ERROR_CODES),
+  "BINDING_DEADLINE",
+  "WORKSPACE_UNBOUND",
+]));
+const MAX_UINT53 = Number.MAX_SAFE_INTEGER;
 const PING_PAYLOAD = JSON.stringify(PING);
 const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
 const V3_CAPABILITIES = Object.freeze([
@@ -83,6 +98,27 @@ function isPositiveDuration(value) {
 }
 function redactOpaqueId(value) {
   return isWorkspaceId(String(value)) ? String(value) : "[redacted-host]";
+}
+function boundedOpaque(value) {
+  return typeof value === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
+    ? value
+    : "[redacted]";
+}
+function boundedCode(value) {
+  return typeof value === "string" && OBSERVABILITY_CODES.has(value)
+    ? value
+    : PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
+}
+function uint53(value) {
+  return Number.isSafeInteger(value) && value >= 0
+    ? Math.min(value, MAX_UINT53)
+    : undefined;
+}
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
 }
 function hostTokenMatches(expected, actual) {
   if (typeof expected !== "string" || typeof actual !== "string") return false;
@@ -241,6 +277,7 @@ export class HostRegistry {
       typeof onObservabilityEvent === "function" ? onObservabilityEvent : undefined;
     /** @type {Map<string, number>} Socket replacements observed per host; stays 0 in off mode. */
     this.reconnectCounts = new Map();
+    this.resourceDenials = 0;
     this.wss.on("error", (error) => {
       if (typeof this.onError === "function") this.onError(error);
       else console.error(`HostRegistry: WS server error: ${error?.message ?? String(error)}`);
@@ -349,7 +386,10 @@ export class HostRegistry {
         // Only binding-capable (v3) registrations count as reconnect churn;
         // off-mode (v0/v2) socket replacements leave the counter at rest.
         if (wantsInventoryReceipt) {
-          this.reconnectCounts.set(hostId, (this.reconnectCounts.get(hostId) ?? 0) + 1);
+          this.reconnectCounts.set(
+            hostId,
+            Math.min(MAX_UINT53, (this.reconnectCounts.get(hostId) ?? 0) + 1)
+          );
         } else if (!this.reconnectCounts.has(hostId)) {
           this.reconnectCounts.set(hostId, 0);
         }
@@ -376,12 +416,11 @@ export class HostRegistry {
         hostId,
         readinessEnabled,
         bindingEnabled,
-        receiptSocketGeneration: undefined,
-        receiptPrevious: undefined,
         revision: 0,
         socketGeneration: undefined,
         observedAt: undefined,
         receivedAt: undefined,
+        monoReceivedAt: undefined,
         expiresAt: undefined,
         monoExpiresAt: undefined,
         expiryTimer: undefined,
@@ -404,6 +443,11 @@ export class HostRegistry {
         /** @type {Map<string, number>} */
         workspaceGenerationHighWater: new Map(),
         workspaceDimensions: undefined,
+        workspaceSocketGeneration: undefined,
+        workspaceRevision: undefined,
+        workspaceObservedAt: undefined,
+        workspaceReceivedAt: undefined,
+        workspaceMonoReceivedAt: undefined,
         workspaceExpiresAt: undefined,
         workspaceMonoExpiresAt: undefined,
         workspaceExpiryTimer: undefined,
@@ -557,51 +601,81 @@ export class HostRegistry {
       : undefined;
   }
 
-  /**
-   * Emits a bounded inventory-lifecycle event to the optional observer. Only
-   * allowlisted, sanitized fields are forwarded: identities are redacted with
-   * the same grammar as /hosts projections and fingerprints are truncated to a
-   * short prefix, so tokens, workDir, raw identities, ACLs, and inventory bytes
-   * can never leak. Observer failures never disrupt the registry.
-   */
+  /** Emits a local, flat, deeply frozen schema-v1 record. */
   #emitObservability(event, fields = {}) {
     const sink = this.onObservabilityEvent;
     if (typeof sink !== "function" || !OBSERVABILITY_EVENTS.includes(event)) return;
-    const payload = { event };
-    if (typeof fields.phase === "string") payload.phase = fields.phase;
-    if (typeof fields.code === "string") payload.code = fields.code;
-    if (typeof fields.bindingId === "string") {
-      payload.bindingId = redactOpaqueId(fields.bindingId);
+    const payload = {
+      schemaVersion: 1,
+      component: "bot",
+      event,
+      phase: boundedOpaque(fields.phase ?? "unknown"),
+      observedAt: uint53(fields.observedAt) ?? uint53(this.now()) ?? 0,
+    };
+    for (const key of [
+      "receivedAt", "expiresAt", "requestAt", "deadlineAt", "durationMs",
+      "fenceSequence", "socketGeneration", "revision",
+    ]) {
+      const value = uint53(fields[key]);
+      if (value !== undefined) payload[key] = value;
     }
-    if (typeof fields.workspaceId === "string") {
-      payload.workspaceId = redactOpaqueId(fields.workspaceId);
+    for (const key of ["hostId", "mappingId", "workspaceId", "bindingId", "transactionId"]) {
+      if (fields[key] !== undefined) payload[key] = boundedOpaque(fields[key]);
     }
-    if (Number.isSafeInteger(fields.generation)) payload.generation = fields.generation;
-    if (typeof fields.fingerprint === "string" && fields.fingerprint.length > 0) {
-      payload.fingerprintPrefix = fields.fingerprint.slice(
-        0,
-        OBSERVABILITY_FINGERPRINT_PREFIX_LENGTH
-      );
+    if (fields.code !== undefined) {
+      payload.code = fields.code === null ? null : boundedCode(fields.code);
+    }
+    // Keep the explicit check close to the boundary; additions require a
+    // deliberate schema review rather than accidentally leaking a field.
+    for (const key of Object.keys(payload)) {
+      if (!OBSERVABILITY_KEYS.has(key)) return;
     }
     try {
-      sink(Object.freeze(payload));
+      sink(deepFreeze(payload));
     } catch {
       // Observers must never disrupt host bookkeeping.
     }
+  }
+
+  #bindingObservabilityFields(state, binding, fields = {}) {
+    const authority = binding?.authority;
+    return {
+      hostId: state?.hostId,
+      mappingId: authority?.mappingId,
+      workspaceId: authority?.workspaceId,
+      bindingId: binding?.bindingId,
+      fenceSequence: authority?.fenceGeneration,
+      socketGeneration: binding?.socketGeneration,
+      revision: binding?.revision,
+      ...fields,
+    };
+  }
+
+  #bindingDuration(binding) {
+    return binding?.requestMonoAt === undefined
+      ? undefined
+      : Math.max(
+          0,
+          Math.min(
+            MAX_UINT53,
+            Math.trunc(this.monotonicNow() - binding.requestMonoAt),
+          ),
+        );
   }
 
   #armBindingDeadline(socket, binding) {
     const deadline = this.timers.setTimeout(() => {
       if (binding.deadline === deadline) {
         binding.deadline = undefined;
-        this.#emitObservability("socket.retire", {
+        this.#clearBindingReadinessExpiry(binding);
+        const state = this.#bindingState(socket);
+        this.#emitObservability("socket.retire", this.#bindingObservabilityFields(state, binding, {
           phase: "deadline",
           code: "BINDING_DEADLINE",
-          bindingId: binding.bindingId,
-        });
+          durationMs: this.#bindingDuration(binding),
+        }));
         // The ensuing close would otherwise emit a second, offline-phase
         // socket.retire for the same physical retirement; suppress it.
-        const state = this.#bindingState(socket);
         if (state) state.socketRetired = true;
         socket.terminate();
       }
@@ -651,13 +725,11 @@ export class HostRegistry {
         inventoryFingerprint: msg.inventoryFingerprint,
         bindingFingerprint: msg.bindingFingerprint,
       });
-      this.#emitObservability("bind.ok", {
+      this.#emitObservability("bind.ok", this.#bindingObservabilityFields(state, binding, {
         phase: "bound",
-        bindingId: binding.bindingId,
-        workspaceId: binding.authority?.workspaceId,
-        generation: msg.inventoryGeneration,
-        fingerprint: msg.inventoryFingerprint,
-      });
+        code: null,
+        durationMs: this.#bindingDuration(binding),
+      }));
       return true;
     }
     if (!isUnbindOkMessage(msg)) return false;
@@ -677,20 +749,23 @@ export class HostRegistry {
     binding.receipt = undefined;
     binding.readiness = undefined;
     binding.heldReadiness = undefined;
+    this.#clearBindingReadinessExpiry(binding);
+    binding.expiresAt = undefined;
+    binding.monoExpiresAt = undefined;
     state.bindingsByDescriptor.delete(binding.descriptorKey);
     this.#clearBindingDeadline(binding);
+    binding.requestAt = this.now();
+    binding.requestMonoAt = this.monotonicNow();
     this.#armBindingDeadline(state.socket, binding);
     state.socket.send(JSON.stringify({
       type: MSG_TYPES.UNBIND_WORKSPACE,
       bindingId: binding.bindingId,
     }));
     if (hadReceipt) {
-      this.#emitObservability("receipt.invalidate", {
+      this.#emitObservability("receipt.invalidate", this.#bindingObservabilityFields(state, binding, {
         phase: "unbind",
         code: "WORKSPACE_UNBOUND",
-        bindingId: binding.bindingId,
-        workspaceId: binding.authority?.workspaceId,
-      });
+      }));
     }
   }
 
@@ -701,13 +776,14 @@ export class HostRegistry {
   }
 
   #acceptInventoryReceiptReadiness(state, msg) {
+    const receivedAt = this.now();
     if (!isInventoryReceiptReadinessMessage(msg, {
       currentSocketGeneration: state.receiptSocketGeneration,
       previous: state.receiptPrevious,
-      receivedAt: this.now(),
+      receivedAt,
     })) return false;
     if (msg.bindingId === undefined) {
-      const accepted = this.#acceptReadiness(state.socket, msg);
+      const accepted = this.#acceptReadiness(state.socket, msg, receivedAt);
       if (accepted) {
         state.receiptSocketGeneration ??= msg.socketGeneration;
         state.receiptPrevious = msg;
@@ -718,15 +794,40 @@ export class HostRegistry {
     if (!binding || binding.status === "tombstone") return false;
     if (binding.status === "unbinding") return true;
     if (
+      binding.status !== "binding" &&
+      binding.status !== "pending" &&
+      binding.status !== "bound"
+    ) return false;
+    if (
       msg.workspaceId !== binding.authority.workspaceId ||
       msg.workspaceGeneration !== binding.authority.workspaceGeneration
     ) return false;
+    if (!isInventoryReceiptReadinessMessage(msg, {
+      currentSocketGeneration: binding.socketGeneration,
+      previous: binding.receiptPrevious,
+      receivedAt,
+    })) return false;
+    // A bound receipt must prove its exact accepted binding before it can
+    // refresh any local freshness state or produce an acceptance event.
     if (
-      state.receiptSocketGeneration !== undefined &&
-      state.receiptSocketGeneration !== msg.socketGeneration
+      binding.status === "bound" &&
+      msg.lastError === undefined &&
+      (!binding.receipt || !this.#receiptMatchesReadiness(binding.receipt, msg))
     ) return false;
+    const ttlMs = normalizeReadinessTtl(msg.ttlMs);
+    const monotonicReceivedAt = this.monotonicNow();
     state.receiptSocketGeneration ??= msg.socketGeneration;
     state.receiptPrevious = msg;
+    this.#clearBindingReadinessExpiry(binding);
+    binding.socketGeneration ??= msg.socketGeneration;
+    binding.revision = msg.revision;
+    binding.observedAt = msg.observedAt;
+    binding.receiptPrevious = msg;
+    binding.receivedAt = receivedAt;
+    binding.monoReceivedAt = monotonicReceivedAt;
+    binding.expiresAt = receivedAt + ttlMs;
+    binding.monoExpiresAt = monotonicReceivedAt + Math.min(ttlMs, READINESS_MAX_TTL_MS);
+    binding.expired = false;
     if (msg.lastError !== undefined) {
       const pending =
         msg.lastError.code === PROTOCOL_ERROR_CODES.INVENTORY_PENDING;
@@ -736,30 +837,37 @@ export class HostRegistry {
       binding.receipt = undefined;
       binding.readiness = Object.freeze({ ...msg });
       binding.heldReadiness = undefined;
+      this.#clearBindingReadinessExpiry(binding);
+      binding.expiresAt = undefined;
+      binding.monoExpiresAt = undefined;
       if (hadReceipt) {
-        this.#emitObservability("receipt.invalidate", {
+        this.#emitObservability("receipt.invalidate", this.#bindingObservabilityFields(state, binding, {
           phase: "drift",
           code: msg.lastError.code,
-          bindingId: binding.bindingId,
-          workspaceId: binding.authority?.workspaceId,
-        });
+        }));
       }
       if (!pending) {
-        this.#emitObservability("bind.negative", {
+        this.#emitObservability("bind.negative", this.#bindingObservabilityFields(state, binding, {
           phase: "negative",
           code: msg.lastError.code,
-          bindingId: binding.bindingId,
-          workspaceId: binding.authority?.workspaceId,
-        });
+          durationMs: this.#bindingDuration(binding),
+        }));
       }
       return true;
     }
+    this.#armBindingReadinessExpiry(state, binding, ttlMs);
+    this.#emitObservability("readiness.accept", this.#bindingObservabilityFields(state, binding, {
+      phase: "receipt",
+      observedAt: receivedAt,
+      receivedAt,
+      expiresAt: binding.expiresAt,
+      code: null,
+    }));
     if (binding.status === "binding" || binding.status === "pending") {
       binding.heldReadiness = Object.freeze({ ...msg });
       return true;
     }
     if (binding.status !== "bound" || !binding.receipt) return false;
-    if (!this.#receiptMatchesReadiness(binding.receipt, msg)) return false;
     binding.readiness = Object.freeze({ ...msg });
     return true;
   }
@@ -784,6 +892,7 @@ export class HostRegistry {
     for (const [descriptorKey, descriptor] of desired) {
       if (state.bindingsByDescriptor.has(descriptorKey)) continue;
       if (state.bindingsById.size >= MAX_BINDING_READINESS_STATES) continue;
+      const requestAt = this.now();
       const binding = {
         bindingId: randomUUID(),
         descriptorKey,
@@ -794,6 +903,12 @@ export class HostRegistry {
         receipt: undefined,
         readiness: undefined,
         heldReadiness: undefined,
+        requestAt,
+        requestMonoAt: this.monotonicNow(),
+        socketGeneration: undefined,
+        revision: undefined,
+        observedAt: undefined,
+        receiptPrevious: undefined,
       };
       state.bindingsById.set(binding.bindingId, binding);
       state.bindingsByDescriptor.set(descriptorKey, binding);
@@ -804,12 +919,13 @@ export class HostRegistry {
         ...binding.authority,
         mapping: binding.mapping,
       }));
-      this.#emitObservability("bind.request", {
+      this.#emitObservability("bind.request", this.#bindingObservabilityFields(state, binding, {
         phase: "request",
-        bindingId: binding.bindingId,
-        workspaceId: binding.authority?.workspaceId,
-        generation: binding.authority?.workspaceGeneration,
-      });
+        observedAt: requestAt,
+        requestAt,
+        deadlineAt: requestAt + this.bindingDeadlineMs,
+        code: null,
+      }));
     }
   }
 
@@ -820,7 +936,17 @@ export class HostRegistry {
       (this.pendingCountBySocket.get(entry.socket) ?? 0) + 1
     );
   }
-  #acceptReadiness(socket, msg) {
+
+  #denyInvoke(hostId, error, fields = {}, code = error?.code) {
+    this.#emitObservability("invoke.deny", {
+      phase: "local_validation",
+      hostId,
+      code: code ?? PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+      ...fields,
+    });
+    return Promise.resolve({ ok: false, error });
+  }
+  #acceptReadiness(socket, msg, acceptedReceivedAt) {
     const heartbeat = this.heartbeatStates.get(socket);
     const hostId = heartbeat?.hostId;
     const state = hostId ? this.readinessStates.get(hostId) : undefined;
@@ -834,7 +960,7 @@ export class HostRegistry {
       return false;
     }
 
-    const receivedAt = this.now();
+    const receivedAt = acceptedReceivedAt ?? this.now();
     const timestampInvalid =
       !Number.isSafeInteger(receivedAt) ||
       receivedAt < 0 ||
@@ -956,6 +1082,7 @@ export class HostRegistry {
     state.revision = msg.revision;
     state.observedAt = msg.observedAt;
     state.receivedAt = receivedAt;
+    state.monoReceivedAt = monotonicReceivedAt;
     state.connected = true;
     state.lastError = msg.lastError
       ? {
@@ -1001,6 +1128,11 @@ export class HostRegistry {
       state.workspaceId = msg.workspaceId;
       state.workspaceGeneration = msg.workspaceGeneration;
       state.bindingId = msg.bindingId;
+      state.workspaceSocketGeneration = msg.socketGeneration;
+      state.workspaceRevision = msg.revision;
+      state.workspaceObservedAt = msg.observedAt;
+      state.workspaceReceivedAt = receivedAt;
+      state.workspaceMonoReceivedAt = monotonicReceivedAt;
       if (msg.bindingId !== undefined) {
         for (const [bindingId, binding] of state.bindingReadiness) {
           if (
@@ -1035,6 +1167,8 @@ export class HostRegistry {
           bindingId: msg.bindingId,
           workspaceId: msg.workspaceId,
           workspaceGeneration: msg.workspaceGeneration,
+          socketGeneration: msg.socketGeneration,
+          revision: msg.revision,
           dimensions: { ...msg.status },
           lastError: msg.lastError
             ? {
@@ -1087,12 +1221,24 @@ export class HostRegistry {
       socketGeneration: state.socketGeneration,
       revision: state.revision,
       observedAt: state.observedAt,
-      bindingId: state.bindingId,
-      workspaceId: state.workspaceId,
-      workspaceGeneration: state.workspaceGeneration,
+      bindingId: hasWorkspace ? state.bindingId : undefined,
+      workspaceId: hasWorkspace ? state.workspaceId : undefined,
+      workspaceGeneration: hasWorkspace ? state.workspaceGeneration : undefined,
       workspaceGenerationHighWater: new Map(
         state.workspaceGenerationHighWater
       ),
+    });
+    this.#emitObservability("readiness.accept", {
+      phase: state.bindingEnabled ? "v3-host" : "v2",
+      observedAt: receivedAt,
+      hostId,
+      workspaceId: hasWorkspace ? state.workspaceId : undefined,
+      bindingId: hasWorkspace ? state.bindingId : undefined,
+      socketGeneration: state.socketGeneration,
+      revision: state.revision,
+      receivedAt,
+      expiresAt: state.expiresAt,
+      code: null,
     });
     return true;
   }
@@ -1118,20 +1264,75 @@ export class HostRegistry {
 
   #armReadinessExpiry(state, workspace, ttlMs) {
     const key = workspace ? "workspaceExpiryTimer" : "expiryTimer";
-    const expiredKey = workspace ? "workspaceExpired" : "hostExpired";
-    const priorReadyKey = workspace ? "workspacePriorReady" : "hostPriorReady";
     if (state[key]) this.timers.clearTimeout(state[key]);
     const delay = Math.min(ttlMs, READINESS_MAX_TTL_MS);
     state[key] = this.timers.setTimeout(() => {
-      const wasReady = this.#isCurrentReady(state);
-      state[expiredKey] = true;
-      if (wasReady) {
-        state[priorReadyKey] = true;
-        state.degraded = true;
+      if (state[key] === undefined) return;
+      const now = this.monotonicNow();
+      if (!this.#transitionReadinessExpiry(state, workspace, now)) {
+        const deadlineKey = workspace
+          ? "workspaceMonoExpiresAt"
+          : "monoExpiresAt";
+        const deadline = state[deadlineKey];
+        if (
+          !state[workspace ? "workspaceExpired" : "hostExpired"] &&
+          deadline !== undefined &&
+          now < deadline
+        ) {
+          this.#armReadinessExpiry(
+            state,
+            workspace,
+            Math.max(1, Math.ceil(deadline - now)),
+          );
+        } else {
+          state[key] = undefined;
+        }
       }
-      state[key] = undefined;
     }, delay);
     state[key]?.unref?.();
+  }
+
+  #transitionReadinessExpiry(
+    state,
+    workspace,
+    now = this.monotonicNow(),
+  ) {
+    const deadlineKey = workspace ? "workspaceMonoExpiresAt" : "monoExpiresAt";
+    const expiredKey = workspace ? "workspaceExpired" : "hostExpired";
+    const priorReadyKey = workspace ? "workspacePriorReady" : "hostPriorReady";
+    const timerKey = workspace ? "workspaceExpiryTimer" : "expiryTimer";
+    const receivedKey = workspace ? "workspaceReceivedAt" : "receivedAt";
+    const monoReceivedKey = workspace ? "workspaceMonoReceivedAt" : "monoReceivedAt";
+    const expiresKey = workspace ? "workspaceExpiresAt" : "expiresAt";
+    if (
+      state[expiredKey] ||
+      state[deadlineKey] === undefined ||
+      now < state[deadlineKey]
+    ) return false;
+    if (state[timerKey]) this.timers.clearTimeout(state[timerKey]);
+    state[timerKey] = undefined;
+    const wasReady = this.#isCurrentReady(state);
+    state[expiredKey] = true;
+    if (wasReady) {
+      state[priorReadyKey] = true;
+      state.degraded = true;
+    }
+    this.#emitObservability("readiness.expire", {
+      phase: workspace ? "workspace" : "host",
+      hostId: state.hostId,
+      workspaceId: workspace ? state.workspaceId : undefined,
+      bindingId: workspace ? state.bindingId : undefined,
+      socketGeneration: workspace ? state.workspaceSocketGeneration : state.socketGeneration,
+      revision: workspace ? state.workspaceRevision : state.revision,
+      receivedAt: state[receivedKey],
+      expiresAt: state[expiresKey],
+      durationMs: Math.max(
+        0,
+        Math.min(MAX_UINT53, Math.trunc(now - (state[monoReceivedKey] ?? 0))),
+      ),
+      code: PROTOCOL_ERROR_CODES.READINESS_EXPIRED,
+    });
+    return true;
   }
 
   #clearWorkspaceExpiry(state) {
@@ -1139,6 +1340,64 @@ export class HostRegistry {
     state.workspaceExpiryTimer = undefined;
     state.workspaceExpiresAt = undefined;
     state.workspaceMonoExpiresAt = undefined;
+  }
+
+  #clearBindingReadinessExpiry(binding) {
+    if (binding?.expiryTimer) this.timers.clearTimeout(binding.expiryTimer);
+    if (binding) binding.expiryTimer = undefined;
+  }
+
+  #armBindingReadinessExpiry(state, binding, ttlMs) {
+    this.#clearBindingReadinessExpiry(binding);
+    const timer = this.timers.setTimeout(() => {
+      if (binding.expiryTimer !== timer) return;
+      const now = this.monotonicNow();
+      if (!this.#transitionBindingExpiry(state, binding, now)) {
+        if (
+          !binding.expired &&
+          binding.monoExpiresAt !== undefined &&
+          now < binding.monoExpiresAt
+        ) {
+          this.#armBindingReadinessExpiry(
+            state,
+            binding,
+            Math.max(1, Math.ceil(binding.monoExpiresAt - now)),
+          );
+        } else {
+          binding.expiryTimer = undefined;
+        }
+      }
+    }, Math.min(ttlMs, READINESS_MAX_TTL_MS));
+    binding.expiryTimer = timer;
+    timer?.unref?.();
+  }
+
+  #transitionBindingExpiry(
+    state,
+    binding,
+    now = this.monotonicNow(),
+  ) {
+    if (
+      (binding.status !== "binding" &&
+        binding.status !== "pending" &&
+        binding.status !== "bound") ||
+      binding.expired ||
+      binding.monoExpiresAt === undefined ||
+      now < binding.monoExpiresAt
+    ) return false;
+    this.#clearBindingReadinessExpiry(binding);
+    binding.expired = true;
+    this.#emitObservability("readiness.expire", this.#bindingObservabilityFields(state, binding, {
+      phase: "receipt",
+      receivedAt: binding.receivedAt,
+      expiresAt: binding.expiresAt,
+      durationMs: Math.max(
+        0,
+        Math.min(MAX_UINT53, Math.trunc(now - (binding.monoReceivedAt ?? 0))),
+      ),
+      code: PROTOCOL_ERROR_CODES.READINESS_EXPIRED,
+    }));
+    return true;
   }
 
   #isCurrentReady(state) {
@@ -1170,21 +1429,8 @@ export class HostRegistry {
   }
 
   #refreshExpired(state) {
-    const now = this.monotonicNow();
-    for (const [deadlineKey, expiredKey, priorReadyKey] of [
-      ["monoExpiresAt", "hostExpired", "hostPriorReady"],
-      ["workspaceMonoExpiresAt", "workspaceExpired", "workspacePriorReady"],
-    ]) {
-      if (state[expiredKey] || state[deadlineKey] === undefined || now < state[deadlineKey]) {
-        continue;
-      }
-      const wasReady = this.#isCurrentReady(state);
-      state[expiredKey] = true;
-      if (wasReady) {
-        state[priorReadyKey] = true;
-        state.degraded = true;
-      }
-    }
+    this.#transitionReadinessExpiry(state, false);
+    this.#transitionReadinessExpiry(state, true);
   }
   #allDimensionsReady(state) {
     const dimensions = this.#effectiveDimensions(state);
@@ -1214,7 +1460,9 @@ export class HostRegistry {
 
   #bindingAggregate(state, binding) {
     if (!binding || this.connections.get(state.hostId) !== state.socket) return "offline";
+    this.#transitionBindingExpiry(state, binding);
     const dimensions = binding.dimensions;
+    if (!dimensions) return "connected-not-ready";
     if (dimensions.connection === "offline") return "offline";
     if (dimensions.runtime === "incompatible") return "incompatible";
     if (binding.lastError) {
@@ -1349,7 +1597,10 @@ export class HostRegistry {
       }
       pending.idleTimer = undefined;
       this.#deletePending(pending.requestId);
-      pending.settle({ ok: false, error: "timed out waiting for host response" });
+      pending.settle(
+        { ok: false, error: "timed out waiting for host response" },
+        "idle_timeout",
+      );
     }, pending.idleMs);
     pending.idleTimer = idleTimer;
     idleTimer?.unref?.();
@@ -1414,13 +1665,12 @@ export class HostRegistry {
     state.workspaceMonoExpiresAt = undefined;
     for (const binding of state.bindingsById?.values() ?? []) {
       this.#clearBindingDeadline(binding);
+      this.#clearBindingReadinessExpiry(binding);
       if (binding.status === "bound" && binding.receipt !== undefined) {
-        this.#emitObservability("receipt.invalidate", {
+        this.#emitObservability("receipt.invalidate", this.#bindingObservabilityFields(state, binding, {
           phase: "offline",
           code: "CONNECTION_LOST",
-          bindingId: binding.bindingId,
-          workspaceId: binding.authority?.workspaceId,
-        });
+        }));
       }
     }
     state.bindingsById?.clear();
@@ -1429,6 +1679,9 @@ export class HostRegistry {
       this.#emitObservability("socket.retire", {
         phase: "offline",
         code: "CONNECTION_LOST",
+        hostId: state.hostId,
+        socketGeneration: state.socketGeneration,
+        revision: state.revision,
       });
     }
     state.connected = false;
@@ -1559,6 +1812,7 @@ export class HostRegistry {
       }
       for (const binding of state.bindingsById?.values() ?? []) {
         this.#clearBindingDeadline(binding);
+        this.#clearBindingReadinessExpiry(binding);
       }
     }
     this.readinessStates.clear();
@@ -1667,6 +1921,44 @@ export class HostRegistry {
     };
   }
 
+  /** Returns a constant-shape, receiver-local schema-v1 gauge snapshot. */
+  getObservabilitySnapshot() {
+    let ready = 0;
+    let degraded = 0;
+    let expired = 0;
+    for (const state of this.readinessStates.values()) {
+      for (const binding of state.bindingsById.values()) {
+        this.#transitionBindingExpiry(state, binding);
+      }
+      const aggregate = this.#aggregate(state);
+      if (aggregate === "ready") ready++;
+      if (aggregate === "degraded") degraded++;
+      if (
+        state.hostExpired ||
+        state.workspaceExpired ||
+        [...state.bindingsById.values()].some((binding) => binding.expired)
+      ) {
+        expired++;
+      }
+    }
+    const replacements = [...this.reconnectCounts.values()]
+      .reduce((total, count) => Math.min(MAX_UINT53, total + count), 0);
+    return deepFreeze({
+      schemaVersion: 1,
+      component: "bot",
+      observedAt: uint53(this.now()) ?? 0,
+      gauges: {
+        "hosts.connected": Math.min(MAX_UINT53, this.connections.size),
+        "hosts.ready": Math.min(MAX_UINT53, ready),
+        "hosts.degraded": Math.min(MAX_UINT53, degraded),
+        "hosts.expired": Math.min(MAX_UINT53, expired),
+        "invokes.inFlight": Math.min(MAX_UINT53, this.pendingRequests.size),
+        "resourceDenials.total": this.resourceDenials,
+        "socketReplacements.total": replacements,
+      },
+    });
+  }
+
   #findBindingReadiness(state, routeIdentity = {}) {
     let match;
     for (const binding of state.bindingReadiness.values()) {
@@ -1712,14 +2004,12 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         routeIdentity = Object.freeze({ ...routeIdentity, authority: managedAuthority });
       }
     } catch {
-      return Promise.resolve({
-        ok: false,
-        error: remediationError(PROTOCOL_ERROR_CODES.CONFIG_INVALID),
-      });
+      return this.#denyInvoke(hostId, remediationError(PROTOCOL_ERROR_CODES.CONFIG_INVALID));
     }
     const socket = this.connections.get(hostId);
     const readiness = this.readinessStates.get(hostId);
     let selectedBindingId;
+    let selectedBindingTelemetry;
     if (managedAuthority) {
       const descriptorKey = canonicalJsonHash(managedAuthority);
       const binding =
@@ -1733,24 +2023,25 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         binding.status !== "bound" ||
         routeIdentity.bindingId !== binding.bindingId
       ) {
-        return Promise.resolve({
-          ok: false,
-          error: remediationError(PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE),
-        });
+        return this.#denyInvoke(
+          hostId,
+          remediationError(PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE)
+        );
       }
       selectedBindingId = binding.bindingId;
+      selectedBindingTelemetry = binding;
       if (!this.workspaceServingEnabled) {
-        return Promise.resolve({
-          ok: false,
-          error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
-        });
+        return this.#denyInvoke(
+          hostId,
+          remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE)
+        );
       }
     }
     if (!socket) {
-      return Promise.resolve({
-        ok: false,
-        error: { ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.CONNECTION_LOST] },
-      });
+      return this.#denyInvoke(
+        hostId,
+        remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST)
+      );
     }
     if (readiness?.readinessEnabled && !readiness.bindingEnabled) {
       const hasBindingSelector =
@@ -1762,44 +2053,42 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
           ? this.#findBindingReadiness(readiness, routeIdentity)
           : undefined;
       selectedBindingId = binding?.bindingId;
+      selectedBindingTelemetry = binding;
       const aggregate =
         hasBindingSelector && binding
           ? this.#bindingAggregate(readiness, binding)
           : this.#aggregate(readiness);
       if (aggregate === "offline") {
-        return Promise.resolve({
-          ok: false,
-          error: this.#notReadyResult(readiness, aggregate),
-        });
+        return this.#denyInvoke(hostId, this.#notReadyResult(readiness, aggregate));
       }
       if (!this.workspaceServingEnabled) {
-        return Promise.resolve({
-          ok: false,
-          error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
-        });
+        return this.#denyInvoke(
+          hostId,
+          remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE)
+        );
       }
       if (hasBindingSelector && !binding) {
-        return Promise.resolve({
-          ok: false,
-          error: remediationError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED),
-        });
+        return this.#denyInvoke(
+          hostId,
+          remediationError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED)
+        );
       }
       if (aggregate !== "ready") {
-        return Promise.resolve({
-          ok: false,
-          error: binding
+        return this.#denyInvoke(
+          hostId,
+          binding
             ? this.#bindingNotReadyResult(binding, aggregate)
-            : this.#notReadyResult(readiness, aggregate),
-        });
+            : this.#notReadyResult(readiness, aggregate)
+        );
       }
     }
 
     const usesV2 = readiness?.readinessEnabled === true;
     if (!usesV2 && isManagedPathFreeRoute(workDir, routeIdentity)) {
-      return Promise.resolve({
-        ok: false,
-        error: remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE),
-      });
+      return this.#denyInvoke(
+        hostId,
+        remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE)
+      );
     }
 
     // Bot-side network backpressure guard, NOT host-wide resource admission
@@ -1813,10 +2102,16 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     // authority.
     const pendingForSocket = this.pendingCountBySocket.get(socket) ?? 0;
     if (pendingForSocket >= V0_LIMITS.MAX_PENDING_PER_HOST) {
-      return Promise.resolve({
-        ok: false,
-        error: remediationError(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED),
-      });
+      this.resourceDenials = Math.min(MAX_UINT53, this.resourceDenials + 1);
+      return this.#denyInvoke(
+        hostId,
+        remediationError(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED),
+        {
+          phase: "bot_admission",
+          socketGeneration: readiness?.socketGeneration,
+          revision: readiness?.revision,
+        }
+      );
     }
 
     const requestId = randomUUID();
@@ -1836,15 +2131,20 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       }
       if (workDir !== undefined && workDir !== null) invoke.workDir = workDir;
       if (!isInvokeMessage(invoke, { v2: true })) {
-        return Promise.resolve({
-          ok: false,
-          error: { ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED] },
-        });
+        return this.#denyInvoke(
+          hostId,
+          remediationError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED)
+        );
       }
     } else {
       invoke.workDir = workDir;
       if (!isInvokeMessage(invoke)) {
-        return Promise.resolve({ ok: false, error: "invalid invoke request" });
+        return this.#denyInvoke(
+          hostId,
+          "invalid invoke request",
+          {},
+          PROTOCOL_ERROR_CODES.CONFIG_INVALID
+        );
       }
     }
 
@@ -1852,14 +2152,40 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
     try {
       payload = JSON.stringify(invoke);
     } catch {
-      return Promise.resolve({ ok: false, error: "invoke request is not serializable" });
+      return this.#denyInvoke(
+        hostId,
+        "invoke request is not serializable",
+        {},
+        PROTOCOL_ERROR_CODES.CONFIG_INVALID
+      );
     }
     if (Buffer.byteLength(payload) > MAX_WS_PAYLOAD_BYTES) {
-      return Promise.resolve({ ok: false, error: "invoke request exceeds WebSocket payload limit" });
+      return this.#denyInvoke(
+        hostId,
+        "invoke request exceeds WebSocket payload limit",
+        {},
+        PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED
+      );
     }
 
+    const invokeTelemetryContext = Object.freeze({
+      hostId,
+      bindingId: selectedBindingId,
+      workspaceId: routeIdentity?.workspaceId,
+      mappingId: routeIdentity?.mappingId,
+      fenceSequence: managedAuthority?.fenceGeneration,
+      socketGeneration: selectedBindingTelemetry
+        ? selectedBindingTelemetry.socketGeneration
+        : readiness?.socketGeneration,
+      revision: selectedBindingTelemetry
+        ? selectedBindingTelemetry.revision
+        : readiness?.revision,
+    });
     return new Promise((resolve) => {
       let settled = false;
+      const transactionId = randomUUID();
+      const requestAt = this.now();
+      const monotonicStartedAt = this.monotonicNow();
       const pending = {
         requestId,
         socket,
@@ -1870,23 +2196,51 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         hardCapTimer: undefined,
         gatePending: false,
         gateId: undefined,
-        settle: (result) => {
+        settle: (result, terminalPhase) => {
           if (settled) return;
           settled = true;
           this.timers.clearTimeout(pending.idleTimer);
           this.timers.clearTimeout(pending.hardCapTimer);
+          const finishedAt = this.monotonicNow();
+          this.#emitObservability("invoke.finish", {
+            phase: terminalPhase ??
+              (result.ok
+                ? "success"
+                : result.error?.code === PROTOCOL_ERROR_CODES.CONNECTION_LOST ||
+                    result.error?.code === PROTOCOL_ERROR_CODES.HEARTBEAT_TIMEOUT
+                  ? "disconnect"
+                  : "remote_error"),
+            ...invokeTelemetryContext,
+            transactionId,
+            requestAt,
+            durationMs: Math.max(0, Math.min(MAX_UINT53, Math.trunc(finishedAt - monotonicStartedAt))),
+            code: result.ok
+              ? null
+              : result.error?.code ?? PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+          });
           resolve(result);
         },
         resolve: (result) => pending.settle(result),
       };
       pending.hardCapTimer = this.timers.setTimeout(() => {
         this.#deletePending(requestId);
-        pending.settle({ ok: false, error: "invoke exceeded absolute hard-cap" });
+        pending.settle(
+          { ok: false, error: "invoke exceeded absolute hard-cap" },
+          "hard_cap",
+        );
       }, this.invokeHardCapMs);
       pending.hardCapTimer?.unref?.();
 
       this.#addPending(requestId, pending);
       this.#armIdleTimer(pending);
+      this.#emitObservability("invoke.start", {
+        phase: "dispatch",
+        ...invokeTelemetryContext,
+        transactionId,
+        requestAt,
+        deadlineAt: requestAt + this.invokeHardCapMs,
+        code: null,
+      });
 
       socket.send(payload);
     });
