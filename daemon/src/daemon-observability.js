@@ -36,6 +36,25 @@ const CLOSED_CODES = new Set([
 ]);
 const CLOSED_CLEANUP_STATES = new Set(["started", "fulfilled", "rejected", "timed_out"]);
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SNAPSHOT_KEY_CONFIGURATION_ERROR =
+  "observability owner snapshots contain duplicate keys";
+
+export function isOpaqueId(value) {
+  return typeof value === "string" && OPAQUE_ID.test(value);
+}
+
+export function validateOwnerObserver(observer) {
+  if (observer === undefined || observer === null || typeof observer === "function") {
+    return observer;
+  }
+  if (
+    typeof observer === "object" &&
+    typeof observer.emitOwnerEvent === "function"
+  ) {
+    return observer;
+  }
+  throw new TypeError("owner observer must be a function or event emitter");
+}
 
 function requiredString(value, field, allowed) {
   if (typeof value !== "string" || !allowed.has(value)) {
@@ -46,7 +65,7 @@ function requiredString(value, field, allowed) {
 
 function optionalOpaqueId(value, field) {
   if (value === undefined || value === null) return null;
-  if (typeof value !== "string" || !OPAQUE_ID.test(value)) {
+  if (!isOpaqueId(value)) {
     throw new TypeError(`owner event ${field} is invalid`);
   }
   return value;
@@ -80,7 +99,7 @@ export class DaemonObservability {
   }
 
   emitOwnerEvent(candidate) {
-    const event = projectOwnerEvent(candidate);
+    const event = normalizeOwnerEvent(candidate);
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -115,11 +134,23 @@ export class DaemonObservability {
     if (!this.snapshotReaders) {
       throw new Error("observability owners are not attached");
     }
+    const snapshots = [
+      this.snapshotReaders.admissionBudget(),
+      this.snapshotReaders.sessionPool(),
+      this.snapshotReaders.workspaceLeaseRegistry(),
+    ];
+    const keys = new Set(["schemaVersion"]);
+    for (const snapshot of snapshots) {
+      for (const key of Object.keys(snapshot)) {
+        if (keys.has(key)) throw new Error(SNAPSHOT_KEY_CONFIGURATION_ERROR);
+        keys.add(key);
+      }
+    }
     return Object.freeze({
       schemaVersion: 1,
-      ...this.snapshotReaders.admissionBudget(),
-      ...this.snapshotReaders.sessionPool(),
-      ...this.snapshotReaders.workspaceLeaseRegistry(),
+      ...snapshots[0],
+      ...snapshots[1],
+      ...snapshots[2],
     });
   }
 }
@@ -160,13 +191,33 @@ export function projectOwnerEvent(candidate) {
   return Object.freeze(event);
 }
 
+function normalizeOwnerEvent(candidate) {
+  if (candidate?.schemaVersion !== 1) return projectOwnerEvent(candidate);
+  const raw = {};
+  for (const field of EVENT_FIELDS) raw[field] = candidate[field];
+  const projected = projectOwnerEvent(raw);
+  if (
+    Object.keys(candidate).length !== Object.keys(projected).length ||
+    Object.keys(projected).some(
+      (key) => !Object.hasOwn(candidate, key) ||
+        !Object.is(candidate[key], projected[key]),
+    )
+  ) {
+    throw new TypeError("projected owner event is invalid");
+  }
+  return projected;
+}
+
 export function emitOwnerEvent(observer, event) {
-  if (!observer) return undefined;
+  const validatedObserver = validateOwnerObserver(observer);
+  if (validatedObserver === undefined || validatedObserver === null) return undefined;
   try {
-    if (typeof observer === "function") return observer(projectOwnerEvent(event));
-    if (typeof observer.emitOwnerEvent === "function") return observer.emitOwnerEvent(event);
+    const projected = projectOwnerEvent(event);
+    if (typeof validatedObserver === "function") {
+      return validatedObserver(projected);
+    }
+    return validatedObserver.emitOwnerEvent(projected);
   } catch {
     return undefined;
   }
-  throw new TypeError("owner observer must be a function or event emitter");
 }

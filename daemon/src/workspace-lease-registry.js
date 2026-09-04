@@ -1,5 +1,9 @@
 import { PROTOCOL_ERROR_CODES } from "@gjc-remote/shared";
-import { emitOwnerEvent } from "./daemon-observability.js";
+import {
+  emitOwnerEvent,
+  isOpaqueId,
+  validateOwnerObserver,
+} from "./daemon-observability.js";
 
 /** Host-wide active-workspace admission ceiling (#43). */
 export const DEFAULT_MAX_ACTIVE_WORKSPACES = 8;
@@ -185,12 +189,13 @@ export class WorkspaceLeaseRegistry {
     if (!Number.isSafeInteger(maxActiveWorkspaces) || maxActiveWorkspaces < 1) {
       throw new TypeError("maxActiveWorkspaces must be a positive safe integer");
     }
+    const validatedObserver = validateOwnerObserver(observer);
     this.authorities = new Map();
     this.activities = new Map();
     this.nextFence = 0;
     this.maxWorkspaces = maxWorkspaces;
     this.maxActiveWorkspaces = maxActiveWorkspaces;
-    this.observer = observer;
+    this.observer = validatedObserver;
     this.monotonicNowFn = monotonicNowFn;
   }
 
@@ -202,11 +207,9 @@ export class WorkspaceLeaseRegistry {
     return Number.isSafeInteger(duration) && duration >= 0 ? duration : undefined;
   }
   #eventIds(authority) {
-    const valid = (value) =>
-      typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
     return {
-      workspaceId: valid(authority.workspaceId) ? authority.workspaceId : undefined,
-      mappingId: valid(authority.mappingId) ? authority.mappingId : undefined,
+      workspaceId: isOpaqueId(authority.workspaceId) ? authority.workspaceId : undefined,
+      mappingId: isOpaqueId(authority.mappingId) ? authority.mappingId : undefined,
     };
   }
 
@@ -332,7 +335,7 @@ export class WorkspaceLeaseRegistry {
           name: "workspace_lease_registry",
           action: "invalidate",
           outcome: "succeeded",
-          workspaceId: /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workspaceId)
+          workspaceId: isOpaqueId(workspaceId)
             ? workspaceId
             : undefined,
           fenceSequence: activity.fence,
