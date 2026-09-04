@@ -3,6 +3,7 @@ import { IDLE_TIMEOUT_MS } from "@gjc-remote/shared";
 import { createSdkSession } from "./sdk-session.js";
 import { validateNativeWorkDir } from "./work-dir.js";
 import { sanitizeErrorMessage } from "./reconnect.js";
+import { emitOwnerEvent } from "./daemon-observability.js";
 
 const SESSION_DISPOSE_TIMEOUT_MS = 5_000;
 export const DEFAULT_MAX_SESSIONS = 8;
@@ -68,6 +69,8 @@ export class SessionPool {
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
     nowFn = Date.now,
+    monotonicNowFn = () => performance.now(),
+    observer,
     sensitiveValues = [],
     maxSessions = DEFAULT_MAX_SESSIONS,
   } = {}) {
@@ -86,6 +89,8 @@ export class SessionPool {
     this.setIntervalFn = setIntervalFn;
     this.clearIntervalFn = clearIntervalFn;
     this.nowFn = nowFn;
+    this.monotonicNowFn = monotonicNowFn;
+    this.observer = observer;
     this.closed = false;
     this.sensitiveValues = [...sensitiveValues];
     this.maxSessions = maxSessions;
@@ -103,6 +108,13 @@ export class SessionPool {
   }
   #sanitize(value) {
     return sanitizeErrorMessage(value, this.sensitiveValues);
+  }
+  #durationSince(start) {
+    const duration = Math.floor(this.monotonicNowFn() - start);
+    return Number.isSafeInteger(duration) && duration >= 0 ? duration : null;
+  }
+  #emit(event) {
+    emitOwnerEvent(this.observer, event);
   }
 
   async #reapIdle() {
@@ -169,7 +181,29 @@ export class SessionPool {
     });
   }
 
+  getObservabilitySnapshot() {
+    const admission = this.getAdmissionSnapshot();
+    return Object.freeze({
+      activeSessions: admission.activeSessions,
+      pendingSessions: admission.pendingSessions,
+      admittedSessionWorkspaces: admission.admittedWorkspaces,
+      maxSessions: admission.maxSessions,
+      pendingReceiptRetirementCleanup: this.pendingManagedDisposals.size,
+      failedManagedSessionCleanup: this.failedManagedDisposals.size,
+    });
+  }
+
   #startDispose(session, workDir, context) {
+    const startedAt = this.monotonicNowFn();
+    const observesReceiptRetirement = context === "receipt retirement";
+    if (observesReceiptRetirement) {
+      this.#emit({
+        name: "session_pool",
+        action: "managed_cleanup",
+        outcome: "started",
+        cleanupState: "started",
+      });
+    }
     const operation = Promise.resolve().then(() => session.dispose());
     const settlement = operation.then(
       (value) => ({ status: "fulfilled", value }),
@@ -185,6 +219,17 @@ export class SessionPool {
       operation,
       this.sessionDisposeTimeoutMs
     );
+    if (observesReceiptRetirement) {
+      void bounded.then((result) => {
+        this.#emit({
+          name: "session_pool",
+          action: "managed_cleanup",
+          outcome: "settled",
+          cleanupState: result.status,
+          durationMs: this.#durationSince(startedAt),
+        });
+      });
+    }
     return { bounded, settlement };
   }
 
@@ -285,6 +330,12 @@ export class SessionPool {
       return await existing.creation;
     }
     if (!existing && this.sessions.size >= this.maxSessions) {
+      this.#emit({
+        name: "session_pool",
+        action: "create",
+        outcome: "denied",
+        code: "SESSION_LIMIT",
+      });
       const error = new Error("SDK session admission limit reached");
       error.code = "SESSION_LIMIT";
       throw error;
@@ -296,6 +347,12 @@ export class SessionPool {
       creation: undefined,
       managedIdentity,
     };
+    const creationStartedAt = this.monotonicNowFn();
+    this.#emit({
+      name: "session_pool",
+      action: "create",
+      outcome: "started",
+    });
     const creation = (async () => {
       let priorSession = existing?.session;
       if (!priorSession && existing?.creation) {
@@ -331,8 +388,22 @@ export class SessionPool {
       }
       entry.session = session;
       entry.creation = undefined;
+      this.#emit({
+        name: "session_pool",
+        action: "create",
+        outcome: "settled",
+        durationMs: this.#durationSince(creationStartedAt),
+      });
       return session;
     })();
+    void creation.then(undefined, () => {
+      this.#emit({
+        name: "session_pool",
+        action: "create",
+        outcome: "settled",
+        durationMs: this.#durationSince(creationStartedAt),
+      });
+    });
     entry.creation = creation;
     this.sessions.set(canonicalWorkDir, entry);
 

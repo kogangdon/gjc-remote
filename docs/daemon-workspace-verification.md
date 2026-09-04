@@ -105,7 +105,18 @@ supplements, and does not replace, the design-only matrix above.
   capabilities); an off-mode (v0/v2) replacement does not increment it, and a host that has
   remained entirely off-mode stays at 0. Prior v3 churn can remain nonzero. Replacements are not
   process restart evidence.
-- Deferred: daemon lifecycle, cleanup, and resource telemetry; supervisor restart proof; and
+- Daemon owner telemetry foundation is local schema-v1 only. `AdmissionBudget`, `SessionPool`,
+  and `WorkspaceLeaseRegistry` expose direct aggregate admission snapshots; lease gauges retain
+  invalidated activities while holders remain. Their optional owner callbacks emit flat,
+  bounded, frozen capacity/session/lease facts plus receipt-retirement cleanup facts with
+  process-local registry-issued fence sequences and isolate subscriber exceptions. Receipt
+  pending receipt-cleanup gauge deliberately excludes idle, replacement, late-created, and shutdown
+  disposal; the failed managed-cleanup gauge includes every managed disposal class already fenced
+  by the pool. Broader pending classification remains deferred. The composite snapshot samples each owner
+  directly but is not cross-owner atomic. This foundation is not wired into daemon orchestration
+  and is not release evidence.
+- Deferred: daemon invoke/lifecycle transaction correlation and manual-cleanup telemetry;
+  supervisor restart proof; and
   exporter/evidence ingestion remain separate daemon/supervisor slices. Bot callback/snapshot
   records are local API telemetry, not wire protocol or release evidence.
 
