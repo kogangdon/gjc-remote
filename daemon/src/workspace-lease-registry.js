@@ -1,4 +1,5 @@
 import { PROTOCOL_ERROR_CODES } from "@gjc-remote/shared";
+import { emitOwnerEvent } from "./daemon-observability.js";
 
 /** Host-wide active-workspace admission ceiling (#43). */
 export const DEFAULT_MAX_ACTIVE_WORKSPACES = 8;
@@ -172,7 +173,12 @@ function authorityChanged(previous, candidate) {
  * surface, not via a live serving invoke, until a later serving-enable slice.
  */
 export class WorkspaceLeaseRegistry {
-  constructor({ maxWorkspaces = 64, maxActiveWorkspaces = DEFAULT_MAX_ACTIVE_WORKSPACES } = {}) {
+  constructor({
+    maxWorkspaces = 64,
+    maxActiveWorkspaces = DEFAULT_MAX_ACTIVE_WORKSPACES,
+    observer,
+    monotonicNowFn = () => performance.now(),
+  } = {}) {
     if (!Number.isSafeInteger(maxWorkspaces) || maxWorkspaces < 1) {
       throw new TypeError("maxWorkspaces must be a positive safe integer");
     }
@@ -184,18 +190,80 @@ export class WorkspaceLeaseRegistry {
     this.nextFence = 0;
     this.maxWorkspaces = maxWorkspaces;
     this.maxActiveWorkspaces = maxActiveWorkspaces;
+    this.observer = observer;
+    this.monotonicNowFn = monotonicNowFn;
+  }
+
+  #emit(event) {
+    emitOwnerEvent(this.observer, event);
+  }
+  #durationSince(start) {
+    const duration = Math.floor(this.monotonicNowFn() - start);
+    return Number.isSafeInteger(duration) && duration >= 0 ? duration : undefined;
+  }
+  #eventIds(authority) {
+    const valid = (value) =>
+      typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+    return {
+      workspaceId: valid(authority.workspaceId) ? authority.workspaceId : undefined,
+      mappingId: valid(authority.mappingId) ? authority.mappingId : undefined,
+    };
+  }
+
+  getAdmissionSnapshot() {
+    let activityHolders = 0;
+    let exclusiveActivityWorkspaces = 0;
+    let invalidatedActivityWorkspaces = 0;
+    for (const activity of this.activities.values()) {
+      activityHolders += activity.holders;
+      if (activity.exclusive) exclusiveActivityWorkspaces += 1;
+      if (activity.invalidated) invalidatedActivityWorkspaces += 1;
+    }
+    return Object.freeze({
+      workspaceAuthorities: this.authorities.size,
+      activityWorkspaces: this.activities.size,
+      activityHolders,
+      exclusiveActivityWorkspaces,
+      invalidatedActivityWorkspaces,
+      maxWorkspaceAuthorities: this.maxWorkspaces,
+      maxActiveWorkspaces: this.maxActiveWorkspaces,
+    });
   }
 
   adoptBinding(candidate) {
     const authority = requireAuthority(candidate);
     const previous = this.authorities.get(authority.workspaceId);
     if (!previous) {
-      if (this.authorities.size >= this.maxWorkspaces) return false;
+      if (this.authorities.size >= this.maxWorkspaces) {
+        this.#emit({
+          name: "workspace_lease_registry",
+          action: "adopt",
+          outcome: "denied",
+          code: "WORKSPACE_ADMISSION_EXCEEDED",
+          ...this.#eventIds(authority),
+        });
+        return false;
+      }
       this.authorities.set(authority.workspaceId, authority);
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "adopt",
+        outcome: "succeeded",
+        ...this.#eventIds(authority),
+      });
       return true;
     }
     if (sameAuthority(previous, authority)) return true;
-    if (regresses(previous, authority)) return false;
+    if (regresses(previous, authority)) {
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "adopt",
+        outcome: "denied",
+        code: "LEASE_CONFLICT",
+        ...this.#eventIds(authority),
+      });
+      return false;
+    }
 
     const mappingAdvanced =
       authority.mappingGeneration > previous.mappingGeneration ||
@@ -206,8 +274,26 @@ export class WorkspaceLeaseRegistry {
       (authority.authorityEpoch ?? 0) > (previous.authorityEpoch ?? 0) ||
       (authority.fenceGeneration ?? 0) > (previous.fenceGeneration ?? 0) ||
       (authority.socketGeneration ?? 0) > (previous.socketGeneration ?? 0);
-    if (!mappingAdvanced && !inventoryAdvanced && !fenceAdvanced) return false;
-    if (authorityChanged(previous, authority) && !mappingAdvanced) return false;
+    if (!mappingAdvanced && !inventoryAdvanced && !fenceAdvanced) {
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "adopt",
+        outcome: "denied",
+        code: "LEASE_CONFLICT",
+        ...this.#eventIds(authority),
+      });
+      return false;
+    }
+    if (authorityChanged(previous, authority) && !mappingAdvanced) {
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "adopt",
+        outcome: "denied",
+        code: "LEASE_CONFLICT",
+        ...this.#eventIds(authority),
+      });
+      return false;
+    }
 
     this.authorities.set(authority.workspaceId, authority);
     const activity = this.activities.get(authority.workspaceId);
@@ -215,6 +301,13 @@ export class WorkspaceLeaseRegistry {
       activity.invalidated = true;
       if (activity.holders === 0) this.activities.delete(authority.workspaceId);
     }
+    this.#emit({
+      name: "workspace_lease_registry",
+      action: "adopt",
+      outcome: "succeeded",
+      ...this.#eventIds(authority),
+      fenceSequence: activity?.fence,
+    });
     return true;
   }
 
@@ -231,14 +324,35 @@ export class WorkspaceLeaseRegistry {
    */
   invalidateAll() {
     const invalidatedIds = new Set();
+    const emittedIds = new Set();
     for (const [workspaceId, activity] of this.activities) {
-      activity.invalidated = true;
+      if (!activity.invalidated) {
+        activity.invalidated = true;
+        this.#emit({
+          name: "workspace_lease_registry",
+          action: "invalidate",
+          outcome: "succeeded",
+          workspaceId: /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workspaceId)
+            ? workspaceId
+            : undefined,
+          fenceSequence: activity.fence,
+        });
+        emittedIds.add(workspaceId);
+      }
       invalidatedIds.add(workspaceId);
       if (activity.holders === 0) this.activities.delete(workspaceId);
     }
     // Adopted authorities with no active activity holder are still cleared
     // below, so they belong in the returned set to keep the contract honest.
-    for (const workspaceId of this.authorities.keys()) {
+    for (const [workspaceId, authority] of this.authorities) {
+      if (!emittedIds.has(workspaceId)) {
+        this.#emit({
+          name: "workspace_lease_registry",
+          action: "invalidate",
+          outcome: "succeeded",
+          ...this.#eventIds(authority),
+        });
+      }
       invalidatedIds.add(workspaceId);
     }
     this.authorities.clear();
@@ -248,13 +362,29 @@ export class WorkspaceLeaseRegistry {
   retireBinding(candidate) {
     const authority = requireAuthority(candidate);
     const current = this.authorities.get(authority.workspaceId);
-    if (!current || !sameAuthority(current, authority)) return false;
+    if (!current || !sameAuthority(current, authority)) {
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "retire",
+        outcome: "denied",
+        code: "LEASE_CONFLICT",
+        ...this.#eventIds(authority),
+      });
+      return false;
+    }
     this.authorities.delete(authority.workspaceId);
     const activity = this.activities.get(authority.workspaceId);
     if (activity) {
       activity.invalidated = true;
       if (activity.holders === 0) this.activities.delete(authority.workspaceId);
     }
+    this.#emit({
+      name: "workspace_lease_registry",
+      action: "retire",
+      outcome: "succeeded",
+      ...this.#eventIds(authority),
+      fenceSequence: activity?.fence,
+    });
     return true;
   }
 
@@ -271,6 +401,13 @@ export class WorkspaceLeaseRegistry {
     }
     const currentAuthority = this.authorities.get(authority.workspaceId);
     if (!currentAuthority || !sameAuthority(currentAuthority, authority)) {
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "acquire",
+        outcome: "denied",
+        code: "LEASE_CONFLICT",
+        ...this.#eventIds(authority),
+      });
       throw leaseConflict();
     }
 
@@ -285,7 +422,17 @@ export class WorkspaceLeaseRegistry {
             entry.bindingFingerprint !== authority.bindingFingerprint)) ||
         (!receipt && entry.bindingFingerprint !== legacyBindingFingerprint)
       ) {
-        if (entry.holders > 0) throw leaseConflict();
+        if (entry.holders > 0) {
+          this.#emit({
+            name: "workspace_lease_registry",
+            action: "acquire",
+            outcome: "denied",
+            code: "LEASE_CONFLICT",
+            ...this.#eventIds(authority),
+            fenceSequence: entry.fence,
+          });
+          throw leaseConflict();
+        }
         this.activities.delete(authority.workspaceId);
         entry = undefined;
       }
@@ -299,6 +446,13 @@ export class WorkspaceLeaseRegistry {
       // succeeds. Fail-closed, synchronous check-then-reserve (no await between
       // the size check and entry creation), matching SessionPool/AdmissionBudget.
       if (this.activities.size >= this.maxActiveWorkspaces) {
+        this.#emit({
+          name: "workspace_lease_registry",
+          action: "acquire",
+          outcome: "denied",
+          code: "WORKSPACE_ADMISSION_EXCEEDED",
+          ...this.#eventIds(authority),
+        });
         throw workspaceAdmissionExceeded();
       }
       this.nextFence =
@@ -334,16 +488,40 @@ export class WorkspaceLeaseRegistry {
     // WORKSPACE_BUSY (workload-not-idle) is intentionally distinct from the
     // LEASE_CONFLICT raised above for fence-succession / identity races.
     if (entry.exclusive && entry.holders > 0) {
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "acquire",
+        outcome: "denied",
+        code: "WORKSPACE_BUSY",
+        ...this.#eventIds(authority),
+        fenceSequence: entry.fence,
+      });
       throw workspaceBusy();
     }
     if (exclusive && entry.holders > 0) {
+      this.#emit({
+        name: "workspace_lease_registry",
+        action: "acquire",
+        outcome: "denied",
+        code: "WORKSPACE_BUSY",
+        ...this.#eventIds(authority),
+        fenceSequence: entry.fence,
+      });
       throw workspaceBusy();
     }
     if (exclusive) {
       entry.exclusive = true;
     }
 
+    const acquiredAt = this.monotonicNowFn();
     entry.holders += 1;
+    this.#emit({
+      name: "workspace_lease_registry",
+      action: "acquire",
+      outcome: "succeeded",
+      ...this.#eventIds(authority),
+      fenceSequence: entry.fence,
+    });
     let released = false;
     return Object.freeze({
       fence: entry.fence,
@@ -357,6 +535,14 @@ export class WorkspaceLeaseRegistry {
         released = true;
         entry.holders -= 1;
         if (entry.holders === 0) this.activities.delete(authority.workspaceId);
+        this.#emit({
+          name: "workspace_lease_registry",
+          action: "release",
+          outcome: "succeeded",
+          ...this.#eventIds(authority),
+          fenceSequence: entry.fence,
+          durationMs: this.#durationSince(acquiredAt),
+        });
       },
     });
   }
