@@ -6,12 +6,14 @@ import {
   constants,
   existsSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   openSync,
   readFileSync,
   readSync,
   realpathSync,
   unlinkSync,
+  writeSync,
   writeFileSync,
 } from 'node:fs';
 import {
@@ -24,7 +26,8 @@ import {
   sep,
 } from 'node:path';
 
-export const SCHEMA = 'gjc-remote.issue55.source-negative.v1';
+export const SCHEMA = 'gjc-remote.issue55.source-negative.v2';
+export const CANDIDATE_SCHEMA = 'gjc-remote.issue55.candidate-execution.v1';
 export const REPOSITORY_URL = 'https://github.com/kogangdon/gjc-remote';
 const SOURCE_REASON = 'source-checkout-derived';
 const MISSING_REASON = 'not-collected-by-source-snapshot';
@@ -223,6 +226,120 @@ function parseDockerfile(text) {
   return { bunImage: { name: image[1], digest: image[2] }, lockSha256: lock[1], sdkVersion: requireVersion(sdk[1], 'DOCKER_CONTRACT_INVALID') };
 }
 
+function dockerStages(text, code) {
+  if (/<<-?\s*['"]?[A-Za-z0-9_]+/.test(text)) fail(code);
+  const logical = [];
+  let current = '';
+  for (const rawLine of text.replaceAll('\r\n', '\n').split('\n')) {
+    const trimmed = rawLine.trim();
+    if (!current && (!trimmed || trimmed.startsWith('#'))) continue;
+    if (trimmed.includes('#')) fail(code);
+    current += `${current ? ' ' : ''}${trimmed.replace(/\\$/, '').trim()}`;
+    if (!trimmed.endsWith('\\')) {
+      logical.push(current);
+      current = '';
+    }
+  }
+  if (current) fail(code);
+  const stages = new Map();
+  let stage;
+  for (const instruction of logical) {
+    const parsed = /^([A-Z]+)\s+(.+)$/.exec(instruction);
+    if (!parsed) fail(code);
+    if (parsed[1] === 'FROM') {
+      const from = /^(\S+)\s+AS\s+([A-Za-z0-9_-]+)$/.exec(parsed[2]);
+      if (!from || stages.has(from[2])) fail(code);
+      stage = { base: from[1], instructions: [] };
+      stages.set(from[2], stage);
+    } else if (stage) {
+      stage.instructions.push(instruction);
+    }
+  }
+  return stages;
+}
+
+function parseBotDockerfile(text, versions) {
+  const unique = (pattern) => {
+    const matches = [...text.matchAll(pattern)];
+    return matches.length === 1 ? matches[0] : null;
+  };
+  const arg = (name) => unique(new RegExp(
+    `^\\s*ARG\\s+${name}\\s*=([^@\\s]+)@sha256:([a-f0-9]{64})\\s*$`,
+    'gim',
+  ));
+  const bun = arg('BUN_IMAGE');
+  const node = arg('NODE_IMAGE');
+  const label = (name) => unique(new RegExp(
+    `^\\s*org\\.opencontainers\\.image\\.${name}="([^"]+)"\\s*\\\\?$`,
+    'gm',
+  ));
+  const version = label('version');
+  const revision = label('revision');
+  const source = label('source');
+  const stages = dockerStages(text, 'BOT_DOCKER_CONTRACT_INVALID');
+  const deps = stages.get('deps');
+  const signedNative = stages.get('signed-native');
+  const runtime = stages.get('runtime');
+  const inStage = (candidate, pattern) =>
+    candidate?.instructions.filter((instruction) => pattern.test(instruction)) ?? [];
+  const runtimeLabels = inStage(runtime, /^LABEL /);
+  const signedCopies = inStage(
+    runtime,
+    /^COPY --chmod=0444 --from=signed-native /,
+  );
+  const expectedSignedCopies = [
+    'COPY --chmod=0444 --from=signed-native /native_control.node ./native-control/build/Release/native_control.node',
+    'COPY --chmod=0444 --from=signed-native /native-control.manifest.json ./native-control/build/Release/native-control.manifest.json',
+    'COPY --chmod=0444 --from=signed-native /native-control.manifest.json.sig ./native-control/build/Release/native-control.manifest.json.sig',
+  ];
+  if (
+    !bun ||
+    !node ||
+    !version ||
+    !revision ||
+    !source ||
+    !equalJson([...stages.keys()], ['deps', 'signed-native', 'runtime']) ||
+    (text.match(/^\s*org\.opencontainers\.image\.version=/gim) ?? []).length !== 1 ||
+    (text.match(/^\s*org\.opencontainers\.image\.revision=/gim) ?? []).length !== 1 ||
+    (text.match(/^\s*org\.opencontainers\.image\.source=/gim) ?? []).length !== 1 ||
+    (text.match(/^\s*ARG\s+BUN_IMAGE\s*=/gim) ?? []).length !== 1 ||
+    (text.match(/^\s*ARG\s+NODE_IMAGE\s*=/gim) ?? []).length !== 1 ||
+    deps?.base !== '${BUN_IMAGE}' ||
+    signedNative?.base !== 'native_control_bundle' ||
+    signedNative?.instructions.length !== 0 ||
+    runtime?.base !== '${NODE_IMAGE}' ||
+    inStage(
+      deps,
+      /^RUN bun install --frozen-lockfile --production --ignore-scripts --filter @gjc-remote\/bot$/,
+    ).length !== 1 ||
+    inStage(
+      runtime,
+      /^RUN node native-control\/scripts\/verify-build\.mjs --require-signature$/,
+    ).length !== 1 ||
+    runtimeLabels.length !== 1 ||
+    !runtimeLabels[0].includes('org.opencontainers.image.version="${VERSION}"') ||
+    !runtimeLabels[0].includes('org.opencontainers.image.revision="${REVISION}"') ||
+    !runtimeLabels[0].includes(`org.opencontainers.image.source="${REPOSITORY_URL}"`) ||
+    !equalJson(signedCopies, expectedSignedCopies) ||
+    version[1] !== '${VERSION}' ||
+    revision[1] !== '${REVISION}' ||
+    source[1] !== REPOSITORY_URL
+  ) fail('BOT_DOCKER_CONTRACT_INVALID');
+  if ((text.match(/^\s*ARG\s+VERSION=/gim) ?? []).length !== 1 ||
+      (text.match(/^\s*ARG\s+REVISION=/gim) ?? []).length !== 1) {
+    fail('BOT_DOCKER_CONTRACT_INVALID');
+  }
+  const versionArg = unique(/^\s*ARG\s+VERSION=([^\s]+)\s*$/gm);
+  const revisionArg = unique(/^\s*ARG\s+REVISION=([^\s]+)\s*$/gm);
+  if (!versionArg || !revisionArg || versionArg[1] !== versions.root || revisionArg[1] !== 'unknown') {
+    fail('BOT_DOCKER_CONTRACT_INVALID');
+  }
+  return {
+    bunImage: { name: bun[1], digest: bun[2] },
+    nodeImage: { name: node[1], digest: node[2] },
+  };
+}
+
 function jsoncTokens(text) {
   const tokens = [];
   for (let index = 0; index < text.length;) {
@@ -418,28 +535,49 @@ export function collectSource({ root = process.cwd(), exec = execFileSync } = {}
   const blob = (path) =>
     runGitBytes(['show', `${headCommit}:${path}`], checkout, exec).toString('utf8');
   const rootPackage = parseJson(blob('package.json'), 'PACKAGE_INVALID');
+  const botPackage = parseJson(blob('bot/package.json'), 'PACKAGE_INVALID');
   const daemonPackage = parseJson(blob('daemon/package.json'), 'PACKAGE_INVALID');
   const nativePackage = parseJson(blob('native-control/package.json'), 'PACKAGE_INVALID');
+  const sharedPackage = parseJson(blob('shared/package.json'), 'PACKAGE_INVALID');
   const lockText = blob('bun.lock');
-  const docker = parseDockerfile(blob('deploy/docker/daemon/Dockerfile'));
   const rootVersion = requireVersion(rootPackage?.version, 'PACKAGE_INVALID');
+  const botVersion = requireVersion(botPackage?.version, 'PACKAGE_INVALID');
   const daemonVersion = requireVersion(daemonPackage?.version, 'PACKAGE_INVALID');
   const nativeVersion = requireVersion(nativePackage?.version, 'PACKAGE_INVALID');
+  const sharedVersion = requireVersion(sharedPackage?.version, 'PACKAGE_INVALID');
+  if (rootVersion !== botVersion || rootVersion !== daemonVersion || rootVersion !== sharedVersion) {
+    fail('PACKAGE_VERSION_MISMATCH');
+  }
+  const daemonDockerfile = blob('deploy/docker/daemon/Dockerfile');
+  const botDockerfile = blob('deploy/docker/bot/Dockerfile');
+  const dockerignore = blob('.dockerignore');
+  const daemonDocker = parseDockerfile(daemonDockerfile);
+  const botDocker = parseBotDockerfile(botDockerfile, { root: rootVersion });
   const declaredVersion = requireVersion(daemonPackage?.dependencies?.['@gajae-code/coding-agent'], 'SDK_DECLARATION_INVALID');
   const contract = nativePackage?.nativeControlContract;
   if (!contract || !Number.isInteger(contract.version) || !Number.isInteger(contract.revision) || !Number.isInteger(contract.napi) || !Array.isArray(contract.platforms) || contract.platforms.some((platform) => typeof platform !== 'string')) fail('NATIVE_CONTRACT_INVALID');
   const lockSha256 = sha256(lockText);
-  if (docker.lockSha256 !== lockSha256 || docker.sdkVersion !== declaredVersion) fail('DOCKER_CONTRACT_MISMATCH');
+  if (daemonDocker.lockSha256 !== lockSha256 || daemonDocker.sdkVersion !== declaredVersion) fail('DOCKER_CONTRACT_MISMATCH');
   if (runGit(['status', '--porcelain=v1', '--untracked-files=all'], checkout, exec)) {
     fail('CHECKOUT_DIRTY');
   }
 
   return {
-    docker,
+    docker: {
+      bot: { ...botDocker, dockerfileSha256: sha256(botDockerfile) },
+      daemon: { ...daemonDocker, dockerfileSha256: sha256(daemonDockerfile) },
+      dockerignoreSha256: sha256(dockerignore),
+    },
     headCommit,
     lockSha256,
     nativeControlContract: { napi: contract.napi, platforms: [...contract.platforms], revision: contract.revision, version: contract.version },
-    packageVersions: { daemon: daemonVersion, native: nativeVersion, root: rootVersion },
+    packageVersions: {
+      bot: botVersion,
+      daemon: daemonVersion,
+      native: nativeVersion,
+      root: rootVersion,
+      shared: sharedVersion,
+    },
     repositoryUrl: REPOSITORY_URL,
     sdk: sdkFromLock(lockText, declaredVersion),
     tree,
@@ -491,58 +629,17 @@ function validateAbsoluteJsonPath(value, code) {
 }
 
 export function writeSnapshot(output, options = {}) {
-  const target = validateAbsoluteJsonPath(output, 'OUTPUT_INVALID');
-  const checkout = resolve(options.root ?? process.cwd());
-  const canonicalCheckout = canonicalPath(checkout, 'CHECKOUT_ROOT_INVALID');
-  const relativeTarget = relative(checkout, target);
-  if (
-    relativeTarget === '' ||
-    (!isAbsolute(relativeTarget) &&
-      relativeTarget !== '..' &&
-      !relativeTarget.startsWith(`..${sep}`))
-  ) {
-    fail('OUTPUT_INSIDE_CHECKOUT');
-  }
-  const canonicalParent = canonicalPath(dirname(target), 'OUTPUT_PARENT_INVALID');
-  try {
-    if (!lstatSync(canonicalParent).isDirectory()) fail('OUTPUT_PARENT_INVALID');
-  } catch (error) {
-    if (error?.code === 'OUTPUT_PARENT_INVALID') throw error;
-    fail('OUTPUT_PARENT_INVALID');
-  }
-  const canonicalRelative = relative(canonicalCheckout, canonicalParent);
-  if (
-    canonicalRelative === '' ||
-    (!isAbsolute(canonicalRelative) &&
-      canonicalRelative !== '..' &&
-      !canonicalRelative.startsWith(`..${sep}`))
-  ) {
-    fail('OUTPUT_INSIDE_CHECKOUT');
-  }
-  if (existsSync(target) || existsSync(`${target}.sha256`)) fail('OUTPUT_EXISTS');
-  const bytes = canonicalBytes(createPacket(options));
-  let packetWritten = false;
-  try {
-    writeFileSync(target, bytes, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-    packetWritten = true;
-    try {
-      writeFileSync(
-        `${target}.sha256`,
-        `${sha256(bytes)}  ${basename(target)}\n`,
-        { encoding: 'utf8', flag: 'wx', mode: 0o600 },
-      );
-    } catch {
-      try { unlinkSync(target); } catch {}
-      fail('CHECKSUM_WRITE_FAILED');
-    }
-  } catch (error) {
-    if (error?.code === 'CHECKSUM_WRITE_FAILED') throw error;
-    if (packetWritten) {
-      try { unlinkSync(target); } catch {}
-    }
-    fail('OUTPUT_WRITE_FAILED');
-  }
-  return sha256(bytes);
+  const target = outsideOutput(
+    output,
+    resolve(options.root ?? process.cwd()),
+    'OUTPUT_INVALID',
+  );
+  return writeCanonical(
+    target,
+    createPacket(options),
+    'OUTPUT_WRITE_FAILED',
+    options.writeIo,
+  );
 }
 
 export function verifyPacket(packetPath, { requirePromotion = false, ...options } = {}) {
@@ -558,12 +655,203 @@ export function verifyPacket(packetPath, { requirePromotion = false, ...options 
   return sha256(bytes);
 }
 
+const CANDIDATE_COMMANDS = Object.freeze([
+  Object.freeze(['bun', 'install', '--frozen-lockfile']),
+  Object.freeze(['npm', 'run', 'build', '--workspace', '@gjc-remote/native-control']),
+  Object.freeze(['npm', 'test']),
+  Object.freeze(['npm', 'run', 'smoke:local']),
+]);
+const CANDIDATE_FAILURE_CODES = Object.freeze([
+  'CANDIDATE_INSTALL_FAILED',
+  'CANDIDATE_NATIVE_BUILD_FAILED',
+  'CANDIDATE_TEST_FAILED',
+  'CANDIDATE_SMOKE_FAILED',
+]);
+
+export function candidateLaunchCommand(
+  logical,
+  {
+    npmCli = process.env.npm_execpath,
+    processPath = process.execPath,
+  } = {},
+) {
+  if (logical[0] !== 'npm') return [...logical];
+  if (
+    typeof npmCli !== 'string' ||
+    !isAbsolute(npmCli) ||
+    !/^(npm-cli\.js|npm\.js)$/i.test(basename(npmCli)) ||
+    typeof processPath !== 'string' ||
+    !isAbsolute(processPath)
+  ) {
+    fail('NPM_CLI_UNAVAILABLE');
+  }
+  return [processPath, npmCli, ...logical.slice(1)];
+}
+
+function requireCleanIndex(root, exec) {
+  const entries = runGitBytes(['ls-files', '-v', '-z'], root, exec)
+    .toString('utf8')
+    .split('\0');
+  if (entries.some((entry) => /^[a-zS] /.test(entry))) {
+    fail('CHECKOUT_INDEX_FLAGS');
+  }
+}
+
+function outsideOutput(output, root, code) {
+  const target = validateAbsoluteJsonPath(output, code);
+  const checkout = resolve(root);
+  const canonicalCheckout = canonicalPath(checkout, 'CHECKOUT_ROOT_INVALID');
+  const relativeTarget = relative(checkout, target);
+  if (relativeTarget === '' || (!isAbsolute(relativeTarget) && relativeTarget !== '..' && !relativeTarget.startsWith(`..${sep}`))) fail('OUTPUT_INSIDE_CHECKOUT');
+  const canonicalParent = canonicalPath(dirname(target), 'OUTPUT_PARENT_INVALID');
+  try {
+    if (!lstatSync(canonicalParent).isDirectory()) fail('OUTPUT_PARENT_INVALID');
+  } catch (error) {
+    if (error?.code === 'OUTPUT_PARENT_INVALID') throw error;
+    fail('OUTPUT_PARENT_INVALID');
+  }
+  const canonicalRelative = relative(canonicalCheckout, canonicalParent);
+  if (canonicalRelative === '' || (!isAbsolute(canonicalRelative) && canonicalRelative !== '..' && !canonicalRelative.startsWith(`..${sep}`))) fail('OUTPUT_INSIDE_CHECKOUT');
+  if (existsSync(target) || existsSync(`${target}.sha256`)) fail('OUTPUT_EXISTS');
+  return target;
+}
+
+export function writeCanonical(output, value, code, {
+  open = openSync,
+  write = writeSync,
+  sync = fsyncSync,
+  close = closeSync,
+  unlink = unlinkSync,
+} = {}) {
+  const bytes = canonicalBytes(value);
+  const checksumPath = `${output}.sha256`;
+  const created = [];
+  let descriptor;
+  const writeOne = (path, content) => {
+    descriptor = open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      0o600,
+    );
+    created.push(path);
+    const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = write(descriptor, buffer, offset, buffer.length - offset);
+      if (!Number.isInteger(count) || count < 1) throw new Error('write');
+      offset += count;
+    }
+    sync(descriptor);
+    close(descriptor);
+    descriptor = undefined;
+  };
+  try {
+    writeOne(output, bytes);
+    writeOne(checksumPath, `${sha256(bytes)}  ${basename(output)}\n`);
+  } catch {
+    if (descriptor !== undefined) {
+      try { close(descriptor); } catch {}
+    }
+    for (const path of [checksumPath, output]) {
+      if (created.includes(path)) {
+        try { unlink(path); } catch {}
+      }
+    }
+    fail(code);
+  }
+  return sha256(bytes);
+}
+
+export function createCandidateReceipt(source) {
+  const packet = { checks: CHECK_REGISTRY.map((check) => ({ ...check })), promotion: { blockingCheckIds: [...BLOCKING_IDS], releaseEligible: false }, schema: SCHEMA, source };
+  return {
+    checks: [
+      { commands: CANDIDATE_COMMANDS.slice(0, 3).map((command) => [...command]), id: 'candidate-tests', reasonCode: 'direct-execution-exit-zero', status: 'verified' },
+      { commands: [[...CANDIDATE_COMMANDS[3]]], id: 'candidate-smoke', reasonCode: 'direct-execution-exit-zero', status: 'verified' },
+    ],
+    schema: CANDIDATE_SCHEMA,
+    subject: {
+      headCommit: source.headCommit,
+      sourcePacketSha256: sha256(canonicalBytes(packet)),
+      tree: source.tree,
+    },
+  };
+}
+
+export function writeCandidate(output, {
+  root = process.cwd(),
+  exec = execFileSync,
+  execute = execFileSync,
+  launch = candidateLaunchCommand,
+  writeIo,
+} = {}) {
+  const checkout = resolve(root);
+  const target = outsideOutput(output, checkout, 'OUTPUT_INVALID');
+  requireCleanIndex(checkout, exec);
+  const source = collectSource({ root: checkout, exec });
+  const sourceBytes = canonicalBytes(source);
+  for (let index = 0; index < CANDIDATE_COMMANDS.length; index += 1) {
+    const launched = launch(CANDIDATE_COMMANDS[index]);
+    try {
+      execute(launched[0], launched.slice(1), {
+        cwd: checkout, encoding: 'utf8', stdio: 'ignore',
+      });
+    } catch {
+      fail(CANDIDATE_FAILURE_CODES[index]);
+    }
+    requireCleanIndex(checkout, exec);
+    const current = collectSource({ root: checkout, exec });
+    if (!canonicalBytes(current).equals(sourceBytes)) {
+      fail('CANDIDATE_SOURCE_DRIFT');
+    }
+  }
+  const finalTarget = outsideOutput(output, checkout, 'OUTPUT_INVALID');
+  return writeCanonical(
+    finalTarget,
+    createCandidateReceipt(source),
+    'OUTPUT_WRITE_FAILED',
+    writeIo,
+  );
+}
+
+export function validateCandidateShape(receipt) {
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
+      !equalJson(Object.keys(receipt).sort(), ['checks', 'schema', 'subject']) ||
+      receipt.schema !== CANDIDATE_SCHEMA || !Array.isArray(receipt.checks) ||
+      receipt.checks.length !== 2) fail('CANDIDATE_SHAPE_INVALID');
+  const expected = createCandidateReceipt({
+    headCommit: receipt.subject?.headCommit, tree: receipt.subject?.tree,
+  });
+  if (!equalJson(receipt.checks, expected.checks) ||
+      !receipt.subject || typeof receipt.subject !== 'object' || Array.isArray(receipt.subject) ||
+      !equalJson(Object.keys(receipt.subject).sort(), ['headCommit', 'sourcePacketSha256', 'tree']) ||
+      !GIT_OBJECT_ID.test(receipt.subject.headCommit) ||
+      !GIT_OBJECT_ID.test(receipt.subject.tree) ||
+      !/^[a-f0-9]{64}$/.test(receipt.subject.sourcePacketSha256)) fail('CANDIDATE_SHAPE_INVALID');
+}
+
+export function verifyCandidate(receiptPath, options = {}) {
+  const target = validateAbsoluteJsonPath(receiptPath, 'RECEIPT_PATH_INVALID');
+  const bytes = Buffer.from(readBoundedRegularUtf8(target, PACKET_MAX_BYTES));
+  const checksum = readBoundedRegularUtf8(`${target}.sha256`, CHECKSUM_MAX_BYTES);
+  if (checksum !== `${sha256(bytes)}  ${basename(target)}\n`) fail('CHECKSUM_MISMATCH');
+  let receipt;
+  try { receipt = JSON.parse(bytes.toString('utf8')); } catch { fail('CANDIDATE_JSON_INVALID'); }
+  if (!canonicalBytes(receipt).equals(bytes)) fail('CANDIDATE_NONCANONICAL');
+  validateCandidateShape(receipt);
+  const source = collectSource(options);
+  if (!equalJson(receipt, createCandidateReceipt(source))) fail('CANDIDATE_SOURCE_MISMATCH');
+  return sha256(bytes);
+}
+
 function usage() { fail('USAGE'); }
 
 export function main(argv = process.argv.slice(2)) {
   const [command, flag, value, extra] = argv;
   if (command === 'snapshot' && flag === '--output' && value && !extra) return writeSnapshot(value);
   if (command === 'verify' && flag === '--packet' && value && (!extra || extra === '--require-promotion')) return verifyPacket(value, { requirePromotion: extra === '--require-promotion' });
+  if (command === 'candidate' && flag === '--output' && value && !extra) return writeCandidate(value);
+  if (command === 'verify-candidate' && flag === '--receipt' && value && !extra) return verifyCandidate(value);
   usage();
 }
 
