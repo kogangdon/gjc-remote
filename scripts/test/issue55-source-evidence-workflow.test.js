@@ -232,6 +232,10 @@ test('documentation keeps source attestation non-promotional', () => {
     'does not prove historical execution',
     'candidate-tests',
     'candidate-smoke',
+    '33962365033',
+    '1d442959ad5ea5ebaacb138e382a785dbc219ff0',
+    '57b8b667921e1dcd51c84efa6535bee15632056851baa5ac00a66fe92d26b574',
+    '21 blockers',
   ]) assert.match(documentation, new RegExp(required, 'i'));
 });
 

@@ -115,3 +115,28 @@ bytes; it does not prove historical execution of tests or smoke. It does not
 prove release eligibility, publication, deployment, platform results, provider
 recovery, serving-enabled execution, or removal of any blocker. This workflow
 does not promote a release.
+
+### First authenticated source run
+
+Workflow run
+[`33962365033`](https://github.com/kogangdon/gjc-remote/actions/runs/33962365033)
+completed successfully on attempt 1 (`workflow_dispatch`) for exact main commit
+`1d442959ad5ea5ebaacb138e382a785dbc219ff0`. GitHub records the run interval as
+2026-09-05T11:05:00Z through 2026-09-05T11:05:47Z. All four jobs succeeded,
+including both artifact-ID downloads and the final attestation action.
+
+The final artifact is
+`issue55-source-evidence-1d442959ad5ea5ebaacb138e382a785dbc219ff0-33962365033-1`
+(artifact ID `9968335947`, expires 2026-12-04T11:05:01Z). Its canonical source
+packet digest is
+`57b8b667921e1dcd51c84efa6535bee15632056851baa5ac00a66fe92d26b574`.
+Both final files passed `gh attestation verify` with the repository, signer
+workflow, signer digest, source ref, and source digest constraints shown above;
+the downloaded packet also passed the local source verifier and checksum
+comparison.
+
+This run proves the workflow's source-only artifact-ID handoff and GitHub
+attestation path. The packet remains deliberately negative with 21 blockers.
+It does not supply `candidate-tests`, `candidate-smoke`, provider, platform,
+serving, recovery, signed-binary/image, release-eligibility, or publication
+evidence.
