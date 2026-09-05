@@ -130,6 +130,12 @@ The final artifact is
 (artifact ID `9968335947`, expires 2026-12-04T11:05:01Z). Its canonical source
 packet digest is
 `57b8b667921e1dcd51c84efa6535bee15632056851baa5ac00a66fe92d26b574`.
+The attested checksum-sidecar digest is
+`ede447ff28745a9515c02118d8442795b7f75856c203be038debf8b0a64e1546`.
+GitHub reports the final artifact archive digest as
+`sha256:8793aa90644a65d9fb8f884c632613e1512f38ee643e310827804ee8056366ac`;
+while the artifact remains available, verify that archive digest before
+extraction.
 Both final files passed `gh attestation verify` with the repository, signer
 workflow, signer digest, source ref, and source digest constraints shown above;
 the downloaded packet also passed the local source verifier and checksum
@@ -140,3 +146,27 @@ attestation path. The packet remains deliberately negative with 21 blockers.
 It does not supply `candidate-tests`, `candidate-smoke`, provider, platform,
 serving, recovery, signed-binary/image, release-eligibility, or publication
 evidence.
+
+After artifact ID `9968335947` expires, regenerate the two subjects instead of
+treating the missing archive as lost evidence. From a clean detached checkout
+of `1d442959ad5ea5ebaacb138e382a785dbc219ff0`, write the packet outside the
+checkout and verify it. The output basename must be exactly
+`issue55-source.json`: the generated sidecar embeds that filename, so another
+basename produces different sidecar bytes.
+
+```sh
+npm run evidence:issue55 -- --output /absolute/path/issue55-source.json
+npm run evidence:issue55:verify -- --packet /absolute/path/issue55-source.json
+```
+
+Require the JSON digest to equal
+`57b8b667921e1dcd51c84efa6535bee15632056851baa5ac00a66fe92d26b574`
+and the checksum-sidecar file digest to equal
+`ede447ff28745a9515c02118d8442795b7f75856c203be038debf8b0a64e1546`.
+Hash the sidecar file itself (for example,
+`sha256sum issue55-source.json.sha256`); do not confuse that digest with the
+packet digest written inside the sidecar.
+Then run the same constrained `gh attestation verify` command above against
+each regenerated file with `EXPECTED_COMMIT` set to the recorded commit. The
+attestation and Rekor entry remain independently discoverable by subject
+digest after the workflow artifact expires.

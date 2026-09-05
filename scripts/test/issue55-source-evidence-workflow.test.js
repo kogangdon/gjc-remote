@@ -235,6 +235,14 @@ test('documentation keeps source attestation non-promotional', () => {
     '33962365033',
     '1d442959ad5ea5ebaacb138e382a785dbc219ff0',
     '57b8b667921e1dcd51c84efa6535bee15632056851baa5ac00a66fe92d26b574',
+    'ede447ff28745a9515c02118d8442795b7f75856c203be038debf8b0a64e1546',
+    '8793aa90644a65d9fb8f884c632613e1512f38ee643e310827804ee8056366ac',
+    'After artifact ID',
+    'clean detached checkout',
+    'basename must be exactly',
+    'sha256sum issue55-source.json.sha256',
+    'each regenerated file',
+    'Rekor entry',
     '21 blockers',
   ]) assert.match(documentation, new RegExp(required, 'i'));
 });
