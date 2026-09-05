@@ -52,6 +52,7 @@ function assertContract(source) {
   assert.deepEqual(value.jobs.validate.steps.map((step) => step.name), ['Verify exact current main revision']);
   assert.deepEqual(value.jobs.generate.steps.map((step) => step.name), [
     'Checkout exact source commit', 'Set up Node', 'Set up Bun',
+    'Install ACL development headers',
     'Generate and verify observability receipt', 'Upload untrusted observability handoff',
     'Remove observability directory',
   ]);
@@ -67,6 +68,7 @@ function assertContract(source) {
   assert.deepEqual(value.jobs.validate.steps.map((step) => Object.keys(step)), [['name', 'env', 'run']]);
   assert.deepEqual(value.jobs.generate.steps.map((step) => Object.keys(step)), [
     ['name', 'uses', 'with'], ['name', 'uses', 'with'], ['name', 'uses', 'with'],
+    ['name', 'run'],
     ['name', 'env', 'run'], ['name', 'id', 'uses', 'env', 'with'], ['name', 'if', 'env', 'run'],
   ]);
   assert.deepEqual(value.jobs.verify.steps.map((step) => Object.keys(step)), [
@@ -81,7 +83,7 @@ function assertContract(source) {
   assert.deepEqual(value.jobs.generate.steps[1].with, { 'node-version': '26.0.0', 'check-latest': false });
   assert.deepEqual(value.jobs.verify.steps[1].with, { 'node-version': '26.0.0', 'check-latest': false });
   assert.deepEqual(value.jobs.generate.steps[2].with, { 'bun-version': '1.3.14', 'no-cache': true });
-  assert.deepEqual(value.jobs.generate.steps[4].with, {
+  assert.deepEqual(value.jobs.generate.steps[5].with, {
     name: 'untrusted-issue55-observability-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}',
     path: `${receiptFiles.join('\n')}\n`, 'retention-days': 1, overwrite: false, 'if-no-files-found': 'error',
   });
@@ -113,13 +115,14 @@ function assertContract(source) {
     job.steps.filter((step) => step.run).map((step) => [`${jobName}:${step.name}`, createHash('sha256').update(step.run).digest('hex')])));
   assert.deepEqual(runDigests, {
     'validate:Verify exact current main revision': 'd515d7c65070826898be17a0910cfb86e0ca41fa5c23b6da4f1f477a53868d69',
+    'generate:Install ACL development headers': '46a722977a31f04801331f87f81fa2439cd4e991825723c5d6bf5aed67e52156',
     'generate:Generate and verify observability receipt': 'fc64d5c58e6284b6828c3303b9e1bb4b17afb28854c639f56a7d3ab3c76acb18',
     'generate:Remove observability directory': '0d79795385ede5c43816bab9432d3f7b7d72520b8a65d849577f112134cfe3fa',
     'verify:Reverify exact observability bytes': 'f285e3ef5111a1aa2b48672b7439bebcd9ed8f9ea9bff7640ce05bca054e5d66',
     'verify:Remove verification directory': '0d79795385ede5c43816bab9432d3f7b7d72520b8a65d849577f112134cfe3fa',
   });
-  assert.match(value.jobs.generate.steps[3].run, /scripts\/issue55-observability-evidence\.js generate --output .* --expected-commit/);
-  assert.match(value.jobs.generate.steps[3].run, /scripts\/issue55-observability-evidence\.js verify --receipt .* --expected-commit/);
+  assert.match(value.jobs.generate.steps[4].run, /scripts\/issue55-observability-evidence\.js generate --output .* --expected-commit/);
+  assert.match(value.jobs.generate.steps[4].run, /scripts\/issue55-observability-evidence\.js verify --receipt .* --expected-commit/);
   assert.match(value.jobs.verify.steps[3].run, /scripts\/issue55-observability-evidence\.js verify --receipt .* --expected-commit/);
   assert.doesNotMatch(source, /(secrets\.|GITHUB_ENV|GITHUB_PATH|continue-on-error|\|\| true|strategy:|matrix:|smoke|native|publish|release|provider|repository_dispatch|workflow_call)/i);
 }
