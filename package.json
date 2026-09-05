@@ -22,5 +22,8 @@
     "daemon",
     "native-control",
     "shared"
-  ]
+  ],
+  "devDependencies": {
+    "yaml": "2.8.1"
+  }
 }
