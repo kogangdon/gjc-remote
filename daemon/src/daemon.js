@@ -155,6 +155,12 @@ const READINESS_TEST_INJECTION_ENABLED =
 const OBSERVABILITY_TEST_IPC_ENABLED =
   process.env.GJC_DAEMON_TEST_MODE === "1" &&
   process.env.GJC_OBSERVABILITY_TEST_IPC === "1";
+const TEST_SESSION_FACTORY_SYMBOL = Symbol.for(
+  "@gjc-remote/daemon/test-session-factory"
+);
+const SESSION_FACTORY_TEST_INJECTION_ENABLED =
+  OBSERVABILITY_TEST_IPC_ENABLED &&
+  process.env.GJC_SESSION_FACTORY_TEST_INJECTION === "1";
 const nativeInventoryMode =
   `${process.env.GJC_NATIVE_INVENTORY_MODE ?? "off"}`.trim().toLowerCase();
 if (nativeInventoryMode !== "off" && nativeInventoryMode !== "verify") {
@@ -441,12 +447,22 @@ try {
 const containerSessionStatePath =
   process.env.GJC_CONTAINER_RUNTIME === "1" ? ROLE_PATHS.session : undefined;
 const daemonObservability = new DaemonObservability();
+const sessionFactory = (() => {
+  const fixtureFactory = globalThis[TEST_SESSION_FACTORY_SYMBOL];
+  if (!SESSION_FACTORY_TEST_INJECTION_ENABLED || fixtureFactory === undefined) {
+    return (workDir) =>
+      createSdkSession(workDir, undefined, {
+        sessionRoot: containerSessionStatePath,
+      });
+  }
+  if (typeof fixtureFactory !== "function") {
+    throw new TypeError("daemon: invalid test session factory");
+  }
+  return fixtureFactory;
+})();
 const pool = new SessionPool({
   sensitiveValues: daemonSensitiveValues,
-  sessionFactory: (workDir) =>
-    createSdkSession(workDir, undefined, {
-      sessionRoot: containerSessionStatePath,
-    }),
+  sessionFactory,
   observer: daemonObservability,
 });
 const admissionBudget = new AdmissionBudget({ observer: daemonObservability });
@@ -1681,6 +1697,7 @@ async function admitReadyWorkload(state, workDir, message) {
         ...(bindingState.receipt
           ? receiptAuthority(bindingState.binding)
           : bindingState.binding),
+        ...(bindingState.receipt ? bindingState.proof : {}),
         bindingFingerprint: bindingFingerprintValue,
         ...(receiptIdentity ?? {}),
       });
