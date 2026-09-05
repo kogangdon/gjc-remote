@@ -19,8 +19,13 @@ const RECEIPT_FIELDS = Object.freeze([
 const isObject = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
-function refuse(code, reason) {
-  return Object.freeze({ ok: false, code, reason });
+function refuse(code, reason, cleanupState = "not_required") {
+  return Object.freeze({
+    ok: false,
+    code,
+    reason,
+    cleanupState,
+  });
 }
 
 function configError(reason) {
@@ -204,13 +209,22 @@ export function createLifecycleRestoreMigrationDispatcher(config = {}) {
         replaySeen,
         ...(hashIdentity ? { hashIdentity } : {}),
       }).runRestoreMigration(request);
-      return Object.freeze({ ok: true, receipt });
+      return Object.freeze({
+        ok: true,
+        receipt,
+        cleanupState: "not_required",
+      });
     } catch (error) {
       return refuse(
         typeof error?.code === "string" ? error.code : RUNTIME_INCOMPATIBLE,
         typeof error?.reason === "string"
           ? error.reason
-          : "restore/migration operation failed"
+          : "restore/migration operation failed",
+        error?.cleanupError
+          ? "manual_required"
+          : error?.code === "WORKSPACE_MIGRATION_UNSUPPORTED"
+            ? "not_required"
+            : "indeterminate",
       );
     }
   }

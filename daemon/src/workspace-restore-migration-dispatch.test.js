@@ -248,6 +248,7 @@ test("restore: authorized restore promotes a successor chained onto the live bas
   const result = await dispatcher.dispatchRestoreMigration(callArgs());
 
   assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.cleanupState, "not_required");
   assert.equal(result.receipt.operation, "restore");
   assert.equal(result.receipt.published.published, true);
   assert.equal(result.receipt.published.activeGeneration, 2);
@@ -279,8 +280,43 @@ test("migration: a docker-session-volume migration is refused before any fence/I
   }));
   assert.equal(result.ok, false);
   assert.equal(result.code, "WORKSPACE_MIGRATION_UNSUPPORTED");
+  assert.equal(result.cleanupState, "not_required");
   assert.equal(fence.state.acquired, 0);
   assert.deepEqual(publishIo.state.order, []);
+});
+
+test("restore: uncertain operation failure reports indeterminate cleanup", async () => {
+  const publishIo = fakePublishIo(generationPointerBytes(basePointer()));
+  publishIo.writeTemp = async () => {
+    throw new Error("publisher unavailable");
+  };
+  const { dispatcher } = makeHarness({
+    publishIo,
+  });
+  const result = await dispatcher.dispatchRestoreMigration(callArgs());
+  assert.equal(result.ok, false);
+  assert.equal(result.cleanupState, "indeterminate");
+});
+
+test("restore: failed candidate cleanup reports only manual-required state", async () => {
+  const publishIo = fakePublishIo(generationPointerBytes(basePointer()));
+  publishIo.writeTemp = async () => {
+    throw new Error("publisher unavailable");
+  };
+  const { dispatcher } = makeHarness({
+    publishIo,
+    stagePromotion: {
+      async materializeAndVerify() {},
+      async cleanup() {
+        throw new Error("private cleanup path");
+      },
+    },
+  });
+  const result = await dispatcher.dispatchRestoreMigration(callArgs());
+  assert.equal(result.ok, false);
+  assert.equal(result.cleanupState, "manual_required");
+  assert.equal(Object.hasOwn(result, "cleanupError"), false);
+  assert.equal(JSON.stringify(result).includes("private cleanup path"), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -298,6 +334,7 @@ for (const [field, tampered] of [
     const result = await dispatcher.dispatchRestoreMigration(callArgs({ message: restoreMessage({ [field]: tampered }) }));
     assert.equal(result.ok, false);
     assert.equal(result.code, "RUNTIME_INCOMPATIBLE");
+    assert.equal(result.cleanupState, "not_required");
     assert.equal(fence.state.acquired, 0, "fence must not be acquired on unauthorized restore");
   });
 }
@@ -455,5 +492,6 @@ test("restore: windows-unc source platform is refused CONTAINMENT_UNSUPPORTED", 
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, "CONTAINMENT_UNSUPPORTED");
+  assert.equal(result.cleanupState, "not_required");
   assert.equal(fence.state.acquired, 0);
 });

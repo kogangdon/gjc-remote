@@ -31,6 +31,100 @@ function receiptIdentity() {
   };
 }
 
+test("workspace lifecycle transactions freeze local correlation and drain once", () => {
+  let now = 10;
+  const observability = new DaemonObservability({ now: () => now });
+  const events = [];
+  observability.subscribe((event) => events.push(event));
+  const connection = {};
+  const context = {
+    socketGeneration: 1,
+    readinessRevision: 2,
+    mappingGeneration: 3,
+    workspaceGeneration: 4,
+    mappingId: "mapping",
+    workspaceId: "workspace",
+    fenceSequence: null,
+  };
+  for (const operation of [
+    "create", "clone", "refresh", "reset", "delete", "restore", "migration",
+  ]) {
+    const transaction = observability.createWorkspaceLifecycleTransaction(
+      connection, operation, `${operation}-tx`,
+    );
+    transaction.admit(context);
+    context.workspaceId = "mutated";
+    transaction.finish(
+      "committed",
+      null,
+      ["reset", "delete", "restore", "migration"].includes(operation)
+        ? "not_required"
+        : "not_applicable",
+    );
+    transaction.finish("failed", "UNKNOWN_RUNTIME");
+    context.workspaceId = "workspace";
+  }
+  const pending = observability.createWorkspaceLifecycleTransaction(
+    connection, "delete", "pending-tx",
+  );
+  pending.admit(context);
+  now = 30;
+  observability.finishWorkspaceLifecycleTransactionsForConnection(
+    connection, "failed", "CONNECTION_LOST",
+  );
+  pending.emitManualCleanupRequired();
+  pending.emitManualCleanupRequired();
+  assert.equal(events.length, 9);
+  assert.equal(events[0].workspaceId, "workspace");
+  assert.equal(events[0].fenceSequence, null);
+  assert.equal(events[7].outcome, "failed");
+  assert.equal(events[7].code, "CONNECTION_LOST");
+  assert.equal(events[7].cleanupState, "indeterminate");
+  assert.equal(events[7].durationMs, 20);
+  assert.equal(events[8].action, "manual_cleanup");
+  assert.equal(events[8].cleanupState, "manual_required");
+});
+
+test("workspace lifecycle telemetry contains only safe terminal values", () => {
+  const observability = new DaemonObservability({ now: () => 1 });
+  const events = [];
+  observability.subscribe(() => {
+    throw new Error("observer failure");
+  });
+  observability.subscribe((event) => events.push(event));
+  const transaction = observability.createWorkspaceLifecycleTransaction(
+    {}, "delete", "lifecycle-tx",
+  );
+  assert.throws(() => transaction.admit({}), /workspace lifecycle dispatch context/);
+  transaction.admit({
+    socketGeneration: null,
+    readinessRevision: null,
+    mappingGeneration: null,
+    workspaceGeneration: null,
+    mappingId: null,
+    workspaceId: null,
+    fenceSequence: null,
+  });
+  transaction.finish("refused", "UNKNOWN_RUNTIME", "manual_required");
+  transaction.emitManualCleanupRequired();
+  transaction.emitManualCleanupRequired();
+  assert.deepEqual(
+    events.map(({ action, outcome, code, cleanupState }) => ({
+      action, outcome, code, cleanupState,
+    })),
+    [
+      {
+        action: "delete", outcome: "refused", code: "UNKNOWN_RUNTIME",
+        cleanupState: "manual_required",
+      },
+      {
+        action: "manual_cleanup", outcome: "required",
+        code: "MANUAL_CLEANUP_REQUIRED", cleanupState: "manual_required",
+      },
+    ],
+  );
+});
+
 const OWNER_EVENT_KEYS = [
   "schemaVersion", "name", "action", "outcome", "code", "cleanupState",
   "mappingId", "workspaceId", "transactionId", "fenceSequence", "durationMs",

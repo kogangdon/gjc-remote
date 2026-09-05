@@ -132,7 +132,16 @@ supplements, and does not replace, the design-only matrix above.
   without changing the embedded SDK's `NODE_ENV`, and requires exactly
   three successful bounded terminals
   for its three real SDK invokes without request-data leakage.
-- Deferred: daemon lifecycle/manual-cleanup transaction telemetry, supervisor restart proof, and
+- Daemon lifecycle telemetry is local schema-v1 only and covers all seven validated operations.
+  It freezes trusted binding/inventory correlation when both resolve, emits exactly one
+  committed/refused/failed terminal, reports destructive cleanup as `not_required`,
+  `manual_required`, or conservatively `indeterminate`, and never projects operation receipts.
+  Manual cleanup produces a separately latched bounded `manual_cleanup/required` signal.
+  Reset/delete additionally retains its existing sanitized receipt-backed console checkpoint;
+  restore/migration candidate-cleanup failure has no receipt and is surfaced only through the
+  bounded telemetry signal. The two local surfaces are not equivalent. Connection loss drains pending destructive
+  operations with indeterminate cleanup rather than claiming no cleanup is needed.
+- Deferred: durable manual-cleanup backlog/resolution, supervisor restart proof, and
   exporter/evidence ingestion remain separate daemon/supervisor slices. Bot callback/snapshot
   records are local API telemetry, not wire protocol or release evidence.
 
@@ -155,7 +164,7 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
-fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:281, an
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:284, an
 `= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
 default) the gate reads `false` and its read site inside `admitReadyWorkload` returns
