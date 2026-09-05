@@ -39,6 +39,7 @@ for (const key of Object.keys(daemonEnvironment)) {
       "GJC_CONTAINER_RUNTIME",
       "GJC_DAEMON_TEST_MODE",
       "GJC_OBSERVABILITY_TEST_IPC",
+      "GJC_SESSION_FACTORY_TEST_INJECTION",
     ].includes(key)
   ) {
     delete daemonEnvironment[key];

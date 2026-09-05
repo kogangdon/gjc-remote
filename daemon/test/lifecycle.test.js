@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
@@ -183,10 +187,13 @@ async function startReadinessDaemon({
   autoBind = false,
   observabilityDaemonTestMode = true,
   observabilityTestIpc = false,
+  daemonEntryOverride = daemonEntry,
+  workspaceInventory = TEST_INVENTORY,
 } = {}) {
   const frames = [];
   const telemetry = [];
   const policyCloses = [];
+  const fixtureReceipts = [];
   const registrations = [];
   const sockets = [];
   const closes = [];
@@ -215,7 +222,7 @@ async function startReadinessDaemon({
     });
   });
 
-  const child = spawn(process.env.BUN_BIN || "bun", [daemonEntry], {
+  const child = spawn(process.env.BUN_BIN || "bun", [daemonEntryOverride], {
     env: {
       ...process.env,
       HOST_ID: "readiness-test-host",
@@ -235,7 +242,7 @@ async function startReadinessDaemon({
       GJC_READINESS_TEST_WORK_DIR: "C:\\workspace",
       ...(testInjection
         ? {
-            GJC_WORKSPACE_INVENTORY: TEST_INVENTORY,
+            GJC_WORKSPACE_INVENTORY: workspaceInventory,
           }
         : {}),
       ...envOverrides,
@@ -253,12 +260,14 @@ async function startReadinessDaemon({
   child.on("message", (message) => {
     if (message?.type === "daemon_observability") telemetry.push(message.event);
     if (message?.type === "daemon_policy_close") policyCloses.push(message);
+    if (message?.type === "invoke_admission_fixture_disposed") fixtureReceipts.push(message);
   });
 
   return {
     frames,
     telemetry,
     policyCloses,
+    fixtureReceipts,
     registrations,
     sockets,
     closes,
@@ -584,6 +593,278 @@ test("bound lifecycle admission projects daemon-owned correlation without wire l
     });
   } finally {
     await daemon.stop();
+  }
+});
+
+test("receipt-bound admitted invoke freezes daemon correlation without wire leakage", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "gjc-invoke-admission-"));
+  const workspaceId = "invoke-workspace-test";
+  const workDir = join(workspaceRoot, workspaceId);
+  await mkdir(workDir);
+  const sourcePlatform = process.platform === "win32" ? "windows-drive" : "posix";
+  const casePolicy = process.platform === "win32" ? "insensitive" : "sensitive";
+  const mapping = fingerprintManagedMappingRecord({
+    mappingId: "invoke-mapping-test",
+    hostId: "readiness-test-host",
+    fenceGeneration: 7,
+    mappingGeneration: 11,
+    workspaceGeneration: 13,
+    mappingVersion: 1,
+    sourcePlatform,
+    workspaceId,
+    workDir: null,
+    sourceRoot: workDir,
+    containerRoot: null,
+    volumeIdentity: "invoke-volume-test",
+    casePolicy,
+    immutableDefault: false,
+    mappingFingerprint: null,
+  });
+  const inventoryGeneration = 17;
+  const inventory = workspaceInventoryBytes(buildWorkspaceInventory({
+    hostId: "readiness-test-host",
+    inventoryGeneration,
+    workspaces: [{
+      hostId: "readiness-test-host",
+      workspaceId: mapping.workspaceId,
+      sourcePlatform,
+      workDir,
+      rootIdentityFingerprint: "3".repeat(64),
+      storageIdentityFingerprint: "4".repeat(64),
+    }],
+  })).toString("utf8");
+  const binding = {
+    type: "bind_workspace",
+    bindingId: "invoke-receipt-binding",
+    authorityEpoch: 7,
+    fenceGeneration: mapping.fenceGeneration,
+    hostId: mapping.hostId,
+    mappingId: mapping.mappingId,
+    mappingGeneration: mapping.mappingGeneration,
+    mappingVersion: mapping.mappingVersion,
+    workspaceId: mapping.workspaceId,
+    workspaceGeneration: mapping.workspaceGeneration,
+    sourcePlatform: mapping.sourcePlatform,
+    authorityFingerprint: mapping.mappingFingerprint,
+    mapping,
+  };
+  assert.equal(Object.hasOwn(binding, "fenceSequence"), false);
+  const requestId = "invoke-admission-first";
+  const barrierRequestId = "invoke-admission-barrier";
+  let bindSent = false;
+  let firstSent = false;
+  let barrierSent = false;
+  let admittedReadiness;
+  let bodyCompleted = false;
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(
+      new URL("../test-fixtures/invoke-admission-daemon.mjs", import.meta.url),
+    ),
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 3,
+      capabilities: [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+      ],
+    },
+    workspaceInventory: inventory,
+    envOverrides: {
+      GJC_NATIVE_INVENTORY_MODE: "verify",
+      GJC_NATIVE_WORKSPACE_SERVING: "1",
+      GJC_NATIVE_WORKSPACE_ROOT: workspaceRoot,
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+      GJC_READINESS_TEST_WORKSPACE_ID: "",
+      GJC_READINESS_TEST_WORKSPACE_GENERATION: "",
+      GJC_READINESS_TEST_MAPPING_ID: "",
+      GJC_READINESS_TEST_MAPPING_GENERATION: "",
+      GJC_READINESS_TEST_MAPPING_VERSION: "",
+      GJC_READINESS_TEST_WORK_DIR: "",
+    },
+    onMessage(message, socket) {
+      if (message.type === "readiness" && !bindSent) {
+        bindSent = true;
+        socket.send(JSON.stringify(binding));
+        return;
+      }
+      if (
+        message.type === "readiness" &&
+        message.bindingId === binding.bindingId &&
+        message.status?.runtime === "ready" &&
+        message.status?.providerAuth === "configured" &&
+        message.status?.modelProfile === "ready" &&
+        message.status?.workspace === "ready" &&
+        !firstSent
+      ) {
+        firstSent = true;
+        // Boot recovery may remove an unrecognized fixture directory while
+        // scanning the real workspace root. Recreate only the pooled-session
+        // workDir after boot has reached bound readiness.
+        mkdirSync(workDir, { recursive: true });
+        admittedReadiness = {
+          socketGeneration: message.socketGeneration,
+          revision: message.revision,
+        };
+        socket.send(JSON.stringify({
+          type: "invoke",
+          requestId,
+          bindingId: binding.bindingId,
+          mappingId: mapping.mappingId,
+          mappingGeneration: mapping.mappingGeneration,
+          mappingVersion: mapping.mappingVersion,
+          workspaceId: mapping.workspaceId,
+          workspaceGeneration: mapping.workspaceGeneration,
+          command: { kind: "prompt", message: "fixture prompt must not leak" },
+        }));
+        return;
+      }
+      if (
+        message.type === "event" &&
+        message.requestId === requestId &&
+        message.done === true &&
+        !barrierSent
+      ) {
+        barrierSent = true;
+        socket.send(JSON.stringify({
+          type: "invoke",
+          requestId: barrierRequestId,
+          bindingId: binding.bindingId,
+          mappingId: mapping.mappingId,
+          mappingGeneration: mapping.mappingGeneration,
+          mappingVersion: mapping.mappingVersion,
+          workspaceId: mapping.workspaceId,
+          workspaceGeneration: mapping.workspaceGeneration,
+          command: { kind: "prompt", message: "fixture barrier must not leak" },
+        }));
+      }
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.registrations,
+      (registration) =>
+        registration.protocolVersion === 3 &&
+        [
+          WORKSPACE_READINESS_CAPABILITY,
+          WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+          WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+        ].every((capability) => registration.capabilities?.includes(capability)),
+      "v3 managed registration",
+    );
+    await waitForFrame(
+      daemon.frames,
+      (message) =>
+        message.type === "bind_ok" &&
+        message.bindingId === binding.bindingId &&
+        message.inventoryGeneration === inventoryGeneration &&
+        typeof message.inventoryFingerprint === "string" &&
+        typeof message.bindingFingerprint === "string",
+      "receipt bind proof",
+    );
+    await waitForFrame(
+      daemon.telemetry,
+      (event) =>
+        event.name === "daemon" &&
+        event.action === "invoke" &&
+        event.transactionId === barrierRequestId &&
+        event.outcome === "succeeded",
+      "invoke telemetry barrier",
+    );
+    const terminals = daemon.telemetry.filter(
+      (event) =>
+        event.name === "daemon" &&
+        event.action === "invoke" &&
+        event.transactionId === requestId,
+    );
+    assert.equal(terminals.length, 1);
+    const terminal = terminals[0];
+    assert.deepEqual(
+      {
+        schemaVersion: terminal.schemaVersion,
+        name: terminal.name,
+        action: terminal.action,
+        outcome: terminal.outcome,
+        code: terminal.code,
+        cleanupState: terminal.cleanupState,
+        transactionId: terminal.transactionId,
+        mappingId: terminal.mappingId,
+        mappingGeneration: terminal.mappingGeneration,
+        workspaceId: terminal.workspaceId,
+        workspaceGeneration: terminal.workspaceGeneration,
+      },
+      {
+        schemaVersion: 1,
+        name: "daemon",
+        action: "invoke",
+        outcome: "succeeded",
+        code: null,
+        cleanupState: null,
+        transactionId: requestId,
+        mappingId: mapping.mappingId,
+        mappingGeneration: mapping.mappingGeneration,
+        workspaceId: mapping.workspaceId,
+        workspaceGeneration: mapping.workspaceGeneration,
+      },
+    );
+    assert.equal(Number.isSafeInteger(terminal.durationMs), true);
+    assert.equal(terminal.durationMs >= 0, true);
+    for (const field of ["socketGeneration", "readinessRevision", "fenceSequence"]) {
+      assert.equal(Number.isSafeInteger(terminal[field]), true);
+      assert.equal(terminal[field] > 0, true);
+    }
+    assert.deepEqual(
+      {
+        socketGeneration: terminal.socketGeneration,
+        readinessRevision: terminal.readinessRevision,
+      },
+      {
+        socketGeneration: admittedReadiness.socketGeneration,
+        readinessRevision: admittedReadiness.revision,
+      },
+    );
+    for (const frame of daemon.frames.filter(
+      (message) => message.requestId === requestId || message.requestId === barrierRequestId,
+    )) {
+      for (const field of [
+        "transactionId", "fenceSequence", "durationMs", "socketGeneration",
+        "readinessRevision", "mappingGeneration", "workspaceGeneration",
+        "mappingId", "workspaceId", "cleanupState",
+      ]) {
+        assert.equal(Object.hasOwn(frame, field), false);
+      }
+    }
+    const successFrame = daemon.frames.find(
+      (message) => message.requestId === requestId && message.done === true,
+    );
+    assert.deepEqual(Object.keys(successFrame).sort(), ["done", "requestId", "type"]);
+    const serialized = JSON.stringify({
+      frames: daemon.frames.filter(
+        (message) => message.requestId === requestId || message.requestId === barrierRequestId,
+      ),
+      telemetry: daemon.telemetry,
+    });
+    for (const secret of [
+      workspaceRoot,
+      workDir,
+      "fixture prompt must not leak",
+      "fixture barrier must not leak",
+      mapping.mappingFingerprint,
+    ]) {
+      assert.equal(serialized.includes(secret), false);
+    }
+    assert.deepEqual(daemon.policyCloses, []);
+    assert.equal(daemon.output().includes("daemon: handler error"), false);
+    assert.equal(daemon.output().includes("fatal"), false);
+    bodyCompleted = true;
+  } finally {
+    await daemon.stop();
+    if (bodyCompleted && process.platform !== "win32") {
+      await waitForLength(daemon.fixtureReceipts, 1, "fixture disposal receipt");
+      assert.equal(daemon.fixtureReceipts.length, 1);
+    }
+    await rm(workspaceRoot, { recursive: true, force: true });
   }
 });
 
