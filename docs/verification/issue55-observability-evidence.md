@@ -78,10 +78,19 @@ from compiling. The tracked bot CLI bin target is committed executable so Bun's
 workspace-bin linking cannot create a source mode change. The generator does
 not tolerate mode-only drift. The observability recipe does not provide
 native-control build or execution evidence.
+
 Independent verification reproduces receipt bytes and source
 association but cannot prove that a compromised setup action actually executed
 the tests. This third-party action is part of the recorded workflow trust base,
 not equivalent to an `actions/*` GitHub-controlled action.
+
+Artifact handoffs use full-SHA-pinned `actions/upload-artifact` v7.0.1 and
+`actions/download-artifact` v8.0.1. Both declare the hosted Node.js 24 action
+runtime, so new runs do not depend on GitHub forcibly upgrading a Node.js 20
+action. Download v8 also defaults artifact digest mismatch handling to `error`,
+so both ID-addressed handoff downloads fail closed before downstream
+verification or attestation. Historical attestations remain bound to their
+original workflow digest and action pins.
 
 ## First authenticated observability run
 

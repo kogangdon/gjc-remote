@@ -45,18 +45,18 @@ jobs:
       commit: ${{ github.sha }}
     steps:
       - name: Checkout exact source commit
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Set up Node
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 26.0.0
           check-latest: false
       - name: Set up Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.14
           no-cache: true
@@ -75,7 +75,7 @@ jobs:
           node scripts/issue55-observability-evidence.js verify --receipt "$EVIDENCE_DIR/issue55-observability.json" --expected-commit "$SHA"
       - name: Upload untrusted observability handoff
         id: handoff
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-${{ github.run_id }}-${{ github.run_attempt }}
         with:
@@ -103,18 +103,18 @@ jobs:
       commit: ${{ needs.generate.outputs.commit }}
     steps:
       - name: Checkout receipt source commit
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.generate.outputs.commit }}
           fetch-depth: 1
           persist-credentials: false
       - name: Set up Node
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 26.0.0
           check-latest: false
       - name: Download untrusted observability handoff
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.generate.outputs.artifact-id }}
           path: ${{ runner.temp }}/issue55-observability-verify-${{ github.run_id }}-${{ github.run_attempt }}
@@ -132,7 +132,7 @@ jobs:
           node scripts/issue55-observability-evidence.js verify --receipt "$EVIDENCE_DIR/issue55-observability.json" --expected-commit "$SHA"
       - name: Upload verified observability handoff
         id: verified
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-verify-${{ github.run_id }}-${{ github.run_attempt }}
         with:
@@ -158,12 +158,12 @@ jobs:
       id-token: write
     steps:
       - name: Download verified observability handoff
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact-id }}
           path: ${{ runner.temp }}/issue55-observability-attest-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Attest observability execution evidence
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-attest-${{ github.run_id }}-${{ github.run_attempt }}
         with:
@@ -171,7 +171,7 @@ jobs:
             ${{ env.EVIDENCE_DIR }}/issue55-observability.json
             ${{ env.EVIDENCE_DIR }}/issue55-observability.json.sha256
       - name: Upload attested observability evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-attest-${{ github.run_id }}-${{ github.run_attempt }}
         with:
