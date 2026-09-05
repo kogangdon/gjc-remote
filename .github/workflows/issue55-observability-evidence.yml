@@ -60,11 +60,6 @@ jobs:
         with:
           bun-version: 1.3.14
           no-cache: true
-      - name: Install ACL development headers
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libacl1-dev
       - name: Generate and verify observability receipt
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-${{ github.run_id }}-${{ github.run_attempt }}

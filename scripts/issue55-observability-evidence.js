@@ -21,7 +21,7 @@ export const FACETS = Object.freeze([
   'redaction-and-bounded-taxonomy', 'exactly-once-terminals', 'local-only-wire-separation',
 ]);
 export const RECIPE = Object.freeze([
-  Object.freeze({ argv: ['bun', 'install', '--frozen-lockfile'], timeoutMs: 300000 }),
+  Object.freeze({ argv: ['bun', 'install', '--frozen-lockfile', '--ignore-scripts'], timeoutMs: 300000 }),
   Object.freeze({ argv: ['npm', 'run', 'test:observability', '--workspace', '@gjc-remote/bot'], timeoutMs: 600000 }),
   Object.freeze({ argv: ['npm', 'run', 'test:observability', '--workspace', '@gjc-remote/daemon'], timeoutMs: 900000 }),
 ]);

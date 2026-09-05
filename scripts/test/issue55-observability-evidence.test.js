@@ -35,12 +35,30 @@ function withFixture(fn) { const root = fixture(); try { return fn(root); } fina
 const testEnvironment = { architecture: 'x64', bunVersion: '1.3.14', nodeVersion: 'v26.0.0', platform: 'linux' };
 function commit(root) { return git(root, ['rev-parse', 'HEAD']).trim(); }
 
+test('workspace bin target is committed executable before Bun linking', () => {
+  const entry = execFileSync(
+    'git',
+    ['ls-files', '--stage', '--', 'bot/src/management-entrypoint.js'],
+    { encoding: 'utf8' },
+  ).trim();
+  assert.match(
+    entry,
+    /^100755 [a-f0-9]{40} 0\tbot\/src\/management-entrypoint\.js$/,
+  );
+});
+
 test('issue55 observability receipt is a closed, canonical singular claim', () => {
   const actual = receipt();
   assert.deepEqual(Object.keys(actual), ['claim', 'environment', 'recipe', 'schema', 'subject']);
   assert.equal(actual.schema, SCHEMA);
   assert.deepEqual(actual.environment, ENVIRONMENT);
   assert.deepEqual(actual.claim.facets, FACETS);
+  assert.deepEqual(RECIPE[0].argv, [
+    'bun',
+    'install',
+    '--frozen-lockfile',
+    '--ignore-scripts',
+  ]);
   assert.deepEqual(actual.recipe.map(({ argv, timeoutMs }) => ({ argv, timeoutMs })), RECIPE);
   assert.ok(canonicalBytes(actual).toString('utf8').endsWith('\n'));
   validateReceiptShape(actual);
