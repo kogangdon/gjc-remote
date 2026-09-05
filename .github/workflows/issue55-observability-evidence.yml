@@ -1,0 +1,183 @@
+name: "Issue #55 observability execution evidence"
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: issue55-observability-evidence-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Verify exact current main revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$REF" = "refs/heads/main"
+          [[ "$SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$SHA" = "$WORKFLOW_SHA"
+          MAIN_SHA="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPOSITORY/git/ref/heads/main" | \
+            node -e 'const v=JSON.parse(require("node:fs").readFileSync(0,"utf8")); process.stdout.write(v.object?.sha ?? "")')"
+          test "$MAIN_SHA" = "$SHA"
+
+  generate:
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.handoff.outputs.artifact-id }}
+      commit: ${{ github.sha }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 26.0.0
+          check-latest: false
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+          no-cache: true
+      - name: Generate and verify observability receipt
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-${{ github.run_id }}-${{ github.run_attempt }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test "$(node --version)" = "v26.0.0"
+          test "$(bun --version)" = "1.3.14"
+          umask 077
+          mkdir "$EVIDENCE_DIR"
+          node scripts/issue55-observability-evidence.js generate --output "$EVIDENCE_DIR/issue55-observability.json" --expected-commit "$SHA"
+          node scripts/issue55-observability-evidence.js verify --receipt "$EVIDENCE_DIR/issue55-observability.json" --expected-commit "$SHA"
+      - name: Upload untrusted observability handoff
+        id: handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          name: untrusted-issue55-observability-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json.sha256
+          retention-days: 1
+          overwrite: false
+          if-no-files-found: error
+      - name: Remove observability directory
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-${{ github.run_id }}-${{ github.run_attempt }}
+        run: rm -rf "$EVIDENCE_DIR"
+
+  verify:
+    needs: generate
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.verified.outputs.artifact-id }}
+      commit: ${{ needs.generate.outputs.commit }}
+    steps:
+      - name: Checkout receipt source commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.generate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 26.0.0
+          check-latest: false
+      - name: Download untrusted observability handoff
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          artifact-ids: ${{ needs.generate.outputs.artifact-id }}
+          path: ${{ runner.temp }}/issue55-observability-verify-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Reverify exact observability bytes
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-verify-${{ github.run_id }}-${{ github.run_attempt }}
+          SHA: ${{ needs.generate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test "$(node --version)" = "v26.0.0"
+          test "$(find "$EVIDENCE_DIR" -maxdepth 1 -type f | wc -l)" -eq 2
+          test ! -L "$EVIDENCE_DIR/issue55-observability.json"
+          test ! -L "$EVIDENCE_DIR/issue55-observability.json.sha256"
+          node scripts/issue55-observability-evidence.js verify --receipt "$EVIDENCE_DIR/issue55-observability.json" --expected-commit "$SHA"
+      - name: Upload verified observability handoff
+        id: verified
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-verify-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          name: verified-unattested-issue55-observability-${{ needs.generate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json.sha256
+          retention-days: 1
+          overwrite: false
+          if-no-files-found: error
+      - name: Remove verification directory
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-verify-${{ github.run_id }}-${{ github.run_attempt }}
+        run: rm -rf "$EVIDENCE_DIR"
+
+  attest:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download verified observability handoff
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact-id }}
+          path: ${{ runner.temp }}/issue55-observability-attest-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Attest observability execution evidence
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-attest-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          subject-path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json.sha256
+      - name: Upload attested observability evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-observability-attest-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          name: issue55-observability-evidence-${{ needs.verify.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json
+            ${{ env.EVIDENCE_DIR }}/issue55-observability.json.sha256
+          overwrite: false
+          if-no-files-found: error

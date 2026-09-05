@@ -14,7 +14,8 @@
     "admin": "node src/management-entrypoint.js",
     "register": "node src/register-commands.js",
     "start": "node src/bot.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:observability": "node --test test/host-registry.test.js"
   },
   "dependencies": {
     "@gjc-remote/native-control": "*",
