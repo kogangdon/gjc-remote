@@ -72,11 +72,12 @@ GitHub attestation authenticates subject bytes and workflow provenance under the
 
 The execution claim also trusts the full-SHA-pinned
 `oven-sh/setup-bun` action to install the declared Bun toolchain before the
-recipe runs. The hosted generator also installs Ubuntu's `libacl1-dev` package
-before the frozen install so the workspace's native-control install script can
-compile; the package version floats with the Ubuntu archive at execution time
-and is part of the workflow trust base. That prerequisite is workflow setup,
-not native-control evidence.
+recipe runs. The frozen install uses `--ignore-scripts`, matching the production
+container install boundary and preventing the unrelated native-control addon
+from compiling. The tracked bot CLI bin target is committed executable so Bun's
+workspace-bin linking cannot create a source mode change. The generator does
+not tolerate mode-only drift. The observability recipe does not provide
+native-control build or execution evidence.
 Independent verification reproduces receipt bytes and source
 association but cannot prove that a compromised setup action actually executed
 the tests. This third-party action is part of the recorded workflow trust base,
