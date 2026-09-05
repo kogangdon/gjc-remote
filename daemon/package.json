@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "bun src/daemon.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:observability": "node --test test/daemon-observability.test.js test/lifecycle.test.js"
   },
   "dependencies": {
     "@gajae-code/coding-agent": "0.12.21",
