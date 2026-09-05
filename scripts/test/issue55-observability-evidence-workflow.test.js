@@ -155,5 +155,34 @@ test('documentation constrains external observability ledger ingestion', () => {
     'test gate', 'local-only', 'artifact expiry requires regeneration', 'No production bot',
     'not distributed exactly-once across process',
     'No provider credential', 'No native-control', 'No full candidate test suite', 'No receipt timestamp',
+    '33993917213', 'e525ff16fc162ee4534dbc5646e5b8d301a6045e',
+    '9977475402', '08b3defc52327c6a967b325c35406fa45071ffb41276cd1378dafb7da11988be',
+    '69db59277f101fd4dc3e93dca769ec8dbd84e21cff011e475b55d774015dc518',
+    'f3689f1d60bae5a3c045be77e55e6e6abf8e5497f64089931e7c7d82822398c8',
+    'Runs 1 and 2 failed closed', 'Node.js 20', 'Node.js 24',
   ]) assert.match(documentation, new RegExp(required, 'i'));
+
+  const runSection = documentation.slice(
+    documentation.indexOf('## First authenticated observability run'),
+  );
+  for (const immutableFact of [
+    '33993917213',
+    'run number 3, attempt 1',
+    'workflow_dispatch',
+    'e525ff16fc162ee4534dbc5646e5b8d301a6045e',
+    '2026-09-05T21:44:39Z',
+    '2026-09-05T21:45:46Z',
+    '(`validate`, `generate`, `verify`, and `attest`) successful',
+    'issue55-observability-evidence-e525ff16fc162ee4534dbc5646e5b8d301a6045e-33993917213-1',
+    '9977475402',
+    '1,015 bytes',
+    '2026-12-04T21:44:40Z',
+    '08b3defc52327c6a967b325c35406fa45071ffb41276cd1378dafb7da11988be',
+    '69db59277f101fd4dc3e93dca769ec8dbd84e21cff011e475b55d774015dc518',
+    'f3689f1d60bae5a3c045be77e55e6e6abf8e5497f64089931e7c7d82822398c8',
+    'c67d19bda37ca29cff9cbb16aef21bed8b88bc32',
+    'c86c4ec0fb4d0367292e6c31e19aa417f5b31f27abd378b9fc82157e12336c4d',
+  ]) {
+    assert.ok(runSection.includes(immutableFact), immutableFact);
+  }
 });
