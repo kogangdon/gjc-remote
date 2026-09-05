@@ -61,3 +61,57 @@ canonical bytes, checksum, exact schema, and current clean v2 source
 association; it never reruns the recipe. It does not alter the negative source
 packet: that packet's candidate checks remain missing, every blocker remains,
 and release eligibility remains false.
+
+## Authenticated negative source evidence
+
+`.github/workflows/issue55-source-evidence.yml` is manual-dispatch only and has
+no inputs. At dispatch validation it accepts only that moment's exact `main`
+commit and requires
+`github.sha` and `github.workflow_sha` to match. It never accepts a local packet,
+candidate receipt, path, artifact URL, or caller-selected revision.
+Queued jobs or failed-job reruns may finish after `main` advances; that creates
+honest historical source provenance for the recorded commit, not evidence for
+the newer tip.
+
+The workflow separates generation, verification, and attestation authority:
+
+1. A `contents: read` hosted job checks out the exact commit, generates the
+   negative source packet, verifies it, and uploads a one-day
+   `untrusted-issue55-source-*` handoff.
+2. A separate hosted job with only `contents: read` and `actions: read`
+   downloads that exact artifact ID, checks out the packet commit, requires
+   exactly the JSON and checksum files, reruns the local verifier, and uploads a
+   one-day `verified-unattested-issue55-source-*` handoff.
+3. The final hosted job has `actions: read`, `id-token: write`, and
+   `attestations: write`. It executes no shell or checked-out repository code.
+   Pinned GitHub actions download the verified artifact ID, attest exactly the
+   two files, and upload `issue55-source-evidence-*`.
+
+Intermediate handoffs are transport only and are not evidence. Missing GitHub
+OIDC or attestation support fails closed before the final artifact. No provider
+login, model profile, self-hosted runner, release permission, candidate test, or
+candidate smoke authority is used. The existing `candidate-tests` and
+`candidate-smoke` blockers remain missing, as do every other source-packet
+blocker.
+
+Consumers must reject both intermediate artifact prefixes and verify each file
+from `issue55-source-evidence-*`:
+Set `EXPECTED_COMMIT` to the immutable commit encoded in the final artifact name
+and source packet; do not substitute the current `main` tip.
+
+```sh
+gh attestation verify <downloaded-file> \
+  --repo kogangdon/gjc-remote \
+  --signer-workflow kogangdon/gjc-remote/.github/workflows/issue55-source-evidence.yml \
+  --signer-digest "$EXPECTED_COMMIT" \
+  --source-ref refs/heads/main \
+  --source-digest "$EXPECTED_COMMIT"
+```
+
+Require exactly `issue55-source.json` and `issue55-source.json.sha256`, validate
+the sidecar digest, and run the source verifier from a clean checkout of
+`$EXPECTED_COMMIT`. GitHub attestation authenticates workflow-produced source
+bytes; it does not prove historical execution of tests or smoke. It does not
+prove release eligibility, publication, deployment, platform results, provider
+recovery, serving-enabled execution, or removal of any blocker. This workflow
+does not promote a release.

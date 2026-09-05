@@ -1,0 +1,172 @@
+name: "Issue #55 source evidence"
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: issue55-source-evidence-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify exact current main revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$REF" = "refs/heads/main"
+          [[ "$SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$SHA" = "$WORKFLOW_SHA"
+          MAIN_SHA="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPOSITORY/git/ref/heads/main" | \
+            node -e 'const v=JSON.parse(require("node:fs").readFileSync(0,"utf8")); process.stdout.write(v.object?.sha ?? "")')"
+          test "$MAIN_SHA" = "$SHA"
+
+  generate:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.handoff.outputs.artifact-id }}
+      commit: ${{ github.sha }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Generate and verify negative source packet
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-${{ github.run_id }}-${{ github.run_attempt }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SHA"
+          umask 077
+          mkdir "$EVIDENCE_DIR"
+          npm run evidence:issue55 -- --output "$EVIDENCE_DIR/issue55-source.json"
+          npm run evidence:issue55:verify -- --packet "$EVIDENCE_DIR/issue55-source.json"
+
+      - name: Upload untrusted source handoff
+        id: handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          name: untrusted-issue55-source-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json.sha256
+          retention-days: 1
+          overwrite: false
+          if-no-files-found: error
+
+      - name: Remove source directory
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-${{ github.run_id }}-${{ github.run_attempt }}
+        run: rm -rf "$EVIDENCE_DIR"
+
+  verify:
+    needs: generate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.verified.outputs.artifact-id }}
+      commit: ${{ needs.generate.outputs.commit }}
+    steps:
+      - name: Checkout packet source commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.generate.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download untrusted source handoff
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          artifact-ids: ${{ needs.generate.outputs.artifact-id }}
+          path: ${{ runner.temp }}/issue55-source-verify-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Reverify exact source bytes
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-verify-${{ github.run_id }}-${{ github.run_attempt }}
+          SHA: ${{ needs.generate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test "$(find "$EVIDENCE_DIR" -maxdepth 1 -type f | wc -l)" -eq 2
+          npm run evidence:issue55:verify -- --packet "$EVIDENCE_DIR/issue55-source.json"
+
+      - name: Upload verified source handoff
+        id: verified
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-verify-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          name: verified-unattested-issue55-source-${{ needs.generate.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json.sha256
+          retention-days: 1
+          overwrite: false
+          if-no-files-found: error
+
+      - name: Remove verification directory
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-verify-${{ github.run_id }}-${{ github.run_attempt }}
+        run: rm -rf "$EVIDENCE_DIR"
+
+  attest:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download verified source handoff
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact-id }}
+          path: ${{ runner.temp }}/issue55-source-attest-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Attest negative source evidence
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-attest-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          subject-path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json.sha256
+
+      - name: Upload attested negative source evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/issue55-source-attest-${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          name: issue55-source-evidence-${{ needs.verify.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json
+            ${{ env.EVIDENCE_DIR }}/issue55-source.json.sha256
+          overwrite: false
+          if-no-files-found: error
