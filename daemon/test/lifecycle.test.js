@@ -448,6 +448,145 @@ test("lifecycle gate refusals emit local-only terminals for every frame family",
   }
 });
 
+test("bound lifecycle admission projects daemon-owned correlation without wire leakage", async () => {
+  const binding = readinessV2Bind();
+  const transactionId = "8".repeat(64);
+  const barrierTransactionId = "9".repeat(64);
+  let lifecycleSent = false;
+  let barrierSent = false;
+  const lifecycleFrame = (id) => ({
+    type: "workspace_create",
+    operation: "create",
+    hostId: binding.hostId,
+    mappingId: "wire-mapping-divergent",
+    mappingGeneration: 9,
+    mappingVersion: binding.mappingVersion,
+    workspaceId: binding.workspaceId,
+    workspaceGeneration: 9,
+    sourcePlatform: binding.sourcePlatform,
+    routeFingerprint: binding.routeFingerprint,
+    authorityFingerprint: binding.authorityFingerprint,
+    inventoryGeneration: binding.inventoryGeneration,
+    idempotencyFingerprint: id,
+  });
+  const daemon = await startReadinessDaemon({
+    autoBind: true,
+    observabilityTestIpc: true,
+    envOverrides: {
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_ROOT: "",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+    },
+    onMessage(message, socket) {
+      if (message.type === "bind_ok" && !lifecycleSent) {
+        lifecycleSent = true;
+        socket.send(JSON.stringify(lifecycleFrame(transactionId)));
+      }
+      if (
+        message.type === "event" &&
+        message.requestId === transactionId &&
+        !barrierSent
+      ) {
+        barrierSent = true;
+        socket.send(JSON.stringify(lifecycleFrame(barrierTransactionId)));
+      }
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.telemetry,
+      (event) =>
+        event.name === "daemon" &&
+        event.action === "create" &&
+        event.transactionId === transactionId,
+      "bound lifecycle telemetry",
+    );
+    const terminal = daemon.telemetry.find(
+      (event) =>
+        event.name === "daemon" &&
+        event.action === "create" &&
+        event.transactionId === transactionId,
+    );
+    // workspaceId must stay equal on the wire because it is the lookup key for
+    // both accepted binding and inventory; the divergent mapping/generations
+    // above are what prove correlation provenance.
+    assert.deepEqual(
+      {
+        outcome: terminal.outcome,
+        code: terminal.code,
+        mappingGeneration: terminal.mappingGeneration,
+        workspaceGeneration: terminal.workspaceGeneration,
+        mappingId: terminal.mappingId,
+        workspaceId: terminal.workspaceId,
+        fenceSequence: terminal.fenceSequence,
+        cleanupState: terminal.cleanupState,
+      },
+      {
+        outcome: "refused",
+        code: "RUNTIME_INCOMPATIBLE",
+        mappingGeneration: 1,
+        workspaceGeneration: 1,
+        mappingId: "mapping-test",
+        workspaceId: "workspace-test",
+        fenceSequence: null,
+        cleanupState: "not_applicable",
+      },
+    );
+    assert.equal(Number.isSafeInteger(terminal.socketGeneration), true);
+    assert.equal(terminal.socketGeneration >= 1, true);
+    assert.equal(Number.isSafeInteger(terminal.readinessRevision), true);
+    assert.equal(terminal.readinessRevision >= 0, true);
+    await waitForFrame(
+      daemon.frames,
+      (message) =>
+        message.type === "event" &&
+        message.requestId === transactionId,
+      "bound lifecycle refusal frame",
+    );
+    await waitForFrame(
+      daemon.telemetry,
+      (event) =>
+        event.name === "daemon" &&
+        event.action === "create" &&
+        event.transactionId === barrierTransactionId,
+      "bound lifecycle telemetry barrier",
+    );
+    assert.equal(
+      daemon.telemetry.filter(
+        (event) =>
+          event.name === "daemon" &&
+          event.action === "create" &&
+          event.transactionId === transactionId,
+      ).length,
+      1,
+    );
+    const frame = daemon.frames.find(
+      (message) =>
+        message.type === "event" &&
+        message.requestId === transactionId,
+    );
+    assert.deepEqual(Object.keys(frame).sort(), [
+      "done",
+      "error",
+      "event",
+      "requestId",
+      "type",
+    ]);
+    assert.deepEqual(frame.event, {
+      type: "workspace_lifecycle_refused",
+      operation: "create",
+      workspaceId: "workspace-test",
+    });
+    assert.deepEqual(JSON.parse(frame.error), {
+      code: "RUNTIME_INCOMPATIBLE",
+      retryable: false,
+      action: "contact_admin",
+    });
+  } finally {
+    await daemon.stop();
+  }
+});
+
 test("denied registration uses one fixed retry and accepted recovery restores normal reconnects", async () => {
   // Deliberately overlaps the credential-bearing BOT_WS_URL to prove the
   // whole URL is redacted before shorter sensitive substrings.

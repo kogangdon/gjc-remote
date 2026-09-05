@@ -136,6 +136,13 @@ supplements, and does not replace, the design-only matrix above.
   It freezes trusted binding/inventory correlation when both resolve, emits exactly one
   committed/refused/failed terminal, reports destructive cleanup as `not_required`,
   `manual_required`, or conservatively `indeterminate`, and never projects operation receipts.
+  A spawned `daemon.js`, protocol-v2, serving-off integration uses test-injected inventory,
+  accepts a daemon-held binding, then sends deliberately divergent wire mapping/generation
+  claims. The terminal retains the accepted binding's non-null mapping/workspace generations and
+  IDs, while exact WebSocket event/error shapes prove that no additional telemetry properties
+  enter the refusal frame (the protocol-required event `workspaceId` remains). Lifecycle
+  `fenceSequence` remains null because no registry-issued lifecycle fence is exposed at this
+  boundary. This fixture is not invoke admission, serving-on E2E, or platform evidence.
   Manual cleanup produces a separately latched bounded `manual_cleanup/required` signal.
   Reset/delete additionally retains its existing sanitized receipt-backed console checkpoint;
   restore/migration candidate-cleanup failure has no receipt and is surfaced only through the
