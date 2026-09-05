@@ -82,3 +82,39 @@ Independent verification reproduces receipt bytes and source
 association but cannot prove that a compromised setup action actually executed
 the tests. This third-party action is part of the recorded workflow trust base,
 not equivalent to an `actions/*` GitHub-controlled action.
+
+## First authenticated observability run
+
+Workflow run
+[`33993917213`](https://github.com/kogangdon/gjc-remote/actions/runs/33993917213)
+(run number 3, attempt 1) completed successfully for exact main commit
+`e525ff16fc162ee4534dbc5646e5b8d301a6045e` after a
+`workflow_dispatch` event. GitHub records
+2026-09-05T21:44:39Z through 2026-09-05T21:45:46Z, with all four jobs
+(`validate`, `generate`, `verify`, and `attest`) successful.
+
+The final artifact
+`issue55-observability-evidence-e525ff16fc162ee4534dbc5646e5b8d301a6045e-33993917213-1`
+has artifact ID `9977475402`, archive digest
+`sha256:08b3defc52327c6a967b325c35406fa45071ffb41276cd1378dafb7da11988be`,
+size 1,015 bytes, and expiry 2026-12-04T21:44:40Z. The attested receipt digest is
+`69db59277f101fd4dc3e93dca769ec8dbd84e21cff011e475b55d774015dc518`;
+the attested checksum-sidecar digest is
+`f3689f1d60bae5a3c045be77e55e6e6abf8e5497f64089931e7c7d82822398c8`.
+The receipt subject binds tree
+`c67d19bda37ca29cff9cbb16aef21bed8b88bc32` and source-packet SHA-256
+`c86c4ec0fb4d0367292e6c31e19aa417f5b31f27abd378b9fc82157e12336c4d`.
+Both files passed the repository/signer/source-constrained
+`gh attestation verify` commands above, and the downloaded receipt passed the
+local verifier.
+
+This authenticated run permits an external ledger to mark only
+`observability=verified` for the recorded commit. The unchanged source-negative
+packet remains `observability: missing`, `releaseEligible: false`, with all 21
+blockers. Runs 1 and 2 failed closed in `generate`; neither uploaded a receipt
+or reached verification/attestation.
+
+GitHub emitted deprecation warnings because the pinned upload/download artifact
+actions declare Node.js 20 and the hosted runner forced them onto Node.js 24.
+The run succeeded, but that forced-runtime behavior is part of this run's
+control-plane evidence and should be removed in a later pinned-action update.
