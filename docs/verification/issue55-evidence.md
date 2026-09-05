@@ -87,6 +87,13 @@ The workflow separates generation, verification, and attestation authority:
    Pinned GitHub actions download the verified artifact ID, attest exactly the
    two files, and upload `issue55-source-evidence-*`.
 
+Artifact handoffs use full-SHA-pinned `actions/upload-artifact` v7.0.1 and
+`actions/download-artifact` v8.0.1, both on the hosted Node.js 24 action
+runtime. Download v8 also fails by default on artifact digest mismatch, so the
+ID-addressed handoff stops before verification or attestation instead of
+continuing after a warning. This affects only future runs; the first authenticated source run
+below remains bound to its original workflow digest and action pins.
+
 Intermediate handoffs are transport only and are not evidence. Missing GitHub
 OIDC or attestation support fails closed before the final artifact. No provider
 login, model profile, self-hosted runner, release permission, candidate test, or
