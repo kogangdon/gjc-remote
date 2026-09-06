@@ -2,6 +2,11 @@
 
 Discord-controlled remote GJC sessions.
 
+> **SDK 0.16.4 upgrade candidate: BLOCKED.** A late follow-up can remain queued
+> without a successor run, holding subsequent commands until cancellation or
+> timeout. The real SDK oracle reproduces this defect; passing regression tests
+> and smoke do not clear it. See [CHANGELOG.md](CHANGELOG.md#upgrade-blocker).
+
 > **⚠️ Security: this grants remote code execution.** A mapped Discord channel
 > runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
 > Keep `bot/`'s WebSocket port on a private network, treat host tokens like
@@ -43,14 +48,21 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    that FIFO and start a prompt-equivalent run instead of waiting on an inactive
    control queue. While a prompt or accepted follow-up pipeline is active,
    controls retain their SDK `steer`/`follow_up` semantics instead of waiting
-   behind it. A `steer` request remains open through the current run's
-   `agent_end`; each successfully queued `follow_up` remains open through its
-   own run's `agent_end` and blocks queued prompt/model operations until that
-   boundary. Rejected follow-up admissions consume no completion boundary. Each
+   behind it. Live controls remain open through the terminal boundary that owns
+   their consumed message; several sequential follow-ups can share one SDK
+   `agent_end`. Queue admission alone is not completion, and queued prompt/model
+   operations wait for the active control pipeline. Rejected admissions consume
+   no completion boundary. SDK failure outcomes reject the invocation. Each
    request receives its event stream, and later controls rejoin the FIFO. Idle
    sessions (no requests for 1 hour) are disposed automatically.
+   Live controls use the SDK's public `sendUserMessage` promotion callbacks and
+   carry literal text; they do not expand CLI prompt templates.
+   Workflow answers use correlated daemon receipts: sending an answer is not
+   acceptance. Rejected answers retain the same live gate for retry; a completed
+   or replaced gate is never silently answered by a retry or converted into a
+   new prompt. Deploy the bot and daemon together for this receipt contract.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
-   bundled skills (`deep-interview`, `ralplan`, `team`, `ultragoal`), `/gjc`,
+   bundled skills (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`), `/gjc`,
    `/model`, and `/hosts` as Discord slash commands.
 4. Each Discord channel configures one `{hostId, workDir}` input via
    `bot/channels.json`. The daemon canonicalizes `workDir`, so the effective
@@ -61,9 +73,10 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
 **Concurrency limits.** All sessions on a host share one daemon process and one
 JS event loop: concurrent prompts on different workDirs interleave cooperatively
 but do not run in true parallel, and a long synchronous stretch in one session
-can briefly stall the others. See `CONTEXT.md` → "Concurrency model: single event
-loop (current SDK 0.12.21)" for the full model and the subprocess option
-(tracked in #33).
+can briefly stall the others. See `CONTEXT.md` → "Concurrency model: current
+in-process topology" for the source-level model, the historical 0.12.21
+isolation evidence, and separately evaluated external-session options (tracked
+in #33).
 
 > **Node requirement:** the root package and `bot/` declare `"engines": {
 > "node": ">=26.0.0" }`. Node 24 on Windows has been observed in CI to crash
@@ -78,14 +91,15 @@ loop (current SDK 0.12.21)" for the full model and the subprocess option
 
 | Component | Native Linux | Native Windows | macOS | Docker |
 | --- | --- | --- | --- | --- |
-| Bot | Documented | Documented with supervisor limitations | Unsupported native-control target | Linux release candidate |
-| Daemon | Documented | Documented for x64 with supervisor limitations | Unsupported native-control target | Design only; no runnable image |
+| Bot | Foreground command documented; no service unit or installer shipped | Foreground command documented; no service wrapper or installer shipped | Unsupported native-control target | Linux release candidate; no supported image |
+| Daemon | Foreground command documented; no service unit or installer shipped | Foreground command documented for x64; no service wrapper or installer shipped | Unsupported native-control target | Design only; no runnable image |
 
 Start with the [deployment index](docs/deployment/README.md), then use the
 [bot](docs/deployment/bot.md), [daemon](docs/deployment/daemon.md), and
 [workspace/path](docs/deployment/workspaces-and-paths.md) guides. Platform and
 Docker status is recorded there without promoting design-only or unevidenced
-paths.
+paths. These are foreground/operator guides, not evidence of a completed live
+deployment.
 
 ## Local quick start
 
@@ -93,7 +107,7 @@ Install the repository prerequisites before running `bun install`:
 
 - **Node.js 26 or newer.** Node runs the bot, management CLI, smoke harness,
   and every `node --test` workspace suite.
-- **Bun 1.3.14 or newer.** Bun installs the committed `bun.lock`, runs the
+- **Bun 1.4.0 or newer.** Bun installs the committed `bun.lock`, runs the
   daemon, and must be on `PATH` because daemon integration tests spawn a real
   Bun child even when `npm test` is launched with Node.
 - **A native C++ build toolchain supported by `node-gyp`.** The
@@ -166,14 +180,14 @@ bun run --filter '@gjc-remote/bot' register    # publish slash commands to Disco
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
 bun run --filter '@gjc-remote/bot' start
 
-# On each machine you want to control (requires Bun 1.3.14 or newer):
+# On each machine you want to control (requires Bun 1.4.0 or newer):
 cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bot's HOST_TOKENS), BOT_WS_URL
 bun run --filter '@gjc-remote/daemon' start
 ```
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
-daemon runs on Bun (>=1.3.14) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.12.21**
+daemon runs on Bun (>=1.4.0) and embeds the
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.16.4**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
@@ -185,11 +199,34 @@ report a Node 26 major to `process.versions.node`, so `bot/src/node-version-guar
 it. `bun run --filter '@gjc-remote/bot' start` (no `--bun`) is fine: Bun just
 shells out to the `node src/bot.js` package script on PATH.
 
-> **SDK update:** `@gajae-code/coding-agent` is pinned to **0.12.21**.
-> This supersedes the previous 0.12.7 pin. Verification passed on 2026-08-09:
-> package/lock reconciliation, canonical SDK imports, root/workspace regression
-> suites, local smoke (`SMOKE_OK`), and manual bot/daemon runtime execution.
-> Provider/model switch coverage remains environment-dependent.
+The integration boundary remains narrow. `gjc-remote` owns host authentication,
+Discord routing, workDir canonicalization, and workspace admission/lifecycle
+policy. The embedded SDK runtime owns provider/model catalogs, authentication,
+and agent-turn semantics; the bridge resolves remote selectors and relays
+controls without replacing those runtime semantics. The SDK's Broker/Router
+surfaces are reserved for separate evaluation as a possible future
+external-session path. Neither is wired into this repository, and this upgrade
+implements no Broker/Router or product-policy migration.
+
+SDK 0.16.4 replaces the retired bundled `team` command with `autoresearch`.
+After deploying this upgrade, run `npm run register` from `bot/` to replace
+the guild slash-command catalog. Registration is an explicit operator action;
+upgrading dependencies alone does not change Discord's stored commands.
+
+> **SDK update status:** `@gajae-code/coding-agent` is pinned to **0.16.4** and
+> the daemon requires **Bun 1.4.0 or newer**. The
+> [current scoped isolation evidence](docs/verification/issue62-evidence.md)
+> distinguishes per-workDir policy from unscoped SDK state. Adapter regressions,
+> the real-SDK contract oracle, canonical imports, and local smoke are separate
+> candidate checks; they do not establish tenant isolation or Broker/Router
+> compatibility. Historical release attestations do not transfer to this pin.
+>
+> **Historical 0.12.21 verification:** that pin superseded 0.12.7, and its
+> 2026-08-09 verification covered package/lock reconciliation, canonical SDK
+> imports, root/workspace regression suites, local smoke (`SMOKE_OK`), and
+> manual bot/daemon runtime execution. Provider/model switch coverage was
+> environment-dependent. This is retained as old-run evidence, not evidence for
+> 0.16.4.
 
 **Optional environment variables** — beyond the required keys above:
 
@@ -322,6 +359,10 @@ distributed binary is unsigned; signed provenance remains a required, still-open
 release-owner item, along with hash pinning, artifact provenance,
 service-account configuration, and production Windows evidence.
 
+This supervisor material is evaluation and operator guidance only. The
+repository ships no native service installer, Windows service wrapper, or
+systemd unit, and it does not claim a completed live supervised deployment.
+
 Direct `sc.exe` service registration is the documented Windows fallback when
 Shawl is unsuitable, with a known cost: Bun/Node do not implement the Windows
 Service Control API, so a directly registered service cannot acknowledge a stop
@@ -357,7 +398,7 @@ cannot satisfy its evidence gates:
 ```text
 # from the repository root
 cd bot    && node src/bot.js
-cd daemon && bun src/daemon.js   # Bun >= 1.3.14
+cd daemon && bun src/daemon.js   # Bun >= 1.4.0
 ```
 
 Foreground execution does not roll back an application artifact, runtime,

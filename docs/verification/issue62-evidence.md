@@ -1,6 +1,6 @@
 # Issue #62 SDK isolation probe
 
-Status: focused real-SDK probe for the approved issue #62 boundary. The probe checks the installed daemon dependency `@gajae-code/coding-agent` **0.12.21** with Bun **1.3.14**. Each receipt carries separate `approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of the approved base. A deterministic SHA-256 digest covers these four files, in this exact order: `daemon/test-fixtures/sdk-isolation-probe.mjs`, `daemon/test/sdk-isolation-probe.test.js`, `docs/verification/issue62-evidence.md`, `CONTEXT.md`.
+Status: focused real-SDK probe for the approved issue #62 boundary. The runnable probe targets the installed daemon dependency `@gajae-code/coding-agent` **0.16.4** with Bun **1.4.0 or newer**. Each receipt carries separate `approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of the approved base. A deterministic SHA-256 digest covers these four files, in this exact order: `daemon/test-fixtures/sdk-isolation-probe.mjs`, `daemon/test/sdk-isolation-probe.test.js`, `docs/verification/issue62-evidence.md`, `CONTEXT.md`.
 The focused wrapper requires Node **>=26**; its `nodeWrapperVersion` field records the actual Node runner separately from Bun's compatibility `nodeVersion` field. The source digest is emitted in the receipt rather than copied here, avoiding a self-referential evidence file.
 
 ## Sanitized receipts
@@ -12,7 +12,46 @@ The Node wrapper is the sole durable receipt writer. It removes any stale output
 
 The Bun fixture writes no repository artifact and emits a bounded structured receipt to stdout only. Raw stdout/stderr and unredacted temporary paths are never persisted. The wrapper owns the final files; this document is the durable reader/reference. Receipts are evidence attachments, not source-controlled proof by themselves.
 
-## Boundary and commands
+## SDK 0.16.4 observed boundary
+
+On 2026-09-06, `node --test daemon/test/sdk-isolation-probe.test.js` passed
+all three tests on native Windows x64, Bun 1.4.0, Node wrapper v26.7.0.
+Both A→B and B→A runs observed:
+
+- SDK-owned `Settings.loadForScope` instances and policies are distinct and
+  remain stable after sibling creation. No global `Settings.init` occurs.
+- A and B retain their own active model and available canonical resolution.
+- Explicit-settings and registered-cwd capability reads select the correct
+  per-workDir provider; the disabled sibling loader is not invoked.
+- An **unregistered** cwd capability lookup and global introspection observe
+  `LAST_CREATED`. These APIs have no session scope in this test; that observation
+  is not evidence that the scoped A/B lookup leaks.
+- Unfiltered canonical model lookup selects provider A in both scopes, while
+  available-model lookup respects A/B policy. Consumers must use the appropriate
+  availability-aware API, not treat unfiltered catalog data as authorization.
+- C has no permitted model and constructs no session; no prompt is submitted.
+- Zero fetch/preconnect calls pass the fixture guard. Startup model-registry
+  polling is disabled before SDK import and unauthenticated discovery providers
+  are disabled in fixture settings. This does not claim network-free production
+  startup or exercise provider credentials, profile activation, or live transport.
+
+The child records SDK-owned session/settings cleanup and explicit fixture-owned
+store cleanup. The Node wrapper owns its temporary root and removes it only
+after the child exits, recording the exact cleanup boundary. Both runs observed
+successful resource cleanup and first-attempt parent removal. A prior standalone
+child removal returned Windows `EPERM`; post-exit removal does not identify
+which process-owned handle or store caused it, and is not reported as child
+cleanup. Standalone diagnostic runs retain their own fail-closed cleanup path.
+
+`sourceIdentity.runtimeHead` names Git HEAD, not uncommitted bytes. The ordered
+working-tree digest identifies only the four listed files. Neither field
+promotes a dirty checkout into release provenance. Artifact receipts include
+actual timestamps and digests; these are regenerated after source edits.
+
+The records below are the **historical 0.12.21 baseline**, not the current
+contents of the mutable receipt paths above.
+
+## Historical 0.12.21 boundary and commands
 
 ```text
 node --test daemon/test/sdk-isolation-probe.test.js

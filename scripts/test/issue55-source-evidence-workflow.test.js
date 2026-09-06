@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import YAML from 'yaml';
@@ -249,7 +249,7 @@ test('documentation keeps source attestation non-promotional', () => {
 
 test('real repository Docker contract pins the current Bun lock', () => {
   const lockDigest = createHash('sha256')
-    .update(execFileSync('git', ['show', 'HEAD:bun.lock']))
+    .update(readFileSync('bun.lock'))
     .digest('hex');
   const dockerfile = readFileSync(
     'deploy/docker/daemon/Dockerfile',

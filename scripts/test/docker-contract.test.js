@@ -28,7 +28,10 @@ const dockerignore = normalizeLines(dockerignoreRaw);
 const deploymentReadme = normalizeLines(deploymentReadmeRaw);
 
 test("bot image pins Bun and Node indexes and never rebuilds signed native code", () => {
-  assert.match(dockerfile, /oven\/bun:1\.3\.14@sha256:[0-9a-f]{64}/);
+  assert.match(
+    dockerfile,
+    /ARG BUN_IMAGE=oven\/bun:1\.4\.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6/,
+  );
   assert.match(dockerfile, /node:26\.8\.1-trixie-slim@sha256:[0-9a-f]{64}/);
   assert.match(dockerfile, /FROM native_control_bundle AS signed-native/);
   assert.equal(

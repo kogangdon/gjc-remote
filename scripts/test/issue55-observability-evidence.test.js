@@ -32,7 +32,7 @@ function fixture() {
   return root;
 }
 function withFixture(fn) { const root = fixture(); try { return fn(root); } finally { rmSync(root, { recursive: true, force: true }); } }
-const testEnvironment = { architecture: 'x64', bunVersion: '1.3.14', nodeVersion: 'v26.0.0', platform: 'linux' };
+const testEnvironment = { architecture: 'x64', bunVersion: '1.4.0', nodeVersion: 'v26.0.0', platform: 'linux' };
 function commit(root) { return git(root, ['rev-parse', 'HEAD']).trim(); }
 
 test('workspace bin target is committed executable before Bun linking', () => {

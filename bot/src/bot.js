@@ -33,6 +33,7 @@ import {
   formatDeliveryError,
 } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
+import { deliverGateAnswer } from "./gate-answer.js";
 import { HostRegistry, extractAssistantText } from "./host-registry.js";
 import { formatHostList } from "./host-projection.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
@@ -265,7 +266,8 @@ const toolLogStore = new ToolLogStore();
 // #35: channelId -> { hostId, requestId, gateId } for a workflow gate currently
 // awaiting a user's answer in that channel. While an entry exists, the next
 // message in the channel is routed to the daemon as the gate answer rather than
-// starting a new prompt. Cleared when answered or when the invoke settles.
+// starting a new prompt. Cleared only after confirmed acceptance or when the
+// invoke settles.
 const pendingGateByChannel = new Map();
 
 const client = new Client({
@@ -389,26 +391,20 @@ async function handleAuthorizedMessage(message) {
 
   // #35: if a workflow gate is awaiting an answer in this channel, route this
   // message to the daemon as the gate answer instead of starting a new prompt.
-  const pendingGate = pendingGateByChannel.get(message.channelId);
-  if (pendingGate) {
-    pendingGateByChannel.delete(message.channelId);
-    const result = registry.answerGate(
-      pendingGate.hostId,
-      pendingGate.requestId,
-      pendingGate.gateId,
-      prompt
-    );
-    if (result.ok) {
-      await message.react("✅").catch(() => {});
-      return;
-    }
-    // #35: the gate is stale (e.g. the run already resumed without our answer, or
-    // the host dropped). Rather than swallow the user's message, fall through and
-    // treat it as an ordinary prompt.
-    console.warn(
-      `gjc-remote bot: stale gate answer for channel ${message.channelId}: ${result.error}; treating as a new prompt.`
-    );
-  }
+  const gateHandled = await deliverGateAnswer({
+    pendingGateByChannel,
+    channelId: message.channelId,
+    answer: prompt,
+    answerGate: registry.answerGate.bind(registry),
+    onAccepted: () => message.react("✅").catch(() => {}),
+    onRejected: ({ retryable }) =>
+      message.reply(
+        noMentions(retryable
+          ? "That answer was not accepted. Reply again to answer the same gate."
+          : "That answer was not accepted and the original gate is no longer available. No new prompt was sent.")
+      ).catch(() => {}),
+  });
+  if (gateHandled) return;
 
   if (!registry.isOnline(route.hostId)) {
     await message.reply(noMentions(`Host '${route.hostId}' is not connected right now.`)).catch(() => {});

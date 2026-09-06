@@ -11,6 +11,7 @@ import {
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+  isGateAnswerResultEvent,
 } from "@gjc-remote/shared";
 import {
   fingerprintManagedMappingRecord,
@@ -279,6 +280,64 @@ async function startReadinessDaemon({
     },
   };
 }
+
+test("daemon confirms actual gate acceptance and preserves rejected-answer retry", async () => {
+  const workDir = await mkdtemp(join(tmpdir(), "gjc-gate-wire-"));
+  const requestId = "gate-wire-request";
+  const answer = (socket, gateId, answerId, value) => socket.send(JSON.stringify({
+    type: "answer", requestId, gateId, answerId, answer: value,
+  }));
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(new URL("../test-fixtures/gate-answer-daemon.mjs", import.meta.url)),
+    testInjection: false,
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: ["invoke", "set_model", "heartbeat"],
+    },
+    envOverrides: {
+      GJC_READINESS_V2: "0",
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+    },
+    afterRegisterResponse(socket) {
+      socket.send(JSON.stringify({
+        type: "invoke", requestId, workDir,
+        command: { kind: "prompt", message: "gate fixture" },
+      }));
+    },
+    onMessage(message, socket) {
+      if (message.event?.type === "gate_request") {
+        if (message.event.gateId === "first") answer(socket, "first", "invalid", "no");
+        else answer(socket, "second", "second-valid", "yes");
+      }
+      if (message.event?.type === "gate_answer_result" && message.event.answerId === "invalid") {
+        answer(socket, "first", "first-valid", "yes");
+      }
+    },
+  });
+  try {
+    await waitForFrame(daemon.frames, (frame) =>
+      frame.event?.answerId === "second-valid", "successor answer receipt");
+    await waitForFrame(daemon.frames, (frame) => frame.requestId === requestId && frame.done === true, "completed gate fixture");
+    const receipts = daemon.frames.filter((frame) => frame.event?.type === "gate_answer_result");
+    assert.equal(receipts.length, 3);
+    for (const frame of receipts) {
+      assert.equal(frame.requestId, requestId);
+      assert.equal(isGateAnswerResultEvent(frame.event), true);
+    }
+    assert.equal(receipts.find((frame) => frame.event.answerId === "invalid").event.accepted, false);
+    assert.equal(receipts.find((frame) => frame.event.answerId === "first-valid").event.accepted, true);
+    assert.equal(receipts.find((frame) => frame.event.answerId === "second-valid").event.accepted, true);
+    assert.equal(JSON.stringify(daemon.frames).includes("fixture-private-rejection"), false);
+    assert.equal(daemon.frames.filter((frame) => frame.done === true).length, 1);
+  } finally {
+    await daemon.stop();
+    await rm(workDir, { recursive: true, force: true });
+  }
+});
 
 test("observability IPC requires both dedicated test gate terms and stays out of WS frames", async () => {
   for (const {

@@ -11,7 +11,7 @@ From the repository root, run components independently:
 
 ```sh
 cd bot && node src/bot.js       # Node.js 26 or newer
-cd daemon && bun src/daemon.js  # Bun 1.3.14 or newer
+cd daemon && bun src/daemon.js  # Bun 1.4.0 or newer
 ```
 
 Foreground execution is the operational fallback when supervision ownership,

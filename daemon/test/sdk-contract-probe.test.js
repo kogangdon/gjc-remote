@@ -1,0 +1,375 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+const testFile = fileURLToPath(import.meta.url);
+const daemonDir = resolve(dirname(testFile), "..");
+const fixture = join(daemonDir, "test-fixtures", "sdk-contract-probe.mjs");
+const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
+const SDK_VERSION = "0.16.4";
+const CHILD_TIMEOUT_MS = 25_000;
+const MAX_OUTPUT_BYTES = 64 * 1024;
+const SECRET_ASSIGNMENT =
+  /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|authorization|cookie|credential|broker[_ -]?(?:key|token)|oauth[_ -]?token)\s*[:=]\s*["']?[^\s,"'}]+/i;
+
+function childEnvironment(root) {
+  const inheritedNames = [
+    "PATH",
+    "Path",
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "COMSPEC",
+    "PATHEXT",
+    "BUN_INSTALL",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "OS",
+    "LANG",
+    "LC_ALL",
+  ];
+  const env = {};
+  for (const name of inheritedNames) {
+    if (process.env[name]) env[name] = process.env[name];
+  }
+  const home = join(root, "home");
+  const temp = join(root, "tmp");
+  Object.assign(env, {
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: join(root, "appdata"),
+    LOCALAPPDATA: join(root, "localappdata"),
+    TMP: temp,
+    TEMP: temp,
+    XDG_CONFIG_HOME: join(root, "xdg-config"),
+    XDG_CACHE_HOME: join(root, "xdg-cache"),
+    SDK_CONTRACT_ROOT: join(root, "owned"),
+    CI: "1",
+    NO_COLOR: "1",
+  });
+  return env;
+}
+
+async function removeRoot(root) {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await rm(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== "EBUSY" && error?.code !== "EPERM") throw error;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    }
+  }
+  throw lastError;
+}
+
+function parseReceipt(stdout) {
+  const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      const value = JSON.parse(lines[index]);
+      if (value?.schema === RECEIPT_SCHEMA) return value;
+    } catch {
+      // Bun diagnostics may precede the bounded receipt.
+    }
+  }
+  assert.fail("real SDK contract fixture emitted no structured receipt");
+}
+
+function failureSummary(receipt, signal) {
+  const safeCode = (value, fallback) =>
+    typeof value === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(value)
+      ? value
+      : fallback;
+  const parts = [safeCode(receipt?.code, safeCode(signal, "unknown"))];
+  if (receipt?.primaryFailure && typeof receipt.primaryFailure === "object") {
+    parts.push(
+      `${safeCode(receipt.primaryFailure.stage, "stage")}:${safeCode(
+        receipt.primaryFailure.code,
+        "failure"
+      )}`
+    );
+    const state = receipt.primaryFailure.state;
+    if (state && typeof state === "object" && !Array.isArray(state)) {
+      const stateKeys = [
+        "followUpStatus",
+        "followUpFailureCode",
+        "initialStatus",
+        "rawTerminalCount",
+        "publicTerminalCount",
+        "publicTerminalCountAtAdmission",
+        "agentStreaming",
+        "executableSteeringCount",
+        "executableFollowUpCount",
+        "displayQueueCount",
+        "primaryProviderCallCount",
+        "consumedMessageStarts",
+      ];
+      const safeState = [];
+      for (const key of stateKeys) {
+        const value = state[key];
+        if (typeof value === "boolean") {
+          safeState.push(`${key}=${value}`);
+        } else if (typeof value === "number" && Number.isFinite(value)) {
+          safeState.push(`${key}=${Math.trunc(value)}`);
+        } else if (
+          typeof value === "string" &&
+          /^[A-Za-z0-9._:<>=-]{0,96}$/.test(value)
+        ) {
+          safeState.push(`${key}=${value}`);
+        }
+      }
+      if (safeState.length > 0) parts.push(`state[${safeState.join(";")}]`);
+    }
+  }
+  if (Array.isArray(receipt?.cleanupFailures)) {
+    for (const failure of receipt.cleanupFailures.slice(0, 16)) {
+      if (!failure || typeof failure !== "object") continue;
+      parts.push(
+        `${safeCode(failure.operation, "cleanup")}:${safeCode(
+          failure.code,
+          "failure"
+        )}`
+      );
+    }
+  }
+  return parts.join(", ");
+}
+
+function spawnProbe(root) {
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(process.env.BUN_BIN || "bun", [fixture], {
+      cwd: root,
+      env: childEnvironment(root),
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let overflow = false;
+    let settled = false;
+    let killTimer;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (!settled) child.kill("SIGKILL");
+      }, 2_000);
+      killTimer.unref?.();
+    }, CHILD_TIMEOUT_MS);
+
+    const append = (target, chunk) => {
+      const next = target + chunk.toString("utf8");
+      if (Buffer.byteLength(next) > MAX_OUTPUT_BYTES) {
+        overflow = true;
+        child.kill("SIGTERM");
+        return target;
+      }
+      return next;
+    };
+    child.stdout.on("data", (chunk) => {
+      stdout = append(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = append(stderr, chunk);
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      clearTimeout(killTimer);
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+      clearTimeout(killTimer);
+      if (settled) return;
+      settled = true;
+      resolveResult({ code, signal, stdout, stderr, overflow });
+    });
+  });
+}
+
+test(
+  "SDK 0.16.4 real AgentSession contracts govern follow-ups, gates, failures, and disposal",
+  { timeout: 30_000 },
+  async () => {
+    assert.ok(existsSync(fixture), "real SDK contract fixture is missing");
+    const root = await mkdtemp(join(tmpdir(), "gjc-sdk-contract-"));
+    await Promise.all([
+      mkdir(join(root, "home"), { recursive: true }),
+      mkdir(join(root, "tmp"), { recursive: true }),
+    ]);
+
+    let result;
+    try {
+      result = await spawnProbe(root);
+    } finally {
+      await removeRoot(root);
+    }
+
+    assert.equal(result.overflow, false, "real SDK contract fixture exceeded its output bound");
+    assert.doesNotMatch(result.stdout, SECRET_ASSIGNMENT, "fixture stdout exposed credential material");
+    assert.doesNotMatch(result.stderr, SECRET_ASSIGNMENT, "fixture stderr exposed credential material");
+    assert.equal(result.stdout.includes(root), false, "fixture stdout exposed its owned root");
+    assert.equal(result.stderr.includes(root), false, "fixture stderr exposed its owned root");
+
+    const receipt = parseReceipt(result.stdout);
+    assert.equal(
+      result.code,
+      0,
+      `real SDK contract fixture failed (${failureSummary(receipt, result.signal)})`
+    );
+    assert.equal(receipt.ok, true);
+    assert.equal(receipt.sdkVersionExpected, SDK_VERSION);
+    assert.equal(receipt.sdkVersionObserved, SDK_VERSION);
+    assert.equal(receipt.daemonDependencyVersion, SDK_VERSION);
+    assert.deepEqual(receipt.upgradeAssessment, {
+      verdict: "BLOCK",
+      oracleStatus: "completed",
+      reasonCodes: ["SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED"],
+    });
+    assert.deepEqual(receipt.environment, {
+      credentialVariableCount: 0,
+      networkAttempts: 0,
+      settingsAndStateOwnedByFixture: true,
+    });
+    assert.equal(existsSync(root), false, "parent wrapper did not remove its fixture root");
+    assert.deepEqual(receipt.cleanup, {
+      harnessCount: 6,
+      sdkResourcesClosed: true,
+      modelCacheStates: ["closed", "closed", "closed", "closed", "closed", "closed"],
+      filesystemRemoval: {
+        owner: "parent-wrapper",
+        childAttempted: false,
+        mustRunAfterChildExit: true,
+      },
+    });
+
+    assert.deepEqual(receipt.followUps.providerPrompts, [
+      "initial",
+      "follow-one",
+      "follow-two",
+      "queued-next",
+    ]);
+    assert.equal(receipt.followUps.sharedRunTerminalCount, 1);
+    assert.equal(receipt.followUps.totalTerminalCount, 2);
+    assert.equal(receipt.followUps.followUpsSettledAtSharedTerminal, true);
+    assert.equal(receipt.followUps.queuedModelSwitchSettled, true);
+    assert.equal(receipt.followUps.queuedPromptWaitedForSharedRun, true);
+    assert.equal(receipt.followUps.finalModelId, "secondary");
+
+    assert.deepEqual(receipt.sameTextQueueDivergence, {
+      rawListenerPrecedesAgentSession: true,
+      admissionTrigger: "raw-agent-start-before-original-message",
+      cleanupTrigger: "original-user-message-start",
+      textCollision: true,
+      displayEntryShape: {
+        idPattern: "followUp:<sequence>",
+        mode: "followUp",
+        label: "Queued",
+      },
+      displayEntryPresentBeforeCleanup: true,
+      displayEntryCountBeforeCleanup: 1,
+      displayEntryAbsentAfterCleanup: true,
+      displayEntryCountAfterCleanup: 0,
+      exactExecutableIdentityRetainedAfterCleanup: true,
+      exactExecutableIdentityRetainedAtPausedTerminal: true,
+      executableFollowUpCountAtPausedTerminal: 1,
+      predecessorStopReason: "paused",
+      followUpPendingAtPredecessorTerminal: true,
+      providerCallCountAtCutoff: 1,
+      followUpRejectedOnDispose: true,
+      rawTerminalCount: 1,
+      publicTerminalCount: 1,
+    });
+
+    assert.deepEqual(receipt.nearTerminalQueue, {
+      rawListenerPrecedesAgentSession: true,
+      admissionContext: "independent-host-async-resource",
+      publicTerminalCountAtAdmission: 0,
+      followUpStatusAfterRawDispatch: "pending",
+      followUpFailureCodeAfterRawDispatch: "NONE",
+      evidenceScope: "unique-text-only",
+      queuedEntry: {
+        idPattern: "followUp:<sequence>",
+        text: "near-terminal-follow-up",
+        mode: "followUp",
+        label: "Queued",
+      },
+      pendingAtPredecessorTerminal: true,
+      publicIdleBoundary: "session.waitForIdle",
+      sdkOutcome: "queued-without-auto-continuation",
+      consumedMessageStartCount: 0,
+      successorProviderCallStarted: false,
+      exactExecutableIdentityRetainedAtIdle: true,
+      executableFollowUpCountAtIdle: 1,
+      pendingAtIdleBoundary: true,
+      rejectedOnDispose: true,
+      rawTerminalCount: 1,
+      publicTerminalCount: 1,
+    });
+
+    assert.equal(receipt.gates.emittedGateCount, 2);
+    assert.equal(receipt.gates.distinctSuccessorGateIds, true);
+    assert.equal(receipt.gates.sdkObjectSchemaObserved, true);
+    assert.equal(receipt.gates.selectionAccepted, true);
+    assert.equal(receipt.gates.invalidCustomRejectedWithoutConsumption, true);
+    assert.equal(receipt.gates.customAcceptedOnRetry, true);
+    assert.equal(receipt.gates.toolResultObservedBothAnswers, true);
+    assert.equal(receipt.gates.terminalCount, 1);
+
+    assert.deepEqual(receipt.failureTerminal, {
+      providerFailureMessageObserved: true,
+      terminalContainsFailure: true,
+      terminalCount: 1,
+      adapterRejected: true,
+    });
+    assert.deepEqual(receipt.disposal, {
+      disposeSettled: true,
+      activeSendRejected: true,
+      underlyingTerminalCount: 0,
+    });
+
+    // SDK 0.16.4 does not publicly export the decision-gate builders. This
+    // oracle deliberately reports that boundary instead of copying a private
+    // approval/execution schema and accidentally turning another fake into truth.
+    assert.deepEqual(receipt.decisionGate, {
+      status: "blocked",
+      blockedCase: "structured_decision_denial",
+      code: "SDK_0_16_4_DECISION_GATE_BUILDERS_NOT_PUBLIC",
+      internalWireSubpathsBlocked: true,
+      fabricatedSchemaUsed: false,
+    });
+    assert.deepEqual(receipt.limitations, {
+      lateFollowUpAutoContinuation: {
+        status: "observed-sdk-gap",
+        code: "SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
+        boundary: "raw-agent-end-before-agent-session-terminal",
+        evidence:
+          "session.waitForIdle resolved while the exact executable follow-up remained queued.",
+      },
+      successorGateCompletion: {
+        status: "not-exercised",
+        code: "COMPLETED_GATE_RECEIPT_NOT_OBSERVED",
+        excludedCase: "accepted-incomplete-predecessor",
+        requiredEvidence: "lookupCompletedResolution.kind=completed",
+      },
+      lateSteerRearm: {
+        status: "not-exercised",
+        code: "LATE_STEER_REARM_NOT_OBSERVED",
+        excludedCase: "steer-rearmed-as-follow-up",
+        reason:
+          "The bounded near-terminal cases exercise follow-up ownership; steering promotion is a distinct SDK path.",
+      },
+    });
+  }
+);

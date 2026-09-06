@@ -1,5 +1,9 @@
 # Issue #63 documentation reconciliation — static evidence
 
+Historical record: all "current" source and SDK references below describe the
+2026-08-10 reconciliation, not the current checkout. The daemon now pins SDK
+0.16.4; these 0.12.21 observations are not rerun or promoted by that upgrade.
+
 This record accompanies the approved documentation-only reconciliation. It is
 intentionally evidence-scoped: it records repository source truth and static
 checks, not a new runtime, native, release, provider, or ACP execution.

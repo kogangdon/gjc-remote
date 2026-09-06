@@ -9,14 +9,24 @@ code on that host. Read [Security](../../SECURITY.md) before provisioning.
 
 | Component | Native status | Container status | Supported platforms |
 | --- | --- | --- | --- |
-| Bot | Foreground available with Node.js >=26; supervisor evidence is platform-specific | Linux-only release candidate; no signed-image release evidence | Native-control: Linux x64/arm64, Windows x64 |
-| Daemon | Foreground available with Bun >=1.3.14 and SDK 0.12.21; supervisor evidence is platform-specific | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
+| Bot | Foreground command documented for Node.js >=26; no native service installer is shipped | Linux-only release candidate; no signed-image release evidence | Native-control: Linux x64/arm64, Windows x64 |
+| Daemon | Foreground command documented for Bun >=1.4.0 and SDK 0.16.4; no native service installer is shipped | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
 | Native control | Observed only on the approved tuples | Used by the bot container candidate only with an externally verified bundle | Linux x64/arm64, Windows x64 |
 
-macOS is not supported for native-control. “Available” describes the current
-foreground execution contract, not boot supervision, production promotion, or
-tenant isolation. “Release candidate” and “future phase” are design/release
-states, not observed production support.
+macOS is not supported for native-control. “Foreground command documented”
+describes only the current command contract, not boot supervision, production
+promotion, or tenant isolation. “Release candidate” and “future phase” are
+design/release states, not observed production support.
+
+No guide in this directory claims a completed live deployment. The repository
+ships no native service installer, Windows service wrapper, or systemd unit;
+supervisor material is evaluation and operator guidance only.
+
+The daemon continues to embed the SDK in-process. `gjc-remote` owns host,
+route, and workspace policy; the SDK runtime owns model/provider catalogs,
+provider authentication, and turn semantics. The Broker/Router surfaces are
+reserved for separate evaluation as a future external-session path, with no
+migration implemented.
 
 ## Choose a guide
 

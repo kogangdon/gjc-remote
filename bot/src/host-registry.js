@@ -2,6 +2,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   CAPABILITIES,
+  GATE_ANSWER_ERROR_CODES,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PING,
@@ -18,6 +19,7 @@ import {
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   isAnswerMessage,
   isEventMessage,
+  isGateAnswerResultEvent,
   isGateRequestEvent,
   isInvokeMessage,
   isMappingGeneration,
@@ -49,6 +51,7 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 const INVOKE_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
+const GATE_ANSWER_TIMEOUT_MS = 30 * 1000;
 const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
 const BINDING_DEADLINE_MS = 10_000;
@@ -203,6 +206,7 @@ export class HostRegistry {
    *   heartbeatTimeoutMs?: number,
    *   invokeIdleTimeoutMs?: number,
    *   invokeHardCapMs?: number,
+   *   gateAnswerTimeoutMs?: number,
    *   workspaceServingEnabled?: boolean,
    *   timers?: typeof SYSTEM_TIMERS,
    *   now?: () => number,
@@ -218,6 +222,7 @@ export class HostRegistry {
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
     invokeIdleTimeoutMs = INVOKE_IDLE_TIMEOUT_MS,
     invokeHardCapMs = INVOKE_HARD_CAP_MS,
+    gateAnswerTimeoutMs = GATE_ANSWER_TIMEOUT_MS,
     workspaceServingEnabled = false,
     timers = SYSTEM_TIMERS,
     now = () => Date.now(),
@@ -240,11 +245,19 @@ export class HostRegistry {
     if (!isPositiveDuration(invokeHardCapMs)) {
       throw new Error("invokeHardCapMs must be a positive duration");
     }
+    if (
+      !Number.isInteger(gateAnswerTimeoutMs) ||
+      gateAnswerTimeoutMs < 1 ||
+      gateAnswerTimeoutMs > GATE_ANSWER_TIMEOUT_MS
+    ) {
+      throw new Error("gateAnswerTimeoutMs must be an integer from 1 to 30000");
+    }
     this.tokensByHostId = tokensByHostId;
     this.heartbeatTimeoutMs = heartbeatTimeoutMs;
     this.invokeIdleTimeoutMs = invokeIdleTimeoutMs;
     this.workspaceServingEnabled = workspaceServingEnabled === true;
     this.invokeHardCapMs = invokeHardCapMs;
+    this.gateAnswerTimeoutMs = gateAnswerTimeoutMs;
     this.bindingDeadlineMs = BINDING_DEADLINE_MS;
     this.timers = timers;
     this.now = now;
@@ -255,6 +268,8 @@ export class HostRegistry {
     this.heartbeatStates = new Map();
     /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string, truncated?: boolean }>} */
     this.pendingRequests = new Map();
+    /** @type {Map<string, { answerId: string, requestId: string, gateId: string, socket: import("ws").WebSocket, pending: object, timer?: object, resolve: (v: any) => void }>} */
+    this.pendingGateAnswers = new Map();
     /** @type {Map<import("ws").WebSocket, number>} */
     this.pendingCountBySocket = new Map();
     /** @type {Map<string, { protocolVersion: number, capabilities: string[] }>} */
@@ -526,6 +541,19 @@ export class HostRegistry {
       return;
     }
 
+    if (msg.event?.type === MSG_TYPES.GATE_ANSWER_RESULT) {
+      if (
+        msg.done !== undefined ||
+        msg.error !== undefined ||
+        !isGateAnswerResultEvent(msg.event)
+      ) {
+        socket.close(1008, "invalid gate answer result");
+        return;
+      }
+      this.#acceptGateAnswerResult(socket, msg.requestId, msg.event);
+      return;
+    }
+
     const pending = this.pendingRequests.get(msg.requestId);
     if (!pending) return;
     if (pending.socket !== socket) {
@@ -576,9 +604,6 @@ export class HostRegistry {
         const text = extractAssistantText(event);
         if (text !== undefined) pending.text = text;
       }
-      // Any non-gate event means the agent resumed, so the gate (if any) resolved.
-      pending.gatePending = false;
-      pending.gateId = undefined;
       pending.onEvent(event);
       this.#armIdleTimer(pending);
     }
@@ -1582,6 +1607,55 @@ export class HostRegistry {
       action: "retry_later",
     };
   }
+
+  #settleGateAnswer(entry, result) {
+    if (this.pendingGateAnswers.get(entry.answerId) !== entry) return false;
+    this.pendingGateAnswers.delete(entry.answerId);
+    this.timers.clearTimeout(entry.timer);
+    entry.timer = undefined;
+    if (entry.pending.gateAnswers?.get(entry.gateId) === entry) {
+      entry.pending.gateAnswers.delete(entry.gateId);
+    }
+    entry.resolve(result);
+    return true;
+  }
+
+  #acceptGateAnswerResult(socket, requestId, event) {
+    const entry = this.pendingGateAnswers.get(event.answerId);
+    if (
+      !entry ||
+      entry.socket !== socket ||
+      entry.requestId !== requestId ||
+      entry.gateId !== event.gateId
+    ) {
+      return;
+    }
+
+    if (!event.accepted) {
+      this.#settleGateAnswer(entry, {
+        ok: false,
+        error: "gate answer was rejected",
+        code: event.errorCode,
+      });
+      return;
+    }
+
+    const pending = entry.pending;
+    // The SDK may publish a successor before the predecessor's answer receipt
+    // arrives. Retire only the exact accepted predecessor.
+    if (pending.gatePending && pending.gateId === entry.gateId) {
+      pending.gatePending = false;
+      pending.gateId = undefined;
+    }
+    this.#settleGateAnswer(entry, { ok: true });
+    if (
+      !pending.gatePending &&
+      this.pendingRequests.get(requestId) === pending
+    ) {
+      this.#armIdleTimer(pending);
+    }
+  }
+
   #armIdleTimer(pending) {
     // #35: while a gate is pending the invoke is deliberately not idle-bounded
     // (it is waiting on a human); never re-arm until the gate is answered.
@@ -1624,6 +1698,14 @@ export class HostRegistry {
       if (pending.socket !== socket) continue;
       pending.resolve({ ok: false, error });
       this.#deletePending(requestId);
+    }
+    for (const entry of [...this.pendingGateAnswers.values()]) {
+      if (entry.socket !== socket) continue;
+      this.#settleGateAnswer(entry, {
+        ok: false,
+        error: "host disconnected before gate answer was confirmed",
+        code: GATE_ANSWER_ERROR_CODES.FAILED,
+      });
     }
   }
 
@@ -1799,6 +1881,13 @@ export class HostRegistry {
         this.#clearHeartbeat(socket);
       }
       socket.terminate();
+    }
+    for (const entry of [...this.pendingGateAnswers.values()]) {
+      this.#settleGateAnswer(entry, {
+        ok: false,
+        error: "host disconnected before gate answer was confirmed",
+        code: GATE_ANSWER_ERROR_CODES.FAILED,
+      });
     }
     this.connections.clear();
     this.hostInfo.clear();
@@ -2196,6 +2285,7 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         hardCapTimer: undefined,
         gatePending: false,
         gateId: undefined,
+        gateAnswers: new Map(),
         settle: (result, terminalPhase) => {
           if (settled) return;
           settled = true;
@@ -2247,31 +2337,51 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
   }
 
   /**
-   * #35: deliver a user's answer to a pending workflow gate on an in-flight
-   * invoke. Sends an `answer` frame to the owning daemon and re-arms the invoke
-   * idle timer (so the daemon's continuation is bounded again). Returns a
-   * synchronous result; a stale gateId or resolved/missing request is rejected
-   * without side effects.
+   * Deliver a user's answer to a pending workflow gate and await the daemon's
+   * receipt for that exact attempt. A rejection or bounded receipt timeout
+   * retains the gate so the user can retry. The invoke idle timer resumes only
+   * after an accepted receipt retires the currently presented gate.
    *
    * @param {string} hostId
    * @param {string} requestId
    * @param {string} gateId
    * @param {string} answer
    */
-  answerGate(hostId, requestId, gateId, answer) {
+  async answerGate(hostId, requestId, gateId, answer) {
     const pending = this.pendingRequests.get(requestId);
     if (!pending) {
       return { ok: false, error: "no in-flight request for that answer" };
     }
     const socket = this.connections.get(hostId);
-    if (!socket || socket !== pending.socket) {
+    if (
+      !socket ||
+      socket !== pending.socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
       return { ok: false, error: `host '${hostId}' is not connected` };
     }
     if (!pending.gatePending || pending.gateId !== gateId) {
       return { ok: false, error: "no matching pending gate for that answer" };
     }
+    if (pending.gateAnswers.has(gateId)) {
+      return { ok: false, error: "an answer for that gate is already pending" };
+    }
+    let outstanding = 0;
+    for (const entry of this.pendingGateAnswers.values()) {
+      if (entry.socket === socket) outstanding += 1;
+    }
+    if (outstanding >= V0_LIMITS.MAX_PENDING_PER_HOST) {
+      return { ok: false, error: "host has too many unconfirmed gate answers" };
+    }
 
-    const message = { type: MSG_TYPES.ANSWER, requestId, gateId, answer };
+    const answerId = randomUUID();
+    const message = {
+      type: MSG_TYPES.ANSWER,
+      requestId,
+      gateId,
+      answerId,
+      answer,
+    };
     if (!isAnswerMessage(message)) {
       return { ok: false, error: "invalid gate answer" };
     }
@@ -2285,13 +2395,44 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       return { ok: false, error: "gate answer exceeds WebSocket payload limit" };
     }
 
-    // The gate is answered: stop suppressing the idle timer and re-arm it so the
-    // daemon's post-answer continuation is bounded like any other streamed work.
-    pending.gatePending = false;
-    pending.gateId = undefined;
-    this.#armIdleTimer(pending);
-    socket.send(payload);
-    return { ok: true };
+    return new Promise((resolve) => {
+      const entry = {
+        answerId,
+        requestId,
+        gateId,
+        socket,
+        pending,
+        timer: undefined,
+        resolve,
+      };
+      pending.gateAnswers.set(gateId, entry);
+      this.pendingGateAnswers.set(answerId, entry);
+      entry.timer = this.timers.setTimeout(() => {
+        this.#settleGateAnswer(entry, {
+          ok: false,
+          error: "timed out waiting for gate answer receipt",
+          code: GATE_ANSWER_ERROR_CODES.FAILED,
+        });
+      }, this.gateAnswerTimeoutMs);
+      entry.timer?.unref?.();
+
+      try {
+        socket.send(payload, (error) => {
+          if (!error) return;
+          this.#settleGateAnswer(entry, {
+            ok: false,
+            error: "failed to send gate answer",
+            code: GATE_ANSWER_ERROR_CODES.FAILED,
+          });
+        });
+      } catch {
+        this.#settleGateAnswer(entry, {
+          ok: false,
+          error: "failed to send gate answer",
+          code: GATE_ANSWER_ERROR_CODES.FAILED,
+        });
+      }
+    });
   }
 }
 

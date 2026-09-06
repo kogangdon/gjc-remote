@@ -26,12 +26,24 @@ const [
 const seccomp = JSON.parse(seccompRaw);
 
 test("daemon image pins runtime, lock, SDK, source, and signed native inputs", () => {
-  assert.match(dockerfile, /oven\/bun:1\.3\.14@sha256:[0-9a-f]{64}/);
-  assert.match(dockerfile, /LOCK_SHA256=[0-9a-f]{64}/);
+  assert.match(
+    dockerfile,
+    /ARG BUN_IMAGE=oven\/bun:1\.4\.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6/,
+  );
+  assert.match(
+    dockerfile,
+    /ARG LOCK_SHA256=21d6506aa65b3ae94601503329b8ebf853612e60c7bc2f5aa9c7365717725f0e/,
+  );
   assert.match(dockerfile, /sha256sum --check --strict/);
   assert.match(dockerfile, /bun install --frozen-lockfile --production --ignore-scripts/);
   assert.match(dockerfile, /--filter @gjc-remote\/daemon/);
-  assert.match(dockerfile, /p\.version!=="0\.12\.21"/);
+  assert.match(dockerfile, /p\.version!=="0\.16\.4"/);
+  assert.match(
+    dockerfile,
+    /org\.opencontainers\.image\.base\.name="oven\/bun:1\.4\.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6"/,
+  );
+  assert.match(dockerfile, /io\.gjc-remote\.lock\.sha256="\$\{LOCK_SHA256\}"/);
+  assert.match(dockerfile, /io\.gjc-remote\.sdk\.version="0\.16\.4"/);
   assert.match(dockerfile, /FROM native_control_bundle AS signed-native/);
   assert.equal(dockerfile.match(/COPY --chmod=0444 --from=signed-native/g)?.length, 3);
   assert.match(dockerfile, /bun native-control\/scripts\/verify-build\.mjs --require-signature/);

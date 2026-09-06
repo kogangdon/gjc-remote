@@ -7,7 +7,7 @@
 
 ## Context
 
-`bot/` is a Node process and `daemon/` is a Bun process (`>=1.3.14`) that embeds the GJC SDK. Neither process daemonizes itself. A bot host needs one long-lived bot process; each remote host needs one outbound daemon process. A supervisor must restart an unexpected exit without changing relay, reconnect, shutdown, or session-pool behavior.
+`bot/` is a Node process and `daemon/` is a Bun process (`>=1.4.0`) that embeds the GJC SDK. Neither process daemonizes itself. A bot host needs one long-lived bot process; each remote host needs one outbound daemon process. A supervisor must restart an unexpected exit without changing relay, reconnect, shutdown, or session-pool behavior.
 
 The design must not turn a service name into a host identity, leak credentials into service metadata, claim a drain that the application cannot guarantee, or silently modify host-global logging policy.
 
@@ -109,7 +109,7 @@ Out of scope are product source edits, protocol/SDK/reconnect/shutdown/session-p
 
 ```text
 bot/:    node src/bot.js
-daemon/: bun src/daemon.js   # Bun >= 1.3.14
+daemon/: bun src/daemon.js   # Bun >= 1.4.0
 ```
 
 ### Supported Windows host boundary

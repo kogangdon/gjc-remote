@@ -80,7 +80,7 @@ function assertContract(source) {
   assert.deepEqual(value.jobs.verify.steps[0].with, { ref: '${{ needs.generate.outputs.commit }}', 'fetch-depth': 1, 'persist-credentials': false });
   assert.deepEqual(value.jobs.generate.steps[1].with, { 'node-version': '26.0.0', 'check-latest': false });
   assert.deepEqual(value.jobs.verify.steps[1].with, { 'node-version': '26.0.0', 'check-latest': false });
-  assert.deepEqual(value.jobs.generate.steps[2].with, { 'bun-version': '1.3.14', 'no-cache': true });
+  assert.deepEqual(value.jobs.generate.steps[2].with, { 'bun-version': '1.4.0', 'no-cache': true });
   assert.deepEqual(value.jobs.generate.steps[4].with, {
     name: 'untrusted-issue55-observability-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}',
     path: `${receiptFiles.join('\n')}\n`, 'retention-days': 1, overwrite: false, 'if-no-files-found': 'error',
@@ -113,7 +113,7 @@ function assertContract(source) {
     job.steps.filter((step) => step.run).map((step) => [`${jobName}:${step.name}`, createHash('sha256').update(step.run).digest('hex')])));
   assert.deepEqual(runDigests, {
     'validate:Verify exact current main revision': 'd515d7c65070826898be17a0910cfb86e0ca41fa5c23b6da4f1f477a53868d69',
-    'generate:Generate and verify observability receipt': 'fc64d5c58e6284b6828c3303b9e1bb4b17afb28854c639f56a7d3ab3c76acb18',
+    'generate:Generate and verify observability receipt': '0af8e74bca463d1504ecedaa8f81d35800acb83312bc2d31660aa19187e50fdd',
     'generate:Remove observability directory': '0d79795385ede5c43816bab9432d3f7b7d72520b8a65d849577f112134cfe3fa',
     'verify:Reverify exact observability bytes': 'f285e3ef5111a1aa2b48672b7439bebcd9ed8f9ea9bff7640ce05bca054e5d66',
     'verify:Remove verification directory': '0d79795385ede5c43816bab9432d3f7b7d72520b8a65d849577f112134cfe3fa',

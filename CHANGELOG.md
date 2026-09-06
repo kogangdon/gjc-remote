@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade blocker
+
+- SDK 0.16.4 does not automatically continue a follow-up admitted after the
+  active run's queue cutoff. The real SDK oracle observes `waitForIdle()`
+  resolving with the exact executable message still queued and no successor
+  run; disposal rejects the pending remote control without false completion.
+  Its defect-detection test passes, but `upgradeAssessment.verdict` is `BLOCK`
+  (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). Passing workspace tests and
+  local smoke do not clear this upgrade or authorize release.
+  Independent review approves adapter ownership safety, not successor
+  delivery: this is an SDK liveness defect, not false completion. That scoped
+  approval does not change the recorded upgrade block. The oracle proves
+  explicit disposal, not automatic timeout expiry. Repair belongs in the
+  SDK's lifecycle-owned queue wakeup; no remote FIFO policy change or
+  lower-level continuation bypass is included.
+
+### Changed
+
+- Upgrade the embedded GJC SDK to 0.16.4 and require Bun 1.4.0 or newer.
+  Align CI, container base pins, lock provenance, and future observability
+  recipes while retaining the existing in-process session architecture.
+- Replace the retired Discord `/team` registration with `/autoresearch`,
+  matching the SDK's bundled workflow catalog.
+- Delegate scoped settings ownership and startup profile activation to the
+  SDK's public APIs instead of cloning process-global settings.
+
+### Fixed
+
+- Align live control completion with SDK queue consumption and terminal
+  outcomes; cancel adapter waiters explicitly during disposal.
+  Live controls use public SDK promotion callbacks with literal-text delivery.
+- Encode SDK workflow answers as structured objects and confirm acceptance
+  through bounded, correlated daemon receipts. Rejections remain retryable only
+  for the same live gate, without erasing successors or starting a new prompt.
+
 ## [0.3.1] - 2026-08-09
 
 ### Changed

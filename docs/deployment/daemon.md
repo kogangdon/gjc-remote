@@ -1,17 +1,28 @@
-# Native daemon deployment
+# Native daemon foreground deployment
 
 Run one daemon on each host that owns mapped work directories. It embeds the
-pinned `@gajae-code/coding-agent` SDK **0.12.21** and requires **Bun 1.3.14 or
+pinned `@gajae-code/coding-agent` SDK **0.16.4** and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
 
+This repository provides the foreground start command below; it does not ship a
+native service installer, service wrapper, or systemd unit, and this guide is
+not evidence of a completed live deployment.
+
+The integration boundary is unchanged by the SDK bump. `gjc-remote` owns host
+authentication, route/workDir selection, and workspace admission/lifecycle
+policy. The embedded SDK runtime owns provider/model catalogs, provider
+authentication, and agent-turn semantics. Broker/Router surfaces are reserved
+for a separate future external-session evaluation; no adapter or migration is
+implemented.
+
 ## Prerequisites and provider identity
 
-Install the workspace dependencies from the committed lockfile, Bun >=1.3.14,
+Install the workspace dependencies from the committed lockfile, Bun >=1.4.0,
 and the native-control prerequisites for the host. Approved native-control
 tuples are Linux x64/arm64 and Windows x64; macOS is unsupported.
 
-Run the service as a dedicated daemon OS account. Before starting the service,
+Run the daemon process as a dedicated daemon OS account. Before starting it,
 log into the provider interactively as that same account:
 
 ```sh

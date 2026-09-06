@@ -24,13 +24,19 @@ export const V0_LIMITS = Object.freeze({
   CAPABILITY: 64,
   MAX_CAPABILITIES: 32,
   // Bounds on the additive #35 ask/gate answer channel. gateId mirrors a UUID;
-  // prompt/choice labels are rendered to a Discord channel; answer reuses the
-  // MESSAGE bound since it is user chat text routed back as a gate answer.
+  // prompt/choice labels are rendered to a Discord channel; answerId reuses
+  // the opaque request-id bound and answer reuses the MESSAGE bound since it
+  // is user chat text routed back as a gate answer.
   GATE_ID: 128,
+  GATE_ERROR_CODE: 64,
   GATE_PROMPT: 16 * 1024,
   CHOICE_LABEL: 1024,
   MAX_CHOICES: 64,
   PROTOCOL_VERSION_MAX: 1_000_000,
+});
+export const GATE_ANSWER_ERROR_CODES = Object.freeze({
+  REJECTED: "GATE_ANSWER_REJECTED",
+  FAILED: "GATE_ANSWER_FAILED",
 });
 export const WORKSPACE_READINESS_CAPABILITY = "workspace_readiness_v2";
 export const WORKSPACE_READINESS_V2_CAPABILITY = WORKSPACE_READINESS_CAPABILITY;
@@ -586,11 +592,13 @@ export const MSG_TYPES = Object.freeze({
   PING: "ping",
   PONG: "pong",
   // #35: additive ask/gate answer channel. ANSWER is a top-level bot->host
-  // message; GATE_REQUEST is an event *subtype* that rides an EventMessage's
-  // `event` payload (daemon->bot). v0 peers that don't know these simply never
-  // emit ANSWER and treat an unrecognized event subtype as an ignorable event.
+  // message; GATE_REQUEST and GATE_ANSWER_RESULT are event *subtypes* that ride
+  // an EventMessage's `event` payload (daemon->bot). v0 peers that don't know
+  // these simply never emit ANSWER and treat an unrecognized event subtype as
+  // an ignorable event.
   ANSWER: "answer",
   GATE_REQUEST: "gate_request",
+  GATE_ANSWER_RESULT: "gate_answer_result",
   READINESS: "readiness",
   // S6f.1b (#81): workspace-lifecycle wire message contract. These are
   // CONTRACT-ONLY additions here; no orchestrator wiring lands until
@@ -1336,15 +1344,52 @@ export function isInvokeMessage(value, context = undefined) {
 /**
  * bot -> host, a user's answer to a pending workflow gate (#35). Additive: v0
  * hosts never receive one because they never emit a `gate_request`.
- * @typedef {{ type: "answer", requestId: string, gateId: string, answer: string }} AnswerMessage
+ * `answerId` is an opaque, per-attempt receipt correlation id.
+ * @typedef {{ type: "answer", requestId: string, gateId: string, answerId: string, answer: string }} AnswerMessage
  */
 export function isAnswerMessage(value) {
   return (
-    isObject(value) &&
+    hasExactFields(value, ["type", "requestId", "gateId", "answerId", "answer"]) &&
     value.type === MSG_TYPES.ANSWER &&
     isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
     isBoundedString(value.gateId, V0_LIMITS.GATE_ID) &&
+    isBoundedString(value.answerId, V0_LIMITS.REQUEST_ID) &&
     isBoundedString(value.answer, V0_LIMITS.MESSAGE, true)
+  );
+}
+
+/**
+ * host -> bot receipt for one exact gate-answer attempt. The outer
+ * EventMessage requestId correlates the invoke; the inner ids fence the gate
+ * and attempt. Rejections expose only a fixed protocol code, never answer
+ * content or an SDK/provider error.
+ *
+ * @typedef {{ type: "gate_answer_result", answerId: string, gateId: string, accepted: true }
+ *   | { type: "gate_answer_result", answerId: string, gateId: string, accepted: false, errorCode: string }} GateAnswerResultEvent
+ */
+export function isGateAnswerResultEvent(value) {
+  if (
+    !isObject(value) ||
+    value.type !== MSG_TYPES.GATE_ANSWER_RESULT ||
+    !isBoundedString(value.answerId, V0_LIMITS.REQUEST_ID) ||
+    !isBoundedString(value.gateId, V0_LIMITS.GATE_ID) ||
+    typeof value.accepted !== "boolean"
+  ) {
+    return false;
+  }
+  if (value.accepted) {
+    return hasExactFields(value, ["type", "answerId", "gateId", "accepted"]);
+  }
+  return (
+    hasExactFields(value, [
+      "type",
+      "answerId",
+      "gateId",
+      "accepted",
+      "errorCode",
+    ]) &&
+    isBoundedString(value.errorCode, V0_LIMITS.GATE_ERROR_CODE) &&
+    Object.values(GATE_ANSWER_ERROR_CODES).includes(value.errorCode)
   );
 }
 

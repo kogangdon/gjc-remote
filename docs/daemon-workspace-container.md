@@ -156,5 +156,5 @@ in-flight invokes, resource denials, lock/fence owner, graph verification, backu
 and restart count. Every release packet runs path/secret/control sentinel scans.
 The five documents carry an assumptions ledger: #44 route/envelope and mapping persistence,
 receiver TTL/skew/probe bounds, Git refs/allowlist/dirty policy, lease/resource budgets, provider
-key recovery, #42/#45 evidence schedules, and SDK/package/lock reconciliation at 0.12.21. Each item
+key recovery, #42/#45 evidence schedules, and SDK/package/lock reconciliation at 0.16.4. Each item
 has an owner, closure gate, and fail-closed behavior; illustrative values are not final approvals.

@@ -10,6 +10,10 @@ A manual run of `.github/workflows/issue55-observability-evidence.yml` on `main`
 
 The focused recipe is a test gate. It covers the landed bot local observability tests and daemon owner, invoke, and lifecycle observability tests, including the dual-gated local-only test IPC and absence of observability correlation fields from WebSocket frames. It is not a production telemetry run.
 
+The SDK 0.16.4 upgrade pins future recipe executions to Bun 1.4.0. Historical
+receipts remain bound to their original commit and Bun runtime; verify them
+with the verifier from that exact commit, not the upgraded checkout.
+
 ## Consumer verification
 
 Accept only the final `issue55-observability-evidence-` artifact. Extract it into an empty directory and require exactly these two top-level regular, non-symlink files:
