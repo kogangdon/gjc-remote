@@ -6,7 +6,7 @@ import { validateManagedProof } from '../src/managed-authority-reader.js';
 import { createTestManagedAuthorityReader } from './helpers/managed-authority-reader.js';
 import { buildAdmissionAck, buildAdmissionGrant, buildAdmissionRequest } from '../../shared/admission-envelope.js';
 import { canonicalJson, canonicalJsonHash } from '../../shared/strict-json.js';
-import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint } from '../../shared/mapping-envelope.js';
+import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, validateManagedChannelsV2 } from '../../shared/mapping-envelope.js';
 import { buildAuthoritySuccessorRecord } from '../../shared/successor-envelope.js';
 
 const owner = { kind: 'sid', value: 'S-1-5-21-100' };
@@ -526,24 +526,160 @@ function mappingInput(mappingId, generation = 1, fenceGeneration = 1, channelId 
     sourceRoot: '/source', containerRoot: '/workspace', volumeIdentity: 'volume-a',
     casePolicy: 'sensitive', immutableDefault: false, mappingFingerprint: null,
   });
-  const route = fingerprintManagedRouteRecord({
-    channelId, hostId: mapping.hostId, mappingId: mapping.mappingId,
-    fenceGeneration: mapping.fenceGeneration,
-    mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion,
-    workspaceGeneration: mapping.workspaceGeneration,
-    sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId,
-    workDir: mapping.workDir, routeFingerprint: null,
-  }, mapping);
-  return { mapping, routes: [route] };
+  const routes = (Array.isArray(channelId) ? channelId : [channelId]).map((currentChannelId) =>
+    fingerprintManagedRouteRecord({
+      channelId: currentChannelId, hostId: mapping.hostId, mappingId: mapping.mappingId,
+      fenceGeneration: mapping.fenceGeneration,
+      mappingGeneration: mapping.mappingGeneration, mappingVersion: mapping.mappingVersion,
+      workspaceGeneration: mapping.workspaceGeneration,
+      sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId,
+      workDir: mapping.workDir, routeFingerprint: null,
+    }, mapping));
+  return { mapping, routes };
 }
-async function failClosedSuccessorFailure(method, stage) {
+const mappingSemantics = (mapping) => Object.fromEntries(
+  Object.entries(mapping).filter(([key]) => !['fenceGeneration', 'mappingFingerprint'].includes(key)),
+);
+const routeSemantics = (route) => Object.fromEntries(
+  Object.entries(route).filter(([key]) => !['fenceGeneration', 'routeFingerprint'].includes(key)),
+);
+const authorityRecord = (files, kind, txId) =>
+  JSON.parse(fileEnding(files, `/${kind}-${txId}.json`));
+const mappingArchivePath = (files, mappingId, generation) =>
+  filePathEnding(files, `/mapping-generation-${encodeURIComponent(mappingId)}-${generation}.json`);
+const mappingHandoff = (files, operation, oldMappingId, newMappingId) => {
+  for (const [path, bytes] of files) {
+    if (!path.replaceAll('\\', '/').includes('/mapping-handoff-')) continue;
+    const record = JSON.parse(bytes);
+    if (record.operation === operation && record.oldMappingId === oldMappingId && record.newMappingId === newMappingId) {
+      return record;
+    }
+  }
+  return null;
+};
+async function assertTerminalManagedSuccessor(harness, before, result, {
+  operation,
+  mappingId = null,
+  mappingGenerationDelta,
+  tokenConfigGenerationDelta,
+}) {
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.pending, false);
+  assert.equal(result.routeDisposition, 'no-route');
+  const after = await harness.native.readManagementState();
+  const proof = await harness.native.readRetainedTargetProof();
+  const fenceFloor = await harness.native.readFenceGenerationFloor();
+  const authorityFloor = await harness.native.readAuthorityEpochFloor();
+  assert.equal(proof.sourceKind, 'managed-v1');
+  assert.doesNotThrow(() => validateManagedChannelsV2(proof.snapshot));
+  assert.deepEqual(after.mappings, proof.snapshot.mappings);
+  assert.deepEqual(after.routes, proof.snapshot.routes);
+  assert.equal(after.revision, before.revision + 1);
+  assert.equal(after.authorityEpoch, before.authorityEpoch + 1);
+  assert.equal(after.fenceGeneration, before.fenceGeneration + 1);
+  assert.equal(after.mappingGeneration, before.mappingGeneration + mappingGenerationDelta);
+  assert.equal(after.tokenConfigGeneration, before.tokenConfigGeneration + tokenConfigGenerationDelta);
+  assert.equal(fenceFloor.highestReservedFenceGeneration, after.fenceGeneration);
+  assert.equal(fenceFloor.highestCommittedFenceGeneration, after.fenceGeneration);
+  assert.equal(fenceFloor.lastReservationTxId, result.txId);
+  assert.equal(fenceFloor.lastCommittedTxId, result.txId);
+  assert.equal(authorityFloor.highestReservedAuthorityEpoch, after.authorityEpoch);
+  assert.equal(authorityFloor.highestCommittedAuthorityEpoch, after.authorityEpoch);
+  assert.equal(after.admission.phase, 'closed');
+  assert.equal(after.admission.finalityFingerprint, null);
+  assert.equal(proof.snapshot.revision, after.revision);
+  assert.equal(proof.snapshot.authorityEpoch, after.authorityEpoch);
+  assert.equal(proof.snapshot.fenceGeneration, after.fenceGeneration);
+  assert.equal(proof.snapshot.mappingGeneration, after.mappingGeneration);
+  assert.equal(proof.snapshot.tokenConfigGeneration, after.tokenConfigGeneration);
+  for (const mapping of Object.values(after.mappings)) assert.equal(mapping.fenceGeneration, after.fenceGeneration);
+  for (const route of Object.values(after.routes)) assert.equal(route.fenceGeneration, after.fenceGeneration);
+
+  const request = authorityRecord(harness.files, 'authority-successor-request', result.txId);
+  const close = authorityRecord(harness.files, 'authority-close-proof', result.txId);
+  const baseline = authorityRecord(harness.files, 'authority-successor-baseline', result.txId);
+  const finality = authorityRecord(harness.files, 'authority-successor-finality', result.txId);
+  const receipt = authorityRecord(harness.files, 'authority-successor-receipt', result.txId);
+  const head = JSON.parse(fileEnding(harness.files, '/authority-head.json'));
+  const marker = await harness.native.readManagedHistoryMarker();
+  assert.equal(request.operation, operation);
+  assert.equal(request.previousRevision, before.revision);
+  assert.equal(request.candidateRevision, after.revision);
+  assert.equal(request.previousFenceGeneration, before.fenceGeneration);
+  assert.equal(request.candidateFenceGeneration, after.fenceGeneration);
+  assert.equal(request.candidateSnapshotFingerprint, proof.snapshot.configFingerprint);
+  assert.equal(request.candidateTargetFingerprint, proof.targetFingerprint);
+  assert.equal(request.candidateMappingGeneration, after.mappingGeneration);
+  assert.equal(request.candidateTokenConfigGeneration, after.tokenConfigGeneration);
+  assert.equal(close.affectedScope, operation === 'tokens-attest' ? 'all' : 'mapping');
+  assert.deepEqual(close.affectedMappingIds, operation === 'tokens-attest' ? [] : [mappingId]);
+  assert.deepEqual(close.affectedRouteFingerprints, []);
+  assert.equal(close.admissionPhaseBefore, 'closed');
+  assert.equal(close.admissionPhaseAfter, 'closed-drained');
+  assert.equal(close.admissionDrained, true);
+  assert.equal(close.outstandingRouteGrantCount, 0);
+  assert.equal(close.routeDisposition, 'no-route');
+  assert.equal(baseline.fenceGeneration, after.fenceGeneration);
+  assert.equal(baseline.candidateSnapshotFingerprint, proof.snapshot.configFingerprint);
+  assert.equal(baseline.candidateTargetFingerprint, proof.targetFingerprint);
+  assert.equal(finality.fenceGeneration, after.fenceGeneration);
+  assert.equal(finality.targetFingerprint, proof.targetFingerprint);
+  assert.equal(finality.wrapperFingerprint, proof.wrapperFingerprint);
+  assert.equal(finality.revision, after.revision);
+  assert.equal(finality.authorityEpoch, after.authorityEpoch);
+  assert.equal(finality.mappingGeneration, after.mappingGeneration);
+  assert.equal(finality.tokenConfigGeneration, after.tokenConfigGeneration);
+  assert.equal(finality.routeDisposition, 'no-route');
+  assert.equal(receipt.fenceGeneration, after.fenceGeneration);
+  assert.equal(receipt.revision, after.revision);
+  assert.equal(receipt.authorityEpoch, after.authorityEpoch);
+  assert.equal(receipt.mappingGeneration, after.mappingGeneration);
+  assert.equal(receipt.tokenConfigGeneration, after.tokenConfigGeneration);
+  assert.equal(receipt.snapshotFingerprint, finality.snapshotFingerprint);
+  assert.equal(receipt.routeDisposition, 'no-route');
+  assert.equal(head.phase, 'terminal');
+  assert.equal(head.txId, result.txId);
+  assert.equal(head.receiptFingerprint, receipt.receiptFingerprint);
+  assert.equal(head.historyMarkerFingerprint, marker.markerFingerprint);
+  assert.equal(head.fenceGeneration, after.fenceGeneration);
+  assert.equal(marker.fenceGeneration, after.fenceGeneration);
+  assert.equal(after.recovery.phase, 'terminal');
+  assert.equal(after.recovery.txId, result.txId);
+  assert.equal(after.recovery.finalityFingerprint, finality.finalityFingerprint);
+  return { after, proof, request, close, baseline, finality, receipt, head, marker };
+}
+async function reconcileMapping(harness, runtime, {
+  mappingId,
+  channelIds,
+  idempotencyKey,
+}) {
+  const before = await harness.native.readManagementState();
+  const candidate = mappingInput(mappingId, before.mappingGeneration + 1, before.fenceGeneration, channelIds);
+  const result = await runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey,
+    mappingId,
+    ...candidate,
+    expectedRevision: before.revision,
+    expectedFingerprint: Object.hasOwn(before.mappings, mappingId) ? before.mappings[mappingId].mappingFingerprint : null,
+  });
+  const terminal = await assertTerminalManagedSuccessor(harness, before, result, {
+    operation: 'mapping-reconcile',
+    mappingId,
+    mappingGenerationDelta: 1,
+    tokenConfigGenerationDelta: 0,
+  });
+  return { before, candidate, result, ...terminal };
+}
+async function failClosedSuccessorFailure(method, stage, injectedMessage = `INJECTED_${stage}`) {
   const harness = adapter({ legacy: false });
   const runtime = new ManagementRuntime({ native: harness.native });
   assert.equal((await runtime.execute('genesis', genesisInput('host=old-secret'))).ok, true);
   const original = harness.native[method].bind(harness.native);
   harness.native[method] = async (...args) => {
     await original(...args);
-    throw new Error(`INJECTED_${stage}`);
+    throw new Error(injectedMessage);
   };
   const before = await harness.native.readManagementState();
   const candidate = mappingInput(`failure-${stage}`);
@@ -576,6 +712,7 @@ async function failClosedSuccessorFailure(method, stage) {
   assert.equal(blocked.ok, false);
   assert.equal(blocked.error, 'RECOVERY_REQUIRED');
   assert.equal(blocked.routeDisposition, 'no-route');
+  return { harness, result, state, request, cleanup };
 }
 test('successor writes fail closed across request, head, publication, finality, and audit stages', async () => {
   for (const [method, stage] of [
@@ -587,6 +724,20 @@ test('successor writes fail closed across request, head, publication, finality, 
   ]) {
     await failClosedSuccessorFailure(method, stage);
   }
+});
+test('a code-shaped post-write failure cannot impersonate completed durable cleanup', async () => {
+  const { harness, cleanup, request } = await failClosedSuccessorFailure(
+    'writeAuthoritySuccessorHead',
+    'MANUAL_CLEANUP_CANARY',
+    'MANUAL_CLEANUP_REQUIRED',
+  );
+  const writtenHead = JSON.parse(fileEnding(
+    harness.files,
+    `/authority-head-${request.sequence}-reserved.json`,
+  ));
+  assert.equal(writtenHead.txId, request.txId);
+  assert.equal(cleanup.reason, 'MANUAL_CLEANUP_REQUIRED');
+  assert.equal(cleanup.txId, request.txId);
 });
 test('token successor audit failure converges cleanup state to the committed durable token lineage', async () => {
   const harness = adapter({ legacy: false });
@@ -952,6 +1103,466 @@ test('first mapping resolves the explicit Genesis-empty CAS sentinel under the m
   assert.equal(result.pending, false);
   assert.equal(result.routeDisposition, 'no-route');
 });
+test('populated mapping successors preserve the predecessor before advancing every fence', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+  for (const index of [1, 2]) {
+    const before = await harness.native.readManagementState();
+    const candidate = mappingInput(`populated-${index}`, before.mappingGeneration + 1, before.fenceGeneration, String(123 + index));
+    const writesBefore = harness.writes.length;
+    const result = await runtime.execute('mapping-reconcile', {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: `populated-${index}`,
+      mappingId: candidate.mapping.mappingId,
+      ...candidate,
+      expectedRevision: before.revision,
+      expectedFingerprint: null,
+    });
+    assert.equal(result.ok, true, JSON.stringify({
+      result,
+      predecessorFence: before.fenceGeneration,
+      retainedMappingFences: Object.values(before.mappings).map((mapping) => mapping.fenceGeneration),
+      retainedRouteFences: Object.values(before.routes).map((route) => route.fenceGeneration),
+      candidateFence: before.fenceGeneration + 1,
+      writesAdded: harness.writes.length - writesBefore,
+    }));
+    assert.equal(result.pending, false);
+    assert.equal(result.routeDisposition, 'no-route');
+    const after = await harness.native.readManagementState();
+    assert.equal(after.fenceGeneration, before.fenceGeneration + 1);
+    assert.equal(Object.keys(after.mappings).length, index);
+    assert.equal(Object.keys(after.routes).length, index);
+    for (const mapping of Object.values(after.mappings)) assert.equal(mapping.fenceGeneration, after.fenceGeneration);
+    for (const route of Object.values(after.routes)) assert.equal(route.fenceGeneration, after.fenceGeneration);
+  }
+});
+test('token successor rejects state-to-target mapping generation drift before successor writes', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+  await reconcileMapping(harness, runtime, {
+    mappingId: 'token-drift-map',
+    channelIds: ['91', '92'],
+    idempotencyKey: 'token-drift-map-create',
+  });
+  const durableState = await harness.native.readManagementState();
+  const filesBefore = new Map([...harness.files].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const writesBefore = harness.writes.length;
+  const readManagementState = harness.native.readManagementState.bind(harness.native);
+  let managementStateReads = 0;
+  harness.native.readManagementState = async () => {
+    const state = await readManagementState();
+    managementStateReads += 1;
+    return managementStateReads === 2
+      ? { ...structuredClone(state), mappingGeneration: 0 }
+      : state;
+  };
+
+  const result = await new ManagementRuntime({ native: harness.native }).execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'token-state-target-drift',
+    hostTokens: 'host=rotated',
+  });
+
+  harness.native.readManagementState = readManagementState;
+  assert.deepEqual(result, {
+    exitCode: 6,
+    ok: false,
+    error: 'MANAGED_CHANNELS_V2_INVALID',
+    routeDisposition: 'no-route',
+  });
+  assert.equal(managementStateReads, 2);
+  assert.equal(harness.writes.length, writesBefore);
+  assert.deepEqual(harness.files, filesBefore);
+  assert.deepEqual(await harness.native.readManagementState(), durableState);
+});
+test('mapping successors carry the complete graph through create, update, token, rollback, and revoke', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+
+  const alphaCreated = await reconcileMapping(harness, runtime, {
+    mappingId: 'alpha',
+    channelIds: ['101', '102'],
+    idempotencyKey: 'alpha-create',
+  });
+  const alphaGenerationOnePath = mappingArchivePath(
+    harness.files,
+    'alpha',
+    alphaCreated.after.mappings.alpha.mappingGeneration,
+  );
+  assert.ok(alphaGenerationOnePath);
+  const alphaGenerationOneBytes = Buffer.from(harness.files.get(alphaGenerationOnePath));
+
+  const betaCreated = await reconcileMapping(harness, runtime, {
+    mappingId: 'beta',
+    channelIds: ['201', '202'],
+    idempotencyKey: 'beta-create',
+  });
+  assert.deepEqual(
+    mappingSemantics(betaCreated.after.mappings.alpha),
+    mappingSemantics(betaCreated.before.mappings.alpha),
+  );
+  assert.notEqual(
+    betaCreated.after.mappings.alpha.mappingFingerprint,
+    betaCreated.before.mappings.alpha.mappingFingerprint,
+  );
+  for (const channelId of ['101', '102']) {
+    assert.deepEqual(
+      routeSemantics(betaCreated.after.routes[channelId]),
+      routeSemantics(betaCreated.before.routes[channelId]),
+    );
+    assert.notEqual(
+      betaCreated.after.routes[channelId].routeFingerprint,
+      betaCreated.before.routes[channelId].routeFingerprint,
+    );
+  }
+  assert.deepEqual(harness.files.get(alphaGenerationOnePath), alphaGenerationOneBytes);
+
+  const alphaUpdated = await reconcileMapping(harness, runtime, {
+    mappingId: 'alpha',
+    channelIds: ['103', '104'],
+    idempotencyKey: 'alpha-update',
+  });
+  assert.deepEqual(
+    mappingSemantics(alphaUpdated.after.mappings.beta),
+    mappingSemantics(alphaUpdated.before.mappings.beta),
+  );
+  assert.notEqual(
+    alphaUpdated.after.mappings.beta.mappingFingerprint,
+    alphaUpdated.before.mappings.beta.mappingFingerprint,
+  );
+  assert.deepEqual(Object.keys(alphaUpdated.after.routes).sort(), ['103', '104', '201', '202']);
+  assert.equal(alphaUpdated.after.mappings.alpha.mappingGeneration, alphaUpdated.before.mappingGeneration + 1);
+  assert.equal(alphaUpdated.after.mappings.alpha.workspaceGeneration, alphaUpdated.candidate.mapping.workspaceGeneration);
+  const alphaCurrentArchivePath = mappingArchivePath(
+    harness.files,
+    'alpha',
+    alphaUpdated.after.mappings.alpha.mappingGeneration,
+  );
+  assert.ok(alphaCurrentArchivePath);
+
+  const betaReassigned = await reconcileMapping(harness, runtime, {
+    mappingId: 'beta',
+    channelIds: ['101', '202'],
+    idempotencyKey: 'beta-reassign-historic-alpha-channel',
+  });
+  assert.equal(betaReassigned.after.routes['101'].mappingId, 'beta');
+  assert.equal(betaReassigned.after.routes['202'].mappingId, 'beta');
+  assert.equal(betaReassigned.after.routes['103'].mappingId, 'alpha');
+  assert.equal(betaReassigned.after.routes['104'].mappingId, 'alpha');
+  assert.deepEqual(harness.files.get(alphaGenerationOnePath), alphaGenerationOneBytes);
+  const betaCurrentArchivePath = mappingArchivePath(
+    harness.files,
+    'beta',
+    betaReassigned.after.mappings.beta.mappingGeneration,
+  );
+  assert.ok(betaCurrentArchivePath);
+  const immutableBytes = new Map([
+    [alphaGenerationOnePath, Buffer.from(harness.files.get(alphaGenerationOnePath))],
+    [alphaCurrentArchivePath, Buffer.from(harness.files.get(alphaCurrentArchivePath))],
+    [betaCurrentArchivePath, Buffer.from(harness.files.get(betaCurrentArchivePath))],
+  ]);
+
+  const beforeToken = await harness.native.readManagementState();
+  const tokenResult = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'populated-token-refence',
+    hostTokens: 'host=rotated',
+  });
+  const token = await assertTerminalManagedSuccessor(harness, beforeToken, tokenResult, {
+    operation: 'tokens-attest',
+    mappingGenerationDelta: 0,
+    tokenConfigGenerationDelta: 1,
+  });
+  for (const mappingId of Object.keys(beforeToken.mappings)) {
+    assert.deepEqual(mappingSemantics(token.after.mappings[mappingId]), mappingSemantics(beforeToken.mappings[mappingId]));
+    assert.notEqual(token.after.mappings[mappingId].mappingFingerprint, beforeToken.mappings[mappingId].mappingFingerprint);
+  }
+  for (const channelId of Object.keys(beforeToken.routes)) {
+    assert.deepEqual(routeSemantics(token.after.routes[channelId]), routeSemantics(beforeToken.routes[channelId]));
+    assert.notEqual(token.after.routes[channelId].routeFingerprint, beforeToken.routes[channelId].routeFingerprint);
+  }
+  for (const [path, bytes] of immutableBytes) assert.deepEqual(harness.files.get(path), bytes);
+
+  const beforeRollback = await harness.native.readManagementState();
+  const currentAlphaArchive = JSON.parse(harness.files.get(alphaCurrentArchivePath));
+  assert.notEqual(currentAlphaArchive.mapping.fenceGeneration, beforeRollback.mappings.alpha.fenceGeneration);
+  const rollbackResult = await runtime.execute('mapping-rollback', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'alpha-rollback',
+    mappingId: 'alpha',
+    replacementMappingId: 'alpha-restored',
+    priorGeneration: alphaCreated.after.mappings.alpha.mappingGeneration,
+    expectedRevision: beforeRollback.revision,
+    expectedFingerprint: beforeRollback.mappings.alpha.mappingFingerprint,
+  });
+  const rollback = await assertTerminalManagedSuccessor(harness, beforeRollback, rollbackResult, {
+    operation: 'mapping-rollback',
+    mappingId: 'alpha',
+    mappingGenerationDelta: 1,
+    tokenConfigGenerationDelta: 0,
+  });
+  assert.equal(Object.hasOwn(rollback.after.mappings, 'alpha'), false);
+  assert.equal(rollback.after.mappings['alpha-restored'].mappingGeneration, beforeRollback.mappingGeneration + 1);
+  assert.equal(rollback.after.mappings['alpha-restored'].workspaceGeneration, alphaCreated.after.mappings.alpha.workspaceGeneration);
+  assert.equal(rollback.after.routes['101'].mappingId, 'alpha-restored');
+  assert.equal(rollback.after.routes['102'].mappingId, 'alpha-restored');
+  assert.equal(rollback.after.routes['202'].mappingId, 'beta');
+  assert.equal(Object.hasOwn(rollback.after.routes, '103'), false);
+  assert.equal(Object.hasOwn(rollback.after.routes, '104'), false);
+  assert.deepEqual(
+    mappingSemantics(rollback.after.mappings.beta),
+    mappingSemantics(beforeRollback.mappings.beta),
+  );
+  assert.notEqual(
+    rollback.after.mappings.beta.mappingFingerprint,
+    beforeRollback.mappings.beta.mappingFingerprint,
+  );
+  assert.deepEqual(routeSemantics(rollback.after.routes['202']), routeSemantics(beforeRollback.routes['202']));
+  assert.notEqual(rollback.after.routes['202'].routeFingerprint, beforeRollback.routes['202'].routeFingerprint);
+  const alphaTombstone = JSON.parse(fileEnding(harness.files, '/mapping-tombstone-alpha.json'));
+  assert.equal(alphaTombstone.operation, 'mapping-rollback');
+  assert.equal(alphaTombstone.fenceGeneration, currentAlphaArchive.mapping.fenceGeneration);
+  assert.equal(alphaTombstone.mappingGeneration, currentAlphaArchive.mapping.mappingGeneration);
+  assert.equal(alphaTombstone.mappingFingerprint, currentAlphaArchive.mapping.mappingFingerprint);
+  assert.equal(alphaTombstone.snapshotFingerprint, rollback.proof.snapshot.configFingerprint);
+  const alphaHandoff = mappingHandoff(harness.files, 'mapping-rollback', 'alpha', 'alpha-restored');
+  assert.ok(alphaHandoff);
+  assert.equal(alphaHandoff.fenceGeneration, rollback.after.fenceGeneration);
+  assert.equal(alphaHandoff.snapshotFingerprint, rollback.proof.snapshot.configFingerprint);
+  assert.equal(alphaHandoff.tombstoneFingerprint, alphaTombstone.tombstoneFingerprint);
+  for (const [path, bytes] of immutableBytes) assert.deepEqual(harness.files.get(path), bytes);
+
+  const beforeRevoke = await harness.native.readManagementState();
+  const betaArchive = JSON.parse(harness.files.get(betaCurrentArchivePath));
+  assert.notEqual(betaArchive.mapping.fenceGeneration, beforeRevoke.mappings.beta.fenceGeneration);
+  const revokeResult = await runtime.execute('mapping-revoke', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'beta-revoke',
+    mappingId: 'beta',
+    expectedRevision: beforeRevoke.revision,
+    expectedFingerprint: beforeRevoke.mappings.beta.mappingFingerprint,
+  });
+  const revoked = await assertTerminalManagedSuccessor(harness, beforeRevoke, revokeResult, {
+    operation: 'mapping-revoke',
+    mappingId: 'beta',
+    mappingGenerationDelta: 1,
+    tokenConfigGenerationDelta: 0,
+  });
+  assert.deepEqual(Object.keys(revoked.after.mappings), ['alpha-restored']);
+  assert.deepEqual(Object.keys(revoked.after.routes).sort(), ['101', '102']);
+  assert.deepEqual(
+    mappingSemantics(revoked.after.mappings['alpha-restored']),
+    mappingSemantics(beforeRevoke.mappings['alpha-restored']),
+  );
+  assert.notEqual(
+    revoked.after.mappings['alpha-restored'].mappingFingerprint,
+    beforeRevoke.mappings['alpha-restored'].mappingFingerprint,
+  );
+  const betaTombstone = JSON.parse(fileEnding(harness.files, '/mapping-tombstone-beta.json'));
+  assert.equal(betaTombstone.operation, 'mapping-revoke');
+  assert.equal(betaTombstone.fenceGeneration, betaArchive.mapping.fenceGeneration);
+  assert.equal(betaTombstone.mappingGeneration, betaArchive.mapping.mappingGeneration);
+  assert.equal(betaTombstone.mappingFingerprint, betaArchive.mapping.mappingFingerprint);
+  assert.equal(betaTombstone.snapshotFingerprint, revoked.proof.snapshot.configFingerprint);
+  const betaHandoff = mappingHandoff(harness.files, 'mapping-revoke', 'beta', null);
+  assert.ok(betaHandoff);
+  assert.equal(betaHandoff.fenceGeneration, revoked.after.fenceGeneration);
+  assert.equal(betaHandoff.snapshotFingerprint, revoked.proof.snapshot.configFingerprint);
+  assert.equal(betaHandoff.tombstoneFingerprint, betaTombstone.tombstoneFingerprint);
+  for (const [path, bytes] of immutableBytes) assert.deepEqual(harness.files.get(path), bytes);
+});
+test('create, update, revoke, and rollback reject exact stale CAS before successor writes', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+  await reconcileMapping(harness, runtime, {
+    mappingId: 'cas-alpha',
+    channelIds: ['301', '302'],
+    idempotencyKey: 'cas-alpha-create',
+  });
+  await reconcileMapping(harness, runtime, {
+    mappingId: 'cas-beta',
+    channelIds: ['401', '402'],
+    idempotencyKey: 'cas-beta-create',
+  });
+  await reconcileMapping(harness, runtime, {
+    mappingId: 'cas-alpha',
+    channelIds: ['303', '304'],
+    idempotencyKey: 'cas-alpha-update',
+  });
+  const before = await harness.native.readManagementState();
+  const create = mappingInput('cas-gamma', before.mappingGeneration + 1, before.fenceGeneration, ['501', '502']);
+  const update = mappingInput('cas-alpha', before.mappingGeneration + 1, before.fenceGeneration, ['305', '306']);
+  const cases = [
+    ['create revision', 'mapping-reconcile', {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: 'stale-create',
+      mappingId: 'cas-gamma',
+      ...create,
+      expectedRevision: before.revision - 1,
+      expectedFingerprint: null,
+    }],
+    ['update fingerprint', 'mapping-reconcile', {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: 'stale-update',
+      mappingId: 'cas-alpha',
+      ...update,
+      expectedRevision: before.revision,
+      expectedFingerprint: '0'.repeat(64),
+    }],
+    ['revoke revision', 'mapping-revoke', {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: 'stale-revoke',
+      mappingId: 'cas-beta',
+      expectedRevision: before.revision - 1,
+      expectedFingerprint: before.mappings['cas-beta'].mappingFingerprint,
+    }],
+    ['rollback fingerprint', 'mapping-rollback', {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey: 'stale-rollback',
+      mappingId: 'cas-alpha',
+      replacementMappingId: 'cas-alpha-restored',
+      priorGeneration: 1,
+      expectedRevision: before.revision,
+      expectedFingerprint: '0'.repeat(64),
+    }],
+  ];
+  for (const [label, command, input] of cases) {
+    const writesBefore = harness.writes.length;
+    const filesBefore = new Map([...harness.files].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+    const result = await runtime.execute(command, input);
+    assert.deepEqual(result, {
+      exitCode: 4,
+      ok: false,
+      error: 'CAS_CONFLICT',
+      routeDisposition: 'no-route',
+    }, label);
+    assert.equal(harness.writes.length, writesBefore, label);
+    assert.deepEqual(harness.files, filesBefore, label);
+    assert.deepEqual(await harness.native.readManagementState(), before, label);
+  }
+});
+test('revoke and rollback validate immutable archives and mapping-only live equivalence before writes', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+  const created = await reconcileMapping(harness, runtime, {
+    mappingId: 'archive-map',
+    channelIds: ['601', '602'],
+    idempotencyKey: 'archive-create',
+  });
+  await reconcileMapping(harness, runtime, {
+    mappingId: 'archive-other',
+    channelIds: ['701', '702'],
+    idempotencyKey: 'archive-other-create',
+  });
+  const updated = await reconcileMapping(harness, runtime, {
+    mappingId: 'archive-map',
+    channelIds: ['603', '604'],
+    idempotencyKey: 'archive-update',
+  });
+  const beforeToken = await harness.native.readManagementState();
+  const token = await runtime.execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'archive-token-refence',
+    hostTokens: 'host=archive-rotated',
+  });
+  const tokenTerminal = await assertTerminalManagedSuccessor(harness, beforeToken, token, {
+    operation: 'tokens-attest',
+    mappingGenerationDelta: 0,
+    tokenConfigGenerationDelta: 1,
+  });
+  const before = tokenTerminal.after;
+  const currentGeneration = before.mappings['archive-map'].mappingGeneration;
+  const priorGeneration = created.after.mappings['archive-map'].mappingGeneration;
+  const currentPath = mappingArchivePath(harness.files, 'archive-map', currentGeneration);
+  const priorPath = mappingArchivePath(harness.files, 'archive-map', priorGeneration);
+  assert.ok(currentPath);
+  assert.ok(priorPath);
+  const currentBytes = Buffer.from(harness.files.get(currentPath));
+  const priorBytes = Buffer.from(harness.files.get(priorPath));
+  const revokeInput = {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    mappingId: 'archive-map',
+    expectedRevision: before.revision,
+    expectedFingerprint: before.mappings['archive-map'].mappingFingerprint,
+  };
+  const rollbackInput = {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    mappingId: 'archive-map',
+    replacementMappingId: 'archive-restored',
+    priorGeneration,
+    expectedRevision: before.revision,
+    expectedFingerprint: before.mappings['archive-map'].mappingFingerprint,
+  };
+  const drifted = JSON.parse(currentBytes);
+  drifted.mapping = fingerprintManagedMappingRecord({
+    ...drifted.mapping,
+    sourceRoot: '/different-source',
+    mappingFingerprint: null,
+  });
+  const invalidCurrentRoute = JSON.parse(currentBytes);
+  invalidCurrentRoute.routes[0].routeFingerprint = '0'.repeat(64);
+  const invalidPriorRoute = JSON.parse(priorBytes);
+  invalidPriorRoute.routes[0].routeFingerprint = '0'.repeat(64);
+  const legacyPrior = JSON.parse(priorBytes);
+  legacyPrior.mapping = fingerprintManagedMappingRecord({
+    ...legacyPrior.mapping,
+    workspaceId: null,
+    workDir: '/legacy-workspace',
+    mappingFingerprint: null,
+  });
+  legacyPrior.routes = legacyPrior.routes.map((route) => fingerprintManagedRouteRecord({
+    ...route,
+    workspaceId: null,
+    workDir: '/legacy-workspace',
+    routeFingerprint: null,
+  }, legacyPrior.mapping));
+  const cases = [
+    ['missing current archive', 'mapping-revoke', { ...revokeInput, idempotencyKey: 'archive-missing' }, currentPath, null, 6, 'MAPPING_INVALID'],
+    ['invalid current archive route', 'mapping-revoke', { ...revokeInput, idempotencyKey: 'archive-route-invalid' }, currentPath, Buffer.from(canonicalJson(invalidCurrentRoute)), 6, 'MAPPING_INVALID'],
+    ['internally valid archive mapping drift', 'mapping-revoke', { ...revokeInput, idempotencyKey: 'archive-mapping-drift' }, currentPath, Buffer.from(canonicalJson(drifted)), 6, 'MAPPING_INVALID'],
+    ['rollback current archive drift', 'mapping-rollback', { ...rollbackInput, idempotencyKey: 'archive-rollback-drift' }, currentPath, Buffer.from(canonicalJson(drifted)), 6, 'MAPPING_INVALID'],
+    ['invalid prior rollback route', 'mapping-rollback', { ...rollbackInput, idempotencyKey: 'archive-prior-invalid' }, priorPath, Buffer.from(canonicalJson(invalidPriorRoute)), 70, 'ROLLBACK_GENERATION_UNKNOWN'],
+    ['shared-valid legacy prior rollback archive', 'mapping-rollback', { ...rollbackInput, idempotencyKey: 'archive-prior-legacy' }, priorPath, Buffer.from(canonicalJson(legacyPrior)), 70, 'ROLLBACK_GENERATION_UNKNOWN'],
+  ];
+  for (const [label, command, input, path, bytes, exitCode, error] of cases) {
+    if (bytes === null) harness.files.delete(path);
+    else harness.files.set(path, bytes);
+    const writesBefore = harness.writes.length;
+    const filesBefore = new Map([...harness.files].map(([name, value]) => [name, Buffer.from(value)]));
+    const result = await runtime.execute(command, input);
+    assert.deepEqual(result, {
+      exitCode,
+      ok: false,
+      error,
+      routeDisposition: 'no-route',
+    }, label);
+    assert.equal(harness.writes.length, writesBefore, label);
+    assert.deepEqual(harness.files, filesBefore, label);
+    assert.deepEqual(await harness.native.readManagementState(), before, label);
+    harness.files.set(currentPath, Buffer.from(currentBytes));
+    harness.files.set(priorPath, Buffer.from(priorBytes));
+  }
+  assert.deepEqual(harness.files.get(currentPath), currentBytes);
+  assert.deepEqual(harness.files.get(priorPath), priorBytes);
+  assert.equal(updated.after.mappings['archive-map'].mappingGeneration, currentGeneration);
+});
 test('no-reader mapping successors reach the terminal graph with exact lineage and replay through recovery', async () => {
   const { native, files } = adapter({ legacy: false });
   const runtime = new ManagementRuntime({ native });
@@ -1143,6 +1754,173 @@ test('bound successors bind exact candidates, require fresh B proof, and roll fo
   assert.equal(afterToken.tokenFloor.lastAttestationFingerprint, tokenAttestation.attestationFingerprint);
   assert.equal(afterToken.tokenAttestation.attestationFingerprint, tokenAttestation.attestationFingerprint);
   assert.equal(afterToken.tokenAttestation.fingerprint, tokenAttestation.tokenConfigHostSetFingerprint);
+});
+test('bound-reader recovery reconstructs the same populated candidate graph across runtime restart', async () => {
+  const harness = await boundReaderRuntime();
+  harness.setPrincipal(botPrincipal);
+  const reader = await createTestManagedAuthorityReader({
+    configPath: 'C:/state/channels.json',
+    expectedHostSetFingerprint: managedHostSetFingerprint('host=secret'),
+    roleBindings: roles,
+    native: harness.native,
+  });
+  harness.setPrincipal(owner);
+  const completeMapping = async (mappingId, channelIds, idempotencyKey) => {
+    const before = await harness.native.readManagementState();
+    const candidate = mappingInput(mappingId, before.mappingGeneration + 1, before.fenceGeneration, channelIds);
+    const input = {
+      actorPrincipal: owner,
+      actorSecret: secret,
+      idempotencyKey,
+      mappingId,
+      ...candidate,
+      expectedRevision: before.revision,
+      expectedFingerprint: null,
+    };
+    const started = await harness.runtime.execute('mapping-reconcile', input);
+    assert.equal(started.ok, true, JSON.stringify(started));
+    assert.equal(started.pending, true);
+    assert.equal(started.phase, 'reader-pending');
+    assert.equal(started.routeDisposition, 'no-route');
+    assert.deepEqual(await harness.native.readManagementState(), before);
+    const request = authorityRecord(harness.files, 'authority-successor-request', started.txId);
+    const recovery = await harness.native.readSuccessorRecovery({
+      predecessorReceiptFingerprint: request.previousReceiptFingerprint,
+    });
+    assert.equal(recovery.candidateConfigFingerprint, request.candidateSnapshotFingerprint);
+    assert.equal(recovery.candidateState.configFingerprint, request.candidateSnapshotFingerprint);
+    assert.equal(recovery.candidateState.fenceGeneration, request.candidateFenceGeneration);
+    assert.doesNotThrow(() => validateManagedChannelsV2(recovery.candidateState));
+
+    harness.setPrincipal(botPrincipal);
+    const pending = await reader.readSnapshot();
+    assert.equal(pending.code, 'MANAGED_AUTHORITY_PENDING');
+    harness.setPrincipal(owner);
+    const completed = await new ManagementRuntime({ native: harness.native }).execute('mapping-reconcile', input);
+    const terminal = await assertTerminalManagedSuccessor(harness, before, completed, {
+      operation: 'mapping-reconcile',
+      mappingId,
+      mappingGenerationDelta: 1,
+      tokenConfigGenerationDelta: 0,
+    });
+    assert.equal(terminal.receipt.readerMode, 'bound-reader');
+    assert.match(terminal.receipt.leaseBindingFingerprint, /^[a-f0-9]{64}$/);
+    assert.match(terminal.receipt.readerProjectionFingerprint, /^[a-f0-9]{64}$/);
+    assert.match(terminal.receipt.ackFingerprint, /^[a-f0-9]{64}$/);
+    assert.equal(terminal.request.candidateSnapshotFingerprint, recovery.candidateState.configFingerprint);
+    return terminal;
+  };
+
+  await completeMapping('bound-alpha', ['801', '802'], 'bound-alpha-create');
+  const beforePopulated = await harness.native.readManagementState();
+  const alphaBefore = structuredClone(beforePopulated.mappings['bound-alpha']);
+  const routesBefore = Object.fromEntries(
+    Object.entries(beforePopulated.routes).map(([channelId, route]) => [channelId, structuredClone(route)]),
+  );
+  const beta = await completeMapping('bound-beta', ['901', '902'], 'bound-beta-create');
+  assert.deepEqual(mappingSemantics(beta.after.mappings['bound-alpha']), mappingSemantics(alphaBefore));
+  assert.notEqual(beta.after.mappings['bound-alpha'].mappingFingerprint, alphaBefore.mappingFingerprint);
+  for (const [channelId, route] of Object.entries(routesBefore)) {
+    assert.deepEqual(routeSemantics(beta.after.routes[channelId]), routeSemantics(route));
+    assert.notEqual(beta.after.routes[channelId].routeFingerprint, route.routeFingerprint);
+  }
+  assert.deepEqual(Object.keys(beta.after.mappings).sort(), ['bound-alpha', 'bound-beta']);
+  assert.deepEqual(Object.keys(beta.after.routes).sort(), ['801', '802', '901', '902']);
+});
+test('populated bound-reader recovery rejects an alternate candidate graph with durable cleanup', async () => {
+  const harness = await boundReaderRuntime();
+  harness.setPrincipal(owner);
+  const firstBefore = await harness.native.readManagementState();
+  const firstCandidate = mappingInput(
+    'recovery-alpha',
+    firstBefore.mappingGeneration + 1,
+    firstBefore.fenceGeneration,
+    ['1001', '1002'],
+  );
+  const firstInput = {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'recovery-alpha-create',
+    mappingId: 'recovery-alpha',
+    ...firstCandidate,
+    expectedRevision: firstBefore.revision,
+    expectedFingerprint: null,
+  };
+  const firstStarted = await harness.runtime.execute('mapping-reconcile', firstInput);
+  assert.equal(firstStarted.pending, true, JSON.stringify(firstStarted));
+  harness.setPrincipal(botPrincipal);
+  const reader = await createTestManagedAuthorityReader({
+    configPath: 'C:/state/channels.json',
+    expectedHostSetFingerprint: managedHostSetFingerprint('host=secret'),
+    roleBindings: roles,
+    native: harness.native,
+  });
+  assert.equal((await reader.readSnapshot()).code, 'MANAGED_AUTHORITY_PENDING');
+  harness.setPrincipal(owner);
+  const firstCompleted = await new ManagementRuntime({ native: harness.native }).execute('mapping-reconcile', firstInput);
+  await assertTerminalManagedSuccessor(harness, firstBefore, firstCompleted, {
+    operation: 'mapping-reconcile',
+    mappingId: 'recovery-alpha',
+    mappingGenerationDelta: 1,
+    tokenConfigGenerationDelta: 0,
+  });
+
+  const before = await harness.native.readManagementState();
+  const originalCandidate = mappingInput(
+    'recovery-beta',
+    before.mappingGeneration + 1,
+    before.fenceGeneration,
+    ['1101', '1102'],
+  );
+  const originalInput = {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'recovery-beta-create',
+    mappingId: 'recovery-beta',
+    ...originalCandidate,
+    expectedRevision: before.revision,
+    expectedFingerprint: null,
+  };
+  const started = await harness.runtime.execute('mapping-reconcile', originalInput);
+  assert.equal(started.ok, true, JSON.stringify(started));
+  assert.equal(started.pending, true);
+  assert.equal(started.phase, 'reader-pending');
+  assert.deepEqual(await harness.native.readManagementState(), before);
+  const request = authorityRecord(harness.files, 'authority-successor-request', started.txId);
+
+  const alternateCandidate = mappingInput(
+    'recovery-beta',
+    before.mappingGeneration + 1,
+    before.fenceGeneration,
+    ['1101', '1103'],
+  );
+  const terminalCleanup = harness.native.terminalCloseOrManualCleanup.bind(harness.native);
+  let cleanupCalls = 0;
+  harness.native.terminalCloseOrManualCleanup = async (...args) => {
+    cleanupCalls += 1;
+    return terminalCleanup(...args);
+  };
+  const recovered = await new ManagementRuntime({ native: harness.native }).execute('mapping-reconcile', {
+    ...originalInput,
+    ...alternateCandidate,
+  });
+  assert.deepEqual(recovered, {
+    exitCode: 7,
+    ok: false,
+    error: 'MANUAL_CLEANUP_REQUIRED',
+    routeDisposition: 'no-route',
+  });
+  assert.equal(cleanupCalls, 1);
+  const state = await harness.native.readManagementState();
+  assert.equal(state.recovery.phase, 'manual_cleanup');
+  assert.equal(state.recovery.txId, started.txId);
+  assert.equal(state.recovery.requestFingerprint, request.requestFingerprint);
+  assert.equal(state.recovery.routeDisposition, 'no-route');
+  const cleanup = JSON.parse(fileEnding(harness.files, '/terminal-close.json'));
+  assert.equal(cleanup.txId, started.txId);
+  assert.equal(cleanup.reason, 'RECOVERY_INPUT_MISMATCH');
+  assert.equal(cleanup.routeDisposition, 'no-route');
+  assert.equal(cleanup.blockedUntilOwnerAction, true);
 });
 test('a second ManagementRuntime adopts only the same stable genesis probe tuple', async () => {
   const harness = adapter();
@@ -1502,6 +2280,102 @@ async function pendingBoundSuccessorFixture(idempotencyKey = 'reader-pending-rec
   assert.equal(started.pending, true, JSON.stringify(started));
   return { ...harness, input, started };
 }
+async function pendingAlternateCandidateFixture(idempotencyKey) {
+  const fixture = await pendingBoundSuccessorFixture(idempotencyKey);
+  fixture.setPrincipal(botPrincipal);
+  const reader = await createTestManagedAuthorityReader({
+    configPath: 'C:/state/channels.json',
+    expectedHostSetFingerprint: managedHostSetFingerprint('host=secret'),
+    roleBindings: roles,
+    native: fixture.native,
+  });
+  assert.equal((await reader.readSnapshot()).code, 'MANAGED_AUTHORITY_PENDING');
+  fixture.setPrincipal(owner);
+  const alternate = mappingInput(
+    fixture.input.mappingId,
+    fixture.input.mapping.mappingGeneration,
+    fixture.input.mapping.fenceGeneration,
+    '999',
+  );
+  return { ...fixture, alternateInput: { ...fixture.input, ...alternate } };
+}
+test('invalid cleanup evidence never earns same-transaction cleanup deduplication', async () => {
+  for (const [kind, expectedCasCalls] of [
+    ['wrong transaction', 0],
+    ['wrong fingerprint', 0],
+    ['wrong disposition', 0],
+    ['wrong accepted phase', 2],
+    ['null terminal fingerprint', 2],
+  ]) {
+    const fixture = await pendingAlternateCandidateFixture(`invalid-cleanup-${kind.replaceAll(' ', '-')}`);
+    const durableState = await fixture.native.readManagementState();
+    const readManagementState = fixture.native.readManagementState.bind(fixture.native);
+    const compareAndSwapManagementState = fixture.native.compareAndSwapManagementState.bind(fixture.native);
+    const terminalCloseOrManualCleanup = fixture.native.terminalCloseOrManualCleanup.bind(fixture.native);
+    let cleanupStarted = false;
+    let cleanupCalls = 0;
+    let casCalls = 0;
+    let terminal = null;
+
+    fixture.native.terminalCloseOrManualCleanup = async (...args) => {
+      cleanupCalls += 1;
+      if (terminal === null) {
+        terminal = kind === 'null terminal fingerprint'
+          ? { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: null }
+          : await terminalCloseOrManualCleanup(...args);
+      }
+      cleanupStarted = true;
+      return structuredClone(terminal);
+    };
+    fixture.native.readManagementState = async () => {
+      const state = await readManagementState();
+      if (!cleanupStarted || ['wrong accepted phase', 'null terminal fingerprint'].includes(kind)) return state;
+      const manualCleanupFingerprint = kind === 'wrong fingerprint'
+        ? `${terminal.manualCleanupFingerprint[0] === '0' ? '1' : '0'}${terminal.manualCleanupFingerprint.slice(1)}`
+        : terminal.manualCleanupFingerprint;
+      return {
+        ...structuredClone(state),
+        recovery: {
+          ...structuredClone(state.recovery),
+          phase: 'manual_cleanup',
+          txId: kind === 'wrong transaction' ? `${fixture.started.txId}-foreign` : fixture.started.txId,
+          routeDisposition: kind === 'wrong disposition' ? 'route-open' : 'no-route',
+          manualCleanupFingerprint,
+        },
+      };
+    };
+    fixture.native.compareAndSwapManagementState = async (expectedRevision, candidate) => {
+      if (!cleanupStarted) return compareAndSwapManagementState(expectedRevision, candidate);
+      casCalls += 1;
+      if (kind === 'wrong accepted phase') candidate.recovery.phase = 'terminal';
+      return true;
+    };
+
+    const result = await new ManagementRuntime({ native: fixture.native }).execute(
+      'mapping-reconcile',
+      fixture.alternateInput,
+    );
+
+    fixture.native.readManagementState = readManagementState;
+    fixture.native.compareAndSwapManagementState = compareAndSwapManagementState;
+    fixture.native.terminalCloseOrManualCleanup = terminalCloseOrManualCleanup;
+    assert.deepEqual(result, {
+      exitCode: 7,
+      ok: false,
+      error: 'MANUAL_CLEANUP_DURABILITY_FAILED',
+      routeDisposition: 'no-route',
+    }, kind);
+    assert.equal(cleanupCalls, 2, kind);
+    assert.equal(casCalls, expectedCasCalls, kind);
+    assert.deepEqual(await fixture.native.readManagementState(), durableState, kind);
+    assert.equal((await fixture.native.readManagementState()).recovery.phase, 'terminal', kind);
+    assert.equal(
+      Boolean(fileEnding(fixture.files, '/terminal-close.json')),
+      kind !== 'null terminal fingerprint',
+      kind,
+    );
+  }
+});
 function setSuccessorHeadPhase(fixture, phase) {
   const headPath = [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/authority-head.json'));
   const markerPath = [...fixture.files.keys()].find((path) => typeof path === 'string' && path.replaceAll('\\', '/').endsWith('.managed-history.json'));
@@ -1872,6 +2746,66 @@ test('public recover completes an interrupted no-reader successor without reader
   assert.equal(head.historyMarkerFingerprint, marker.markerFingerprint);
   assert.equal(marker.sequence, head.sequence);
   assert.equal((await fixture.native.readManagementState()).recovery.phase, 'terminal');
+});
+test('public no-reader recovery preserves a populated complete candidate graph', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=populated-recovery'))).ok, true);
+  await reconcileMapping(harness, runtime, {
+    mappingId: 'recover-alpha',
+    channelIds: ['1201', '1202'],
+    idempotencyKey: 'recover-alpha-create',
+  });
+  const predecessorMarker = await harness.native.readManagedHistoryMarker();
+  const second = await reconcileMapping(harness, runtime, {
+    mappingId: 'recover-beta',
+    channelIds: ['1301', '1302'],
+    idempotencyKey: 'recover-beta-create',
+  });
+  const expectedState = await harness.native.readManagementState();
+  const expectedProof = await harness.native.readRetainedTargetProof();
+  const fixture = {
+    ...harness,
+    genesisMarker: predecessorMarker,
+    successor: second.result,
+  };
+  setSuccessorHeadPhase(fixture, 'reader-pending');
+
+  const recovered = await new ManagementRuntime({ native: harness.native }).execute('recover', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'recover-beta-create',
+  });
+  assert.deepEqual(Object.keys(recovered).sort(), [
+    'exitCode',
+    'idempotent',
+    'ok',
+    'pending',
+    'phase',
+    'receiptFingerprint',
+    'routeDisposition',
+    'txId',
+  ]);
+  assert.equal(recovered.exitCode, 0);
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.pending, false);
+  assert.equal(recovered.idempotent, true);
+  assert.equal(recovered.phase, 'terminal');
+  assert.equal(recovered.txId, second.result.txId);
+  assert.equal(recovered.routeDisposition, 'no-route');
+  assert.match(recovered.receiptFingerprint, /^[a-f0-9]{64}$/);
+  const after = await harness.native.readManagementState();
+  const proof = await harness.native.readRetainedTargetProof();
+  assert.deepEqual(after.mappings, expectedState.mappings);
+  assert.deepEqual(after.routes, expectedState.routes);
+  assert.deepEqual(proof.snapshot, expectedProof.snapshot);
+  assert.equal(after.fenceGeneration, expectedState.fenceGeneration);
+  assert.equal(after.mappingGeneration, expectedState.mappingGeneration);
+  assert.deepEqual(Object.keys(after.mappings).sort(), ['recover-alpha', 'recover-beta']);
+  assert.deepEqual(Object.keys(after.routes).sort(), ['1201', '1202', '1301', '1302']);
+  assert.equal(after.recovery.phase, 'terminal');
+  assert.equal(after.recovery.txId, second.result.txId);
+  assert.equal(JSON.parse(fileEnding(harness.files, '/authority-head.json')).phase, 'terminal');
 });
 
 test('public recover completes legacy-retained no-reader successor from the predecessor proof', async () => {

@@ -159,6 +159,64 @@ The native primitive set does not enumerate arbitrary control-directory entries;
 an archive with an ID not present in the bound inventory remains outside the
 proof boundary rather than being silently treated as valid.
 
+## Mapping successor predecessor and candidate fences
+
+**Decision:** validate the complete predecessor graph at fence `F` and compare
+the caller's revision/mapping fingerprint against that untouched graph before
+constructing a separate candidate at `F+1`. Every retained mapping and route
+receives the candidate fence and a recomputed fingerprint. Retained semantic
+mapping/workspace generations do not advance merely because the global fence
+advances. Apply the requested mapping delta before sealing the candidate.
+
+**Drivers and rationale:** populated successors must remain usable without
+weakening CAS, graph validation, or the single native authority. The regression
+on baseline `f8fbe0f` completed Genesis and a first mapping, then reproduced
+`MANAGED_CHANNELS_V2_INVALID`/6 on a fresh second mapping: predecessor records
+were at fence 2, the attempted candidate was at 3, and no successor write
+occurred. Updating only the top-level fence created an invalid mixed graph
+before CAS. The runtime now uses one deterministic carry-forward transform for
+mapping preparation, recovery reconstruction, and managed token candidates.
+
+**Alternatives rejected:** retaining old record fences or loosening the shared
+validator breaks envelope equality; omitting `F+1` breaks monotonic fencing.
+Rewriting retained immutable generation records would collide with their
+unchanged generation identity. Reclassifying mapping operations as all-scope
+would change authority policy rather than repair candidate construction.
+
+**Archive and route-history consequences:** revoke and rollback validate the
+immutable current-generation mapping and each archived route internally.
+Re-fencing that archived mapping to predecessor `F` must reproduce the live
+mapping exactly. Historic routes need not equal current routes: another
+mapping may have acquired a channel without rewriting the displaced mapping's
+archive. Current route removals derive from the predecessor graph; rollback's
+replacement delta uses its separately validated requested historical generation.
+Tombstones bind the original archive mapping fence/fingerprint, while handoffs
+and candidate snapshots bind `F+1`. Retained archives remain byte-for-byte
+unchanged.
+
+**Authority and finality consequences:** mapping operations retain
+`affectedScope:"mapping"`, their existing operation mapping-ID convention, and
+the empty affected-route fingerprint list; token attestation retains `all`.
+Close remains globally `closed-drained`, zero outstanding grants, and
+`no-route`. Request, publication, finality, live target, receipt, and terminal
+management state must agree on the complete candidate graph. Bound-reader
+completion still requires the exact B lease/projection/acknowledgement.
+Recovery reconstructs only the original request's candidate; it cannot silently
+substitute another graph.
+The replay bundle's candidate fence is an input to validation, not a replacement
+for the predecessor's fence. Reconstruction requires the exact next safe-integer
+fence `F+1`; a mismatch enters `RECOVERY_INPUT_MISMATCH` and manual cleanup
+instead of adopting the bundle's asserted fence.
+
+**Verification and follow-ups:** `bot/test/management-runtime.test.js` covers
+multi-mapping/multi-route successors, exact stale CAS, immutable archive drift
+and channel reassignment, token carry-forward, and no-reader/bound-reader
+recovery/finality. This is JavaScript runtime/native-adapter evidence using the
+test low-level filesystem and locks, not proof of OS locking, ACLs, or durability.
+The targeted precondition CLI is a separate dependent change. No native schema,
+admission authority, host-secret cutover, serving, or deployment change follows
+from this correction.
+
 ## Windows durability contract (non-elevated)
 `flush_directory_or_volume` on Windows never opens a raw volume device for
 `FlushFileBuffers`, because that call requires `SeManageVolumePrivilege`
