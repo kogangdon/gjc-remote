@@ -127,6 +127,10 @@ const ROUTE_KEYS = [
 const OPAQUE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const DISCORD_ID = /^[0-9]{1,20}$/;
 
+export function isManagedMappingId(value) {
+  return typeof value === "string" && OPAQUE_TOKEN.test(value);
+}
+
 function exactHostId(value) {
   return typeof value === "string" && value.length <= 128 &&
     Buffer.byteLength(value, "utf8") <= 128 && validText(value, 128) &&
@@ -163,7 +167,7 @@ function validMappingLocation(mapping) {
 }
 
 export function validateManagedMappingRecord(mapping) {
-  if (!exact(mapping, MAPPING_KEYS) || !OPAQUE_TOKEN.test(mapping.mappingId) ||
+  if (!exact(mapping, MAPPING_KEYS) || !isManagedMappingId(mapping.mappingId) ||
       !exactHostId(mapping.hostId) || !positiveFence(mapping.fenceGeneration) || !Number.isSafeInteger(mapping.mappingGeneration) ||
       mapping.mappingGeneration < 1 || !Number.isSafeInteger(mapping.workspaceGeneration) ||
       mapping.workspaceGeneration < 1 || mapping.mappingVersion !== 1 ||

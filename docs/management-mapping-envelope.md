@@ -83,6 +83,68 @@ Every successor-producing mutation (`genesis`, `tokens-attest`,
 not a credential; all credential and token values remain protected stdin fields.
 Duplicate, unknown, and secret-bearing argv flags are refused.
 
+## Targeted mapping preconditions
+
+`mapping-preconditions` supplies the revision and selected mapping fingerprint
+needed by a later mapping mutation. It is an owner-only CAS hint, not a mapping
+inventory or a display of the mapping's configuration.
+
+```bash
+# Supply protected stdin separately; never put an actual secret in argv.
+node bot/src/management-entrypoint.js mapping-preconditions \
+  --actor-principal uid:1000 --actor-secret-stdin true --mapping-id map-1
+```
+
+The stdin schema is exactly `{"actorSecret":"REDACTED"}` (placeholder only,
+not a usable credential). The actual secret must have at least 16 JavaScript
+UTF-16 code units and at most 4096 UTF-8 bytes; it is not a grapheme count.
+The three shown flags are the only permitted flags; no idempotency key or
+mapping payload is accepted. Mapping IDs are strings of 1–128 ASCII characters,
+matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. Names such as `constructor`,
+`toString`, and `hasOwnProperty` are valid own keys, not reserved words.
+
+An absent mapping can produce this illustrative response:
+
+```json
+{"ok":true,"exitCode":0,"mappingId":"map-1","expectedRevision":12,"expectedFingerprint":null,"routeDisposition":"no-route"}
+```
+
+These are the only six success fields. A present mapping returns its lowercase
+64-character fingerprint instead of null. Revision is a positive safe integer,
+never the Genesis null sentinel. Absence grants no create permission.
+
+The native capability and immutable OS-role checks remain mandatory even with
+valid owner credentials. Under the native M mapping lock, the command reads the
+raw state and separate auth store, authenticates the owner before disclosing
+recovery or target information, and refuses nonterminal recovery. It validates
+the original mapping/route containers and every original record before any
+clone can hide corruption, then validates the complete graph before selecting
+the requested own key. Unrelated corruption therefore blocks the read too.
+
+No durable state, target, auth, audit, generation, or floor is changed. This
+command never repairs, publishes, recovers, opens admission, or contacts B.
+Existing native lock mechanics and entrypoint self-test scratch I/O still apply;
+"read-only" does not promise zero transient filesystem operations.
+
+Use the returned pair as the explicit expected values for a later
+`mapping-reconcile`, `mapping-revoke`, or `mapping-rollback`. The pair is not a
+lease, reservation, live-target proof, or permission to mutate. The lock is
+released before output. A legitimate intervening successor can invalidate even
+an unrelated mapping's fingerprint through re-fencing. Otherwise-admissible
+stale mutations return `CAS_CONFLICT`/4 without successor writes; inspect the
+change and explicitly obtain a fresh pair rather than automatically retrying.
+The predecessor/candidate correction in PR #229 supplies this mutation boundary.
+Historic archive route membership remains distinct from current membership.
+
+Parser/schema failures retain the existing stderr `USAGE_*`/2 behavior;
+lower-level strict-input failures without that prefix are redacted as
+`INPUT_INVALID`/6. Runtime errors use only this command's exact allowlist and
+the four fields `ok`, `exitCode`, `error`, and `routeDisposition`. Unknown
+exceptions become `MANAGEMENT_FAILED`/70, never raw native text. No result
+contains mapping bodies, paths, credentials, readiness, or extra authority
+fingerprints. `no-route` describes this operation, not the system's serving
+state. Other aggregate-read commands retain their existing contracts.
+
 ## Publication, recovery, and audit
 
 Publication is atomic and ordered:

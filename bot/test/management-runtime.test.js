@@ -13,6 +13,7 @@ const owner = { kind: 'sid', value: 'S-1-5-21-100' };
 const target = { kind: 'sid', value: 'S-1-5-21-103' };
 const botPrincipal = { kind: 'sid', value: 'S-1-5-21-101' };
 const recoveryPrincipal = { kind: 'sid', value: 'S-1-5-21-102' };
+const nonowner = { kind: 'sid', value: 'S-1-5-21-104' };
 const roles = { managementSid: owner.value, botSid: botPrincipal.value, recoverySid: recoveryPrincipal.value, systemSid: 'S-1-5-18' };
 const provisioning = {
   management: 'a'.repeat(64),
@@ -20,6 +21,7 @@ const provisioning = {
   recovery: 'c'.repeat(64),
 };
 const secret = 'owner-secret-is-long-enough';
+const nonownerSecret = 'nonowner-secret-is-long-enough';
 const fileEnding = (files, ending) => [...files.entries()].find(([path]) => path.replaceAll("\\", "/").endsWith(ending))?.[1];
 const filePathEnding = (files, ending) => [...files.keys()].find((path) => path.replaceAll("\\", "/").endsWith(ending));
 const genesisInput = (hostTokens) => ({
@@ -672,6 +674,1038 @@ async function reconcileMapping(harness, runtime, {
   });
   return { before, candidate, result, ...terminal };
 }
+const mappingPreconditionsInput = (mappingId, actorPrincipal = owner, actorSecret = secret) => ({
+  actorPrincipal,
+  actorSecret,
+  mappingId,
+});
+const durableFileSnapshot = (files) =>
+  new Map([...files].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+const assertMappingPreconditionsFailure = (result, exitCode, error) => {
+  assert.deepEqual(Object.keys(result).sort(), ['error', 'exitCode', 'ok', 'routeDisposition']);
+  assert.deepEqual(result, {
+    ok: false,
+    exitCode,
+    error,
+    routeDisposition: 'no-route',
+  });
+};
+const assertMappingPreconditionsSuccess = (result, mappingId, expectedRevision, expectedFingerprint) => {
+  assert.deepEqual(Object.keys(result).sort(), [
+    'exitCode',
+    'expectedFingerprint',
+    'expectedRevision',
+    'mappingId',
+    'ok',
+    'routeDisposition',
+  ]);
+  assert.deepEqual(result, {
+    ok: true,
+    exitCode: 0,
+    mappingId,
+    expectedRevision,
+    expectedFingerprint,
+    routeDisposition: 'no-route',
+  });
+};
+function secondStateNative(native, secondState, {
+  auth,
+  onSecondRead,
+  onReadAuth,
+  onLock,
+} = {}) {
+  let reads = 0;
+  return {
+    ...native,
+    async readManagementState() {
+      reads += 1;
+      if (reads === 1) return native.readManagementState();
+      onSecondRead?.(reads);
+      return typeof secondState === 'function' ? secondState(reads) : secondState;
+    },
+    async readManagementAuth() {
+      await onReadAuth?.();
+      return auth === undefined ? native.readManagementAuth() : auth;
+    },
+    async withManagementLocks(locks, callback) {
+      onLock?.('start', locks);
+      try {
+        return await callback();
+      } finally {
+        onLock?.('end', locks);
+      }
+    },
+  };
+}
+function stateWithMappingId(state, mappingId) {
+  const [original] = Object.values(state.mappings);
+  const mapping = fingerprintManagedMappingRecord({
+    ...structuredClone(original),
+    mappingId,
+    mappingFingerprint: null,
+  });
+  const routes = Object.fromEntries(Object.values(state.routes).map((originalRoute) => {
+    const route = fingerprintManagedRouteRecord({
+      ...structuredClone(originalRoute),
+      mappingId,
+      routeFingerprint: null,
+    }, mapping);
+    return [route.channelId, route];
+  }));
+  return {
+    ...structuredClone(state),
+    mappings: { [mappingId]: mapping },
+    routes,
+  };
+}
+async function mappingPreconditionsFixture({
+  mappingIds = ['precondition-map'],
+  channelIds = [['1401', '1402']],
+} = {}) {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=preconditions'))).ok, true);
+  for (let index = 0; index < mappingIds.length; index += 1) {
+    await reconcileMapping(harness, runtime, {
+      mappingId: mappingIds[index],
+      channelIds: channelIds[index],
+      idempotencyKey: `${mappingIds[index]}-create`,
+    });
+  }
+  return { ...harness, runtime };
+}
+test('mapping-preconditions returns exact present, absent, and prototype-name pairs without durable mutation', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const beforeState = await fixture.native.readManagementState();
+  const beforeAuth = await fixture.native.readManagementAuth();
+  const beforeFiles = durableFileSnapshot(fixture.files);
+  const directoriesBefore = new Set(fixture.directories);
+  const writesBefore = fixture.writes.length;
+  const payloadsBefore = fixture.payloads.length;
+  const present = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  assertMappingPreconditionsSuccess(
+    present,
+    'precondition-map',
+    beforeState.revision,
+    beforeState.mappings['precondition-map'].mappingFingerprint,
+  );
+  for (const mappingId of ['a', 'a'.repeat(128), 'missing-map', 'constructor', 'toString', 'hasOwnProperty']) {
+    const absent = await fixture.runtime.execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput(mappingId),
+    );
+    assertMappingPreconditionsSuccess(absent, mappingId, beforeState.revision, null);
+  }
+
+  for (const mappingId of ['constructor', 'toString', 'hasOwnProperty']) {
+    const projected = stateWithMappingId(beforeState, mappingId);
+    const runtime = new ManagementRuntime({
+      native: secondStateNative(fixture.native, projected),
+    });
+    const own = await runtime.execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput(mappingId),
+    );
+    assertMappingPreconditionsSuccess(
+      own,
+      mappingId,
+      projected.revision,
+      projected.mappings[mappingId].mappingFingerprint,
+    );
+  }
+
+  assert.equal(fixture.writes.length, writesBefore);
+  assert.equal(fixture.payloads.length, payloadsBefore);
+  assert.deepEqual(fixture.files, beforeFiles);
+  assert.deepEqual(fixture.directories, directoriesBefore);
+  assert.deepEqual(await fixture.native.readManagementState(), beforeState);
+  assert.deepEqual(await fixture.native.readManagementAuth(), beforeAuth);
+});
+
+test('mapping-preconditions accepts the maximum safe positive locked revision', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const state = {
+    ...await fixture.native.readManagementState(),
+    revision: Number.MAX_SAFE_INTEGER,
+  };
+  const result = await new ManagementRuntime({
+    native: secondStateNative(fixture.native, state),
+  }).execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  assertMappingPreconditionsSuccess(
+    result,
+    'precondition-map',
+    Number.MAX_SAFE_INTEGER,
+    state.mappings['precondition-map'].mappingFingerprint,
+  );
+});
+
+test('mapping-preconditions returns numeric absence for the post-Genesis empty graph', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=empty-preconditions'))).ok, true);
+  const state = await harness.native.readManagementState();
+  assert.equal(state.mappingGeneration, 0);
+  assert.deepEqual(state.mappings, {});
+  assert.deepEqual(state.routes, {});
+  const filesBefore = durableFileSnapshot(harness.files);
+  const writesBefore = harness.writes.length;
+  const result = await runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('not-created'),
+  );
+  assertMappingPreconditionsSuccess(result, 'not-created', state.revision, null);
+  assert.equal(harness.writes.length, writesBefore);
+  assert.deepEqual(harness.files, filesBefore);
+});
+
+test('mapping-preconditions direct inputs and full runtime boundary use the exact error allowlist', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const filesBefore = durableFileSnapshot(fixture.files);
+  const directoriesBefore = new Set(fixture.directories);
+  const writesBefore = fixture.writes.length;
+  for (const [input, exitCode, error] of [
+    [{ actorSecret: secret, mappingId: 'precondition-map' }, 6, 'ACTOR_PRINCIPAL_INVALID'],
+    [{ actorPrincipal: { kind: 'uid', value: 'uid:01' }, actorSecret: secret, mappingId: 'precondition-map' }, 6, 'ACTOR_PRINCIPAL_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: null }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: false }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: 1 }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: ['precondition-map'] }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: { value: 'precondition-map' } }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: '' }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: '.invalid' }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, actorSecret: secret, mappingId: 'a'.repeat(129) }, 6, 'MAPPING_ID_INVALID'],
+    [{ actorPrincipal: owner, mappingId: 'precondition-map' }, 3, 'AUTH_SECRET_REQUIRED'],
+    [{ actorPrincipal: owner, actorSecret: 'short', mappingId: 'precondition-map' }, 3, 'AUTH_SECRET_INVALID'],
+  ]) {
+    assertMappingPreconditionsFailure(
+      await fixture.runtime.execute('mapping-preconditions', input),
+      exitCode,
+      error,
+    );
+  }
+
+  for (const native of [null, {}, { readManagementState: async () => null }]) {
+    assertMappingPreconditionsFailure(
+      await new ManagementRuntime({ native }).execute(
+        'mapping-preconditions',
+        mappingPreconditionsInput('precondition-map'),
+      ),
+      5,
+      'MANAGED_NATIVE_UNAVAILABLE',
+    );
+  }
+
+  const missingFirstState = {
+    ...fixture.native,
+    readManagementState: async () => null,
+  };
+  assertMappingPreconditionsFailure(
+    await new ManagementRuntime({ native: missingFirstState }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('precondition-map'),
+    ),
+    6,
+    'MANAGEMENT_ROLE_BINDING_REQUIRED',
+  );
+  assertMappingPreconditionsFailure(
+    await new ManagementRuntime({ native: missingFirstState }).execute(
+      'mapping-preconditions',
+      {},
+    ),
+    6,
+    'MANAGEMENT_ROLE_BINDING_REQUIRED',
+  );
+
+  const nativeRefusal = {
+    ...fixture.native,
+    async configureManagementRoles() {
+      const error = new Error('C:\\secret\\state and owner-secret-is-long-enough');
+      error.code = 'ERR_NATIVE_CONTROL_REFUSED';
+      error.reason = 'PRIVATE_NATIVE_REASON';
+      throw error;
+    },
+  };
+  const refused = await new ManagementRuntime({ native: nativeRefusal }).execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  assertMappingPreconditionsFailure(refused, 5, 'ERR_NATIVE_CONTROL_REFUSED');
+  assert.equal(JSON.stringify(refused).includes('secret'), false);
+  assert.equal(JSON.stringify(refused).includes('PRIVATE_NATIVE_REASON'), false);
+
+  for (const errorFactory of [
+    () => new Error('UPPERCASE_SECRET_CANARY'),
+    () => new Error('ERR_NATIVE_CONTROL_REFUSED'),
+    () => {
+      const error = new Error('OWNER_REQUIRED');
+      error.code = 'UPPERCASE_NATIVE_CODE_CANARY';
+      return error;
+    },
+  ]) {
+    const native = {
+      ...fixture.native,
+      async readManagementState() {
+        throw errorFactory();
+      },
+    };
+    const result = await new ManagementRuntime({ native }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('precondition-map'),
+    );
+    assertMappingPreconditionsFailure(result, 70, 'MANAGEMENT_FAILED');
+    assert.equal(JSON.stringify(result).includes('CANARY'), false);
+  }
+  const lockedCanaryNative = secondStateNative(
+    fixture.native,
+    await fixture.native.readManagementState(),
+  );
+  lockedCanaryNative.readManagementAuth = async () => {
+    throw new Error('UPPERCASE_LOCKED_SECRET_PATH_CANARY');
+  };
+  const lockedCanary = await new ManagementRuntime({ native: lockedCanaryNative }).execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  assertMappingPreconditionsFailure(lockedCanary, 70, 'MANAGEMENT_FAILED');
+  assert.equal(JSON.stringify(lockedCanary).includes('CANARY'), false);
+  assert.equal(fixture.writes.length, writesBefore);
+  assert.deepEqual(fixture.files, filesBefore);
+  assert.deepEqual(fixture.directories, directoriesBefore);
+});
+test('mapping-preconditions authenticates and requires owner before state, recovery, or target disclosure', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const added = await fixture.runtime.execute('auth-add', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    targetPrincipal: nonowner,
+    targetSecret: nonownerSecret,
+    idempotencyKey: 'mapping-preconditions-nonowner',
+  });
+  assert.equal(added.ok, true, JSON.stringify(added));
+  const filesAfterAdd = durableFileSnapshot(fixture.files);
+  const writesAfterAdd = fixture.writes.length;
+  const state = await fixture.native.readManagementState();
+  const guardedState = structuredClone(state);
+  const mapping = guardedState.mappings['precondition-map'];
+  delete guardedState.mappings['precondition-map'];
+  let targetReads = 0;
+  Object.defineProperty(guardedState.mappings, 'precondition-map', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      targetReads += 1;
+      return mapping;
+    },
+  });
+  const auth = await fixture.native.readManagementAuth();
+
+  for (const [mappingId, secondState] of [
+    ['precondition-map', guardedState],
+    ['missing-map', guardedState],
+    ['precondition-map', { ...guardedState, recovery: { phase: 'reader-pending' } }],
+    ['precondition-map', { ...guardedState, auth: {} }],
+    ['precondition-map', null],
+  ]) {
+    const result = await new ManagementRuntime({
+      native: secondStateNative(fixture.native, secondState, { auth }),
+    }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput(mappingId, nonowner, nonownerSecret),
+    );
+    assertMappingPreconditionsFailure(result, 3, 'OWNER_REQUIRED');
+    assert.equal(targetReads, 0);
+  }
+
+  for (const [actorPrincipal, actorSecret] of [
+    [owner, 'incorrect-owner-secret'],
+    [{ kind: 'sid', value: 'S-1-5-21-999' }, 'unknown-principal-secret'],
+  ]) {
+    const present = await new ManagementRuntime({
+      native: secondStateNative(fixture.native, guardedState, { auth }),
+    }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('precondition-map', actorPrincipal, actorSecret),
+    );
+    const absent = await new ManagementRuntime({
+      native: secondStateNative(fixture.native, null, { auth }),
+    }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('missing-map', actorPrincipal, actorSecret),
+    );
+    assertMappingPreconditionsFailure(present, 3, 'AUTH_DENIED');
+    assert.deepEqual(absent, present);
+    assert.equal(targetReads, 0);
+  }
+
+  for (const [storedAuth, error] of [
+    [null, 'MANAGEMENT_AUTH_REQUIRED'],
+    [{}, 'AUTH_CREDENTIAL_INVALID'],
+  ]) {
+    const result = await new ManagementRuntime({
+      native: secondStateNative(fixture.native, guardedState, { auth: storedAuth }),
+    }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('precondition-map'),
+    );
+    assertMappingPreconditionsFailure(result, 3, error);
+    assert.equal(targetReads, 0);
+  }
+
+  const legacyEmbeddedAuth = { ...structuredClone(state), auth: {} };
+  assertMappingPreconditionsFailure(
+    await new ManagementRuntime({
+      native: secondStateNative(fixture.native, legacyEmbeddedAuth, { auth }),
+    }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('precondition-map'),
+    ),
+    3,
+    'MANAGEMENT_AUTH_MIGRATION_REQUIRED',
+  );
+  assert.equal(fixture.writes.length, writesAfterAdd);
+  assert.deepEqual(fixture.files, filesAfterAdd);
+
+  const revoked = await fixture.runtime.execute('auth-revoke', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    targetPrincipal: nonowner,
+    idempotencyKey: 'mapping-preconditions-revoke-nonowner',
+  });
+  assert.equal(revoked.ok, true, JSON.stringify(revoked));
+  const filesAfterRevoke = durableFileSnapshot(fixture.files);
+  const writesAfterRevoke = fixture.writes.length;
+  const revokedPresent = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map', nonowner, nonownerSecret),
+  );
+  const revokedAbsent = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('missing-map', nonowner, nonownerSecret),
+  );
+  const revokedAuth = await fixture.native.readManagementAuth();
+  const revokedRecovery = await new ManagementRuntime({
+    native: secondStateNative(
+      fixture.native,
+      { ...guardedState, recovery: { phase: 'reader-pending' } },
+      { auth: revokedAuth },
+    ),
+  }).execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map', nonowner, nonownerSecret),
+  );
+  assertMappingPreconditionsFailure(
+    revokedPresent,
+    3,
+    'AUTH_DENIED',
+  );
+  assert.deepEqual(revokedAbsent, revokedPresent);
+  assert.deepEqual(revokedRecovery, revokedPresent);
+  assert.equal(targetReads, 0);
+  assert.equal(fixture.writes.length, writesAfterRevoke);
+  assert.deepEqual(fixture.files, filesAfterRevoke);
+});
+
+test('mapping-preconditions exposes only exact native refusal codes at role and lock boundaries', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  fixture.setPrincipal(nonowner);
+  const wrongOsRole = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  fixture.setPrincipal(owner);
+  assertMappingPreconditionsFailure(wrongOsRole, 5, 'ERR_NATIVE_CONTROL_REFUSED');
+  for (const [boundary, native] of [
+    ['role', {
+      ...fixture.native,
+      async configureManagementRoles() {
+        const error = new Error('wrong OS role at C:\\private\\control');
+        error.code = 'ERR_NATIVE_CONTROL_REFUSED';
+        throw error;
+      },
+    }],
+    ['lock', {
+      ...fixture.native,
+      async withManagementLocks() {
+        const error = new Error('lock refused for private principal');
+        error.code = 'ERR_NATIVE_CONTROL_REFUSED';
+        throw error;
+      },
+    }],
+    ['auth read', {
+      ...fixture.native,
+      async readManagementAuth() {
+        const error = new Error('malformed native auth at private path');
+        error.code = 'ERR_NATIVE_CONTROL_REFUSED';
+        throw error;
+      },
+    }],
+  ]) {
+    const result = await new ManagementRuntime({ native }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('precondition-map'),
+    );
+    assertMappingPreconditionsFailure(result, 5, 'ERR_NATIVE_CONTROL_REFUSED');
+    assert.equal(JSON.stringify(result).includes('private'), false, boundary);
+  }
+});
+
+test('mapping-preconditions refuses every nonterminal recovery phase before target access or recovery calls', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const state = await fixture.native.readManagementState();
+  const filesBefore = durableFileSnapshot(fixture.files);
+  const writesBefore = fixture.writes.length;
+  const recoveryMethods = [
+    'recoverGenesisSuffix',
+    'completePendingGenesis',
+    'readAuthoritySuccessorHeadRaw',
+    'readSuccessorBundle',
+    'readSuccessorRecovery',
+    'terminalCloseOrManualCleanup',
+  ];
+  for (const phase of [
+    'prepared',
+    'handshake-pending',
+    'reserved',
+    'closed',
+    'replaced',
+    'reader-pending',
+    'terminalizing',
+    'manual_cleanup',
+  ]) {
+    const guardedState = {
+      ...structuredClone(state),
+      recovery: { phase },
+    };
+    const mapping = guardedState.mappings['precondition-map'];
+    delete guardedState.mappings['precondition-map'];
+    let targetReads = 0;
+    Object.defineProperty(guardedState.mappings, 'precondition-map', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        targetReads += 1;
+        return mapping;
+      },
+    });
+    const recoveryCalls = [];
+    const native = secondStateNative(fixture.native, guardedState);
+    for (const method of recoveryMethods) {
+      if (typeof native[method] !== 'function') continue;
+      native[method] = async () => {
+        recoveryCalls.push(method);
+        throw new Error('RECOVERY_CALL_FORBIDDEN');
+      };
+    }
+    const result = await new ManagementRuntime({ native }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('precondition-map'),
+    );
+    assertMappingPreconditionsFailure(result, 7, 'RECOVERY_REQUIRED');
+    assert.equal(targetReads, 0, phase);
+    assert.deepEqual(recoveryCalls, [], phase);
+  }
+  assert.equal(fixture.writes.length, writesBefore);
+  assert.deepEqual(fixture.files, filesBefore);
+});
+test('mapping-preconditions validates original containers, every nested record, counters, and the complete graph', async () => {
+  const fixture = await mappingPreconditionsFixture({
+    mappingIds: ['state-alpha', 'state-beta'],
+    channelIds: [['1501', '1502'], ['1601', '1602']],
+  });
+  const state = await fixture.native.readManagementState();
+  const cases = [
+    ['second read absent', () => null],
+    ['second read undefined', () => undefined],
+    ['scalar state', () => 1],
+    ['array state', () => []],
+    ['custom state prototype', () => Object.setPrototypeOf(structuredClone(state), { polluted: true })],
+    ['missing mappings', () => {
+      const value = structuredClone(state);
+      delete value.mappings;
+      return value;
+    }],
+    ['null mappings', () => ({ ...structuredClone(state), mappings: null })],
+    ['custom mappings prototype', () => {
+      const value = structuredClone(state);
+      Object.setPrototypeOf(value.mappings, { inherited: value.mappings['state-alpha'] });
+      return value;
+    }],
+    ['missing routes', () => {
+      const value = structuredClone(state);
+      delete value.routes;
+      return value;
+    }],
+    ['null routes', () => ({ ...structuredClone(state), routes: null })],
+    ['custom routes prototype', () => {
+      const value = structuredClone(state);
+      Object.setPrototypeOf(value.routes, { inherited: value.routes['1501'] });
+      return value;
+    }],
+    ['custom requested mapping prototype', () => {
+      const value = structuredClone(state);
+      Object.setPrototypeOf(value.mappings['state-alpha'], { polluted: true });
+      return value;
+    }],
+    ['custom unrelated mapping prototype', () => {
+      const value = structuredClone(state);
+      Object.setPrototypeOf(value.mappings['state-beta'], { polluted: true });
+      return value;
+    }],
+    ['custom requested route prototype', () => {
+      const value = structuredClone(state);
+      Object.setPrototypeOf(value.routes['1501'], { polluted: true });
+      return value;
+    }],
+    ['custom unrelated route prototype', () => {
+      const value = structuredClone(state);
+      Object.setPrototypeOf(value.routes['1601'], { polluted: true });
+      return value;
+    }],
+    ['requested mapping record invalid', () => {
+      const value = structuredClone(state);
+      value.mappings['state-alpha'].mappingFingerprint = '0'.repeat(64);
+      return value;
+    }],
+    ['coercible requested mapping ID', () => {
+      const value = structuredClone(state);
+      value.mappings['state-alpha'].mappingId = ['state-alpha'];
+      return value;
+    }],
+    ['unrelated mapping record invalid', () => {
+      const value = structuredClone(state);
+      value.mappings['state-beta'].mappingFingerprint = '0'.repeat(64);
+      return value;
+    }],
+    ['requested route record invalid', () => {
+      const value = structuredClone(state);
+      value.routes['1501'].routeFingerprint = '0'.repeat(64);
+      return value;
+    }],
+    ['unrelated route record invalid', () => {
+      const value = structuredClone(state);
+      value.routes['1601'].routeFingerprint = '0'.repeat(64);
+      return value;
+    }],
+    ['mapping dictionary identity mismatch', () => {
+      const value = structuredClone(state);
+      value.mappings.foreign = value.mappings['state-beta'];
+      delete value.mappings['state-beta'];
+      return value;
+    }],
+    ['route dictionary identity mismatch', () => {
+      const value = structuredClone(state);
+      value.routes.foreign = value.routes['1601'];
+      delete value.routes['1601'];
+      return value;
+    }],
+    ['route mapping relation missing', () => {
+      const value = structuredClone(state);
+      delete value.mappings['state-beta'];
+      return value;
+    }],
+    ['mapping fence differs from graph', () => {
+      const value = structuredClone(state);
+      const mapping = fingerprintManagedMappingRecord({
+        ...value.mappings['state-beta'],
+        fenceGeneration: value.fenceGeneration - 1,
+        mappingFingerprint: null,
+      });
+      value.mappings['state-beta'] = mapping;
+      for (const channelId of ['1601', '1602']) {
+        value.routes[channelId] = fingerprintManagedRouteRecord({
+          ...value.routes[channelId],
+          fenceGeneration: mapping.fenceGeneration,
+          routeFingerprint: null,
+        }, mapping);
+      }
+      return value;
+    }],
+    ['mapping generation exceeds graph counter', () => ({
+      ...structuredClone(state),
+      mappingGeneration: 0,
+    })],
+    ['missing token attestation', () => {
+      const value = structuredClone(state);
+      delete value.tokenAttestation;
+      return value;
+    }],
+    ['null token attestation', () => ({
+      ...structuredClone(state),
+      tokenAttestation: null,
+    })],
+    ['custom token attestation prototype', () => {
+      const value = structuredClone(state);
+      Object.setPrototypeOf(value.tokenAttestation, { polluted: true });
+      return value;
+    }],
+    ['missing token host-set fingerprint', () => {
+      const value = structuredClone(state);
+      delete value.tokenAttestation.fingerprint;
+      return value;
+    }],
+    ['coercible token host-set fingerprint', () => ({
+      ...structuredClone(state),
+      tokenAttestation: {
+        ...structuredClone(state.tokenAttestation),
+        fingerprint: { toString: () => 'f'.repeat(64) },
+      },
+    })],
+    ['invalid token host-set fingerprint', () => ({
+      ...structuredClone(state),
+      tokenAttestation: {
+        ...structuredClone(state.tokenAttestation),
+        fingerprint: 'F'.repeat(64),
+      },
+    })],
+  ];
+  for (const field of ['revision', 'authorityEpoch', 'fenceGeneration', 'tokenConfigGeneration']) {
+    for (const value of [undefined, null, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      cases.push([`${field} ${String(value)}`, () => {
+        const candidate = structuredClone(state);
+        if (value === undefined) delete candidate[field];
+        else candidate[field] = value;
+        return candidate;
+      }]);
+    }
+  }
+  for (const value of [undefined, null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    cases.push([`mappingGeneration ${String(value)}`, () => {
+      const candidate = structuredClone(state);
+      if (value === undefined) delete candidate.mappingGeneration;
+      else candidate.mappingGeneration = value;
+      return candidate;
+    }]);
+  }
+
+  for (const [label, build] of cases) {
+    const candidate = build();
+    const serializedBefore = JSON.stringify(candidate);
+    const statePrototype = candidate && typeof candidate === 'object'
+      ? Object.getPrototypeOf(candidate)
+      : null;
+    const mappingsPrototype = candidate?.mappings && typeof candidate.mappings === 'object'
+      ? Object.getPrototypeOf(candidate.mappings)
+      : null;
+    const routesPrototype = candidate?.routes && typeof candidate.routes === 'object'
+      ? Object.getPrototypeOf(candidate.routes)
+      : null;
+    const tokenAttestationPrototype = candidate?.tokenAttestation &&
+      typeof candidate.tokenAttestation === 'object'
+      ? Object.getPrototypeOf(candidate.tokenAttestation)
+      : null;
+    const nestedPrototypes = [
+      ...Object.values(candidate?.mappings ?? {}),
+      ...Object.values(candidate?.routes ?? {}),
+    ].filter((value) => value && typeof value === 'object')
+      .map((value) => Object.getPrototypeOf(value));
+    const filesBefore = durableFileSnapshot(fixture.files);
+    const writesBefore = fixture.writes.length;
+    const result = await new ManagementRuntime({
+      native: secondStateNative(fixture.native, candidate),
+    }).execute(
+      'mapping-preconditions',
+      mappingPreconditionsInput('state-alpha'),
+    );
+    assertMappingPreconditionsFailure(result, 6, 'MANAGEMENT_STATE_INVALID');
+    assert.equal(JSON.stringify(candidate), serializedBefore, label);
+    if (candidate && typeof candidate === 'object') assert.equal(Object.getPrototypeOf(candidate), statePrototype, label);
+    if (candidate?.mappings && typeof candidate.mappings === 'object') {
+      assert.equal(Object.getPrototypeOf(candidate.mappings), mappingsPrototype, label);
+    }
+    if (candidate?.routes && typeof candidate.routes === 'object') {
+      assert.equal(Object.getPrototypeOf(candidate.routes), routesPrototype, label);
+    }
+    if (candidate?.tokenAttestation && typeof candidate.tokenAttestation === 'object') {
+      assert.equal(Object.getPrototypeOf(candidate.tokenAttestation), tokenAttestationPrototype, label);
+    }
+    assert.deepEqual([
+      ...Object.values(candidate?.mappings ?? {}),
+      ...Object.values(candidate?.routes ?? {}),
+    ].filter((value) => value && typeof value === 'object')
+      .map((value) => Object.getPrototypeOf(value)), nestedPrototypes, label);
+    assert.equal(fixture.writes.length, writesBefore, label);
+    assert.deepEqual(fixture.files, filesBefore, label);
+  }
+});
+test('mapping-preconditions calls only role setup, one mapping lock, and locked state/auth reads', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const secondState = await fixture.native.readManagementState();
+  const secondAuth = await fixture.native.readManagementAuth();
+  const stateBefore = structuredClone(secondState);
+  const authBefore = structuredClone(secondAuth);
+  const filesBefore = durableFileSnapshot(fixture.files);
+  const directoriesBefore = new Set(fixture.directories);
+  const writesBefore = fixture.writes.length;
+  const payloadsBefore = fixture.payloads.length;
+  const calls = [];
+  let stateReads = 0;
+  const allowed = new Set([
+    'readManagementState',
+    'readManagementAuth',
+    'configureManagementRoles',
+    'withManagementLocks',
+  ]);
+  const native = new Proxy(fixture.native, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== 'function') return value;
+      if (property === 'readManagementState') {
+        return async () => {
+          stateReads += 1;
+          calls.push(['readManagementState', stateReads]);
+          return stateReads === 1 ? value.call(target) : secondState;
+        };
+      }
+      if (property === 'readManagementAuth') {
+        return async () => {
+          calls.push(['readManagementAuth']);
+          return secondAuth;
+        };
+      }
+      if (property === 'configureManagementRoles') {
+        return async (...args) => {
+          calls.push(['configureManagementRoles']);
+          return value.apply(target, args);
+        };
+      }
+      if (property === 'withManagementLocks') {
+        return async (locks, callback) => {
+          calls.push(['withManagementLocks:start', structuredClone(locks)]);
+          try {
+            return await value.call(target, locks, callback);
+          } finally {
+            calls.push(['withManagementLocks:end', structuredClone(locks)]);
+          }
+        };
+      }
+      if (!allowed.has(property)) {
+        return async () => {
+          calls.push(['forbidden', property]);
+          throw new Error(`FORBIDDEN_PRECONDITION_CALL_${String(property)}`);
+        };
+      }
+      return value.bind(target);
+    },
+  });
+
+  const result = await new ManagementRuntime({ native }).execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+
+  assertMappingPreconditionsSuccess(
+    result,
+    'precondition-map',
+    secondState.revision,
+    secondState.mappings['precondition-map'].mappingFingerprint,
+  );
+  assert.deepEqual(calls, [
+    ['readManagementState', 1],
+    ['configureManagementRoles'],
+    ['withManagementLocks:start', ['mapping']],
+    ['readManagementState', 2],
+    ['readManagementAuth'],
+    ['withManagementLocks:end', ['mapping']],
+  ]);
+  assert.equal(calls.some(([kind]) => kind === 'forbidden'), false);
+  assert.deepEqual(secondState, stateBefore);
+  assert.deepEqual(secondAuth, authBefore);
+  assert.equal(fixture.writes.length, writesBefore);
+  assert.equal(fixture.payloads.length, payloadsBefore);
+  assert.deepEqual(fixture.files, filesBefore);
+  assert.deepEqual(fixture.directories, directoriesBefore);
+});
+
+test('mapping-preconditions returns one coherent second-read pair across a gated JavaScript interleaving', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const lockedState = await fixture.native.readManagementState();
+  const tokenSuccessor = await fixture.runtime.execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'mapping-preconditions-intervening-token',
+    hostTokens: 'host=preconditions-rotated',
+  });
+  assert.equal(tokenSuccessor.ok, true, JSON.stringify(tokenSuccessor));
+  const laterState = await fixture.native.readManagementState();
+  assert.notEqual(laterState.revision, lockedState.revision);
+  assert.notEqual(
+    laterState.mappings['precondition-map'].mappingFingerprint,
+    lockedState.mappings['precondition-map'].mappingFingerprint,
+  );
+  let releaseAuth;
+  const authGate = new Promise((resolve) => {
+    releaseAuth = resolve;
+  });
+  let observeAuthRead;
+  const authReadObserved = new Promise((resolve) => {
+    observeAuthRead = resolve;
+  });
+  const order = [];
+  let visibleState = lockedState;
+  const native = secondStateNative(fixture.native, () => {
+    order.push('second-state-read');
+    return structuredClone(visibleState);
+  }, {
+    async onReadAuth() {
+      order.push('auth-read-start');
+      observeAuthRead();
+      await authGate;
+      order.push('auth-read-finish');
+    },
+    onLock(phase, locks) {
+      order.push(`${phase}:${locks.join(',')}`);
+    },
+  });
+
+  const pending = new ManagementRuntime({ native }).execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  await authReadObserved;
+  visibleState = laterState;
+  order.push('intervening-state-visible');
+  releaseAuth();
+  const result = await pending;
+
+  assertMappingPreconditionsSuccess(
+    result,
+    'precondition-map',
+    lockedState.revision,
+    lockedState.mappings['precondition-map'].mappingFingerprint,
+  );
+  assert.deepEqual(order, [
+    'start:mapping',
+    'second-state-read',
+    'auth-read-start',
+    'intervening-state-visible',
+    'auth-read-finish',
+    'end:mapping',
+  ]);
+  assert.equal(result.expectedRevision === laterState.revision, false);
+  assert.equal(
+    result.expectedFingerprint === laterState.mappings['precondition-map'].mappingFingerprint,
+    false,
+  );
+});
+test('mapping-preconditions handoff becomes exact stale CAS after a legitimate intervening successor', async () => {
+  const fixture = await mappingPreconditionsFixture();
+  const stale = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  const staleState = await fixture.native.readManagementState();
+  assertMappingPreconditionsSuccess(
+    stale,
+    'precondition-map',
+    staleState.revision,
+    staleState.mappings['precondition-map'].mappingFingerprint,
+  );
+
+  await reconcileMapping(fixture, fixture.runtime, {
+    mappingId: 'intervening-map',
+    channelIds: ['1701', '1702'],
+    idempotencyKey: 'mapping-preconditions-intervening-successor',
+  });
+  const current = await fixture.native.readManagementState();
+  assert.notEqual(current.revision, stale.expectedRevision);
+  assert.notEqual(
+    current.mappings['precondition-map'].mappingFingerprint,
+    stale.expectedFingerprint,
+  );
+  const update = mappingInput(
+    'precondition-map',
+    current.mappingGeneration + 1,
+    current.fenceGeneration,
+    ['1403', '1404'],
+  );
+  const filesBeforeStaleMutation = durableFileSnapshot(fixture.files);
+  const writesBeforeStaleMutation = fixture.writes.length;
+  const staleMutation = await fixture.runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'mapping-preconditions-stale-consumer',
+    mappingId: 'precondition-map',
+    ...update,
+    expectedRevision: stale.expectedRevision,
+    expectedFingerprint: stale.expectedFingerprint,
+  });
+  assert.deepEqual(staleMutation, {
+    exitCode: 4,
+    ok: false,
+    error: 'CAS_CONFLICT',
+    routeDisposition: 'no-route',
+  });
+  assert.equal(fixture.writes.length, writesBeforeStaleMutation);
+  assert.deepEqual(fixture.files, filesBeforeStaleMutation);
+  assert.deepEqual(await fixture.native.readManagementState(), current);
+
+  const fresh = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('precondition-map'),
+  );
+  assertMappingPreconditionsSuccess(
+    fresh,
+    'precondition-map',
+    current.revision,
+    current.mappings['precondition-map'].mappingFingerprint,
+  );
+
+  const staleAbsent = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('future-map'),
+  );
+  assertMappingPreconditionsSuccess(staleAbsent, 'future-map', current.revision, null);
+  const tokenSuccessor = await fixture.runtime.execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'mapping-preconditions-absent-intervening-successor',
+    hostTokens: 'host=preconditions-after-absence',
+  });
+  assert.equal(tokenSuccessor.ok, true, JSON.stringify(tokenSuccessor));
+  const afterAbsentDrift = await fixture.native.readManagementState();
+  const create = mappingInput(
+    'future-map',
+    afterAbsentDrift.mappingGeneration + 1,
+    afterAbsentDrift.fenceGeneration,
+    ['1801', '1802'],
+  );
+  const filesBeforeStaleCreate = durableFileSnapshot(fixture.files);
+  const writesBeforeStaleCreate = fixture.writes.length;
+  const staleCreate = await fixture.runtime.execute('mapping-reconcile', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'mapping-preconditions-stale-absent-consumer',
+    mappingId: 'future-map',
+    ...create,
+    expectedRevision: staleAbsent.expectedRevision,
+    expectedFingerprint: staleAbsent.expectedFingerprint,
+  });
+  assert.deepEqual(staleCreate, {
+    exitCode: 4,
+    ok: false,
+    error: 'CAS_CONFLICT',
+    routeDisposition: 'no-route',
+  });
+  assert.equal(fixture.writes.length, writesBeforeStaleCreate);
+  assert.deepEqual(fixture.files, filesBeforeStaleCreate);
+  const freshAbsent = await fixture.runtime.execute(
+    'mapping-preconditions',
+    mappingPreconditionsInput('future-map'),
+  );
+  assertMappingPreconditionsSuccess(
+    freshAbsent,
+    'future-map',
+    afterAbsentDrift.revision,
+    null,
+  );
+});
 async function failClosedSuccessorFailure(method, stage, injectedMessage = `INJECTED_${stage}`) {
   const harness = adapter({ legacy: false });
   const runtime = new ManagementRuntime({ native: harness.native });

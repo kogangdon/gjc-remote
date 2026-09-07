@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { canonicalJsonHash, parseStrictJsonBytes } from "../strict-json.js";
 import { isPrincipal, managementAnchorFingerprint } from "../identity.js";
-import { classifyMappingEnvelope, createGenesisEmptyChannels, fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2 } from "../mapping-envelope.js";
+import { classifyMappingEnvelope, createGenesisEmptyChannels, fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, isManagedMappingId, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord } from "../mapping-envelope.js";
 
 const anchor = {
   anchorVersion: 1,
@@ -31,6 +31,85 @@ function rootFor(wrapper) {
   };
   return { ...root, controlRootFingerprint: canonicalJsonHash(root) };
 }
+
+function mappingRecord(mappingId) {
+  const mapping = {
+    mappingId,
+    hostId: "host-A",
+    fenceGeneration: 1,
+    mappingGeneration: 3,
+    workspaceGeneration: 2,
+    mappingVersion: 1,
+    sourcePlatform: "posix",
+    workspaceId: "workspace-1",
+    workDir: null,
+    sourceRoot: "/srv/repo",
+    containerRoot: "/workspace",
+    volumeIdentity: "dev:42",
+    casePolicy: "sensitive",
+    immutableDefault: false,
+    mappingFingerprint: null,
+  };
+  mapping.mappingFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(mapping).filter(([key]) => key !== "mappingFingerprint")),
+  );
+  return mapping;
+}
+
+test("managed mapping IDs use the exact noncoercing opaque-token grammar", () => {
+  assert.equal(isManagedMappingId(undefined), false);
+  for (const value of [
+    "a",
+    "Z",
+    "0",
+    "a".repeat(128),
+    "map.with_Every-9",
+    "constructor",
+    "toString",
+    "hasOwnProperty",
+  ]) {
+    assert.equal(isManagedMappingId(value), true, JSON.stringify(value));
+    assert.equal(validateManagedMappingRecord(mappingRecord(value)).mappingId, value);
+  }
+
+  for (const value of [
+    "",
+    "a".repeat(129),
+    ".leading",
+    "_leading",
+    "-leading",
+    "white space",
+    "é",
+    "a/b",
+    "a\\b",
+    "a:b",
+    "a%b",
+    "..",
+    "a/../b",
+    null,
+    false,
+    true,
+    0,
+    1,
+    ["a"],
+    { value: "a" },
+  ]) {
+    assert.equal(isManagedMappingId(value), false, JSON.stringify(value));
+    assert.throws(
+      () => validateManagedMappingRecord(mappingRecord(value)),
+      /MANAGED_MAPPING_INVALID/,
+      JSON.stringify(value),
+    );
+  }
+  for (const value of ["\u0000", "a\n", "a\r", "a\t", "\u007f"]) {
+    assert.equal(isManagedMappingId(value), false, JSON.stringify(value));
+    assert.throws(
+      () => validateManagedMappingRecord({ ...mappingRecord("valid"), mappingId: value }),
+      /MANAGED_MAPPING_INVALID/,
+      JSON.stringify(value),
+    );
+  }
+});
 
 test("canonical hash sorts UTF-8 object keys and strict parsing rejects duplicate aliases", () => {
   assert.equal(canonicalJsonHash({ z: 1, ä: 2 }), canonicalJsonHash({ ä: 2, z: 1 }));
