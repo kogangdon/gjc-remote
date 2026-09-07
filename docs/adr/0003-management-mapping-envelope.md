@@ -203,6 +203,10 @@ management state must agree on the complete candidate graph. Bound-reader
 completion still requires the exact B lease/projection/acknowledgement.
 Recovery reconstructs only the original request's candidate; it cannot silently
 substitute another graph.
+The replay bundle's candidate fence is an input to validation, not a replacement
+for the predecessor's fence. Reconstruction requires the exact next safe-integer
+fence `F+1`; a mismatch enters `RECOVERY_INPUT_MISMATCH` and manual cleanup
+instead of adopting the bundle's asserted fence.
 
 **Verification and follow-ups:** `bot/test/management-runtime.test.js` covers
 multi-mapping/multi-route successors, exact stale CAS, immutable archive drift

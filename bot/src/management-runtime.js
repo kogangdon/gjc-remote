@@ -237,7 +237,7 @@ const channelsSnapshot = (state, revision = state.revision, authorityEpoch = sta
   const snapshot = {
     version: 2, managementStamp: "gjc-management-channels/v2", revision, authorityEpoch,
     fenceGeneration: state.fenceGeneration, mappingGeneration: state.mappingGeneration, tokenConfigGeneration: state.tokenConfigGeneration,
-    tokenConfigHostSetFingerprint: state.tokenAttestation?.fingerprint, targetState: Object.keys(state.routes ?? {}).length ? "managed" : "managed-empty",
+    tokenConfigHostSetFingerprint: state.tokenAttestation?.fingerprint, targetState: Object.keys(state.routes).length ? "managed" : "managed-empty",
     dispatchClass: "workspace-only", mappings: structuredClone(state.mappings), routes: structuredClone(state.routes), configFingerprint: null,
   };
   snapshot.configFingerprint = recordHash(snapshot, "configFingerprint");

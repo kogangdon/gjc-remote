@@ -1138,6 +1138,47 @@ test('populated mapping successors preserve the predecessor before advancing eve
     for (const route of Object.values(after.routes)) assert.equal(route.fenceGeneration, after.fenceGeneration);
   }
 });
+test('token successor rejects state-to-target mapping generation drift before successor writes', async () => {
+  const harness = adapter({ legacy: false });
+  const runtime = new ManagementRuntime({ native: harness.native });
+  assert.equal((await runtime.execute('genesis', genesisInput('host=old'))).ok, true);
+  await reconcileMapping(harness, runtime, {
+    mappingId: 'token-drift-map',
+    channelIds: ['91', '92'],
+    idempotencyKey: 'token-drift-map-create',
+  });
+  const durableState = await harness.native.readManagementState();
+  const filesBefore = new Map([...harness.files].map(([path, bytes]) => [path, Buffer.from(bytes)]));
+  const writesBefore = harness.writes.length;
+  const readManagementState = harness.native.readManagementState.bind(harness.native);
+  let managementStateReads = 0;
+  harness.native.readManagementState = async () => {
+    const state = await readManagementState();
+    managementStateReads += 1;
+    return managementStateReads === 2
+      ? { ...structuredClone(state), mappingGeneration: 0 }
+      : state;
+  };
+
+  const result = await new ManagementRuntime({ native: harness.native }).execute('tokens-attest', {
+    actorPrincipal: owner,
+    actorSecret: secret,
+    idempotencyKey: 'token-state-target-drift',
+    hostTokens: 'host=rotated',
+  });
+
+  harness.native.readManagementState = readManagementState;
+  assert.deepEqual(result, {
+    exitCode: 6,
+    ok: false,
+    error: 'MANAGED_CHANNELS_V2_INVALID',
+    routeDisposition: 'no-route',
+  });
+  assert.equal(managementStateReads, 2);
+  assert.equal(harness.writes.length, writesBefore);
+  assert.deepEqual(harness.files, filesBefore);
+  assert.deepEqual(await harness.native.readManagementState(), durableState);
+});
 test('mapping successors carry the complete graph through create, update, token, rollback, and revoke', async () => {
   const harness = adapter({ legacy: false });
   const runtime = new ManagementRuntime({ native: harness.native });
@@ -1479,12 +1520,26 @@ test('revoke and rollback validate immutable archives and mapping-only live equi
   invalidCurrentRoute.routes[0].routeFingerprint = '0'.repeat(64);
   const invalidPriorRoute = JSON.parse(priorBytes);
   invalidPriorRoute.routes[0].routeFingerprint = '0'.repeat(64);
+  const legacyPrior = JSON.parse(priorBytes);
+  legacyPrior.mapping = fingerprintManagedMappingRecord({
+    ...legacyPrior.mapping,
+    workspaceId: null,
+    workDir: '/legacy-workspace',
+    mappingFingerprint: null,
+  });
+  legacyPrior.routes = legacyPrior.routes.map((route) => fingerprintManagedRouteRecord({
+    ...route,
+    workspaceId: null,
+    workDir: '/legacy-workspace',
+    routeFingerprint: null,
+  }, legacyPrior.mapping));
   const cases = [
     ['missing current archive', 'mapping-revoke', { ...revokeInput, idempotencyKey: 'archive-missing' }, currentPath, null, 6, 'MAPPING_INVALID'],
     ['invalid current archive route', 'mapping-revoke', { ...revokeInput, idempotencyKey: 'archive-route-invalid' }, currentPath, Buffer.from(canonicalJson(invalidCurrentRoute)), 6, 'MAPPING_INVALID'],
     ['internally valid archive mapping drift', 'mapping-revoke', { ...revokeInput, idempotencyKey: 'archive-mapping-drift' }, currentPath, Buffer.from(canonicalJson(drifted)), 6, 'MAPPING_INVALID'],
     ['rollback current archive drift', 'mapping-rollback', { ...rollbackInput, idempotencyKey: 'archive-rollback-drift' }, currentPath, Buffer.from(canonicalJson(drifted)), 6, 'MAPPING_INVALID'],
     ['invalid prior rollback route', 'mapping-rollback', { ...rollbackInput, idempotencyKey: 'archive-prior-invalid' }, priorPath, Buffer.from(canonicalJson(invalidPriorRoute)), 70, 'ROLLBACK_GENERATION_UNKNOWN'],
+    ['shared-valid legacy prior rollback archive', 'mapping-rollback', { ...rollbackInput, idempotencyKey: 'archive-prior-legacy' }, priorPath, Buffer.from(canonicalJson(legacyPrior)), 70, 'ROLLBACK_GENERATION_UNKNOWN'],
   ];
   for (const [label, command, input, path, bytes, exitCode, error] of cases) {
     if (bytes === null) harness.files.delete(path);
@@ -2225,6 +2280,102 @@ async function pendingBoundSuccessorFixture(idempotencyKey = 'reader-pending-rec
   assert.equal(started.pending, true, JSON.stringify(started));
   return { ...harness, input, started };
 }
+async function pendingAlternateCandidateFixture(idempotencyKey) {
+  const fixture = await pendingBoundSuccessorFixture(idempotencyKey);
+  fixture.setPrincipal(botPrincipal);
+  const reader = await createTestManagedAuthorityReader({
+    configPath: 'C:/state/channels.json',
+    expectedHostSetFingerprint: managedHostSetFingerprint('host=secret'),
+    roleBindings: roles,
+    native: fixture.native,
+  });
+  assert.equal((await reader.readSnapshot()).code, 'MANAGED_AUTHORITY_PENDING');
+  fixture.setPrincipal(owner);
+  const alternate = mappingInput(
+    fixture.input.mappingId,
+    fixture.input.mapping.mappingGeneration,
+    fixture.input.mapping.fenceGeneration,
+    '999',
+  );
+  return { ...fixture, alternateInput: { ...fixture.input, ...alternate } };
+}
+test('invalid cleanup evidence never earns same-transaction cleanup deduplication', async () => {
+  for (const [kind, expectedCasCalls] of [
+    ['wrong transaction', 0],
+    ['wrong fingerprint', 0],
+    ['wrong disposition', 0],
+    ['wrong accepted phase', 2],
+    ['null terminal fingerprint', 2],
+  ]) {
+    const fixture = await pendingAlternateCandidateFixture(`invalid-cleanup-${kind.replaceAll(' ', '-')}`);
+    const durableState = await fixture.native.readManagementState();
+    const readManagementState = fixture.native.readManagementState.bind(fixture.native);
+    const compareAndSwapManagementState = fixture.native.compareAndSwapManagementState.bind(fixture.native);
+    const terminalCloseOrManualCleanup = fixture.native.terminalCloseOrManualCleanup.bind(fixture.native);
+    let cleanupStarted = false;
+    let cleanupCalls = 0;
+    let casCalls = 0;
+    let terminal = null;
+
+    fixture.native.terminalCloseOrManualCleanup = async (...args) => {
+      cleanupCalls += 1;
+      if (terminal === null) {
+        terminal = kind === 'null terminal fingerprint'
+          ? { phase: 'manual_cleanup', routeDisposition: 'no-route', manualCleanupFingerprint: null }
+          : await terminalCloseOrManualCleanup(...args);
+      }
+      cleanupStarted = true;
+      return structuredClone(terminal);
+    };
+    fixture.native.readManagementState = async () => {
+      const state = await readManagementState();
+      if (!cleanupStarted || ['wrong accepted phase', 'null terminal fingerprint'].includes(kind)) return state;
+      const manualCleanupFingerprint = kind === 'wrong fingerprint'
+        ? `${terminal.manualCleanupFingerprint[0] === '0' ? '1' : '0'}${terminal.manualCleanupFingerprint.slice(1)}`
+        : terminal.manualCleanupFingerprint;
+      return {
+        ...structuredClone(state),
+        recovery: {
+          ...structuredClone(state.recovery),
+          phase: 'manual_cleanup',
+          txId: kind === 'wrong transaction' ? `${fixture.started.txId}-foreign` : fixture.started.txId,
+          routeDisposition: kind === 'wrong disposition' ? 'route-open' : 'no-route',
+          manualCleanupFingerprint,
+        },
+      };
+    };
+    fixture.native.compareAndSwapManagementState = async (expectedRevision, candidate) => {
+      if (!cleanupStarted) return compareAndSwapManagementState(expectedRevision, candidate);
+      casCalls += 1;
+      if (kind === 'wrong accepted phase') candidate.recovery.phase = 'terminal';
+      return true;
+    };
+
+    const result = await new ManagementRuntime({ native: fixture.native }).execute(
+      'mapping-reconcile',
+      fixture.alternateInput,
+    );
+
+    fixture.native.readManagementState = readManagementState;
+    fixture.native.compareAndSwapManagementState = compareAndSwapManagementState;
+    fixture.native.terminalCloseOrManualCleanup = terminalCloseOrManualCleanup;
+    assert.deepEqual(result, {
+      exitCode: 7,
+      ok: false,
+      error: 'MANUAL_CLEANUP_DURABILITY_FAILED',
+      routeDisposition: 'no-route',
+    }, kind);
+    assert.equal(cleanupCalls, 2, kind);
+    assert.equal(casCalls, expectedCasCalls, kind);
+    assert.deepEqual(await fixture.native.readManagementState(), durableState, kind);
+    assert.equal((await fixture.native.readManagementState()).recovery.phase, 'terminal', kind);
+    assert.equal(
+      Boolean(fileEnding(fixture.files, '/terminal-close.json')),
+      kind !== 'null terminal fingerprint',
+      kind,
+    );
+  }
+});
 function setSuccessorHeadPhase(fixture, phase) {
   const headPath = [...fixture.files.keys()].find((path) => path.replaceAll('\\', '/').endsWith('/authority-head.json'));
   const markerPath = [...fixture.files.keys()].find((path) => typeof path === 'string' && path.replaceAll('\\', '/').endsWith('.managed-history.json'));
