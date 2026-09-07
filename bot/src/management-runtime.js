@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { assertStrictText, canonicalJsonHash } from "@gjc-remote/shared/strict-json";
 import { isPrincipal } from "@gjc-remote/shared/identity";
-import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord } from "@gjc-remote/shared/mapping-envelope";
+import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord, validateManagedRouteRecord } from "@gjc-remote/shared/mapping-envelope";
 import { attestTokenFloor, authorityRecordFingerprint, advanceReaderVersionFloor, buildAttestedTokenFloorProof, buildGenesisPrecommit, buildGenesisZeroGrantProofFingerprint, commitTokenFloor, reserveTokenGeneration, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisRequest, validateGenesisReceipt, validateReaderProjection, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
 import { addCredential, authenticate, bootstrapOwner, revokeCredential, rotateCredential, requireOwner } from "./management-auth.js";
 import { buildAdmissionGrant, buildAdmissionRequest, validateAdmissionAck, validateAdmissionGenesisBinding, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
@@ -14,6 +14,7 @@ const LOCK_ORDER = ["genesis", "mapping", "admission"];
 const MAX_MAPPING_BYTES = 1024 * 1024;
 const emptyState = () => ({ version: 1, revision: 0, authorityEpoch: 0, fenceGeneration: 1, tokenConfigGeneration: 0, mappingGeneration: 0, roleBindings: null, mappings: {}, routes: {}, tokenAttestation: null, recovery: null, genesis: null, admission: { phase: "closed", finalityFingerprint: null } });
 const safe = (error) => ({ code: /^[A-Z0-9_]+$/.test(error?.code ?? "") ? error.code : /^[A-Z0-9_]+$/.test(error?.message ?? "") ? error.message : "MANAGEMENT_FAILED" });
+const DURABLE_MANUAL_CLEANUP_TX = Symbol("durable-manual-cleanup-tx");
 const principal = (value, name) => { if (!isPrincipal(value)) throw new Error(`${name}_INVALID`); return value; };
 const protectedTokenFingerprint = (value) => managedHostSetFingerprint(parseManagedHostTokens(value));
 const recordHash = (record, field) => canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field)));
@@ -237,10 +238,75 @@ const channelsSnapshot = (state, revision = state.revision, authorityEpoch = sta
     version: 2, managementStamp: "gjc-management-channels/v2", revision, authorityEpoch,
     fenceGeneration: state.fenceGeneration, mappingGeneration: state.mappingGeneration, tokenConfigGeneration: state.tokenConfigGeneration,
     tokenConfigHostSetFingerprint: state.tokenAttestation?.fingerprint, targetState: Object.keys(state.routes ?? {}).length ? "managed" : "managed-empty",
-    dispatchClass: "workspace-only", mappings: structuredClone(state.mappings), routes: structuredClone(state.routes ?? {}), configFingerprint: null,
+    dispatchClass: "workspace-only", mappings: structuredClone(state.mappings), routes: structuredClone(state.routes), configFingerprint: null,
   };
   snapshot.configFingerprint = recordHash(snapshot, "configFingerprint");
   return validateManagedChannelsV2(snapshot);
+};
+const advanceManagedGraphFence = (snapshot, fenceGeneration) => {
+  validateManagedChannelsV2(snapshot);
+  if (!Number.isSafeInteger(fenceGeneration) || fenceGeneration !== snapshot.fenceGeneration + 1) {
+    throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
+  }
+  const mappings = Object.fromEntries(Object.entries(snapshot.mappings).map(([mappingId, mapping]) => [
+    mappingId,
+    fingerprintManagedMappingRecord({
+      ...structuredClone(mapping),
+      fenceGeneration,
+      mappingFingerprint: null,
+    }),
+  ]));
+  const routes = Object.fromEntries(Object.entries(snapshot.routes).map(([channelId, route]) => {
+    const mapping = mappings[route.mappingId];
+    if (!mapping) throw new TypeError("MANAGED_CHANNELS_V2_INVALID");
+    return [channelId, fingerprintManagedRouteRecord({
+      ...structuredClone(route),
+      fenceGeneration,
+      hostId: mapping.hostId,
+      mappingId: mapping.mappingId,
+      mappingGeneration: mapping.mappingGeneration,
+      workspaceGeneration: mapping.workspaceGeneration,
+      mappingVersion: mapping.mappingVersion,
+      sourcePlatform: mapping.sourcePlatform,
+      workspaceId: mapping.workspaceId,
+      workDir: mapping.workDir,
+      routeFingerprint: null,
+    }, mapping)];
+  }));
+  return { mappings, routes };
+};
+const validateImmutableMappingGeneration = (record, mappingId, generation, errorCode) => {
+  try {
+    if (!record || Object.getPrototypeOf(record) !== Object.prototype ||
+        record.mappingId !== mappingId || record.generation !== generation ||
+        record.fenceGeneration !== record.mapping?.fenceGeneration ||
+        record.mapping?.mappingId !== mappingId || record.mapping?.mappingGeneration !== generation ||
+        typeof record.publicationTxId !== "string" || !Array.isArray(record.routes)) {
+      throw new TypeError("invalid immutable mapping generation");
+    }
+    validateManagedMappingRecord(record.mapping);
+    if (typeof record.mapping.workspaceId !== "string" || record.mapping.workDir !== null) {
+      throw new TypeError("invalid immutable mapping generation");
+    }
+    for (const route of record.routes) {
+      validateManagedRouteRecord(route, record.mapping);
+    }
+    return record;
+  } catch {
+    throw new Error(errorCode);
+  }
+};
+const validateLiveMappingGeneration = (record, current, fenceGeneration, errorCode) => {
+  const refenced = fingerprintManagedMappingRecord({
+    ...structuredClone(record.mapping),
+    fenceGeneration,
+    mappingFingerprint: null,
+  });
+  if (refenced.mappingFingerprint !== current.mappingFingerprint ||
+      canonicalJsonHash(refenced) !== canonicalJsonHash(current)) {
+    throw new Error(errorCode);
+  }
+  return record;
 };
 const publicationGraph = ({ txId, genesisTxId, generation, fenceGeneration, baseline, targetFingerprint, stateFingerprint, payloadFingerprint, snapshotFingerprint, publicationFingerprint, checkpointFingerprint }) => {
   const transaction = buildPublicationTransaction({ txId, genesisTxId, generation, fenceGeneration, baselineFingerprint: baseline.baselineFingerprint });
@@ -617,7 +683,17 @@ export class ManagementRuntime {
       }
       if (!await this.native.compareAndSwapManagementState(revision, current)) throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
     }
-    throw new Error("MANUAL_CLEANUP_REQUIRED");
+    const cleanupTxId = current.recovery?.txId ?? null;
+    if (current.recovery?.phase !== "manual_cleanup" ||
+        current.recovery.routeDisposition !== "no-route" ||
+        !/^[a-f0-9]{64}$/.test(current.recovery.manualCleanupFingerprint ?? "") ||
+        current.recovery.manualCleanupFingerprint !== terminal.manualCleanupFingerprint ||
+        (typeof durableRecovery.txId === "string" && cleanupTxId !== durableRecovery.txId)) {
+      throw new Error("MANUAL_CLEANUP_DURABILITY_FAILED");
+    }
+    const error = new Error("MANUAL_CLEANUP_REQUIRED");
+    error[DURABLE_MANUAL_CLEANUP_TX] = cleanupTxId;
+    throw error;
   }
   async #genesisManualCleanup(state, reason) {
     try {
@@ -1878,9 +1954,13 @@ export class ManagementRuntime {
           }
         } else {
           const recoveryState = structuredClone(state);
-          recoveryState.authorityEpoch = bundle.request.candidateAuthorityEpoch - 1;
-          recoveryState.fenceGeneration = bundle.request.candidateFenceGeneration;
-          const prepared = await this.#prepareMappingMutation(operation, recoveryState, input);
+          const prepared = await this.#prepareMappingMutation(
+            operation,
+            recoveryState,
+            input,
+            bundle.request.candidateFenceGeneration,
+            bundle.request.candidateAuthorityEpoch,
+          );
           if (prepared.snapshot.configFingerprint !== bundle.request.candidateSnapshotFingerprint) {
             throw new Error("RECOVERY_INPUT_MISMATCH");
           }
@@ -1916,6 +1996,7 @@ export class ManagementRuntime {
       const recovery = state.recovery?.terminalization?.txId === mutation.recovery?.txId
         ? state.recovery
         : mutation.recovery;
+      if (typeof recovery?.txId === "string" && error?.[DURABLE_MANUAL_CLEANUP_TX] === recovery.txId) throw error;
       await this.#manualCleanup(state, safe(error).code, recovery);
       throw error;
     }
@@ -2028,41 +2109,17 @@ export class ManagementRuntime {
       throw new Error("LEGACY_MAPPING_MUTATION_REFUSED");
     }
     const candidateAuthorityEpoch = await this.#nextAuthorityEpoch(state);
-    const preparedState = operation === "tokens-attest" ? null : structuredClone(state);
-    if (preparedState) preparedState.authorityEpoch = candidateAuthorityEpoch - 1;
-    if (preparedState) preparedState.fenceGeneration = candidateFenceGeneration;
-    const prepared = preparedState ? await this.#prepareMappingMutation(operation, preparedState, input) : null;
+    const predecessorState = operation === "tokens-attest" ? null : structuredClone(state);
+    const prepared = predecessorState
+      ? await this.#prepareMappingMutation(operation, predecessorState, input, candidateFenceGeneration, candidateAuthorityEpoch)
+      : null;
     let candidateSnapshot = prepared?.snapshot ?? null;
     if (operation === "tokens-attest" && predecessor.sourceKind === "managed-v1") {
-      const candidateMappings = Object.fromEntries(Object.entries(predecessor.snapshot.mappings).map(([mappingId, mapping]) => [
-        mappingId,
-        fingerprintManagedMappingRecord({
-          ...structuredClone(mapping),
-          fenceGeneration: candidateFenceGeneration,
-          mappingFingerprint: null,
-        }),
-      ]));
-      const candidateRoutes = Object.fromEntries(Object.entries(predecessor.snapshot.routes).map(([channelId, route]) => {
-        const mapping = candidateMappings[route.mappingId];
-        if (!mapping) throw new Error("CANDIDATE_TARGET_PROOF_REQUIRED");
-        return [channelId, fingerprintManagedRouteRecord({
-          ...structuredClone(route),
-          fenceGeneration: candidateFenceGeneration,
-          hostId: mapping.hostId,
-          mappingId: mapping.mappingId,
-          mappingGeneration: mapping.mappingGeneration,
-          workspaceGeneration: mapping.workspaceGeneration,
-          mappingVersion: mapping.mappingVersion,
-          sourcePlatform: mapping.sourcePlatform,
-          workspaceId: mapping.workspaceId,
-          workDir: mapping.workDir,
-          routeFingerprint: null,
-        }, mapping)];
-      }));
+      const candidateGraph = advanceManagedGraphFence(predecessor.snapshot, candidateFenceGeneration);
       candidateSnapshot = {
         ...structuredClone(predecessor.snapshot),
-        mappings: candidateMappings,
-        routes: candidateRoutes,
+        mappings: candidateGraph.mappings,
+        routes: candidateGraph.routes,
         revision: state.revision + 1,
         authorityEpoch: candidateAuthorityEpoch,
         mappingGeneration: state.mappingGeneration,
@@ -2073,6 +2130,7 @@ export class ManagementRuntime {
         configFingerprint: null,
       };
       candidateSnapshot.configFingerprint = recordHash(candidateSnapshot, "configFingerprint");
+      validateManagedChannelsV2(candidateSnapshot);
     }
     const candidateSnapshotFingerprint = candidateSnapshot?.configFingerprint ?? predecessor.snapshotFingerprint;
     const candidateTargetFingerprint = candidateSnapshot ? canonicalJsonHash(candidateSnapshot) : predecessor.targetFingerprint;
@@ -2441,9 +2499,9 @@ export class ManagementRuntime {
     terminalState.authorityEpoch = request.candidateAuthorityEpoch;
     terminalState.tokenConfigGeneration = request.candidateTokenConfigGeneration;
     terminalState.mappingGeneration = request.candidateMappingGeneration;
-    if (preparedState) {
-      terminalState.mappings = preparedState.mappings;
-      terminalState.routes = preparedState.routes;
+    if (candidateSnapshot) {
+      terminalState.mappings = structuredClone(candidateSnapshot.mappings);
+      terminalState.routes = structuredClone(candidateSnapshot.routes);
     }
     terminalState.tokenFloor = structuredClone(committedFloor);
     terminalState.tokenAttestation = {
@@ -2608,53 +2666,82 @@ export class ManagementRuntime {
     });
   }
 
-  async #prepareMappingMutation(command, state, input) {
+  async #prepareMappingMutation(
+    command,
+    state,
+    input,
+    candidateFenceGeneration = state.fenceGeneration + 1,
+    candidateAuthorityEpoch = state.authorityEpoch + 1,
+  ) {
     const key = input.mappingId;
     if (typeof key !== "string" || key.length === 0 || key.length > 256) throw new Error("MAPPING_ID_INVALID");
-    state.routes ??= {};
     const oldSnapshot = channelsSnapshot(state);
-    const current = state.mappings[key];
+    const current = Object.hasOwn(state.mappings, key) ? state.mappings[key] : null;
     if (command === "mapping-revoke") {
       if (!current) throw new Error("MAPPING_UNKNOWN");
       if (input.expectedRevision !== state.revision || input.expectedFingerprint !== current.mappingFingerprint) throw new Error("CAS_CONFLICT");
-      delete state.mappings[key];
-      for (const [channelId, route] of Object.entries(state.routes)) if (route.mappingId === key) delete state.routes[channelId];
-      state.mappingGeneration += 1;
-      const snapshot = channelsSnapshot(state, state.revision + 1, state.authorityEpoch + 1);
+      const archived = validateLiveMappingGeneration(
+        validateImmutableMappingGeneration(
+          await this.native.readMappingGeneration({ mappingId: key, generation: current.mappingGeneration }),
+          key,
+          current.mappingGeneration,
+          "MAPPING_INVALID",
+        ),
+        current,
+        state.fenceGeneration,
+        "MAPPING_INVALID",
+      );
+      const candidateGraph = advanceManagedGraphFence(oldSnapshot, candidateFenceGeneration);
+      const candidateState = {
+        ...structuredClone(state),
+        fenceGeneration: candidateFenceGeneration,
+        mappingGeneration: state.mappingGeneration + 1,
+        mappings: candidateGraph.mappings,
+        routes: candidateGraph.routes,
+      };
+      delete candidateState.mappings[key];
+      for (const [channelId, route] of Object.entries(candidateState.routes)) {
+        if (route.mappingId === key) delete candidateState.routes[channelId];
+      }
+      const snapshot = channelsSnapshot(candidateState, state.revision + 1, candidateAuthorityEpoch);
       const publicationTxId = randomUUID();
       const tombstone = {
-        fenceGeneration: state.fenceGeneration,
+        fenceGeneration: archived.mapping.fenceGeneration,
         version: 1, kind: "mapping-tombstone", operation: command, publicationTxId,
-        mappingId: key, mappingGeneration: current.mappingGeneration, mappingFingerprint: current.mappingFingerprint,
+        mappingId: key, mappingGeneration: archived.mapping.mappingGeneration, mappingFingerprint: archived.mapping.mappingFingerprint,
         snapshotFingerprint: snapshot.configFingerprint, routeDisposition: "no-route", tombstoneFingerprint: null,
       };
       tombstone.tombstoneFingerprint = recordHash(tombstone, "tombstoneFingerprint");
       const handoffReceipt = {
-        fenceGeneration: state.fenceGeneration,
+        fenceGeneration: candidateFenceGeneration,
         version: 1, kind: "mapping-handoff-receipt", operation: command, publicationTxId,
         oldMappingId: key, oldMappingGeneration: current.mappingGeneration, newMappingId: null, newMappingGeneration: null,
         snapshotFingerprint: snapshot.configFingerprint, routeDisposition: "no-route", tombstoneFingerprint: tombstone.tombstoneFingerprint, handoffReceiptFingerprint: null,
       };
       handoffReceipt.handoffReceiptFingerprint = recordHash(handoffReceipt, "handoffReceiptFingerprint");
       return {
-        snapshot, oldSnapshot, publicationTxId, tombstone, handoffReceipt,
-        expectedFingerprint: current.mappingFingerprint, oldMappingId: key, oldMappingGeneration: current.mappingGeneration,
-        candidateMappingId: null, candidateMappingGeneration: null,
-        immutableGeneration: { mapping: structuredClone(current), routes: Object.values(oldSnapshot.routes).filter((route) => route.mappingId === key) },
-        result: { revoked: true, mappingGeneration: state.mappingGeneration },
+        snapshot, tombstone, handoffReceipt,
         publish: () => this.native.revokeMapping({ mappingId: key, expectedFingerprint: current.mappingFingerprint, expectedRevision: state.revision, snapshot }),
       };
     }
 
     let candidate;
     let routeCandidates;
+    let archivedCurrent = null;
     if (command === "mapping-rollback") {
       const priorGeneration = input.priorGeneration;
       const replacementMappingId = input.replacementMappingId;
       if (!current || !Number.isSafeInteger(priorGeneration) || priorGeneration < 1 || priorGeneration === current.mappingGeneration) throw new Error("ROLLBACK_GENERATION_REQUIRED");
-      if (typeof replacementMappingId !== "string" || replacementMappingId.length === 0 || replacementMappingId.length > 256 || replacementMappingId === key || state.mappings[replacementMappingId]) throw new Error("ROLLBACK_REPLACEMENT_MAPPING_ID_REQUIRED");
-      const retained = await this.native.readMappingGeneration({ mappingId: key, generation: priorGeneration });
-      if (!retained || !validMappingCandidate(retained.mapping) || !Array.isArray(retained.routes)) throw new Error("ROLLBACK_GENERATION_UNKNOWN");
+      if (typeof replacementMappingId !== "string" || replacementMappingId.length === 0 || replacementMappingId.length > 256 ||
+          replacementMappingId === key || Object.hasOwn(state.mappings, replacementMappingId)) {
+        throw new Error("ROLLBACK_REPLACEMENT_MAPPING_ID_REQUIRED");
+      }
+      const retained = validateImmutableMappingGeneration(
+        await this.native.readMappingGeneration({ mappingId: key, generation: priorGeneration }),
+        key,
+        priorGeneration,
+        "ROLLBACK_GENERATION_UNKNOWN",
+      );
       candidate = fingerprintManagedMappingRecord({ ...structuredClone(retained.mapping), mappingId: replacementMappingId, mappingFingerprint: null });
       routeCandidates = structuredClone(retained.routes);
     } else {
@@ -2664,29 +2751,55 @@ export class ManagementRuntime {
     const mappingId = command === "mapping-rollback" ? input.replacementMappingId : key;
     if (!validMappingCandidate(candidate) || candidate.mappingId !== mappingId || !Array.isArray(routeCandidates)) throw new Error("MAPPING_INVALID");
     if (input.expectedRevision !== state.revision || input.expectedFingerprint !== (current?.mappingFingerprint ?? null)) throw new Error("CAS_CONFLICT");
-    const mapping = fingerprintManagedMappingRecord({ ...candidate, fenceGeneration: state.fenceGeneration, mappingGeneration: state.mappingGeneration + 1 });
+    if (command === "mapping-rollback") {
+      archivedCurrent = validateLiveMappingGeneration(
+        validateImmutableMappingGeneration(
+          await this.native.readMappingGeneration({ mappingId: key, generation: current.mappingGeneration }),
+          key,
+          current.mappingGeneration,
+          "MAPPING_INVALID",
+        ),
+        current,
+        state.fenceGeneration,
+        "MAPPING_INVALID",
+      );
+    }
+    const candidateGraph = advanceManagedGraphFence(oldSnapshot, candidateFenceGeneration);
+    const candidateState = {
+      ...structuredClone(state),
+      fenceGeneration: candidateFenceGeneration,
+      mappings: candidateGraph.mappings,
+      routes: candidateGraph.routes,
+    };
+    const mapping = fingerprintManagedMappingRecord({
+      ...candidate,
+      fenceGeneration: candidateFenceGeneration,
+      mappingGeneration: state.mappingGeneration + 1,
+    });
     const routes = {};
     for (const candidateRoute of routeCandidates) {
       const route = fingerprintManagedRouteRecord({ ...candidateRoute, fenceGeneration: mapping.fenceGeneration, hostId: mapping.hostId, mappingId: mapping.mappingId, mappingGeneration: mapping.mappingGeneration, workspaceGeneration: mapping.workspaceGeneration, mappingVersion: mapping.mappingVersion, sourcePlatform: mapping.sourcePlatform, workspaceId: mapping.workspaceId, workDir: mapping.workDir }, mapping);
       if (Object.hasOwn(routes, route.channelId)) throw new Error("MAPPING_INVALID");
       routes[route.channelId] = route;
     }
-    state.mappingGeneration = mapping.mappingGeneration;
-    if (command === "mapping-rollback") delete state.mappings[key];
-    state.mappings[mapping.mappingId] = mapping;
-    for (const [channelId, route] of Object.entries(state.routes)) if (route.mappingId === key || route.mappingId === mapping.mappingId) delete state.routes[channelId];
-    Object.assign(state.routes, routes);
+    candidateState.mappingGeneration = mapping.mappingGeneration;
+    if (command === "mapping-rollback") delete candidateState.mappings[key];
+    candidateState.mappings[mapping.mappingId] = mapping;
+    for (const [channelId, route] of Object.entries(candidateState.routes)) {
+      if (route.mappingId === key || route.mappingId === mapping.mappingId) delete candidateState.routes[channelId];
+    }
+    Object.assign(candidateState.routes, routes);
     const publicationTxId = randomUUID();
-    const snapshot = channelsSnapshot(state, state.revision + 1, state.authorityEpoch + 1);
+    const snapshot = channelsSnapshot(candidateState, state.revision + 1, candidateAuthorityEpoch);
     const tombstone = command === "mapping-rollback" ? {
-      fenceGeneration: state.fenceGeneration,
+      fenceGeneration: archivedCurrent.mapping.fenceGeneration,
       version: 1, kind: "mapping-tombstone", operation: command, publicationTxId,
-      mappingId: key, mappingGeneration: current.mappingGeneration, mappingFingerprint: current.mappingFingerprint,
+      mappingId: key, mappingGeneration: archivedCurrent.mapping.mappingGeneration, mappingFingerprint: archivedCurrent.mapping.mappingFingerprint,
       snapshotFingerprint: snapshot.configFingerprint, routeDisposition: "no-route", tombstoneFingerprint: null,
     } : null;
     if (tombstone) tombstone.tombstoneFingerprint = recordHash(tombstone, "tombstoneFingerprint");
     const handoffReceipt = {
-      fenceGeneration: state.fenceGeneration,
+      fenceGeneration: candidateFenceGeneration,
       version: 1, kind: "mapping-handoff-receipt", operation: command, publicationTxId,
       oldMappingId: current?.mappingId ?? null, oldMappingGeneration: current?.mappingGeneration ?? null,
       newMappingId: mapping.mappingId, newMappingGeneration: mapping.mappingGeneration,
@@ -2695,11 +2808,7 @@ export class ManagementRuntime {
     };
     handoffReceipt.handoffReceiptFingerprint = recordHash(handoffReceipt, "handoffReceiptFingerprint");
     return {
-      snapshot, oldSnapshot, publicationTxId, tombstone, handoffReceipt,
-      expectedFingerprint: current?.mappingFingerprint ?? null, oldMappingId: current?.mappingId ?? null, oldMappingGeneration: current?.mappingGeneration ?? null,
-      candidateMappingId: mapping.mappingId, candidateMappingGeneration: mapping.mappingGeneration,
-      immutableGeneration: { mapping: structuredClone(mapping), routes: Object.values(routes) },
-      result: { fingerprint: mapping.mappingFingerprint, mappingGeneration: mapping.mappingGeneration, routeCount: Object.keys(routes).length },
+      snapshot, tombstone, handoffReceipt,
       publish: async () => {
         await this.native.writeMappingGeneration({
           fenceGeneration: mapping.fenceGeneration,
