@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { assertStrictText, canonicalJsonHash } from "@gjc-remote/shared/strict-json";
 import { isPrincipal } from "@gjc-remote/shared/identity";
-import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord, validateManagedRouteRecord } from "@gjc-remote/shared/mapping-envelope";
+import { fingerprintManagedMappingRecord, fingerprintManagedRouteRecord, isManagedMappingId, managedHostSetFingerprint, parseManagedHostTokens, validateManagedChannelsV2, validateManagedMappingRecord, validateManagedRouteRecord } from "@gjc-remote/shared/mapping-envelope";
 import { attestTokenFloor, authorityRecordFingerprint, advanceReaderVersionFloor, buildAttestedTokenFloorProof, buildGenesisPrecommit, buildGenesisZeroGrantProofFingerprint, commitTokenFloor, reserveTokenGeneration, validateAuthorityCommitSnapshot, validateAuthorityEpoch, validateAuthorityReservation, validateBaselineSnapshot, validateFenceBinding, validateGenesisAuthorityReceipt, validateGenesisAuthorityRequest, validateGenesisRequest, validateGenesisReceipt, validateReaderProjection, validateReaderVersionFloor, validateTokenConfigAttestation, validateTokenFloor, validateTokenFloorReservation, validateZFinality } from "@gjc-remote/shared/genesis-envelope";
 import { addCredential, authenticate, bootstrapOwner, revokeCredential, rotateCredential, requireOwner } from "./management-auth.js";
 import { buildAdmissionGrant, buildAdmissionRequest, validateAdmissionAck, validateAdmissionGenesisBinding, validateFinalityProof } from "@gjc-remote/shared/admission-envelope";
@@ -18,6 +18,94 @@ const DURABLE_MANUAL_CLEANUP_TX = Symbol("durable-manual-cleanup-tx");
 const principal = (value, name) => { if (!isPrincipal(value)) throw new Error(`${name}_INVALID`); return value; };
 const protectedTokenFingerprint = (value) => managedHostSetFingerprint(parseManagedHostTokens(value));
 const recordHash = (record, field) => canonicalJsonHash(Object.fromEntries(Object.entries(record).filter(([key]) => key !== field)));
+const MAPPING_PRECONDITION_ERRORS = new Map([
+  ["AUTH_SECRET_REQUIRED", EXIT.AUTH],
+  ["AUTH_SECRET_INVALID", EXIT.AUTH],
+  ["MANAGEMENT_AUTH_REQUIRED", EXIT.AUTH],
+  ["MANAGEMENT_AUTH_MIGRATION_REQUIRED", EXIT.AUTH],
+  ["AUTH_CREDENTIAL_INVALID", EXIT.AUTH],
+  ["AUTH_DENIED", EXIT.AUTH],
+  ["OWNER_REQUIRED", EXIT.AUTH],
+  ["MANAGED_NATIVE_UNAVAILABLE", EXIT.NATIVE],
+  ["MANAGEMENT_ROLE_BINDING_REQUIRED", EXIT.INVALID],
+  ["ACTOR_PRINCIPAL_INVALID", EXIT.INVALID],
+  ["MAPPING_ID_INVALID", EXIT.INVALID],
+  ["MANAGEMENT_STATE_INVALID", EXIT.INVALID],
+  ["RECOVERY_REQUIRED", EXIT.RECOVERY],
+]);
+const mappingPreconditionFailure = (error) => {
+  const nativeRefusal = error?.code === "ERR_NATIVE_CONTROL_REFUSED";
+  const candidate = error?.code === undefined ? error?.message : null;
+  const exitCode = MAPPING_PRECONDITION_ERRORS.get(candidate);
+  return {
+    ok: false,
+    exitCode: nativeRefusal ? EXIT.NATIVE : exitCode ?? EXIT.INTERNAL,
+    error: nativeRefusal
+      ? "ERR_NATIVE_CONTROL_REFUSED"
+      : exitCode === undefined ? "MANAGEMENT_FAILED" : candidate,
+    routeDisposition: "no-route",
+  };
+};
+const plainObject = (value) =>
+  value !== null && typeof value === "object" && !Array.isArray(value) &&
+  Object.getPrototypeOf(value) === Object.prototype;
+const validateMappingPreconditionState = (state) => {
+  try {
+    if (!plainObject(state) ||
+        !Object.hasOwn(state, "revision") ||
+        !Object.hasOwn(state, "authorityEpoch") ||
+        !Object.hasOwn(state, "fenceGeneration") ||
+        !Object.hasOwn(state, "mappingGeneration") ||
+        !Object.hasOwn(state, "tokenConfigGeneration") ||
+        !Object.hasOwn(state, "tokenAttestation") ||
+        !Object.hasOwn(state, "mappings") ||
+        !Object.hasOwn(state, "routes") ||
+        !plainObject(state.tokenAttestation) ||
+        !Object.hasOwn(state.tokenAttestation, "fingerprint") ||
+        !plainObject(state.mappings) ||
+        !plainObject(state.routes) ||
+        !Number.isSafeInteger(state.revision) || state.revision < 1 ||
+        !Number.isSafeInteger(state.authorityEpoch) || state.authorityEpoch < 1 ||
+        !Number.isSafeInteger(state.fenceGeneration) || state.fenceGeneration < 1 ||
+        !Number.isSafeInteger(state.mappingGeneration) || state.mappingGeneration < 0 ||
+        !Number.isSafeInteger(state.tokenConfigGeneration) || state.tokenConfigGeneration < 1 ||
+        typeof state.tokenAttestation.fingerprint !== "string" ||
+        !/^[a-f0-9]{64}$/.test(state.tokenAttestation.fingerprint)) {
+      throw new TypeError("invalid management state");
+    }
+    for (const [mappingId, mapping] of Object.entries(state.mappings)) {
+      if (mappingId !== mapping?.mappingId) throw new TypeError("invalid mapping identity");
+      validateManagedMappingRecord(mapping);
+    }
+    for (const [channelId, route] of Object.entries(state.routes)) {
+      if (channelId !== route?.channelId || !Object.hasOwn(state.mappings, route?.mappingId)) {
+        throw new TypeError("invalid route identity");
+      }
+      validateManagedRouteRecord(route, state.mappings[route.mappingId]);
+    }
+    // Retain the original dictionaries and records through complete graph validation.
+    const projection = {
+      version: 2,
+      managementStamp: "gjc-management-channels/v2",
+      revision: state.revision,
+      authorityEpoch: state.authorityEpoch,
+      fenceGeneration: state.fenceGeneration,
+      mappingGeneration: state.mappingGeneration,
+      tokenConfigGeneration: state.tokenConfigGeneration,
+      tokenConfigHostSetFingerprint: state.tokenAttestation.fingerprint,
+      targetState: Object.keys(state.routes).length ? "managed" : "managed-empty",
+      dispatchClass: "workspace-only",
+      mappings: state.mappings,
+      routes: state.routes,
+      configFingerprint: null,
+    };
+    projection.configFingerprint = recordHash(projection, "configFingerprint");
+    validateManagedChannelsV2(projection);
+    return state;
+  } catch {
+    throw new Error("MANAGEMENT_STATE_INVALID");
+  }
+};
 const parentMutationProofFingerprint = ({ parentIdentityFingerprint, parentAclFingerprint, targetPrincipal }) => canonicalJsonHash({
   version: 1,
   kind: "genesis-parent-mutation-proof",
@@ -383,6 +471,7 @@ export class ManagementRuntime {
       const outcome = command === "genesis" ? await this.#genesis(input) : await this.#authenticated(command, input);
       return { exitCode: EXIT.OK, ok: true, ...outcome };
     } catch (error) {
+      if (command === "mapping-preconditions") return mappingPreconditionFailure(error);
       const code = safe(error).code;
       return { exitCode: code.includes("AUTH") || code.includes("OWNER") ? EXIT.AUTH : code.includes("CONFLICT") ? EXIT.CONFLICT : code.includes("NATIVE") ? EXIT.NATIVE : code.includes("RECOVERY") || code.includes("MANUAL_CLEANUP") ? EXIT.RECOVERY : code.includes("INVALID") || code.includes("REQUIRED") ? EXIT.INVALID : EXIT.INTERNAL, ok: false, error: code, routeDisposition: "no-route" };
     }
@@ -785,6 +874,32 @@ export class ManagementRuntime {
       if (state.recovery && state.recovery.phase !== "terminal") throw new Error("RECOVERY_REQUIRED");
       const authenticated = await this.#authenticatedState(state);
       return fn(state, authenticate(authenticated, actorPrincipal, input.actorSecret));
+    });
+  }
+  async #mappingPreconditions(input) {
+    const actorPrincipal = principal(input?.actorPrincipal, "ACTOR_PRINCIPAL");
+    if (!isManagedMappingId(input?.mappingId)) throw new Error("MAPPING_ID_INVALID");
+    if (typeof input?.actorSecret !== "string") throw new Error("AUTH_SECRET_REQUIRED");
+    return this.native.withManagementLocks(["mapping"], async () => {
+      const state = await this.native.readManagementState();
+      const auth = await this.native.readManagementAuth();
+      if (auth === null || auth === undefined) throw new Error("MANAGEMENT_AUTH_REQUIRED");
+      requireOwner(authenticate({ auth }, actorPrincipal, input.actorSecret));
+      if (state === null || state === undefined) throw new Error("MANAGEMENT_STATE_INVALID");
+      if (typeof state === "object" && Object.hasOwn(state, "auth")) {
+        throw new Error("MANAGEMENT_AUTH_MIGRATION_REQUIRED");
+      }
+      if (state?.recovery !== null && state?.recovery !== undefined &&
+          state.recovery?.phase !== "terminal") throw new Error("RECOVERY_REQUIRED");
+      validateMappingPreconditionState(state);
+      return {
+        mappingId: input.mappingId,
+        expectedRevision: state.revision,
+        expectedFingerprint: Object.hasOwn(state.mappings, input.mappingId)
+          ? state.mappings[input.mappingId].mappingFingerprint
+          : null,
+        routeDisposition: "no-route",
+      };
     });
   }
 
@@ -1479,6 +1594,7 @@ export class ManagementRuntime {
   }
 
   async #authenticated(command, input) {
+    if (command === "mapping-preconditions") return this.#mappingPreconditions(input);
     const target = input.targetPrincipal === undefined ? null : principal(input.targetPrincipal, "TARGET_PRINCIPAL");
     const actor = { actorPrincipal: input.actorPrincipal, secret: input.actorSecret };
     if (command === "auth-add") return this.#mutate(command, input, (state) => ({ epoch: addCredential(state, actor, target, input.targetSecret) }));

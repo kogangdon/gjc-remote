@@ -1,8 +1,9 @@
 import { assertStrictText, parseStrictJsonBytes, STRICT_JSON_LIMITS } from "@gjc-remote/shared/strict-json";
 import { isPrincipal } from "@gjc-remote/shared/identity";
+import { isManagedMappingId } from "@gjc-remote/shared/mapping-envelope";
 import { ManagementRuntime, EXIT } from "./management-runtime.js";
 
-const COMMANDS = new Set(["genesis", "mapping-validate", "mapping-snapshot", "mapping-reconcile", "mapping-revoke", "mapping-rollback", "tokens-attest", "auth-add", "auth-rotate", "auth-revoke", "recover", "status"]);
+const COMMANDS = new Set(["genesis", "mapping-validate", "mapping-snapshot", "mapping-preconditions", "mapping-reconcile", "mapping-revoke", "mapping-rollback", "tokens-attest", "auth-add", "auth-rotate", "auth-revoke", "recover", "status"]);
 const AUTH_MUTATION_COMMANDS = new Set(["auth-add", "auth-rotate", "auth-revoke"]);
 const AUTH_IDEMPOTENCY_KEY_MAX_LENGTH = 256;
 const validAuthIdempotencyKey = (value) => {
@@ -21,6 +22,7 @@ const COMMAND_FLAGS = Object.freeze({
   genesis: new Set(["--target-principal", "--bot-principal", "--recovery-principal", "--management-provisioning-fingerprint", "--bot-provisioning-fingerprint", "--recovery-provisioning-fingerprint", "--idempotency-key", "--requested-reader-mode", "--reader-instance-id", "--reader-start-nonce", "--host-tokens-stdin"]),
   "mapping-validate": new Set(),
   "mapping-snapshot": new Set(),
+  "mapping-preconditions": new Set(["--mapping-id"]),
   "mapping-reconcile": new Set(["--mapping-id", "--expected-revision", "--expected-fingerprint", "--idempotency-key"]),
   "mapping-revoke": new Set(["--mapping-id", "--expected-revision", "--expected-fingerprint", "--idempotency-key"]),
   "mapping-rollback": new Set(["--mapping-id", "--replacement-mapping-id", "--expected-revision", "--expected-fingerprint", "--prior-generation", "--idempotency-key"]),
@@ -67,6 +69,10 @@ export function parseManagementArgs(argv) {
   }
   if (!input.actorPrincipal || !input.actorSecretStdin) throw new Error("USAGE_ACTOR_AUTH_REQUIRED");
   input.actorPrincipal = parsePrincipal(input.actorPrincipal, "ACTOR_PRINCIPAL");
+  if (command === "mapping-preconditions") {
+    if (!Object.hasOwn(input, "mappingId")) throw new Error("USAGE_MAPPING_ID_REQUIRED");
+    if (!isManagedMappingId(input.mappingId)) throw new Error("USAGE_MAPPING_ID_INVALID");
+  }
   if (input.targetPrincipal) input.targetPrincipal = parsePrincipal(input.targetPrincipal, "TARGET_PRINCIPAL");
   if (input.botPrincipal) input.botPrincipal = parsePrincipal(input.botPrincipal, "BOT_PRINCIPAL");
   if (input.recoveryPrincipal) input.recoveryPrincipal = parsePrincipal(input.recoveryPrincipal, "RECOVERY_PRINCIPAL");
@@ -112,7 +118,8 @@ export async function runManagementCli({ argv, stdin, stdout, stderr, native }) 
   try {
     const { command, input } = parseManagementArgs(argv);
     const protectedInput = await readProtectedInput(stdin);
-    if (command === "recover" && Object.keys(protectedInput).some((key) => key !== "actorSecret")) {
+    if (["recover", "mapping-preconditions"].includes(command) &&
+        Object.keys(protectedInput).some((key) => key !== "actorSecret")) {
       throw new Error("USAGE_STDIN_FIELD_INVALID");
     }
     for (const [key, value] of Object.entries(protectedInput)) {

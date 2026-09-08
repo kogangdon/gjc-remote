@@ -217,6 +217,52 @@ The targeted precondition CLI is a separate dependent change. No native schema,
 admission authority, host-secret cutover, serving, or deployment change follows
 from this correction.
 
+## Owner-only targeted mapping preconditions
+
+**Decision:** expose `mapping-preconditions` as a separate authenticated,
+owner-only CLI read. Return only the selected mapping ID, positive safe-integer
+revision, selected fingerprint (or null for absence), success/exit fields, and
+`no-route`. The pair comes from one raw second state read inside the existing
+native M mapping lock; it is not a lease or live-target authority proof.
+
+**Drivers:** make the existing exact-CAS mutation interface usable without
+direct state-file inspection, prevent a target/recovery oracle for nonowners,
+and retain a single native authority with no new persistence or recovery path.
+
+**Alternatives considered and why rejected:** extending `mapping-snapshot`
+would mix aggregate disclosure with owner-only mutation preconditions and alter
+its existing authorization. A new native targeted-reader API would expand the
+platform capability contract without supplying a lease. Automatically reading
+fresh expected values inside a mutation would bypass the caller's stale-state
+check. A command-local projection using existing validators is the smaller
+boundary; no complete state schema or accessor framework is introduced.
+
+**Ordering and consequences:** native capability, first-state role setup, and
+syntax checks may precede owner authentication. Inside the lock, authenticate
+the separate auth store and require owner before recovery, semantic validation,
+or requested-key access. Preserve a null second read as invalid state rather
+than synthesizing empty state. Validate all original mapping and route records,
+including unrelated records and prototypes, before cloning can normalize them;
+then validate the complete graph and use an own-key lookup. Valid prototype-name
+IDs remain legal; inherited properties never imply presence.
+
+The command has an exact full-runtime error allowlist, including pre-dispatch
+native failures; unknown errors become `MANAGEMENT_FAILED`/70. Existing CLI
+usage versus strict-input stream behavior and other commands are unchanged.
+Absence returns a numeric revision and null fingerprint, not create permission.
+No durable state/auth/target/audit write, recovery, admission, or B-reader
+operation is allowed; existing lock and MST transient I/O is not excluded.
+
+**Verification and follow-ups:** ID/argv/stdin boundaries, owner-first
+disclosure, missing/corrupt original records, recovery refusal, exact output and
+error redaction, unchanged bytes, child-process CLI responses, and a real
+intervening successor followed by exact stale CAS are required. The prerequisite
+successor correction is PR #229; archive/current-route semantics and global
+fence/finality remain unchanged. JavaScript fault/interleaving and scripted
+child-native evidence do not establish OS locks, ACLs, durability, or current
+platform support. API/web, host-token cutover, SDK adoption, native serving,
+deployment, and release remain separately authorized work.
+
 ## Windows durability contract (non-elevated)
 `flush_directory_or_volume` on Windows never opens a raw volume device for
 `FlushFileBuffers`, because that call requires `SeManageVolumePrivilege`
