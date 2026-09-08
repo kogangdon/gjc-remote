@@ -1,17 +1,40 @@
-# Native daemon deployment
+# Native daemon foreground deployment
 
 Run one daemon on each host that owns mapped work directories. It embeds the
-pinned `@gajae-code/coding-agent` SDK **0.12.21** and requires **Bun 1.3.14 or
+pinned `@gajae-code/coding-agent` SDK **0.16.6** and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
 
+The daemon adapter rejects `steer` and `follow_up` while a prompt is active,
+before SDK queue admission. Idle controls remain prompt-equivalent FIFO work.
+Upstream issue
+[#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is fixed on the
+development branch by
+[#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that fix is
+absent from both the `v0.16.6` tag and the actual published 0.16.6 npm tarball.
+A supported public ownership lifecycle is requested in
+[#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429); live controls
+remain fail-closed until it ships. See the
+[containment record](../../CHANGELOG.md#sdk-0166-containment).
+
+This repository provides the foreground start command below; it does not ship a
+native service installer, service wrapper, or systemd unit, and this guide is
+not evidence of a completed live deployment.
+
+The integration boundary is unchanged by the SDK bump. `gjc-remote` owns host
+authentication, route/workDir selection, and workspace admission/lifecycle
+policy. The embedded SDK runtime owns provider/model catalogs, provider
+authentication, and agent-turn semantics. Broker/Router surfaces are reserved
+for a separate future external-session evaluation; no adapter or migration is
+implemented.
+
 ## Prerequisites and provider identity
 
-Install the workspace dependencies from the committed lockfile, Bun >=1.3.14,
+Install the workspace dependencies from the committed lockfile, Bun >=1.4.0,
 and the native-control prerequisites for the host. Approved native-control
 tuples are Linux x64/arm64 and Windows x64; macOS is unsupported.
 
-Run the service as a dedicated daemon OS account. Before starting the service,
+Run the daemon process as a dedicated daemon OS account. Before starting it,
 log into the provider interactively as that same account:
 
 ```sh

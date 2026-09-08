@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SDK 0.16.6 containment
+
+- Reject `steer` and `follow_up` with `SDK_LIVE_CONTROL_UNSUPPORTED` while a
+  prompt is active. The rejection occurs before SDK queue admission, preventing
+  a late follow-up from hanging or being correlated with an unrelated terminal.
+  Idle controls remain serialized prompt-equivalent work.
+- Historical 0.16.4 evidence: the real SDK oracle observed `waitForIdle()`
+  resolving with the exact executable follow-up still queued and no successor
+  run after admission beyond the active run's queue cutoff. Disposal rejected
+  the pending remote control without false completion. The characterization
+  test passed, while its receipt recorded `BLOCK`
+  (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). This receipt is old-run
+  evidence, not a 0.16.6 result.
+  The required repair belongs in the SDK's lifecycle-owned queue wakeup; no
+  lower-level continuation bypass is included here.
+- Upstream [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is
+  fixed on the development branch by
+  [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that fix is
+  absent from both the `v0.16.6` tag and the actual published
+  `@gajae-code/coding-agent@0.16.6` npm tarball. The merged development source
+  and the installed package are distinct evidence surfaces; issue closure does
+  not alter the packaged behavior.
+- Remove the adapter's dependency on internal `queuedAtDispatch` and
+  `onQueuedPromoted` hooks. Upstream
+  [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429) requests a
+  supported queued-input ownership lifecycle; live controls remain disabled
+  until that contract is available and verified.
+
+### Changed
+
+- Upgrade the embedded GJC SDK to 0.16.6 and require Bun 1.4.0 or newer.
+  Align CI, container base pins, lock provenance, and future observability
+  recipes while retaining the existing in-process session architecture.
+- Replace the retired Discord `/team` registration with `/autoresearch`,
+  matching the SDK's bundled workflow catalog.
+- Delegate scoped settings ownership and startup profile activation to the
+  SDK's public APIs instead of cloning process-global settings.
+
+### Fixed
+
+- Fail closed instead of admitting live controls through unsupported SDK
+  ownership hooks; cancel prompt and gate waiters explicitly during disposal.
+- Encode SDK workflow answers as structured objects and confirm acceptance
+  through bounded, correlated daemon receipts. Rejections remain retryable only
+  for the same live gate, without erasing successors or starting a new prompt.
+  The unreleased gate-answer wire shape now requires `answerId` and exact fields;
+  it has no mixed-version capability negotiation, so bot and daemon peers must
+  be deployed together before the workflow-gate channel is enabled.
+
 ## [0.3.1] - 2026-08-09
 
 ### Changed

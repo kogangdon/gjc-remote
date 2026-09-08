@@ -184,9 +184,11 @@ A development-only `connectivity-only` Git probe was, in the MVP interim, gated 
 all-reachable verification is now unconditional at every create/clone and refresh generation
 publication. The removal gate `FULL_GRAPH_PUBLICATION_TESTS_PASS` is retired; the flag name is now
 rejected at daemon startup (presence-based fail-closed, see `daemon/src/workspace-removed-flags.js`).
-Removing these interim flags does NOT cross the native-serving boundary
-(`NATIVE_WORKSPACE_SERVING_ENABLED` stays false) - that flip is the separate human-approved decision
-tracked by issue #81 / slice S6f.
+At slice S6e, removing these interim flags did NOT cross the native-serving boundary:
+`NATIVE_WORKSPACE_SERVING_ENABLED` was still a hard false, and the separate human-approved
+enablement decision remained tracked by issue #81 / slice S6f. That is historical slice status;
+the current fail-closed, default-off opt-in gate is documented in the evolving as-built section
+below.
 
 Docker session-volume migration is disabled with an internal diagnostic
 `DOCKER_SESSION_MIGRATION_DISABLED` that is never sent as a public protocol/remediation code; public
@@ -234,7 +236,7 @@ attestation, and supported-platform promotion remain Phase 4 obligations.
 
 Every verification-matrix evidence layer and non-negotiable gate must close before promotion:
 
-- ownership/fixture agreement and exact SDK/package/lock provenance at 0.12.21;
+- ownership/fixture agreement and exact SDK/package/lock provenance at 0.16.6;
 - unit/integration/Compose tests for mapping, readiness, lifecycle, resource, Git, backup/restore,
   provider recovery, remap fencing, and cleanup;
 - image/base/source/lock/SDK digests, SBOM, scan, signature/attestation, volume manifests, copied or
@@ -260,7 +262,7 @@ not authorize any behavior more permissive than the phase contracts above.
 **Serving is env-gated and OFF by default.** The native inventory contract (config modes, five-role
 bindings, the durable D floor, the live invalidation cascade, and the bot receipt binding/observability
 surface) is implemented as capability scaffolding. Native workspace serving is now a fail-closed
-runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:290)
+runtime decision rather than a hard literal: the daemon defines `NATIVE_WORKSPACE_SERVING_ENABLED` (daemon/src/daemon.js:291)
 as an `= resolveNativeServingEnabled({ env, inventoryReceiptAdvertised })`
 call, which is `true` only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 equals `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the default)
@@ -324,9 +326,10 @@ error to a structured, path-free, secret-free `inventoryConfigDiagnostic` and `p
 `sanitizeDaemonError`); provider construction/read failures keep their existing `sanitizeDaemonError`
 catch. The `workspace_inventory_receipt_v2` advertisement keying is unchanged, so a production
 verify-mode receipt now depends on a genuinely self-tested native reader rather than requiring
-test-injected inventory. Native serving itself remains FUTURE work gated behind the existing
-native-serving boundary defined earlier in this document (`NATIVE_WORKSPACE_SERVING_ENABLED = false`
-is unchanged); this wiring does not bring serving into scope.
+test-injected inventory. At the time of this #53 Phase 2 slice, native serving remained future work
+behind a hard-false `NATIVE_WORKSPACE_SERVING_ENABLED` boundary; that is historical slice status,
+not the current gate. The current runtime uses the fail-closed, default-off opt-in gate documented
+at the start of this section. This reader-wiring slice did not itself enable serving.
 
 **Host-wide active-workspace admission (#53 Phase 2, #43 ownership).** Of the three #43 host-wide
 bounds, two were already implemented and boundary-tested before this slice: 64 in-flight invokes per
@@ -344,14 +347,17 @@ the daemon process; the bot's per-socket `V0_LIMITS.MAX_PENDING_PER_HOST` (64) i
 as a thin network-backpressure guard (two-layer, not two-authorities) and is held equal to the daemon
 ceiling by an in-slice constant-reconciliation test.
 
-**Forward-scaffolding / dormancy.** `acquireActivity` is reached from the invoke handler only AFTER
-the `NATIVE_WORKSPACE_SERVING_ENABLED` serving gate (source order: mapping/route -> read-before-
-admission fence -> serving-disabled gate -> workspace-admission -> session creation), which is
-hard-disabled. The new active-workspace bound is therefore dormant on the live invoke wire today --
-exactly like the existing 8-session bound -- and is proven at the `WorkspaceLeaseRegistry`
+**Historical forward-scaffolding / dormancy (pre-S6f.7).** At the time of this slice,
+`acquireActivity` was reached from the invoke handler only AFTER the
+`NATIVE_WORKSPACE_SERVING_ENABLED` serving gate (source order: mapping/route -> read-before-
+admission fence -> serving-disabled gate -> workspace-admission -> session creation), which was
+hard-disabled. The new active-workspace bound was therefore dormant on the live invoke wire then --
+exactly like the existing 8-session bound -- and was proven at the `WorkspaceLeaseRegistry`
 component/unit surface, not via a live serving invoke. Only the 64-invoke `AdmissionBudget` (which
-runs upstream of the serving gate) is load-bearing end-to-end today. This slice does not enable native
-serving.
+ran upstream of the serving gate) was load-bearing end-to-end for that slice. The slice did not
+enable native serving. The current runtime instead uses the fail-closed, default-off opt-in gate
+documented at the start of this section; without its exact operator opt-in, advertised receipt
+capability, and operation-specific gates, serving remains refused.
 
 **cgroup headroom (contract + Linux-guarded test; enforcement deferred to Phase 3/#42).** The daemon
 performs no runtime cgroup manipulation. `daemon/src/admission-headroom.js` declares the memory

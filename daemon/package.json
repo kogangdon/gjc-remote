@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/daemon.js",
   "engines": {
-    "bun": ">=1.3.14"
+    "bun": ">=1.4.0"
   },
   "scripts": {
     "start": "bun src/daemon.js",
@@ -13,7 +13,7 @@
     "test:observability": "node --test test/daemon-observability.test.js test/lifecycle.test.js"
   },
   "dependencies": {
-    "@gajae-code/coding-agent": "0.12.21",
+    "@gajae-code/coding-agent": "0.16.6",
     "@gjc-remote/native-control": "*",
     "@gjc-remote/shared": "*",
     "dotenv": "^16.4.5",

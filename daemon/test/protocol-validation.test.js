@@ -24,7 +24,9 @@ import {
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   INVENTORY_RECEIPT_TTL_MS,
+  GATE_ANSWER_ERROR_CODES,
   isAnswerMessage,
+  isGateAnswerResultEvent,
   isBindOkMessage,
   isBindWorkspaceMessage,
   isEventMessage,
@@ -1676,62 +1678,62 @@ test("daemon rejects an oversized inbound WebSocket payload", async () => {
   }
 });
 test("isAnswerMessage accepts a well-formed answer and rejects malformed ones (#35)", () => {
-  assert.equal(
-    isAnswerMessage({
-      type: "answer",
-      requestId: "request-1",
-      gateId: "gate-1",
-      answer: "yes",
-    }),
-    true
-  );
-  // Empty answer is allowed (a user may send an empty selection the daemon maps/rejects).
-  assert.equal(
-    isAnswerMessage({ type: "answer", requestId: "r", gateId: "g", answer: "" }),
-    true
-  );
+  const valid = {
+    type: "answer",
+    requestId: "request-1",
+    gateId: "gate-1",
+    answerId: "answer-1",
+    answer: "yes",
+  };
+  assert.equal(isAnswerMessage(valid), true);
+  assert.equal(isAnswerMessage({ ...valid, answer: "" }), true);
+  assert.equal(isAnswerMessage({ ...valid, answerId: "x".repeat(V0_LIMITS.REQUEST_ID) }), true);
+  assert.equal(isAnswerMessage({ ...valid, token: "unexpected" }), false);
   assert.equal(isAnswerMessage(null), false);
   assert.equal(isAnswerMessage({ type: "answer" }), false);
-  assert.equal(
-    isAnswerMessage({ type: "answer", requestId: "r", gateId: "g" }),
-    false,
-    "missing answer"
-  );
-  assert.equal(
-    isAnswerMessage({ type: "answer", requestId: "", gateId: "g", answer: "x" }),
-    false,
-    "empty requestId"
-  );
-  assert.equal(
-    isAnswerMessage({ type: "answer", requestId: "r", gateId: "", answer: "x" }),
-    false,
-    "empty gateId"
-  );
-  assert.equal(
-    isAnswerMessage({
-      type: "answer",
-      requestId: "r",
-      gateId: "x".repeat(V0_LIMITS.GATE_ID + 1),
-      answer: "x",
-    }),
-    false,
-    "oversized gateId"
-  );
-  assert.equal(
-    isAnswerMessage({
-      type: "answer",
-      requestId: "r",
-      gateId: "g",
-      answer: "x".repeat(V0_LIMITS.MESSAGE + 1),
-    }),
-    false,
-    "oversized answer"
-  );
-  assert.equal(
-    isAnswerMessage({ type: "invoke", requestId: "r", gateId: "g", answer: "x" }),
-    false,
-    "wrong type"
-  );
+  for (const [field, value] of [
+    ["answer", undefined],
+    ["requestId", ""],
+    ["gateId", ""],
+    ["gateId", "x".repeat(V0_LIMITS.GATE_ID + 1)],
+    ["answerId", undefined],
+    ["answerId", ""],
+    ["answerId", "x".repeat(V0_LIMITS.REQUEST_ID + 1)],
+    ["answer", "x".repeat(V0_LIMITS.MESSAGE + 1)],
+    ["type", "invoke"],
+  ]) {
+    assert.equal(isAnswerMessage({ ...valid, [field]: value }), false, field);
+  }
+});
+
+test("gate answer receipts require exact correlation and sanitized outcomes", () => {
+  const accepted = {
+    type: "gate_answer_result",
+    answerId: "attempt",
+    gateId: "gate",
+    accepted: true,
+  };
+  assert.equal(isGateAnswerResultEvent(accepted), true);
+  for (const errorCode of Object.values(GATE_ANSWER_ERROR_CODES)) {
+    assert.equal(isGateAnswerResultEvent({ ...accepted, accepted: false, errorCode }), true);
+  }
+  for (const invalid of [
+    null,
+    { ...accepted, answerId: undefined },
+    { ...accepted, answerId: "" },
+    { ...accepted, answerId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+    { ...accepted, gateId: "" },
+    { ...accepted, gateId: "x".repeat(V0_LIMITS.GATE_ID + 1) },
+    { ...accepted, accepted: "true" },
+    { ...accepted, accepted: false },
+    { ...accepted, accepted: false, errorCode: "raw SDK details" },
+    { ...accepted, errorCode: Object.values(GATE_ANSWER_ERROR_CODES)[0] },
+    { ...accepted, answer: "must not cross receipt boundary" },
+    { ...accepted, token: "must not cross receipt boundary" },
+    { ...accepted, type: "answer" },
+  ]) {
+    assert.equal(isGateAnswerResultEvent(invalid), false);
+  }
 });
 
 test("isGateRequestEvent validates the gate_request event subtype incl. bounds and choices (#35)", () => {

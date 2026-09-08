@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import test from "node:test";
 
@@ -10,6 +11,286 @@ import {
 } from "../src/sdk-session.js";
 import { V0_LIMITS, isGateRequestEvent } from "@gjc-remote/shared";
 
+const usage = {
+  input: 0,
+  output: 1,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 1,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function assistantMessage(text = "done", overrides = {}) {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: "fake-api",
+    provider: "fake-provider",
+    model: "fake-model",
+    usage,
+    stopReason: "stop",
+    timestamp: 1,
+    ...overrides,
+  };
+}
+
+// AgentEvent.agent_end in @gajae-code/agent-core 0.16.6 always carries the
+// run's messages. Tests use this source-shaped boundary instead of fabricating
+// a bare terminal that the installed SDK cannot emit.
+function terminalEvent({ text = "done", messages, ...overrides } = {}) {
+  return {
+    type: "agent_end",
+    messages: messages ?? [assistantMessage(text)],
+    stopReason: "completed",
+    ...overrides,
+  };
+}
+
+function attemptScope(generation, attemptId = `attempt-${generation}`) {
+  return Object.freeze({
+    attemptId,
+    generation,
+    lineage: "main",
+  });
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
+}
+
+function schemaHash(schema) {
+  return createHash("sha256").update(canonicalJson(schema)).digest("hex");
+}
+
+// Exact output shape of SDK 0.16.6 buildAskGateAnswerSchema() and
+// buildAskGateStageState(); see workflow-gate-types.ts:206-293. Keeping the
+// generated schema on every fake gate makes scalar-answer regressions visible.
+function sdkAskGate({
+  gate_id,
+  kind = "question",
+  stage = "deep-interview",
+  context = {},
+  options = [],
+  multi = false,
+  allowEmpty = false,
+  customMaxLength,
+}) {
+  const labels = options.map((option) => option.label);
+  const selectedItems = { type: "string", enum: labels };
+  const selectedBase = {
+    type: "array",
+    items: selectedItems,
+    uniqueItems: true,
+  };
+  const selectedOnly = {
+    ...selectedBase,
+    minItems: allowEmpty ? 0 : 1,
+    ...(multi ? {} : { maxItems: 1 }),
+  };
+  const selectedWithOther = {
+    ...selectedBase,
+    ...(multi ? {} : { maxItems: 0 }),
+  };
+  const schema = {
+    type: "object",
+    properties: {
+      selected: selectedBase,
+      other: {
+        type: "boolean",
+        description: "set true to provide a free-text answer in `custom`",
+      },
+      custom: {
+        type: "string",
+        minLength: 1,
+        ...(customMaxLength === undefined
+          ? {}
+          : { maxLength: customMaxLength }),
+        pattern: "\\S",
+        description: "free-text answer; required when `other` is true",
+      },
+      action: {
+        type: "string",
+        enum: ["answer", "clarify"],
+        description:
+          "set to `clarify` to ask about the choices without answering the round",
+      },
+      question: {
+        type: "string",
+        minLength: 1,
+        pattern: "\\S",
+        description: "clarification question; required when action is `clarify`",
+      },
+    },
+    additionalProperties: false,
+    anyOf: [
+      {
+        type: "object",
+        properties: {
+          selected: selectedOnly,
+          other: { const: false },
+          action: { const: "answer" },
+        },
+        required: ["selected"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          selected: selectedWithOther,
+          other: { const: true },
+          custom: {
+            type: "string",
+            minLength: 1,
+            ...(customMaxLength === undefined
+              ? {}
+              : { maxLength: customMaxLength }),
+            pattern: "\\S",
+          },
+          action: { const: "answer" },
+        },
+        required: ["selected", "other", "custom"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          action: { const: "clarify" },
+          question: { type: "string", minLength: 1, pattern: "\\S" },
+        },
+        required: ["action", "question"],
+        additionalProperties: false,
+      },
+    ],
+  };
+  const canonicalOptions = options.map((option) => ({
+    value: option.label,
+    label: option.label,
+    ...(option.description === undefined
+      ? {}
+      : { description: option.description }),
+  }));
+  const gate = {
+    type: "workflow_gate",
+    gate_id,
+    stage,
+    kind,
+    schema,
+    schema_hash: schemaHash(schema),
+    options: canonicalOptions,
+    context: {
+      ...context,
+      stage_state: {
+        question_id: gate_id,
+        multi,
+        options: labels,
+        other_option: "Other (type your own)",
+        clarification_action: "clarify",
+        allow_empty: allowEmpty,
+        ...(context.stage_state ?? {}),
+      },
+    },
+    created_at: "2026-09-06T00:00:00.000Z",
+    required: true,
+  };
+  return gate;
+}
+
+// Exact schemas/options from SDK 0.16.6 approval-gate.ts:54-94.
+function sdkDecisionGate({ gate_id, kind, context = {} }) {
+  const approval = kind === "approval";
+  const decisions = approval
+    ? ["approve", "request-changes", "reject"]
+    : ["approve", "decline"];
+  const detailKey = approval ? "comments" : "reason";
+  const schema = {
+    type: "object",
+    properties: {
+      decision: { type: "string", enum: decisions },
+      [detailKey]: {
+        type: "string",
+        description: approval
+          ? "required when requesting changes"
+          : "optional rationale; required when declining",
+      },
+    },
+    required: ["decision"],
+    additionalProperties: false,
+  };
+  return {
+    type: "workflow_gate",
+    gate_id,
+    stage: approval ? "ralplan" : "ultragoal",
+    kind,
+    schema,
+    schema_hash: schemaHash(schema),
+    options: decisions.map((decision) => ({
+      value: decision,
+      label: decision,
+    })),
+    context,
+    created_at: "2026-09-06T00:00:00.000Z",
+    required: true,
+  };
+}
+
+// The fake emitter evaluates the constrained schema subset used by the exact
+// fixtures above, matching workflow-gate-schema.ts rather than accepting an
+// arbitrary answer selected by the test.
+function schemaAccepts(schema, value) {
+  if (schema.type === "object" && (typeof value !== "object" || value === null || Array.isArray(value))) {
+    return false;
+  }
+  if (schema.type === "array" && !Array.isArray(value)) return false;
+  if (schema.type === "string" && typeof value !== "string") return false;
+  if (schema.type === "boolean" && typeof value !== "boolean") return false;
+  if (Object.hasOwn(schema, "const") && canonicalJson(value) !== canonicalJson(schema.const)) {
+    return false;
+  }
+  if (
+    Array.isArray(schema.enum) &&
+    !schema.enum.some((candidate) => canonicalJson(candidate) === canonicalJson(value))
+  ) {
+    return false;
+  }
+  if (typeof value === "string") {
+    if (schema.minLength !== undefined && [...value].length < schema.minLength) return false;
+    if (schema.maxLength !== undefined && [...value].length > schema.maxLength) return false;
+    if (schema.pattern !== undefined && !new RegExp(schema.pattern).test(value)) return false;
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) return false;
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) return false;
+    if (schema.uniqueItems && new Set(value.map(canonicalJson)).size !== value.length) {
+      return false;
+    }
+    if (schema.items && !value.every((item) => schemaAccepts(schema.items, item))) {
+      return false;
+    }
+  }
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    for (const required of schema.required ?? []) {
+      if (!Object.hasOwn(value, required)) return false;
+    }
+    const properties = schema.properties ?? {};
+    for (const [key, propertyValue] of Object.entries(value)) {
+      if (properties[key]) {
+        if (!schemaAccepts(properties[key], propertyValue)) return false;
+      } else if (schema.additionalProperties === false) {
+        return false;
+      }
+    }
+  }
+  if (Array.isArray(schema.anyOf)) {
+    return schema.anyOf.some((branch) => schemaAccepts(branch, value));
+  }
+  return true;
+}
+
 class FakeAgentSession {
   constructor() {
     this.listeners = new Set();
@@ -18,6 +299,7 @@ class FakeAgentSession {
     ];
     this.calls = [];
     this.disposeCalls = 0;
+    this.profileCalls = [];
     this.modelRegistry = { id: "fake-model-registry" };
     this.settings = {
       get: (key) => (key === "modelProfile.default" ? "copilot-claude" : undefined),
@@ -44,17 +326,12 @@ class FakeAgentSession {
   async prompt(message) {
     this.calls.push(["prompt", message]);
     this.emit({ type: "message_update", value: message });
-    this.emit({ type: "agent_end" });
+    this.emit(terminalEvent({ text: message }));
   }
 
-  async steer(message) {
-    this.calls.push(["steer", message]);
-    queueMicrotask(() => this.emit({ type: "agent_end" }));
-  }
-
-  async followUp(message) {
-    this.calls.push(["follow_up", message]);
-    queueMicrotask(() => this.emit({ type: "agent_end" }));
+  async activateModelProfileForControl(profileName) {
+    this.profileCalls.push(profileName);
+    return true;
   }
 
   async dispose() {
@@ -71,29 +348,108 @@ class FakeGateEmitter {
   constructor() {
     this.listeners = new Set();
     this.resolveCalls = [];
+    this.prepareCalls = [];
+    this.clearPreparedCalls = [];
+    this.quarantineCalls = [];
     this.resolvers = new Map();
+    this.pending = new Map();
+    this.prepared = new Set();
+    this.completed = new Map();
+    this.acceptedIncompleteKeys = new Set();
+    this.beforeReceipt = undefined;
+  }
+  supportsRemoteGateAnswers() {
+    return true;
   }
   onGateEmitted(listener) {
     this.listeners.add(listener);
+    for (const gate of this.pending.values()) listener(gate);
     return () => this.listeners.delete(listener);
   }
   emitGate(gate) {
-    for (const listener of this.listeners) listener(gate);
-    return new Promise((resolve) => this.resolvers.set(gate.gate_id, resolve));
+    return new Promise((resolve, reject) => {
+      this.pending.set(gate.gate_id, gate);
+      this.resolvers.set(gate.gate_id, { resolve, reject });
+      for (const listener of this.listeners) listener(gate);
+    });
+  }
+  prepareTerminalization(gateId, proof) {
+    this.prepareCalls.push([gateId, proof]);
+    if (!this.pending.has(gateId)) return false;
+    this.prepared.add(gateId);
+    return true;
+  }
+  clearPreparedTerminalization(gateId) {
+    this.clearPreparedCalls.push(gateId);
+    this.prepared.delete(gateId);
   }
   async resolveGate(response) {
     this.resolveCalls.push(response);
-    const resolve = this.resolvers.get(response.gate_id);
-    if (resolve) {
-      this.resolvers.delete(response.gate_id);
-      resolve({ gate_id: response.gate_id, status: "accepted", answer: response.answer });
+    if (!this.prepared.has(response.gate_id)) {
+      throw new Error("workflow gate has no terminalization proof");
     }
-    return { gate_id: response.gate_id, status: "accepted", answer_hash: "hash" };
+    const gate = this.pending.get(response.gate_id);
+    if (!gate || !schemaAccepts(gate.schema, response.answer)) {
+      return {
+        gate_id: response.gate_id,
+        status: "rejected",
+        answer_hash: "rejected-hash",
+        error: { code: "invalid_workflow_gate_answer" },
+      };
+    }
+    const resolver = this.resolvers.get(response.gate_id);
+    if (resolver) {
+      this.resolvers.delete(response.gate_id);
+      this.pending.delete(response.gate_id);
+      this.prepared.delete(response.gate_id);
+      resolver.resolve(response.answer);
+    }
+    const resolution = {
+      gate_id: response.gate_id,
+      status: "accepted",
+      answer_hash: "hash",
+    };
+    this.completed.set(response.idempotency_key, { response, resolution });
+    await this.beforeReceipt?.(response);
+    return resolution;
+  }
+  lookupCompletedResolution(response) {
+    const completed = this.completed.get(response.idempotency_key);
+    if (!completed) return { kind: "none" };
+    if (
+      completed.response.gate_id === response.gate_id &&
+      completed.response.answer === response.answer
+    ) {
+      if (this.acceptedIncompleteKeys.has(response.idempotency_key)) {
+        return { kind: "accepted_incomplete" };
+      }
+      return { kind: "completed", resolution: completed.resolution };
+    }
+    throw new Error("idempotency_conflict");
+  }
+  async recoverAcceptedGates() {
+    return [];
+  }
+  quarantineGate(gateId) {
+    this.quarantineCalls.push(gateId);
+    this.pending.delete(gateId);
+    this.prepared.delete(gateId);
+    const resolver = this.resolvers.get(gateId);
+    if (resolver) {
+      this.resolvers.delete(gateId);
+      resolver.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
+    }
   }
   listPendingGates() {
-    return [...this.resolvers.keys()].map((gate_id) => ({ gate_id }));
+    return [...this.pending.values()];
   }
 }
+
+const gateResponse = (gateId, answer) => ({
+  gate_id: gateId,
+  answer,
+  idempotency_key: `gjc-remote:${gateId}`,
+});
 
 // #35: a session whose prompt() opens one or more gates and blocks on each until
 // answered, then emits agent_end.
@@ -101,7 +457,9 @@ class GatingAgentSession extends FakeAgentSession {
   constructor(gates) {
     super();
     this.gateEmitter = new FakeGateEmitter();
-    this.gates = Array.isArray(gates) ? gates : [gates];
+    this.gates = (Array.isArray(gates) ? gates : [gates]).map((gate) =>
+      gate?.schema ? gate : sdkAskGate(gate)
+    );
     this.answers = [];
   }
   getWorkflowGateEmitter() {
@@ -113,7 +471,7 @@ class GatingAgentSession extends FakeAgentSession {
     for (const gate of this.gates) {
       this.answers.push(await this.gateEmitter.emitGate(gate));
     }
-    this.emit({ type: "agent_end" });
+    this.emit(terminalEvent());
   }
 }
 
@@ -158,22 +516,7 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   const calls = [];
   const agent = new FakeAgentSession();
   let manager;
-  const activateCalls = [];
-  let cloneForCwdArg;
-  const scopedSettings = {
-    get: (key) => (key === "modelProfile.default" ? "copilot-claude" : undefined),
-  };
   const sdk = {
-    Settings: {
-      async init() {
-        return {
-          async cloneForCwd(cwd) {
-            cloneForCwdArg = cwd;
-            return scopedSettings;
-          },
-        };
-      },
-    },
     SessionManager: {
       create(workDir, sessionDir) {
         calls.push(["manager", workDir, sessionDir]);
@@ -183,12 +526,7 @@ test("createSdkSession uses the canonical workDir and dedicated session director
     },
     async createAgentSession(options) {
       calls.push(["session", options]);
-      // Model reality: the session reads the settings passed in (the clone).
-      agent.settings = options.settings;
       return { session: agent };
-    },
-    async activateModelProfile(options, applyOptions) {
-      activateCalls.push([options, applyOptions]);
     },
   };
 
@@ -203,15 +541,12 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(calls[1][0], "session");
   assert.equal(calls[1][1].cwd, "/workspace");
   assert.strictEqual(calls[1][1].sessionManager, manager);
-  assert.strictEqual(calls[1][1].settings, scopedSettings);
-  assert.equal(cloneForCwdArg, "/workspace");
-  assert.equal(activateCalls.length, 1);
-  const [activateOptions, activateApplyOptions] = activateCalls[0];
-  assert.equal(activateOptions.profileName, "copilot-claude");
-  assert.strictEqual(activateOptions.session, agent);
-  assert.strictEqual(activateOptions.modelRegistry, agent.modelRegistry);
-  assert.strictEqual(activateOptions.settings, agent.settings);
-  assert.deepEqual(activateApplyOptions, { persistDefault: false });
+  assert.equal(
+    Object.hasOwn(calls[1][1], "settings"),
+    false,
+    "SDK 0.16.6 must own and close its Settings.loadForScope instance"
+  );
+  assert.deepEqual(agent.profileCalls, ["copilot-claude"]);
   await session.dispose();
   assert.equal(agent.disposeCalls, 1);
 });
@@ -251,22 +586,15 @@ test("createSdkSession passes the configured container session directory to Sess
   const sessionRoot = resolve("container-sessions");
   let sessionDir;
   const sdk = {
-    Settings: {
-      async init() {
-        return { async cloneForCwd() { return agent.settings; } };
-      },
-    },
     SessionManager: {
       create(workDir, directory) {
         sessionDir = directory;
         return { workDir, sessionDir: directory };
       },
     },
-    async createAgentSession(options) {
-      agent.settings = options.settings;
+    async createAgentSession() {
       return { session: agent };
     },
-    async activateModelProfile() {},
   };
 
   const session = await createSdkSession("/workspace", async () => sdk, { sessionRoot });
@@ -349,7 +677,7 @@ test("prompt completion waits for the final agent_end event", async () => {
   assert.equal(settled, false);
   assert.equal(timers.size, 2);
 
-  agent.emit({ type: "agent_end" });
+  agent.emit(terminalEvent());
   try {
     await waitForImmediate(() => settled, 20);
     const outcome = await observed;
@@ -365,35 +693,153 @@ test("prompt completion waits for the final agent_end event", async () => {
   await session.dispose();
 });
 
-test("agent_end marks a prompt inactive before prompt() settles", async () => {
+test("continuing maintenance agent_end checkpoints do not complete a prompt", async () => {
   const agent = new FakeAgentSession();
-  let releasePrompt;
-  const promptGate = new Promise((resolve) => {
-    releasePrompt = resolve;
-  });
+  const events = [];
   agent.prompt = async (message) => {
     agent.calls.push(["prompt", message]);
-    agent.emit({ type: "agent_end" });
-    if (message === "first") await promptGate;
+    for (const maintenanceOutcome of ["pruned", "compacted", "promoted"]) {
+      agent.emit(terminalEvent({
+        stopReason: "maintenance",
+        maintenanceOutcome,
+      }));
+    }
+  };
+  const session = new SdkSession(agent);
+  let settled = false;
+
+  const prompt = session
+    .send({ type: "prompt", message: "first" }, (event) => events.push(event), 100)
+    .finally(() => {
+      settled = true;
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(settled, false);
+  assert.equal(events.length, 3, "maintenance checkpoints remain visible");
+
+  agent.emit(terminalEvent());
+  await prompt;
+  assert.equal(settled, true);
+  await session.dispose();
+});
+
+test("a prompt rejection after agent_end still fails the invocation", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    agent.emit(terminalEvent({ text: message }));
+    throw Object.assign(new Error("raw provider detail must not escape"), {
+      code: "provider_down",
+    });
   };
   const session = new SdkSession(agent);
 
-  const first = session.send({ type: "prompt", message: "first" }, () => {}, 100);
-  await new Promise((resolve) => setImmediate(resolve));
-  const followUp = session.send(
-    { type: "follow_up", message: "after end" },
-    () => {},
-    100
+  await assert.rejects(
+    session.send({ type: "prompt", message: "first" }, () => {}, 100),
+    (error) => {
+      assert.equal(error.code, "provider_down");
+      assert.match(error.message, /provider_down/);
+      assert.doesNotMatch(error.message, /raw provider detail/);
+      return true;
+    }
   );
-  await new Promise((resolve) => setImmediate(resolve));
+  await session.dispose();
+});
 
-  assert.deepEqual(agent.calls, [["prompt", "first"]]);
-  releasePrompt();
-  await Promise.all([first, followUp]);
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["prompt", "after end"],
-  ]);
+test("a provider-error terminal is readiness evidence but not success", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async () => {
+    agent.emit(
+      terminalEvent({
+        messages: [
+          assistantMessage("", {
+            stopReason: "error",
+            errorMessage: "credential-bearing provider detail",
+            errorStatus: 429,
+          }),
+        ],
+      })
+    );
+  };
+  const session = new SdkSession(agent);
+
+  await assert.rejects(
+    session.send({ type: "prompt", message: "first" }, () => {}, 100),
+    (error) => {
+      assert.equal(error.code, "provider_http_429");
+      assert.doesNotMatch(error.message, /credential-bearing/);
+      return true;
+    }
+  );
+  await session.dispose();
+});
+
+test("agent_failed is retained until its terminal boundary", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async () => {
+    agent.emit({
+      type: "agent_failed",
+      error: {
+        code: "provider_unavailable",
+        message: "Prompt submission failed.",
+      },
+    });
+    agent.emit(
+      terminalEvent({
+        messages: [assistantMessage("", { stopReason: "error" })],
+      })
+    );
+  };
+  const session = new SdkSession(agent);
+
+  await assert.rejects(
+    session.send({ type: "prompt", message: "first" }, () => {}, 100),
+    (error) => {
+      assert.equal(error.code, "provider_unavailable");
+      return true;
+    }
+  );
+  await session.dispose();
+});
+
+test("failed maintenance terminal does not report successful completion", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async () => {
+    agent.emit(
+      terminalEvent({
+        stopReason: "maintenance",
+        maintenanceOutcome: "failed",
+        messages: [assistantMessage("", { stopReason: "error" })],
+      })
+    );
+  };
+  const session = new SdkSession(agent);
+
+  await assert.rejects(
+    session.send({ type: "prompt", message: "first" }, () => {}, 100),
+    (error) => {
+      assert.equal(error.code, "context_maintenance_failed");
+      return true;
+    }
+  );
+  await session.dispose();
+});
+
+test("a terminal without assistant activity fails closed", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = async () => {
+    agent.emit(terminalEvent({ messages: [] }));
+  };
+  const session = new SdkSession(agent);
+
+  await assert.rejects(
+    session.send({ type: "prompt", message: "first" }, () => {}, 100),
+    (error) => {
+      assert.equal(error.code, "prompt_failed");
+      return true;
+    }
+  );
   await session.dispose();
 });
 
@@ -426,7 +872,7 @@ test("SDK adapter serializes commands per session", async () => {
   agent.prompt = async (message) => {
     agent.calls.push(["prompt", message]);
     if (message === "first") await firstGate;
-    agent.emit({ type: "agent_end" });
+    agent.emit(terminalEvent({ text: message }));
   };
   const session = new SdkSession(agent);
 
@@ -444,278 +890,49 @@ test("SDK adapter serializes commands per session", async () => {
   await session.dispose();
 });
 
-test("live controls dispatch during a prompt and keep their event streams open", async () => {
+test("live steer and follow-up fail closed without calling SDK queue hooks", async () => {
   const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
+  let finishPrompt;
+  agent.prompt = (message) => {
     agent.calls.push(["prompt", message]);
-  };
-  agent.steer = async (message) => {
-    agent.calls.push(["steer", message]);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
+    return new Promise((resolve) => {
+      finishPrompt = resolve;
+    });
   };
   const session = new SdkSession(agent);
-  const promptEvents = [];
-  const steerEvents = [];
-  const followUpEvents = [];
-  let promptSettled = false;
-  let steerSettled = false;
-  let followUpSettled = false;
-
-  const prompt = session
-    .send({ type: "prompt", message: "first" }, (event) => promptEvents.push(event), 100)
-    .finally(() => {
-      promptSettled = true;
-    });
-  const steer = session
-    .send({ type: "steer", message: "adjust" }, (event) => steerEvents.push(event), 100)
-    .finally(() => {
-      steerSettled = true;
-    });
-  const followUp = session
-    .send(
-      { type: "follow_up", message: "then continue" },
-      (event) => followUpEvents.push(event),
-      100
-    )
-    .finally(() => {
-      followUpSettled = true;
-    });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(promptSettled, false);
-  assert.equal(steerSettled, false);
-  assert.equal(followUpSettled, false);
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["steer", "adjust"],
-    ["follow_up", "then continue"],
-  ]);
-
-  const currentUpdate = { type: "message_update", value: "controlled" };
-  const currentEnd = { type: "agent_end" };
-  agent.emit(currentUpdate);
-  agent.emit(currentEnd);
-  await Promise.all([prompt, steer]);
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(followUpSettled, false);
-
-  const followUpUpdate = { type: "message_update", value: "follow-up" };
-  const followUpEnd = { type: "agent_end" };
-  agent.emit(followUpUpdate);
-  agent.emit(followUpEnd);
-  await followUp;
-
-  assert.deepEqual(promptEvents, [currentUpdate, currentEnd]);
-  assert.deepEqual(steerEvents, [currentUpdate, currentEnd]);
-  assert.deepEqual(followUpEvents, [
-    currentUpdate,
-    currentEnd,
-    followUpUpdate,
-    followUpEnd,
-  ]);
-  await session.dispose();
-});
-
-test("controls retain SDK semantics during an active follow-up run", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.steer = async (message) => {
-    agent.calls.push(["steer", message]);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-  };
-  const session = new SdkSession(agent);
-  let secondSettled = false;
-
-  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
-  const first = session.send({ type: "follow_up", message: "first" }, () => {}, 100);
-  await new Promise((resolve) => setImmediate(resolve));
-
-  agent.emit({ type: "agent_end" });
-  await prompt;
-
-  const steer = session.send({ type: "steer", message: "adjust" }, () => {}, 100);
-  const second = session
-    .send({ type: "follow_up", message: "second" }, () => {}, 100)
-    .finally(() => {
-      secondSettled = true;
-    });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(agent.calls, [
-    ["prompt", "initial"],
-    ["follow_up", "first"],
-    ["steer", "adjust"],
-    ["follow_up", "second"],
-  ]);
-
-  agent.emit({ type: "agent_end" });
-  await Promise.all([first, steer]);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(secondSettled, false);
-
-  agent.emit({ type: "agent_end" });
-  await second;
-  assert.equal(secondSettled, true);
-  await session.dispose();
-});
-
-test("queued commands wait for an active follow-up run to complete", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-  };
-  const session = new SdkSession(agent);
-
-  const prompt = session.send({ type: "prompt", message: "first" }, () => {}, 100);
-  const followUp = session.send(
-    { type: "follow_up", message: "continue" },
-    () => {},
-    100
-  );
-  const modelSwitch = session.send(
-    { type: "set_model", provider: "provider-a", modelId: "model-a" },
+  const prompt = session.send(
+    { type: "prompt", message: "active" },
     () => {},
     100
   );
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["follow_up", "continue"],
-  ]);
+  for (const type of ["steer", "follow_up"]) {
+    await assert.rejects(
+      session.send({ type, message: "unsupported live control" }, () => {}, 100),
+      (error) => {
+        assert.equal(error.code, "SDK_LIVE_CONTROL_UNSUPPORTED");
+        assert.match(error.message, /supported queued-input ownership contract/);
+        return true;
+      }
+    );
+  }
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+  assert.equal(session.closed, false);
 
-  agent.emit({ type: "agent_end" });
+  agent.emit(terminalEvent());
+  finishPrompt();
   await prompt;
-  await new Promise((resolve) => setImmediate(resolve));
+  agent.prompt = FakeAgentSession.prototype.prompt.bind(agent);
+  await session.send(
+    { type: "follow_up", message: "idle retry" },
+    () => {},
+    100
+  );
   assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["follow_up", "continue"],
+    ["prompt", "active"],
+    ["prompt", "idle retry"],
   ]);
-
-  agent.emit({ type: "agent_end" });
-  await Promise.all([followUp, modelSwitch]);
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["follow_up", "continue"],
-    ["set_model", agent.models[0]],
-  ]);
-  await session.dispose();
-});
-
-test("multiple active follow-ups wait for their own queued run boundaries", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-  };
-  const session = new SdkSession(agent);
-  let firstSettled = false;
-  let secondSettled = false;
-
-  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
-  const first = session
-    .send({ type: "follow_up", message: "first" }, () => {}, 100)
-    .finally(() => {
-      firstSettled = true;
-    });
-  const second = session
-    .send({ type: "follow_up", message: "second" }, () => {}, 100)
-    .finally(() => {
-      secondSettled = true;
-    });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  agent.emit({ type: "agent_end" });
-  await prompt;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(firstSettled, false);
-  assert.equal(secondSettled, false);
-
-  agent.emit({ type: "agent_end" });
-  await first;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(firstSettled, true);
-  assert.equal(secondSettled, false);
-
-  agent.emit({ type: "agent_end" });
-  await second;
-  assert.equal(secondSettled, true);
-  await session.dispose();
-});
-
-test("rejected live follow-ups do not reserve completion boundaries", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  let followUpCalls = 0;
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-    followUpCalls += 1;
-    if (followUpCalls === 1) throw new Error("queue rejected");
-  };
-  const session = new SdkSession(agent);
-  let secondSettled = false;
-
-  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
-  const first = session.send({ type: "follow_up", message: "rejected" }, () => {}, 100);
-  const firstRejection = assert.rejects(first, /queue rejected/);
-  const second = session
-    .send({ type: "follow_up", message: "accepted" }, () => {}, 100)
-    .finally(() => {
-      secondSettled = true;
-    });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  agent.emit({ type: "agent_end" });
-  await Promise.all([prompt, firstRejection]);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(secondSettled, false);
-
-  agent.emit({ type: "agent_end" });
-  await second;
-  assert.equal(secondSettled, true);
-  await session.dispose();
-});
-
-test("active follow-up subscribes before a queued agent_end callback", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-  };
-  const session = new SdkSession(agent);
-  let followUpSettled = false;
-
-  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
-  const followUp = session
-    .send({ type: "follow_up", message: "continue" }, () => {}, 100)
-    .finally(() => {
-      followUpSettled = true;
-    });
-  queueMicrotask(() => agent.emit({ type: "agent_end" }));
-
-  await prompt;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(followUpSettled, false);
-
-  agent.emit({ type: "agent_end" });
-  await followUp;
-  assert.equal(followUpSettled, true);
   await session.dispose();
 });
 
@@ -733,7 +950,7 @@ test("idle follow-up starts a prompt run and keeps its event stream", async () =
   assert.deepEqual(agent.calls, [["prompt", "continue"]]);
   assert.deepEqual(events, [
     { type: "message_update", value: "continue" },
-    { type: "agent_end" },
+    terminalEvent({ text: "continue" }),
   ]);
   await session.dispose();
 });
@@ -781,7 +998,7 @@ test("multiple idle controls remain FIFO prompt runs", async () => {
   agent.prompt = async (message) => {
     agent.calls.push(["prompt", message]);
     if (message === "first") await firstGate;
-    agent.emit({ type: "agent_end" });
+    agent.emit(terminalEvent({ text: message }));
   };
   const session = new SdkSession(agent);
 
@@ -847,7 +1064,7 @@ test("prompt idle timer resets on streamed activity and completes past the idle 
     await delay(25);
     agent.emit({ type: "message_update", value: "c" });
     await delay(25);
-    agent.emit({ type: "agent_end" });
+    agent.emit(terminalEvent());
   };
   const session = new SdkSession(agent, { idleTimeoutMs: 60, hardCapMs: 5000 });
 
@@ -967,59 +1184,31 @@ test("adversarial: non-positive/NaN/undefined idle and hard-cap config fall back
   }
 });
 
-test("concurrent live-control sibling settles boundedly when the other hard-caps and disposes", async () => {
+
+test("dispose cancels adapter waiters without relying on an SDK terminal", async () => {
   const agent = new FakeAgentSession();
+  const timers = createManualTimeouts();
   agent.prompt = () => new Promise(() => {});
-  agent.steer = () => new Promise(() => {});
-  const session = new SdkSession(agent, { idleTimeoutMs: 5000, hardCapMs: 30 });
-
-  const prompt = session.send({ type: "prompt", message: "hard-cap me" }, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  const steer = session.send({ type: "steer", message: "sibling" }, () => {}, 10);
-
-  const guard = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error("test guard: settlement hung")), 2000).unref?.();
-  });
-
-  const results = await Promise.race([
-    Promise.allSettled([prompt, steer]),
-    guard,
-  ]);
-
-  assert.equal(results[0].status, "rejected");
-  assert.match(results[0].reason.message, /exceeded absolute hard-cap/);
-  assert.equal(results[1].status, "rejected");
-  assert.equal(session.closed, true);
-  await session.dispose();
-});
-test("dispose ignores prior control failures after underlying cleanup succeeds", async () => {
-  const agent = new FakeAgentSession();
-  let rejectSteer;
-  const steerGate = new Promise((_, reject) => {
-    rejectSteer = reject;
-  });
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.steer = async (message) => {
-    agent.calls.push(["steer", message]);
-    await steerGate;
-  };
   agent.dispose = async () => {
     agent.disposeCalls += 1;
-    rejectSteer(new Error("control failed"));
-    agent.emit({ type: "agent_end" });
   };
-  const session = new SdkSession(agent);
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 100,
+    hardCapMs: 1_000,
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
+  });
 
   const prompt = session.send({ type: "prompt", message: "active" }, () => {}, 100);
   await new Promise((resolve) => setImmediate(resolve));
-  const steer = session.send({ type: "steer", message: "adjust" }, () => {}, 100);
-  const steerFailure = assert.rejects(steer, /control failed/);
-  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(timers.size, 2);
 
+  const resultsPromise = Promise.allSettled([prompt]);
   await session.dispose();
-  await Promise.all([prompt, steerFailure]);
+  const results = await resultsPromise;
+  assert.equal(results[0].status, "rejected");
+  assert.match(results[0].reason.message, /disposed/);
+  assert.equal(timers.size, 0);
   assert.equal(agent.disposeCalls, 1);
 });
 
@@ -1043,16 +1232,17 @@ test("timeout-triggered disposal rejections are handled immediately", async () =
 function activationHarness() {
   const activateCalls = [];
   const settings = { get: () => undefined };
-  const session = { modelRegistry: { id: "registry" }, settings };
+  const session = {
+    settings,
+    async activateModelProfileForControl(profileName) {
+      activateCalls.push(profileName);
+      return true;
+    },
+  };
   return {
     activateCalls,
     session,
     settings,
-    sdk: {
-      async activateModelProfile(options, applyOptions) {
-        activateCalls.push([options, applyOptions]);
-      },
-    },
   };
 }
 
@@ -1061,15 +1251,9 @@ test("applyConfiguredModelProfile activates the host-configured profile in-memor
   h.settings.get = (key) =>
     key === "modelProfile.default" ? "copilot-claude" : undefined;
 
-  await applyConfiguredModelProfile(h.session, h.sdk);
+  await applyConfiguredModelProfile(h.session);
 
-  assert.equal(h.activateCalls.length, 1);
-  const [options, applyOptions] = h.activateCalls[0];
-  assert.equal(options.profileName, "copilot-claude");
-  assert.strictEqual(options.session, h.session);
-  assert.strictEqual(options.modelRegistry, h.session.modelRegistry);
-  assert.strictEqual(options.settings, h.settings);
-  assert.deepEqual(applyOptions, { persistDefault: false });
+  assert.deepEqual(h.activateCalls, ["copilot-claude"]);
 });
 
 test("applyConfiguredModelProfile lets GJC_MODEL_PROFILE override the configured profile", async () => {
@@ -1078,14 +1262,14 @@ test("applyConfiguredModelProfile lets GJC_MODEL_PROFILE override the configured
   const previous = process.env.GJC_MODEL_PROFILE;
   process.env.GJC_MODEL_PROFILE = "  custom-profile  ";
   try {
-    await applyConfiguredModelProfile(h.session, h.sdk);
+    await applyConfiguredModelProfile(h.session);
   } finally {
     if (previous === undefined) delete process.env.GJC_MODEL_PROFILE;
     else process.env.GJC_MODEL_PROFILE = previous;
   }
 
   assert.equal(h.activateCalls.length, 1);
-  assert.equal(h.activateCalls[0][0].profileName, "custom-profile");
+  assert.equal(h.activateCalls[0], "custom-profile");
 });
 
 test("applyConfiguredModelProfile skips activation and warns when no profile is configured", async () => {
@@ -1097,7 +1281,7 @@ test("applyConfiguredModelProfile skips activation and warns when no profile is 
   const warnings = [];
   console.warn = (...args) => warnings.push(args.join(" "));
   try {
-    await applyConfiguredModelProfile(h.session, h.sdk);
+    await applyConfiguredModelProfile(h.session);
   } finally {
     console.warn = originalWarn;
     if (previous !== undefined) process.env.GJC_MODEL_PROFILE = previous;
@@ -1117,7 +1301,7 @@ test("applyConfiguredModelProfile warns distinctly when modelProfile.default is 
   const warnings = [];
   console.warn = (...args) => warnings.push(args.join(" "));
   try {
-    await applyConfiguredModelProfile(h.session, h.sdk);
+    await applyConfiguredModelProfile(h.session);
   } finally {
     console.warn = originalWarn;
     if (previous !== undefined) process.env.GJC_MODEL_PROFILE = previous;
@@ -1136,25 +1320,25 @@ test("applyConfiguredModelProfile ignores a whitespace-only GJC_MODEL_PROFILE an
   const previous = process.env.GJC_MODEL_PROFILE;
   process.env.GJC_MODEL_PROFILE = "   ";
   try {
-    await applyConfiguredModelProfile(h.session, h.sdk);
+    await applyConfiguredModelProfile(h.session);
   } finally {
     if (previous === undefined) delete process.env.GJC_MODEL_PROFILE;
     else process.env.GJC_MODEL_PROFILE = previous;
   }
 
   assert.equal(h.activateCalls.length, 1);
-  assert.equal(h.activateCalls[0][0].profileName, "copilot-claude");
+  assert.equal(h.activateCalls[0], "copilot-claude");
 });
 
 test("applyConfiguredModelProfile surfaces activation failures loudly", async () => {
   const h = activationHarness();
   h.settings.get = () => "copilot-claude";
-  h.sdk.activateModelProfile = async () => {
+  h.session.activateModelProfileForControl = async () => {
     throw new Error("missing credentials for provider github-copilot");
   };
 
   await assert.rejects(
-    applyConfiguredModelProfile(h.session, h.sdk),
+    applyConfiguredModelProfile(h.session),
     (error) => {
       assert.match(error.message, /failed to activate model profile "copilot-claude"/);
       assert.match(error.message, /missing credentials for provider github-copilot/);
@@ -1165,19 +1349,13 @@ test("applyConfiguredModelProfile surfaces activation failures loudly", async ()
 });
 test("createSdkSession disposes the raw session when profile activation fails", async () => {
   const agent = new FakeAgentSession();
+  agent.activateModelProfileForControl = async () => {
+    throw new Error("missing credentials for provider github-copilot");
+  };
   const sdk = {
-    Settings: {
-      async init() {
-        return { async cloneForCwd() { return agent.settings; } };
-      },
-    },
     SessionManager: { create: (workDir, sessionDir) => ({ workDir, sessionDir }) },
-    async createAgentSession(options) {
-      agent.settings = options.settings ?? agent.settings;
+    async createAgentSession() {
       return { session: agent };
-    },
-    async activateModelProfile() {
-      throw new Error("missing credentials for provider github-copilot");
     },
   };
 
@@ -1220,8 +1398,8 @@ test("gate emission produces a gate_request event and resolves on a label answer
   assert.equal(gateReq.kind, "question");
   assert.equal(gateReq.prompt, "Pick a fruit");
   assert.deepEqual(gateReq.choices, [
-    { value: "a", label: "Apple" },
-    { value: "b", label: "Banana" },
+    { value: "Apple", label: "Apple" },
+    { value: "Banana", label: "Banana" },
   ]);
   assert.equal(session.pendingGates.size, 1);
 
@@ -1232,12 +1410,15 @@ test("gate emission produces a gate_request event and resolves on a label answer
   assert.equal(result.ok, true);
   await done;
 
-  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g1", answer: "b" }]);
+  assert.deepEqual(agent.gateEmitter.prepareCalls, [["g1", "not_published"]]);
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    gateResponse("g1", { selected: ["Banana"] }),
+  ]);
   assert.equal(session.pendingGates.size, 0);
   await session.dispose();
 });
 
-test("gate answer maps a 1-based index to the option value", async () => {
+test("gate answer maps a 1-based index to the Ask selected-object schema", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g2",
     kind: "question",
@@ -1257,11 +1438,13 @@ test("gate answer maps a 1-based index to the option value", async () => {
 
   await session.answerGate("g2", "2");
   await done;
-  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g2", answer: "y" }]);
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    gateResponse("g2", { selected: ["Second"] }),
+  ]);
   await session.dispose();
 });
 
-test("free-text gate (no options) passes the answer through verbatim", async () => {
+test("free text is encoded as the Ask other/custom object", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g3",
     kind: "question",
@@ -1278,58 +1461,504 @@ test("free-text gate (no options) passes the answer through verbatim", async () 
   await session.answerGate("g3", "a long free-form answer");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
-    { gate_id: "g3", answer: "a long free-form answer" },
+    gateResponse("g3", {
+      selected: [],
+      other: true,
+      custom: "a long free-form answer",
+    }),
   ]);
   await session.dispose();
 });
 
-test("a workflow gate suspends idle timers for every active run", async () => {
-  class MultiRunGatingAgent extends GatingAgentSession {
-    constructor() {
-      super({ gate_id: "g-all", kind: "question", context: { prompt: "Continue" } });
-      this.allowGate = new Promise((resolve) => {
-        this.releaseGate = resolve;
-      });
-      this.steerBlock = new Promise(() => {});
-    }
-    async prompt(message) {
-      this.calls.push(["prompt", message]);
-      await this.allowGate;
-      this.answers.push(await this.gateEmitter.emitGate(this.gates[0]));
-      this.emit({ type: "agent_end" });
-    }
-    async steer(message) {
-      this.calls.push(["steer", message]);
-      await this.steerBlock;
-    }
-  }
+test("structured Ask answers preserve clarification and explicit custom semantics", async () => {
+  for (const { gateId, answer, expected } of [
+    {
+      gateId: "g-clarify",
+      answer:
+        '{"action":"clarify","question":"What does the recommended choice change?"}',
+      expected: {
+        action: "clarify",
+        question: "What does the recommended choice change?",
+      },
+    },
+    {
+      gateId: "g-custom",
+      answer:
+        '{"selected":[],"other":true,"custom":"Apple","action":"answer"}',
+      expected: {
+        selected: [],
+        other: true,
+        custom: "Apple",
+        action: "answer",
+      },
+    },
+  ]) {
+    const agent = new GatingAgentSession({
+      gate_id: gateId,
+      context: { prompt: "Pick or explain" },
+      options: [{ label: "Apple" }],
+    });
+    const session = new SdkSession(agent, {
+      idleTimeoutMs: 5_000,
+      hardCapMs: 10_000,
+    });
+    const done = session.send({ type: "prompt", message: "hi" }, () => {});
+    await waitForImmediate(() => session.pendingGates.has(gateId));
 
-  const agent = new MultiRunGatingAgent();
+    const result = await session.answerGate(gateId, answer);
+    assert.equal(result.ok, true);
+    await done;
+    assert.deepEqual(agent.gateEmitter.resolveCalls, [
+      gateResponse(gateId, expected),
+    ]);
+    await session.dispose();
+  }
+});
+
+test("approval answers preserve denial and require comments for changes", async () => {
+  const rejectAgent = new GatingAgentSession(
+    sdkDecisionGate({
+      gate_id: "g-approval-reject",
+      kind: "approval",
+      context: { title: "Approve the plan?" },
+    })
+  );
+  const rejectSession = new SdkSession(rejectAgent);
+  const rejectDone = rejectSession.send(
+    { type: "prompt", message: "review" },
+    () => {}
+  );
+  await waitForImmediate(() =>
+    rejectSession.pendingGates.has("g-approval-reject")
+  );
+  assert.equal(
+    (await rejectSession.answerGate("g-approval-reject", "reject")).ok,
+    true
+  );
+  await rejectDone;
+  assert.deepEqual(rejectAgent.gateEmitter.resolveCalls, [
+    gateResponse("g-approval-reject", { decision: "reject" }),
+  ]);
+  await rejectSession.dispose();
+
+  const changesAgent = new GatingAgentSession(
+    sdkDecisionGate({
+      gate_id: "g-approval-changes",
+      kind: "approval",
+      context: { title: "Approve the plan?" },
+    })
+  );
+  const changesSession = new SdkSession(changesAgent);
+  const changesDone = changesSession.send(
+    { type: "prompt", message: "review" },
+    () => {}
+  );
+  await waitForImmediate(() =>
+    changesSession.pendingGates.has("g-approval-changes")
+  );
+
+  const unsupported = await changesSession.answerGate(
+    "g-approval-changes",
+    "request-changes"
+  );
+  assert.deepEqual(unsupported, {
+    ok: false,
+    error: "request-changes requires structured comments",
+  });
+  assert.deepEqual(changesAgent.gateEmitter.resolveCalls, []);
+
+  const accepted = await changesSession.answerGate(
+    "g-approval-changes",
+    '{"decision":"request-changes","comments":"Cover the failure branch."}'
+  );
+  assert.equal(accepted.ok, true);
+  await changesDone;
+  assert.deepEqual(changesAgent.gateEmitter.resolveCalls, [
+    gateResponse("g-approval-changes", {
+      decision: "request-changes",
+      comments: "Cover the failure branch.",
+    }),
+  ]);
+  await changesSession.dispose();
+});
+
+test("execution decline is encoded as an explicit decision object", async () => {
+  const agent = new GatingAgentSession(
+    sdkDecisionGate({
+      gate_id: "g-execution-decline",
+      kind: "execution",
+      context: { title: "Approve execution?" },
+    })
+  );
+  const session = new SdkSession(agent);
+  const done = session.send({ type: "prompt", message: "execute" }, () => {});
+  await waitForImmediate(() =>
+    session.pendingGates.has("g-execution-decline")
+  );
+
+  const result = await session.answerGate("g-execution-decline", "2");
+  assert.equal(result.ok, true);
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    gateResponse("g-execution-decline", { decision: "decline" }),
+  ]);
+  await session.dispose();
+});
+
+test("unsupported structured answer shapes are rejected before SDK resolution", async () => {
+  const agent = new GatingAgentSession(
+    sdkDecisionGate({
+      gate_id: "g-unsupported-answer",
+      kind: "execution",
+    })
+  );
+  const session = new SdkSession(agent);
+  const done = session.send({ type: "prompt", message: "execute" }, () => {});
+  await waitForImmediate(() =>
+    session.pendingGates.has("g-unsupported-answer")
+  );
+
+  const rejected = await session.answerGate(
+    "g-unsupported-answer",
+    '{"decision":"approve","extra":true}'
+  );
+  assert.deepEqual(rejected, {
+    ok: false,
+    error: "unsupported gate answer shape",
+  });
+  assert.deepEqual(agent.gateEmitter.resolveCalls, []);
+
+  assert.equal(
+    (await session.answerGate("g-unsupported-answer", "approve")).ok,
+    true
+  );
+  await done;
+  await session.dispose();
+});
+
+test("a rejected SDK gate answer remains pending for a valid retry", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-retry",
+    kind: "question",
+    context: { prompt: "Try again" },
+    customMaxLength: 3,
+  });
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+  });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await waitForImmediate(() => session.pendingGates.has("g-retry"));
+
+  const rejected = await session.answerGate(
+    "g-retry",
+    '{"selected":[],"other":true,"custom":"invalid"}'
+  );
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.resolution.status, "rejected");
+  assert.equal(session.pendingGates.has("g-retry"), true);
+  assert.deepEqual(agent.gateEmitter.clearPreparedCalls, ["g-retry"]);
+
+  const accepted = await session.answerGate("g-retry", "ok");
+  assert.equal(accepted.ok, true);
+  await done;
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    gateResponse("g-retry", {
+      selected: [],
+      other: true,
+      custom: "invalid",
+    }),
+    gateResponse("g-retry", {
+      selected: [],
+      other: true,
+      custom: "ok",
+    }),
+  ]);
+  await session.dispose();
+});
+
+test("a lost resolveGate response reconciles a durably completed answer", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-reconcile",
+    kind: "question",
+    context: { prompt: "Continue?" },
+  });
+  const resolveGate = agent.gateEmitter.resolveGate.bind(agent.gateEmitter);
+  agent.gateEmitter.resolveGate = async (response) => {
+    await resolveGate(response);
+    throw new Error("control response lost");
+  };
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+  });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await waitForImmediate(() => session.pendingGates.has("g-reconcile"));
+
+  const answered = await session.answerGate("g-reconcile", "yes");
+  assert.equal(answered.ok, true);
+  assert.equal(answered.resolution.status, "accepted");
+  assert.equal(session.pendingGates.size, 0);
+  await done;
+  await session.dispose();
+});
+
+test("a proven successor gate is admitted while predecessor receipt is pending", async () => {
+  const agent = new GatingAgentSession([
+    sdkAskGate({
+      gate_id: "g-successor-1",
+      context: { prompt: "First question" },
+      options: [{ label: "Continue" }],
+    }),
+    sdkAskGate({
+      gate_id: "g-successor-2",
+      context: { prompt: "Second question" },
+      options: [{ label: "Finish" }],
+    }),
+  ]);
+  let releaseFirstReceipt;
+  const firstReceiptBarrier = new Promise((resolve) => {
+    releaseFirstReceipt = resolve;
+  });
+  agent.gateEmitter.beforeReceipt = async (response) => {
+    if (response.gate_id === "g-successor-1") await firstReceiptBarrier;
+  };
   const timers = createManualTimeouts();
   const session = new SdkSession(agent, {
-    idleTimeoutMs: 25,
-    hardCapMs: 5_000,
-    gateAnswerWindowMs: 1_000,
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 100,
     setTimeoutFn: timers.setTimeout,
     clearTimeoutFn: timers.clearTimeout,
   });
-  const prompt = session.send({ type: "prompt", message: "first" }, () => {});
-  const steer = session.send({ type: "steer", message: "adjust" }, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  agent.releaseGate();
-  await waitForImmediate(() => session.pendingGates.size === 1);
-  const lateSteer = session.send({ type: "steer", message: "late-adjust" }, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(session.pendingGates.size, 1);
+  const events = [];
+  const done = session.send(
+    { type: "prompt", message: "ask twice" },
+    (event) => events.push(event)
+  );
+  await waitForImmediate(() => session.pendingGates.has("g-successor-1"));
 
-  timers.advance(75);
-  assert.equal(session.closed, false);
-  await session.answerGate("g-all", "ok");
-  timers.advance(5_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  timers.advance(90);
+  const firstAnswer = session.answerGate("g-successor-1", "Continue");
+  await waitForImmediate(() => session.pendingGates.has("g-successor-2"));
+  timers.advance(20);
+  assert.equal(session.closed, false, "the successor receives its own gate window");
+  assert.equal(session.pendingGates.has("g-successor-1"), false);
+  assert.deepEqual(agent.gateEmitter.quarantineCalls, []);
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "gate_request" && event.gateId === "g-successor-2"
+    ),
+    true
+  );
+
+  releaseFirstReceipt();
+  assert.equal((await firstAnswer).ok, true);
+  assert.equal(
+    (await session.answerGate("g-successor-2", "Finish")).ok,
+    true
+  );
+  await done;
+  assert.deepEqual(agent.gateEmitter.quarantineCalls, []);
   await session.dispose();
-  await Promise.allSettled([prompt, steer, lateSteer]);
 });
+
+test("an accepted-incomplete predecessor retains ownership until completed proof", async () => {
+  const agent = new GatingAgentSession([
+    sdkAskGate({
+      gate_id: "g-incomplete-1",
+      context: { prompt: "First question" },
+      options: [{ label: "Continue" }],
+    }),
+    sdkAskGate({
+      gate_id: "g-incomplete-2",
+      context: { prompt: "Second question" },
+      options: [{ label: "Finish" }],
+    }),
+  ]);
+  const key = "gjc-remote:g-incomplete-1";
+  agent.gateEmitter.acceptedIncompleteKeys.add(key);
+  let releaseReceipt;
+  const receiptBarrier = new Promise((resolve) => {
+    releaseReceipt = resolve;
+  });
+  agent.gateEmitter.beforeReceipt = async (response) => {
+    if (response.gate_id === "g-incomplete-1") await receiptBarrier;
+  };
+  const events = [];
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+    gateAnswerWindowMs: 5_000,
+  });
+  const done = session.send(
+    { type: "prompt", message: "ask twice" },
+    (event) => events.push(event)
+  );
+  await waitForImmediate(() => session.pendingGates.has("g-incomplete-1"));
+
+  const firstAnswer = session.answerGate("g-incomplete-1", "Continue");
+  await waitForImmediate(
+    () => session.deferredGateCandidate?.gate?.gate_id === "g-incomplete-2"
+  );
+  assert.strictEqual(
+    session.pendingGates.get("g-incomplete-1").response,
+    agent.gateEmitter.resolveCalls[0]
+  );
+  assert.equal(session.pendingGates.has("g-incomplete-1"), true);
+  assert.equal(session.pendingGates.has("g-incomplete-2"), false);
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "gate_request" && event.gateId === "g-incomplete-2"
+    ),
+    false
+  );
+  assert.deepEqual(agent.gateEmitter.quarantineCalls, []);
+
+  agent.gateEmitter.acceptedIncompleteKeys.delete(key);
+  releaseReceipt();
+  assert.equal((await firstAnswer).ok, true);
+  await waitForImmediate(() => session.pendingGates.has("g-incomplete-2"));
+  assert.equal(session.pendingGates.has("g-incomplete-1"), false);
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "gate_request" && event.gateId === "g-incomplete-2"
+    ),
+    true
+  );
+
+  assert.equal(
+    (await session.answerGate("g-incomplete-2", "Finish")).ok,
+    true
+  );
+  await done;
+  await session.dispose();
+});
+
+test("a deferred accepted-incomplete candidate is bounded by the gate window", async () => {
+  const agent = new GatingAgentSession([
+    sdkAskGate({
+      gate_id: "g-bounded-1",
+      context: { prompt: "First question" },
+      options: [{ label: "Continue" }],
+    }),
+    sdkAskGate({
+      gate_id: "g-bounded-2",
+      context: { prompt: "Second question" },
+      options: [{ label: "Finish" }],
+    }),
+  ]);
+  agent.gateEmitter.acceptedIncompleteKeys.add("gjc-remote:g-bounded-1");
+  agent.gateEmitter.beforeReceipt = () => new Promise(() => {});
+  const timers = createManualTimeouts();
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 1_000,
+    hardCapMs: 100,
+    gateAnswerWindowMs: 40,
+    setTimeoutFn: timers.setTimeout,
+    clearTimeoutFn: timers.clearTimeout,
+  });
+  const done = session.send(
+    { type: "prompt", message: "ask twice" },
+    () => {}
+  );
+  const doneResult = Promise.allSettled([done]);
+  await waitForImmediate(() => session.pendingGates.has("g-bounded-1"));
+  const answer = session.answerGate("g-bounded-1", "Continue");
+  await waitForImmediate(
+    () => session.deferredGateCandidate?.gate?.gate_id === "g-bounded-2"
+  );
+
+  timers.advance(40);
+  const [promptResult] = await doneResult;
+  assert.equal(promptResult.status, "rejected");
+  assert.match(promptResult.reason.message, /gate answer window expired/);
+  assert.deepEqual(await answer, {
+    ok: false,
+    error: "session is closed",
+  });
+  assert.equal(session.deferredGateCandidate, undefined);
+  assert.equal(
+    agent.gateEmitter.quarantineCalls.includes("g-bounded-2"),
+    true
+  );
+  await session.dispose();
+});
+
+test("dispose settles an adapter-owned gate receipt waiter", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-dispose-receipt",
+    context: { prompt: "Continue?" },
+    options: [{ label: "Continue" }],
+  });
+  agent.gateEmitter.beforeReceipt = () => new Promise(() => {});
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+  });
+  const done = session.send({ type: "prompt", message: "hi" }, () => {});
+  await waitForImmediate(() =>
+    session.pendingGates.has("g-dispose-receipt")
+  );
+
+  const answer = session.answerGate("g-dispose-receipt", "Continue");
+  const answerResult = answer.then(
+    (result) => result,
+    (error) => ({ ok: false, error: error.message })
+  );
+  await waitForImmediate(() => agent.gateEmitter.resolveCalls.length === 1);
+
+  await session.dispose();
+  assert.deepEqual(await answerResult, {
+    ok: false,
+    error: "session is closed",
+  });
+  await Promise.allSettled([done]);
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("onGateEmitted replay is attributed to the run before subscription", async () => {
+  const agent = new FakeAgentSession();
+  const emitter = new FakeGateEmitter();
+  const gate = sdkAskGate({
+    gate_id: "g-replay",
+    kind: "question",
+    context: { prompt: "Recovered question" },
+  });
+  const gateAnswer = emitter.emitGate(gate);
+  agent.getWorkflowGateEmitter = () => emitter;
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    await gateAnswer;
+    agent.emit(terminalEvent());
+  };
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 5_000,
+    hardCapMs: 10_000,
+  });
+  const events = [];
+
+  const done = session.send(
+    { type: "prompt", message: "resume" },
+    (event) => events.push(event)
+  );
+  await waitForImmediate(() => session.pendingGates.has("g-replay"));
+  assert.equal(
+    events.some((event) => event.type === "gate_request" && event.gateId === "g-replay"),
+    true
+  );
+  assert.deepEqual(emitter.quarantineCalls, []);
+
+  const answered = await session.answerGate("g-replay", "continue");
+  assert.equal(answered.ok, true);
+  await done;
+  await session.dispose();
+});
+
+
 test("gate-answer window expiry disposes the session with a distinct error", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g4",
@@ -1354,7 +1983,7 @@ test("a failed run removes its pending workflow gate", async () => {
   class FailingGatingAgent extends GatingAgentSession {
     async prompt(message) {
       this.calls.push(["prompt", message]);
-      void this.gateEmitter.emitGate(this.gates[0]);
+      void this.gateEmitter.emitGate(this.gates[0]).catch(() => {});
       throw new Error("SDK prompt failed");
     }
   }
@@ -1367,7 +1996,7 @@ test("a failed run removes its pending workflow gate", async () => {
   const session = new SdkSession(agent);
   await assert.rejects(
     session.send({ type: "prompt", message: "first" }, () => {}),
-    /SDK prompt failed/
+    /prompt_failed/
   );
   assert.equal(session.pendingGates.size, 0);
   await session.dispose();
@@ -1402,12 +2031,14 @@ test("a concurrent second gate is rejected without overwriting the first resolve
   // The first gate is untouched; only one gate is tracked.
   assert.equal(session.pendingGates.size, 1);
   assert.ok(session.pendingGates.has("g5"));
-  // The newcomer was best-effort rejected (answer: null).
-  assert.ok(emitter.resolveCalls.some((r) => r.gate_id === "g5b" && r.answer === null));
+  // The newcomer was fenced through the SDK's explicit quarantine operation.
+  assert.deepEqual(emitter.quarantineCalls, ["g5b"]);
 
   await session.answerGate("g5", "A");
   await done;
-  assert.ok(emitter.resolveCalls.some((r) => r.gate_id === "g5" && r.answer === "a"));
+  assert.deepEqual(emitter.resolveCalls, [
+    gateResponse("g5", { selected: ["A"] }),
+  ]);
   await session.dispose();
 });
 
@@ -1442,7 +2073,7 @@ test("adversarial: the absolute hard-cap still fires while a gate is suspended, 
       // Silent stretch after the gate resolves, long enough to blow the hard-cap
       // even though the idle timer was freshly re-armed by resumeAfterGate.
       await gateDelay(200);
-      this.emit({ type: "agent_end" });
+      this.emit(terminalEvent());
     }
   }
   const agent = new SlowResumeAgentSession({
@@ -1494,12 +2125,8 @@ test("adversarial: answering the same gate twice is a safe no-op the second time
 });
 
 test("adversarial: an answer submitted after the gate-answer window already expired must be a safe no-op", async () => {
-  // #35 spec requires a post-expiry/disposal answer to be a safe no-op. The
-  // private disposal path (idle/hard-cap/gate-window rejection inside
-  // #withStreamingTimeout) only disposes the underlying session; it does NOT
-  // clear `pendingGates` (only the public dispose() does that). So a late
-  // answerGate() call after a gate-window expiry still finds the stale entry
-  // and "succeeds" against an abandoned gate emitter instead of no-op'ing.
+  // #35 spec requires the timeout close path to fence the continuation and make
+  // a post-expiry answer a no-op before public dispose() is called.
   const agent = new GatingAgentSession({
     gate_id: "g-late",
     kind: "question",
@@ -1582,7 +2209,7 @@ test("adversarial: a concurrent gate rejection leaves pendingGates empty once th
   await session.dispose();
 });
 
-test("adversarial: mapAnswerToGate — a numeric-looking label wins over positional index parsing", async () => {
+test("adversarial: a numeric-looking Ask label wins over positional index parsing", async () => {
   // options[0].label is "2"; an index-based reading of answer "2" would pick
   // options[1] instead. Label matching must run first and win.
   const agent = new GatingAgentSession({
@@ -1601,12 +2228,12 @@ test("adversarial: mapAnswerToGate — a numeric-looking label wins over positio
   await session.answerGate("g-numlabel", "2");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
-    { gate_id: "g-numlabel", answer: "label-two" },
+    gateResponse("g-numlabel", { selected: ["2"] }),
   ]);
   await session.dispose();
 });
 
-test("adversarial: mapAnswerToGate — duplicate labels resolve to the first matching option", async () => {
+test("adversarial: duplicate Ask labels still encode one schema-valid selection", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g-dup",
     kind: "question",
@@ -1622,11 +2249,13 @@ test("adversarial: mapAnswerToGate — duplicate labels resolve to the first mat
 
   await session.answerGate("g-dup", "yes");
   await done;
-  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-dup", answer: "first" }]);
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    gateResponse("g-dup", { selected: ["Yes"] }),
+  ]);
   await session.dispose();
 });
 
-test("adversarial: mapAnswerToGate — whitespace/case variance still matches by label", async () => {
+test("adversarial: whitespace/case variance still matches an Ask label", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g-ws",
     kind: "question",
@@ -1639,11 +2268,13 @@ test("adversarial: mapAnswerToGate — whitespace/case variance still matches by
 
   await session.answerGate("g-ws", "  APPLE  ");
   await done;
-  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-ws", answer: "a" }]);
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    gateResponse("g-ws", { selected: ["Apple"] }),
+  ]);
   await session.dispose();
 });
 
-test("adversarial: mapAnswerToGate — out-of-range index (0, negative, overflow) passes the raw answer through", async () => {
+test("adversarial: an out-of-range index is an explicit Ask custom answer", async () => {
   for (const bad of ["0", "-1", "5"]) {
     const agent = new GatingAgentSession({
       gate_id: "g-range",
@@ -1660,12 +2291,18 @@ test("adversarial: mapAnswerToGate — out-of-range index (0, negative, overflow
 
     await session.answerGate("g-range", bad);
     await done;
-    assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-range", answer: bad }]);
+    assert.deepEqual(agent.gateEmitter.resolveCalls, [
+      gateResponse("g-range", {
+        selected: [],
+        other: true,
+        custom: bad,
+      }),
+    ]);
     await session.dispose();
   }
 });
 
-test("adversarial: mapAnswerToGate — an empty-string answer passes through rather than matching any option", async () => {
+test("adversarial: a required Ask rejects an empty answer before resolution", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g-empty",
     kind: "question",
@@ -1679,9 +2316,17 @@ test("adversarial: mapAnswerToGate — an empty-string answer passes through rat
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await gateDelay(0);
 
-  await session.answerGate("g-empty", "");
+  const rejected = await session.answerGate("g-empty", "");
+  assert.deepEqual(rejected, {
+    ok: false,
+    error: "gate answer must not be empty",
+  });
+  assert.deepEqual(agent.gateEmitter.resolveCalls, []);
+  await session.answerGate("g-empty", "A");
   await done;
-  assert.deepEqual(agent.gateEmitter.resolveCalls, [{ gate_id: "g-empty", answer: "" }]);
+  assert.deepEqual(agent.gateEmitter.resolveCalls, [
+    gateResponse("g-empty", { selected: ["A"] }),
+  ]);
   await session.dispose();
 });
 test("#35 concurrency: the workflow-gate listener is registered once per session, not per run", async () => {
@@ -1700,7 +2345,7 @@ test("#35 concurrency: the workflow-gate listener is registered once per session
 
   // Exactly ONE session-level listener — the old per-run design added a listener
   // per #runPromptCommand, so a second concurrent run's listener fired on the same
-  // emit and self-rejected the pending gate with answer:null.
+  // emit and quarantined the pending gate.
   assert.equal(agent.gateEmitter.listeners.size, 1);
   assert.equal(session.pendingGates.size, 1);
   assert.deepEqual(agent.gateEmitter.resolveCalls, []);
@@ -1725,6 +2370,16 @@ test("#35 concurrency: answerGate resumes the OWNING run's idle controller", asy
     kind: "question",
     context: { prompt: "Park here" },
   });
+  let releaseTerminal;
+  const terminalGate = new Promise((resolve) => {
+    releaseTerminal = resolve;
+  });
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    agent.answers.push(await agent.gateEmitter.emitGate(agent.gates[0]));
+    await terminalGate;
+    agent.emit(terminalEvent());
+  };
   const session = new SdkSession(agent, {
     idleTimeoutMs: 5_000,
     hardCapMs: 10_000,
@@ -1746,16 +2401,17 @@ test("#35 concurrency: answerGate resumes the OWNING run's idle controller", asy
   const answered = await session.answerGate("g-owner", "ok");
   assert.equal(answered.ok, true);
   assert.equal(resumeCalls.length, 1, "the owning run's controller was resumed exactly once");
+  releaseTerminal();
   await parked;
   await session.dispose();
 });
 
-test("#35 an oversized / unknown-kind gate is clamped so the bot's isGateRequestEvent still accepts it", async () => {
+test("#35 an oversized supported gate is clamped for the protocol", async () => {
   const hugePrompt = "P".repeat(V0_LIMITS.GATE_PROMPT + 500);
   const hugeLabel = "L".repeat(V0_LIMITS.CHOICE_LABEL + 200);
   const agent = new GatingAgentSession({
     gate_id: "g-clamp",
-    kind: "totally-unknown-kind",
+    kind: "question",
     context: { prompt: hugePrompt },
     options: [{ value: "a", label: hugeLabel }],
   });
@@ -1770,12 +2426,37 @@ test("#35 an oversized / unknown-kind gate is clamped so the bot's isGateRequest
 
   const gateEvent = events.find((evt) => evt.type === "gate_request");
   assert.ok(gateEvent, "a gate_request event was emitted");
-  assert.equal(gateEvent.kind, "question", "unknown kind is coerced to a valid kind");
+  assert.equal(gateEvent.kind, "question");
   assert.equal(gateEvent.prompt.length, V0_LIMITS.GATE_PROMPT, "prompt clamped to the limit");
   assert.equal(gateEvent.choices[0].label.length, V0_LIMITS.CHOICE_LABEL, "label clamped to the limit");
   assert.equal(isGateRequestEvent(gateEvent), true, "the clamped event passes the bot's validator");
 
-  await session.answerGate("g-clamp", "a");
+  await session.answerGate("g-clamp", "1");
   await done;
+  await session.dispose();
+});
+
+test("unsupported gate kinds are quarantined instead of coerced", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-unsupported-kind",
+    kind: "totally-unknown-kind",
+    context: { prompt: "Unsupported" },
+    options: [{ label: "A" }],
+  });
+  const session = new SdkSession(agent);
+  const events = [];
+
+  await assert.rejects(
+    session.send(
+      { type: "prompt", message: "hi" },
+      (event) => events.push(event),
+      100
+    ),
+    /prompt_failed/
+  );
+  assert.equal(events.some((event) => event.type === "gate_request"), false);
+  assert.deepEqual(agent.gateEmitter.quarantineCalls, [
+    "g-unsupported-kind",
+  ]);
   await session.dispose();
 });

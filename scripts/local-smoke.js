@@ -7,7 +7,7 @@ const port = Number(process.env.SMOKE_HOST_WS_PORT || 7788);
 const hostId = process.env.SMOKE_HOST_ID || "local-smoke";
 const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
 // A second, distinct canonical workDir so the smoke drives two concurrent
-// pooled sessions (each session clones Settings for its own cwd). This guards
+// pooled sessions (the SDK owns scope-local Settings for each cwd). This guards
 // against gross cross-session breakage: session A must keep working after
 // session B is created and activates the host profile. NOTE: when both workDirs
 // resolve the SAME effective modelProfile.default (the default case), this does
@@ -120,7 +120,7 @@ try {
 
   const result = { text: await promptExact(workDir) };
 
-  // Create a second pooled session (its own Settings clone + profile
+  // Create a second pooled session (its own SDK-owned Settings scope + profile
   // activation), then re-prompt the first. A passing re-prompt proves session A
   // survives session B's creation/activation end to end — a guard against gross
   // cross-session breakage (see the workDir2 note above for its limits).

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import YAML from 'yaml';
 
@@ -249,7 +252,7 @@ test('documentation keeps source attestation non-promotional', () => {
 
 test('real repository Docker contract pins the current Bun lock', () => {
   const lockDigest = createHash('sha256')
-    .update(execFileSync('git', ['show', 'HEAD:bun.lock']))
+    .update(readFileSync('bun.lock'))
     .digest('hex');
   const dockerfile = readFileSync(
     'deploy/docker/daemon/Dockerfile',
@@ -259,4 +262,47 @@ test('real repository Docker contract pins the current Bun lock', () => {
     dockerfile,
     new RegExp(`^ARG LOCK_SHA256=${lockDigest}$`, 'm'),
   );
+});
+
+test('Windows-style Git checkout preserves exact Bun lock bytes and Docker digest', () => {
+  const lock = readFileSync('bun.lock');
+  const attributes = readFileSync('.gitattributes');
+  const root = mkdtempSync(join(tmpdir(), 'gjc-lock-checkout-'));
+  const env = {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')),
+    ),
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: join(root, 'absent-global-config'),
+    GIT_ATTR_NOSYSTEM: '1',
+  };
+  const git = (...args) => execFileSync('git', [
+    '-c', 'core.autocrlf=true',
+    '-c', 'core.safecrlf=false',
+    '-c', `core.attributesFile=${join(root, 'absent-global-attributes')}`,
+    ...args,
+  ], { cwd: root, env, timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+
+  try {
+    git('init');
+    writeFileSync(join(root, '.gitattributes'), attributes);
+    writeFileSync(join(root, 'bun.lock'), lock);
+    writeFileSync(join(root, 'control.txt'), lock);
+    git('add', '--', '.gitattributes', 'bun.lock', 'control.txt');
+    rmSync(join(root, 'bun.lock'));
+    rmSync(join(root, 'control.txt'));
+    git('checkout-index', '--', 'bun.lock', 'control.txt');
+
+    const checkedOut = readFileSync(join(root, 'bun.lock'));
+    const control = readFileSync(join(root, 'control.txt'));
+    assert.equal(control.includes('\r\n'), true, 'control must undergo CRLF checkout');
+    assert.notDeepEqual(control, checkedOut, 'lock must bypass CRLF conversion');
+    assert.deepEqual(checkedOut, lock, 'checkout must preserve source bytes');
+    assert.deepEqual(checkedOut, git('show', ':bun.lock'), 'checkout must match indexed bytes');
+    const digest = createHash('sha256').update(checkedOut).digest('hex');
+    const dockerfile = readFileSync('deploy/docker/daemon/Dockerfile', 'utf8');
+    assert.match(dockerfile, new RegExp(`^ARG LOCK_SHA256=${digest}\\r?$`, 'm'));
+  } finally {
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
 });

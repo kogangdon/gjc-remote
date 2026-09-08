@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import WebSocket from "ws";
 import {
   CAPABILITIES,
+  GATE_ANSWER_ERROR_CODES,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PONG,
@@ -1905,6 +1906,36 @@ function closePolicyViolation(connection, reason) {
   connection.close(1008, reason);
 }
 
+async function sendGateAnswerResult(
+  connection,
+  requestId,
+  answerId,
+  gateId,
+  accepted,
+  errorCode,
+) {
+  if (connection.readyState !== WebSocket.OPEN) return;
+  const event = {
+    type: MSG_TYPES.GATE_ANSWER_RESULT,
+    answerId,
+    gateId,
+    accepted,
+  };
+  if (!accepted) event.errorCode = errorCode;
+  const payload = JSON.stringify({
+    type: MSG_TYPES.EVENT,
+    requestId,
+    event,
+  });
+  await new Promise((resolve) => {
+    try {
+      connection.send(payload, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
 async function handleMessage(
   connection,
   raw,
@@ -2008,19 +2039,29 @@ async function handleMessage(
     return;
   }
   if (isAnswerMessage(msg)) {
-    // #35: route a gate answer to the in-flight session that owns the gate.
-    // Stale/unknown requestIds are silently ignored (the gate may have already
-    // resolved, timed out, or the session disposed).
+    // Route and receipt an exact gate-answer attempt. Rejections deliberately
+    // collapse to fixed wire codes: SDK errors and answer content never cross
+    // this boundary.
     const request = inFlightByRequestId.get(msg.requestId);
-    if (request) {
+    let accepted = false;
+    let errorCode = GATE_ANSWER_ERROR_CODES.REJECTED;
+    if (request?.connection === connection) {
       try {
-        await request.session.answerGate(msg.gateId, msg.answer);
-      } catch (err) {
-        console.error(
-          `daemon: failed to answer gate: ${sanitizeDaemonError(err)}`
-        );
+        const result = await request.session.answerGate(msg.gateId, msg.answer);
+        accepted = result?.ok === true;
+      } catch {
+        errorCode = GATE_ANSWER_ERROR_CODES.FAILED;
+        console.error("daemon: failed to answer gate");
       }
     }
+    await sendGateAnswerResult(
+      connection,
+      msg.requestId,
+      msg.answerId,
+      msg.gateId,
+      accepted,
+      errorCode,
+    );
     return;
   }
   if (msg?.type === MSG_TYPES.BIND_WORKSPACE) {

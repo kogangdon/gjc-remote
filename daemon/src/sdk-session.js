@@ -1,8 +1,27 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
-import { V0_LIMITS, isGateRequestEvent } from "@gjc-remote/shared";
+import {
+  PROTOCOL_ERROR_CODES,
+  V0_LIMITS,
+  isGateRequestEvent,
+} from "@gjc-remote/shared";
 
 const GATE_KINDS = new Set(["question", "approval", "execution"]);
+// @gajae-code/agent-core 0.16.6 can emit an `agent_end` checkpoint before
+// continuing these mid-run maintenance outcomes. AgentSession normally
+// suppresses them, but they still are not terminal if an injected/session seam
+// exposes one.
+const CONTINUING_MAINTENANCE_OUTCOMES = new Set([
+  "pruned",
+  "compacted",
+  "promoted",
+]);
+const APPROVAL_DECISIONS = ["approve", "request-changes", "reject"];
+const EXECUTION_DECISIONS = ["approve", "decline"];
+const SAFE_FAILURE_CODE = /^[A-Za-z0-9._-]+$/;
+const SAFE_FAILURE_CODE_MAX = 64;
+const LIVE_CONTROL_UNSUPPORTED_CODE =
+  PROTOCOL_ERROR_CODES.LIVE_CONTROL_UNSUPPORTED;
 
 const SDK_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SDK_HARD_CAP_MS = 30 * 60 * 1000;
@@ -66,51 +85,392 @@ function gatePrompt(gate) {
   return "The workflow is waiting for your answer.";
 }
 
-// #35: map a user's free-text answer onto a WorkflowGateResponse `answer`. For a
-// choice gate, resolve the text to the matching option's `value` (by exact label,
-// case-insensitive, then by 1-based index). Otherwise pass the text through and
-// let the SDK's schema validation decide.
-function mapAnswerToGate(gate, answer) {
-  const options = Array.isArray(gate?.options) ? gate.options : [];
-  if (options.length === 0) return answer;
-  const text = typeof answer === "string" ? answer.trim() : answer;
-  const byLabel = options.find(
-    (option) =>
-      typeof option.label === "string" &&
-      option.label.toLowerCase() === String(text).toLowerCase()
+function isPlainRecord(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasOnlyKeys(value, allowed) {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function sameArray(left, right) {
+  return (
+    Array.isArray(left) &&
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
   );
-  if (byLabel) return byLabel.value;
+}
+
+// SDK 0.16.6 has two concrete gate-answer schema families. AskTool gates use
+// buildAskGateAnswerSchema() and approval/execution gates use decision objects.
+// Recognize only those producer shapes: inventing a scalar fallback would turn a
+// transport limitation into a workflow decision the SDK never received.
+function gateAnswerCodec(gate) {
+  if (!GATE_KINDS.has(gate?.kind) || !isPlainRecord(gate?.schema)) return undefined;
+  const schema = gate.schema;
+  const properties = schema.properties;
+  if (
+    schema.type !== "object" ||
+    schema.additionalProperties !== false ||
+    !isPlainRecord(properties)
+  ) {
+    return undefined;
+  }
+
+  const options = Array.isArray(gate.options) ? gate.options : [];
+  const labels = [];
+  for (const option of options) {
+    if (
+      !isPlainRecord(option) ||
+      typeof option.label !== "string" ||
+      option.label.length === 0
+    ) {
+      return undefined;
+    }
+    labels.push(option.label);
+  }
+
+  const selected = properties.selected;
+  const state = gate.context?.stage_state;
+  if (
+    isPlainRecord(selected) &&
+    selected.type === "array" &&
+    selected.uniqueItems === true &&
+    isPlainRecord(selected.items) &&
+    sameArray(selected.items.enum, labels) &&
+    isPlainRecord(properties.other) &&
+    properties.other.type === "boolean" &&
+    isPlainRecord(properties.custom) &&
+    properties.custom.type === "string" &&
+    isPlainRecord(properties.action) &&
+    sameArray(properties.action.enum, ["answer", "clarify"]) &&
+    isPlainRecord(properties.question) &&
+    properties.question.type === "string" &&
+    Array.isArray(schema.anyOf) &&
+    schema.anyOf.length === 3 &&
+    isPlainRecord(state) &&
+    typeof state.multi === "boolean" &&
+    typeof state.allow_empty === "boolean" &&
+    sameArray(state.options, labels) &&
+    state.other_option === "Other (type your own)" &&
+    state.clarification_action === "clarify" &&
+    options.every((option) => option.value === option.label)
+  ) {
+    return {
+      type: "ask",
+      labels,
+      multi: state.multi,
+      allowEmpty: state.allow_empty,
+    };
+  }
+
+  const decision = properties.decision;
+  const expectedDecisions =
+    gate.kind === "approval"
+      ? APPROVAL_DECISIONS
+      : gate.kind === "execution"
+        ? EXECUTION_DECISIONS
+        : undefined;
+  const detailKey = gate.kind === "approval" ? "comments" : "reason";
+  if (
+    expectedDecisions &&
+    isPlainRecord(decision) &&
+    decision.type === "string" &&
+    sameArray(decision.enum, expectedDecisions) &&
+    sameArray(schema.required, ["decision"]) &&
+    hasOnlyKeys(properties, new Set(["decision", detailKey])) &&
+    isPlainRecord(properties[detailKey]) &&
+    properties[detailKey].type === "string" &&
+    options.length === expectedDecisions.length &&
+    options.every(
+      (option, index) =>
+        option.value === expectedDecisions[index] &&
+        option.label === expectedDecisions[index]
+    )
+  ) {
+    return { type: gate.kind, decisions: expectedDecisions, detailKey };
+  }
+
+  return undefined;
+}
+
+function parseStructuredGateAnswer(answer) {
+  if (typeof answer !== "string") {
+    return { ok: false, error: "gate answer must be text" };
+  }
+  const text = answer.trim();
+  if (!text.startsWith("{") && !text.startsWith("[")) {
+    return { ok: true, text };
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (!isPlainRecord(parsed)) {
+      return { ok: false, error: "structured gate answer must be an object" };
+    }
+    return { ok: true, text, structured: parsed };
+  } catch {
+    return { ok: false, error: "structured gate answer is not valid JSON" };
+  }
+}
+
+function validateAskAnswerShape(answer, codec) {
+  if (!isPlainRecord(answer)) return false;
+  if (answer.action === "clarify") {
+    return (
+      hasOnlyKeys(answer, new Set(["action", "question"])) &&
+      typeof answer.question === "string" &&
+      /\S/u.test(answer.question)
+    );
+  }
+  if (
+    !hasOnlyKeys(answer, new Set(["selected", "other", "custom", "action"])) ||
+    (answer.action !== undefined && answer.action !== "answer") ||
+    !Array.isArray(answer.selected) ||
+    !answer.selected.every(
+      (selection) =>
+        typeof selection === "string" && codec.labels.includes(selection)
+    ) ||
+    new Set(answer.selected).size !== answer.selected.length ||
+    (!codec.multi && answer.selected.length > 1)
+  ) {
+    return false;
+  }
+  if (answer.other === true) {
+    return (
+      (codec.multi || answer.selected.length === 0) &&
+      typeof answer.custom === "string" &&
+      /\S/u.test(answer.custom)
+    );
+  }
+  return (
+    (answer.other === undefined || answer.other === false) &&
+    answer.custom === undefined &&
+    (codec.allowEmpty || answer.selected.length > 0)
+  );
+}
+
+function validateDecisionAnswerShape(answer, codec) {
+  if (
+    !isPlainRecord(answer) ||
+    !hasOnlyKeys(answer, new Set(["decision", codec.detailKey])) ||
+    !codec.decisions.includes(answer.decision)
+  ) {
+    return false;
+  }
+  const detail = answer[codec.detailKey];
+  if (detail !== undefined && typeof detail !== "string") return false;
+  return !(
+    codec.type === "approval" &&
+    answer.decision === "request-changes" &&
+    (typeof detail !== "string" || detail.trim() === "")
+  );
+}
+
+function matchGateChoice(options, text) {
+  const byLabel = options.find(
+    (option) => option.label.toLowerCase() === text.toLowerCase()
+  );
+  if (byLabel) return byLabel;
   const index = Number(text);
   if (Number.isInteger(index) && index >= 1 && index <= options.length) {
-    return options[index - 1].value;
+    return options[index - 1];
   }
-  return answer;
+  return undefined;
+}
+
+// Encode the daemon's bounded text answer into the exact object unions emitted
+// by SDK 0.16.6. JSON objects are the explicit route for multi-select,
+// clarification, custom-answer disambiguation, and decision comments/reasons.
+function encodeGateAnswer(gate, answer) {
+  const codec = gateAnswerCodec(gate);
+  if (!codec) return { ok: false, error: "unsupported workflow gate schema" };
+  const parsed = parseStructuredGateAnswer(answer);
+  if (!parsed.ok) return parsed;
+
+  if (parsed.structured) {
+    const valid =
+      codec.type === "ask"
+        ? validateAskAnswerShape(parsed.structured, codec)
+        : validateDecisionAnswerShape(parsed.structured, codec);
+    return valid
+      ? { ok: true, answer: parsed.structured }
+      : { ok: false, error: "unsupported gate answer shape" };
+  }
+
+  const options = Array.isArray(gate.options) ? gate.options : [];
+  const choice = matchGateChoice(options, parsed.text);
+  if (codec.type === "ask") {
+    if (choice) return { ok: true, answer: { selected: [choice.label] } };
+    if (parsed.text === "") {
+      return codec.allowEmpty
+        ? { ok: true, answer: { selected: [] } }
+        : { ok: false, error: "gate answer must not be empty" };
+    }
+    return {
+      ok: true,
+      answer: { selected: [], other: true, custom: answer },
+    };
+  }
+
+  if (!choice) return { ok: false, error: "unsupported gate decision" };
+  if (codec.type === "approval" && choice.value === "request-changes") {
+    return {
+      ok: false,
+      error: "request-changes requires structured comments",
+    };
+  }
+  return { ok: true, answer: { decision: choice.value } };
+}
+
+function sanitizedFailure(error, fallbackCode = "prompt_failed") {
+  let candidate;
+  try {
+    candidate = error?.code;
+  } catch {
+    candidate = undefined;
+  }
+  const code =
+    typeof candidate === "string" &&
+    candidate.length <= SAFE_FAILURE_CODE_MAX &&
+    SAFE_FAILURE_CODE.test(candidate)
+      ? candidate
+      : fallbackCode;
+  return { code, message: "Prompt submission failed." };
+}
+
+function sdkFailureError(failure) {
+  const error = new Error(`GJC SDK invocation failed (${failure.code})`);
+  error.code = failure.code;
+  return error;
+}
+
+function lastAssistantMessage(messages) {
+  if (!Array.isArray(messages)) return undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isPlainRecord(message) && message.role === "assistant") return message;
+  }
+  return undefined;
+}
+
+function assistantHasActivity(message) {
+  let content;
+  try {
+    content = message.content;
+  } catch {
+    return false;
+  }
+  if (typeof content === "string") return content.trim().length > 0;
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => {
+    if (!isPlainRecord(block) || typeof block.type !== "string") return false;
+    if (block.type !== "text") return block.type.length > 0;
+    return typeof block.text === "string" && block.text.trim().length > 0;
+  });
+}
+
+// An agent_end is a readiness boundary, not evidence that its work succeeded.
+// Mirror the installed SDK host's terminal classification without retaining raw
+// provider error text.
+function terminalFailure(event) {
+  if (event.stopReason === "maintenance") {
+    if (event.maintenanceOutcome === "failed") {
+      return sanitizedFailure(undefined, "context_maintenance_failed");
+    }
+    if (event.maintenanceOutcome === "aborted") {
+      return sanitizedFailure(undefined, "aborted");
+    }
+  }
+  if (event.stopReason === "cancelled") {
+    return sanitizedFailure(undefined, "aborted");
+  }
+
+  let messages;
+  try {
+    messages = event.messages;
+  } catch {
+    messages = undefined;
+  }
+  const assistant = lastAssistantMessage(messages);
+  if (!assistant) return sanitizedFailure(undefined);
+
+  let stopReason;
+  try {
+    stopReason = assistant.stopReason;
+  } catch {
+    return sanitizedFailure(undefined);
+  }
+  if (stopReason === "aborted") return sanitizedFailure(undefined, "aborted");
+  if (stopReason === "error") {
+    let status;
+    try {
+      status = assistant.errorStatus ?? assistant.transportFailure?.status;
+    } catch {
+      status = undefined;
+    }
+    if (status === 402 || status === 429) {
+      return sanitizedFailure(undefined, `provider_http_${status}`);
+    }
+    return sanitizedFailure(
+      { code: assistant.errorCode },
+      "provider_rejected"
+    );
+  }
+  return assistantHasActivity(assistant)
+    ? undefined
+    : sanitizedFailure(undefined);
+}
+
+function isTerminalAgentEnd(event) {
+  return (
+    event?.type === "agent_end" &&
+    !(
+      event.stopReason === "maintenance" &&
+      CONTINUING_MAINTENANCE_OUTCOMES.has(event.maintenanceOutcome)
+    )
+  );
+}
+
+function attemptScopeBoundary(scope) {
+  if (
+    !isPlainRecord(scope) ||
+    typeof scope.attemptId !== "string" ||
+    !Number.isSafeInteger(scope.generation) ||
+    typeof scope.lineage !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    attemptId: scope.attemptId,
+    generation: scope.generation,
+    lineage: scope.lineage,
+  };
+}
+
+function attemptScopesEqual(left, right) {
+  return (
+    left?.attemptId === right?.attemptId &&
+    left?.generation === right?.generation &&
+    left?.lineage === right?.lineage
+  );
 }
 
 /**
  * Load only the canonical SDK surfaces this daemon needs, rather than the
  * package-root barrel (`@gajae-code/coding-agent`) which pulls the entire
  * runtime graph — TUI/modes and browser/puppeteer tools — into the daemon
- * process. `@gajae-code/coding-agent/sdk` exports `createAgentSession` and
- * re-exports `Settings`; `.../session/session-manager` provides `SessionManager`.
- *
- * `config/model-profile-activation` is the config-layer surface used to honour
- * the host's model profile (see `applyConfiguredModelProfile`). It is
- * lower-level than `/sdk`, so it is more version-coupled — the trade accepted
- * so config discovery stays GJC's own concern (robust to config-path/schema
- * changes) instead of hand-parsed.
+ * process. `@gajae-code/coding-agent/sdk` exports `createAgentSession`;
+ * `.../session/session-manager` provides the public `SessionManager` needed for
+ * the daemon's dedicated transcript directory.
  */
 async function loadCanonicalSdk() {
-  const [
-    { createAgentSession, Settings },
-    { SessionManager },
-    { activateModelProfile },
-  ] = await Promise.all([
+  const [{ createAgentSession }, { SessionManager }] = await Promise.all([
     import("@gajae-code/coding-agent/sdk"),
     import("@gajae-code/coding-agent/session/session-manager"),
-    import("@gajae-code/coding-agent/config/model-profile-activation"),
   ]);
-  return { createAgentSession, Settings, SessionManager, activateModelProfile };
+  return { createAgentSession, SessionManager };
 }
 
 export function resolveSdkSessionDirectory(workDir, sessionRoot) {
@@ -126,27 +486,18 @@ export function resolveSdkSessionDirectory(workDir, sessionRoot) {
 
 export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { sessionRoot } = {}) {
   const sessionDir = resolveSdkSessionDirectory(workDir, sessionRoot);
-  const { createAgentSession, Settings, SessionManager, activateModelProfile } =
-    await loadSdk();
+  const { createAgentSession, SessionManager } = await loadSdk();
   const sessionManager = SessionManager.create(workDir, sessionDir);
-  // `Settings.init()` returns a process-global singleton whose cwd is frozen at
-  // first call, so it cannot scope per pooled session. Clone it per workDir so
-  // each session reads that directory's merged config AND so profile activation
-  // (which mutates modelRoles/agentModelOverrides via settings.override) stays
-  // isolated to this session instead of clobbering every other live session.
-  // Caveat: the clone isolates settings-derived state (model roles, profile
-  // activation), but the SDK's capability/discovery layer keeps a module-global
-  // bound to the most recently created session's settings, so disabledProviders
-  // /capability resolution is still last-writer-wins across pooled sessions —
-  // an upstream SDK limitation the clone cannot fix, no worse than before.
-  const settings = await (await Settings.init()).cloneForCwd(workDir);
+  // SDK 0.16.6 creates an isolated Settings.loadForScope({ cwd, agentDir })
+  // instance when `settings` is omitted and closes that owned scope from
+  // AgentSession.dispose(). Supplying a clone here would transfer ownership to
+  // the daemon and bypass that lifecycle.
   const { session } = await createAgentSession({
     cwd: workDir,
     sessionManager,
-    settings,
   });
   try {
-    await applyConfiguredModelProfile(session, { activateModelProfile });
+    await applyConfiguredModelProfile(session);
   } catch (error) {
     // The raw AgentSession is not yet owned by an SdkSession/SessionPool, so
     // dispose it here to avoid leaking the underlying runtime on a failed
@@ -173,19 +524,17 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { se
  * commonly an unauthenticated model — so prompts return empty text under a
  * hidden `stopReason: "error"` (the "ok:true, hasText:false" silent failure).
  *
- * Resolution is delegated to GJC's own `activateModelProfile`, reading the
- * profile from `session.settings` — the per-workDir clone `createSdkSession`
- * built, so a project-level `modelProfile.default` override is honoured the same
- * way interactive GJC would in that directory, and the activation's in-memory
- * mutations never leak to other sessions. `persistDefault` is false: activation
- * is in-memory for this session only and never mutates the host's `config.yml`.
- * A misconfigured/uncredentialed profile throws here (e.g.
- * `ModelProfileCredentialError`), which fails session creation loudly instead
- * of silently serving a broken session.
+ * Resolution reads the profile from the SDK-owned scope-local
+ * `session.settings`, so a project-level `modelProfile.default` override is
+ * honoured in that directory. `AgentSession.activateModelProfileForControl()`
+ * is the 0.16.6 public nonvisual, session-scoped activation surface; it never
+ * persists `modelProfile.default`. A misconfigured/uncredentialed profile
+ * throws here, which fails session creation loudly instead of silently serving
+ * a broken session.
  *
  * `GJC_MODEL_PROFILE` overrides the configured profile name when set.
  */
-export async function applyConfiguredModelProfile(session, { activateModelProfile }) {
+export async function applyConfiguredModelProfile(session) {
   const settings = session.settings;
   const configured = settings.get("modelProfile.default");
   const envOverride = (process.env.GJC_MODEL_PROFILE ?? "").trim();
@@ -212,10 +561,7 @@ export async function applyConfiguredModelProfile(session, { activateModelProfil
   }
 
   try {
-    await activateModelProfile(
-      { session, modelRegistry: session.modelRegistry, settings, profileName },
-      { persistDefault: false }
-    );
+    await session.activateModelProfileForControl(profileName);
   } catch (error) {
     throw new Error(
       `gjc-remote daemon: failed to activate model profile "${profileName}": ${
@@ -236,12 +582,9 @@ export class SdkSession {
     this.closed = false;
     this.queue = Promise.resolve();
     this.queuedCommands = 0;
-    this.inFlightControls = new Set();
     this.activePromptRuns = 0;
-    this.pendingLiveFollowUps = 0;
-    this.liveFollowUpAcceptance = Promise.resolve();
-    this.outstandingAcceptedFollowUps = 0;
-    this.liveFollowUpBarrier = undefined;
+    this.adapterWaiterCancellations = new Set();
+    this.inFlightGateAnswers = new Set();
     this.disposePromise = undefined;
     this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
     this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
@@ -274,12 +617,17 @@ export class SdkSession {
       this.hardCapMs,
       "GJC_GATE_ANSWER_WINDOW_MS"
     );
-    // #35: gateId -> { gate, emitter, controller }. At most one gate is
+    // #35: gateId -> { gate, emitter, controller, response? }. At most one gate is
     // registered at a time; a concurrent gate is rejected (see #handleGateEmitted)
     // so the first resolver is never overwritten. Each entry stores the OWNING
     // run's idle controller so answerGate resumes exactly that run (multiple
     // prompt runs can share this session when channels map to one workDir).
     this.pendingGates = new Map();
+    // One successor may be emitted while its accepted predecessor is still
+    // advancing. It is held off-stream until the predecessor's exact response
+    // has a completed resolution; the owning run's existing gate/hard-cap
+    // timers bound this candidate.
+    this.deferredGateCandidate = undefined;
     // #35: active prompt runs, most-recent last ({ onEvent, controller }). A gate
     // emitted on the shared session-level emitter is attributed to the most
     // recently started run.
@@ -297,10 +645,8 @@ export class SdkSession {
     return (
       this.queuedCommands > 0 ||
       this.activePromptRuns > 0 ||
-      this.inFlightControls.size > 0 ||
-      this.pendingLiveFollowUps > 0 ||
-      this.outstandingAcceptedFollowUps > 0 ||
-      this.pendingGates.size > 0
+      this.pendingGates.size > 0 ||
+      this.deferredGateCandidate !== undefined
     );
   }
   send(command, onEvent, timeoutMs = this.idleTimeoutMs) {
@@ -309,85 +655,23 @@ export class SdkSession {
     const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
     if (!isLiveControl) return this.#enqueue(command, onEvent, timeoutMs);
 
-    const result = Promise.resolve().then(() => {
+    return Promise.resolve().then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
-      if (this.activePromptRuns <= 0 && !this.liveFollowUpBarrier) {
+      if (this.activePromptRuns <= 0) {
         return this.#enqueue(command, onEvent, timeoutMs);
       }
-      if (command.type !== "follow_up") {
-        return this.#runPromptCommand(command, onEvent, timeoutMs);
-      }
-
-      if (this.pendingLiveFollowUps === 0) {
-        this.liveFollowUpAcceptance = Promise.resolve();
-      }
-      this.pendingLiveFollowUps += 1;
-      const previousAcceptance = this.liveFollowUpAcceptance;
-      let releaseAcceptance;
-      let accepted = false;
-      this.liveFollowUpAcceptance = new Promise((resolve) => {
-        releaseAcceptance = resolve;
-      });
-      const settleAcceptance = async (queued, getObservedAgentEnds) => {
-        await previousAcceptance;
-        let agentEndsToWait;
-        if (queued) {
-          const observedAgentEnds = getObservedAgentEnds();
-          agentEndsToWait =
-            observedAgentEnds +
-            this.outstandingAcceptedFollowUps +
-            (this.activePromptRuns > 0 ? 1 : 0) +
-            1;
-          this.outstandingAcceptedFollowUps += 1;
-          accepted = true;
-        }
-        releaseAcceptance();
-        return agentEndsToWait;
-      };
-      const control = this.#runPromptCommand(
-        command,
-        onEvent,
-        timeoutMs,
-        settleAcceptance
+      const error = new Error(
+        `Live SDK ${command.type} is unavailable until the SDK exposes a supported queued-input ownership contract`
       );
-      const priorBarrier = this.liveFollowUpBarrier;
-      const barrier = Promise.allSettled(
-        priorBarrier ? [priorBarrier, control] : [control]
-      ).then(() => {});
-      this.liveFollowUpBarrier = barrier;
-      barrier.then(() => {
-        if (this.liveFollowUpBarrier === barrier) {
-          this.liveFollowUpBarrier = undefined;
-        }
-      });
-      control.then(
-        () => {
-          this.pendingLiveFollowUps -= 1;
-          if (accepted) this.outstandingAcceptedFollowUps -= 1;
-        },
-        () => {
-          this.pendingLiveFollowUps -= 1;
-          if (accepted) this.outstandingAcceptedFollowUps -= 1;
-        }
-      );
-      return control;
+      error.code = LIVE_CONTROL_UNSUPPORTED_CODE;
+      throw error;
     });
-    this.inFlightControls.add(result);
-    result.then(
-      () => this.inFlightControls.delete(result),
-      () => this.inFlightControls.delete(result)
-    );
-    return result;
   }
 
   #enqueue(command, onEvent, timeoutMs) {
     this.queuedCommands += 1;
     const result = this.queue
       .then(async () => {
-        while (this.liveFollowUpBarrier) {
-          const barrier = this.liveFollowUpBarrier;
-          await barrier;
-        }
         if (this.closed) throw new Error("GJC SDK session is not running");
         return this.#dispatch(command, onEvent, timeoutMs);
       })
@@ -455,34 +739,27 @@ export class SdkSession {
     }
   }
 
-  async #runPromptCommand(command, onEvent, timeoutMs, settleFollowUpAcceptance) {
+  async #runPromptCommand(command, onEvent, timeoutMs) {
     let resolveAgentEnd;
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
     });
-    const startsPrompt = command.type === "prompt";
-    let promptActive = startsPrompt;
+    let promptActive = true;
     let eventConsumerError;
+    const reportedFailures = [];
+    let promptFailure;
+    const terminalFailures = [];
+    let sawAgentStart = false;
     let observedAgentEnds = 0;
-    let requiredAgentEnds = settleFollowUpAcceptance ? undefined : 1;
     let resetIdle = () => {};
-    // #35: register the session-level workflow-gate subscription once and track
-    // this run so a gate emitted mid-run is attributed to it. The gate's onEvent
-    // stream and idle controller both come from the owning run context, so a
-    // second concurrent run on this session cannot clobber either.
-    this.#ensureGateSubscription();
+    // #35: track this run before registering the session-level gate listener.
+    // SDK 0.16.6 replays durable pending gates synchronously from
+    // onGateEmitted(), so subscribing first would see no owner and quarantine a
+    // valid resumed gate.
     const gateRun = { onEvent, controller: undefined };
     this.activeGateRuns.push(gateRun);
-    if (startsPrompt) this.activePromptRuns += 1;
-
-    const resolveIfComplete = () => {
-      if (
-        requiredAgentEnds !== undefined &&
-        observedAgentEnds >= requiredAgentEnds
-      ) {
-        resolveAgentEnd();
-      }
-    };
+    this.#ensureGateSubscription();
+    this.activePromptRuns += 1;
     const markPromptInactive = () => {
       if (!promptActive) return;
       promptActive = false;
@@ -490,10 +767,36 @@ export class SdkSession {
     };
     const unsubscribe = this.session.subscribe((event) => {
       resetIdle();
-      if (event.type === "agent_end") {
+      if (event?.type === "agent_start") {
+        sawAgentStart = true;
+      }
+      if (event?.type === "agent_failed") {
+        reportedFailures.push({
+          scope: attemptScopeBoundary(event.scope),
+          failure: sanitizedFailure(event.error),
+        });
+      }
+      if (isTerminalAgentEnd(event)) {
         markPromptInactive();
+        const terminalScope = attemptScopeBoundary(event.scope);
+        let failureIndex = -1;
+        for (let index = reportedFailures.length - 1; index >= 0; index -= 1) {
+          const reported = reportedFailures[index];
+          if (
+            (terminalScope === undefined && reported.scope === undefined) ||
+            attemptScopesEqual(reported.scope, terminalScope)
+          ) {
+            failureIndex = index;
+            break;
+          }
+        }
+        const failure =
+          failureIndex >= 0
+            ? reportedFailures.splice(failureIndex, 1)[0].failure
+            : terminalFailure(event);
+        terminalFailures.push(failure);
         observedAgentEnds += 1;
-        resolveIfComplete();
+        if (observedAgentEnds >= 1) resolveAgentEnd();
       }
       try {
         onEvent(event);
@@ -508,23 +811,35 @@ export class SdkSession {
     try {
       await this.#withStreamingTimeout(
         async () => {
-          if (command.type === "prompt") {
-            await this.session.prompt(command.message);
-          } else if (command.type === "steer") {
-            await this.session.steer(command.message);
-          } else {
-            try {
-              await this.session.followUp(command.message);
-            } catch (error) {
-              await settleFollowUpAcceptance?.(false);
-              throw error;
-            }
-            if (settleFollowUpAcceptance) {
-              requiredAgentEnds = await settleFollowUpAcceptance(true, () => observedAgentEnds);
-              resolveIfComplete();
-            }
+          let promptSubmission;
+          try {
+            promptSubmission = this.session.prompt(command.message);
+          } catch (error) {
+            promptSubmission = Promise.reject(error);
+          }
+          const promptOutcome = Promise.resolve(promptSubmission).then(
+            () => ({ ok: true }),
+            (error) => ({
+              ok: false,
+              failure: sanitizedFailure(error),
+            })
+          );
+          const first = await Promise.race([
+            promptOutcome.then((outcome) => ({ type: "prompt", outcome })),
+            agentEnd.then(() => ({ type: "terminal" })),
+          ]);
+          if (
+            first.type === "prompt" &&
+            !first.outcome.ok &&
+            !sawAgentStart &&
+            observedAgentEnds === 0
+          ) {
+            throw sdkFailureError(first.outcome.failure);
           }
           await agentEnd;
+          const outcome =
+            first.type === "prompt" ? first.outcome : await promptOutcome;
+          if (!outcome.ok) promptFailure = outcome.failure;
         },
         timeoutMs,
         this.hardCapMs,
@@ -537,17 +852,29 @@ export class SdkSession {
           }
         }
       );
+      const failureAtTerminal = terminalFailures[0];
+      if (failureAtTerminal) throw sdkFailureError(failureAtTerminal);
+      if (promptFailure) throw sdkFailureError(promptFailure);
       if (eventConsumerError) throw eventConsumerError;
     } finally {
       markPromptInactive();
       unsubscribe();
       for (const [gateId, entry] of this.pendingGates) {
         if (entry.owner !== gateRun) continue;
+        // answerGate owns cleanup while a direct resolution is in flight. The
+        // accepted gate can wake the run before resolveGate returns its receipt;
+        // quarantining it in that window would race the 0.16.6 completion path.
+        if (entry.resolving) continue;
         this.pendingGates.delete(gateId);
         for (const activeRun of this.activeGateRuns) {
           activeRun.controller?.resumeAfterGate();
         }
-        void this.#rejectGate(entry.emitter, gateId);
+        this.#quarantineGate(entry.emitter, gateId);
+      }
+      if (this.deferredGateCandidate?.owner === gateRun) {
+        const candidate = this.deferredGateCandidate;
+        this.deferredGateCandidate = undefined;
+        this.#quarantineGate(candidate.emitter, candidate.gate.gate_id);
       }
       const runIndex = this.activeGateRuns.indexOf(gateRun);
       if (runIndex >= 0) this.activeGateRuns.splice(runIndex, 1);
@@ -555,12 +882,18 @@ export class SdkSession {
   }
 
   // #35: register the workflow-gate subscription once for the whole session.
-  // Legacy sessions without an emitter are marked subscribed so we never retry.
+  // Sessions without a remote-answer emitter are marked subscribed so we never
+  // install a partial gate path.
   #ensureGateSubscription() {
     if (this.gateSubscribed) return;
     this.gateSubscribed = true;
     const emitter = this.session.getWorkflowGateEmitter?.();
-    if (typeof emitter?.onGateEmitted !== "function") return;
+    if (
+      emitter?.supportsRemoteGateAnswers?.() !== true ||
+      typeof emitter.onGateEmitted !== "function"
+    ) {
+      return;
+    }
     this.gateEmitter = emitter;
     this.gateUnsubscribe = emitter.onGateEmitted((gate) =>
       this.#handleGateEmitted(gate, emitter)
@@ -575,31 +908,48 @@ export class SdkSession {
     if (typeof gateId !== "string" || gateId.length === 0) return;
     // The single session-level listener can be invoked more than once for the
     // same gate on some SDK builds; treat a re-delivery as an idempotent no-op.
-    if (this.pendingGates.has(gateId)) return;
+    if (
+      this.pendingGates.has(gateId) ||
+      this.deferredGateCandidate?.gate?.gate_id === gateId
+    ) {
+      return;
+    }
+    const predecessorState =
+      this.#retireCompletedGateBeforeSuccessor(gateEmitter);
     if (this.pendingGates.size > 0) {
+      if (predecessorState === "accepted_incomplete") {
+        this.#deferGateCandidate(gate, gateEmitter);
+        return;
+      }
       // Concurrent-gate guard: never overwrite the first resolver. Best-effort
       // reject the newcomer so it does not hang; the first gate stays pending.
       console.warn(
         `gjc-remote daemon: rejecting concurrent workflow gate ${gateId}; a gate is already pending.`
       );
-      void this.#rejectGate(gateEmitter, gateId);
+      this.#quarantineGate(gateEmitter, gateId);
       return;
     }
+    this.#presentGate(gate, gateEmitter);
+  }
+
+  #presentGate(gate, gateEmitter, deferredOwner, deferredEvent) {
+    const gateId = gate.gate_id;
     // Attribute the gate to the most recently started run (gates emit while that
     // run's prompt() is executing). With no active run there is nothing to
     // suspend or stream to, so reject rather than leak a pending gate.
-    const gateRun = this.activeGateRuns[this.activeGateRuns.length - 1];
-    if (!gateRun) {
-      void this.#rejectGate(gateEmitter, gateId);
+    const gateRun =
+      deferredOwner ?? this.activeGateRuns[this.activeGateRuns.length - 1];
+    if (!gateRun || !this.activeGateRuns.includes(gateRun)) {
+      this.#quarantineGate(gateEmitter, gateId);
       return;
     }
-    const event = this.#buildGateRequestEvent(gate, gateId);
+    const event = deferredEvent ?? this.#buildGateRequestEvent(gate, gateId);
     if (!event) {
       // A malformed/oversized gate the bot could not render; do not hang the run.
       console.error(
         `gjc-remote daemon: dropping unrenderable workflow gate ${gateId}.`
       );
-      void this.#rejectGate(gateEmitter, gateId);
+      this.#quarantineGate(gateEmitter, gateId);
       return;
     }
     this.pendingGates.set(gateId, {
@@ -618,12 +968,42 @@ export class SdkSession {
     }
   }
 
-  // #35: build a protocol-conforming gate_request event, clamping the prompt,
-  // kind, and choices to V0_LIMITS so the bot's isGateRequestEvent never silently
-  // drops a valid-but-oversized SDK gate. Returns undefined if it cannot be made
-  // to validate.
+  #deferGateCandidate(gate, gateEmitter) {
+    const gateId = gate.gate_id;
+    if (this.deferredGateCandidate) {
+      console.warn(
+        `gjc-remote daemon: rejecting concurrent workflow gate ${gateId}; a successor is already deferred.`
+      );
+      this.#quarantineGate(gateEmitter, gateId);
+      return;
+    }
+    const owner = this.activeGateRuns[this.activeGateRuns.length - 1];
+    const event = this.#buildGateRequestEvent(gate, gateId);
+    if (!owner || !event) {
+      this.#quarantineGate(gateEmitter, gateId);
+      return;
+    }
+    this.deferredGateCandidate = {
+      gate,
+      emitter: gateEmitter,
+      owner,
+      event,
+    };
+  }
+
+  #discardDeferredGateCandidate() {
+    const candidate = this.deferredGateCandidate;
+    if (!candidate) return;
+    this.deferredGateCandidate = undefined;
+    this.#quarantineGate(candidate.emitter, candidate.gate.gate_id);
+  }
+
+  // #35: build a protocol-conforming gate_request event for one supported SDK
+  // schema, clamping its prompt and choices to V0_LIMITS. Returns undefined for
+  // an unknown kind/schema or an event that cannot be made to validate.
   #buildGateRequestEvent(gate, gateId) {
-    const kind = GATE_KINDS.has(gate?.kind) ? gate.kind : "question";
+    if (!gateAnswerCodec(gate)) return undefined;
+    const kind = gate.kind;
     const prompt = gatePrompt(gate).slice(0, V0_LIMITS.GATE_PROMPT);
     const options = Array.isArray(gate?.options) ? gate.options : [];
     const choices =
@@ -646,6 +1026,73 @@ export class SdkSession {
     return isGateRequestEvent(event) ? event : undefined;
   }
 
+  #gateResolutionState(entry) {
+    if (
+      !entry.response ||
+      typeof entry.emitter.lookupCompletedResolution !== "function"
+    ) {
+      return { kind: "none" };
+    }
+    try {
+      const state = entry.emitter.lookupCompletedResolution(entry.response);
+      return state?.kind === "completed" ||
+        state?.kind === "accepted_incomplete"
+        ? state
+        : { kind: "none" };
+    } catch {
+      return { kind: "none" };
+    }
+  }
+
+  // Accepted persistence removes a gate from listPendingGates before its
+  // continuation is terminalized and advanced. Only the SDK's exact
+  // response-bound completed lookup authorizes retirement.
+  #retireCompletedGateBeforeSuccessor(gateEmitter) {
+    for (const [gateId, entry] of this.pendingGates) {
+      if (entry.emitter !== gateEmitter || !entry.resolving || !entry.response) {
+        continue;
+      }
+      const state = this.#gateResolutionState(entry);
+      if (state.kind === "completed") {
+        this.#retirePendingGate(gateId, entry);
+        this.#flushDeferredGateCandidate(entry);
+        return "completed";
+      }
+      if (state.kind === "accepted_incomplete") return state.kind;
+    }
+    return "none";
+  }
+
+  #flushDeferredGateCandidate(completedEntry) {
+    if (
+      this.pendingGates.size > 0 ||
+      this.#gateResolutionState(completedEntry).kind !== "completed"
+    ) {
+      return false;
+    }
+    const candidate = this.deferredGateCandidate;
+    if (!candidate) return false;
+    this.deferredGateCandidate = undefined;
+    this.#presentGate(
+      candidate.gate,
+      candidate.emitter,
+      candidate.owner,
+      candidate.event
+    );
+    return true;
+  }
+
+  #retirePendingGate(gateId, entry) {
+    if (this.pendingGates.get(gateId) !== entry) return false;
+    this.pendingGates.delete(gateId);
+    if (this.pendingGates.size === 0) {
+      for (const activeRun of this.activeGateRuns) {
+        activeRun.controller?.resumeAfterGate();
+      }
+    }
+    return true;
+  }
+
   // #35: resolve a pending gate with a user's answer (called from daemon message
   // routing when an ANSWER frame arrives). Runs concurrently with the blocked
   // prompt run that is awaiting the gate. A stale/unknown gateId is a safe no-op.
@@ -653,29 +1100,182 @@ export class SdkSession {
     if (this.closed) return { ok: false, error: "session is closed" };
     const entry = this.pendingGates.get(gateId);
     if (!entry) return { ok: false, error: "no pending gate for id" };
-    this.pendingGates.delete(gateId);
-    for (const activeRun of this.activeGateRuns) {
-      activeRun.controller?.resumeAfterGate();
+    if (entry.resolving) {
+      return { ok: false, error: "gate answer is already being resolved" };
     }
+    const encoded = encodeGateAnswer(entry.gate, answer);
+    if (!encoded.ok) return encoded;
+    entry.resolving = true;
+    const response = {
+      gate_id: gateId,
+      answer: encoded.answer,
+      // One gate accepts one answer. Binding retries to its immutable gate id
+      // gives the 0.16.6 recovery APIs a stable idempotency identity without
+      // retaining or hashing user answer content.
+      idempotency_key: `gjc-remote:${gateId}`,
+    };
+    entry.response = response;
     try {
-      const resolution = await entry.emitter.resolveGate({
-        gate_id: gateId,
-        answer: mapAnswerToGate(entry.gate, answer),
-      });
-      return { ok: true, resolution };
+      // This adapter does not publish through the SDK presentation arbiter, so
+      // the direct-control proof is `not_published`, matching the SDK 0.16.6
+      // workflow.gate_answer path. Without this proof resolveGate accepts the
+      // answer durably and then rejects because no terminal controller exists.
+      if (entry.emitter.prepareTerminalization?.(gateId, "not_published") !== true) {
+        entry.response = undefined;
+        return { ok: false, error: "workflow gate is no longer answerable" };
+      }
+      const resolution = await this.#awaitGateOperation(
+        () => entry.emitter.resolveGate(response)
+      );
+      if (resolution?.status === "rejected") {
+        entry.response = undefined;
+        this.#discardDeferredGateCandidate();
+        entry.emitter.clearPreparedTerminalization?.(gateId);
+        return {
+          ok: false,
+          error: "workflow gate answer was rejected",
+          resolution,
+        };
+      }
+      if (resolution?.status !== "accepted") {
+        entry.response = undefined;
+        this.#discardDeferredGateCandidate();
+        entry.emitter.clearPreparedTerminalization?.(gateId);
+        return {
+          ok: false,
+          error: "workflow gate returned an invalid resolution",
+        };
+      }
+      let completed = this.#gateResolutionState(entry);
+      if (completed.kind === "accepted_incomplete") {
+        await this.#awaitGateOperation(
+          () => entry.emitter.recoverAcceptedGates?.()
+        );
+        completed = this.#gateResolutionState(entry);
+      }
+      if (completed.kind !== "completed") {
+        return {
+          ok: false,
+          error: "workflow gate resolution is incomplete",
+          resolution,
+        };
+      }
+      this.#retirePendingGate(gateId, entry);
+      this.#flushDeferredGateCandidate(entry);
+      return { ok: true, resolution: completed.resolution };
     } catch (error) {
+      if (this.closed) {
+        return { ok: false, error: "session is closed" };
+      }
+      // resolveGate can lose its response after durable acceptance. Reconcile
+      // through the exact public recovery surfaces before classifying failure.
+      try {
+        let completed = this.#gateResolutionState(entry);
+        if (completed?.kind === "accepted_incomplete") {
+          await this.#awaitGateOperation(
+            () => entry.emitter.recoverAcceptedGates?.()
+          );
+          completed = this.#gateResolutionState(entry);
+        }
+        if (completed?.kind === "completed") {
+          this.#retirePendingGate(gateId, entry);
+          this.#flushDeferredGateCandidate(entry);
+          return { ok: true, resolution: completed.resolution };
+        }
+        if (completed?.kind === "accepted_incomplete") {
+          return {
+            ok: false,
+            error: "workflow gate resolution is incomplete",
+          };
+        }
+      } catch {
+        // Preserve the original resolution failure below.
+      }
+      if (this.closed) {
+        return { ok: false, error: "session is closed" };
+      }
+      const stillPending =
+        entry.emitter
+          .listPendingGates?.()
+          .some((gate) => gate?.gate_id === gateId) === true;
+      if (stillPending) {
+        entry.emitter.clearPreparedTerminalization?.(gateId);
+      } else {
+        this.#retirePendingGate(gateId, entry);
+        this.#quarantineGate(entry.emitter, gateId);
+        this.#discardDeferredGateCandidate();
+      }
       return {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      if (this.pendingGates.get(gateId) === entry) {
+        entry.resolving = false;
+      }
     }
   }
 
-  async #rejectGate(gateEmitter, gateId) {
+  #quarantineGate(gateEmitter, gateId) {
     try {
-      await gateEmitter?.resolveGate?.({ gate_id: gateId, answer: null });
+      // SDK 0.16.6's quarantine surface revokes the continuation and rejects
+      // its waiter. Sending `answer:null` is not a rejection operation: schema
+      // validation can leave the gate pending forever.
+      gateEmitter?.quarantineGate?.(gateId);
     } catch {
       // Best-effort: the concurrent run's own idle/hard-cap still bounds it.
+    }
+  }
+
+  #withAdapterClose(operation) {
+    let active = true;
+    let rejectClosed;
+    const closed = new Promise((_, reject) => {
+      rejectClosed = reject;
+    });
+    const cancel = (error) => {
+      if (!active) return;
+      active = false;
+      rejectClosed(error);
+    };
+    this.adapterWaiterCancellations.add(cancel);
+    let result;
+    try {
+      result = operation();
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    return Promise.race([Promise.resolve(result), closed]).finally(() => {
+      active = false;
+      this.adapterWaiterCancellations.delete(cancel);
+    });
+  }
+
+  async #awaitGateOperation(operation) {
+    const waiter = this.#withAdapterClose(operation);
+    this.inFlightGateAnswers.add(waiter);
+    try {
+      return await waiter;
+    } finally {
+      this.inFlightGateAnswers.delete(waiter);
+    }
+  }
+
+  #closeAdapter(error) {
+    this.closed = true;
+    try {
+      this.gateUnsubscribe?.();
+    } catch {
+      // Best-effort: the underlying session is being disposed below.
+    }
+    this.gateUnsubscribe = undefined;
+    for (const [gateId, entry] of this.pendingGates) {
+      this.#quarantineGate(entry.emitter, gateId);
+    }
+    this.pendingGates.clear();
+    this.#discardDeferredGateCandidate();
+    for (const cancel of [...this.adapterWaiterCancellations]) {
+      cancel(error);
     }
   }
 
@@ -687,10 +1287,10 @@ export class SdkSession {
     });
 
     try {
-      return await Promise.race([Promise.resolve().then(operation), timeout]);
+      return await Promise.race([this.#withAdapterClose(operation), timeout]);
     } catch (error) {
       if (error === timeoutError) {
-        this.closed = true;
+        this.#closeAdapter(timeoutError);
         void this.#disposeUnderlying().catch(() => {});
       }
       throw error;
@@ -737,14 +1337,13 @@ export class SdkSession {
     onArm?.({ arm: armIdle, suspendForGate, resumeAfterGate });
 
     try {
-      return await Promise.race([Promise.resolve().then(operation), timeout]);
+      return await Promise.race([this.#withAdapterClose(operation), timeout]);
     } catch (error) {
       if (error === idleError || error === hardCapError || error === gateError) {
-        this.closed = true;
+        this.#closeAdapter(error);
         // #35: a timeout/hard-cap/gate-window expiry tears down the session via
-        // #disposeUnderlying (not the public dispose()), so drop any pending gate
-        // here too — otherwise a late answerGate() would resolve an orphaned gate.
-        this.pendingGates.clear();
+        // #disposeUnderlying (not the public dispose()). #closeAdapter already
+        // rejects every sibling waiter and fences any pending gate.
         void this.#disposeUnderlying().catch(() => {});
       }
       throw error;
@@ -764,21 +1363,15 @@ export class SdkSession {
   }
 
   async dispose() {
-    this.closed = true;
-    // #35: drop any pending gate so a later answer is a no-op, unsubscribe the
-    // session-level gate listener, and forget active runs; the awaiting run is
-    // already being torn down by the disposal below.
-    this.pendingGates.clear();
-    this.activeGateRuns.length = 0;
-    try {
-      this.gateUnsubscribe?.();
-    } catch {
-      // Best-effort: the underlying session is being disposed anyway.
-    }
-    this.gateUnsubscribe = undefined;
+    this.#closeAdapter(new Error("GJC SDK session was disposed"));
     const disposal = this.#disposeUnderlying();
-    const commands = Promise.allSettled([this.queue, ...this.inFlightControls]);
-    await disposal;
+    const commands = Promise.allSettled([
+      this.queue,
+      ...this.inFlightGateAnswers,
+    ]);
+    const [disposalResult] = await Promise.allSettled([disposal]);
     await commands;
+    this.activeGateRuns.length = 0;
+    if (disposalResult.status === "rejected") throw disposalResult.reason;
   }
 }

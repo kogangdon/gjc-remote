@@ -14,7 +14,7 @@ import {
 
 export const SCHEMA = 'gjc-remote.issue55.observability-execution.v1';
 export const RECEIPT_BASENAME = 'issue55-observability.json';
-export const ENVIRONMENT = Object.freeze({ architecture: 'x64', bunVersion: '1.3.14', nodeVersion: 'v26.0.0', platform: 'linux' });
+export const ENVIRONMENT = Object.freeze({ architecture: 'x64', bunVersion: '1.4.0', nodeVersion: 'v26.0.0', platform: 'linux' });
 export const FACETS = Object.freeze([
   'bot-local-observability', 'daemon-owner-telemetry', 'daemon-invoke-telemetry',
   'daemon-lifecycle-telemetry', 'admitted-v3-correlation-fence',

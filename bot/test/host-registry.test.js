@@ -5,6 +5,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import {
   CAPABILITIES,
+  GATE_ANSWER_ERROR_CODES,
   MAX_WS_PAYLOAD_BYTES,
   PONG,
   PROTOCOL_VERSION,
@@ -397,7 +398,7 @@ test("heartbeat durations must be positive finite values", () => {
   }
 });
 
-test("adversarial: invoke idle/hard-cap durations must be positive finite values", () => {
+test("adversarial: invoke and gate-answer durations must be positive finite values", () => {
   const tokensByHostId = new Map([["host-a", "token-a"]]);
 
   for (const invokeIdleTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
@@ -411,6 +412,23 @@ test("adversarial: invoke idle/hard-cap durations must be positive finite values
       () => new HostRegistry({ port: 0, tokensByHostId, invokeHardCapMs }),
       /invokeHardCapMs must be a positive duration/
     );
+  }
+  for (const gateAnswerTimeoutMs of [0, -1, 1.5, 30_001, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new HostRegistry({ port: 0, tokensByHostId, gateAnswerTimeoutMs }),
+      /gateAnswerTimeoutMs must be an integer from 1 to 30000/
+    );
+  }
+});
+
+test("gate-answer timeout accepts its exact minimum and maximum", async () => {
+  for (const gateAnswerTimeoutMs of [1, 30_000]) {
+    const server = await startRegistry(undefined, { gateAnswerTimeoutMs });
+    try {
+      assert.equal(server.registry.gateAnswerTimeoutMs, gateAnswerTimeoutMs);
+    } finally {
+      await server.close();
+    }
   }
 });
 
@@ -2572,11 +2590,12 @@ test("Finding-1: a non-binding peer missing the bind-authority-verification capa
 // #35: workflow gate answer channel
 // ---------------------------------------------------------------------------
 
-test("#35 a gate_request fires onGate, suspends the invoke idle timer, and answerGate sends an answer frame", async () => {
+test("#35 answerGate sends a correlated frame and resumes idle timing only after acceptance", async () => {
   const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 40,
     invokeHardCapMs: 5000,
+    gateAnswerTimeoutMs: 1000,
     timers: timers.api,
   });
   try {
@@ -2625,15 +2644,38 @@ test("#35 a gate_request fires onGate, suspends the invoke idle timer, and answe
     assert.strictEqual(timers.timeoutHandleByDelay(5000), hardCapTimer);
 
     const answerFrame = once(socket, "message");
-    const answerResult = server.registry.answerGate("host-a", requestId, "g1", "Apple");
-    assert.deepEqual(answerResult, { ok: true });
+    const answerResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "Apple"
+    );
     const [rawAnswer] = await answerFrame;
-    assert.deepEqual(JSON.parse(rawAnswer.toString()), {
+    const parsedAnswer = JSON.parse(rawAnswer.toString());
+    assert.deepEqual(parsedAnswer, {
       type: "answer",
       requestId,
       gateId: "g1",
+      answerId: parsedAnswer.answerId,
       answer: "Apple",
     });
+    assert.equal(typeof parsedAnswer.answerId, "string");
+    assert.ok(parsedAnswer.answerId.length <= V0_LIMITS.REQUEST_ID);
+    assert.deepEqual(
+      timers.timeoutDelays.sort((a, b) => a - b),
+      [1000, 5000]
+    );
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: parsedAnswer.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+    assert.deepEqual(await answerResult, { ok: true });
     assert.deepEqual(
       timers.timeoutDelays.sort((a, b) => a - b),
       [40, 5000]
@@ -2669,11 +2711,11 @@ test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
 
-    assert.deepEqual(server.registry.answerGate("host-a", "nope", "g1", "x"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", "nope", "g1", "x"), {
       ok: false,
       error: "no in-flight request for that answer",
     });
-    assert.deepEqual(server.registry.answerGate("host-a", requestId, "g1", "x"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "g1", "x"), {
       ok: false,
       error: "no matching pending gate for that answer",
     });
@@ -2689,15 +2731,35 @@ test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
 
-    assert.deepEqual(server.registry.answerGate("host-a", requestId, "WRONG", "x"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "WRONG", "x"), {
       ok: false,
       error: "no matching pending gate for that answer",
     });
-    assert.equal(server.registry.answerGate("host-b", requestId, "g1", "x").ok, false);
+    assert.equal(
+      (await server.registry.answerGate("host-b", requestId, "g1", "x")).ok,
+      false
+    );
 
     const answerFrame = once(socket, "message");
-    assert.deepEqual(server.registry.answerGate("host-a", requestId, "g1", "yes"), { ok: true });
-    await answerFrame;
+    const answerResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "yes"
+    );
+    const [rawAnswer] = await answerFrame;
+    const answer = JSON.parse(rawAnswer.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+    assert.deepEqual(await answerResult, { ok: true });
     socket.send(JSON.stringify({ type: "event", requestId, done: true }));
     await resultPromise;
   } finally {
@@ -2705,7 +2767,7 @@ test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and
   }
 });
 
-test("#35 answering a gate re-arms the idle timer so a silent daemon still times out", async () => {
+test("#35 a rejected answer retains the same gate so a valid retry can resume the invoke", async () => {
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 40,
     invokeHardCapMs: 5000,
@@ -2735,11 +2797,59 @@ test("#35 answering a gate re-arms the idle timer so a silent daemon still times
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
 
-    const answerFrame = once(socket, "message");
-    server.registry.answerGate("host-a", requestId, "g1", "yes");
-    await answerFrame;
+    const invalidFrame = once(socket, "message");
+    const invalidResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "invalid"
+    );
+    const [rawInvalid] = await invalidFrame;
+    const invalid = JSON.parse(rawInvalid.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: invalid.answerId,
+        gateId: "g1",
+        accepted: false,
+        errorCode: GATE_ANSWER_ERROR_CODES.REJECTED,
+      },
+    }));
+    assert.deepEqual(await invalidResult, {
+      ok: false,
+      error: "gate answer was rejected",
+      code: GATE_ANSWER_ERROR_CODES.REJECTED,
+    });
+    assert.equal(
+      server.registry.pendingRequests.get(requestId)?.gateId,
+      "g1"
+    );
 
-    // Daemon stays silent after the answer: the re-armed idle timer must fire.
+    const validFrame = once(socket, "message");
+    const validResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "valid"
+    );
+    const [rawValid] = await validFrame;
+    const valid = JSON.parse(rawValid.toString());
+    assert.notEqual(valid.answerId, invalid.answerId);
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: valid.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+    assert.deepEqual(await validResult, { ok: true });
+
+    // Only confirmed acceptance re-arms the invoke idle timer.
     assert.deepEqual(await resultPromise, {
       ok: false,
       error: "timed out waiting for host response",
@@ -2750,7 +2860,7 @@ test("#35 answering a gate re-arms the idle timer so a silent daemon still times
 });
 
 
-test("adversarial: a late answer after the invoke has already settled (done) is rejected without throwing", async () => {
+test("adversarial: DONE may precede an exact answer receipt without creating false success or a hang", async () => {
   const server = await startRegistry();
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -2777,13 +2887,32 @@ test("adversarial: a late answer after the invoke has already settled (done) is 
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
 
-    server.registry.answerGate("host-a", requestId, "g1", "yes");
+    const answerFrame = once(socket, "message");
+    const answerResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "yes"
+    );
+    const [rawAnswer] = await answerFrame;
+    const answer = JSON.parse(rawAnswer.toString());
     socket.send(JSON.stringify({ type: "event", requestId, done: true }));
     await resultPromise;
+    assert.equal(server.registry.pendingGateAnswers.has(answer.answerId), true);
 
-    // The request is gone: a late answer for the same (now-stale) requestId/gateId
-    // must be rejected, not throw.
-    assert.deepEqual(server.registry.answerGate("host-a", requestId, "g1", "late"), {
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+    assert.deepEqual(await answerResult, { ok: true });
+
+    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "g1", "late"), {
       ok: false,
       error: "no in-flight request for that answer",
     });
@@ -2792,7 +2921,143 @@ test("adversarial: a late answer after the invoke has already settled (done) is 
   }
 });
 
-test("adversarial: a second answer for the same requestId/gateId after the gate was already answered is rejected", async () => {
+test("adversarial: a rejected receipt after DONE settles false without reviving the invoke", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "g1",
+        prompt: "p",
+        kind: "question",
+      },
+    }));
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
+    );
+
+    const answerFrame = once(socket, "message");
+    const answerResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "invalid"
+    );
+    const [rawAnswer] = await answerFrame;
+    const answer = JSON.parse(rawAnswer.toString());
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    assert.equal((await resultPromise).ok, true);
+    assert.equal(server.registry.pendingRequests.has(requestId), false);
+
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: "g1",
+        accepted: false,
+        errorCode: GATE_ANSWER_ERROR_CODES.REJECTED,
+      },
+    }));
+    assert.deepEqual(await answerResult, {
+      ok: false,
+      error: "gate answer was rejected",
+      code: GATE_ANSWER_ERROR_CODES.REJECTED,
+    });
+    assert.equal(server.registry.pendingGateAnswers.size, 0);
+    assert.equal(server.registry.pendingRequests.has(requestId), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("receipt capacity remains bounded after DONE and is isolated by socket", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(new Map([["host-a", "token-a"], ["host-b", "token-b"]]), {
+    timers: timers.api,
+  });
+  const outstanding = [];
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    let sentAnswers = 0;
+    socket.on("message", (raw) => {
+      if (JSON.parse(raw.toString()).type === "answer") sentAnswers += 1;
+    });
+    async function openGate(host, peer) {
+      const invokeFrame = once(peer, "message");
+      const done = server.registry.invoke(host, "/workspace",
+        { kind: "prompt", message: "gate" }, () => {}, undefined, () => {});
+      const [raw] = await invokeFrame;
+      const { requestId } = JSON.parse(raw.toString());
+      peer.send(JSON.stringify({
+        type: "event", requestId,
+        event: { type: "gate_request", gateId: "gate", prompt: "p", kind: "question" },
+      }));
+      await waitFor(() => server.registry.pendingRequests.get(requestId)?.gatePending);
+      return { requestId, done };
+    }
+    async function submit(host, peer, gate) {
+      const frame = once(peer, "message");
+      const result = server.registry.answerGate(host, gate.requestId, "gate", "yes");
+      outstanding.push(result);
+      const [raw] = await frame;
+      return { answer: JSON.parse(raw.toString()), result };
+    }
+    const retained = [];
+    for (let i = 0; i < V0_LIMITS.MAX_PENDING_PER_HOST; i += 1) {
+      const gate = await openGate("host-a", socket);
+      retained.push(await submit("host-a", socket, gate));
+      socket.send(JSON.stringify({ type: "event", requestId: gate.requestId, done: true }));
+      await gate.done;
+    }
+    assert.equal(server.registry.pendingRequests.size, 0);
+    assert.equal(server.registry.pendingGateAnswers.size, V0_LIMITS.MAX_PENDING_PER_HOST);
+    const overflow = await openGate("host-a", socket);
+    assert.deepEqual(await server.registry.answerGate("host-a", overflow.requestId, "gate", "yes"), {
+      ok: false, error: "host has too many unconfirmed gate answers",
+    });
+    assert.equal(sentAnswers, V0_LIMITS.MAX_PENDING_PER_HOST);
+    assert.equal(server.registry.pendingRequests.get(overflow.requestId).gatePending, true);
+
+    const peer = await server.connect("host-b", "token-b");
+    const otherGate = await openGate("host-b", peer);
+    await submit("host-b", peer, otherGate);
+    assert.equal(server.registry.pendingGateAnswers.size, V0_LIMITS.MAX_PENDING_PER_HOST + 1);
+
+    const first = retained[0];
+    socket.send(JSON.stringify({
+      type: "event", requestId: first.answer.requestId,
+      event: { type: "gate_answer_result", answerId: first.answer.answerId, gateId: "gate", accepted: true },
+    }));
+    assert.deepEqual(await first.result, { ok: true });
+    await submit("host-a", socket, overflow);
+    assert.equal(sentAnswers, V0_LIMITS.MAX_PENDING_PER_HOST + 1);
+    assert.equal(server.registry.pendingGateAnswers.size, V0_LIMITS.MAX_PENDING_PER_HOST + 1);
+    await server.close();
+    await Promise.all([overflow.done, otherGate.done]);
+    await Promise.all(outstanding);
+    assert.equal(server.registry.pendingGateAnswers.size, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: a second answer for the same gate is rejected while its receipt is outstanding", async () => {
   const server = await startRegistry();
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -2819,18 +3084,39 @@ test("adversarial: a second answer for the same requestId/gateId after the gate 
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
 
-    const firstAnswer = server.registry.answerGate("host-a", requestId, "g1", "yes");
-    assert.deepEqual(firstAnswer, { ok: true });
+    const answerFrame = once(socket, "message");
+    const firstAnswer = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "yes"
+    );
+    const [rawAnswer] = await answerFrame;
+    const answer = JSON.parse(rawAnswer.toString());
 
-    // Same requestId, same gateId, submitted again before `done`: gatePending is
-    // already false, so this must be rejected rather than sending a duplicate
-    // answer frame to the daemon.
-    const secondAnswer = server.registry.answerGate("host-a", requestId, "g1", "yes-again");
+    // Only one answer attempt per gate may await a receipt at a time.
+    const secondAnswer = await server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "yes-again"
+    );
     assert.deepEqual(secondAnswer, {
       ok: false,
-      error: "no matching pending gate for that answer",
+      error: "an answer for that gate is already pending",
     });
 
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+    assert.deepEqual(await firstAnswer, { ok: true });
     socket.send(JSON.stringify({ type: "event", requestId, done: true }));
     await resultPromise;
   } finally {
@@ -2838,10 +3124,13 @@ test("adversarial: a second answer for the same requestId/gateId after the gate 
   }
 });
 
-test("adversarial: a gate pending across multiple idle windows never times out, only silence after answering does", async () => {
+test("adversarial: a bounded answer-receipt timeout retains the gate and ignores a late receipt", async () => {
+  const timers = createManualTimers();
   const server = await startRegistry(undefined, {
     invokeIdleTimeoutMs: 30,
     invokeHardCapMs: 5000,
+    gateAnswerTimeoutMs: 70,
+    timers: timers.api,
   });
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -2854,10 +3143,6 @@ test("adversarial: a gate pending across multiple idle windows never times out, 
       undefined,
       () => {}
     );
-    let settled = false;
-    resultPromise.then(() => {
-      settled = true;
-    });
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
 
@@ -2872,23 +3157,333 @@ test("adversarial: a gate pending across multiple idle windows never times out, 
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
 
-    // Wait across several multiples of the idle window while the gate is
-    // pending: the invoke must survive every one of them.
-    await new Promise((resolve) => setTimeout(resolve, 30 * 6));
-    assert.equal(settled, false);
-
-    server.registry.answerGate("host-a", requestId, "g1", "yes");
-
-    // The daemon goes silent after the answer: the re-armed idle timer must
-    // now fire.
-    assert.deepEqual(await resultPromise, {
+    const firstFrame = once(socket, "message");
+    const firstResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "first"
+    );
+    const [rawFirst] = await firstFrame;
+    const first = JSON.parse(rawFirst.toString());
+    timers.runTimeoutByDelay(70);
+    assert.deepEqual(await firstResult, {
       ok: false,
-      error: "timed out waiting for host response",
+      error: "timed out waiting for gate answer receipt",
+      code: GATE_ANSWER_ERROR_CODES.FAILED,
     });
+    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g1");
+
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: first.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+
+    const retryFrame = once(socket, "message");
+    const retryResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "retry"
+    );
+    const [rawRetry] = await retryFrame;
+    const retry = JSON.parse(rawRetry.toString());
+    assert.notEqual(retry.answerId, first.answerId);
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: retry.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+    assert.deepEqual(await retryResult, { ok: true });
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    await resultPromise;
   } finally {
     await server.close();
   }
 });
+
+test("adversarial: answer receipts are fenced by exact socket, request, gate, and answer ids", async () => {
+  const server = await startRegistry(
+    new Map([
+      ["host-a", "token-a"],
+      ["host-b", "token-b"],
+    ])
+  );
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const otherSocket = await server.connect("host-b", "token-b");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "g1",
+        prompt: "p",
+        kind: "question",
+      },
+    }));
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
+    );
+
+    const answerFrame = once(socket, "message");
+    const answerResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "yes"
+    );
+    let answerSettled = false;
+    answerResult.then(() => {
+      answerSettled = true;
+    });
+    const [rawAnswer] = await answerFrame;
+    const answer = JSON.parse(rawAnswer.toString());
+    const receipt = (overrides = {}) => JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: "g1",
+        accepted: true,
+        ...overrides,
+      },
+    });
+
+    socket.send(receipt({ answerId: "different-answer" }));
+    socket.send(receipt({ gateId: "different-gate" }));
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId: "different-request",
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: "g1",
+        accepted: true,
+      },
+    }));
+    otherSocket.send(receipt());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(answerSettled, false);
+    assert.equal(server.registry.pendingGateAnswers.has(answer.answerId), true);
+    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g1");
+
+    socket.send(receipt());
+    assert.deepEqual(await answerResult, { ok: true });
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    await resultPromise;
+    otherSocket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: disconnect settles an outstanding answer false and clears its timer", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "g1",
+        prompt: "p",
+        kind: "question",
+      },
+    }));
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
+    );
+
+    const answerFrame = once(socket, "message");
+    const answerResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "yes"
+    );
+    await answerFrame;
+    const closed = once(socket, "close");
+    socket.terminate();
+    await closed;
+
+    assert.deepEqual(await answerResult, {
+      ok: false,
+      error: "host disconnected before gate answer was confirmed",
+      code: GATE_ANSWER_ERROR_CODES.FAILED,
+    });
+    assert.equal(server.registry.pendingGateAnswers.size, 0);
+    assert.equal((await resultPromise).ok, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: registry disposal settles an outstanding answer false", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      () => {}
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "g1",
+        prompt: "p",
+        kind: "question",
+      },
+    }));
+    await waitFor(
+      () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
+    );
+
+    const answerFrame = once(socket, "message");
+    const answerResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "yes"
+    );
+    await answerFrame;
+    await server.close();
+
+    assert.deepEqual(await answerResult, {
+      ok: false,
+      error: "host disconnected before gate answer was confirmed",
+      code: GATE_ANSWER_ERROR_CODES.FAILED,
+    });
+    assert.equal(server.registry.pendingGateAnswers.size, 0);
+    assert.equal((await resultPromise).ok, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("adversarial: accepting a predecessor receipt preserves a successor gate", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const gates = [];
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      (gate) => gates.push(gate)
+    );
+    const [raw] = await invokeFrame;
+    const { requestId } = JSON.parse(raw.toString());
+    const sendGate = (gateId) => socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId,
+        prompt: gateId,
+        kind: "question",
+      },
+    }));
+    const sendAccepted = (answer) => socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: answer.gateId,
+        accepted: true,
+      },
+    }));
+
+    sendGate("g1");
+    await waitFor(() => gates.length === 1);
+    const firstFrame = once(socket, "message");
+    const firstResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g1",
+      "first"
+    );
+    const [rawFirst] = await firstFrame;
+    const first = JSON.parse(rawFirst.toString());
+
+    sendGate("g2");
+    await waitFor(() => gates.length === 2);
+    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g2");
+    sendAccepted(first);
+    assert.deepEqual(await firstResult, { ok: true });
+    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g2");
+    assert.equal(
+      server.registry.pendingRequests.get(requestId)?.gatePending,
+      true
+    );
+
+    const secondFrame = once(socket, "message");
+    const secondResult = server.registry.answerGate(
+      "host-a",
+      requestId,
+      "g2",
+      "second"
+    );
+    const [rawSecond] = await secondFrame;
+    const second = JSON.parse(rawSecond.toString());
+    sendAccepted(second);
+    assert.deepEqual(await secondResult, { ok: true });
+    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    assert.equal((await resultPromise).ok, true);
+  } finally {
+    await server.close();
+  }
+});
+
 test("phase 1 gates readiness capability advertisement atomically", async () => {
   const server = await startRegistry();
   try {

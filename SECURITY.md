@@ -21,6 +21,13 @@ hosts. This is the intended capability, not a bug; secure it accordingly.
 - **Authorization** is enforced by `GJC_BOT_ALLOWED_USERS` (Discord user IDs).
   The bot ships fail-closed: `GJC_REMOTE_REQUIRE_ALLOWLIST=1` refuses to start
   with an empty allowlist.
+- **Runtime ownership** is split deliberately. `gjc-remote` owns host
+  authentication, channel routing, workDir selection, and workspace policy.
+  The embedded SDK owns provider/model catalogs, provider authentication, and
+  agent-turn semantics. SDK Broker/Router surfaces are not a second authority
+  path in this repository: no external-session adapter or migration is
+  implemented.
+
 ## Management mapping control plane
 
 #44 management mapping is a separate, native-gated control plane. Its sole
@@ -146,5 +153,5 @@ disclosure. There is no bug-bounty program; this is a community project.
 ## Supported versions
 
 This project tracks a specific embedded `@gajae-code/coding-agent` release
-(currently `0.12.21`, pinned in `daemon/package.json` and `bun.lock`). Security
+(currently `0.16.6`, pinned in `daemon/package.json` and `bun.lock`). Security
 fixes land on `main`; there are no long-term support branches.

@@ -1,6 +1,18 @@
 # Issue #62 SDK isolation probe
 
-Status: focused real-SDK probe for the approved issue #62 boundary. The probe checks the installed daemon dependency `@gajae-code/coding-agent` **0.12.21** with Bun **1.3.14**. Each receipt carries separate `approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of the approved base. A deterministic SHA-256 digest covers these four files, in this exact order: `daemon/test-fixtures/sdk-isolation-probe.mjs`, `daemon/test/sdk-isolation-probe.test.js`, `docs/verification/issue62-evidence.md`, `CONTEXT.md`.
+Status: the focused real-SDK probe passes for the installed daemon
+dependency `@gajae-code/coding-agent` **0.16.6** with Bun **1.4.0 or newer**.
+The current parent-run wrapper passes all three tests on Windows x64 with
+Bun 1.4.0 and Node wrapper 26.7.0, including both creation orders and zero
+network attempts. This is scoped policy evidence, not tenant isolation.
+Each receipt carries separate
+`approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of
+the approved base. The approved original base remains
+`a5bb530bd5a063b6571a7ba963e938bb6f97616f`. A deterministic SHA-256 digest
+covers these four files, in this exact order:
+`daemon/test-fixtures/sdk-isolation-probe.mjs`,
+`daemon/test/sdk-isolation-probe.test.js`,
+`docs/verification/issue62-evidence.md`, `CONTEXT.md`.
 The focused wrapper requires Node **>=26**; its `nodeWrapperVersion` field records the actual Node runner separately from Bun's compatibility `nodeVersion` field. The source digest is emitted in the receipt rather than copied here, avoiding a self-referential evidence file.
 
 ## Sanitized receipts
@@ -12,7 +24,98 @@ The Node wrapper is the sole durable receipt writer. It removes any stale output
 
 The Bun fixture writes no repository artifact and emits a bounded structured receipt to stdout only. Raw stdout/stderr and unredacted temporary paths are never persisted. The wrapper owns the final files; this document is the durable reader/reference. Receipts are evidence attachments, not source-controlled proof by themselves.
 
-## Boundary and commands
+These ignored mutable paths contain current-run receipts but are not permanent
+proof of any future checkout. A current receipt must independently report `sdkVersionExpected`,
+`sdkVersionObserved`, `daemonDependencyVersion`, and `lockfileVersionEvidence`
+as `0.16.6`, and its ordered working-tree digest must match the four live files.
+The wrapper removes each stale order-specific output before running that order.
+
+## SDK 0.16.6 observed probe boundary
+
+The installed 0.16.6 package source and exports map were inspected before
+retargeting the probe. The scoped surfaces it exercises remain available:
+
+- `@gajae-code/coding-agent/sdk` exports `createAgentSession` and `Settings`;
+  omitted settings still select `Settings.loadForScope({ cwd, agentDir })`.
+- `session/session-manager`, `session/auth-storage`,
+  `config/model-registry`, `config/model-resolver`, and `capability` remain
+  exported package subpaths with the constructors and functions used by the
+  fixture.
+- `createAgentSession` still accepts the fixture's explicit `SessionManager`
+  and startup-disable options. SDK-owned sessions dispose their scoped model
+  registry, empty auth storage, settings, and session manager; the C oracle
+  retains explicit ownership of its registry, empty auth storage, and settings.
+
+The source inspection above is distinct from execution evidence. The executed
+probe passes both creation orders, divergent per-workDir settings/model policy,
+capability lookups, the no-model/no-session C negative, fail-closed network and
+host-environment guards, bounded redaction, and explicit cleanup accounting.
+Canonical `createAgentSession` and `SessionManager` imports are exercised by
+the real factory path, not inferred merely from package declarations.
+
+The queued-follow-up liveness gap remains in this published package. The daemon
+contains it by rejecting `steer` and `follow_up` while a prompt is active,
+before SDK queue admission; idle controls remain prompt-equivalent FIFO work.
+Upstream issue
+[`Yeachan-Heo/gajae-code#5351`](https://github.com/Yeachan-Heo/gajae-code/issues/5351)
+was closed after
+[#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371) was squash-merged
+to upstream `dev` on 2026-09-07. That does not put the fix in the already
+published 0.16.6 package. Installed 0.16.6 has
+`#scheduleNonAdmittedSteerContinuation()`, but `#queueFollowUp()` still only
+attempts the idle-gated `#scheduleQueuedFollowUpContinuation()` on the
+empty-queue transition; it has no
+`#scheduleNonAdmittedQueuedContinuation()` from #5371. The 0.16.6 changelog
+lists only the smoke-test timing and SDK lifecycle-replay fixes for that
+release. Issue closure on `dev` is therefore not release inclusion. A supported
+public ownership lifecycle is requested in
+[`Yeachan-Heo/gajae-code#5429`](https://github.com/Yeachan-Heo/gajae-code/issues/5429);
+the contract oracle verifies fail-closed containment independently of this
+isolation probe.
+
+## Historical SDK 0.16.4 observed boundary
+
+The following dated result belongs to the prior 0.16.4 dependency. It remains
+historical evidence and is not mechanically relabeled as a 0.16.6 result.
+
+On 2026-09-06, `node --test daemon/test/sdk-isolation-probe.test.js` passed
+all three tests on native Windows x64, Bun 1.4.0, Node wrapper v26.7.0.
+Both A→B and B→A runs observed:
+
+- SDK-owned `Settings.loadForScope` instances and policies are distinct and
+  remain stable after sibling creation. No global `Settings.init` occurs.
+- A and B retain their own active model and available canonical resolution.
+- Explicit-settings and registered-cwd capability reads select the correct
+  per-workDir provider; the disabled sibling loader is not invoked.
+- An **unregistered** cwd capability lookup and global introspection observe
+  `LAST_CREATED`. These APIs have no session scope in this test; that observation
+  is not evidence that the scoped A/B lookup leaks.
+- Unfiltered canonical model lookup selects provider A in both scopes, while
+  available-model lookup respects A/B policy. Consumers must use the appropriate
+  availability-aware API, not treat unfiltered catalog data as authorization.
+- C has no permitted model and constructs no session; no prompt is submitted.
+- Zero fetch/preconnect calls pass the fixture guard. Startup model-registry
+  polling is disabled before SDK import and unauthenticated discovery providers
+  are disabled in fixture settings. This does not claim network-free production
+  startup or exercise provider credentials, profile activation, or live transport.
+
+The child records SDK-owned session/settings cleanup and explicit fixture-owned
+store cleanup. The Node wrapper owns its temporary root and removes it only
+after the child exits, recording the exact cleanup boundary. Both runs observed
+successful resource cleanup and first-attempt parent removal. A prior standalone
+child removal returned Windows `EPERM`; post-exit removal does not identify
+which process-owned handle or store caused it, and is not reported as child
+cleanup. Standalone diagnostic runs retain their own fail-closed cleanup path.
+
+`sourceIdentity.runtimeHead` names Git HEAD, not uncommitted bytes. The ordered
+working-tree digest identifies only the four listed files. Neither field
+promotes a dirty checkout into release provenance. Artifact receipts include
+actual timestamps and digests; these are regenerated after source edits.
+
+The records below are the **historical 0.12.21 baseline**, not the current
+contents of the mutable receipt paths above.
+
+## Historical 0.12.21 boundary and commands
 
 ```text
 node --test daemon/test/sdk-isolation-probe.test.js
@@ -134,4 +237,10 @@ fixture stores only; no broker or credential claim is made.
 
 ## Residual caveat
 
-The probe measures current SDK behavior; it does not repair process-global capability/model-provider state or claim full isolation. Preserve the existing requirement to rerun this focused probe after every SDK bump before changing the caveat. A reproducible global direction is evidence for the current upstream/architecture boundary, not a local workaround authorization.
+When executed against matching version and provenance, the probe measures the
+installed SDK behavior; it does not repair process-global
+capability/model-provider state or claim full isolation. Current 0.16.6
+receipts do not remove those limits. Preserve the requirement to rerun this focused
+probe after every SDK bump before changing the caveat. A reproducible global
+direction is evidence only for the exact observed upstream/architecture
+boundary, not a local workaround authorization.
