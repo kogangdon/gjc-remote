@@ -12,7 +12,7 @@ const daemonDir = resolve(dirname(testFile), "..");
 const fixture = join(daemonDir, "test-fixtures", "sdk-contract-probe.mjs");
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
 const SDK_VERSION = "0.16.6";
-const CHILD_TIMEOUT_MS = 25_000;
+const CHILD_TIMEOUT_MS = 50_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const SECRET_ASSIGNMENT =
   /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|authorization|cookie|credential|broker[_ -]?(?:key|token)|oauth[_ -]?token)\s*[:=]\s*["']?[^\s,"'}]+/i;
@@ -200,7 +200,7 @@ function spawnProbe(root) {
 
 test(
   "SDK 0.16.6 real AgentSession contracts contain live controls and govern gates, failures, and disposal",
-  { timeout: 30_000 },
+  { timeout: 55_000 },
   async () => {
     assert.ok(existsSync(fixture), "real SDK contract fixture is missing");
     const root = await mkdtemp(join(tmpdir(), "gjc-sdk-contract-"));

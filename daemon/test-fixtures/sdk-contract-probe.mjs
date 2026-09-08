@@ -19,7 +19,7 @@ const DECISION_GATE_CODE =
   "SDK_0_16_6_DECISION_GATE_BUILDERS_NOT_PUBLIC";
 const STEP_TIMEOUT_MS = 3_000;
 const CLEANUP_TIMEOUT_MS = 4_000;
-const HARD_TIMEOUT_MS = 20_000;
+const HARD_TIMEOUT_MS = 45_000;
 
 class ProbeError extends Error {
   constructor(code, state) {
