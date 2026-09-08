@@ -1,6 +1,18 @@
 # Issue #62 SDK isolation probe
 
-Status: focused real-SDK probe for the approved issue #62 boundary. The runnable probe targets the installed daemon dependency `@gajae-code/coding-agent` **0.16.4** with Bun **1.4.0 or newer**. Each receipt carries separate `approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of the approved base. A deterministic SHA-256 digest covers these four files, in this exact order: `daemon/test-fixtures/sdk-isolation-probe.mjs`, `daemon/test/sdk-isolation-probe.test.js`, `docs/verification/issue62-evidence.md`, `CONTEXT.md`.
+Status: the focused real-SDK probe passes for the installed daemon
+dependency `@gajae-code/coding-agent` **0.16.6** with Bun **1.4.0 or newer**.
+The current parent-run wrapper passes all three tests on Windows x64 with
+Bun 1.4.0 and Node wrapper 26.7.0, including both creation orders and zero
+network attempts. This is scoped policy evidence, not tenant isolation.
+Each receipt carries separate
+`approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of
+the approved base. The approved original base remains
+`a5bb530bd5a063b6571a7ba963e938bb6f97616f`. A deterministic SHA-256 digest
+covers these four files, in this exact order:
+`daemon/test-fixtures/sdk-isolation-probe.mjs`,
+`daemon/test/sdk-isolation-probe.test.js`,
+`docs/verification/issue62-evidence.md`, `CONTEXT.md`.
 The focused wrapper requires Node **>=26**; its `nodeWrapperVersion` field records the actual Node runner separately from Bun's compatibility `nodeVersion` field. The source digest is emitted in the receipt rather than copied here, avoiding a self-referential evidence file.
 
 ## Sanitized receipts
@@ -12,7 +24,54 @@ The Node wrapper is the sole durable receipt writer. It removes any stale output
 
 The Bun fixture writes no repository artifact and emits a bounded structured receipt to stdout only. Raw stdout/stderr and unredacted temporary paths are never persisted. The wrapper owns the final files; this document is the durable reader/reference. Receipts are evidence attachments, not source-controlled proof by themselves.
 
-## SDK 0.16.4 observed boundary
+These ignored mutable paths contain current-run receipts but are not permanent
+proof of any future checkout. A current receipt must independently report `sdkVersionExpected`,
+`sdkVersionObserved`, `daemonDependencyVersion`, and `lockfileVersionEvidence`
+as `0.16.6`, and its ordered working-tree digest must match the four live files.
+The wrapper removes each stale order-specific output before running that order.
+
+## SDK 0.16.6 observed probe boundary
+
+The installed 0.16.6 package source and exports map were inspected before
+retargeting the probe. The scoped surfaces it exercises remain available:
+
+- `@gajae-code/coding-agent/sdk` exports `createAgentSession` and `Settings`;
+  omitted settings still select `Settings.loadForScope({ cwd, agentDir })`.
+- `session/session-manager`, `session/auth-storage`,
+  `config/model-registry`, `config/model-resolver`, and `capability` remain
+  exported package subpaths with the constructors and functions used by the
+  fixture.
+- `createAgentSession` still accepts the fixture's explicit `SessionManager`
+  and startup-disable options. SDK-owned sessions dispose their scoped model
+  registry, empty auth storage, settings, and session manager; the C oracle
+  retains explicit ownership of its registry, empty auth storage, and settings.
+
+The source inspection above is distinct from execution evidence. The executed
+probe passes both creation orders, divergent per-workDir settings/model policy,
+capability lookups, the no-model/no-session C negative, fail-closed network and
+host-environment guards, bounded redaction, and explicit cleanup accounting.
+Canonical `createAgentSession` and `SessionManager` imports are exercised by
+the real factory path, not inferred merely from package declarations.
+
+The separate queued-follow-up liveness blocker also remains unresolved in this
+published package. Upstream issue
+[`Yeachan-Heo/gajae-code#5351`](https://github.com/Yeachan-Heo/gajae-code/issues/5351)
+was closed after
+[#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371) was squash-merged
+to upstream `dev` on 2026-09-07. That does not put the fix in the already
+published 0.16.6 package. Installed 0.16.6 has
+`#scheduleNonAdmittedSteerContinuation()`, but `#queueFollowUp()` still only
+attempts the idle-gated `#scheduleQueuedFollowUpContinuation()` on the
+empty-queue transition; it has no
+`#scheduleNonAdmittedQueuedContinuation()` from #5371. The 0.16.6 changelog
+lists only the smoke-test timing and SDK lifecycle-replay fixes for that
+release. Issue closure on `dev` is therefore not release inclusion, and this
+isolation probe does not substitute for the separate real contract oracle.
+
+## Historical SDK 0.16.4 observed boundary
+
+The following dated result belongs to the prior 0.16.4 dependency. It remains
+historical evidence and is not mechanically relabeled as a 0.16.6 result.
 
 On 2026-09-06, `node --test daemon/test/sdk-isolation-probe.test.js` passed
 all three tests on native Windows x64, Bun 1.4.0, Node wrapper v26.7.0.
@@ -173,4 +232,10 @@ fixture stores only; no broker or credential claim is made.
 
 ## Residual caveat
 
-The probe measures current SDK behavior; it does not repair process-global capability/model-provider state or claim full isolation. Preserve the existing requirement to rerun this focused probe after every SDK bump before changing the caveat. A reproducible global direction is evidence for the current upstream/architecture boundary, not a local workaround authorization.
+When executed against matching version and provenance, the probe measures the
+installed SDK behavior; it does not repair process-global
+capability/model-provider state or claim full isolation. Current 0.16.6
+receipts do not remove those limits. Preserve the requirement to rerun this focused
+probe after every SDK bump before changing the caveat. A reproducible global
+direction is evidence only for the exact observed upstream/architecture
+boundary, not a local workaround authorization.

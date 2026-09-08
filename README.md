@@ -2,10 +2,19 @@
 
 Discord-controlled remote GJC sessions.
 
-> **SDK 0.16.4 upgrade candidate: BLOCKED.** A late follow-up can remain queued
-> without a successor run, holding subsequent commands until cancellation or
-> timeout. The real SDK oracle reproduces this defect; passing regression tests
-> and smoke do not clear it. See [CHANGELOG.md](CHANGELOG.md#upgrade-blocker).
+> **SDK 0.16.6 upgrade candidate: BLOCKED.** The current real SDK oracle
+> reproduces a late follow-up remaining queued without a successor run after
+> `waitForIdle()` settles. This is fresh 0.16.6 evidence, not an inherited result.
+> Upstream [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is
+> fixed on the development branch by
+> [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that
+> lifecycle wakeup fix is absent from both the `v0.16.6` tag and the actual
+> published `@gajae-code/coding-agent@0.16.6` npm tarball. Development-source
+> status, regression tests, and smoke alone do not clear the installed package.
+> The candidate remains `BLOCK` under
+> `SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`. Internal queued-control
+> ownership hooks are a separate blocker. See
+> [CHANGELOG.md](CHANGELOG.md#upgrade-blocker).
 
 > **⚠️ Security: this grants remote code execution.** A mapped Discord channel
 > runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
@@ -55,8 +64,10 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    no completion boundary. SDK failure outcomes reject the invocation. Each
    request receives its event stream, and later controls rejoin the FIFO. Idle
    sessions (no requests for 1 hour) are disposed automatically.
-   Live controls use the SDK's public `sendUserMessage` promotion callbacks and
-   carry literal text; they do not expand CLI prompt templates.
+   Live controls carry literal text without expanding CLI prompt templates.
+   Their exact ownership currently depends on internal SDK correlation hooks
+   (`queuedAtDispatch` / `onQueuedPromoted`), not an established generic public
+   embedder contract. This is a separate upgrade blocker; see the changelog.
    Workflow answers use correlated daemon receipts: sending an answer is not
    acceptance. Rejected answers retain the same live gate for retry; a completed
    or replaced gate is never silently answered by a retry or converted into a
@@ -187,7 +198,7 @@ bun run --filter '@gjc-remote/daemon' start
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
 daemon runs on Bun (>=1.4.0) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.16.4**
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.16.6**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
@@ -208,25 +219,33 @@ surfaces are reserved for separate evaluation as a possible future
 external-session path. Neither is wired into this repository, and this upgrade
 implements no Broker/Router or product-policy migration.
 
-SDK 0.16.4 replaces the retired bundled `team` command with `autoresearch`.
-After deploying this upgrade, run `npm run register` from `bot/` to replace
-the guild slash-command catalog. Registration is an explicit operator action;
-upgrading dependencies alone does not change Discord's stored commands.
+SDK 0.16.6 retains the bundled catalog change introduced in 0.16.4: the retired
+`team` command is replaced by `autoresearch`. After deploying this upgrade, run
+`npm run register` from `bot/` to replace the guild slash-command catalog.
+Registration is an explicit operator action; upgrading dependencies alone does
+not change Discord's stored commands.
 
-> **SDK update status:** `@gajae-code/coding-agent` is pinned to **0.16.4** and
+> **SDK update status:** `@gajae-code/coding-agent` is pinned to **0.16.6** and
 > the daemon requires **Bun 1.4.0 or newer**. The
 > [current scoped isolation evidence](docs/verification/issue62-evidence.md)
 > distinguishes per-workDir policy from unscoped SDK state. Adapter regressions,
 > the real-SDK contract oracle, canonical imports, and local smoke are separate
 > candidate checks; they do not establish tenant isolation or Broker/Router
-> compatibility. Historical release attestations do not transfer to this pin.
+> compatibility. Historical release attestations and oracle receipts do not
+> transfer to this pin.
+>
+> **Historical 0.16.4 blocker evidence:** the real-SDK oracle observed
+> `waitForIdle()` resolving with the exact executable late follow-up still
+> queued and no successor run. Its receipt recorded `BLOCK`
+> (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). That is retained as
+> old-run evidence, not a current 0.16.6 oracle result.
 >
 > **Historical 0.12.21 verification:** that pin superseded 0.12.7, and its
 > 2026-08-09 verification covered package/lock reconciliation, canonical SDK
 > imports, root/workspace regression suites, local smoke (`SMOKE_OK`), and
 > manual bot/daemon runtime execution. Provider/model switch coverage was
 > environment-dependent. This is retained as old-run evidence, not evidence for
-> 0.16.4.
+> 0.16.6.
 
 **Optional environment variables** — beyond the required keys above:
 

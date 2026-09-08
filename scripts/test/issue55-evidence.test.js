@@ -29,7 +29,7 @@ import {
   writeSnapshot,
 } from '../issue55-evidence.js';
 
-const SDK_INTEGRITY = 'sha512-t6iHwJBOpfbZYdpCfz8RxRpx22v9eQUB4PZmMad+F7jPTFLDZRVFiPHcBe+GBKx/Yr5iVU8nsdpxQCya/z7hbg==';
+const SDK_INTEGRITY = 'sha512-53/Mdppx1gDzdtslKpGpuhVEU9he5+G7WfaHCXdbXRBYAbjkKBVwL9xFN9bAlRbX+gwWRShvr/dnYmTV2PHrWw==';
 const BUN_DIGEST = 'e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4';
 const logicalLaunch = (command) => [...command];
 
@@ -46,14 +46,14 @@ function fixture() {
   };
   write('package.json', '{"version":"0.3.1"}\n');
   write('bot/package.json', '{"version":"0.3.1"}\n');
-  write('daemon/package.json', '{"version":"0.3.1","dependencies":{"@gajae-code/coding-agent":"0.16.4"}}\n');
+  write('daemon/package.json', '{"version":"0.3.1","dependencies":{"@gajae-code/coding-agent":"0.16.6"}}\n');
   write('native-control/package.json', '{"version":"1.0.0","nativeControlContract":{"version":4,"revision":3,"napi":8,"platforms":["linux-x64","linux-arm64","win32-x64"]}}\n');
   write('shared/package.json', '{"version":"0.3.1"}\n');
   write('.dockerignore', 'node_modules\n.git\n');
   const lock = `{
   "lockfileVersion": 1,
   "packages": {
-    "@gajae-code/coding-agent": ["@gajae-code/coding-agent@0.16.4", "", {}, "${SDK_INTEGRITY}"]
+    "@gajae-code/coding-agent": ["@gajae-code/coding-agent@0.16.6", "", {}, "${SDK_INTEGRITY}"]
   }
 }\n`;
   write('bun.lock', lock);
@@ -63,11 +63,11 @@ FROM \${BUN_IMAGE} AS deps
 FROM \${BUN_IMAGE} AS fixture
 FROM \${BUN_IMAGE} AS runtime-base
 RUN echo "\${LOCK_SHA256}  bun.lock" | sha256sum --check --strict \\
-    && bun -e 'const p={version:"0.16.4"}; if(p.version!=="0.16.4") process.exit(1)'
+    && bun -e 'const p={version:"0.16.6"}; if(p.version!=="0.16.6") process.exit(1)'
 LABEL fixture="true" \\
       org.opencontainers.image.base.name="oven/bun:1.4.0@sha256:${BUN_DIGEST}" \\
       io.gjc-remote.lock.sha256="\${LOCK_SHA256}" \\
-      io.gjc-remote.sdk.version="0.16.4"
+      io.gjc-remote.sdk.version="0.16.6"
 `);
   write('deploy/docker/bot/Dockerfile', `ARG BUN_IMAGE=oven/bun:1.4.0@sha256:${BUN_DIGEST}
 ARG NODE_IMAGE=node:26.8.1@sha256:${'1'.repeat(64)}
@@ -567,7 +567,7 @@ test('issue55 detects SDK declaration and Docker lock/sdk/base mismatches from c
 
 test('issue55 detects SDK declaration drift from the Docker contract', () => withFixture((root) => {
   const daemon = join(root, 'daemon/package.json');
-  writeFileSync(daemon, readFileSync(daemon, 'utf8').replace('0.16.4', '0.16.5'));
+  writeFileSync(daemon, readFileSync(daemon, 'utf8').replace('0.16.6', '0.16.7'));
   command(root, ['add', '.']); command(root, ['commit', '--quiet', '-m', 'bad-sdk']);
   assert.throws(() => createPacket({ root }), { code: 'DOCKER_CONTRACT_MISMATCH' });
 }));
@@ -729,7 +729,7 @@ test('issue55 rejects duplicate Docker contract labels', () =>
     const docker = join(root, 'deploy/docker/daemon/Dockerfile');
     writeFileSync(
       docker,
-      `${readFileSync(docker, 'utf8')}LABEL io.gjc-remote.sdk.version="0.16.4"\n`,
+      `${readFileSync(docker, 'utf8')}LABEL io.gjc-remote.sdk.version="0.16.6"\n`,
     );
     command(root, ['add', '.']);
     command(root, ['commit', '--quiet', '-m', 'duplicate-label']);

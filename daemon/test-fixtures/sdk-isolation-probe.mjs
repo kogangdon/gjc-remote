@@ -25,7 +25,7 @@ let registerProvider;
 
 const ISSUE = 62;
 const BASE_COMMIT = "a5bb530bd5a063b6571a7ba963e938bb6f97616f";
-const EXPECTED_SDK = "0.16.4";
+const EXPECTED_SDK = "0.16.6";
 const MIN_BUN = [1, 4, 0];
 const PROVIDER_A = "issue62-provider-a";
 const PROVIDER_B = "issue62-provider-b";
@@ -379,8 +379,8 @@ async function assertSdkProvenance(sourceCommit, changeSetDigest) {
   const lock = await readFile(join(repoRoot, "bun.lock"), "utf8");
   const lockEvidence = lock.match(/"@gajae-code\/coding-agent": \["@gajae-code\/coding-agent@([^"]+)"/)?.[1];
   const bunVersion = Bun.version;
-  requireCondition(daemonPackage.dependencies?.["@gajae-code/coding-agent"] === EXPECTED_SDK, "SDK_VERSION_MISMATCH", "daemon dependency is not pinned to 0.16.4", { daemon: daemonPackage.dependencies?.["@gajae-code/coding-agent"] });
-  requireCondition(installedPackage.version === EXPECTED_SDK && lockEvidence === EXPECTED_SDK, "SDK_VERSION_MISMATCH", "installed package or lockfile is not 0.16.4", { installed: installedPackage.version, lock: lockEvidence });
+  requireCondition(daemonPackage.dependencies?.["@gajae-code/coding-agent"] === EXPECTED_SDK, "SDK_VERSION_MISMATCH", `daemon dependency is not pinned to ${EXPECTED_SDK}`, { daemon: daemonPackage.dependencies?.["@gajae-code/coding-agent"] });
+  requireCondition(installedPackage.version === EXPECTED_SDK && lockEvidence === EXPECTED_SDK, "SDK_VERSION_MISMATCH", `installed package or lockfile is not ${EXPECTED_SDK}`, { installed: installedPackage.version, lock: lockEvidence });
   requireCondition(versionAtLeast(bunVersion, MIN_BUN), "SDK_VERSION_MISMATCH", "Bun is older than 1.4.0", { bunVersion });
   return {
     sdkPackage: "@gajae-code/coding-agent",
@@ -1411,7 +1411,7 @@ async function runOrder(order, fixture, provenance) {
         scopedSettings: "createAgentSession calls Settings.loadForScope when settings is omitted",
         ownedResources: "AgentSession.dispose awaits SDK-owned ModelRegistry, AuthStorage, Settings, and SessionManager cleanup",
         sharedModelCache: "probe closes the exact fixture models.db with closeModelCache",
-        processGlobalDrain: "No aggregate process-global drain is exported by @gajae-code/coding-agent/sdk 0.16.4",
+        processGlobalDrain: `No aggregate process-global drain is exported by @gajae-code/coding-agent/sdk ${EXPECTED_SDK}`,
       },
     };
     const cleanupErrors = [];

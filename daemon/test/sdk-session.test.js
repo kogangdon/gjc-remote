@@ -34,7 +34,7 @@ function assistantMessage(text = "done", overrides = {}) {
   };
 }
 
-// AgentEvent.agent_end in @gajae-code/agent-core 0.16.4 always carries the
+// AgentEvent.agent_end in @gajae-code/agent-core 0.16.6 always carries the
 // run's messages. Tests use this source-shaped boundary instead of fabricating
 // a bare terminal that the installed SDK cannot emit.
 function terminalEvent({ text = "done", messages, ...overrides } = {}) {
@@ -67,7 +67,7 @@ function schemaHash(schema) {
   return createHash("sha256").update(canonicalJson(schema)).digest("hex");
 }
 
-// Exact output shape of SDK 0.16.4 buildAskGateAnswerSchema() and
+// Exact output shape of SDK 0.16.6 buildAskGateAnswerSchema() and
 // buildAskGateStageState(); see workflow-gate-types.ts:206-293. Keeping the
 // generated schema on every fake gate makes scalar-answer regressions visible.
 function sdkAskGate({
@@ -200,7 +200,7 @@ function sdkAskGate({
   return gate;
 }
 
-// Exact schemas/options from SDK 0.16.4 approval-gate.ts:38-94.
+// Exact schemas/options from SDK 0.16.6 approval-gate.ts:54-94.
 function sdkDecisionGate({ gate_id, kind, context = {} }) {
   const approval = kind === "approval";
   const decisions = approval
@@ -685,7 +685,7 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(
     Object.hasOwn(calls[1][1], "settings"),
     false,
-    "SDK 0.16.4 must own and close its Settings.loadForScope instance"
+    "SDK 0.16.6 must own and close its Settings.loadForScope instance"
   );
   assert.deepEqual(agent.profileCalls, ["copilot-claude"]);
   await session.dispose();
@@ -1477,7 +1477,7 @@ test("live controls fail closed when SDK promotion ownership is unavailable", as
       () => {},
       100
     ),
-    /promotion API is unavailable/
+    /ownership hooks are unavailable/
   );
   await session.dispose();
   await promptResult;
@@ -1533,6 +1533,7 @@ test("live controls use the SDK literal-text promotion surface", async () => {
   assert.equal(content, literal);
   assert.equal(options.deliverAs, "followUp");
   assert.equal(options.queuedAtDispatch, true);
+  assert.equal(typeof options.onQueuedPromoted, "function");
   agent.emit(terminalEvent());
   finishPrompt();
   await Promise.all([prompt, followUp]);

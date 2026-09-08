@@ -9,23 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade blocker
 
-- SDK 0.16.4 does not automatically continue a follow-up admitted after the
-  active run's queue cutoff. The real SDK oracle observes `waitForIdle()`
-  resolving with the exact executable message still queued and no successor
-  run; disposal rejects the pending remote control without false completion.
-  Its defect-detection test passes, but `upgradeAssessment.verdict` is `BLOCK`
-  (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). Passing workspace tests and
-  local smoke do not clear this upgrade or authorize release.
-  Independent review approves adapter ownership safety, not successor
-  delivery: this is an SDK liveness defect, not false completion. That scoped
-  approval does not change the recorded upgrade block. The oracle proves
-  explicit disposal, not automatic timeout expiry. Repair belongs in the
-  SDK's lifecycle-owned queue wakeup; no remote FIFO policy change or
-  lower-level continuation bypass is included.
+- The real SDK 0.16.6 oracle reproduces the queued follow-up without a successor
+  after `waitForIdle()` settles: `SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`.
+  The characterization test passes while its upgrade verdict remains `BLOCK`.
+  Current adapter/oracle/isolation tests pass 84/84; this does not clear the
+  upgrade or authorize release.
+- Historical 0.16.4 evidence: the real SDK oracle observed `waitForIdle()`
+  resolving with the exact executable follow-up still queued and no successor
+  run after admission beyond the active run's queue cutoff. Disposal rejected
+  the pending remote control without false completion. The characterization
+  test passed, while its receipt recorded `BLOCK`
+  (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). This receipt is old-run
+  evidence, not a 0.16.6 result.
+  The associated independent review approved adapter ownership safety, not
+  successor delivery: this was an SDK liveness defect, not false completion.
+  That scoped approval did not change the recorded upgrade block. The oracle
+  proved explicit disposal, not automatic timeout expiry. The required repair
+  belonged in the SDK's lifecycle-owned queue wakeup; no remote FIFO policy
+  change or lower-level continuation bypass was included.
+- Upstream [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is
+  fixed on the development branch by
+  [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that fix is
+  absent from both the `v0.16.6` tag and the actual published
+  `@gajae-code/coding-agent@0.16.6` npm tarball. The merged development source
+  and the installed package are distinct evidence surfaces; issue closure does
+  not clear the packaged candidate.
+- A separate integration blocker remains: exact queued-control ownership in
+  this candidate depends on `queuedAtDispatch` and `onQueuedPromoted`.
+  The former is explicitly internal in SDK 0.16.6; the latter is SDK-host
+  ownership correlation, not an established generic embedder contract.
+  A supported public ownership boundary is required before promotion. These
+  hooks are retained only in this blocked candidate, not offered as public
+  integration guidance.
 
 ### Changed
 
-- Upgrade the embedded GJC SDK to 0.16.4 and require Bun 1.4.0 or newer.
+- Upgrade the embedded GJC SDK to 0.16.6 and require Bun 1.4.0 or newer.
   Align CI, container base pins, lock provenance, and future observability
   recipes while retaining the existing in-process session architecture.
 - Replace the retired Discord `/team` registration with `/autoresearch`,
@@ -37,7 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Align live control completion with SDK queue consumption and terminal
   outcomes; cancel adapter waiters explicitly during disposal.
-  Live controls use public SDK promotion callbacks with literal-text delivery.
+  Live controls use SDK ownership-correlation hooks with literal-text delivery;
+  their internal-contract dependency remains blocked as described above.
 - Encode SDK workflow answers as structured objects and confirm acceptance
   through bounded, correlated daemon receipts. Rejections remain retryable only
   for the same live gate, without erasing successors or starting a new prompt.

@@ -10,13 +10,19 @@ code on that host. Read [Security](../../SECURITY.md) before provisioning.
 | Component | Native status | Container status | Supported platforms |
 | --- | --- | --- | --- |
 | Bot | Foreground command documented for Node.js >=26; no native service installer is shipped | Linux-only release candidate; no signed-image release evidence | Native-control: Linux x64/arm64, Windows x64 |
-| Daemon | Foreground command documented for Bun >=1.4.0 and SDK 0.16.4; no native service installer is shipped | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
+| Daemon | Foreground command documented for Bun >=1.4.0 and SDK 0.16.6; no native service installer is shipped | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
 | Native control | Observed only on the approved tuples | Used by the bot container candidate only with an externally verified bundle | Linux x64/arm64, Windows x64 |
 
 macOS is not supported for native-control. “Foreground command documented”
 describes only the current command contract, not boot supervision, production
 promotion, or tenant isolation. “Release candidate” and “future phase” are
 design/release states, not observed production support.
+
+The installed SDK 0.16.6 pin remains an upgrade candidate: its real oracle
+confirms the liveness `BLOCK`, and internal ownership hooks remain a separate
+integration blocker. Passing other checks is not promotion evidence. See the
+[upgrade blocker](../../CHANGELOG.md#upgrade-blocker) for the distinction
+between the upstream development-source fix and the tagged npm package.
 
 No guide in this directory claims a completed live deployment. The repository
 ships no native service installer, Windows service wrapper, or systemd unit;

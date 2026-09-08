@@ -236,7 +236,7 @@ attestation, and supported-platform promotion remain Phase 4 obligations.
 
 Every verification-matrix evidence layer and non-negotiable gate must close before promotion:
 
-- ownership/fixture agreement and exact SDK/package/lock provenance at 0.16.4;
+- ownership/fixture agreement and exact SDK/package/lock provenance at 0.16.6;
 - unit/integration/Compose tests for mapping, readiness, lifecycle, resource, Git, backup/restore,
   provider recovery, remap fencing, and cleanup;
 - image/base/source/lock/SDK digests, SBOM, scan, signature/attestation, volume manifests, copied or

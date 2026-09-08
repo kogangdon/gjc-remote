@@ -13,7 +13,7 @@
     "test:observability": "node --test test/daemon-observability.test.js test/lifecycle.test.js"
   },
   "dependencies": {
-    "@gajae-code/coding-agent": "0.16.4",
+    "@gajae-code/coding-agent": "0.16.6",
     "@gjc-remote/native-control": "*",
     "@gjc-remote/shared": "*",
     "dotenv": "^16.4.5",

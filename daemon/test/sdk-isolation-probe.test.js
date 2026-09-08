@@ -20,7 +20,7 @@ const CHANGE_FILES = [
 ];
 const artifactsDir = join(repoRoot, "artifacts");
 const BASE_COMMIT = "a5bb530bd5a063b6571a7ba963e938bb6f97616f";
-const SDK_VERSION = "0.16.4";
+const SDK_VERSION = "0.16.6";
 const MIN_BUN_VERSION = [1, 4, 0];
 const FIXTURE_ROOT_PREFIX = "gjc-issue62-sdk-";
 const MAX_RECEIPT_BYTES = 100_000;

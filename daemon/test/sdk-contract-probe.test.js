@@ -11,7 +11,7 @@ const testFile = fileURLToPath(import.meta.url);
 const daemonDir = resolve(dirname(testFile), "..");
 const fixture = join(daemonDir, "test-fixtures", "sdk-contract-probe.mjs");
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
-const SDK_VERSION = "0.16.4";
+const SDK_VERSION = "0.16.6";
 const CHILD_TIMEOUT_MS = 25_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const SECRET_ASSIGNMENT =
@@ -199,7 +199,7 @@ function spawnProbe(root) {
 }
 
 test(
-  "SDK 0.16.4 real AgentSession contracts govern follow-ups, gates, failures, and disposal",
+  "SDK 0.16.6 real AgentSession contracts govern follow-ups, gates, failures, and disposal",
   { timeout: 30_000 },
   async () => {
     assert.ok(existsSync(fixture), "real SDK contract fixture is missing");
@@ -235,7 +235,19 @@ test(
     assert.deepEqual(receipt.upgradeAssessment, {
       verdict: "BLOCK",
       oracleStatus: "completed",
-      reasonCodes: ["SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED"],
+      reasonCodes: [
+        "SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
+        "SDK_0_16_6_QUEUED_CONTROL_OWNERSHIP_REQUIRES_INTERNAL_HOOKS",
+      ],
+    });
+    assert.deepEqual(receipt.historicalProvenance, {
+      oracleOriginSdkVersion: "0.16.4",
+      originalReasonCode:
+        "SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
+      upstreamIssue: 5351,
+      upstreamFixPullRequest: 5371,
+      upstreamFixBranch: "dev",
+      upstreamFixPublishedInObservedVersion: false,
     });
     assert.deepEqual(receipt.environment, {
       credentialVariableCount: 0,
@@ -339,20 +351,34 @@ test(
       underlyingTerminalCount: 0,
     });
 
-    // SDK 0.16.4 does not publicly export the decision-gate builders. This
+    // SDK 0.16.6 does not publicly export the decision-gate builders. This
     // oracle deliberately reports that boundary instead of copying a private
     // approval/execution schema and accidentally turning another fake into truth.
     assert.deepEqual(receipt.decisionGate, {
       status: "blocked",
       blockedCase: "structured_decision_denial",
-      code: "SDK_0_16_4_DECISION_GATE_BUILDERS_NOT_PUBLIC",
+      code: "SDK_0_16_6_DECISION_GATE_BUILDERS_NOT_PUBLIC",
       internalWireSubpathsBlocked: true,
       fabricatedSchemaUsed: false,
+    });
+    assert.deepEqual(receipt.queuedControlOwnership, {
+      status: "blocked",
+      code:
+        "SDK_0_16_6_QUEUED_CONTROL_OWNERSHIP_REQUIRES_INTERNAL_HOOKS",
+      affectedAdapterPath: "SdkSession.send(live steer/follow_up)",
+      sendUserMessageHooksStructurallyDeclared: true,
+      queuedAtDispatchClassification: "internal-sdk-signal",
+      onQueuedPromotedClassification: "sdk-host-ownership-correlation",
+      publicSteerFollowUpPromotionReceiptObserved: false,
+      publicQueueEntryExecutableIdentityObserved: false,
+      sdkRunCapabilitySubpathBlocked: true,
+      upstream5371FixMarkerObserved: false,
+      unsupportedFallbackUsed: false,
     });
     assert.deepEqual(receipt.limitations, {
       lateFollowUpAutoContinuation: {
         status: "observed-sdk-gap",
-        code: "SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
+        code: "SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
         boundary: "raw-agent-end-before-agent-session-terminal",
         evidence:
           "session.waitForIdle resolved while the exact executable follow-up remained queued.",

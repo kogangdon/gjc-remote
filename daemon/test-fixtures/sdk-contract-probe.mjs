@@ -1,12 +1,22 @@
 #!/usr/bin/env bun
-/* Real SDK 0.16.4 contract oracle. Stdout contains one bounded JSON receipt. */
+/*
+ * Real installed SDK 0.16.6 contract oracle. The late-follow-up reproducer
+ * originated on 0.16.4 as upstream #5351; stdout contains one bounded receipt.
+ */
 import { AsyncResource } from "node:async_hooks";
 import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
-const EXPECTED_SDK_VERSION = "0.16.4";
+const EXPECTED_SDK_VERSION = "0.16.6";
+const HISTORICAL_SDK_VERSION = "0.16.4";
+const LATE_FOLLOW_UP_CODE =
+  "SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED";
+const QUEUED_CONTROL_OWNERSHIP_CODE =
+  "SDK_0_16_6_QUEUED_CONTROL_OWNERSHIP_REQUIRES_INTERNAL_HOOKS";
+const DECISION_GATE_CODE =
+  "SDK_0_16_6_DECISION_GATE_BUILDERS_NOT_PUBLIC";
 const STEP_TIMEOUT_MS = 3_000;
 const CLEANUP_TIMEOUT_MS = 4_000;
 const HARD_TIMEOUT_MS = 20_000;
@@ -153,6 +163,12 @@ function toolResultText(context) {
 
 const fixtureFile = fileURLToPath(import.meta.url);
 const repoRoot = resolve(dirname(fixtureFile), "../..");
+const installedSdkRoot = join(
+  repoRoot,
+  "node_modules",
+  "@gajae-code",
+  "coding-agent"
+);
 let networkAttempts = 0;
 let harnessSequence = 0;
 const harnessCleanupOutcomes = [];
@@ -1278,27 +1294,15 @@ async function probeDisposeWithoutTerminal(ownerRoot) {
 }
 
 async function decisionGateLimitation() {
-  const packagePath = join(
-    repoRoot,
-    "node_modules",
-    "@gajae-code",
-    "coding-agent",
-    "package.json"
-  );
+  const packagePath = join(installedSdkRoot, "package.json");
   const modesIndexPath = join(
-    repoRoot,
-    "node_modules",
-    "@gajae-code",
-    "coding-agent",
+    installedSdkRoot,
     "src",
     "modes",
     "index.ts"
   );
   const rootIndexPath = join(
-    repoRoot,
-    "node_modules",
-    "@gajae-code",
-    "coding-agent",
+    installedSdkRoot,
     "src",
     "index.ts"
   );
@@ -1322,18 +1326,97 @@ async function decisionGateLimitation() {
   return {
     status: "blocked",
     blockedCase: "structured_decision_denial",
-    code: "SDK_0_16_4_DECISION_GATE_BUILDERS_NOT_PUBLIC",
+    code: DECISION_GATE_CODE,
     internalWireSubpathsBlocked: true,
     fabricatedSchemaUsed: false,
   };
 }
 
+async function queuedControlOwnershipLimitation(sdkPackage) {
+  const [agentSessionTypes, extensionTypes, sessionRuntimeSource, agentSessionSource] =
+    await Promise.all([
+      readFile(
+        join(installedSdkRoot, "dist", "types", "session", "agent-session.d.ts"),
+        "utf8"
+      ),
+      readFile(
+        join(
+          installedSdkRoot,
+          "dist",
+          "types",
+          "extensibility",
+          "extensions",
+          "types.d.ts"
+        ),
+        "utf8"
+      ),
+      readFile(
+        join(installedSdkRoot, "src", "sdk", "host", "session-runtime.ts"),
+        "utf8"
+      ),
+      readFile(
+        join(installedSdkRoot, "src", "session", "agent-session.ts"),
+        "utf8"
+      ),
+    ]);
+
+  const sendUserMessageDeclaresQueuedAtDispatch =
+    agentSessionTypes.includes("queuedAtDispatch?: boolean;");
+  const sendUserMessageDeclaresPromotionHook =
+    agentSessionTypes.includes("onQueuedPromoted?: (promotion:");
+  const queuedAtDispatchMarkedInternal = extensionTypes.includes(
+    "Internal SDK signal preserving a busy dispatch across async admission fences."
+  );
+  const sdkHostConsumesPromotionHook =
+    sessionRuntimeSource.includes("onQueuedPromoted: (promotion?:") &&
+    sessionRuntimeSource.includes("queuedAtDispatch,");
+  const publicSteerHasNoPromotionReceipt = agentSessionTypes.includes(
+    "steer(text: string, images?: ImageContent[]): Promise<void>;"
+  );
+  const publicFollowUpHasNoPromotionReceipt = agentSessionTypes.includes(
+    'followUp(text: string, images?: ImageContent[], options?: Pick<PromptOptions, "followUpQueuePolicy">): Promise<void>;'
+  );
+  const publicQueueEntryIsTextOnly =
+    /export interface QueuedMessageEditEntry\s*\{\s*id: string;\s*text: string;\s*mode: QueuedMessageEditMode;\s*label: string;\s*\}/.test(
+      agentSessionTypes
+    );
+  const sdkRunCapabilitySubpathBlocked =
+    sdkPackage.exports?.["./session/sdk-run-capability"] === null;
+  const upstream5371FixMarkerObserved = agentSessionSource.includes(
+    "#scheduleNonAdmittedQueuedContinuation"
+  );
+
+  requireCondition(
+    sendUserMessageDeclaresQueuedAtDispatch &&
+      sendUserMessageDeclaresPromotionHook &&
+      queuedAtDispatchMarkedInternal &&
+      sdkHostConsumesPromotionHook &&
+      publicSteerHasNoPromotionReceipt &&
+      publicFollowUpHasNoPromotionReceipt &&
+      publicQueueEntryIsTextOnly &&
+      sdkRunCapabilitySubpathBlocked &&
+      !upstream5371FixMarkerObserved,
+    "QUEUED_CONTROL_CONTRACT_EVIDENCE_CHANGED"
+  );
+
+  return {
+    status: "blocked",
+    code: QUEUED_CONTROL_OWNERSHIP_CODE,
+    affectedAdapterPath: "SdkSession.send(live steer/follow_up)",
+    sendUserMessageHooksStructurallyDeclared: true,
+    queuedAtDispatchClassification: "internal-sdk-signal",
+    onQueuedPromotedClassification: "sdk-host-ownership-correlation",
+    publicSteerFollowUpPromotionReceiptObserved: false,
+    publicQueueEntryExecutableIdentityObserved: false,
+    sdkRunCapabilitySubpathBlocked: true,
+    upstream5371FixMarkerObserved: false,
+    unsupportedFallbackUsed: false,
+  };
+}
+
 async function runProbe(ownerRoot) {
   const [sdkPackage, daemonPackage] = await Promise.all([
-    readFile(
-      join(repoRoot, "node_modules", "@gajae-code", "coding-agent", "package.json"),
-      "utf8"
-    ).then(JSON.parse),
+    readFile(join(installedSdkRoot, "package.json"), "utf8").then(JSON.parse),
     readFile(join(repoRoot, "daemon", "package.json"), "utf8").then(JSON.parse),
   ]);
   requireCondition(sdkPackage.version === EXPECTED_SDK_VERSION, "SDK_VERSION_MISMATCH");
@@ -1373,6 +1456,8 @@ async function runProbe(ownerRoot) {
   const failureTerminal = await probeFailureTerminal(ownerRoot);
   const disposal = await probeDisposeWithoutTerminal(ownerRoot);
   const decisionGate = await decisionGateLimitation();
+  const queuedControlOwnership =
+    await queuedControlOwnershipLimitation(sdkPackage);
   requireCondition(networkAttempts === 0, "NETWORK_ACCESS_ATTEMPTED");
   requireCondition(harnessCleanupOutcomes.length === 6, "CLEANUP_OUTCOME_COUNT_WRONG");
   requireCondition(
@@ -1389,7 +1474,19 @@ async function runProbe(ownerRoot) {
     upgradeAssessment: {
       verdict: "BLOCK",
       oracleStatus: "completed",
-      reasonCodes: ["SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED"],
+      reasonCodes: [
+        LATE_FOLLOW_UP_CODE,
+        QUEUED_CONTROL_OWNERSHIP_CODE,
+      ],
+    },
+    historicalProvenance: {
+      oracleOriginSdkVersion: HISTORICAL_SDK_VERSION,
+      originalReasonCode:
+        "SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
+      upstreamIssue: 5351,
+      upstreamFixPullRequest: 5371,
+      upstreamFixBranch: "dev",
+      upstreamFixPublishedInObservedVersion: false,
     },
     environment: {
       credentialVariableCount: Object.keys(process.env).filter((key) =>
@@ -1417,10 +1514,11 @@ async function runProbe(ownerRoot) {
     failureTerminal,
     disposal,
     decisionGate,
+    queuedControlOwnership,
     limitations: {
       lateFollowUpAutoContinuation: {
         status: "observed-sdk-gap",
-        code: "SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
+        code: LATE_FOLLOW_UP_CODE,
         boundary: "raw-agent-end-before-agent-session-terminal",
         evidence:
           "session.waitForIdle resolved while the exact executable follow-up remained queued.",
