@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Encode SDK workflow answers as structured objects and confirm acceptance
   through bounded, correlated daemon receipts. Rejections remain retryable only
   for the same live gate, without erasing successors or starting a new prompt.
+  The unreleased gate-answer wire shape now requires `answerId` and exact fields;
+  it has no mixed-version capability negotiation, so bot and daemon peers must
+  be deployed together before the workflow-gate channel is enabled.
 
 ## [0.3.1] - 2026-08-09
 

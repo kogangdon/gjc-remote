@@ -1349,9 +1349,10 @@ export function isInvokeMessage(value, context = undefined) {
 }
 
 /**
- * bot -> host, a user's answer to a pending workflow gate (#35). Additive: v0
- * hosts never receive one because they never emit a `gate_request`.
- * `answerId` is an opaque, per-attempt receipt correlation id.
+ * bot -> host, a user's answer to a pending workflow gate (#35). This unreleased
+ * channel requires the exact receipt-aware shape on both peers; `answerId` is
+ * an opaque, per-attempt correlation id. There is no mixed-version negotiation,
+ * so deploy the bot and daemon together before enabling workflow gates.
  * @typedef {{ type: "answer", requestId: string, gateId: string, answerId: string, answer: string }} AnswerMessage
  */
 export function isAnswerMessage(value) {
