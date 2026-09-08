@@ -5,14 +5,17 @@ pinned `@gajae-code/coding-agent` SDK **0.16.6** and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
 
-The installed SDK pin is an upgrade candidate, not release-promotion evidence.
-Its current real SDK oracle confirms the follow-up liveness `BLOCK`; internal
-queued-control ownership hooks are a separate blocker. Upstream issue
+The daemon adapter rejects `steer` and `follow_up` while a prompt is active,
+before SDK queue admission. Idle controls remain prompt-equivalent FIFO work.
+Upstream issue
 [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is fixed on the
 development branch by
 [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that fix is
 absent from both the `v0.16.6` tag and the actual published 0.16.6 npm tarball.
-See the [upgrade blocker](../../CHANGELOG.md#upgrade-blocker).
+A supported public ownership lifecycle is requested in
+[#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429); live controls
+remain fail-closed until it ships. See the
+[containment record](../../CHANGELOG.md#sdk-0166-containment).
 
 This repository provides the foreground start command below; it does not ship a
 native service installer, service wrapper, or systemd unit, and this guide is

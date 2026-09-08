@@ -2,19 +2,19 @@
 
 Discord-controlled remote GJC sessions.
 
-> **SDK 0.16.6 upgrade candidate: BLOCKED.** The current real SDK oracle
-> reproduces a late follow-up remaining queued without a successor run after
-> `waitForIdle()` settles. This is fresh 0.16.6 evidence, not an inherited result.
+> **SDK 0.16.6 upgrade candidate: live controls fail closed.** The published SDK
+> can leave a late follow-up queued without a successor run after
+> `waitForIdle()` settles.
 > Upstream [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is
 > fixed on the development branch by
 > [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that
 > lifecycle wakeup fix is absent from both the `v0.16.6` tag and the actual
-> published `@gajae-code/coding-agent@0.16.6` npm tarball. Development-source
-> status, regression tests, and smoke alone do not clear the installed package.
-> The candidate remains `BLOCK` under
-> `SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`. Internal queued-control
-> ownership hooks are a separate blocker. See
-> [CHANGELOG.md](CHANGELOG.md#upgrade-blocker).
+> published `@gajae-code/coding-agent@0.16.6` npm tarball. The daemon therefore
+> rejects `steer` and `follow_up` while a prompt is active instead of entering
+> the unsupported queue path. Idle controls remain prompt-equivalent FIFO work.
+> A supported ownership API is tracked upstream in
+> [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429). See
+> [CHANGELOG.md](CHANGELOG.md#sdk-0166-containment).
 
 > **⚠️ Security: this grants remote code execution.** A mapped Discord channel
 > runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
@@ -55,19 +55,14 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    directory reuse one in-process GJC SDK `AgentSession`. Prompt and model
    operations are serialized per session. Idle `steer`/`follow_up` requests join
    that FIFO and start a prompt-equivalent run instead of waiting on an inactive
-   control queue. While a prompt or accepted follow-up pipeline is active,
-   controls retain their SDK `steer`/`follow_up` semantics instead of waiting
-   behind it. Live controls remain open through the terminal boundary that owns
-   their consumed message; several sequential follow-ups can share one SDK
-   `agent_end`. Queue admission alone is not completion, and queued prompt/model
-   operations wait for the active control pipeline. Rejected admissions consume
-   no completion boundary. SDK failure outcomes reject the invocation. Each
-   request receives its event stream, and later controls rejoin the FIFO. Idle
-   sessions (no requests for 1 hour) are disposed automatically.
-   Live controls carry literal text without expanding CLI prompt templates.
-   Their exact ownership currently depends on internal SDK correlation hooks
-   (`queuedAtDispatch` / `onQueuedPromoted`), not an established generic public
-   embedder contract. This is a separate upgrade blocker; see the changelog.
+   control queue. While a prompt is active, `steer` and `follow_up` fail
+   immediately with `SDK_LIVE_CONTROL_UNSUPPORTED`; they are never admitted to
+   the SDK queue. This prevents an unowned request from hanging or being matched
+   to an unrelated terminal. SDK failure outcomes reject the invocation. Each
+   prompt receives its event stream. Idle sessions (no requests for 1 hour) are
+   disposed automatically. Live controls can be restored once upstream
+   [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429) provides a
+   supported submission-ownership lifecycle.
    Workflow answers use correlated daemon receipts: sending an answer is not
    acceptance. Rejected answers retain the same live gate for retry; a completed
    or replaced gate is never silently answered by a retry or converted into a

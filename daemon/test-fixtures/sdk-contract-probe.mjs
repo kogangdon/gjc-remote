@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /*
- * Real installed SDK 0.16.6 contract oracle. The late-follow-up reproducer
- * originated on 0.16.4 as upstream #5351; stdout contains one bounded receipt.
+ * Real installed SDK 0.16.6 contract oracle. It verifies fail-closed live
+ * controls while retaining static evidence for upstream #5351/#5371 and #5429.
+ * Stdout contains one bounded receipt.
  */
-import { AsyncResource } from "node:async_hooks";
 import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -138,18 +138,6 @@ function observe(promise) {
 
 function terminalEvents(events) {
   return events.filter((event) => event?.type === "agent_end");
-}
-
-function latestUserText(context) {
-  for (let index = context.messages.length - 1; index >= 0; index -= 1) {
-    const message = context.messages[index];
-    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
-    return message.content
-      .filter((item) => item?.type === "text")
-      .map((item) => item.text)
-      .join("");
-  }
-  return undefined;
 }
 
 function toolResultText(context) {
@@ -418,693 +406,95 @@ async function withHarness(stage, ownerRoot, responseSets, options, run) {
   }
   return value;
 }
-
-async function probeFollowUps(ownerRoot) {
-  const releaseInitial = deferred();
-  const releaseQueued = deferred();
-  const observedPrompts = [];
+async function probeLiveControlContainment(ownerRoot) {
+  const releasePrompt = deferred();
   try {
     return await withHarness(
-      "follow-ups",
+      "live-control-containment",
       ownerRoot,
       {
         primary: [
-          async (context) => {
-            observedPrompts.push(latestUserText(context));
-            await releaseInitial.promise;
+          async () => {
+            await releasePrompt.promise;
             return { content: ["initial complete"] };
-          },
-          (context) => {
-            observedPrompts.push(latestUserText(context));
-            return { content: ["first follow-up complete"] };
-          },
-          (context) => {
-            observedPrompts.push(latestUserText(context));
-            return { content: ["second follow-up complete"] };
-          },
-        ],
-        secondary: [
-          async (context) => {
-            observedPrompts.push(latestUserText(context));
-            await releaseQueued.promise;
-            return { content: ["queued prompt complete"] };
           },
         ],
       },
       {},
       async (harness) => {
-        const initial = observe(
-          harness.adapter.send({ type: "prompt", message: "initial" }, () => {}, 5_000)
+        const prompt = observe(
+          harness.adapter.send(
+            { type: "prompt", message: "initial" },
+            () => {},
+            5_000
+          )
         );
         await waitFor(
           () => harness.mockModels.get("primary").calls.length === 1,
           "INITIAL_PROVIDER_CALL_MISSING"
         );
 
-        const first = observe(
-          harness.adapter.send({ type: "follow_up", message: "follow-one" }, () => {}, 5_000)
-        );
-        const second = observe(
-          harness.adapter.send({ type: "follow_up", message: "follow-two" }, () => {}, 5_000)
-        );
-        const modelEvents = [];
-        const modelSwitch = observe(
+        const steer = observe(
           harness.adapter.send(
-            { type: "set_model", provider: harness.provider, modelId: "secondary" },
-            (event) => modelEvents.push(event),
+            { type: "steer", message: "adjust" },
+            () => {},
             5_000
           )
         );
-        const queuedPrompt = observe(
-          harness.adapter.send({ type: "prompt", message: "queued-next" }, () => {}, 5_000)
+        const followUp = observe(
+          harness.adapter.send(
+            { type: "follow_up", message: "continue" },
+            () => {},
+            5_000
+          )
         );
-
-        await waitFor(
-          () => harness.agent.snapshotQueues().followUp.length === 2,
-          "FOLLOW_UPS_NOT_ADMITTED"
-        );
-        releaseInitial.resolve();
-        await waitFor(
-          () => harness.mockModels.get("secondary").calls.length === 1,
-          "QUEUED_PROMPT_NOT_STARTED"
-        );
-        await Bun.sleep(0);
-
-        requireCondition(terminalEvents(harness.events).length === 1, "FOLLOW_UP_TERMINAL_COUNT_WRONG");
-        requireCondition(initial.status === "fulfilled", "INITIAL_SEND_NOT_SETTLED");
-        requireCondition(first.status === "fulfilled", "FIRST_FOLLOW_UP_NOT_SETTLED");
-        requireCondition(second.status === "fulfilled", "SECOND_FOLLOW_UP_NOT_SETTLED");
-        requireCondition(modelSwitch.status === "fulfilled", "QUEUED_MODEL_SWITCH_NOT_SETTLED");
-        requireCondition(queuedPrompt.status === "pending", "QUEUED_PROMPT_SETTLED_TOO_EARLY");
-        requireCondition(
-          modelEvents.some(
-            (event) =>
-              event?.type === "response" &&
-              event?.success === true &&
-              event?.data?.modelId === "secondary"
-          ),
-          "MODEL_SWITCH_RESPONSE_MISSING"
-        );
-
-        releaseQueued.resolve();
         await withDeadline(
-          Promise.all([
-            initial.settled,
-            first.settled,
-            second.settled,
-            modelSwitch.settled,
-            queuedPrompt.settled,
-          ]),
+          Promise.all([steer.settled, followUp.settled]),
           STEP_TIMEOUT_MS,
-          "FOLLOW_UP_SENDS_DID_NOT_SETTLE"
+          "LIVE_CONTROLS_DID_NOT_FAIL_CLOSED"
         );
-        requireCondition(queuedPrompt.status === "fulfilled", "QUEUED_PROMPT_FAILED");
-        requireCondition(terminalEvents(harness.events).length === 2, "TOTAL_TERMINAL_COUNT_WRONG");
+
         requireCondition(
-          JSON.stringify(observedPrompts) ===
-            JSON.stringify(["initial", "follow-one", "follow-two", "queued-next"]),
-          "PROVIDER_PROMPT_ORDER_WRONG"
+          steer.status === "rejected" &&
+            steer.failureCode === "SDK_LIVE_CONTROL_UNSUPPORTED" &&
+            followUp.status === "rejected" &&
+            followUp.failureCode === "SDK_LIVE_CONTROL_UNSUPPORTED",
+          "LIVE_CONTROL_REJECTION_WRONG",
+          {
+            steerStatus: steer.status,
+            steerFailureCode: steer.failureCode,
+            followUpStatus: followUp.status,
+            followUpFailureCode: followUp.failureCode,
+          }
         );
-        requireCondition(harness.session.model?.id === "secondary", "MODEL_SWITCH_NOT_APPLIED");
+        const queues = harness.agent.snapshotQueues();
+        requireCondition(
+          queues.steering.length === 0 && queues.followUp.length === 0,
+          "LIVE_CONTROL_REACHED_SDK_QUEUE"
+        );
+        requireCondition(prompt.status === "pending", "ACTIVE_PROMPT_SETTLED_TOO_EARLY");
+
+        releasePrompt.resolve();
+        await withDeadline(
+          prompt.settled,
+          STEP_TIMEOUT_MS,
+          "ACTIVE_PROMPT_DID_NOT_SETTLE"
+        );
+        requireCondition(prompt.status === "fulfilled", "ACTIVE_PROMPT_FAILED");
 
         return {
-          providerPrompts: observedPrompts,
-          sharedRunTerminalCount: 1,
-          totalTerminalCount: 2,
-          followUpsSettledAtSharedTerminal: true,
-          queuedModelSwitchSettled: true,
-          queuedPromptWaitedForSharedRun: true,
-          finalModelId: harness.session.model.id,
-        };
-      }
-    );
-  } finally {
-    releaseInitial.resolve();
-    releaseQueued.resolve();
-  }
-}
-
-async function probeSameTextQueueDivergence(ownerRoot) {
-  const text = "same-text-control";
-  const rawAdmissionRequested = deferred();
-  const rawOriginalMessageObserved = deferred();
-  const followUpEvents = [];
-  let followUp;
-  let rawListenerFailure;
-  let rawAgentStarts = 0;
-  let rawUserMessageStarts = 0;
-  let rawTerminalCount = 0;
-  let executableMessage;
-  let beforeDisplayCleanup;
-  let atRawPausedTerminal;
-
-  const onRawAgentEvent = (event, getAdapter, getRuntime) => {
-    if (event?.type === "agent_start") {
-      rawAgentStarts += 1;
-      if (rawAgentStarts !== 1) return;
-      const adapter = getAdapter();
-      if (!adapter) {
-        rawListenerFailure = "SAME_TEXT_ADAPTER_UNAVAILABLE";
-        rawAdmissionRequested.resolve();
-        return;
-      }
-      // SdkSession dispatches controls in a promise turn. Submit at the raw
-      // agent_start so its real SDK queue entry exists when the immediately
-      // following original message_start reaches this pre-AgentSession listener.
-      followUp = observe(
-        adapter.send(
-          { type: "follow_up", message: text },
-          (sessionEvent) => followUpEvents.push(sessionEvent),
-          5_000
-        )
-      );
-      rawAdmissionRequested.resolve();
-      return;
-    }
-
-    const rawUserText =
-      event?.type === "message_start" && event.message?.role === "user"
-        ? latestUserText({ messages: [event.message] })
-        : undefined;
-    if (rawUserText === text && rawUserMessageStarts === 0) {
-      rawUserMessageStarts += 1;
-      const runtime = getRuntime();
-      const displayEntries = runtime?.session?.getQueuedMessageEntries?.();
-      const executable = runtime?.agent?.snapshotQueues?.();
-      if (
-        !followUp ||
-        !Array.isArray(displayEntries) ||
-        !Array.isArray(executable?.steering) ||
-        !Array.isArray(executable?.followUp) ||
-        executable.steering.length !== 0 ||
-        executable.followUp.length !== 1
-      ) {
-        rawListenerFailure = "SAME_TEXT_QUEUE_NOT_READY_BEFORE_DISPLAY_CLEANUP";
-      } else {
-        executableMessage = executable.followUp[0];
-        beforeDisplayCleanup = {
-          displayEntries,
-          executableFollowUpCount: executable.followUp.length,
-          executableRetained:
-            executable.followUp.includes(executableMessage) ||
-            executable.steering.includes(executableMessage),
+          mode: "fail-closed",
+          errorCode: "SDK_LIVE_CONTROL_UNSUPPORTED",
+          steerStatus: steer.status,
           followUpStatus: followUp.status,
+          executableSteeringCount: queues.steering.length,
+          executableFollowUpCount: queues.followUp.length,
+          promptStatus: prompt.status,
         };
-      }
-      rawOriginalMessageObserved.resolve();
-      return;
-    }
-
-    if (event?.type === "agent_end") {
-      rawTerminalCount += 1;
-      if (rawTerminalCount !== 1 || !executableMessage) return;
-      const runtime = getRuntime();
-      const executable = runtime.agent.snapshotQueues();
-      atRawPausedTerminal = {
-        stopReason: event.stopReason,
-        displayEntries: runtime.session.getQueuedMessageEntries(),
-        executableSteeringCount: executable.steering.length,
-        executableFollowUpCount: executable.followUp.length,
-        executableRetained:
-          executable.followUp.includes(executableMessage) ||
-          executable.steering.includes(executableMessage),
-        followUpStatus: followUp?.status ?? "not-created",
-      };
-    }
-  };
-
-  return withHarness(
-    "same-text-queue-divergence",
-    ownerRoot,
-    { primary: [{ content: ["paused predecessor complete"] }] },
-    {
-      onRawAgentEvent,
-      // Public Agent pause hook: stop at the predecessor boundary before the
-      // loop can consume the queued same-text follow-up.
-      shouldPause: () => true,
-    },
-    async (harness) => {
-      let afterDisplayCleanup;
-      let atPublicPausedTerminal;
-      let publicTerminalCount = 0;
-      const unsubscribe = harness.session.subscribe((event) => {
-        const userText =
-          event?.type === "message_start" && event.message?.role === "user"
-            ? latestUserText({ messages: [event.message] })
-            : undefined;
-        if (userText === text && !afterDisplayCleanup && executableMessage) {
-          const executable = harness.agent.snapshotQueues();
-          afterDisplayCleanup = {
-            displayEntries: harness.session.getQueuedMessageEntries(),
-            executableFollowUpCount: executable.followUp.length,
-            executableRetained:
-              executable.followUp.includes(executableMessage) ||
-              executable.steering.includes(executableMessage),
-            followUpStatus: followUp?.status ?? "not-created",
-          };
-        }
-        if (event?.type === "agent_end") {
-          publicTerminalCount += 1;
-          if (publicTerminalCount !== 1 || !executableMessage) return;
-          const executable = harness.agent.snapshotQueues();
-          atPublicPausedTerminal = {
-            stopReason: event.stopReason,
-            displayEntries: harness.session.getQueuedMessageEntries(),
-            executableFollowUpCount: executable.followUp.length,
-            executableRetained:
-              executable.followUp.includes(executableMessage) ||
-              executable.steering.includes(executableMessage),
-            followUpStatus: followUp?.status ?? "not-created",
-          };
-        }
-      });
-
-      try {
-        const initial = observe(
-          harness.adapter.send({ type: "prompt", message: text }, () => {}, 5_000)
-        );
-        await withDeadline(
-          rawAdmissionRequested.promise,
-          STEP_TIMEOUT_MS,
-          "SAME_TEXT_ADMISSION_NOT_REQUESTED"
-        );
-        await withDeadline(
-          rawOriginalMessageObserved.promise,
-          STEP_TIMEOUT_MS,
-          "SAME_TEXT_ORIGINAL_MESSAGE_NOT_OBSERVED"
-        );
-        requireCondition(!rawListenerFailure, rawListenerFailure);
-        requireCondition(followUp, "SAME_TEXT_FOLLOW_UP_NOT_CREATED");
-        await withDeadline(
-          initial.settled,
-          STEP_TIMEOUT_MS,
-          "SAME_TEXT_PREDECESSOR_DID_NOT_SETTLE"
-        );
-        await waitFor(
-          () => atPublicPausedTerminal !== undefined,
-          "SAME_TEXT_PUBLIC_PAUSED_TERMINAL_MISSING"
-        );
-        await Bun.sleep(0);
-
-        const originalDisplayEntry = beforeDisplayCleanup.displayEntries.find(
-          (entry) => entry.text === text
-        );
-        requireCondition(
-          originalDisplayEntry && beforeDisplayCleanup.displayEntries.length === 1,
-          "SAME_TEXT_DISPLAY_ENTRY_NOT_CREATED"
-        );
-        requireCondition(
-          JSON.stringify(Object.keys(originalDisplayEntry).sort()) ===
-            JSON.stringify(["id", "label", "mode", "text"]) &&
-            /^followUp:\d+$/.test(originalDisplayEntry.id) &&
-            originalDisplayEntry.mode === "followUp" &&
-            originalDisplayEntry.label === "Queued",
-          "SAME_TEXT_DISPLAY_ENTRY_SHAPE_WRONG"
-        );
-        requireCondition(
-          beforeDisplayCleanup.executableRetained &&
-            beforeDisplayCleanup.executableFollowUpCount === 1 &&
-            beforeDisplayCleanup.followUpStatus === "pending",
-          "SAME_TEXT_EXECUTABLE_NOT_RETAINED_BEFORE_DISPLAY_CLEANUP"
-        );
-        requireCondition(
-          afterDisplayCleanup &&
-            afterDisplayCleanup.displayEntries.length === 0 &&
-            afterDisplayCleanup.executableFollowUpCount === 1 &&
-            afterDisplayCleanup.executableRetained &&
-            afterDisplayCleanup.followUpStatus === "pending",
-          "SAME_TEXT_DISPLAY_EXECUTABLE_DIVERGENCE_MISSING"
-        );
-        requireCondition(
-          atRawPausedTerminal?.stopReason === "paused" &&
-            atRawPausedTerminal.displayEntries.length === 0 &&
-            atRawPausedTerminal.executableSteeringCount === 0 &&
-            atRawPausedTerminal.executableFollowUpCount === 1 &&
-            atRawPausedTerminal.executableRetained &&
-            atRawPausedTerminal.followUpStatus === "pending",
-          "SAME_TEXT_RAW_PAUSED_CUTOFF_WRONG"
-        );
-        requireCondition(
-          atPublicPausedTerminal.stopReason === "paused" &&
-            atPublicPausedTerminal.displayEntries.length === 0 &&
-            atPublicPausedTerminal.executableFollowUpCount === 1 &&
-            atPublicPausedTerminal.executableRetained &&
-            atPublicPausedTerminal.followUpStatus === "pending",
-          "SAME_TEXT_PUBLIC_PAUSED_CUTOFF_WRONG"
-        );
-        requireCondition(initial.status === "fulfilled", "SAME_TEXT_PREDECESSOR_FAILED");
-        requireCondition(
-          followUp.status === "pending" &&
-            terminalEvents(followUpEvents).length === 1 &&
-            harness.mockModels.get("primary").calls.length === 1,
-          "SAME_TEXT_CONTROL_FALSELY_COMPLETED"
-        );
-
-        const disposal = observe(harness.adapter.dispose());
-        await withDeadline(
-          Promise.all([disposal.settled, followUp.settled]),
-          STEP_TIMEOUT_MS,
-          "SAME_TEXT_DISPOSAL_DID_NOT_SETTLE"
-        );
-        requireCondition(disposal.status === "fulfilled", "SAME_TEXT_DISPOSAL_FAILED");
-        requireCondition(
-          followUp.status === "rejected" &&
-            rawTerminalCount === 1 &&
-            publicTerminalCount === 1,
-          "SAME_TEXT_DISPOSAL_TERMINALIZED_CONTROL"
-        );
-
-        return {
-          rawListenerPrecedesAgentSession: true,
-          admissionTrigger: "raw-agent-start-before-original-message",
-          cleanupTrigger: "original-user-message-start",
-          textCollision: true,
-          displayEntryShape: {
-            idPattern: "followUp:<sequence>",
-            mode: originalDisplayEntry.mode,
-            label: originalDisplayEntry.label,
-          },
-          displayEntryPresentBeforeCleanup: true,
-          displayEntryCountBeforeCleanup: beforeDisplayCleanup.displayEntries.length,
-          displayEntryAbsentAfterCleanup: true,
-          displayEntryCountAfterCleanup: afterDisplayCleanup.displayEntries.length,
-          exactExecutableIdentityRetainedAfterCleanup: true,
-          exactExecutableIdentityRetainedAtPausedTerminal: true,
-          executableFollowUpCountAtPausedTerminal:
-            atPublicPausedTerminal.executableFollowUpCount,
-          predecessorStopReason: "paused",
-          followUpPendingAtPredecessorTerminal: true,
-          providerCallCountAtCutoff: 1,
-          followUpRejectedOnDispose: true,
-          rawTerminalCount,
-          publicTerminalCount,
-        };
-      } finally {
-        unsubscribe();
-      }
-    }
-  );
-}
-
-async function probeNearTerminalQueue(ownerRoot) {
-  const followUpText = "near-terminal-follow-up";
-  // Constructed outside AgentSession's AsyncLocalStorage admission scope. The
-  // raw Agent callback below is synchronous but inherits the prompt's scope;
-  // dispatching through this public Node host resource models an independent
-  // adapter caller without bypassing any SDK admission API.
-  const hostDispatch = new AsyncResource("sdk-contract-host-dispatch");
-  const rawInjection = deferred();
-  const successorStarted = deferred();
-  const releaseSuccessor = deferred();
-  const followUpEvents = [];
-  let followUp;
-  let rawListenerFailure;
-  let rawTerminalCount = 0;
-  let publicTerminalCount = 0;
-  let publicTerminalCountAtAdmission;
-  let followUpStatusAfterRawDispatch;
-  let followUpFailureCodeAfterRawDispatch;
-  let executableMessage;
-  let successorUserText;
-
-  const onRawAgentEvent = (event, getAdapter) => {
-    if (event?.type !== "agent_end") return;
-    rawTerminalCount += 1;
-    if (rawTerminalCount !== 1) return;
-    const adapter = getAdapter();
-    if (!adapter) {
-      rawListenerFailure = "RAW_LISTENER_ADAPTER_UNAVAILABLE";
-      rawInjection.resolve();
-      return;
-    }
-    publicTerminalCountAtAdmission = publicTerminalCount;
-    hostDispatch.runInAsyncScope(() => {
-      followUp = observe(
-        adapter.send(
-          { type: "follow_up", message: followUpText },
-          (sessionEvent) => followUpEvents.push(sessionEvent),
-          5_000
-        )
-      );
-    });
-    rawInjection.resolve();
-  };
-
-  try {
-    return await withHarness(
-      "near-terminal-queue",
-      ownerRoot,
-      {
-        primary: [
-          { content: ["predecessor complete"] },
-          async (context) => {
-            successorUserText = latestUserText(context);
-            successorStarted.resolve();
-            await releaseSuccessor.promise;
-            return { content: ["successor complete"] };
-          },
-        ],
-      },
-      { onRawAgentEvent },
-      async (harness) => {
-        let consumedMessageStarts = 0;
-        let predecessorTerminalSnapshot;
-        let consumptionSnapshot;
-        const admissionState = () => {
-          const queues = harness.agent.snapshotQueues();
-          return {
-            followUpStatus: followUp?.status ?? "not-created",
-            followUpFailureCode: followUp?.failureCode ?? "NONE",
-            initialStatus: initial?.status ?? "not-created",
-            rawTerminalCount,
-            publicTerminalCount,
-            publicTerminalCountAtAdmission:
-              publicTerminalCountAtAdmission ?? -1,
-            agentStreaming: harness.agent.state.isStreaming === true,
-            executableSteeringCount: queues.steering.length,
-            executableFollowUpCount: queues.followUp.length,
-            displayQueueCount: harness.session.getQueuedMessageEntries().length,
-            primaryProviderCallCount:
-              harness.mockModels.get("primary").calls.length,
-            consumedMessageStarts,
-          };
-        };
-        const unsubscribe = harness.session.subscribe((event) => {
-          if (
-            event?.type === "message_start" &&
-            latestUserText({ messages: [event.message] }) === followUpText
-          ) {
-            consumedMessageStarts += 1;
-            consumptionSnapshot = {
-              entries: harness.session.getQueuedMessageEntries(),
-              followUpStatus: followUp?.status ?? "not-created",
-            };
-          }
-          if (event?.type === "agent_end") {
-            publicTerminalCount += 1;
-            if (!predecessorTerminalSnapshot) {
-              predecessorTerminalSnapshot = {
-                entries: harness.session.getQueuedMessageEntries(),
-                followUpStatus: followUp?.status ?? "not-created",
-                consumedMessageStarts,
-              };
-            }
-          }
-        });
-
-        let initial;
-        try {
-          initial = observe(
-            harness.adapter.send(
-              { type: "prompt", message: "finish before queued admission" },
-              () => {},
-              5_000
-            )
-          );
-          await withDeadline(
-            rawInjection.promise,
-            STEP_TIMEOUT_MS,
-            "RAW_NEAR_TERMINAL_INJECTION_MISSING"
-          );
-          requireCondition(!rawListenerFailure, rawListenerFailure);
-          requireCondition(followUp, "RAW_NEAR_TERMINAL_FOLLOW_UP_MISSING");
-          requireCondition(
-            publicTerminalCountAtAdmission === 0,
-            "NEAR_TERMINAL_ADMISSION_MISSED_RAW_WINDOW",
-            admissionState()
-          );
-          requireCondition(
-            followUp.status !== "rejected",
-            "NEAR_TERMINAL_ADMISSION_REJECTED",
-            admissionState()
-          );
-          try {
-            await waitFor(
-              () =>
-                followUp.status === "rejected" ||
-                harness.agent.snapshotQueues().followUp.length === 1,
-              "NEAR_TERMINAL_EXECUTABLE_QUEUE_NOT_OBSERVED"
-            );
-          } catch {
-            throw new ProbeError(
-              "NEAR_TERMINAL_EXECUTABLE_QUEUE_NOT_OBSERVED",
-              admissionState()
-            );
-          }
-          requireCondition(
-            followUp.status !== "rejected",
-            "NEAR_TERMINAL_ADMISSION_REJECTED",
-            admissionState()
-          );
-          const queuedAtAdmission = harness.agent.snapshotQueues();
-          requireCondition(
-            queuedAtAdmission.steering.length === 0 &&
-              queuedAtAdmission.followUp.length === 1,
-            "NEAR_TERMINAL_EXECUTABLE_QUEUE_SHAPE_WRONG",
-            admissionState()
-          );
-          [executableMessage] = queuedAtAdmission.followUp;
-          followUpStatusAfterRawDispatch = followUp.status;
-          followUpFailureCodeAfterRawDispatch = followUp.failureCode;
-          await withDeadline(
-            initial.settled,
-            STEP_TIMEOUT_MS,
-            "PREDECESSOR_SEND_DID_NOT_SETTLE"
-          );
-          requireCondition(
-            followUp.status !== "rejected",
-            "NEAR_TERMINAL_CONTROL_REJECTED_AT_PREDECESSOR",
-            admissionState()
-          );
-
-          let successorTimer;
-          const successorOutcome = await Promise.race([
-            successorStarted.promise.then(() => "started"),
-            followUp.settled.then(() => "control-settled"),
-            harness.session.waitForIdle().then(
-              () => "session-idle",
-              () => "idle-rejected"
-            ),
-            new Promise((resolveOutcome) => {
-              successorTimer = setTimeout(
-                () => resolveOutcome("timed-out"),
-                STEP_TIMEOUT_MS
-              );
-            }),
-          ]);
-          clearTimeout(successorTimer);
-          if (successorOutcome !== "session-idle") {
-            throw new ProbeError(
-              successorOutcome === "control-settled" &&
-                  followUp.status === "rejected"
-                ? "NEAR_TERMINAL_CONTROL_REJECTED_BEFORE_SUCCESSOR"
-                : successorOutcome === "control-settled"
-                  ? "NEAR_TERMINAL_CONTROL_FALSELY_COMPLETED"
-                  : successorOutcome === "started"
-                    ? "NEAR_TERMINAL_SDK_GAP_BEHAVIOR_CHANGED"
-                    : successorOutcome === "idle-rejected"
-                      ? "NEAR_TERMINAL_IDLE_BOUNDARY_REJECTED"
-                      : "NEAR_TERMINAL_IDLE_BOUNDARY_TIMEOUT",
-              admissionState()
-            );
-          }
-
-          requireCondition(initial.status === "fulfilled", "PREDECESSOR_SEND_FAILED");
-          requireCondition(
-            predecessorTerminalSnapshot,
-            "PREDECESSOR_PUBLIC_TERMINAL_MISSING"
-          );
-          const queuedEntry = predecessorTerminalSnapshot.entries.find(
-            (entry) => entry.text === followUpText
-          );
-          requireCondition(queuedEntry, "FOLLOW_UP_NOT_QUEUED_AT_PREDECESSOR_TERMINAL");
-          requireCondition(
-            JSON.stringify(Object.keys(queuedEntry).sort()) ===
-              JSON.stringify(["id", "label", "mode", "text"]),
-            "QUEUED_ENTRY_PUBLIC_SHAPE_WRONG"
-          );
-          requireCondition(
-            /^followUp:\d+$/.test(queuedEntry.id) &&
-              queuedEntry.mode === "followUp" &&
-              queuedEntry.label === "Queued",
-            "QUEUED_ENTRY_IDENTITY_WRONG"
-          );
-          requireCondition(
-            predecessorTerminalSnapshot.followUpStatus === "pending" &&
-              predecessorTerminalSnapshot.consumedMessageStarts === 0,
-            "FOLLOW_UP_SETTLED_OR_CONSUMED_AT_PREDECESSOR_TERMINAL"
-          );
-          const queuesAtIdle = harness.agent.snapshotQueues();
-          requireCondition(
-            consumedMessageStarts === 0 &&
-              consumptionSnapshot === undefined &&
-              queuesAtIdle.steering.length === 0 &&
-              queuesAtIdle.followUp.length === 1 &&
-              queuesAtIdle.followUp.includes(executableMessage) &&
-              followUp.status === "pending" &&
-              harness.agent.state.isStreaming === false &&
-              harness.mockModels.get("primary").calls.length === 1,
-            "FOLLOW_UP_NOT_RETAINED_AT_IDLE_BOUNDARY",
-            admissionState()
-          );
-          requireCondition(
-            successorUserText === undefined &&
-              rawTerminalCount === 1 &&
-              publicTerminalCount === 1,
-            "SUCCESSOR_STARTED_BEFORE_IDLE_GAP_WAS_RECORDED",
-            admissionState()
-          );
-
-          const disposal = observe(harness.adapter.dispose());
-          await withDeadline(
-            Promise.all([disposal.settled, followUp.settled]),
-            STEP_TIMEOUT_MS,
-            "NEAR_TERMINAL_GAP_DISPOSAL_DID_NOT_SETTLE"
-          );
-          requireCondition(
-            disposal.status === "fulfilled" &&
-              followUp.status === "rejected" &&
-              rawTerminalCount === 1 &&
-              publicTerminalCount === 1 &&
-              terminalEvents(followUpEvents).length === 1 &&
-              harness.mockModels.get("primary").calls.length === 1,
-            "NEAR_TERMINAL_GAP_DISPOSAL_WRONG"
-          );
-
-          return {
-            rawListenerPrecedesAgentSession: true,
-            admissionContext: "independent-host-async-resource",
-            publicTerminalCountAtAdmission,
-            followUpStatusAfterRawDispatch,
-            followUpFailureCodeAfterRawDispatch,
-            evidenceScope: "unique-text-only",
-            queuedEntry: {
-              idPattern: "followUp:<sequence>",
-              text: queuedEntry.text,
-              mode: queuedEntry.mode,
-              label: queuedEntry.label,
-            },
-            pendingAtPredecessorTerminal: true,
-            publicIdleBoundary: "session.waitForIdle",
-            sdkOutcome: "queued-without-auto-continuation",
-            consumedMessageStartCount: 0,
-            successorProviderCallStarted: false,
-            exactExecutableIdentityRetainedAtIdle: true,
-            executableFollowUpCountAtIdle: queuesAtIdle.followUp.length,
-            pendingAtIdleBoundary: true,
-            rejectedOnDispose: true,
-            rawTerminalCount,
-            publicTerminalCount,
-          };
-        } finally {
-          releaseSuccessor.resolve();
-          unsubscribe();
-        }
       }
     );
   } finally {
-    releaseSuccessor.resolve();
-    hostDispatch.emitDestroy();
+    releasePrompt.resolve();
   }
 }
 
@@ -1400,9 +790,9 @@ async function queuedControlOwnershipLimitation(sdkPackage) {
   );
 
   return {
-    status: "blocked",
+    status: "contained",
     code: QUEUED_CONTROL_OWNERSHIP_CODE,
-    affectedAdapterPath: "SdkSession.send(live steer/follow_up)",
+    affectedAdapterPath: "SdkSession.send rejects live steer/follow_up",
     sendUserMessageHooksStructurallyDeclared: true,
     queuedAtDispatchClassification: "internal-sdk-signal",
     onQueuedPromotedClassification: "sdk-host-ownership-correlation",
@@ -1411,6 +801,7 @@ async function queuedControlOwnershipLimitation(sdkPackage) {
     sdkRunCapabilitySubpathBlocked: true,
     upstream5371FixMarkerObserved: false,
     unsupportedFallbackUsed: false,
+    publicContractRequestIssue: 5429,
   };
 }
 
@@ -1449,17 +840,16 @@ async function runProbe(ownerRoot) {
     import("../src/sdk-session.js"),
   ]);
 
-  const followUps = await probeFollowUps(ownerRoot);
-  const sameTextQueueDivergence = await probeSameTextQueueDivergence(ownerRoot);
-  const nearTerminalQueue = await probeNearTerminalQueue(ownerRoot);
   const gates = await probeGates(ownerRoot);
   const failureTerminal = await probeFailureTerminal(ownerRoot);
   const disposal = await probeDisposeWithoutTerminal(ownerRoot);
+  const liveControlContainment =
+    await probeLiveControlContainment(ownerRoot);
   const decisionGate = await decisionGateLimitation();
   const queuedControlOwnership =
     await queuedControlOwnershipLimitation(sdkPackage);
   requireCondition(networkAttempts === 0, "NETWORK_ACCESS_ATTEMPTED");
-  requireCondition(harnessCleanupOutcomes.length === 6, "CLEANUP_OUTCOME_COUNT_WRONG");
+  requireCondition(harnessCleanupOutcomes.length === 4, "CLEANUP_OUTCOME_COUNT_WRONG");
   requireCondition(
     harnessCleanupOutcomes.every(
       (outcome) => outcome.failures.length === 0 && outcome.completed.length === 7
@@ -1472,9 +862,10 @@ async function runProbe(ownerRoot) {
     sdkVersionObserved: sdkPackage.version,
     daemonDependencyVersion: daemonPackage.dependencies["@gajae-code/coding-agent"],
     upgradeAssessment: {
-      verdict: "BLOCK",
+      verdict: "PASS",
       oracleStatus: "completed",
-      reasonCodes: [
+      containment: "live-controls-fail-closed",
+      limitationCodes: [
         LATE_FOLLOW_UP_CODE,
         QUEUED_CONTROL_OWNERSHIP_CODE,
       ],
@@ -1507,9 +898,7 @@ async function runProbe(ownerRoot) {
         mustRunAfterChildExit: true,
       },
     },
-    followUps,
-    sameTextQueueDivergence,
-    nearTerminalQueue,
+    liveControlContainment,
     gates,
     failureTerminal,
     disposal,
@@ -1517,11 +906,11 @@ async function runProbe(ownerRoot) {
     queuedControlOwnership,
     limitations: {
       lateFollowUpAutoContinuation: {
-        status: "observed-sdk-gap",
+        status: "contained-sdk-gap",
         code: LATE_FOLLOW_UP_CODE,
-        boundary: "raw-agent-end-before-agent-session-terminal",
+        boundary: "live controls rejected before SDK queue admission",
         evidence:
-          "session.waitForIdle resolved while the exact executable follow-up remained queued.",
+          "The published package lacks the upstream continuation marker; the adapter does not enter that queue path.",
       },
       successorGateCompletion: {
         status: "not-exercised",
@@ -1530,11 +919,11 @@ async function runProbe(ownerRoot) {
         requiredEvidence: "lookupCompletedResolution.kind=completed",
       },
       lateSteerRearm: {
-        status: "not-exercised",
+        status: "unsupported-fail-closed",
         code: "LATE_STEER_REARM_NOT_OBSERVED",
-        excludedCase: "steer-rearmed-as-follow-up",
+        excludedCase: "live steer",
         reason:
-          "The bounded near-terminal cases exercise follow-up ownership; steering promotion is a distinct SDK path.",
+          "Live controls remain disabled until upstream issue #5429 provides a supported ownership contract.",
       },
     },
   };

@@ -11,14 +11,13 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (SDK 0.16.6; evidence-scoped blocked integration)
+## Architecture (SDK 0.16.6; fail-closed live controls)
 
-Upgrade status is **BLOCK**, not release-ready. The daemon dependency, lockfile,
-and installed package are 0.16.6. Current adapter/oracle/isolation tests pass
-84/84, but the real oracle reproduces
-`SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`: public `waitForIdle()` resolves
-with the exact executable follow-up still queued and no successor. This is a
-current execution, separate from the historical 0.16.4 observation.
+The daemon dependency, lockfile, and installed package are 0.16.6. The published
+SDK can leave a late follow-up queued without a successor after
+`waitForIdle()`, so the adapter does not enter that path: `steer` and
+`follow_up` are rejected with `SDK_LIVE_CONTROL_UNSUPPORTED` whenever a prompt
+is active. Idle controls remain serialized prompt-equivalent work.
 
 Upstream issue `Yeachan-Heo/gajae-code#5351` was closed after PR #5371 was
 squash-merged to upstream `dev` on 2026-09-07, but the already published 0.16.6
@@ -26,15 +25,14 @@ package does not contain that fix. Installed source still routes
 `#queueFollowUp()` only through the idle-gated
 `#scheduleQueuedFollowUpContinuation()` and lacks #5371's
 `#scheduleNonAdmittedQueuedContinuation()`. Issue closure on `dev` is not
-release inclusion. The current oracle records `BLOCK` for that boundary and
-separately for `SDK_0_16_6_QUEUED_CONTROL_OWNERSHIP_REQUIRES_INTERNAL_HOOKS`.
+release inclusion.
 `queuedAtDispatch` is explicitly internal; `onQueuedPromoted` is SDK-host
 ownership correlation, not a supported generic embedder contract. Source/type
 inspection establishes this second limitation, not a second runtime failure.
-The existing coupling is retained only in the blocked candidate; no supported
-public replacement has been established. Prior review approved ownership
-safety, not release readiness. Keep the reproducer; do not substitute remote
-FIFO delivery, private capabilities, or forced lower-level continuation.
+The adapter no longer consumes either hook. A supported public replacement is
+requested in `Yeachan-Heo/gajae-code#5429`; live controls remain fail-closed
+until that contract ships. Do not substitute queue-text matching, private
+capabilities, or forced lower-level continuation.
 
 The topology below remains the implemented integration. The prepared current
 isolation boundary and explicitly historical observations are recorded in
@@ -64,16 +62,10 @@ explicitly historical.
    under `<workDir>/.gjc-remote-session`. Prompt and model operations are
    serialized per session. Idle `steer`/`follow_up` requests join that FIFO and
    start a prompt-equivalent run instead of waiting on an inactive control queue.
-   While a prompt or accepted follow-up pipeline is active, controls retain
-   their SDK `steer`/`follow_up` semantics instead of waiting behind it. Live
-   controls wait for the terminal that owns their consumed message; several
-   sequential follow-ups can share one `agent_end`. Admission alone does not
-   complete a command, and the active pipeline blocks queued prompt/model work.
-   SDK `sendUserMessage` promotion callbacks identify actual control consumption;
-   display-queue state is not completion authority.
-   Rejected admissions consume no completion boundary; SDK failure outcomes
-   reject the invocation. Each request
-   receives its event stream, and later controls rejoin the FIFO. Idle sessions
+   While a prompt is active, live controls fail immediately with
+   `SDK_LIVE_CONTROL_UNSUPPORTED` before SDK queue admission. This avoids
+   unowned completion and unrelated-terminal correlation. SDK failure outcomes
+   reject the invocation. Each prompt receives its event stream. Idle sessions
    (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
    Gate answers use per-attempt `answerId` receipts. Only confirmed acceptance
    retires the exact presentation; rejection preserves a live retry route.

@@ -18,11 +18,13 @@ describes only the current command contract, not boot supervision, production
 promotion, or tenant isolation. “Release candidate” and “future phase” are
 design/release states, not observed production support.
 
-The installed SDK 0.16.6 pin remains an upgrade candidate: its real oracle
-confirms the liveness `BLOCK`, and internal ownership hooks remain a separate
-integration blocker. Passing other checks is not promotion evidence. See the
-[upgrade blocker](../../CHANGELOG.md#upgrade-blocker) for the distinction
-between the upstream development-source fix and the tagged npm package.
+The installed SDK 0.16.6 pin keeps live controls fail-closed: an active
+`steer` or `follow_up` is rejected before SDK queue admission, while an idle
+control remains prompt-equivalent FIFO work. The published package lacks the
+upstream late-follow-up continuation fix and a supported ownership lifecycle;
+the latter is tracked in
+[upstream #5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429).
+See the [containment record](../../CHANGELOG.md#sdk-0166-containment).
 
 No guide in this directory claims a completed live deployment. The repository
 ships no native service installer, Windows service wrapper, or systemd unit;

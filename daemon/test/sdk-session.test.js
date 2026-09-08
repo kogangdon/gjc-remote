@@ -300,19 +300,6 @@ class FakeAgentSession {
     this.calls = [];
     this.disposeCalls = 0;
     this.profileCalls = [];
-    this.followUpOptions = [];
-    this.sendUserMessageCalls = [];
-    this.queuedMessageEntries = [];
-    this.queuedMessageSequence = 0;
-    this.executableQueues = { steering: [], followUp: [] };
-    this.queuedControlPromotions = [];
-    this.retainExecutableQueuesOnNextTerminal = false;
-    this.agent = {
-      snapshotQueues: () => ({
-        steering: [...this.executableQueues.steering],
-        followUp: [...this.executableQueues.followUp],
-      }),
-    };
     this.modelRegistry = { id: "fake-model-registry" };
     this.settings = {
       get: (key) => (key === "modelProfile.default" ? "copilot-claude" : undefined),
@@ -325,67 +312,7 @@ class FakeAgentSession {
   }
 
   emit(event) {
-    if (event?.type === "agent_end") {
-      if (!this.retainExecutableQueuesOnNextTerminal) {
-        this.promoteQueuedControls({ startsOwnRun: false });
-      }
-      // Display entries are not consumption evidence: AgentSession can remove
-      // one earlier on an unrelated same-text user message_start.
-      this.queuedMessageEntries.length = 0;
-      this.retainExecutableQueuesOnNextTerminal = false;
-    }
     for (const listener of this.listeners) listener(event);
-  }
-
-  queueControl(mode, text, onQueuedPromoted) {
-    const promotionCallback = onQueuedPromoted ?? this.nextQueuedPromotion;
-    const message = {
-      role: "user",
-      content: [{ type: "text", text }],
-      attribution: "user",
-      timestamp: this.queuedMessageSequence + 1,
-    };
-    const entry = {
-      id: `${mode}:${++this.queuedMessageSequence}`,
-      text,
-      mode,
-      label: mode === "steer" ? "Steer" : "Queued",
-      message,
-    };
-    this.executableQueues[mode === "steer" ? "steering" : "followUp"].push(
-      message
-    );
-    this.queuedMessageEntries.push(entry);
-    this.queuedControlPromotions.push({
-      message,
-      onQueuedPromoted: promotionCallback,
-    });
-    return message;
-  }
-
-  getQueuedMessageEntries() {
-    return this.queuedMessageEntries.map(({ message: _message, ...entry }) => ({
-      ...entry,
-    }));
-  }
-
-  promoteQueuedControls({ startsOwnRun }) {
-    const promotions = this.queuedControlPromotions.splice(0);
-    this.executableQueues.steering.length = 0;
-    this.executableQueues.followUp.length = 0;
-    for (const promotion of promotions) {
-      promotion.onQueuedPromoted?.({ startsOwnRun });
-    }
-  }
-
-  removeQueuedControls() {
-    const promotions = this.queuedControlPromotions.splice(0);
-    this.executableQueues.steering.length = 0;
-    this.executableQueues.followUp.length = 0;
-    this.queuedMessageEntries.length = 0;
-    for (const promotion of promotions) {
-      promotion.onQueuedPromoted?.({ startsOwnRun: false, removed: true });
-    }
   }
 
   getAvailableModels() {
@@ -402,35 +329,6 @@ class FakeAgentSession {
     this.emit(terminalEvent({ text: message }));
   }
 
-  async steer(message) {
-    this.calls.push(["steer", message]);
-    this.queueControl("steer", message);
-  }
-
-  async followUp(message, images, options) {
-    this.calls.push(["follow_up", message]);
-    this.followUpOptions.push([images, options]);
-    this.queueControl("followUp", message);
-  }
-
-  async sendUserMessage(content, options) {
-    this.sendUserMessageCalls.push([content, options]);
-    const mode = options?.deliverAs === "followUp" ? "followUp" : "steer";
-    const previousPromotion = this.nextQueuedPromotion;
-    this.nextQueuedPromotion = options?.onQueuedPromoted;
-    let submission;
-    try {
-      if (mode === "followUp") {
-        submission = this.followUp(content);
-      } else {
-        submission = this.steer(content);
-      }
-    } finally {
-      this.nextQueuedPromotion = previousPromotion;
-    }
-    return await submission;
-  }
-
   async activateModelProfileForControl(profileName) {
     this.profileCalls.push(profileName);
     return true;
@@ -438,45 +336,6 @@ class FakeAgentSession {
 
   async dispose() {
     this.disposeCalls += 1;
-  }
-}
-
-// agent-loop.ts:4404-4430 drains every sequential follow-up back into the
-// current outer loop and publishes one agent_end only after the queue is empty.
-class SequentialFollowUpAgentSession extends FakeAgentSession {
-  constructor() {
-    super();
-    this.queuedFollowUps = [];
-    this.consumedFollowUps = [];
-    this.runGate = new Promise((resolve) => {
-      this.releaseRun = resolve;
-    });
-  }
-
-  async prompt(message) {
-    this.calls.push(["prompt", message]);
-    await this.runGate;
-    this.consumedFollowUps.push(...this.queuedFollowUps.splice(0));
-    this.emit(
-      terminalEvent({
-        messages: [
-          ...this.consumedFollowUps.map((text) => ({
-            role: "user",
-            content: [{ type: "text", text }],
-            attribution: "user",
-            timestamp: 1,
-          })),
-          assistantMessage("drained"),
-        ],
-      })
-    );
-  }
-
-  async followUp(message, images, options) {
-    this.calls.push(["follow_up", message]);
-    this.followUpOptions.push([images, options]);
-    this.queueControl("followUp", message);
-    this.queuedFollowUps.push(message);
   }
 }
 
@@ -1031,489 +890,15 @@ test("SDK adapter serializes commands per session", async () => {
   await session.dispose();
 });
 
-test("live controls consumed in one SDK run share its single terminal", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.steer = async (message) => {
-    agent.calls.push(["steer", message]);
-    agent.queueControl("steer", message);
-  };
-  agent.followUp = async (message, images, options) => {
-    agent.calls.push(["follow_up", message]);
-    agent.followUpOptions.push([images, options]);
-    agent.queueControl("followUp", message);
-  };
-  const session = new SdkSession(agent);
-  const promptEvents = [];
-  const steerEvents = [];
-  const followUpEvents = [];
-  let promptSettled = false;
-  let steerSettled = false;
-  let followUpSettled = false;
-
-  const prompt = session
-    .send({ type: "prompt", message: "first" }, (event) => promptEvents.push(event), 100)
-    .finally(() => {
-      promptSettled = true;
-    });
-  const steer = session
-    .send({ type: "steer", message: "adjust" }, (event) => steerEvents.push(event), 100)
-    .finally(() => {
-      steerSettled = true;
-    });
-  const followUp = session
-    .send(
-      { type: "follow_up", message: "then continue" },
-      (event) => followUpEvents.push(event),
-      100
-    )
-    .finally(() => {
-      followUpSettled = true;
-    });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(promptSettled, false);
-  assert.equal(steerSettled, false);
-  assert.equal(followUpSettled, false);
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["steer", "adjust"],
-    ["follow_up", "then continue"],
-  ]);
-  assert.deepEqual(
-    agent.sendUserMessageCalls.map(([content, options]) => ({
-      content,
-      deliverAs: options.deliverAs,
-      queuedAtDispatch: options.queuedAtDispatch,
-      hasPromotionHook: typeof options.onQueuedPromoted === "function",
-    })),
-    [
-      {
-        content: "adjust",
-        deliverAs: "steer",
-        queuedAtDispatch: true,
-        hasPromotionHook: true,
-      },
-      {
-        content: "then continue",
-        deliverAs: "followUp",
-        queuedAtDispatch: true,
-        hasPromotionHook: true,
-      },
-    ]
-  );
-
-  const currentUpdate = { type: "message_update", value: "controlled" };
-  const currentEnd = terminalEvent();
-  agent.emit(currentUpdate);
-  agent.emit(currentEnd);
-  await Promise.all([prompt, steer, followUp]);
-
-  assert.deepEqual(promptEvents, [currentUpdate, currentEnd]);
-  assert.deepEqual(steerEvents, [currentUpdate, currentEnd]);
-  assert.deepEqual(followUpEvents, [currentUpdate, currentEnd]);
-  assert.equal(promptSettled, true);
-  assert.equal(steerSettled, true);
-  assert.equal(followUpSettled, true);
-  await session.dispose();
-});
-
-test("multiple controls accepted before drain do not reserve extra terminals", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.steer = async (message) => {
-    agent.calls.push(["steer", message]);
-    agent.queueControl("steer", message);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-    agent.queueControl("followUp", message);
-  };
-  const session = new SdkSession(agent);
-  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
-  const first = session.send({ type: "follow_up", message: "first" }, () => {}, 100);
-  const steer = session.send({ type: "steer", message: "adjust" }, () => {}, 100);
-  const second = session.send(
-    { type: "follow_up", message: "second" },
-    () => {},
-    100
-  );
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(agent.calls, [
-    ["prompt", "initial"],
-    ["follow_up", "first"],
-    ["steer", "adjust"],
-    ["follow_up", "second"],
-  ]);
-
-  agent.emit(terminalEvent());
-  await Promise.all([prompt, first, steer, second]);
-  await session.dispose();
-});
-
-test("queued commands wait for an active follow-up run to complete", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-    agent.queueControl("followUp", message);
-  };
-  const session = new SdkSession(agent);
-
-  const prompt = session.send({ type: "prompt", message: "first" }, () => {}, 100);
-  const followUp = session.send(
-    { type: "follow_up", message: "continue" },
-    () => {},
-    100
-  );
-  const modelSwitch = session.send(
-    { type: "set_model", provider: "provider-a", modelId: "model-a" },
-    () => {},
-    100
-  );
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["follow_up", "continue"],
-  ]);
-
-  agent.emit(terminalEvent());
-  await Promise.all([prompt, followUp, modelSwitch]);
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["follow_up", "continue"],
-    ["set_model", agent.models[0]],
-  ]);
-  await session.dispose();
-});
-
-test("queued commands wait for a late steer rearmed into its own run", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  const session = new SdkSession(agent);
-
-  const prompt = session.send(
-    { type: "prompt", message: "first" },
-    () => {},
-    100
-  );
-  const steer = session.send(
-    { type: "steer", message: "adjust" },
-    () => {},
-    100
-  );
-  const modelSwitch = session.send(
-    { type: "set_model", provider: "provider-a", modelId: "model-a" },
-    () => {},
-    100
-  );
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["steer", "adjust"],
-  ]);
-
-  agent.retainExecutableQueuesOnNextTerminal = true;
-  agent.emit(terminalEvent({ scope: attemptScope(1, "predecessor") }));
-  await prompt;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(
-    agent.calls.some(([operation]) => operation === "set_model"),
-    false
-  );
-
-  const steerScope = attemptScope(2, "steer-run");
-  agent.promoteQueuedControls({ startsOwnRun: true });
-  agent.emit({ type: "agent_start", scope: steerScope });
-  agent.emit(terminalEvent({ scope: steerScope }));
-  await Promise.all([prompt, steer, modelSwitch]);
-  assert.deepEqual(agent.calls, [
-    ["prompt", "first"],
-    ["steer", "adjust"],
-    ["set_model", agent.models[0]],
-  ]);
-  await session.dispose();
-});
-
-test("multiple sequential follow-ups complete at one drained-run boundary", async () => {
-  const agent = new SequentialFollowUpAgentSession();
-  const session = new SdkSession(agent);
-  const promptEvents = [];
-  const firstEvents = [];
-  const secondEvents = [];
-  let firstSettled = false;
-  let secondSettled = false;
-
-  const prompt = session.send(
-    { type: "prompt", message: "initial" },
-    (event) => promptEvents.push(event),
-    100
-  );
-  const first = session
-    .send(
-      { type: "follow_up", message: "first" },
-      (event) => firstEvents.push(event),
-      100
-    )
-    .finally(() => {
-      firstSettled = true;
-    });
-  const second = session
-    .send(
-      { type: "follow_up", message: "second" },
-      (event) => secondEvents.push(event),
-      100
-    )
-    .finally(() => {
-      secondSettled = true;
-    });
-  const modelSwitch = session.send(
-    { type: "set_model", provider: "provider-a", modelId: "model-a" },
-    () => {},
-    100
-  );
-  await waitForImmediate(() => agent.queuedFollowUps.length === 2);
-  assert.equal(
-    agent.calls.some(([operation]) => operation === "set_model"),
-    false
-  );
-
-  agent.releaseRun();
-  await Promise.all([prompt, first, second, modelSwitch]);
-  assert.deepEqual(agent.consumedFollowUps, ["first", "second"]);
-  assert.deepEqual(agent.calls, [
-    ["prompt", "initial"],
-    ["follow_up", "first"],
-    ["follow_up", "second"],
-    ["set_model", agent.models[0]],
-  ]);
-  for (const events of [promptEvents, firstEvents, secondEvents]) {
-    assert.equal(
-      events.filter((event) => event.type === "agent_end").length,
-      1
-    );
-  }
-  assert.equal(firstSettled, true);
-  assert.equal(secondSettled, true);
-  await session.dispose();
-});
-
-test("rejected live follow-ups do not reserve completion boundaries", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  let followUpCalls = 0;
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-    followUpCalls += 1;
-    if (followUpCalls === 1) throw new Error("queue rejected");
-    agent.queueControl("followUp", message);
-  };
-  const session = new SdkSession(agent);
-  let secondSettled = false;
-
-  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
-  const first = session.send({ type: "follow_up", message: "rejected" }, () => {}, 100);
-  const firstRejection = assert.rejects(first, /queue rejected/);
-  const second = session
-    .send({ type: "follow_up", message: "accepted" }, () => {}, 100)
-    .finally(() => {
-      secondSettled = true;
-    });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  await firstRejection;
-  assert.equal(secondSettled, false);
-  agent.emit(terminalEvent());
-  await Promise.all([prompt, second]);
-  assert.equal(secondSettled, true);
-  await session.dispose();
-});
-
-test("terminal during follow-up admission owns that accepted FIFO entry", async () => {
-  const agent = new FakeAgentSession();
-  let releaseAcceptance;
-  const acceptance = new Promise((resolve) => {
-    releaseAcceptance = resolve;
-  });
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  agent.followUp = async (message) => {
-    agent.calls.push(["follow_up", message]);
-    agent.queueControl("followUp", message);
-    if (message === "continue") await acceptance;
-  };
-  const session = new SdkSession(agent);
-  let followUpSettled = false;
-  let successorSettled = false;
-
-  const prompt = session.send({ type: "prompt", message: "initial" }, () => {}, 100);
-  const followUp = session
-    .send({ type: "follow_up", message: "continue" }, () => {}, 100)
-    .finally(() => {
-      followUpSettled = true;
-    });
-  await waitForImmediate(() => agent.calls.length === 2);
-  agent.emit(terminalEvent());
-  await prompt;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(followUpSettled, false);
-
-  const successor = session
-    .send(
-      { type: "follow_up", message: "after cutoff" },
-      () => {},
-      100
-    )
-    .finally(() => {
-      successorSettled = true;
-    });
-  await waitForImmediate(() => agent.calls.length === 3);
-  releaseAcceptance();
-  await followUp;
-  assert.equal(followUpSettled, true);
-  assert.equal(successorSettled, false);
-
-  const successorScope = attemptScope(2);
-  agent.promoteQueuedControls({ startsOwnRun: true });
-  agent.emit({ type: "agent_start", scope: successorScope });
-  agent.emit(terminalEvent({ scope: successorScope }));
-  await successor;
-  assert.equal(successorSettled, true);
-  await session.dispose();
-});
-
-test("same-text display loss cannot promote a still-executable follow-up", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = async (message) => {
-    agent.calls.push(["prompt", message]);
-  };
-  const session = new SdkSession(agent);
-  let followUpSettled = false;
-
-  const prompt = session.send(
-    { type: "prompt", message: "same text" },
-    () => {},
-    100
-  );
-  const followUp = session
-    .send(
-      { type: "follow_up", message: "same text" },
-      () => {},
-      100
-    )
-    .finally(() => {
-      followUpSettled = true;
-    });
-  await waitForImmediate(() =>
-    agent.agent.snapshotQueues().followUp.length === 1
-  );
-
-  // AgentSession's display handler can remove the follow-up chip when the
-  // original prompt's same-text message_start arrives. The SDK-owned promotion
-  // callback has not fired and the exact executable message remains queued.
-  agent.queuedMessageEntries.length = 0;
-  assert.deepEqual(agent.getQueuedMessageEntries(), []);
-  const [executable] = agent.agent.snapshotQueues().followUp;
-  agent.retainExecutableQueuesOnNextTerminal = true;
-  agent.emit(terminalEvent());
-  await prompt;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(followUpSettled, false);
-  assert.strictEqual(agent.agent.snapshotQueues().followUp[0], executable);
-
-  // AgentSession schedules the still-queued entry into its own continuation.
-  agent.promoteQueuedControls({ startsOwnRun: true });
-  agent.emit(terminalEvent());
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(
-    followUpSettled,
-    false,
-    "an own-run promotion still requires its following agent_start"
-  );
-  const followUpScope = attemptScope(2);
-  agent.emit({ type: "agent_start", scope: followUpScope });
-  agent.emit(terminalEvent({ scope: attemptScope(1, "predecessor") }));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(
-    followUpSettled,
-    false,
-    "a delayed predecessor terminal cannot own the promoted run"
-  );
-  agent.emit(terminalEvent({ scope: attemptScope(3, "follow-up-retry") }));
-  await followUp;
-  assert.equal(followUpSettled, true);
-  await session.dispose();
-});
-
-test("live controls fail closed when SDK promotion ownership is unavailable", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = () => new Promise(() => {});
-  agent.sendUserMessage = undefined;
-  const session = new SdkSession(agent);
-  const prompt = session.send(
-    { type: "prompt", message: "active" },
-    () => {},
-    100
-  );
-  const promptResult = Promise.allSettled([prompt]);
-  await new Promise((resolve) => setImmediate(resolve));
-
-  await assert.rejects(
-    session.send(
-      { type: "follow_up", message: "unowned" },
-      () => {},
-      100
-    ),
-    /ownership hooks are unavailable/
-  );
-  await session.dispose();
-  await promptResult;
-});
-
-test("SDK removal disposition rejects a queued control without waiting for a terminal", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = () => new Promise(() => {});
-  const session = new SdkSession(agent);
-  const prompt = session.send(
-    { type: "prompt", message: "active" },
-    () => {},
-    100
-  );
-  const promptResult = Promise.allSettled([prompt]);
-  await new Promise((resolve) => setImmediate(resolve));
-
-  const followUp = session.send(
-    { type: "follow_up", message: "remove me" },
-    () => {},
-    100
-  );
-  await waitForImmediate(
-    () => agent.agent.snapshotQueues().followUp.length === 1
-  );
-  agent.removeQueuedControls();
-  await assert.rejects(followUp, /removed before execution/);
-
-  await session.dispose();
-  await promptResult;
-});
-
-test("live controls use the SDK literal-text promotion surface", async () => {
+test("live steer and follow-up fail closed without calling SDK queue hooks", async () => {
   const agent = new FakeAgentSession();
   let finishPrompt;
-  agent.prompt = () => new Promise((resolve) => { finishPrompt = resolve; });
+  agent.prompt = (message) => {
+    agent.calls.push(["prompt", message]);
+    return new Promise((resolve) => {
+      finishPrompt = resolve;
+    });
+  };
   const session = new SdkSession(agent);
   const prompt = session.send(
     { type: "prompt", message: "active" },
@@ -1521,22 +906,33 @@ test("live controls use the SDK literal-text promotion surface", async () => {
     100
   );
   await new Promise((resolve) => setImmediate(resolve));
-  const literal = "/local-template must stay literal";
-  const followUp = session.send(
-    { type: "follow_up", message: literal },
+
+  for (const type of ["steer", "follow_up"]) {
+    await assert.rejects(
+      session.send({ type, message: "unsupported live control" }, () => {}, 100),
+      (error) => {
+        assert.equal(error.code, "SDK_LIVE_CONTROL_UNSUPPORTED");
+        assert.match(error.message, /supported queued-input ownership contract/);
+        return true;
+      }
+    );
+  }
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+  assert.equal(session.closed, false);
+
+  agent.emit(terminalEvent());
+  finishPrompt();
+  await prompt;
+  agent.prompt = FakeAgentSession.prototype.prompt.bind(agent);
+  await session.send(
+    { type: "follow_up", message: "idle retry" },
     () => {},
     100
   );
-  await waitForImmediate(() => agent.sendUserMessageCalls.length === 1);
-
-  const [content, options] = agent.sendUserMessageCalls[0];
-  assert.equal(content, literal);
-  assert.equal(options.deliverAs, "followUp");
-  assert.equal(options.queuedAtDispatch, true);
-  assert.equal(typeof options.onQueuedPromoted, "function");
-  agent.emit(terminalEvent());
-  finishPrompt();
-  await Promise.all([prompt, followUp]);
+  assert.deepEqual(agent.calls, [
+    ["prompt", "active"],
+    ["prompt", "idle retry"],
+  ]);
   await session.dispose();
 });
 
@@ -1788,42 +1184,11 @@ test("adversarial: non-positive/NaN/undefined idle and hard-cap config fall back
   }
 });
 
-test("a timed-out live control explicitly settles its sibling waiter", async () => {
-  const agent = new FakeAgentSession();
-  agent.prompt = () => new Promise(() => {});
-  agent.steer = (message) => {
-    agent.queueControl("steer", message);
-    return new Promise(() => {});
-  };
-  const session = new SdkSession(agent, { idleTimeoutMs: 5000, hardCapMs: 30 });
 
-  const prompt = session.send({ type: "prompt", message: "hard-cap me" }, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  const steer = session.send({ type: "steer", message: "sibling" }, () => {}, 10);
-
-  const guard = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error("test guard: settlement hung")), 2000).unref?.();
-  });
-
-  const results = await Promise.race([
-    Promise.allSettled([prompt, steer]),
-    guard,
-  ]);
-
-  assert.equal(results[0].status, "rejected");
-  assert.match(results[0].reason.message, /timed out/);
-  assert.equal(results[1].status, "rejected");
-  assert.equal(session.closed, true);
-  await session.dispose();
-});
 test("dispose cancels adapter waiters without relying on an SDK terminal", async () => {
   const agent = new FakeAgentSession();
   const timers = createManualTimeouts();
   agent.prompt = () => new Promise(() => {});
-  agent.steer = (message) => {
-    agent.queueControl("steer", message);
-    return new Promise(() => {});
-  };
   agent.dispose = async () => {
     agent.disposeCalls += 1;
   };
@@ -1836,17 +1201,13 @@ test("dispose cancels adapter waiters without relying on an SDK terminal", async
 
   const prompt = session.send({ type: "prompt", message: "active" }, () => {}, 100);
   await new Promise((resolve) => setImmediate(resolve));
-  const steer = session.send({ type: "steer", message: "adjust" }, () => {}, 100);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(timers.size, 4);
+  assert.equal(timers.size, 2);
 
-  const resultsPromise = Promise.allSettled([prompt, steer]);
+  const resultsPromise = Promise.allSettled([prompt]);
   await session.dispose();
   const results = await resultsPromise;
   assert.equal(results[0].status, "rejected");
   assert.match(results[0].reason.message, /disposed/);
-  assert.equal(results[1].status, "rejected");
-  assert.match(results[1].reason.message, /disposed/);
   assert.equal(timers.size, 0);
   assert.equal(agent.disposeCalls, 1);
 });
@@ -2597,54 +1958,7 @@ test("onGateEmitted replay is attributed to the run before subscription", async 
   await session.dispose();
 });
 
-test("a workflow gate suspends idle timers for every active run", async () => {
-  class MultiRunGatingAgent extends GatingAgentSession {
-    constructor() {
-      super({ gate_id: "g-all", kind: "question", context: { prompt: "Continue" } });
-      this.allowGate = new Promise((resolve) => {
-        this.releaseGate = resolve;
-      });
-      this.steerBlock = new Promise(() => {});
-    }
-    async prompt(message) {
-      this.calls.push(["prompt", message]);
-      await this.allowGate;
-      this.answers.push(await this.gateEmitter.emitGate(this.gates[0]));
-      this.emit(terminalEvent());
-    }
-    async steer(message) {
-      this.calls.push(["steer", message]);
-      this.queueControl("steer", message);
-      await this.steerBlock;
-    }
-  }
 
-  const agent = new MultiRunGatingAgent();
-  const timers = createManualTimeouts();
-  const session = new SdkSession(agent, {
-    idleTimeoutMs: 25,
-    hardCapMs: 5_000,
-    gateAnswerWindowMs: 1_000,
-    setTimeoutFn: timers.setTimeout,
-    clearTimeoutFn: timers.clearTimeout,
-  });
-  const prompt = session.send({ type: "prompt", message: "first" }, () => {});
-  const steer = session.send({ type: "steer", message: "adjust" }, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  agent.releaseGate();
-  await waitForImmediate(() => session.pendingGates.size === 1);
-  const lateSteer = session.send({ type: "steer", message: "late-adjust" }, () => {});
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(session.pendingGates.size, 1);
-
-  timers.advance(75);
-  assert.equal(session.closed, false);
-  await session.answerGate("g-all", "ok");
-  timers.advance(5_000);
-  await new Promise((resolve) => setImmediate(resolve));
-  await session.dispose();
-  await Promise.allSettled([prompt, steer, lateSteer]);
-});
 test("gate-answer window expiry disposes the session with a distinct error", async () => {
   const agent = new GatingAgentSession({
     gate_id: "g4",

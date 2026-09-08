@@ -53,8 +53,10 @@ host-environment guards, bounded redaction, and explicit cleanup accounting.
 Canonical `createAgentSession` and `SessionManager` imports are exercised by
 the real factory path, not inferred merely from package declarations.
 
-The separate queued-follow-up liveness blocker also remains unresolved in this
-published package. Upstream issue
+The queued-follow-up liveness gap remains in this published package. The daemon
+contains it by rejecting `steer` and `follow_up` while a prompt is active,
+before SDK queue admission; idle controls remain prompt-equivalent FIFO work.
+Upstream issue
 [`Yeachan-Heo/gajae-code#5351`](https://github.com/Yeachan-Heo/gajae-code/issues/5351)
 was closed after
 [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371) was squash-merged
@@ -65,8 +67,11 @@ attempts the idle-gated `#scheduleQueuedFollowUpContinuation()` on the
 empty-queue transition; it has no
 `#scheduleNonAdmittedQueuedContinuation()` from #5371. The 0.16.6 changelog
 lists only the smoke-test timing and SDK lifecycle-replay fixes for that
-release. Issue closure on `dev` is therefore not release inclusion, and this
-isolation probe does not substitute for the separate real contract oracle.
+release. Issue closure on `dev` is therefore not release inclusion. A supported
+public ownership lifecycle is requested in
+[`Yeachan-Heo/gajae-code#5429`](https://github.com/Yeachan-Heo/gajae-code/issues/5429);
+the contract oracle verifies fail-closed containment independently of this
+isolation probe.
 
 ## Historical SDK 0.16.4 observed boundary
 

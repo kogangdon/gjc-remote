@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
-import { V0_LIMITS, isGateRequestEvent } from "@gjc-remote/shared";
+import {
+  PROTOCOL_ERROR_CODES,
+  V0_LIMITS,
+  isGateRequestEvent,
+} from "@gjc-remote/shared";
 
 const GATE_KINDS = new Set(["question", "approval", "execution"]);
 // @gajae-code/agent-core 0.16.6 can emit an `agent_end` checkpoint before
@@ -16,6 +20,8 @@ const APPROVAL_DECISIONS = ["approve", "request-changes", "reject"];
 const EXECUTION_DECISIONS = ["approve", "decline"];
 const SAFE_FAILURE_CODE = /^[A-Za-z0-9._-]+$/;
 const SAFE_FAILURE_CODE_MAX = 64;
+const LIVE_CONTROL_UNSUPPORTED_CODE =
+  PROTOCOL_ERROR_CODES.LIVE_CONTROL_UNSUPPORTED;
 
 const SDK_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SDK_HARD_CAP_MS = 30 * 60 * 1000;
@@ -443,19 +449,6 @@ function attemptScopeBoundary(scope) {
   };
 }
 
-function terminalBelongsToStartedRun(start, terminal) {
-  const candidate = attemptScopeBoundary(terminal);
-  // Main-attempt generations are monotonic. A fallback/retry belonging to the
-  // promoted run may have a later generation; a delayed predecessor cannot.
-  return (
-    candidate !== undefined &&
-    candidate.lineage === start.lineage &&
-    (candidate.generation > start.generation ||
-      (candidate.generation === start.generation &&
-        candidate.attemptId === start.attemptId))
-  );
-}
-
 function attemptScopesEqual(left, right) {
   return (
     left?.attemptId === right?.attemptId &&
@@ -589,10 +582,7 @@ export class SdkSession {
     this.closed = false;
     this.queue = Promise.resolve();
     this.queuedCommands = 0;
-    this.inFlightControls = new Set();
     this.activePromptRuns = 0;
-    this.pendingLiveFollowUps = 0;
-    this.liveControlBarrier = undefined;
     this.adapterWaiterCancellations = new Set();
     this.inFlightGateAnswers = new Set();
     this.disposePromise = undefined;
@@ -655,8 +645,6 @@ export class SdkSession {
     return (
       this.queuedCommands > 0 ||
       this.activePromptRuns > 0 ||
-      this.inFlightControls.size > 0 ||
-      this.pendingLiveFollowUps > 0 ||
       this.pendingGates.size > 0 ||
       this.deferredGateCandidate !== undefined
     );
@@ -667,61 +655,23 @@ export class SdkSession {
     const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
     if (!isLiveControl) return this.#enqueue(command, onEvent, timeoutMs);
 
-    const result = Promise.resolve().then(() => {
+    return Promise.resolve().then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
-      if (this.activePromptRuns <= 0 && !this.liveControlBarrier) {
+      if (this.activePromptRuns <= 0) {
         return this.#enqueue(command, onEvent, timeoutMs);
       }
-      if (command.type !== "follow_up") {
-        return this.#trackLiveControl(
-          this.#runPromptCommand(command, onEvent, timeoutMs)
-        );
-      }
-
-      this.pendingLiveFollowUps += 1;
-      const control = this.#trackLiveControl(
-        this.#runPromptCommand(command, onEvent, timeoutMs)
+      const error = new Error(
+        `Live SDK ${command.type} is unavailable until the SDK exposes a supported queued-input ownership contract`
       );
-      control.then(
-        () => {
-          this.pendingLiveFollowUps -= 1;
-        },
-        () => {
-          this.pendingLiveFollowUps -= 1;
-        }
-      );
-      return control;
+      error.code = LIVE_CONTROL_UNSUPPORTED_CODE;
+      throw error;
     });
-    this.inFlightControls.add(result);
-    result.then(
-      () => this.inFlightControls.delete(result),
-      () => this.inFlightControls.delete(result)
-    );
-    return result;
-  }
-
-  #trackLiveControl(control) {
-    const priorBarrier = this.liveControlBarrier;
-    const barrier = Promise.allSettled(
-      priorBarrier ? [priorBarrier, control] : [control]
-    ).then(() => {});
-    this.liveControlBarrier = barrier;
-    barrier.then(() => {
-      if (this.liveControlBarrier === barrier) {
-        this.liveControlBarrier = undefined;
-      }
-    });
-    return control;
   }
 
   #enqueue(command, onEvent, timeoutMs) {
     this.queuedCommands += 1;
     const result = this.queue
       .then(async () => {
-        while (this.liveControlBarrier) {
-          const barrier = this.liveControlBarrier;
-          await barrier;
-        }
         if (this.closed) throw new Error("GJC SDK session is not running");
         return this.#dispatch(command, onEvent, timeoutMs);
       })
@@ -794,21 +744,13 @@ export class SdkSession {
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
     });
-    const startsPrompt = command.type === "prompt";
-    let promptActive = startsPrompt;
+    let promptActive = true;
     let eventConsumerError;
     const reportedFailures = [];
     let promptFailure;
     const terminalFailures = [];
     let sawAgentStart = false;
     let observedAgentEnds = 0;
-    let completionFailure;
-    let controlPromotion;
-    let resolveControlPromotion;
-    const controlPromotionReady = new Promise((resolve) => {
-      resolveControlPromotion = resolve;
-    });
-    let promotedOwnRunStart;
     let resetIdle = () => {};
     // #35: track this run before registering the session-level gate listener.
     // SDK 0.16.6 replays durable pending gates synchronously from
@@ -817,16 +759,7 @@ export class SdkSession {
     const gateRun = { onEvent, controller: undefined };
     this.activeGateRuns.push(gateRun);
     this.#ensureGateSubscription();
-    if (startsPrompt) this.activePromptRuns += 1;
-
-    const markControlPromoted = (promotion = {}) => {
-      if (controlPromotion) return;
-      controlPromotion = {
-        startsOwnRun: promotion.startsOwnRun === true,
-        removed: promotion.removed === true,
-      };
-      resolveControlPromotion(controlPromotion);
-    };
+    this.activePromptRuns += 1;
     const markPromptInactive = () => {
       if (!promptActive) return;
       promptActive = false;
@@ -836,13 +769,6 @@ export class SdkSession {
       resetIdle();
       if (event?.type === "agent_start") {
         sawAgentStart = true;
-        if (
-          controlPromotion?.startsOwnRun &&
-          !controlPromotion.removed &&
-          promotedOwnRunStart === undefined
-        ) {
-          promotedOwnRunStart = attemptScopeBoundary(event.scope);
-        }
       }
       if (event?.type === "agent_failed") {
         reportedFailures.push({
@@ -868,23 +794,9 @@ export class SdkSession {
           failureIndex >= 0
             ? reportedFailures.splice(failureIndex, 1)[0].failure
             : terminalFailure(event);
-        if (startsPrompt) {
-          terminalFailures.push(failure);
-          observedAgentEnds += 1;
-          if (observedAgentEnds >= 1) resolveAgentEnd();
-        } else if (
-          controlPromotion &&
-          !controlPromotion.removed &&
-          (!controlPromotion.startsOwnRun ||
-            (promotedOwnRunStart !== undefined &&
-              terminalBelongsToStartedRun(
-                promotedOwnRunStart,
-                event.scope
-              )))
-        ) {
-          completionFailure = failure;
-          resolveAgentEnd();
-        }
+        terminalFailures.push(failure);
+        observedAgentEnds += 1;
+        if (observedAgentEnds >= 1) resolveAgentEnd();
       }
       try {
         onEvent(event);
@@ -899,80 +811,35 @@ export class SdkSession {
     try {
       await this.#withStreamingTimeout(
         async () => {
-          if (command.type === "prompt") {
-            let promptSubmission;
-            try {
-              // Invoke immediately after the queued dispatch gains ownership.
-              // Deferring this call by another microtask lets live controls
-              // overtake the prompt whose run they are meant to join.
-              promptSubmission = this.session.prompt(command.message);
-            } catch (error) {
-              promptSubmission = Promise.reject(error);
-            }
-            const promptOutcome = Promise.resolve(promptSubmission).then(
-              () => ({ ok: true }),
-              (error) => ({
-                ok: false,
-                failure: sanitizedFailure(error),
-              })
-            );
-            const first = await Promise.race([
-              promptOutcome.then((outcome) => ({ type: "prompt", outcome })),
-              agentEnd.then(() => ({ type: "terminal" })),
-            ]);
-            if (
-              first.type === "prompt" &&
-              !first.outcome.ok &&
-              !sawAgentStart &&
-              observedAgentEnds === 0
-            ) {
-              throw sdkFailureError(first.outcome.failure);
-            }
-            await agentEnd;
-            const outcome =
-              first.type === "prompt" ? first.outcome : await promptOutcome;
-            if (!outcome.ok) promptFailure = outcome.failure;
-          } else if (command.type === "steer") {
-            if (typeof this.session.sendUserMessage !== "function") {
-              throw new Error("SDK queued-control ownership hooks are unavailable");
-            }
-            // sendUserMessage's explicit delivery path treats remote input as
-            // literal text: unlike raw steer()/followUp(), it does not expand
-            // host prompt templates or interpret extension slash commands.
-            //
-            // Installed 0.16.6 still declares queuedAtDispatch and
-            // onQueuedPromoted on AgentSession, but identifies them as SDK-host
-            // dispatch/ownership correlation rather than a generic embedder
-            // contract. This candidate retains that exact ownership seam and
-            // fails closed if it is absent; the real-SDK oracle records the
-            // unsupported public-lifecycle dependency as an upgrade blocker.
-            // Never replace it with text/display-queue matching.
-            await this.session.sendUserMessage(command.message, {
-              deliverAs: "steer",
-              queuedAtDispatch: true,
-              onQueuedPromoted: markControlPromoted,
-            });
-          } else {
-            if (typeof this.session.sendUserMessage !== "function") {
-              throw new Error("SDK queued-control ownership hooks are unavailable");
-            }
-            await this.session.sendUserMessage(command.message, {
-              deliverAs: "followUp",
-              // SDK 0.16.6 uses this bit to force one-at-a-time follow-up
-              // delivery, preserving the adapter's bounded FIFO policy.
-              queuedAtDispatch: true,
-              onQueuedPromoted: markControlPromoted,
-            });
+          let promptSubmission;
+          try {
+            promptSubmission = this.session.prompt(command.message);
+          } catch (error) {
+            promptSubmission = Promise.reject(error);
           }
-          if (!startsPrompt) {
-            const promotion = await controlPromotionReady;
-            if (promotion.removed) {
-              throw new Error(
-                `SDK ${command.type} was removed before execution`
-              );
-            }
+          const promptOutcome = Promise.resolve(promptSubmission).then(
+            () => ({ ok: true }),
+            (error) => ({
+              ok: false,
+              failure: sanitizedFailure(error),
+            })
+          );
+          const first = await Promise.race([
+            promptOutcome.then((outcome) => ({ type: "prompt", outcome })),
+            agentEnd.then(() => ({ type: "terminal" })),
+          ]);
+          if (
+            first.type === "prompt" &&
+            !first.outcome.ok &&
+            !sawAgentStart &&
+            observedAgentEnds === 0
+          ) {
+            throw sdkFailureError(first.outcome.failure);
           }
           await agentEnd;
+          const outcome =
+            first.type === "prompt" ? first.outcome : await promptOutcome;
+          if (!outcome.ok) promptFailure = outcome.failure;
         },
         timeoutMs,
         this.hardCapMs,
@@ -985,9 +852,7 @@ export class SdkSession {
           }
         }
       );
-      const failureAtTerminal = startsPrompt
-        ? terminalFailures[0]
-        : completionFailure;
+      const failureAtTerminal = terminalFailures[0];
       if (failureAtTerminal) throw sdkFailureError(failureAtTerminal);
       if (promptFailure) throw sdkFailureError(promptFailure);
       if (eventConsumerError) throw eventConsumerError;
@@ -1502,7 +1367,6 @@ export class SdkSession {
     const disposal = this.#disposeUnderlying();
     const commands = Promise.allSettled([
       this.queue,
-      ...this.inFlightControls,
       ...this.inFlightGateAnswers,
     ]);
     const [disposalResult] = await Promise.allSettled([disposal]);

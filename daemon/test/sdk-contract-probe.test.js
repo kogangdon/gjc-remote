@@ -199,7 +199,7 @@ function spawnProbe(root) {
 }
 
 test(
-  "SDK 0.16.6 real AgentSession contracts govern follow-ups, gates, failures, and disposal",
+  "SDK 0.16.6 real AgentSession contracts contain live controls and govern gates, failures, and disposal",
   { timeout: 30_000 },
   async () => {
     assert.ok(existsSync(fixture), "real SDK contract fixture is missing");
@@ -233,9 +233,10 @@ test(
     assert.equal(receipt.sdkVersionObserved, SDK_VERSION);
     assert.equal(receipt.daemonDependencyVersion, SDK_VERSION);
     assert.deepEqual(receipt.upgradeAssessment, {
-      verdict: "BLOCK",
+      verdict: "PASS",
       oracleStatus: "completed",
-      reasonCodes: [
+      containment: "live-controls-fail-closed",
+      limitationCodes: [
         "SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
         "SDK_0_16_6_QUEUED_CONTROL_OWNERSHIP_REQUIRES_INTERNAL_HOOKS",
       ],
@@ -256,9 +257,9 @@ test(
     });
     assert.equal(existsSync(root), false, "parent wrapper did not remove its fixture root");
     assert.deepEqual(receipt.cleanup, {
-      harnessCount: 6,
+      harnessCount: 4,
       sdkResourcesClosed: true,
-      modelCacheStates: ["closed", "closed", "closed", "closed", "closed", "closed"],
+      modelCacheStates: ["closed", "closed", "closed", "closed"],
       filesystemRemoval: {
         owner: "parent-wrapper",
         childAttempted: false,
@@ -266,68 +267,14 @@ test(
       },
     });
 
-    assert.deepEqual(receipt.followUps.providerPrompts, [
-      "initial",
-      "follow-one",
-      "follow-two",
-      "queued-next",
-    ]);
-    assert.equal(receipt.followUps.sharedRunTerminalCount, 1);
-    assert.equal(receipt.followUps.totalTerminalCount, 2);
-    assert.equal(receipt.followUps.followUpsSettledAtSharedTerminal, true);
-    assert.equal(receipt.followUps.queuedModelSwitchSettled, true);
-    assert.equal(receipt.followUps.queuedPromptWaitedForSharedRun, true);
-    assert.equal(receipt.followUps.finalModelId, "secondary");
-
-    assert.deepEqual(receipt.sameTextQueueDivergence, {
-      rawListenerPrecedesAgentSession: true,
-      admissionTrigger: "raw-agent-start-before-original-message",
-      cleanupTrigger: "original-user-message-start",
-      textCollision: true,
-      displayEntryShape: {
-        idPattern: "followUp:<sequence>",
-        mode: "followUp",
-        label: "Queued",
-      },
-      displayEntryPresentBeforeCleanup: true,
-      displayEntryCountBeforeCleanup: 1,
-      displayEntryAbsentAfterCleanup: true,
-      displayEntryCountAfterCleanup: 0,
-      exactExecutableIdentityRetainedAfterCleanup: true,
-      exactExecutableIdentityRetainedAtPausedTerminal: true,
-      executableFollowUpCountAtPausedTerminal: 1,
-      predecessorStopReason: "paused",
-      followUpPendingAtPredecessorTerminal: true,
-      providerCallCountAtCutoff: 1,
-      followUpRejectedOnDispose: true,
-      rawTerminalCount: 1,
-      publicTerminalCount: 1,
-    });
-
-    assert.deepEqual(receipt.nearTerminalQueue, {
-      rawListenerPrecedesAgentSession: true,
-      admissionContext: "independent-host-async-resource",
-      publicTerminalCountAtAdmission: 0,
-      followUpStatusAfterRawDispatch: "pending",
-      followUpFailureCodeAfterRawDispatch: "NONE",
-      evidenceScope: "unique-text-only",
-      queuedEntry: {
-        idPattern: "followUp:<sequence>",
-        text: "near-terminal-follow-up",
-        mode: "followUp",
-        label: "Queued",
-      },
-      pendingAtPredecessorTerminal: true,
-      publicIdleBoundary: "session.waitForIdle",
-      sdkOutcome: "queued-without-auto-continuation",
-      consumedMessageStartCount: 0,
-      successorProviderCallStarted: false,
-      exactExecutableIdentityRetainedAtIdle: true,
-      executableFollowUpCountAtIdle: 1,
-      pendingAtIdleBoundary: true,
-      rejectedOnDispose: true,
-      rawTerminalCount: 1,
-      publicTerminalCount: 1,
+    assert.deepEqual(receipt.liveControlContainment, {
+      mode: "fail-closed",
+      errorCode: "SDK_LIVE_CONTROL_UNSUPPORTED",
+      steerStatus: "rejected",
+      followUpStatus: "rejected",
+      executableSteeringCount: 0,
+      executableFollowUpCount: 0,
+      promptStatus: "fulfilled",
     });
 
     assert.equal(receipt.gates.emittedGateCount, 2);
@@ -362,10 +309,10 @@ test(
       fabricatedSchemaUsed: false,
     });
     assert.deepEqual(receipt.queuedControlOwnership, {
-      status: "blocked",
+      status: "contained",
       code:
         "SDK_0_16_6_QUEUED_CONTROL_OWNERSHIP_REQUIRES_INTERNAL_HOOKS",
-      affectedAdapterPath: "SdkSession.send(live steer/follow_up)",
+      affectedAdapterPath: "SdkSession.send rejects live steer/follow_up",
       sendUserMessageHooksStructurallyDeclared: true,
       queuedAtDispatchClassification: "internal-sdk-signal",
       onQueuedPromotedClassification: "sdk-host-ownership-correlation",
@@ -374,14 +321,15 @@ test(
       sdkRunCapabilitySubpathBlocked: true,
       upstream5371FixMarkerObserved: false,
       unsupportedFallbackUsed: false,
+      publicContractRequestIssue: 5429,
     });
     assert.deepEqual(receipt.limitations, {
       lateFollowUpAutoContinuation: {
-        status: "observed-sdk-gap",
+        status: "contained-sdk-gap",
         code: "SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED",
-        boundary: "raw-agent-end-before-agent-session-terminal",
+        boundary: "live controls rejected before SDK queue admission",
         evidence:
-          "session.waitForIdle resolved while the exact executable follow-up remained queued.",
+          "The published package lacks the upstream continuation marker; the adapter does not enter that queue path.",
       },
       successorGateCompletion: {
         status: "not-exercised",
@@ -390,11 +338,11 @@ test(
         requiredEvidence: "lookupCompletedResolution.kind=completed",
       },
       lateSteerRearm: {
-        status: "not-exercised",
+        status: "unsupported-fail-closed",
         code: "LATE_STEER_REARM_NOT_OBSERVED",
-        excludedCase: "steer-rearmed-as-follow-up",
+        excludedCase: "live steer",
         reason:
-          "The bounded near-terminal cases exercise follow-up ownership; steering promotion is a distinct SDK path.",
+          "Live controls remain disabled until upstream issue #5429 provides a supported ownership contract.",
       },
     });
   }
