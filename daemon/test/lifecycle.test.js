@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
+  TERMINAL_DISPOSITION_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -178,7 +179,10 @@ async function startReadinessDaemon({
   registerResponse = {
     type: "register_ok",
     protocolVersion: 2,
-    capabilities: ["workspace_readiness_v2"],
+    capabilities: [
+      TERMINAL_DISPOSITION_CAPABILITY,
+      WORKSPACE_READINESS_CAPABILITY,
+    ],
   },
   envOverrides = {},
   onMessage,
@@ -294,7 +298,12 @@ test("daemon confirms actual gate acceptance and preserves rejected-answer retry
     registerResponse: {
       type: "register_ok",
       protocolVersion: 1,
-      capabilities: ["invoke", "set_model", "heartbeat"],
+      capabilities: [
+        "invoke",
+        "set_model",
+        "heartbeat",
+        TERMINAL_DISPOSITION_CAPABILITY,
+      ],
     },
     envOverrides: {
       GJC_READINESS_V2: "0",
@@ -724,6 +733,7 @@ test("receipt-bound admitted invoke freezes daemon correlation without wire leak
       type: "register_ok",
       protocolVersion: 3,
       capabilities: [
+        TERMINAL_DISPOSITION_CAPABILITY,
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
         WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -897,7 +907,16 @@ test("receipt-bound admitted invoke freezes daemon correlation without wire leak
     const successFrame = daemon.frames.find(
       (message) => message.requestId === requestId && message.done === true,
     );
-    assert.deepEqual(Object.keys(successFrame).sort(), ["done", "requestId", "type"]);
+    assert.deepEqual(Object.keys(successFrame).sort(), [
+      "done",
+      "event",
+      "requestId",
+      "type",
+    ]);
+    assert.deepEqual(successFrame.event, {
+      type: "invoke_terminal",
+      disposition: "completed",
+    });
     const serialized = JSON.stringify({
       frames: daemon.frames.filter(
         (message) => message.requestId === requestId || message.requestId === barrierRequestId,
@@ -1207,9 +1226,13 @@ test("missing authenticated mapping stays non-ready and rejects before session c
         message.type === "event" &&
         message.requestId === "missing-mapping-request"
     );
-    const error = JSON.parse(event.error);
-    assert.equal(error.code, "MAPPING_ID_REQUIRED");
-    assert.equal(event.error.includes("private"), false);
+    assert.deepEqual(event.event, {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: "MAPPING_ID_REQUIRED",
+    });
+    assert.equal(event.error, undefined);
+    assert.equal(JSON.stringify(event).includes("private"), false);
     await waitForFrame(
       daemon.telemetry,
       (record) =>
@@ -1357,6 +1380,40 @@ test("v1 register response suppresses readiness egress and ping remains a plain 
   }
 });
 
+test("daemon refuses invokes when the bot did not negotiate terminal dispositions", async () => {
+  const requestId = "legacy-terminal/request";
+  const daemon = await startReadinessDaemon({
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: ["invoke", "set_model", "heartbeat"],
+    },
+    afterRegisterResponse(socket) {
+      socket.send(JSON.stringify({
+        type: "invoke",
+        requestId,
+        workDir: "C:\\private\\workspace",
+        command: { kind: "prompt", message: "must not execute" },
+      }));
+    },
+  });
+  try {
+    await waitForFrame(
+      daemon.frames,
+      (message) => message.requestId === requestId && message.done === true,
+      "terminal capability refusal"
+    );
+    const refusal = daemon.frames.find(
+      (message) => message.requestId === requestId && message.done === true
+    );
+    assert.equal(refusal.event, undefined);
+    assert.equal(JSON.parse(refusal.error).code, "PROTOCOL_INCOMPATIBLE");
+    assert.equal(JSON.stringify(refusal).includes("must not execute"), false);
+  } finally {
+    await daemon.stop();
+  }
+});
+
 test("replacement sockets reset readiness generation and revision", async () => {
   let closedFirst = false;
   const daemon = await startReadinessDaemon({
@@ -1427,11 +1484,14 @@ test("failed current-run readiness probes stay non-ready and expose only bounded
     const rejection = daemon.frames.find(
       (message) => message.type === "event" && message.requestId === "probe/request"
     );
-    const error = JSON.parse(rejection.error);
-    assert.equal(error.code, "UNKNOWN_RUNTIME");
-    assert.equal(error.action, "retry_later");
-    assert.equal(rejection.error.includes(secret), false);
-    assert.equal(rejection.error.includes("private"), false);
+    assert.deepEqual(rejection.event, {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: "UNKNOWN_RUNTIME",
+    });
+    assert.equal(rejection.error, undefined);
+    assert.equal(JSON.stringify(rejection).includes(secret), false);
+    assert.equal(JSON.stringify(rejection).includes("private"), false);
     const readiness = daemon.frames.filter((message) => message.type === "readiness");
     const failed = readiness.find(
       (message) => message.lastError?.code === "UNKNOWN_RUNTIME"

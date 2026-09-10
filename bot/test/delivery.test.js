@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AttachmentBuilder } from "discord.js";
-import { CHUNK_LIMIT, MAX_CHUNKS, createTextAttachment, deliverResult } from "../src/delivery.js";
+import {
+  CHUNK_LIMIT,
+  MAX_CHUNKS,
+  createTextAttachment,
+  deliverResult,
+  formatDeliveryError,
+} from "../src/delivery.js";
 
 function captureDelivery() {
   const first = [];
@@ -100,6 +106,52 @@ test("delivered content disables Discord mention parsing", async () => {
 
   assert.equal(capture.first[0].content.includes("<@&123456789>"), true);
   assert.deepEqual(capture.first[0].allowedMentions, { parse: [] });
+});
+
+test("terminal failures use truthful fixed safety wording", () => {
+  const structured = {
+    code: "UNKNOWN_RUNTIME",
+    retryable: true,
+    action: "retry_later",
+  };
+  assert.equal(
+    formatDeliveryError({ ...structured, terminalDisposition: "failed" }),
+    "The host reported that the request failed. Follow the safety guidance before retrying.\nUNKNOWN_RUNTIME (action: retry_later; retryable)"
+  );
+  assert.match(
+    formatDeliveryError({ ...structured, terminalDisposition: "cancelled" }),
+    /^The host reported that the request was cancelled\./
+  );
+  const paused = formatDeliveryError({ ...structured, terminalDisposition: "paused" });
+  assert.match(paused, /^The host reported that the request was paused\./);
+  assert.equal(paused.includes("resum"), false);
+  for (const disposition of ["timed_out", "disconnected"]) {
+    assert.match(
+      formatDeliveryError({ ...structured, terminalDisposition: disposition }),
+      /Interruption is unconfirmed;/
+    );
+  }
+  assert.equal(
+    formatDeliveryError({
+      ...structured,
+      terminalDisposition: "disconnected",
+    }).includes("host connection was lost"),
+    false
+  );
+});
+
+test("bot-local deadlines warn that interruption is unconfirmed", () => {
+  for (const localOutcome of ["idle_timeout", "hard_cap"]) {
+    const rendered = formatDeliveryError({
+      localOutcome,
+      code: "UNKNOWN_RUNTIME",
+      retryable: false,
+      action: "verify_host_state",
+    });
+    assert.match(rendered, /Interruption is unconfirmed;/);
+    assert.match(rendered, /verify the host state before retrying/);
+    assert.equal(rendered.includes("UNKNOWN_RUNTIME"), false);
+  }
 });
 
 test("delivery rejects and stops after the first send fails", async () => {

@@ -191,7 +191,13 @@ current transport lives in `daemon/src/sdk-session.js`.
    operation settles. Positive disposal fulfillment is the only authority for
    reuse; rejection leaves a permanent process-local fence, so a successor SDK
    session cannot overlap ownership with unproven prior work.
-8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
+8. **Terminal SDK outcomes lost their meaning at the relay boundary.** Current
+   bot and daemon peers require `terminal_disposition_v1` before admitting an
+   invoke. The daemon emits one exact completed, failed, cancelled, paused,
+   timed-out, or disconnected disposition; the bot accepts the first valid
+   terminal frame only. A timeout or transport loss does not prove interruption
+   and is rendered as unconfirmed until session retirement proves quiescence.
+9. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.
    Separator, case, or symlink aliases that resolve to one directory therefore

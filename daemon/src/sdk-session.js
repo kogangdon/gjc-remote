@@ -340,9 +340,23 @@ function sanitizedFailure(error, fallbackCode = "prompt_failed") {
   return { code, message: "Prompt submission failed." };
 }
 
-function sdkFailureError(failure) {
-  const error = new Error(`GJC SDK invocation failed (${failure.code})`);
-  error.code = failure.code;
+function sdkTerminalError(outcome) {
+  const error = new Error(
+    `GJC SDK invocation failed${outcome.code ? ` (${outcome.code})` : ""}`
+  );
+  if (outcome.code) error.code = outcome.code;
+  error.terminalDisposition = outcome.disposition;
+  return error;
+}
+
+function failedTerminalOutcome(failure) {
+  return { disposition: "failed", code: failure.code };
+}
+
+function timedOutTerminalError(message) {
+  const error = new Error(message);
+  error.terminalDisposition = "timed_out";
+  error.interruptionConfirmed = false;
   return error;
 }
 
@@ -373,18 +387,29 @@ function assistantHasActivity(message) {
 
 // An agent_end is a readiness boundary, not evidence that its work succeeded.
 // Mirror the installed SDK host's terminal classification without retaining raw
-// provider error text.
-function terminalFailure(event) {
+// provider error text. Explicit event-level dispositions win over all assistant
+// content because a partial assistant message is not proof that a paused,
+// cancelled, or failed run completed.
+function terminalOutcome(event, reportedFailure) {
+  if (event?.stopReason === "paused") return { disposition: "paused" };
+  if (event?.stopReason === "cancelled") {
+    return { disposition: "cancelled", code: "aborted" };
+  }
   if (event.stopReason === "maintenance") {
     if (event.maintenanceOutcome === "failed") {
-      return sanitizedFailure(undefined, "context_maintenance_failed");
+      return failedTerminalOutcome(
+        sanitizedFailure(undefined, "context_maintenance_failed")
+      );
     }
     if (event.maintenanceOutcome === "aborted") {
-      return sanitizedFailure(undefined, "aborted");
+      return failedTerminalOutcome(sanitizedFailure(undefined, "aborted"));
     }
   }
-  if (event.stopReason === "cancelled") {
-    return sanitizedFailure(undefined, "aborted");
+  if (reportedFailure) {
+    return failedTerminalOutcome(reportedFailure);
+  }
+  if (event.stopReason !== "completed") {
+    return failedTerminalOutcome(sanitizedFailure(undefined));
   }
 
   let messages;
@@ -394,15 +419,22 @@ function terminalFailure(event) {
     messages = undefined;
   }
   const assistant = lastAssistantMessage(messages);
-  if (!assistant) return sanitizedFailure(undefined);
+  if (!assistant) {
+    return failedTerminalOutcome(sanitizedFailure(undefined));
+  }
 
   let stopReason;
   try {
     stopReason = assistant.stopReason;
   } catch {
-    return sanitizedFailure(undefined);
+    return failedTerminalOutcome(sanitizedFailure(undefined));
   }
-  if (stopReason === "aborted") return sanitizedFailure(undefined, "aborted");
+  if (stopReason === "aborted") {
+    return {
+      disposition: "cancelled",
+      code: sanitizedFailure(undefined, "aborted").code,
+    };
+  }
   if (stopReason === "error") {
     let status;
     try {
@@ -411,16 +443,17 @@ function terminalFailure(event) {
       status = undefined;
     }
     if (status === 402 || status === 429) {
-      return sanitizedFailure(undefined, `provider_http_${status}`);
+      return failedTerminalOutcome(
+        sanitizedFailure(undefined, `provider_http_${status}`)
+      );
     }
-    return sanitizedFailure(
-      { code: assistant.errorCode },
-      "provider_rejected"
+    return failedTerminalOutcome(
+      sanitizedFailure({ code: assistant.errorCode }, "provider_rejected")
     );
   }
   return assistantHasActivity(assistant)
-    ? undefined
-    : sanitizedFailure(undefined);
+    ? { disposition: "completed" }
+    : failedTerminalOutcome(sanitizedFailure(undefined));
 }
 
 function isTerminalAgentEnd(event) {
@@ -724,16 +757,14 @@ export class SdkSession {
         return;
       }
       case "prompt":
-        await this.#runPromptCommand(command, onEvent, timeoutMs);
-        return;
+        return this.#runPromptCommand(command, onEvent, timeoutMs);
       case "steer":
       case "follow_up":
-        await this.#runPromptCommand(
+        return this.#runPromptCommand(
           { type: "prompt", message: command.message },
           onEvent,
           timeoutMs
         );
-        return;
       default:
         throw new Error(`Unknown SDK session command: ${command.type}`);
     }
@@ -748,7 +779,7 @@ export class SdkSession {
     let eventConsumerError;
     const reportedFailures = [];
     let promptFailure;
-    const terminalFailures = [];
+    const terminalOutcomes = [];
     let sawAgentStart = false;
     let observedAgentEnds = 0;
     let resetIdle = () => {};
@@ -790,13 +821,16 @@ export class SdkSession {
             break;
           }
         }
-        const failure =
+        const reportedFailure =
           failureIndex >= 0
             ? reportedFailures.splice(failureIndex, 1)[0].failure
-            : terminalFailure(event);
-        terminalFailures.push(failure);
+            : undefined;
+        terminalOutcomes.push(terminalOutcome(event, reportedFailure));
         observedAgentEnds += 1;
         if (observedAgentEnds >= 1) resolveAgentEnd();
+      }
+      if (event?.type === "agent_failed" || event?.type === "agent_end") {
+        return;
       }
       try {
         onEvent(event);
@@ -834,7 +868,7 @@ export class SdkSession {
             !sawAgentStart &&
             observedAgentEnds === 0
           ) {
-            throw sdkFailureError(first.outcome.failure);
+            throw sdkTerminalError(failedTerminalOutcome(first.outcome.failure));
           }
           await agentEnd;
           const outcome =
@@ -852,10 +886,17 @@ export class SdkSession {
           }
         }
       );
-      const failureAtTerminal = terminalFailures[0];
-      if (failureAtTerminal) throw sdkFailureError(failureAtTerminal);
-      if (promptFailure) throw sdkFailureError(promptFailure);
+      const outcomeAtTerminal = terminalOutcomes[0];
+      if (outcomeAtTerminal?.disposition !== "completed") {
+        throw sdkTerminalError(
+          outcomeAtTerminal ?? failedTerminalOutcome(sanitizedFailure(undefined))
+        );
+      }
+      if (promptFailure) {
+        throw sdkTerminalError(failedTerminalOutcome(promptFailure));
+      }
       if (eventConsumerError) throw eventConsumerError;
+      return outcomeAtTerminal;
     } finally {
       markPromptInactive();
       unsubscribe();
@@ -1280,7 +1321,7 @@ export class SdkSession {
   }
 
   async #withTimeout(operation, timeoutMs) {
-    const timeoutError = new Error("SDK command timed out");
+    const timeoutError = timedOutTerminalError("SDK command timed out");
     let timer;
     const timeout = new Promise((_, reject) => {
       timer = this.setTimeoutFn(() => reject(timeoutError), timeoutMs);
@@ -1299,9 +1340,11 @@ export class SdkSession {
     }
   }
   async #withStreamingTimeout(operation, idleMs, hardCapMs, gateWindowMs, onArm) {
-    const idleError = new Error("SDK command timed out");
-    const hardCapError = new Error("SDK command exceeded absolute hard-cap");
-    const gateError = new Error("SDK gate answer window expired");
+    const idleError = timedOutTerminalError("SDK command timed out");
+    const hardCapError = timedOutTerminalError(
+      "SDK command exceeded absolute hard-cap"
+    );
+    const gateError = timedOutTerminalError("SDK gate answer window expired");
     let idleTimer;
     let hardCapTimer;
     let gateTimer;

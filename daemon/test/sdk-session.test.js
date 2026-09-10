@@ -625,7 +625,10 @@ test("SDK adapter forwards prompt events and preserves model command receipts", 
   const session = new SdkSession(agent);
   const events = [];
 
-  await session.send({ type: "prompt", message: "hello" }, (event) => events.push(event));
+  const promptResult = await session.send(
+    { type: "prompt", message: "hello" },
+    (event) => events.push(event)
+  );
   await session.send({ type: "get_available_models" }, (event) => events.push(event));
   await session.send(
     { type: "set_model", provider: "provider-a", modelId: "model-a" },
@@ -637,11 +640,11 @@ test("SDK adapter forwards prompt events and preserves model command receipts", 
     ["set_model", agent.models[0]],
   ]);
   assert.deepEqual(events[0], { type: "message_update", value: "hello" });
-  assert.equal(events[1].type, "agent_end");
-  assert.deepEqual(events[2].data.models, [
+  assert.deepEqual(events[1].data.models, [
     { provider: "provider-a", id: "model-a", name: "Model A" },
   ]);
-  assert.deepEqual(events[3].data, { provider: "provider-a", modelId: "model-a" });
+  assert.deepEqual(events[2].data, { provider: "provider-a", modelId: "model-a" });
+  assert.deepEqual(promptResult, { disposition: "completed" });
 
   await session.dispose();
 });
@@ -716,7 +719,7 @@ test("continuing maintenance agent_end checkpoints do not complete a prompt", as
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(settled, false);
-  assert.equal(events.length, 3, "maintenance checkpoints remain visible");
+  assert.equal(events.length, 0, "internal maintenance terminals stay off the wire");
 
   agent.emit(terminalEvent());
   await prompt;
@@ -734,16 +737,24 @@ test("a prompt rejection after agent_end still fails the invocation", async () =
     });
   };
   const session = new SdkSession(agent);
+  const events = [];
 
   await assert.rejects(
-    session.send({ type: "prompt", message: "first" }, () => {}, 100),
+    session.send(
+      { type: "prompt", message: "first" },
+      (event) => events.push(event),
+      100
+    ),
     (error) => {
       assert.equal(error.code, "provider_down");
+      assert.equal(error.terminalDisposition, "failed");
       assert.match(error.message, /provider_down/);
       assert.doesNotMatch(error.message, /raw provider detail/);
       return true;
     }
   );
+  assert.equal(JSON.stringify(events).includes("credential-bearing"), false);
+  assert.deepEqual(events, []);
   await session.dispose();
 });
 
@@ -768,11 +779,112 @@ test("a provider-error terminal is readiness evidence but not success", async ()
     session.send({ type: "prompt", message: "first" }, () => {}, 100),
     (error) => {
       assert.equal(error.code, "provider_http_429");
+      assert.equal(error.terminalDisposition, "failed");
       assert.doesNotMatch(error.message, /credential-bearing/);
       return true;
     }
   );
   await session.dispose();
+});
+
+test("terminal dispositions preserve explicit stop reasons over assistant activity", async () => {
+  const cases = [
+    {
+      name: "paused",
+      event: terminalEvent({
+        stopReason: "paused",
+        messages: [assistantMessage("partial response", { stopReason: "error" })],
+      }),
+      disposition: "paused",
+      code: undefined,
+      reportedFailure: "provider_down",
+    },
+    {
+      name: "cancelled",
+      event: terminalEvent({
+        stopReason: "cancelled",
+        messages: [assistantMessage("partial response", { stopReason: "error" })],
+      }),
+      disposition: "cancelled",
+      code: "aborted",
+    },
+    {
+      name: "maintenance failure",
+      event: terminalEvent({
+        stopReason: "maintenance",
+        maintenanceOutcome: "failed",
+        messages: [assistantMessage("partial response")],
+      }),
+      disposition: "failed",
+      code: "context_maintenance_failed",
+    },
+    {
+      name: "maintenance abort",
+      event: terminalEvent({
+        stopReason: "maintenance",
+        maintenanceOutcome: "aborted",
+        messages: [assistantMessage("partial response")],
+      }),
+      disposition: "failed",
+      code: "aborted",
+    },
+    {
+      name: "assistant abort",
+      event: terminalEvent({
+        messages: [assistantMessage("partial response", { stopReason: "aborted" })],
+      }),
+      disposition: "cancelled",
+      code: "aborted",
+    },
+    {
+      name: "malformed terminal messages",
+      event: terminalEvent({ messages: { role: "assistant" } }),
+      disposition: "failed",
+      code: "prompt_failed",
+    },
+    {
+      name: "missing outer stop reason",
+      event: terminalEvent({
+        stopReason: undefined,
+        messages: [assistantMessage("partial response")],
+      }),
+      disposition: "failed",
+      code: "prompt_failed",
+    },
+    {
+      name: "unknown outer stop reason",
+      event: terminalEvent({
+        stopReason: "future-terminal",
+        messages: [assistantMessage("partial response")],
+      }),
+      disposition: "failed",
+      code: "prompt_failed",
+    },
+  ];
+
+  for (const fixture of cases) {
+    const agent = new FakeAgentSession();
+    agent.prompt = async () => {
+      if (fixture.reportedFailure) {
+        agent.emit({
+          type: "agent_failed",
+          error: { code: fixture.reportedFailure },
+        });
+      }
+      agent.emit(fixture.event);
+    };
+    const session = new SdkSession(agent);
+
+    await assert.rejects(
+      session.send({ type: "prompt", message: fixture.name }, () => {}, 100),
+      (error) => {
+        assert.equal(error.terminalDisposition, fixture.disposition);
+        assert.equal(error.code, fixture.code);
+        return true;
+      }
+    );
+    await session.dispose();
+  }
 });
 
 test("agent_failed is retained until its terminal boundary", async () => {
@@ -782,7 +894,7 @@ test("agent_failed is retained until its terminal boundary", async () => {
       type: "agent_failed",
       error: {
         code: "provider_unavailable",
-        message: "Prompt submission failed.",
+        message: "credential-bearing agent failure",
       },
     });
     agent.emit(
@@ -792,14 +904,21 @@ test("agent_failed is retained until its terminal boundary", async () => {
     );
   };
   const session = new SdkSession(agent);
+  const events = [];
 
   await assert.rejects(
-    session.send({ type: "prompt", message: "first" }, () => {}, 100),
+    session.send(
+      { type: "prompt", message: "first" },
+      (event) => events.push(event),
+      100
+    ),
     (error) => {
       assert.equal(error.code, "provider_unavailable");
+      assert.equal(error.terminalDisposition, "failed");
       return true;
     }
   );
+  assert.deepEqual(events, []);
   await session.dispose();
 });
 
@@ -820,6 +939,7 @@ test("failed maintenance terminal does not report successful completion", async 
     session.send({ type: "prompt", message: "first" }, () => {}, 100),
     (error) => {
       assert.equal(error.code, "context_maintenance_failed");
+      assert.equal(error.terminalDisposition, "failed");
       return true;
     }
   );
@@ -837,6 +957,7 @@ test("a terminal without assistant activity fails closed", async () => {
     session.send({ type: "prompt", message: "first" }, () => {}, 100),
     (error) => {
       assert.equal(error.code, "prompt_failed");
+      assert.equal(error.terminalDisposition, "failed");
       return true;
     }
   );
@@ -948,10 +1069,7 @@ test("idle follow-up starts a prompt run and keeps its event stream", async () =
   );
 
   assert.deepEqual(agent.calls, [["prompt", "continue"]]);
-  assert.deepEqual(events, [
-    { type: "message_update", value: "continue" },
-    terminalEvent({ text: "continue" }),
-  ]);
+  assert.deepEqual(events, [{ type: "message_update", value: "continue" }]);
   await session.dispose();
 });
 
@@ -1023,7 +1141,12 @@ test("SDK adapter poisons and disposes a timed-out session", async () => {
 
   await assert.rejects(
     session.send({ type: "prompt", message: "never" }, () => {}, 1),
-    /SDK command timed out/
+    (error) => {
+      assert.match(error.message, /SDK command timed out/);
+      assert.equal(error.terminalDisposition, "timed_out");
+      assert.equal(error.interruptionConfirmed, false);
+      return true;
+    }
   );
   assert.equal(session.closed, true);
   await session.dispose();
@@ -1045,7 +1168,12 @@ test("model switches use the same timeout and poison lifecycle", async () => {
       () => {},
       1
     ),
-    /SDK command timed out/
+    (error) => {
+      assert.match(error.message, /SDK command timed out/);
+      assert.equal(error.terminalDisposition, "timed_out");
+      assert.equal(error.interruptionConfirmed, false);
+      return true;
+    }
   );
   assert.equal(session.closed, true);
   await session.dispose();
@@ -1090,7 +1218,12 @@ test("prompt hard cap fires and disposes despite continuous activity", async () 
   try {
     await assert.rejects(
       session.send({ type: "prompt", message: "x" }, () => {}),
-      /exceeded absolute hard-cap/
+      (error) => {
+        assert.match(error.message, /exceeded absolute hard-cap/);
+        assert.equal(error.terminalDisposition, "timed_out");
+        assert.equal(error.interruptionConfirmed, false);
+        return true;
+      }
     );
   } finally {
     clearInterval(agent._activityInterval);
@@ -1973,7 +2106,12 @@ test("gate-answer window expiry disposes the session with a distinct error", asy
 
   await assert.rejects(
     session.send({ type: "prompt", message: "hi" }, () => {}),
-    /gate answer window expired/
+    (error) => {
+      assert.match(error.message, /gate answer window expired/);
+      assert.equal(error.terminalDisposition, "timed_out");
+      assert.equal(error.interruptionConfirmed, false);
+      return true;
+    }
   );
   assert.equal(session.closed, true);
   await session.dispose();

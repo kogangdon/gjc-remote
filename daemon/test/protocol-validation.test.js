@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   CAPABILITIES,
+  TERMINAL_DISPOSITION_CAPABILITY,
+  INVOKE_TERMINAL_DISPOSITIONS,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PROTOCOL_VERSION,
@@ -32,6 +34,7 @@ import {
   isEventMessage,
   isGateRequestEvent,
   isInvokeMessage,
+  isInvokeTerminalEvent,
   isReadinessCapabilityGate,
   isReadinessMessage,
   isReadinessStatus,
@@ -436,7 +439,10 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [
+        TERMINAL_DISPOSITION_CAPABILITY,
+        WORKSPACE_READINESS_CAPABILITY,
+      ],
     }));
     assert.equal((await registerOk).type, MSG_TYPES.READINESS);
 
@@ -475,7 +481,10 @@ test("v2 bind verifies the authority preimage before same-binding replay accepta
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [
+        TERMINAL_DISPOSITION_CAPABILITY,
+        WORKSPACE_READINESS_CAPABILITY,
+      ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -502,7 +511,10 @@ test("v2 bind verifies an advanced authority before lease adoption", async () =>
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [
+        TERMINAL_DISPOSITION_CAPABILITY,
+        WORKSPACE_READINESS_CAPABILITY,
+      ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -602,7 +614,10 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [
+        TERMINAL_DISPOSITION_CAPABILITY,
+        WORKSPACE_READINESS_CAPABILITY,
+      ],
     }));
     await initialReadiness;
     const readinessPromise = waitForMessage(
@@ -630,10 +645,12 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
     }));
     const response = await onceMessage(daemon.peer, MSG_TYPES.EVENT);
     assert.equal(response.requestId, "native-serving-remains-disabled");
-    assert.equal(
-      JSON.parse(response.error).code,
-      PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
-    );
+    assert.deepEqual(response.event, {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE,
+    });
+    assert.equal(response.error, undefined);
   } finally {
     await daemon.close();
   }
@@ -1231,7 +1248,10 @@ test("daemon rejects an invoke with a stale workspace generation", async () => {
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [
+        TERMINAL_DISPOSITION_CAPABILITY,
+        WORKSPACE_READINESS_CAPABILITY,
+      ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -1253,7 +1273,12 @@ test("daemon rejects an invoke with a stale workspace generation", async () => {
     }));
     const response = await onceMessage(daemon.peer, MSG_TYPES.EVENT);
     assert.equal(response.requestId, "stale-workspace-generation");
-    assert.equal(JSON.parse(response.error).code, PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE);
+    assert.deepEqual(response.event, {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: PROTOCOL_ERROR_CODES.WORKSPACE_GENERATION_STALE,
+    });
+    assert.equal(response.error, undefined);
   } finally {
     await daemon.close();
   }
@@ -1460,7 +1485,10 @@ test("daemon replaces an older binding for the same workspace after a generation
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [
+        TERMINAL_DISPOSITION_CAPABILITY,
+        WORKSPACE_READINESS_CAPABILITY,
+      ],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -1486,7 +1514,12 @@ test("daemon replaces an older binding for the same workspace after a generation
       command: { kind: "prompt", message: "hello" },
     }));
     const response = await onceMessage(daemon.peer, MSG_TYPES.EVENT);
-    assert.equal(JSON.parse(response.error).code, PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED);
+    assert.deepEqual(response.event, {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED,
+    });
+    assert.equal(response.error, undefined);
   } finally {
     await daemon.close();
   }
@@ -1594,7 +1627,11 @@ test("malformed invoke closes with a policy violation", async () => {
 test("daemon closes a socket that reuses an in-flight requestId", async () => {
   const daemon = await startDaemon();
   try {
-    daemon.peer.send(JSON.stringify({ type: "register_ok" }));
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: CAPABILITIES,
+    }));
     const closed = once(daemon.peer, "close");
     const invoke = {
       type: "invoke",
@@ -1616,7 +1653,11 @@ test("daemon closes a socket that reuses an in-flight requestId", async () => {
 test("daemon permits requestId reuse only after the prior invoke settles", async () => {
   const daemon = await startDaemon();
   try {
-    daemon.peer.send(JSON.stringify({ type: "register_ok" }));
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: CAPABILITIES,
+    }));
     const invoke = {
       type: "invoke",
       requestId: "reusable-request",
@@ -1631,7 +1672,12 @@ test("daemon permits requestId reuse only after the prior invoke settles", async
       const event = JSON.parse(raw.toString());
       assert.equal(event.requestId, invoke.requestId);
       assert.equal(event.done, true);
-      assert.equal(typeof event.error, "string");
+      assert.deepEqual(event.event, {
+        type: "invoke_terminal",
+        disposition: "failed",
+        code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+      });
+      assert.equal(event.error, undefined);
     }
     assert.equal(daemon.peer.readyState, WebSocket.OPEN);
   } finally {
@@ -1642,7 +1688,11 @@ test("daemon permits requestId reuse only after the prior invoke settles", async
 test("daemon sends a bounded error event when invoke setup fails", async () => {
   const daemon = await startDaemon();
   try {
-    daemon.peer.send(JSON.stringify({ type: "register_ok" }));
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: CAPABILITIES,
+    }));
     const response = once(daemon.peer, "message");
     daemon.peer.send(
       JSON.stringify({
@@ -1658,9 +1708,12 @@ test("daemon sends a bounded error event when invoke setup fails", async () => {
     assert.equal(isEventMessage(event), true);
     assert.equal(event.requestId, "request-setup-failure");
     assert.equal(event.done, true);
-    assert.equal(typeof event.error, "string");
-    assert.ok(event.error.length > 0);
-    assert.ok(event.error.length <= V0_LIMITS.ERROR);
+    assert.deepEqual(event.event, {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+    });
+    assert.equal(event.error, undefined);
   } finally {
     await daemon.close();
   }
@@ -1677,6 +1730,86 @@ test("daemon rejects an oversized inbound WebSocket payload", async () => {
     await daemon.close();
   }
 });
+
+test("invoke terminal event contract accepts only exact terminal dispositions", () => {
+  assert.equal(Object.isFrozen(INVOKE_TERMINAL_DISPOSITIONS), true);
+  assert.deepEqual(INVOKE_TERMINAL_DISPOSITIONS, [
+    "completed",
+    "failed",
+    "cancelled",
+    "paused",
+    "timed_out",
+    "disconnected",
+  ]);
+  assert.throws(() => INVOKE_TERMINAL_DISPOSITIONS.push("bogus"), TypeError);
+
+  for (const disposition of INVOKE_TERMINAL_DISPOSITIONS) {
+    assert.equal(
+      isInvokeTerminalEvent({ type: "invoke_terminal", disposition }),
+      true,
+      disposition
+    );
+  }
+  for (const disposition of ["failed", "timed_out"]) {
+    assert.equal(
+      isInvokeTerminalEvent({
+        type: "invoke_terminal",
+        disposition,
+        code: PROTOCOL_ERROR_CODES.PROVIDER_UNAVAILABLE,
+      }),
+      true,
+      `${disposition} with protocol code`
+    );
+  }
+});
+
+test("invoke terminal event contract rejects malformed, inherited, and raw error fields", () => {
+  const valid = { type: "invoke_terminal", disposition: "failed" };
+  const inherited = Object.create(valid);
+  inherited.type = "invoke_terminal";
+  assert.equal(isInvokeTerminalEvent(inherited), false, "inherited disposition");
+
+  for (const invalid of [
+    null,
+    [],
+    Object.create(null),
+    { type: "invoke_terminal" },
+    { type: "invoke_terminal", disposition: "" },
+    { type: "invoke_terminal", disposition: "unknown" },
+    { type: "invoke_terminal", disposition: "x".repeat(V0_LIMITS.CAPABILITY + 1) },
+    { type: "event", disposition: "completed" },
+    { type: "invoke_terminal", disposition: "failed", code: "" },
+    { type: "invoke_terminal", disposition: "failed", code: "raw provider error text" },
+    {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: "x".repeat(V0_LIMITS.TERMINAL_ERROR_CODE + 1),
+    },
+    { type: "invoke_terminal", disposition: "failed", code: 42 },
+    { type: "invoke_terminal", disposition: "completed", code: PROTOCOL_ERROR_CODES.DAEMON_FATAL },
+    { type: "invoke_terminal", disposition: "paused", code: PROTOCOL_ERROR_CODES.DAEMON_FATAL },
+    { type: "invoke_terminal", disposition: "cancelled", code: PROTOCOL_ERROR_CODES.DAEMON_FATAL },
+    { type: "invoke_terminal", disposition: "disconnected", code: PROTOCOL_ERROR_CODES.CONNECTION_LOST },
+    { type: "invoke_terminal", disposition: "failed", extra: true },
+    { type: "invoke_terminal", disposition: "failed", code: PROTOCOL_ERROR_CODES.DAEMON_FATAL, extra: true },
+  ]) {
+    assert.equal(isInvokeTerminalEvent(invalid), false);
+  }
+
+  const polluted = {
+    type: "invoke_terminal",
+    disposition: "completed",
+    __proto__: { code: PROTOCOL_ERROR_CODES.DAEMON_FATAL },
+  };
+  assert.equal(isInvokeTerminalEvent(polluted), false, "custom prototype");
+});
+
+test("terminal disposition capability is frozen and advertised", () => {
+  assert.equal(TERMINAL_DISPOSITION_CAPABILITY, "terminal_disposition_v1");
+  assert.equal(Object.isFrozen(CAPABILITIES), true);
+  assert.ok(CAPABILITIES.includes(TERMINAL_DISPOSITION_CAPABILITY));
+});
+
 test("isAnswerMessage accepts a well-formed answer and rejects malformed ones (#35)", () => {
   const valid = {
     type: "answer",

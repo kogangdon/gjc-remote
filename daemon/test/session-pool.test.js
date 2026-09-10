@@ -197,6 +197,127 @@ test("unmanaged retirement late rejection fences concurrent aliases", async () =
   }
 });
 
+test("retireSession disposes only the exact live session and releases its hold", async () => {
+  const session = new FakeSession();
+  const pool = createPool({ sessionFactory: async () => session });
+  let releases = 0;
+  try {
+    await pool.ensureSession(WORK_DIR);
+    await pool.retireSession(session, { holds: [() => { releases += 1 }] });
+    assert.equal(session.disposeCalls, 1);
+    assert.equal(releases, 1);
+    await pool.retireSession(session, { holds: [() => { releases += 1 }] });
+    assert.equal(releases, 2);
+    await assert.rejects(
+      pool.retireSession(new FakeSession()),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("retireSession joins pending disposal and releases holds only after fulfillment", async () => {
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  const session = new FakeSession();
+  session.dispose = async () => {
+    session.disposeCalls += 1;
+    await disposalGate;
+    session.closed = true;
+  };
+  const pool = createPool({ sessionDisposeTimeoutMs: 1, sessionFactory: async () => session });
+  let releases = 0;
+  try {
+    await pool.ensureSession(WORK_DIR);
+    let firstError;
+    try {
+      await pool.retireSession(session, { holds: [() => { releases += 1 }] });
+    } catch (error) {
+      firstError = error;
+    }
+    assert.equal(firstError?.code, "SESSION_RETIREMENT_PENDING");
+    await assert.rejects(
+      pool.retireSession(session, { holds: [() => { releases += 1 }] }),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    assert.equal(session.disposeCalls, 1);
+    assert.equal(releases, 0);
+    releaseDisposal();
+    await firstError.pendingCleanup;
+    assert.equal(releases, 2);
+  } finally {
+    releaseDisposal();
+    await pool.shutdown();
+  }
+});
+
+test("retireSession reports immediate and late disposal rejection without releasing holds", async () => {
+  const rejected = new FakeSession();
+  rejected.dispose = async () => {
+    rejected.disposeCalls += 1;
+    throw new Error("dispose failed");
+  };
+  const immediatePool = createPool({ sessionFactory: async () => rejected });
+  let immediateReleases = 0;
+  try {
+    await immediatePool.ensureSession(WORK_DIR);
+    await assert.rejects(
+      immediatePool.retireSession(rejected, { holds: [() => { immediateReleases += 1 }] }),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    await assert.rejects(
+      immediatePool.retireSession(rejected),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    assert.equal(immediateReleases, 0);
+  } finally {
+    rejected.dispose = FakeSession.prototype.dispose;
+    await immediatePool.shutdown();
+  }
+});
+
+test("retireSession pending cleanup rejects after late disposal rejection", async () => {
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  const session = new FakeSession();
+  session.dispose = async () => {
+    session.disposeCalls += 1;
+    await disposalGate;
+    throw new Error("late dispose failed");
+  };
+  const pool = createPool({ sessionDisposeTimeoutMs: 1, sessionFactory: async () => session });
+  let releases = 0;
+  try {
+    await pool.ensureSession(WORK_DIR);
+    let retirementError;
+    try {
+      await pool.retireSession(session, { holds: [() => { releases += 1 }] });
+    } catch (error) {
+      retirementError = error;
+    }
+    assert.equal(retirementError?.code, "SESSION_RETIREMENT_PENDING");
+    releaseDisposal();
+    await assert.rejects(
+      retirementError.pendingCleanup,
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    await assert.rejects(
+      pool.retireSession(session),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    assert.equal(releases, 0);
+  } finally {
+    releaseDisposal();
+    session.dispose = FakeSession.prototype.dispose;
+    await pool.shutdown();
+  }
+});
+
 test("closed managed session disposal timeout fences reuse until settlement", async () => {
   let releaseDisposal;
   const disposalGate = new Promise((resolve) => {
