@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fence every canonical workDir while an SDK session is retiring. Idle reap,
+  managed receipt retirement, closed-session replacement, and late-created
+  cleanup now share one fail-closed disposal contract: only positive disposal
+  fulfillment permits a successor, while pending and failed retirement expose
+  distinct sanitized remediation codes.
 - Fail closed instead of admitting live controls through unsupported SDK
   ownership hooks; cancel prompt and gate waiters explicitly during disposal.
 - Encode SDK workflow answers as structured objects and confirm acceptance

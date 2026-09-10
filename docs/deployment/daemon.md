@@ -94,6 +94,12 @@ or a particular workspace is ready. The bot's `/hosts` and its structured logs
 are the operator view of connection and readiness, while the daemon service
 logs provide local startup and shutdown diagnostics.
 
+`SESSION_RETIREMENT_PENDING` means late SDK cleanup is still pending. Wait for
+that cleanup to settle, then retry; do not assume disposal has succeeded.
+`SESSION_RETIREMENT_FAILED` is a permanent, process-local fence. Investigate
+the old SDK work and ensure it is gone before restarting the daemon; do not
+blindly retry the operation or reuse the fenced session.
+
 Before an upgrade, record the deployed revision, Bun and SDK versions,
 `HOST_ID`, service-account identity, model profile, and protected-state backup
 status. Stop gracefully, install the new locked dependencies, restart, then

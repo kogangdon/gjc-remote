@@ -2308,6 +2308,21 @@ test("WORKSPACE_ADMISSION_EXCEEDED is a first-class, classification-safe protoco
   );
 });
 
+test("session retirement states have exact resource/session remediation", () => {
+  const expected = [
+    [PROTOCOL_ERROR_CODES.SESSION_RETIREMENT_PENDING, true, "retry_later"],
+    [PROTOCOL_ERROR_CODES.SESSION_RETIREMENT_FAILED, false, "contact_admin"],
+  ];
+
+  const codeSet = new Set(Object.values(PROTOCOL_ERROR_CODES));
+  for (const [code, retryable, action] of expected) {
+    assert.equal(codeSet.has(code), true);
+    assert.deepEqual(READINESS_REMEDIATIONS[code], { code, retryable, action });
+    assert.equal(Object.isFrozen(READINESS_REMEDIATIONS[code]), true);
+    assert.equal(READINESS_ERROR_TAXONOMY.resourceSession.includes(code), true);
+  }
+});
+
 
 test("WORKSPACE_RESIDUAL_PROCESS is a first-class, classification-safe protocol code", () => {
   const code = PROTOCOL_ERROR_CODES.WORKSPACE_RESIDUAL_PROCESS;

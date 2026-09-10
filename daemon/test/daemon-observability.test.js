@@ -376,7 +376,7 @@ test("owner snapshots are authoritative, frozen, and attached once", () => {
   observability.subscribe((event) => events.push(event));
   const budget = new AdmissionBudget({ maxInFlightInvokes: 1, observer: observability });
   const registry = new WorkspaceLeaseRegistry({ maxWorkspaces: 1, maxActiveWorkspaces: 1, observer: observability });
-  const pool = { getObservabilitySnapshot: () => Object.freeze({ activeSessions: 0, pendingSessions: 0, admittedSessionWorkspaces: 0, maxSessions: 1, pendingReceiptRetirementCleanup: 0, failedManagedSessionCleanup: 0 }) };
+  const pool = { getObservabilitySnapshot: () => Object.freeze({ activeSessions: 0, pendingSessions: 0, admittedSessionWorkspaces: 0, maxSessions: 1, pendingSessionRetirements: 0, failedSessionRetirements: 0 }) };
   observability.attachOwners({ admissionBudget: budget, sessionPool: pool, workspaceLeaseRegistry: registry });
   const release = budget.tryAcquireInvoke();
   assert.equal(budget.tryAcquireInvoke(), undefined);
@@ -465,7 +465,7 @@ test("registry counts invalidated held activity and emits one idempotent release
   assert.equal(events.filter((event) => event.action === "release").length, 2);
 });
 
-test("session creation joins once and receipt cleanup has one bounded terminal", async () => {
+test("session creation joins once and retirement cleanup has one bounded terminal", async () => {
   const events = [];
   let createSession;
   const creation = new Promise((resolve) => {
@@ -512,7 +512,7 @@ test("session creation joins once and receipt cleanup has one bounded terminal",
     monotonic = 10;
     await assert.rejects(
       pool.retireManagedReceipt(WORK_DIR, receiptIdentity()),
-      (error) => error?.code === "LEASE_CONFLICT",
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING",
     );
     const cleanup = events.filter(
       (event) =>
@@ -522,7 +522,7 @@ test("session creation joins once and receipt cleanup has one bounded terminal",
     assert.equal(cleanup[0].cleanupState, "timed_out");
     assert.equal(cleanup[0].durationMs, 0);
     assert.equal(
-      pool.getObservabilitySnapshot().pendingReceiptRetirementCleanup,
+      pool.getObservabilitySnapshot().pendingSessionRetirements,
       1,
     );
     finishDispose();
@@ -535,7 +535,7 @@ test("session creation joins once and receipt cleanup has one bounded terminal",
       1,
     );
     assert.equal(
-      pool.getObservabilitySnapshot().pendingReceiptRetirementCleanup,
+      pool.getObservabilitySnapshot().pendingSessionRetirements,
       0,
     );
   } finally {
@@ -713,7 +713,7 @@ test("session pool emits one settled create failure and session-limit denial", a
   }
 });
 
-test("receipt retirement cleanup emits fulfilled and rejected terminals", async () => {
+test("session retirement cleanup emits fulfilled and rejected terminals", async () => {
   for (const [dispose, expectedState] of [
     [async () => {}, "fulfilled"],
     [async () => { throw new Error("raw disposal failure"); }, "rejected"],
@@ -730,7 +730,11 @@ test("receipt retirement cleanup emits fulfilled and rejected terminals", async 
       } else {
         await assert.rejects(
           pool.retireManagedReceipt(WORK_DIR, receiptIdentity()),
-          (error) => error?.code === "LEASE_CONFLICT",
+          (error) => error?.code === "SESSION_RETIREMENT_FAILED",
+        );
+        assert.equal(
+          pool.getObservabilitySnapshot().failedSessionRetirements,
+          1,
         );
       }
       const cleanup = events.filter(

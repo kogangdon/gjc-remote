@@ -84,7 +84,7 @@ import {
   WorkspaceLeaseRegistry,
   DEFAULT_MAX_ACTIVE_WORKSPACES,
 } from "./workspace-lease-registry.js";
-import { isLeaseBoundaryRejection } from "./readiness-classification.js";
+import { isAdmissionBoundaryRejection } from "./readiness-classification.js";
 import { RequestIdFence } from "./request-id-fence.js";
 import { resolveDaemonConnectionConfig } from "./daemon-config.js";
 import { ROLE_PATHS } from "./container-security-preflight.js";
@@ -1724,8 +1724,11 @@ async function admitReadyWorkload(state, workDir, message) {
         publishRead.inventory.inventoryFingerprint !== bindingState.proof?.inventoryFingerprint ||
         publishRead.inventory.inventoryGeneration !== bindingState.proof?.inventoryGeneration;
       if (rotated) {
-        await Promise.resolve(session.dispose()).catch(() => {});
-        activityLease?.release();
+        const retirementLease = activityLease;
+        activityLease = undefined;
+        await pool.retireManagedReceipt(effectiveWorkDir, receiptIdentity, {
+          holds: [() => retirementLease?.release()],
+        });
         return {
           error: makeReadinessError(PROTOCOL_ERROR_CODES.INVENTORY_STALE),
         };
@@ -1753,12 +1756,10 @@ async function admitReadyWorkload(state, workDir, message) {
       error,
       PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND
     );
-    // WORKSPACE_ADMISSION_EXCEEDED, like LEASE_CONFLICT, is a synchronous
-    // rejection at the lease-acquisition boundary itself (acquireActivity threw
-    // fail-closed at the host-wide active-workspace ceiling), not a downstream
-    // session/readiness-state fault. Return the distinct fail-closed error
-    // directly without polluting the binding's readiness state.
-    if (isLeaseBoundaryRejection(errorCode)) {
+    // Admission-boundary refusals describe this invoke, not a durable
+    // workspace-readiness fault. Return them without poisoning the binding's
+    // otherwise valid readiness receipt.
+    if (isAdmissionBoundaryRejection(errorCode)) {
       return { error: makeReadinessError(errorCode) };
     }
     setReadinessError(state, error, PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND);

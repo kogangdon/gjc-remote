@@ -105,19 +105,20 @@ supplements, and does not replace, the design-only matrix above.
   capabilities); an off-mode (v0/v2) replacement does not increment it, and a host that has
   remained entirely off-mode stays at 0. Prior v3 churn can remain nonzero. Replacements are not
   process restart evidence.
-- Daemon owner telemetry foundation is local schema-v1 only. `AdmissionBudget`, `SessionPool`,
-  and `WorkspaceLeaseRegistry` expose direct aggregate admission snapshots; lease gauges retain
+- Daemon owner telemetry foundation is local schema-v1 only. `AdmissionBudget`,
+  `SessionPool`, and `WorkspaceLeaseRegistry` expose direct aggregate admission
+  snapshots; lease gauges retain
   invalidated activities while holders remain. Their optional owner callbacks emit flat,
-  bounded, frozen capacity/session/lease facts plus receipt-retirement cleanup facts with
-  process-local registry-issued fence sequences and isolate subscriber exceptions. Receipt
-  pending receipt-cleanup gauge deliberately excludes idle, replacement, late-created, and shutdown
-  disposal; the failed managed-cleanup gauge includes every managed disposal class already fenced
-  by the pool. Broader pending classification remains deferred. The composite snapshot samples each owner
+  bounded, frozen capacity/session/lease facts plus session-retirement facts with
+  process-local registry-issued fence sequences and isolate subscriber exceptions. The
+  pending and failed session-retirement gauges cover every retirement context fenced by
+  the pool, including idle, replacement, late-created, managed, and shutdown disposal.
+  The composite snapshot samples each owner
   directly but is not cross-owner atomic. Owner observer types are validated at construction,
   while event IDs use one shared opaque-ID grammar at projection/emission time. Composite
   snapshots reject duplicate/reserved keys rather than
   silently shadowing one owner's gauge. Focused tests pin every owner capacity/busy/retire/create
-  and bounded receipt-cleanup terminal. This owner foundation is wired into daemon orchestration:
+  and bounded session-retirement terminal. This owner foundation is wired into daemon orchestration:
   one process-local composite attaches the three owner snapshots and emits one correlated,
   bounded daemon `invoke` terminal after each valid invoke. Invoke records use only admitted
   local readiness/mapping/workspace generations and a registry-issued activity fence; they carry

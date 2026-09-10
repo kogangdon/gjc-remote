@@ -72,14 +72,127 @@ test("closed managed session disposal rejection permanently fences reuse", async
     };
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { receiptIdentity: identity }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { receiptIdentity: identity }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
   } finally {
     session.dispose = FakeSession.prototype.dispose;
+    await pool.shutdown();
+  }
+});
+
+test("receipt retirement joins an immediately rejected matching replacement", async () => {
+  const session = new FakeSession();
+  const pool = createPool({ sessionFactory: async () => session });
+  const identity = receiptIdentity(1, "binding-a", "a");
+  let releases = 0;
+  try {
+    await pool.ensureSession(WORK_DIR, { receiptIdentity: identity });
+    session.closed = true;
+    session.dispose = async () => {
+      session.disposeCalls += 1;
+      throw new Error("dispose failed");
+    };
+
+    const replacement = pool.ensureSession(WORK_DIR, {
+      receiptIdentity: identity,
+    });
+    const retirement = pool.retireManagedReceipt(WORK_DIR, identity, {
+      holds: [() => { releases += 1; }],
+    });
+
+    await assert.rejects(
+      replacement,
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    await assert.rejects(
+      retirement,
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    assert.equal(session.disposeCalls, 1);
+    assert.equal(releases, 0);
+  } finally {
+    session.dispose = FakeSession.prototype.dispose;
+    await pool.shutdown();
+  }
+});
+
+test("unmanaged closed-session disposal rejection permanently fences aliases", async () => {
+  const original = new FakeSession();
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return original;
+    },
+  });
+  try {
+    await pool.ensureSession(WORK_DIR);
+    original.closed = true;
+    original.dispose = async () => {
+      original.disposeCalls += 1;
+      throw new Error("dispose failed");
+    };
+    await assert.rejects(
+      pool.ensureSession(ALIAS_WORK_DIR),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    assert.equal(original.disposeCalls, 1);
+    assert.equal(factoryCalls, 1);
+  } finally {
+    original.dispose = FakeSession.prototype.dispose;
+    await pool.shutdown();
+  }
+});
+
+test("unmanaged retirement late rejection fences concurrent aliases", async () => {
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  const original = new FakeSession();
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return original;
+    },
+  });
+  try {
+    await pool.ensureSession(WORK_DIR);
+    original.closed = true;
+    original.dispose = async () => {
+      original.disposeCalls += 1;
+      await disposalGate;
+      throw new Error("late dispose failed");
+    };
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    await assert.rejects(
+      Promise.all([pool.ensureSession(ALIAS_WORK_DIR), pool.ensureSession(WORK_DIR)]),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    assert.equal(original.disposeCalls, 1);
+    assert.equal(factoryCalls, 1);
+    releaseDisposal();
+    await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(
+      pool.ensureSession(ALIAS_WORK_DIR),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+  } finally {
+    releaseDisposal();
+    original.dispose = FakeSession.prototype.dispose;
     await pool.shutdown();
   }
 });
@@ -113,10 +226,10 @@ test("closed managed session disposal timeout fences reuse until settlement", as
     } catch (error) {
       transitionError = error;
     }
-    assert.equal(transitionError?.code, "LEASE_CONFLICT");
+    assert.equal(transitionError?.code, "SESSION_RETIREMENT_PENDING");
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { receiptIdentity: identity }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
     );
     releaseDisposal();
     await transitionError.pendingCleanup;
@@ -124,6 +237,55 @@ test("closed managed session disposal timeout fences reuse until settlement", as
       await pool.ensureSession(WORK_DIR, { receiptIdentity: identity }),
       replacement
     );
+  } finally {
+    releaseDisposal();
+    await pool.shutdown();
+  }
+});
+
+test("canonical aliases share one timed-out closed-session retirement", async () => {
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  const original = new FakeSession();
+  const replacement = new FakeSession();
+  let factoryCalls = 0;
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return factoryCalls === 1 ? original : replacement;
+    },
+  });
+
+  try {
+    await pool.ensureSession(WORK_DIR);
+    original.closed = true;
+    original.dispose = async () => {
+      original.disposeCalls += 1;
+      await disposalGate;
+      original.closed = true;
+    };
+
+    let retirementError;
+    try {
+      await pool.ensureSession(ALIAS_WORK_DIR);
+    } catch (error) {
+      retirementError = error;
+    }
+    assert.equal(retirementError?.code, "SESSION_RETIREMENT_PENDING");
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    assert.equal(original.disposeCalls, 1);
+    assert.equal(factoryCalls, 1);
+
+    releaseDisposal();
+    await retirementError.pendingCleanup;
+    assert.strictEqual(await pool.ensureSession(ALIAS_WORK_DIR), replacement);
+    assert.equal(factoryCalls, 2);
   } finally {
     releaseDisposal();
     await pool.shutdown();
@@ -236,13 +398,13 @@ test("rejected receipt retirement permanently fences the workDir", async () => {
     await pool.ensureSession(WORK_DIR, { receiptIdentity: retired });
     await assert.rejects(
       pool.retireManagedReceipt(WORK_DIR, retired),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     await assert.rejects(
       pool.ensureSession(WORK_DIR, {
         receiptIdentity: receiptIdentity(2, "binding-b", "b"),
       }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
   } finally {
     session.dispose = FakeSession.prototype.dispose;
@@ -280,10 +442,10 @@ test("timed-out receipt retirement blocks replacement until cleanup settles", as
     } catch (error) {
       retirementError = error;
     }
-    assert.equal(retirementError?.code, "LEASE_CONFLICT");
+    assert.equal(retirementError?.code, "SESSION_RETIREMENT_PENDING");
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { receiptIdentity: successor }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
     );
     releaseDisposal();
     await retirementError.pendingCleanup;
@@ -358,7 +520,7 @@ test("receipt retirement rejects when timed-out creation cleanup fails", async (
     releaseCreation();
     await assert.rejects(
       retirement,
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
   } finally {
     releaseCreation();
@@ -441,12 +603,12 @@ test("managed replacement disposal failure permanently fences managed reuse", as
     await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" });
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     assert.equal(factoryCalls, 1);
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
   } finally {
     original.dispose = FakeSession.prototype.dispose;
@@ -478,17 +640,17 @@ test("rejected managed disposal fails closed and cannot be bypassed", async () =
     });
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
     );
     await assert.rejects(
       rejectedTransition,
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     assert.equal(factoryCalls, 1);
 
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     assert.equal(disposalAttempts, 1);
     assert.equal(factoryCalls, 1);
@@ -524,11 +686,11 @@ test("managed replacement disposal timeout creates no replacement session", asyn
     await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-a" });
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
     );
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
     );
     assert.equal(factoryCalls, 1);
 
@@ -538,10 +700,101 @@ test("managed replacement disposal timeout creates no replacement session", asyn
       await pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
       replacement
     );
-    assert.equal(disposalAttempts, 2);
+    assert.equal(disposalAttempts, 1);
     assert.equal(factoryCalls, 2);
   } finally {
     releaseDisposal();
+    await pool.shutdown();
+  }
+});
+
+test("receipt retirement joins a pending replacement retirement and releases holds once", async () => {
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  const original = new FakeSession();
+  original.dispose = async () => {
+    original.disposeCalls += 1;
+    await disposalGate;
+    original.closed = true;
+  };
+  const pool = createPool({
+    sessionDisposeTimeoutMs: 1,
+    sessionFactory: async () => original,
+  });
+  const identity = receiptIdentity(1, "binding-a", "a");
+  let releases = 0;
+  try {
+    await pool.ensureSession(WORK_DIR, { receiptIdentity: identity });
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    await assert.rejects(
+      pool.retireManagedReceipt(WORK_DIR, identity, {
+        holds: [() => { releases += 1 }],
+      }),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    assert.equal(original.disposeCalls, 1);
+    assert.equal(releases, 0);
+    releaseDisposal();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(releases, 1);
+  } finally {
+    releaseDisposal();
+    await pool.shutdown();
+  }
+});
+
+test("receipt retirement joining a late-rejected idle retirement remains failed", async () => {
+  let now = 0;
+  let reap;
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  const session = new FakeSession();
+  session.dispose = async () => {
+    session.disposeCalls += 1;
+    await disposalGate;
+    throw new Error("dispose failed");
+  };
+  const pool = createPool({
+    nowFn: () => now,
+    idleTimeoutMs: 1,
+    sessionDisposeTimeoutMs: 1,
+    setIntervalFn: (callback) => {
+      reap = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn: () => {},
+    sessionFactory: async () => session,
+  });
+  const identity = receiptIdentity(1, "binding-a", "a");
+  let releases = 0;
+  try {
+    await pool.ensureSession(WORK_DIR, { receiptIdentity: identity });
+    now = 2;
+    reap();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await assert.rejects(
+      pool.retireManagedReceipt(WORK_DIR, identity, {
+        holds: [() => { releases += 1 }],
+      }),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    releaseDisposal();
+    await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(
+      pool.retireManagedReceipt(WORK_DIR, identity),
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
+    );
+    assert.equal(releases, 0);
+  } finally {
+    releaseDisposal();
+    session.dispose = FakeSession.prototype.dispose;
     await pool.shutdown();
   }
 });
@@ -573,15 +826,15 @@ test("managed replacement timeout with late rejection permanently fences", async
     } catch (error) {
       replacementError = error;
     }
-    assert.equal(replacementError?.code, "LEASE_CONFLICT");
+    assert.equal(replacementError?.code, "SESSION_RETIREMENT_PENDING");
     releaseDisposal();
     await assert.rejects(
       replacementError.pendingCleanup,
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-c" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     assert.equal(factoryCalls, 1);
   } finally {
@@ -637,7 +890,7 @@ test("managed identity change is fenced until late creation cleanup settles", as
     assert.equal(late.disposeCalls, 1);
     await assert.rejects(
       pool.ensureSession(WORK_DIR, { managedIdentity: "binding-b" }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
     );
 
     releaseDisposal();
@@ -769,7 +1022,60 @@ test("idle reaper skips busy sessions and reaps them after work settles", async 
   }
 });
 
-test("replacement creation proceeds when closed-session disposal stalls", async () => {
+test("idle reaping installs a retirement fence before a concurrent replacement", async () => {
+  let now = 0;
+  let reap;
+  let releaseDisposal;
+  const disposalGate = new Promise((resolve) => {
+    releaseDisposal = resolve;
+  });
+  const original = new FakeSession();
+  const replacement = new FakeSession();
+  let factoryCalls = 0;
+  original.dispose = async () => {
+    original.disposeCalls += 1;
+    await disposalGate;
+    original.closed = true;
+  };
+  const pool = createPool({
+    nowFn: () => now,
+    idleTimeoutMs: 5,
+    sessionDisposeTimeoutMs: 1,
+    reapIntervalMs: 5,
+    setIntervalFn: (callback) => {
+      reap = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn: () => {},
+    sessionFactory: async () => {
+      factoryCalls += 1;
+      return factoryCalls === 1 ? original : replacement;
+    },
+  });
+
+  try {
+    await pool.ensureSession(WORK_DIR);
+    now += 6;
+    reap();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    reap();
+    await assert.rejects(
+      pool.ensureSession(ALIAS_WORK_DIR),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
+    assert.equal(original.disposeCalls, 1);
+    assert.equal(factoryCalls, 1);
+
+    releaseDisposal();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(await pool.ensureSession(WORK_DIR), replacement);
+  } finally {
+    releaseDisposal();
+    await pool.shutdown();
+  }
+});
+
+test("closed-session disposal timeout fences replacement creation", async () => {
   const created = [];
   const pool = createPool({
     sessionDisposeTimeoutMs: 1,
@@ -788,11 +1094,12 @@ test("replacement creation proceeds when closed-session disposal stalls", async 
       return new Promise(() => {});
     };
 
-    const replacement = await pool.ensureSession(WORK_DIR);
-
-    assert.notStrictEqual(replacement, stuck);
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error?.code === "SESSION_RETIREMENT_PENDING"
+    );
     assert.equal(stuck.disposeCalls, 1);
-    assert.equal(created.length, 2);
+    assert.equal(created.length, 1);
   } finally {
     await pool.shutdown();
   }
@@ -811,7 +1118,7 @@ test("a workDir that resolves to a file is rejected before SDK session creation"
   try {
     await assert.rejects(
       pool.ensureSession(WORK_DIR),
-      (error) => error.message === `workDir is not a directory on this host: ${WORK_DIR}`
+      (error) => error.message === "workDir is not a directory on this host"
     );
     assert.equal(factoryCalls, 0);
   } finally {
@@ -836,7 +1143,7 @@ test("a nonexistent workDir is rejected before SDK session creation", async () =
   try {
     await assert.rejects(
       pool.ensureSession(WORK_DIR),
-      (error) => error.message === `workDir does not exist on this host: ${WORK_DIR}`
+      (error) => error.message === "workDir does not exist on this host"
     );
     assert.equal(factoryCalls, 0);
   } finally {
@@ -983,7 +1290,7 @@ test("an unresolvable workDir fails before SDK session creation", async () => {
     await assert.rejects(
       pool.ensureSession(WORK_DIR),
       (error) =>
-        error.message === `workDir cannot be resolved on this host: ${WORK_DIR}` &&
+        error.message === "workDir cannot be resolved on this host" &&
         error.cause === failure
     );
     assert.equal(factoryCalls, 0);
@@ -1096,7 +1403,7 @@ test("shutdown completes when SDK session creation stalls", async () => {
   await creationRejection;
 });
 
-test("timed-out session creation is evicted and late sessions are disposed", async () => {
+test("timed-out session creation fences reuse until the late session is disposed", async () => {
   let release;
   const gate = new Promise((resolve) => {
     release = resolve;
@@ -1118,15 +1425,56 @@ test("timed-out session creation is evicted and late sessions are disposed", asy
   });
 
   try {
-    await assert.rejects(pool.ensureSession(WORK_DIR), /session creation timed out/);
-    assert.strictEqual(await pool.ensureSession(WORK_DIR), replacement);
+    let creationError;
+    try {
+      await pool.ensureSession(WORK_DIR);
+    } catch (error) {
+      creationError = error;
+    }
+    assert.match(creationError?.message, /session creation timed out/);
+    await assert.rejects(
+      pool.ensureSession(WORK_DIR),
+      (error) => error?.code === "LEASE_CONFLICT"
+    );
 
     release();
-    await new Promise((resolve) => setImmediate(resolve));
+    await creationError.pendingCleanup;
+    assert.strictEqual(await pool.ensureSession(WORK_DIR), replacement);
 
     assert.equal(factoryCalls, 2);
     assert.equal(late.disposeCalls, 1);
   } finally {
+    await pool.shutdown();
+  }
+});
+
+test("timed-out creation retains max-session admission until late cleanup settles", async () => {
+  let releaseCreation;
+  const creationGate = new Promise((resolve) => {
+    releaseCreation = resolve;
+  });
+  const late = new FakeSession();
+  const otherWorkDir = process.platform === "win32" ? String.raw`C:\other` : "/other";
+  const pool = new SessionPool({
+    maxSessions: 1,
+    sessionCreateTimeoutMs: 1,
+    statSyncFn: () => ({ isDirectory: () => true }),
+    realpathSyncFn: (workDir) => workDir,
+    sessionFactory: async () => {
+      await creationGate;
+      return late;
+    },
+  });
+  try {
+    await assert.rejects(pool.ensureSession(WORK_DIR), /session creation timed out/);
+    await assert.rejects(
+      pool.ensureSession(otherWorkDir),
+      (error) => error?.code === "SESSION_LIMIT"
+    );
+    releaseCreation();
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    releaseCreation();
     await pool.shutdown();
   }
 });
@@ -1160,13 +1508,13 @@ test("managed creation timeout permanently fences after late disposal rejection"
     releaseCreation();
     await assert.rejects(
       creationError.pendingCleanup,
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
     await assert.rejects(
       pool.ensureSession(WORK_DIR, {
         receiptIdentity: receiptIdentity(2, "binding-b", "b"),
       }),
-      (error) => error?.code === "LEASE_CONFLICT"
+      (error) => error?.code === "SESSION_RETIREMENT_FAILED"
     );
   } finally {
     releaseCreation();
