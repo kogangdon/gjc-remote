@@ -97,9 +97,11 @@ export class SessionPool {
     this.maxSessions = maxSessions;
     this.pendingOperations = new Map();
     this.sessionTransitions = new Map();
-    this.failedManagedDisposals = new Set();
-    this.pendingManagedDisposals = new Set();
-    this.retiringReceiptIdentities = new Set();
+    /** @type {Map<string, { session: object, generation: number, managedIdentity?: string, settlement: Promise<{ status: string }>, state: "pending" | "retired" | "failed" }>} */
+    this.retirements = new Map();
+    this.receiptRetirements = new Map();
+    this.creationHolds = new Map();
+    this.nextRetirementGeneration = 1;
     this.reapTimer = this.setIntervalFn(() => {
       void this.#reapIdle().catch((error) =>
         console.error(`SessionPool: idle reap failed: ${this.#sanitize(error)}`)
@@ -129,8 +131,13 @@ export class SessionPool {
       }
       if (now - entry.lastUsed > this.idleTimeoutMs) {
         console.log(`SessionPool: reaping idle session for ${this.#sanitize(workDir)}`);
-        this.sessions.delete(workDir);
-        disposals.push(this.#disposeIgnoringFailure(entry.session, workDir, "idle"));
+        const disposal = this.#retireIgnoringFailure(
+          entry.session,
+          workDir,
+          "idle",
+          entry.managedIdentity
+        );
+        disposals.push(disposal);
       }
     }
     await Promise.all(disposals);
@@ -169,15 +176,20 @@ export class SessionPool {
 
   getAdmissionSnapshot() {
     let activeSessions = 0;
-    let pendingSessions = 0;
-    for (const entry of this.sessions.values()) {
+    const pendingWorkspaces = new Set(this.creationHolds.keys());
+    for (const [workDir, entry] of this.sessions) {
       if (entry.session && !entry.session.closed) activeSessions += 1;
-      if (entry.creation) pendingSessions += 1;
+      if (entry.creation) pendingWorkspaces.add(workDir);
     }
+    const admittedWorkspaces = new Set([
+      ...this.sessions.keys(),
+      ...this.retirements.keys(),
+      ...this.creationHolds.keys(),
+    ]).size;
     return Object.freeze({
       activeSessions,
-      pendingSessions,
-      admittedWorkspaces: this.sessions.size,
+      pendingSessions: pendingWorkspaces.size,
+      admittedWorkspaces,
       maxSessions: this.maxSessions,
     });
   }
@@ -189,8 +201,12 @@ export class SessionPool {
       pendingSessions: admission.pendingSessions,
       admittedSessionWorkspaces: admission.admittedWorkspaces,
       maxSessions: admission.maxSessions,
-      pendingReceiptRetirementCleanup: this.pendingManagedDisposals.size,
-      failedManagedSessionCleanup: this.failedManagedDisposals.size,
+      pendingSessionRetirements: [...this.retirements.values()].filter(
+        (retirement) => retirement.state === "pending"
+      ).length,
+      failedSessionRetirements: [...this.retirements.values()].filter(
+        (retirement) => retirement.state === "failed"
+      ).length,
     });
   }
 
@@ -234,12 +250,90 @@ export class SessionPool {
     return { bounded, settlement };
   }
 
-  #disposeBounded(session, workDir, context) {
-    return this.#startDispose(session, workDir, context).bounded;
+  #addRetirementHolds(retirement, holds) {
+    if (holds === undefined) return;
+    if (!Array.isArray(holds) || holds.some((hold) => typeof hold !== "function")) {
+      throw new TypeError("holds must be an array of release callbacks");
+    }
+    for (const hold of holds) {
+      if (retirement.releasedHolds.has(hold)) continue;
+      if (retirement.state === "retired") {
+        retirement.releasedHolds.add(hold);
+        try {
+          hold();
+        } catch {
+          console.error("SessionPool: containment hold release failed");
+        }
+      } else {
+        retirement.holds.add(hold);
+      }
+    }
   }
 
-  async #disposeIgnoringFailure(session, workDir, context) {
-    const result = await this.#disposeBounded(session, workDir, context);
+  #releaseRetirementHolds(retirement) {
+    retirement.state = "retired";
+    this.#addRetirementHolds(retirement, [...retirement.holds]);
+    retirement.holds.clear();
+  }
+
+  #transferRetirementHolds(source, retirement) {
+    this.#addRetirementHolds(retirement, [...source.holds]);
+    source.holds.clear();
+  }
+
+  #retire(session, workDir, context, managedIdentity, holds) {
+    const existing = this.retirements.get(workDir);
+    if (existing) {
+      if (existing.session !== session) {
+        const error = new Error("SDK session retirement identity mismatch");
+        error.code = "SESSION_RETIREMENT_FAILED";
+        throw error;
+      }
+      if (
+        existing.managedIdentity !== undefined &&
+        managedIdentity !== undefined &&
+        existing.managedIdentity !== managedIdentity
+      ) {
+        const error = new Error("SDK session retirement identity mismatch");
+        error.code = "SESSION_RETIREMENT_FAILED";
+        throw error;
+      }
+      this.#addRetirementHolds(existing, holds);
+      return existing;
+    }
+
+    const disposal = this.#startDispose(session, workDir, context);
+    const retirement = {
+      session,
+      generation: this.nextRetirementGeneration++,
+      managedIdentity,
+      holds: new Set(),
+      releasedHolds: new Set(),
+      settlement: undefined,
+      state: "pending",
+      bounded: disposal.bounded,
+    };
+    this.#addRetirementHolds(retirement, holds);
+    this.retirements.set(workDir, retirement);
+    if (this.sessions.get(workDir)?.session === session) {
+      this.sessions.delete(workDir);
+    }
+    retirement.settlement = disposal.settlement.then((result) => {
+      if (result.status === "fulfilled") {
+        if (this.retirements.get(workDir) === retirement) {
+          this.retirements.delete(workDir);
+        }
+        this.#releaseRetirementHolds(retirement);
+      } else {
+        retirement.state = "failed";
+      }
+      return result;
+    });
+    return retirement;
+  }
+
+  async #retireIgnoringFailure(session, workDir, context, managedIdentity) {
+    const result = await this.#retire(session, workDir, context, managedIdentity).bounded;
     if (result.status === "rejected") {
       console.error(
         `SessionPool: failed to dispose ${context} session for ${this.#sanitize(
@@ -255,66 +349,90 @@ export class SessionPool {
     }
   }
 
-  async #disposeForReplacement(session, workDir) {
-    const disposal = this.#startDispose(session, workDir, "replacement");
-    const result = await disposal.bounded;
+  async #retireForReplacement(session, workDir, managedIdentity) {
+    const retirement = this.#retire(session, workDir, "replacement", managedIdentity);
+    const result = await retirement.bounded;
     if (result.status === "fulfilled") return;
     console.error(
       result.status === "timed_out"
         ? "SessionPool: managed replacement session disposal timed out"
         : "SessionPool: managed replacement session disposal failed"
     );
-    const error = new Error("prior managed session could not be fenced");
-    error.code = "LEASE_CONFLICT";
+    const error = result.status === "rejected"
+      ? this.#retirementError({ state: "failed" })
+      : this.#retirementError(retirement);
     if (result.status === "timed_out") {
-      error.pendingCleanup = disposal.settlement.then((settlement) => {
+      error.pendingCleanup = retirement.settlement.then((settlement) => {
         if (settlement.status === "rejected") {
-          this.failedManagedDisposals.add(workDir);
-          throw leaseConflict();
+          throw this.#retirementError({ state: "failed" });
         }
         return settlement;
       });
-    } else {
-      // A rejected dispose has no later settlement that can establish the
-      // session is gone. Do not retry into a potentially live SDK session.
-      this.failedManagedDisposals.add(workDir);
     }
     throw error;
   }
 
-  async #createSessionBounded(workDir, managed) {
+  #retirementError(retirement) {
+    const error = new Error("prior SDK session retirement has not completed");
+    error.code = retirement.state === "failed"
+      ? "SESSION_RETIREMENT_FAILED"
+      : "SESSION_RETIREMENT_PENDING";
+    return error;
+  }
+
+  async #createSessionBounded(workDir, managedIdentity) {
+    const hold = Symbol("session creation");
+    this.creationHolds.set(workDir, hold);
     const pending = Promise.resolve().then(() => this.sessionFactory(workDir));
     const result = await this.#settleBounded(pending, this.sessionCreateTimeoutMs);
-    if (result.status === "fulfilled") return result.value;
-    if (result.status === "rejected") throw result.reason;
+    if (result.status === "fulfilled") {
+      if (this.creationHolds.get(workDir) === hold) this.creationHolds.delete(workDir);
+      return result.value;
+    }
+    if (result.status === "rejected") {
+      if (this.creationHolds.get(workDir) === hold) this.creationHolds.delete(workDir);
+      throw result.reason;
+    }
 
-    const error = new Error(`GJC SDK session creation timed out for ${workDir}`);
+    const error = new Error("GJC SDK session creation timed out");
+    error.code = "SESSION_CREATE_TIMEOUT";
     error.pendingCleanup = pending.then(
       async (session) => {
-        const disposal = this.#startDispose(session, workDir, "late-created");
-        const result = await disposal.bounded;
+        const retirement = this.#retire(
+          session,
+          workDir,
+          "late-created",
+          managedIdentity
+        );
+        const result = await retirement.bounded;
         if (result.status === "rejected") {
-          if (managed) this.failedManagedDisposals.add(workDir);
           console.error(
             `SessionPool: failed to dispose late-created session for ${this.#sanitize(
               workDir
             )}: ` + this.#sanitize(result.reason)
           );
-          if (managed) throw leaseConflict();
+          if (managedIdentity !== undefined) throw this.#retirementError(retirement);
         } else if (result.status === "timed_out") {
           console.error(
             `SessionPool: late-created session disposal timed out for ${this.#sanitize(
               workDir
             )}`
           );
-          const settlement = await disposal.settlement;
-          if (managed && settlement.status === "rejected") {
-            this.failedManagedDisposals.add(workDir);
-            throw leaseConflict();
+          const settlement = await retirement.settlement;
+          if (managedIdentity !== undefined && settlement.status === "rejected") {
+            throw this.#retirementError(retirement);
           }
         }
       },
       () => {}
+    );
+    void error.pendingCleanup.then(
+      () => {
+        if (this.creationHolds.get(workDir) === hold) this.creationHolds.delete(workDir);
+      },
+      () => {
+        if (this.creationHolds.get(workDir) === hold) this.creationHolds.delete(workDir);
+      }
     );
     throw error;
   }
@@ -330,7 +448,12 @@ export class SessionPool {
       existing.lastUsed = this.nowFn();
       return await existing.creation;
     }
-    if (!existing && this.sessions.size >= this.maxSessions) {
+    const admittedWorkspaces = new Set([
+      ...this.sessions.keys(),
+      ...this.retirements.keys(),
+      ...this.creationHolds.keys(),
+    ]).size;
+    if (!existing && admittedWorkspaces >= this.maxSessions) {
       this.#emit({
         name: "session_pool",
         action: "create",
@@ -354,6 +477,7 @@ export class SessionPool {
       action: "create",
       outcome: "started",
     });
+    let priorRetired = false;
     const creation = (async () => {
       let priorSession = existing?.session;
       if (!priorSession && existing?.creation) {
@@ -365,26 +489,25 @@ export class SessionPool {
         }
       }
       if (priorSession) {
-        if (
-          existing?.managedIdentity !== managedIdentity ||
-          managedIdentity !== undefined
-        ) {
-          await this.#disposeForReplacement(priorSession, canonicalWorkDir);
-        } else {
-          await this.#disposeIgnoringFailure(
-            priorSession,
-            canonicalWorkDir,
-            "replacement"
-          );
-        }
+        priorRetired = true;
+        await this.#retireForReplacement(
+          priorSession,
+          canonicalWorkDir,
+          existing?.managedIdentity
+        );
       }
 
       const session = await this.#createSessionBounded(
         canonicalWorkDir,
-        managedIdentity !== undefined
+        managedIdentity
       );
       if (this.closed) {
-        await this.#disposeIgnoringFailure(session, canonicalWorkDir, "late-created");
+        await this.#retireIgnoringFailure(
+          session,
+          canonicalWorkDir,
+          "late-created",
+          managedIdentity
+        );
         throw new Error("SessionPool was shut down during session creation");
       }
       entry.session = session;
@@ -412,7 +535,7 @@ export class SessionPool {
       return await creation;
     } catch (error) {
       if (this.sessions.get(canonicalWorkDir) === entry) {
-        if (existing) {
+        if (existing && !priorRetired) {
           this.sessions.set(canonicalWorkDir, existing);
         } else {
           this.sessions.delete(canonicalWorkDir);
@@ -439,11 +562,11 @@ export class SessionPool {
     const effectiveManagedIdentity = normalizedReceiptIdentity === undefined
       ? managedIdentity
       : receiptIdentityKey(normalizedReceiptIdentity);
-    if (
-      effectiveManagedIdentity !== undefined &&
-      this.retiringReceiptIdentities.has(effectiveManagedIdentity)
-    ) {
-      throw leaseConflict();
+    const receiptRetirement = effectiveManagedIdentity === undefined
+      ? undefined
+      : this.receiptRetirements.get(effectiveManagedIdentity);
+    if (receiptRetirement) {
+      throw this.#retirementError(receiptRetirement);
     }
 
     const requestedWorkDir = validateNativeWorkDir(workDir, this.platform);
@@ -452,10 +575,10 @@ export class SessionPool {
     try {
       stat = this.statSyncFn(requestedWorkDir);
     } catch {
-      throw new Error(`workDir does not exist on this host: ${requestedWorkDir}`);
+      throw new Error("workDir does not exist on this host");
     }
     if (!stat.isDirectory()) {
-      throw new Error(`workDir is not a directory on this host: ${requestedWorkDir}`);
+      throw new Error("workDir is not a directory on this host");
     }
 
     let canonicalWorkDir;
@@ -466,24 +589,19 @@ export class SessionPool {
       );
       canonicalWorkDir = validateNativeWorkDir(canonicalWorkDir, this.platform);
     } catch (error) {
-      throw new Error(`workDir cannot be resolved on this host: ${requestedWorkDir}`, {
+      throw new Error("workDir cannot be resolved on this host", {
         cause: error,
       });
     }
 
     const active = this.sessionTransitions.get(canonicalWorkDir);
-    if (
-      this.failedManagedDisposals.has(canonicalWorkDir) ||
-      this.pendingManagedDisposals.has(canonicalWorkDir)
-    ) {
-      throw leaseConflict();
+    const retirement = this.retirements.get(canonicalWorkDir);
+    if (retirement) {
+      throw this.#retirementError(retirement);
     }
     if (active) {
-      if (
-        active.managedIdentity === undefined &&
-        effectiveManagedIdentity === undefined
-      ) {
-        return await this.#ensureCanonicalSession(canonicalWorkDir, managedIdentity);
+      if (active.cleanupPending) {
+        throw leaseConflict();
       }
       if (active.managedIdentity === effectiveManagedIdentity) {
         return await active.operation;
@@ -495,7 +613,11 @@ export class SessionPool {
       canonicalWorkDir,
       effectiveManagedIdentity
     );
-    const transition = { managedIdentity: effectiveManagedIdentity, operation: undefined };
+    const transition = {
+      managedIdentity: effectiveManagedIdentity,
+      operation: undefined,
+      cleanupPending: false,
+    };
     const clearTransition = () => {
       if (this.sessionTransitions.get(canonicalWorkDir) === transition) {
         this.sessionTransitions.delete(canonicalWorkDir);
@@ -508,6 +630,7 @@ export class SessionPool {
       },
       (error) => {
         if (error?.pendingCleanup) {
+          transition.cleanupPending = true;
           void error.pendingCleanup.then(clearTransition, clearTransition);
         } else {
           clearTransition();
@@ -520,11 +643,62 @@ export class SessionPool {
     return await operation;
   }
 
-  async retireManagedReceipt(workDir, receiptIdentity) {
+  async retireManagedReceipt(workDir, receiptIdentity, { holds } = {}) {
     if (this.closed) return;
     const identity = receiptIdentityKey(normalizeReceiptIdentity(receiptIdentity));
-    if (this.retiringReceiptIdentities.has(identity)) return;
-    this.retiringReceiptIdentities.add(identity);
+    const existing = this.receiptRetirements.get(identity);
+    if (existing) {
+      this.#addRetirementHolds(existing, holds);
+      if (existing.retirement) {
+        this.#transferRetirementHolds(existing, existing.retirement);
+      }
+      if (existing.state === "failed") {
+        throw this.#retirementError(existing.retirement ?? existing);
+      }
+      return await existing.operation;
+    }
+    const receiptRetirement = {
+      state: "pending",
+      operation: undefined,
+      retirement: undefined,
+      holds: new Set(),
+      releasedHolds: new Set(),
+    };
+    this.#addRetirementHolds(receiptRetirement, holds);
+    this.receiptRetirements.set(identity, receiptRetirement);
+    const operation = this.#retireManagedReceipt(identity, receiptRetirement);
+    receiptRetirement.operation = operation.then(
+      (result) => {
+        if (!receiptRetirement.retirement) {
+          this.#releaseRetirementHolds(receiptRetirement);
+        }
+        if (this.receiptRetirements.get(identity) === receiptRetirement) {
+          this.receiptRetirements.delete(identity);
+        }
+        return result;
+      },
+      (error) => {
+        if (error?.pendingCleanup) {
+          void error.pendingCleanup.then(
+            () => {
+              if (this.receiptRetirements.get(identity) === receiptRetirement) {
+                this.receiptRetirements.delete(identity);
+              }
+            },
+            () => {
+              receiptRetirement.state = "failed";
+            }
+          );
+        } else {
+          receiptRetirement.state = "failed";
+        }
+        throw error;
+      }
+    );
+    return await receiptRetirement.operation;
+  }
+
+  async #retireManagedReceipt(identity, receiptRetirement) {
     const transitionMatch = [...this.sessionTransitions.entries()].find(
       ([, transition]) => transition.managedIdentity === identity
     );
@@ -533,52 +707,69 @@ export class SessionPool {
       try {
         await transition.operation;
       } catch (error) {
-        if (!error?.pendingCleanup) {
-          this.retiringReceiptIdentities.delete(identity);
-          return;
-        }
-        try {
-          await error.pendingCleanup;
-        } catch {
-          throw leaseConflict();
+        if (error?.pendingCleanup) {
+          try {
+            await error.pendingCleanup;
+          } catch (cleanupError) {
+            if (
+              cleanupError?.code === "SESSION_RETIREMENT_PENDING" ||
+              cleanupError?.code === "SESSION_RETIREMENT_FAILED"
+            ) {
+              throw cleanupError;
+            }
+            throw this.#retirementError({ state: "failed" });
+          }
         }
       }
+    }
+    const canonicalRetirement = [...this.retirements.values()].find(
+      (retirement) => retirement.managedIdentity === identity
+    );
+    if (canonicalRetirement) {
+      receiptRetirement.retirement = canonicalRetirement;
+      this.#transferRetirementHolds(receiptRetirement, canonicalRetirement);
+      const result = await canonicalRetirement.bounded;
+      if (result.status === "fulfilled") return;
+      const error = result.status === "rejected"
+        ? this.#retirementError({ state: "failed" })
+        : this.#retirementError(canonicalRetirement);
+      if (result.status === "timed_out") {
+        error.pendingCleanup = canonicalRetirement.settlement.then((settlement) => {
+          if (settlement.status === "rejected") {
+            throw this.#retirementError(canonicalRetirement);
+          }
+        });
+      }
+      throw error;
     }
     const sessionMatch = [...this.sessions.entries()].find(
       ([, entry]) => entry.managedIdentity === identity
     );
     if (!sessionMatch) {
-      this.retiringReceiptIdentities.delete(identity);
       return;
     }
     const [canonicalWorkDir, entry] = sessionMatch;
-    this.sessions.delete(canonicalWorkDir);
     const session = entry.session ?? await entry.creation;
-    this.pendingManagedDisposals.add(canonicalWorkDir);
-    const disposal = this.#startDispose(
+    const retirement = this.#retire(
       session,
       canonicalWorkDir,
-      "receipt retirement"
+      "receipt retirement",
+      identity,
+      [...receiptRetirement.holds]
     );
-    const result = await disposal.bounded;
+    receiptRetirement.retirement = retirement;
+    receiptRetirement.holds.clear();
+    const result = await retirement.bounded;
     if (result.status === "fulfilled") {
-      this.pendingManagedDisposals.delete(canonicalWorkDir);
-      this.retiringReceiptIdentities.delete(identity);
       return;
     }
-    const error = leaseConflict();
+    const error = result.status === "rejected"
+      ? this.#retirementError({ state: "failed" })
+      : this.#retirementError(retirement);
     if (result.status === "timed_out") {
-      error.pendingCleanup = disposal.settlement.then((settlement) => {
-        this.pendingManagedDisposals.delete(canonicalWorkDir);
-        if (settlement.status === "fulfilled") {
-          this.retiringReceiptIdentities.delete(identity);
-        } else {
-          this.failedManagedDisposals.add(canonicalWorkDir);
-        }
+      error.pendingCleanup = retirement.settlement.then((settlement) => {
+        if (settlement.status === "rejected") throw this.#retirementError(retirement);
       });
-    } else {
-      this.pendingManagedDisposals.delete(canonicalWorkDir);
-      this.failedManagedDisposals.add(canonicalWorkDir);
     }
     throw error;
   }
@@ -589,6 +780,18 @@ export class SessionPool {
     this.clearIntervalFn(this.reapTimer);
 
     const entries = [...this.sessions.entries()];
+    const shutdownRetirements = new Map(
+      entries.flatMap(([workDir, entry]) =>
+        entry.session
+          ? [[workDir, this.#retire(
+            entry.session,
+            workDir,
+            "shutdown",
+            entry.managedIdentity
+          )]]
+          : []
+      )
+    );
     this.sessions.clear();
     const results = await Promise.allSettled(
       entries.map(async ([workDir, entry]) => {
@@ -614,7 +817,7 @@ export class SessionPool {
         }
         if (!session) return;
 
-        const result = await this.#disposeBounded(session, workDir, "shutdown");
+        const result = await shutdownRetirements.get(workDir).bounded;
         if (result.status === "rejected") throw result.reason;
         if (result.status === "timed_out") {
           console.error(

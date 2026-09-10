@@ -186,9 +186,11 @@ current transport lives in `daemon/src/sdk-session.js`.
    assigned to replacement sessions. The current SDK adapter preserves the
    relevant invariant by timing out and poisoning a stuck `AgentSession`.
    `SessionPool` bounds session creation, idle/replacement/shutdown disposal,
-   and shutdown waits for in-flight creation. Timed-out creations are evicted,
-   and any session they produce later is disposed, so stalled SDK work cannot
-   block a workDir or daemon shutdown indefinitely.
+   and shutdown waits for in-flight creation. A timed-out creation or session
+   retirement retains the canonical workDir admission fence until the original
+   operation settles. Positive disposal fulfillment is the only authority for
+   reuse; rejection leaves a permanent process-local fence, so a successor SDK
+   session cannot overlap ownership with unproven prior work.
 8. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.
