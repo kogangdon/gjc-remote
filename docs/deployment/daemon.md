@@ -17,9 +17,28 @@ A supported public ownership lifecycle is requested in
 remain fail-closed until it ships. See the
 [containment record](../../CHANGELOG.md#sdk-0166-containment).
 
-The bot and daemon must negotiate `terminal_disposition_v1` and
-`invoke_cancellation_v1` before serving an invoke; mixed peers refuse an
-invoke before execution, so deploy both components lockstep. `cancel_invoke`
+The bot and daemon must negotiate `gate_presentation_v1`,
+`terminal_disposition_v1`, and `invoke_cancellation_v1` before serving a
+gate-capable invoke; mixed peers refuse an invoke before execution, so deploy
+both components lockstep. A workflow gate begins `awaiting_presentation` under
+its exact `ownerId`, `gateId`, and `presentationId`. The bot renders a bounded
+Discord gate message with the complete wire-bounded prompt/options attached,
+then sends `present_gate`; only the exact accepted presentation receipt makes
+that gate answerable. Presentation and abandonment receipts are nonterminal.
+Answers bind the exact request, gate, and presentation to the original Discord
+gate message, channel, and initiating user. Buttons/select menus are used when
+suitable; free text must exactly reply to the original gate message, and
+ordinary channel messages never satisfy a gate. The bot edits that original
+message through Answering, Answered, Rejected—retry available, Expired,
+Replaced, and Disconnected. Only an exact accepted answer receipt retires its
+presentation; a rejected receipt retains the exact retry route. Presentation
+failure or timeout sends `abandon_gate` while the socket is open and separately
+requests `presentation_failed` cancellation without claiming active work was
+interrupted. Duplicate attempt/answer IDs replay exact receipts, conflicting
+reuse policy-closes, and bounded receipt capacity fails closed without evicting
+live entries. Oversized gate protocol content is refused and quarantined rather
+than silently truncated; the Discord preview is bounded but the attachment
+preserves complete wire-bounded content. `cancel_invoke`
 reasons are exactly `idle_timeout`, `hard_cap`, `disconnect`, `user_cancelled`,
 and `presentation_failed`; `cancel_result` outcomes are exactly
 `cancelled_before_start`, `cancellation_pending`, `already_terminal`, and
@@ -42,10 +61,11 @@ was interrupted. A bot-local response timeout is likewise an unconfirmed local
 failure, not a daemon `timed_out` disposition. On adapter timeout, the daemon
 transfers the session/activity hold to SessionPool retirement containment (#234)
 while cleanup settles because work may continue. On socket close, the daemon
-synchronously revokes queued sibling invokes and retires each active shared
-session once through #234 containment. It retains associated leases and
-admission fences until positive disposal proof; no successor may adopt or
-downgrade owned work. The #231 live-control containment above remains active:
+synchronously quarantines exact socket-generation gate owners before
+cancellation retirement and reconnect scheduling, revokes queued sibling
+invokes, and retires each active shared session once through #234 containment.
+It retains associated leases and admission fences until positive disposal
+proof; no successor may adopt or downgrade owned work. The #231 live-control containment above remains active:
 cancellation does not restore active `steer`/`follow_up` or unblock #231.
 
 This repository provides the foreground start command below; it does not ship a
@@ -121,11 +141,14 @@ siblings before execution and starts #234 retirement for active shared
 sessions; it is not proof that active SDK/provider work was interrupted.
 
 Monitor daemon process health, outbound WebSocket registration at the bot,
-provider/profile failures, and the expected mapped workspace state separately.
+provider/profile failures, gate presentation/abandonment/answer receipt
+outcomes, gate quarantine, and the expected mapped workspace state separately.
 A connected daemon is not proof that provider authentication, model selection,
 or a particular workspace is ready. The bot's `/hosts` and its structured logs
 are the operator view of connection and readiness, while the daemon service
-logs provide local startup and shutdown diagnostics.
+logs provide local startup and shutdown diagnostics. Keep gate observability
+metadata-only: never export prompt or answer text, workDir/path data, provider
+or host tokens, or Discord attachment contents.
 
 `SESSION_RETIREMENT_PENDING` means late SDK cleanup is still pending. Wait for
 that cleanup to settle, then retry; do not assume disposal has succeeded.
@@ -136,8 +159,9 @@ blindly retry the operation or reuse the fenced session.
 Before an upgrade, record the deployed revision, Bun and SDK versions,
 `HOST_ID`, service-account identity, model profile, and protected-state backup
 status. Deploy bot and daemon lockstep for `terminal_disposition_v1` and
-`invoke_cancellation_v1`: after one side updates, an old peer cannot serve
-invokes and the mixed pair fails closed. Drain in-flight requests to
+`invoke_cancellation_v1`, and `gate_presentation_v1`: after one side updates,
+an old peer cannot serve invokes and the mixed pair fails closed. Drain
+in-flight requests to
 terminal/quiescence evidence before rollback; never downgrade owned work while
 #234 leases and fences await positive disposal proof. Stop gracefully, install
 the new locked dependencies, restart, then confirm registration, negotiated

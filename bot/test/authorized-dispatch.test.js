@@ -114,6 +114,31 @@ test("unauthorized tool-log button is denied ephemerally before store work", asy
   ]);
 });
 
+test("unauthorized gate select is denied before its handler", async () => {
+  const replies = [];
+  const interaction = {
+    user: { id: "denied-user" },
+    isButton: () => false,
+    isStringSelectMenu: () => true,
+    isChatInputCommand: () => false,
+    async reply(payload) {
+      replies.push(payload);
+    },
+  };
+  assert.equal(
+    await dispatchAuthorizedInteraction({
+      interaction,
+      authorization,
+      onButton: () => assert.fail("button handler must not run"),
+      onSelect: () => assert.fail("select handler must not run"),
+      onChatInput: () => assert.fail("chat handler must not run"),
+    }),
+    "denied"
+  );
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].ephemeral, true);
+});
+
 test("unauthorized mapped message is silent before registry work", async () => {
   const { calls, registry } = protectedFakes();
   const replies = [];
@@ -160,6 +185,22 @@ test("authorized interactions and messages reach their protected handlers", asyn
     }),
     "handled"
   );
+  const select = {
+    user: { id: "allowed-user" },
+    isButton: () => false,
+    isStringSelectMenu: () => true,
+    isChatInputCommand: () => false,
+  };
+  assert.equal(
+    await dispatchAuthorizedInteraction({
+      interaction: select,
+      authorization,
+      onButton: () => assert.fail("button handler must not run"),
+      onSelect: async () => calls.push("select"),
+      onChatInput: () => assert.fail("chat handler must not run"),
+    }),
+    "handled"
+  );
   assert.equal(
     await dispatchAuthorizedMessage({
       message,
@@ -168,7 +209,7 @@ test("authorized interactions and messages reach their protected handlers", asyn
     }),
     "handled"
   );
-  assert.deepEqual(calls, ["command", "message"]);
+  assert.deepEqual(calls, ["command", "select", "message"]);
 });
 test("authorized interaction handler failures are contained", async () => {
   const interaction = {

@@ -87,9 +87,28 @@ and workspace readiness are distinct:
 - Readiness alone does not authorize workspace serving; preserve the fail-closed
   mapping and receipt requirements described in [daemon deployment](daemon.md).
 
-For an invoke-capable host, registration must negotiate
-`terminal_disposition_v1` and `invoke_cancellation_v1`; a mixed peer refuses
-the invoke before execution. Deploy the bot and daemon lockstep. A
+For a gate-capable invoke, registration must negotiate
+`gate_presentation_v1`, `terminal_disposition_v1`, and
+`invoke_cancellation_v1`; a mixed peer refuses the invoke before execution.
+Deploy the bot and daemon lockstep. A daemon gate starts
+`awaiting_presentation` under its exact `ownerId`, `gateId`, and
+`presentationId`. The bot creates a bounded original Discord gate message with
+the complete wire-bounded prompt/options attached, sends `present_gate`, and
+does not route an answer until the exact accepted presentation receipt arrives.
+Presentation and abandonment receipts are nonterminal. Buttons/select menus
+are used where suitable. Every answer is bound to the exact
+request/gate/presentation, original gate message, channel, and initiating user;
+free text must be an exact reply to that message, and ordinary channel messages
+never satisfy a gate. That original message is edited as Answering, Answered,
+Rejected—retry available, Expired, Replaced, or Disconnected. Only an exact
+accepted answer receipt retires the presentation; a rejected receipt enables
+retry on that same gate. Presentation failure or timeout sends `abandon_gate`
+while open and separately requests `presentation_failed` cancellation, without
+claiming interruption. Duplicate attempt/answer IDs replay exact receipts,
+conflicting reuse policy-closes, and bounded capacity fails closed without
+evicting live entries. Oversized gate protocol content is refused/quarantined,
+not silently truncated; the complete wire-bounded content is preserved in the
+attachment. A
 `cancel_invoke` reason is exactly one of `idle_timeout`, `hard_cap`,
 `disconnect`, `user_cancelled`, or `presentation_failed`; its `cancel_result`
 is exactly one of `cancelled_before_start`, `cancellation_pending`,
@@ -128,18 +147,23 @@ failure, and shutdown/disconnect ownership changes use the same revocation
 path. This does not restore active `steer`/`follow_up` or unblock #231.
 
 Alert separately for bot exit, listener failure, Discord disconnects, unknown
-or rejected host registrations, and absent expected daemons.
+or rejected host registrations, absent expected daemons, gate presentation/
+abandonment/answer receipt refusal, and gate quarantine. Keep observability
+metadata-only: do not log prompt or answer text, host paths, tokens, Discord
+content attachments, or receipt payloads that contain them.
 
 ## Upgrade and rollback
 
 1. Record the deployed revision, Node version, configuration checksum (never
    secret contents), mapping revision, and connected-host baseline.
-2. Upgrade bot and daemon lockstep for `terminal_disposition_v1` and
-   `invoke_cancellation_v1`. Quiesce mapping changes, drain in-flight requests
-   to terminal/quiescence evidence before rollback, install the new
-   checkout/dependencies, register commands when their definition changed, and
-   restart through their supervisors. A mixed old/new pair fails closed; an old
-   peer cannot serve invokes after the other side updates. Never downgrade
+2. Upgrade bot and daemon lockstep for `gate_presentation_v1`,
+   `terminal_disposition_v1`, and `invoke_cancellation_v1`. Quiesce mapping
+   changes, drain in-flight requests to terminal/quiescence evidence before
+   rollback, install the new checkout/dependencies, and restart through their
+   supervisors. Gate presentation does not change slash-command definitions,
+   so command registration is unchanged for this rollout. A mixed old/new pair
+   fails closed; an old peer cannot serve invokes after the other side updates.
+   Never downgrade
    owned work: preserve #234 containment, leases, and fences until positive
    disposal proof.
 3. Confirm listener startup, Discord login, expected mappings, negotiated

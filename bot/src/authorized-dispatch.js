@@ -6,13 +6,21 @@ export async function dispatchAuthorizedInteraction({
   interaction,
   authorization,
   onButton,
+  onSelect,
   onChatInput,
 }) {
-  if (interaction.isButton()) {
+  const componentKind = interaction.isButton()
+    ? "button"
+    : interaction.isStringSelectMenu?.()
+      ? "select"
+      : undefined;
+  if (componentKind) {
     if (!authorization.isAuthorized(interaction.user.id)) {
       await interaction
         .reply({
-          content: "You are not authorized to view GJC tool logs.",
+          content: `${interaction.customId ?? ""}`.startsWith("gate:")
+            ? "You are not authorized to answer this GJC gate."
+            : "You are not authorized to view GJC tool logs.",
           ephemeral: true,
         })
         .catch(() => {});
@@ -20,11 +28,12 @@ export async function dispatchAuthorizedInteraction({
     }
 
     try {
-      await onButton(interaction);
+      if (componentKind === "button") await onButton(interaction);
+      else await onSelect(interaction);
       return "handled";
     } catch (error) {
       console.error(
-        "Discord button interaction handler failed:",
+        "Discord component interaction handler failed:",
         handlerErrorKind(error)
       );
       return "failed";

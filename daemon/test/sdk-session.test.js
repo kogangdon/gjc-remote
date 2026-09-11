@@ -20,6 +20,21 @@ const usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+async function answerGate(session, gateId, answer) {
+  const entry = session.pendingGates.get(gateId);
+  assert.ok(entry, `gate ${gateId} is pending`);
+  assert.equal(
+    session.presentGate(
+      entry.ownerId,
+      gateId,
+      entry.presentationId,
+      `test-presentation-${gateId}`
+    ),
+    true
+  );
+  return session.answerGate(entry.ownerId, gateId, entry.presentationId, answer);
+}
+
 function assistantMessage(text = "done", overrides = {}) {
   return {
     role: "assistant",
@@ -1703,7 +1718,7 @@ test("gate emission produces a gate_request event and resolves on a label answer
   timers.advance(120);
   assert.equal(session.closed, false);
 
-  const result = await session.answerGate("g1", "Banana");
+  const result = await answerGate(session, "g1", "Banana");
   assert.equal(result.ok, true);
   await done;
 
@@ -1713,6 +1728,184 @@ test("gate emission produces a gate_request event and resolves on a label answer
   ]);
   assert.equal(session.pendingGates.size, 0);
   await session.dispose();
+});
+
+test("owned gates require their exact presentation before an answer is accepted", async () => {
+  const agent = new GatingAgentSession({
+    gate_id: "g-presentation",
+    kind: "question",
+    context: { prompt: "Pick one" },
+    options: [{ value: "a", label: "A" }],
+  });
+  const session = new SdkSession(agent);
+  const events = [];
+  const ticket = session.sendOwned(
+    "socket-1:request-1",
+    { type: "prompt", message: "hi" },
+    (event) => events.push(event)
+  );
+  await waitForImmediate(() => session.pendingGates.has("g-presentation"));
+  const entry = session.pendingGates.get("g-presentation");
+  const request = events.find((event) => event.type === "gate_request");
+  assert.ok(request);
+  assert.equal(entry.state, "awaiting_presentation");
+  assert.equal(request.presentationId, entry.presentationId);
+  assert.equal(
+    (await session.answerGate(entry.ownerId, "g-presentation", entry.presentationId, "A"))
+      .ok,
+    false
+  );
+  assert.equal(
+    session.presentGate(
+      "socket-2:request-1",
+      "g-presentation",
+      entry.presentationId,
+      "attempt-1"
+    ),
+    false
+  );
+  assert.equal(
+    session.presentGate(
+      entry.ownerId,
+      "g-presentation",
+      entry.presentationId,
+      "attempt-1"
+    ),
+    true
+  );
+  assert.equal(entry.state, "answerable");
+  assert.equal(
+    session.presentGate(
+      entry.ownerId,
+      "g-presentation",
+      entry.presentationId,
+      "attempt-1"
+    ),
+    true
+  );
+  assert.equal(
+    session.presentGate(
+      entry.ownerId,
+      "g-presentation",
+      entry.presentationId,
+      "attempt-2"
+    ),
+    false
+  );
+  assert.equal(
+    (await session.answerGate("socket-2:request-1", "g-presentation", entry.presentationId, "A"))
+      .ok,
+    false
+  );
+  assert.equal(
+    (await session.answerGate(entry.ownerId, "g-presentation", "stale-presentation", "A"))
+      .ok,
+    false
+  );
+  assert.equal(
+    (await session.answerGate(entry.ownerId, "g-presentation", entry.presentationId, "A")).ok,
+    true
+  );
+  await ticket.result;
+  await session.dispose();
+});
+
+test("multi-select ownership is carried to the presentation event", async () => {
+  const agent = new GatingAgentSession(
+    sdkAskGate({
+      gate_id: "g-multi",
+      context: { prompt: "Pick several" },
+      options: [{ label: "A" }, { label: "B" }],
+      multi: true,
+    })
+  );
+  const session = new SdkSession(agent);
+  const events = [];
+  const ticket = session.sendOwned(
+    "socket-1:request-multi",
+    { type: "prompt", message: "hi" },
+    (event) => events.push(event)
+  );
+  await waitForImmediate(() => session.pendingGates.has("g-multi"));
+  const request = events.find((event) => event.type === "gate_request");
+  assert.equal(request.multi, true);
+  assert.equal(
+    session.presentGate(
+      "socket-1:request-multi",
+      request.gateId,
+      request.presentationId,
+      "attempt-multi"
+    ),
+    true
+  );
+  assert.equal(
+    (
+      await session.answerGate(
+        "socket-1:request-multi",
+        request.gateId,
+        request.presentationId,
+        JSON.stringify({ selected: ["A", "B"] })
+      )
+    ).ok,
+    true
+  );
+  await ticket.result;
+  await session.dispose();
+});
+
+test("abandonment and owner quarantine synchronously remove only matching gates", async () => {
+  const firstAgent = new GatingAgentSession({
+    gate_id: "g-abandon-before",
+    kind: "question",
+    context: { prompt: "Pick one" },
+    options: [{ value: "a", label: "A" }],
+  });
+  const first = new SdkSession(firstAgent);
+  const firstTicket = first.sendOwned(
+    "socket-a:request-1",
+    { type: "prompt", message: "hi" },
+    () => {}
+  );
+  await waitForImmediate(() => first.pendingGates.has("g-abandon-before"));
+  const before = first.pendingGates.get("g-abandon-before");
+  assert.equal(
+    first.abandonGate(before.ownerId, "g-abandon-before", before.presentationId),
+    true
+  );
+  assert.equal(first.pendingGates.size, 0);
+  assert.deepEqual(firstAgent.gateEmitter.quarantineCalls, ["g-abandon-before"]);
+  assert.equal(
+    first.abandonGate(before.ownerId, "g-abandon-before", before.presentationId),
+    false
+  );
+  await assert.rejects(firstTicket.result);
+  await first.dispose();
+
+  const secondAgent = new GatingAgentSession({
+    gate_id: "g-abandon-after",
+    kind: "question",
+    context: { prompt: "Pick one" },
+    options: [{ value: "a", label: "A" }],
+  });
+  const second = new SdkSession(secondAgent);
+  const secondTicket = second.sendOwned(
+    "socket-b:request-1",
+    { type: "prompt", message: "hi" },
+    () => {}
+  );
+  await waitForImmediate(() => second.pendingGates.has("g-abandon-after"));
+  const after = second.pendingGates.get("g-abandon-after");
+  assert.equal(
+    second.presentGate(after.ownerId, "g-abandon-after", after.presentationId, "attempt-1"),
+    true
+  );
+  assert.equal(second.quarantineOwnedGates("socket-other:request-1"), false);
+  assert.equal(second.pendingGates.size, 1);
+  assert.equal(second.quarantineOwnedGates(after.ownerId), true);
+  assert.equal(second.pendingGates.size, 0);
+  assert.deepEqual(secondAgent.gateEmitter.quarantineCalls, ["g-abandon-after"]);
+  await assert.rejects(secondTicket.result);
+  await second.dispose();
 });
 
 test("gate answer maps a 1-based index to the Ask selected-object schema", async () => {
@@ -1733,7 +1926,7 @@ test("gate answer maps a 1-based index to the Ask selected-object schema", async
   const gateReq = events.find((e) => e && e.type === "gate_request");
   assert.equal(gateReq.prompt, "Choose"); // falls back to context.title
 
-  await session.answerGate("g2", "2");
+  await answerGate(session, "g2", "2");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
     gateResponse("g2", { selected: ["Second"] }),
@@ -1755,7 +1948,7 @@ test("free text is encoded as the Ask other/custom object", async () => {
   const gateReq = events.find((e) => e && e.type === "gate_request");
   assert.equal(gateReq.choices, undefined);
 
-  await session.answerGate("g3", "a long free-form answer");
+  await answerGate(session, "g3", "a long free-form answer");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
     gateResponse("g3", {
@@ -1802,7 +1995,7 @@ test("structured Ask answers preserve clarification and explicit custom semantic
     const done = session.send({ type: "prompt", message: "hi" }, () => {});
     await waitForImmediate(() => session.pendingGates.has(gateId));
 
-    const result = await session.answerGate(gateId, answer);
+    const result = await answerGate(session, gateId, answer);
     assert.equal(result.ok, true);
     await done;
     assert.deepEqual(agent.gateEmitter.resolveCalls, [
@@ -1829,7 +2022,7 @@ test("approval answers preserve denial and require comments for changes", async 
     rejectSession.pendingGates.has("g-approval-reject")
   );
   assert.equal(
-    (await rejectSession.answerGate("g-approval-reject", "reject")).ok,
+    (await answerGate(rejectSession, "g-approval-reject", "reject")).ok,
     true
   );
   await rejectDone;
@@ -1854,7 +2047,7 @@ test("approval answers preserve denial and require comments for changes", async 
     changesSession.pendingGates.has("g-approval-changes")
   );
 
-  const unsupported = await changesSession.answerGate(
+  const unsupported = await answerGate(changesSession,
     "g-approval-changes",
     "request-changes"
   );
@@ -1864,7 +2057,7 @@ test("approval answers preserve denial and require comments for changes", async 
   });
   assert.deepEqual(changesAgent.gateEmitter.resolveCalls, []);
 
-  const accepted = await changesSession.answerGate(
+  const accepted = await answerGate(changesSession,
     "g-approval-changes",
     '{"decision":"request-changes","comments":"Cover the failure branch."}'
   );
@@ -1893,7 +2086,7 @@ test("execution decline is encoded as an explicit decision object", async () => 
     session.pendingGates.has("g-execution-decline")
   );
 
-  const result = await session.answerGate("g-execution-decline", "2");
+  const result = await answerGate(session, "g-execution-decline", "2");
   assert.equal(result.ok, true);
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
@@ -1915,7 +2108,7 @@ test("unsupported structured answer shapes are rejected before SDK resolution", 
     session.pendingGates.has("g-unsupported-answer")
   );
 
-  const rejected = await session.answerGate(
+  const rejected = await answerGate(session,
     "g-unsupported-answer",
     '{"decision":"approve","extra":true}'
   );
@@ -1926,7 +2119,7 @@ test("unsupported structured answer shapes are rejected before SDK resolution", 
   assert.deepEqual(agent.gateEmitter.resolveCalls, []);
 
   assert.equal(
-    (await session.answerGate("g-unsupported-answer", "approve")).ok,
+    (await answerGate(session, "g-unsupported-answer", "approve")).ok,
     true
   );
   await done;
@@ -1947,7 +2140,7 @@ test("a rejected SDK gate answer remains pending for a valid retry", async () =>
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await waitForImmediate(() => session.pendingGates.has("g-retry"));
 
-  const rejected = await session.answerGate(
+  const rejected = await answerGate(session,
     "g-retry",
     '{"selected":[],"other":true,"custom":"invalid"}'
   );
@@ -1956,7 +2149,7 @@ test("a rejected SDK gate answer remains pending for a valid retry", async () =>
   assert.equal(session.pendingGates.has("g-retry"), true);
   assert.deepEqual(agent.gateEmitter.clearPreparedCalls, ["g-retry"]);
 
-  const accepted = await session.answerGate("g-retry", "ok");
+  const accepted = await answerGate(session, "g-retry", "ok");
   assert.equal(accepted.ok, true);
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
@@ -1992,7 +2185,7 @@ test("a lost resolveGate response reconciles a durably completed answer", async 
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await waitForImmediate(() => session.pendingGates.has("g-reconcile"));
 
-  const answered = await session.answerGate("g-reconcile", "yes");
+  const answered = await answerGate(session, "g-reconcile", "yes");
   assert.equal(answered.ok, true);
   assert.equal(answered.resolution.status, "accepted");
   assert.equal(session.pendingGates.size, 0);
@@ -2036,7 +2229,7 @@ test("a proven successor gate is admitted while predecessor receipt is pending",
   await waitForImmediate(() => session.pendingGates.has("g-successor-1"));
 
   timers.advance(90);
-  const firstAnswer = session.answerGate("g-successor-1", "Continue");
+  const firstAnswer = answerGate(session, "g-successor-1", "Continue");
   await waitForImmediate(() => session.pendingGates.has("g-successor-2"));
   timers.advance(20);
   assert.equal(session.closed, false, "the successor receives its own gate window");
@@ -2053,7 +2246,7 @@ test("a proven successor gate is admitted while predecessor receipt is pending",
   releaseFirstReceipt();
   assert.equal((await firstAnswer).ok, true);
   assert.equal(
-    (await session.answerGate("g-successor-2", "Finish")).ok,
+    (await answerGate(session, "g-successor-2", "Finish")).ok,
     true
   );
   await done;
@@ -2095,7 +2288,7 @@ test("an accepted-incomplete predecessor retains ownership until completed proof
   );
   await waitForImmediate(() => session.pendingGates.has("g-incomplete-1"));
 
-  const firstAnswer = session.answerGate("g-incomplete-1", "Continue");
+  const firstAnswer = answerGate(session, "g-incomplete-1", "Continue");
   await waitForImmediate(
     () => session.deferredGateCandidate?.gate?.gate_id === "g-incomplete-2"
   );
@@ -2128,7 +2321,7 @@ test("an accepted-incomplete predecessor retains ownership until completed proof
   );
 
   assert.equal(
-    (await session.answerGate("g-incomplete-2", "Finish")).ok,
+    (await answerGate(session, "g-incomplete-2", "Finish")).ok,
     true
   );
   await done;
@@ -2164,7 +2357,7 @@ test("a deferred accepted-incomplete candidate is bounded by the gate window", a
   );
   const doneResult = Promise.allSettled([done]);
   await waitForImmediate(() => session.pendingGates.has("g-bounded-1"));
-  const answer = session.answerGate("g-bounded-1", "Continue");
+  const answer = answerGate(session, "g-bounded-1", "Continue");
   await waitForImmediate(
     () => session.deferredGateCandidate?.gate?.gate_id === "g-bounded-2"
   );
@@ -2201,7 +2394,7 @@ test("dispose settles an adapter-owned gate receipt waiter", async () => {
     session.pendingGates.has("g-dispose-receipt")
   );
 
-  const answer = session.answerGate("g-dispose-receipt", "Continue");
+  const answer = answerGate(session, "g-dispose-receipt", "Continue");
   const answerResult = answer.then(
     (result) => result,
     (error) => ({ ok: false, error: error.message })
@@ -2249,7 +2442,7 @@ test("onGateEmitted replay is attributed to the run before subscription", async 
   );
   assert.deepEqual(emitter.quarantineCalls, []);
 
-  const answered = await session.answerGate("g-replay", "continue");
+  const answered = await answerGate(session, "g-replay", "continue");
   assert.equal(answered.ok, true);
   await done;
   await session.dispose();
@@ -2307,7 +2500,12 @@ test("a failed run removes its pending workflow gate", async () => {
 test("answerGate on an unknown/stale gate id is a safe no-op", async () => {
   const agent = new FakeAgentSession();
   const session = new SdkSession(agent, { idleTimeoutMs: 5_000, hardCapMs: 10_000 });
-  const result = await session.answerGate("nope", "x");
+  const result = await session.answerGate(
+    "socket-1:request-1",
+    "nope",
+    "stale-presentation",
+    "x"
+  );
   assert.equal(result.ok, false);
   await session.dispose();
 });
@@ -2336,7 +2534,7 @@ test("a concurrent second gate is rejected without overwriting the first resolve
   // The newcomer was fenced through the SDK's explicit quarantine operation.
   assert.deepEqual(emitter.quarantineCalls, ["g5b"]);
 
-  await session.answerGate("g5", "A");
+  await answerGate(session, "g5", "A");
   await done;
   assert.deepEqual(emitter.resolveCalls, [
     gateResponse("g5", { selected: ["A"] }),
@@ -2392,7 +2590,7 @@ test("adversarial: the absolute hard-cap still fires while a gate is suspended, 
   const events = [];
   const done = session.send({ type: "prompt", message: "hi" }, (e) => events.push(e));
   await gateDelay(0);
-  const answerResult = await session.answerGate("g-hardcap", "anything");
+  const answerResult = await answerGate(session, "g-hardcap", "anything");
   assert.equal(answerResult.ok, true);
 
   await assert.rejects(done, /exceeded absolute hard-cap/);
@@ -2411,9 +2609,16 @@ test("adversarial: answering the same gate twice is a safe no-op the second time
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await gateDelay(0);
 
-  const first = await session.answerGate("g-double", "A");
+  const pending = session.pendingGates.get("g-double");
+  assert.ok(pending);
+  const first = await answerGate(session, "g-double", "A");
   assert.equal(first.ok, true);
-  const second = await session.answerGate("g-double", "A");
+  const second = await session.answerGate(
+    pending.ownerId,
+    "g-double",
+    pending.presentationId,
+    "A"
+  );
   assert.deepEqual(second, { ok: false, error: "no pending gate for id" });
 
   await done;
@@ -2448,7 +2653,12 @@ test("adversarial: an answer submitted after the gate-answer window already expi
 
   // The run already errored out on the gate-answer window; a late answer for
   // that same gate must be rejected, not honored.
-  const lateAnswer = await session.answerGate("g-late", "too late");
+  const lateAnswer = await session.answerGate(
+    "socket-1:request-1",
+    "g-late",
+    "stale-presentation",
+    "too late"
+  );
   assert.deepEqual(lateAnswer, { ok: false, error: "session is closed" });
 
   await session.dispose();
@@ -2480,7 +2690,7 @@ test("adversarial: a gate answered normally, followed by silence, still idle-tim
 
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await gateDelay(0);
-  const answerResult = await session.answerGate("g-silent", "ok");
+  const answerResult = await answerGate(session, "g-silent", "ok");
   assert.equal(answerResult.ok, true);
 
   await assert.rejects(done, /SDK command timed out/);
@@ -2505,7 +2715,7 @@ test("adversarial: a concurrent gate rejection leaves pendingGates empty once th
   }
   assert.equal(session.pendingGates.size, 1);
 
-  await session.answerGate("g6", "A");
+  await answerGate(session, "g6", "A");
   await done;
   assert.equal(session.pendingGates.size, 0);
   await session.dispose();
@@ -2527,7 +2737,7 @@ test("adversarial: a numeric-looking Ask label wins over positional index parsin
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await gateDelay(0);
 
-  await session.answerGate("g-numlabel", "2");
+  await answerGate(session, "g-numlabel", "2");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
     gateResponse("g-numlabel", { selected: ["2"] }),
@@ -2549,7 +2759,7 @@ test("adversarial: duplicate Ask labels still encode one schema-valid selection"
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await gateDelay(0);
 
-  await session.answerGate("g-dup", "yes");
+  await answerGate(session, "g-dup", "yes");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
     gateResponse("g-dup", { selected: ["Yes"] }),
@@ -2568,7 +2778,7 @@ test("adversarial: whitespace/case variance still matches an Ask label", async (
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await gateDelay(0);
 
-  await session.answerGate("g-ws", "  APPLE  ");
+  await answerGate(session, "g-ws", "  APPLE  ");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
     gateResponse("g-ws", { selected: ["Apple"] }),
@@ -2591,7 +2801,7 @@ test("adversarial: an out-of-range index is an explicit Ask custom answer", asyn
     const done = session.send({ type: "prompt", message: "hi" }, () => {});
     await gateDelay(0);
 
-    await session.answerGate("g-range", bad);
+    await answerGate(session, "g-range", bad);
     await done;
     assert.deepEqual(agent.gateEmitter.resolveCalls, [
       gateResponse("g-range", {
@@ -2618,13 +2828,13 @@ test("adversarial: a required Ask rejects an empty answer before resolution", as
   const done = session.send({ type: "prompt", message: "hi" }, () => {});
   await gateDelay(0);
 
-  const rejected = await session.answerGate("g-empty", "");
+  const rejected = await answerGate(session, "g-empty", "");
   assert.deepEqual(rejected, {
     ok: false,
     error: "gate answer must not be empty",
   });
   assert.deepEqual(agent.gateEmitter.resolveCalls, []);
-  await session.answerGate("g-empty", "A");
+  await answerGate(session, "g-empty", "A");
   await done;
   assert.deepEqual(agent.gateEmitter.resolveCalls, [
     gateResponse("g-empty", { selected: ["A"] }),
@@ -2652,7 +2862,7 @@ test("#35 concurrency: the workflow-gate listener is registered once per session
   assert.equal(session.pendingGates.size, 1);
   assert.deepEqual(agent.gateEmitter.resolveCalls, []);
 
-  const answered = await session.answerGate("g-one", "ok");
+  const answered = await answerGate(session, "g-one", "ok");
   assert.equal(answered.ok, true);
   await run;
 
@@ -2700,7 +2910,7 @@ test("#35 concurrency: answerGate resumes the OWNING run's idle controller", asy
     return realResume.apply(entry.controller, args);
   };
 
-  const answered = await session.answerGate("g-owner", "ok");
+  const answered = await answerGate(session, "g-owner", "ok");
   assert.equal(answered.ok, true);
   assert.equal(resumeCalls.length, 1, "the owning run's controller was resumed exactly once");
   releaseTerminal();
@@ -2708,7 +2918,7 @@ test("#35 concurrency: answerGate resumes the OWNING run's idle controller", asy
   await session.dispose();
 });
 
-test("#35 an oversized supported gate is clamped for the protocol", async () => {
+test("oversized gate content is quarantined without silent truncation", async () => {
   const hugePrompt = "P".repeat(V0_LIMITS.GATE_PROMPT + 500);
   const hugeLabel = "L".repeat(V0_LIMITS.CHOICE_LABEL + 200);
   const agent = new GatingAgentSession({
@@ -2724,17 +2934,12 @@ test("#35 an oversized supported gate is clamped for the protocol", async () => 
   });
   const events = [];
   const done = session.send({ type: "prompt", message: "hi" }, (evt) => events.push(evt));
+  const rejected = assert.rejects(done, /prompt_failed/);
   await gateDelay(0);
 
-  const gateEvent = events.find((evt) => evt.type === "gate_request");
-  assert.ok(gateEvent, "a gate_request event was emitted");
-  assert.equal(gateEvent.kind, "question");
-  assert.equal(gateEvent.prompt.length, V0_LIMITS.GATE_PROMPT, "prompt clamped to the limit");
-  assert.equal(gateEvent.choices[0].label.length, V0_LIMITS.CHOICE_LABEL, "label clamped to the limit");
-  assert.equal(isGateRequestEvent(gateEvent), true, "the clamped event passes the bot's validator");
-
-  await session.answerGate("g-clamp", "1");
-  await done;
+  assert.equal(events.some((evt) => evt.type === "gate_request"), false);
+  assert.deepEqual(agent.gateEmitter.quarantineCalls, ["g-clamp"]);
+  await rejected;
   await session.dispose();
 });
 

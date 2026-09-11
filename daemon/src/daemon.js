@@ -4,6 +4,7 @@ import WebSocket from "ws";
 import {
   CAPABILITIES,
   GATE_ANSWER_ERROR_CODES,
+  GATE_PRESENTATION_CAPABILITY,
   INVOKE_CANCELLATION_CAPABILITY,
   INVOKE_OWNERSHIP_RETENTION_MS,
   TERMINAL_DISPOSITION_CAPABILITY,
@@ -27,6 +28,7 @@ import {
   isWorkspaceId,
   isReadinessWorkspaceGeneration,
   isAnswerMessage,
+  isAbandonGateMessage,
   isBindWorkspaceMessage,
   isInventoryReceiptBindWorkspaceMessage,
   isInventoryReceiptBindOkMessage,
@@ -36,6 +38,7 @@ import {
   isUnbindWorkspaceMessage,
   isInvokeMessage,
   isPingMessage,
+  isPresentGateMessage,
   isReadinessCapabilityGate,
   isReadinessMessage,
   isReadinessTtl,
@@ -505,6 +508,21 @@ const requestIds = new RequestIdFence();
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
 const inFlightByRequestId = new Map();
+
+function releaseSettledGateOwner(requestId, request) {
+  if (
+    request?.invokeSettled === true &&
+    request.gateOperations === 0 &&
+    inFlightByRequestId.get(requestId) === request
+  ) {
+    inFlightByRequestId.delete(requestId);
+  }
+}
+// Gate presentation receipts are socket-generation scoped.  Attempt ids are
+// never transferable across reconnects, and unexpired receipts are retained
+// verbatim so retries cannot cause duplicate SDK transitions.
+const gateReceiptByConnection = new WeakMap();
+const GATE_RECEIPT_MAX_RECORDS = 1024;
 // Cancellation ownership is deliberately connection-local.  A request id is
 // not an authority token across a reconnect, even when a peer reuses it.
 const cancellationByConnection = new WeakMap();
@@ -519,6 +537,98 @@ function cancellationStateFor(connection, socketGeneration) {
     cancellationByConnection.set(connection, state);
   }
   return state;
+}
+
+function gateReceiptStateFor(connection, socketGeneration) {
+  let state = gateReceiptByConnection.get(connection);
+  if (!state) {
+    state = {
+      socketGeneration,
+      receipts: new Map(),
+      answerReceipts: new Map(),
+    };
+    gateReceiptByConnection.set(connection, state);
+  }
+  return state;
+}
+
+function sweepGateReceiptState(state, now = Date.now()) {
+  for (const [attemptId, receipt] of state.receipts) {
+    if (receipt.expiresAt <= now) state.receipts.delete(attemptId);
+  }
+  for (const [answerId, receipt] of state.answerReceipts) {
+    if (receipt.expiresAt <= now) state.answerReceipts.delete(answerId);
+  }
+}
+
+function sendGateWorkflowReceipt(connection, state, msg, operation, accepted) {
+  const attemptId =
+    operation === "present" ? msg.presentationAttemptId : msg.abandonId;
+  const event = {
+    type:
+      operation === "present"
+        ? MSG_TYPES.GATE_PRESENTATION_RESULT
+        : MSG_TYPES.GATE_ABANDON_RESULT,
+    [operation === "present" ? "presentationAttemptId" : "abandonId"]: attemptId,
+    gateId: msg.gateId,
+    presentationId: msg.presentationId,
+    accepted,
+  };
+  const frame = JSON.stringify({
+    type: MSG_TYPES.EVENT,
+    requestId: msg.requestId,
+    event,
+  });
+  state.receipts.set(attemptId, {
+    operation,
+    requestId: msg.requestId,
+    gateId: msg.gateId,
+    presentationId: msg.presentationId,
+    reason: operation === "abandon" ? msg.reason : undefined,
+    frame,
+    expiresAt: Date.now() + INVOKE_OWNERSHIP_RETENTION_MS,
+  });
+  if (connection.readyState === WebSocket.OPEN) {
+    try {
+      connection.send(frame, () => {});
+    } catch {}
+  }
+}
+
+function gateReceiptMatches(receipt, msg, operation) {
+  return (
+    receipt.operation === operation &&
+    receipt.requestId === msg.requestId &&
+    receipt.gateId === msg.gateId &&
+    receipt.presentationId === msg.presentationId &&
+    (operation !== "abandon" || receipt.reason === msg.reason)
+  );
+}
+
+function quarantineGatesOnClose(connection, readinessState) {
+  const owners = new Map();
+  for (const request of inFlightByRequestId.values()) {
+    if (
+      request.connection !== connection ||
+      request.socketGeneration !== readinessState?.socketGeneration
+    ) {
+      continue;
+    }
+    owners.set(request.ownerId, request.session);
+  }
+  for (const [ownerId, session] of owners) {
+    let quarantined = false;
+    try {
+      quarantined = session.quarantineOwnedGates(ownerId) === true;
+    } catch {
+      // Close containment is fail-closed; SDK errors never delay reconnect.
+    }
+    daemonObservability.emitOwnerEvent({
+      name: "daemon",
+      action: "gate_quarantine",
+      outcome: quarantined ? "succeeded" : "refused",
+    });
+  }
 }
 
 function sweepCancellationState(state, now = Date.now()) {
@@ -1961,6 +2071,7 @@ function connectToBot() {
   connection.on("close", () => {
     // Revoke queued work before retiring active siblings.  This is synchronous
     // so no queued SDK dispatch can slip through while reconnect is scheduled.
+    quarantineGatesOnClose(connection, readinessState);
     containCancellationOnClose(connection, readinessState);
     daemonObservability.finishInvokeTransactionsForConnection(
       connection,
@@ -2033,14 +2144,16 @@ async function sendGateAnswerResult(
   requestId,
   answerId,
   gateId,
+  presentationId,
   accepted,
   errorCode,
 ) {
-  if (connection.readyState !== WebSocket.OPEN) return;
+  if (connection.readyState !== WebSocket.OPEN) return undefined;
   const event = {
     type: MSG_TYPES.GATE_ANSWER_RESULT,
     answerId,
     gateId,
+    presentationId,
     accepted,
   };
   if (!accepted) event.errorCode = errorCode;
@@ -2056,6 +2169,7 @@ async function sendGateAnswerResult(
       resolve();
     }
   });
+  return payload;
 }
 
 async function handleMessage(
@@ -2188,9 +2302,14 @@ async function handleMessage(
         closePolicyViolation(connection, "conflicting cancellation receipt");
         return;
       }
+      if (priorReceipt.frame === undefined) {
+        await priorReceipt.ready;
+      }
       if (connection.readyState === WebSocket.OPEN) {
         try {
-          connection.send(priorReceipt.frame, () => {});
+          if (priorReceipt.frame !== undefined) {
+            connection.send(priorReceipt.frame, () => {});
+          }
         } catch {}
       }
       return;
@@ -2234,6 +2353,65 @@ async function handleMessage(
     return;
   }
   if (isAnswerMessage(msg)) {
+    if (
+      !readinessState.negotiatedCapabilities?.has(
+        GATE_PRESENTATION_CAPABILITY
+      )
+    ) {
+      closePolicyViolation(connection, "gate presentation capability required");
+      return;
+    }
+    const gateState = gateReceiptStateFor(
+      connection,
+      readinessState.socketGeneration,
+    );
+    sweepGateReceiptState(gateState);
+    const answerFingerprint = createHash("sha256")
+      .update(msg.answer)
+      .digest("hex");
+    const priorReceipt = gateState.answerReceipts.get(msg.answerId);
+    if (priorReceipt) {
+      if (
+        priorReceipt.requestId !== msg.requestId ||
+        priorReceipt.gateId !== msg.gateId ||
+        priorReceipt.presentationId !== msg.presentationId ||
+        priorReceipt.answerFingerprint !== answerFingerprint
+      ) {
+        closePolicyViolation(connection, "conflicting gate answer receipt");
+        return;
+      }
+      if (priorReceipt.frame === undefined) {
+        await priorReceipt.ready;
+      }
+      if (connection.readyState === WebSocket.OPEN) {
+        try {
+          if (priorReceipt.frame !== undefined) {
+            connection.send(priorReceipt.frame, () => {});
+          }
+        } catch {}
+      }
+      return;
+    }
+    if (
+      gateState.receipts.size + gateState.answerReceipts.size >=
+      GATE_RECEIPT_MAX_RECORDS
+    ) {
+      closePolicyViolation(connection, "gate answer receipt capacity exhausted");
+      return;
+    }
+    let resolveReceipt;
+    const receiptEntry = {
+      requestId: msg.requestId,
+      gateId: msg.gateId,
+      presentationId: msg.presentationId,
+      answerFingerprint,
+      frame: undefined,
+      ready: new Promise((resolve) => {
+        resolveReceipt = resolve;
+      }),
+      expiresAt: Date.now() + INVOKE_OWNERSHIP_RETENTION_MS,
+    };
+    gateState.answerReceipts.set(msg.answerId, receiptEntry);
     // Route and receipt an exact gate-answer attempt. Rejections deliberately
     // collapse to fixed wire codes: SDK errors and answer content never cross
     // this boundary.
@@ -2242,24 +2420,108 @@ async function handleMessage(
     let errorCode = GATE_ANSWER_ERROR_CODES.REJECTED;
     if (
       request?.connection === connection &&
-      request.socketGeneration === readinessState?.socketGeneration
+      request.socketGeneration === readinessState?.socketGeneration &&
+      request.ownerId === `${readinessState.socketGeneration}:${msg.requestId}`
     ) {
+      request.gateOperations += 1;
       try {
-        const result = await request.session.answerGate(msg.gateId, msg.answer);
+        const result = await request.session.answerGate(
+          request.ownerId,
+          msg.gateId,
+          msg.presentationId,
+          msg.answer,
+        );
         accepted = result?.ok === true;
       } catch {
         errorCode = GATE_ANSWER_ERROR_CODES.FAILED;
         console.error("daemon: failed to answer gate");
+      } finally {
+        request.gateOperations -= 1;
+        releaseSettledGateOwner(msg.requestId, request);
       }
     }
-    await sendGateAnswerResult(
+    const frame = await sendGateAnswerResult(
       connection,
       msg.requestId,
       msg.answerId,
       msg.gateId,
+      msg.presentationId,
       accepted,
       errorCode,
     );
+    if (frame !== undefined) {
+      receiptEntry.frame = frame;
+    }
+    resolveReceipt();
+    return;
+  }
+  if (msg?.type === MSG_TYPES.PRESENT_GATE || msg?.type === MSG_TYPES.ABANDON_GATE) {
+    const operation = msg.type === MSG_TYPES.PRESENT_GATE ? "present" : "abandon";
+    const valid = operation === "present"
+      ? isPresentGateMessage(msg)
+      : isAbandonGateMessage(msg);
+    if (!valid) {
+      closePolicyViolation(connection, "invalid gate workflow message");
+      return;
+    }
+    if (
+      !readinessState.negotiatedCapabilities?.has(GATE_PRESENTATION_CAPABILITY)
+    ) {
+      closePolicyViolation(connection, "gate presentation capability required");
+      return;
+    }
+    const gateState = gateReceiptStateFor(
+      connection,
+      readinessState.socketGeneration,
+    );
+    sweepGateReceiptState(gateState);
+    const attemptId =
+      operation === "present" ? msg.presentationAttemptId : msg.abandonId;
+    const priorReceipt = gateState.receipts.get(attemptId);
+    if (priorReceipt) {
+      if (!gateReceiptMatches(priorReceipt, msg, operation)) {
+        closePolicyViolation(connection, "conflicting gate workflow receipt");
+        return;
+      }
+      if (connection.readyState === WebSocket.OPEN) {
+        try {
+          connection.send(priorReceipt.frame, () => {});
+        } catch {}
+      }
+      return;
+    }
+    if (
+      gateState.receipts.size + gateState.answerReceipts.size >=
+      GATE_RECEIPT_MAX_RECORDS
+    ) {
+      closePolicyViolation(connection, "gate workflow receipt capacity exhausted");
+      return;
+    }
+    const request = inFlightByRequestId.get(msg.requestId);
+    let accepted = false;
+    if (
+      request?.connection === connection &&
+      request.socketGeneration === readinessState.socketGeneration &&
+      request.ownerId === `${readinessState.socketGeneration}:${msg.requestId}`
+    ) {
+      try {
+        accepted = operation === "present"
+          ? request.session.presentGate(
+              request.ownerId, msg.gateId, msg.presentationId, msg.presentationAttemptId,
+            ) === true
+          : request.session.abandonGate(
+              request.ownerId, msg.gateId, msg.presentationId,
+            ) === true;
+      } catch {
+        accepted = false;
+      }
+    }
+    sendGateWorkflowReceipt(connection, gateState, msg, operation, accepted);
+    daemonObservability.emitOwnerEvent({
+      name: "daemon",
+      action: operation === "present" ? "present_gate" : "abandon_gate",
+      outcome: accepted ? "succeeded" : "refused",
+    });
     return;
   }
   if (msg?.type === MSG_TYPES.BIND_WORKSPACE) {
@@ -2753,6 +3015,28 @@ async function handleMessage(
   }
 
   const { requestId, workDir, command } = msg;
+  const requiresGatePresentation = [
+    "prompt",
+    "steer",
+    "follow_up",
+  ].includes(command.kind);
+  if (
+    requiresGatePresentation &&
+    !readinessState?.negotiatedCapabilities?.has(GATE_PRESENTATION_CAPABILITY)
+  ) {
+    const frame = serializeEventFrame(requestId, undefined, {
+      error: formatReadinessRejection(
+        makeReadinessError(PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE)
+      ),
+      done: true,
+    });
+    if (connection.readyState === WebSocket.OPEN) {
+      try {
+        connection.send(frame, () => {});
+      } catch {}
+    }
+    return;
+  }
   if (
     !readinessState?.negotiatedCapabilities?.has(
       INVOKE_CANCELLATION_CAPABILITY
@@ -2970,6 +3254,9 @@ async function handleMessage(
       session,
       bindingId: msg.bindingId,
       socketGeneration: readinessState.socketGeneration,
+      ownerId: `${readinessState.socketGeneration}:${requestId}`,
+      gateOperations: 0,
+      invokeSettled: false,
     });
 
     let commandResult;
@@ -3100,7 +3387,8 @@ async function handleMessage(
     releaseAdmission();
     const request = inFlightByRequestId.get(requestId);
     if (request?.connection === connection && request.session === session) {
-      inFlightByRequestId.delete(requestId);
+      request.invokeSettled = true;
+      releaseSettledGateOwner(requestId, request);
     }
     retainCancellationTerminal(cancellationState, cancellationRecord);
   }

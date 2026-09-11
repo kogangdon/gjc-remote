@@ -186,6 +186,44 @@ test("owner events are flat, frozen, schema-versioned, and isolate subscribers",
   }));
 });
 
+test("gate workflow observability accepts only bounded outcome facts", () => {
+  const observability = new DaemonObservability();
+  const events = [];
+  observability.subscribe((event) => events.push(event));
+  for (const [action, outcome] of [
+    ["present_gate", "succeeded"],
+    ["abandon_gate", "refused"],
+    ["gate_quarantine", "succeeded"],
+  ]) {
+    observability.emitOwnerEvent({ name: "daemon", action, outcome });
+  }
+  assert.deepEqual(
+    events.map(({ name, action, outcome, code, transactionId }) => ({
+      name, action, outcome, code, transactionId,
+    })),
+    [
+      {
+        name: "daemon", action: "present_gate", outcome: "succeeded",
+        code: null, transactionId: null,
+      },
+      {
+        name: "daemon", action: "abandon_gate", outcome: "refused",
+        code: null, transactionId: null,
+      },
+      {
+        name: "daemon", action: "gate_quarantine", outcome: "succeeded",
+        code: null, transactionId: null,
+      },
+    ],
+  );
+  assert.throws(() => observability.emitOwnerEvent({
+    name: "daemon",
+    action: "present_gate",
+    outcome: "succeeded",
+    prompt: "secret prompt",
+  }));
+});
+
 test("invoke transactions freeze admitted trusted correlation and omit request data", () => {
   let now = 100;
   const observability = new DaemonObservability({ now: () => now });

@@ -2,6 +2,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   CAPABILITIES,
+  GATE_PRESENTATION_CAPABILITY,
   GATE_ANSWER_ERROR_CODES,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
@@ -21,8 +22,12 @@ import {
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   isAnswerMessage,
+  isPresentGateMessage,
+  isAbandonGateMessage,
   isEventMessage,
   isGateAnswerResultEvent,
+  isGatePresentationResultMessage,
+  isGateAbandonResultMessage,
   isGateRequestEvent,
   isInvokeMessage,
   isInvokeTerminalEvent,
@@ -60,6 +65,8 @@ const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
 const CANCEL_RECEIPT_TIMEOUT_MS = 10_000;
 const MAX_CANCEL_TOMBSTONES = 64;
 const GATE_ANSWER_TIMEOUT_MS = 30 * 1000;
+const GATE_PRESENTATION_TIMEOUT_MS = 30 * 1000;
+const MAX_GATE_PRESENTATION_ATTEMPTS = 64;
 const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
 const BINDING_DEADLINE_MS = 10_000;
@@ -91,7 +98,6 @@ const OBSERVABILITY_CODES = Object.freeze(new Set([
 ]));
 const MAX_UINT53 = Number.MAX_SAFE_INTEGER;
 const PING_PAYLOAD = JSON.stringify(PING);
-// Cancellation is a bot-owned admission requirement, deliberately not a
 const BOT_CAPABILITIES = CAPABILITIES;
 const V2_CAPABILITIES = Object.freeze([...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
 const V3_CAPABILITIES = Object.freeze([
@@ -227,6 +233,7 @@ export class HostRegistry {
    *   cancelIdFactory?: () => string,
    *   requestIdFactory?: () => string,
    *   gateAnswerTimeoutMs?: number,
+   *   gatePresentationTimeoutMs?: number,
    *   workspaceServingEnabled?: boolean,
    *   timers?: typeof SYSTEM_TIMERS,
    *   now?: () => number,
@@ -246,6 +253,7 @@ export class HostRegistry {
     cancelIdFactory = randomUUID,
     requestIdFactory = randomUUID,
     gateAnswerTimeoutMs = GATE_ANSWER_TIMEOUT_MS,
+    gatePresentationTimeoutMs = GATE_PRESENTATION_TIMEOUT_MS,
     workspaceServingEnabled = false,
     timers = SYSTEM_TIMERS,
     now = () => Date.now(),
@@ -292,6 +300,13 @@ export class HostRegistry {
     ) {
       throw new Error("gateAnswerTimeoutMs must be an integer from 1 to 30000");
     }
+    if (
+      !Number.isInteger(gatePresentationTimeoutMs) ||
+      gatePresentationTimeoutMs < 1 ||
+      gatePresentationTimeoutMs > GATE_PRESENTATION_TIMEOUT_MS
+    ) {
+      throw new Error("gatePresentationTimeoutMs must be an integer from 1 to 30000");
+    }
     this.tokensByHostId = tokensByHostId;
     this.heartbeatTimeoutMs = heartbeatTimeoutMs;
     this.invokeIdleTimeoutMs = invokeIdleTimeoutMs;
@@ -302,6 +317,7 @@ export class HostRegistry {
     this.cancelIdFactory = cancelIdFactory;
     this.requestIdFactory = requestIdFactory;
     this.gateAnswerTimeoutMs = gateAnswerTimeoutMs;
+    this.gatePresentationTimeoutMs = gatePresentationTimeoutMs;
     this.bindingDeadlineMs = BINDING_DEADLINE_MS;
     this.timers = timers;
     this.now = now;
@@ -319,6 +335,14 @@ export class HostRegistry {
     this.cancelTombstones = new Map();
     /** @type {Map<string, { answerId: string, requestId: string, gateId: string, socket: import("ws").WebSocket, pending: object, timer?: object, resolve: (v: any) => void }>} */
     this.pendingGateAnswers = new Map();
+    /** @type {Map<string, { presentationAttemptId: string, requestId: string, gateId: string, presentationId: string, socket: import("ws").WebSocket, pending: object, timer?: object }>} */
+    this.pendingGatePresentations = new Map();
+    /** @type {Map<string, { abandonId: string, requestId: string, gateId: string, presentationId: string, socket: import("ws").WebSocket, timer?: object }>} */
+    this.pendingGateAbandons = new Map();
+    /** @type {Map<string, { accepted: boolean, socket: import("ws").WebSocket, connectionIdentity: number, requestId: string, gateId: string, presentationId: string }>} */
+    this.gatePresentationReceipts = new Map();
+    /** @type {Map<string, { accepted: boolean, socket: import("ws").WebSocket, connectionIdentity: number, requestId: string, gateId: string, presentationId: string }>} */
+    this.gateAbandonReceipts = new Map();
     /** @type {Map<import("ws").WebSocket, number>} */
     this.pendingCountBySocket = new Map();
     /** @type {Map<string, { protocolVersion: number, capabilities: string[] }>} */
@@ -393,18 +417,18 @@ export class HostRegistry {
         ? {
             type: MSG_TYPES.REGISTER_OK,
             protocolVersion: PROTOCOL_VERSION_V3,
-            capabilities: V3_CAPABILITIES,
+            capabilities: negotiateCapabilities(V3_CAPABILITIES, msg.capabilities),
           }
         : wantsReadiness
         ? {
             type: MSG_TYPES.REGISTER_OK,
             protocolVersion: PROTOCOL_VERSION_V2,
-            capabilities: V2_CAPABILITIES,
+            capabilities: negotiateCapabilities(V2_CAPABILITIES, msg.capabilities),
           }
         : {
             type: MSG_TYPES.REGISTER_OK,
             protocolVersion: PROTOCOL_VERSION,
-            capabilities: BOT_CAPABILITIES,
+            capabilities: negotiateCapabilities(BOT_CAPABILITIES, msg.capabilities),
           };
       if (!isRegisterOkMessage(registerOk)) {
         socket.close(1008, "invalid register response");
@@ -592,6 +616,22 @@ export class HostRegistry {
       return;
     }
 
+    if (msg.event?.type === MSG_TYPES.GATE_PRESENTATION_RESULT) {
+      if (!isGatePresentationResultMessage(msg)) {
+        socket.close(1008, "invalid gate presentation result");
+        return;
+      }
+      this.#acceptGatePresentationResult(socket, msg);
+      return;
+    }
+    if (msg.event?.type === MSG_TYPES.GATE_ABANDON_RESULT) {
+      if (!isGateAbandonResultMessage(msg)) {
+        socket.close(1008, "invalid gate abandon result");
+        return;
+      }
+      this.#acceptGateAbandonResult(socket, msg);
+      return;
+    }
     if (msg.event?.type === MSG_TYPES.GATE_ANSWER_RESULT) {
       if (
         msg.done !== undefined ||
@@ -682,6 +722,10 @@ export class HostRegistry {
           error: terminalError(disposition, code),
         });
       }
+      if (pending.gatePending) {
+        this.#deactivateGateHandle(pending.gatePresentation ?? {}, "Expired");
+      }
+      this.#abandonGate(pending, "invoke_terminal");
       this.#deletePending(msg.requestId);
       this.#deleteCancelTombstone(msg.requestId);
       return;
@@ -698,6 +742,18 @@ export class HostRegistry {
       // the absolute hard-cap remains the backstop. onEvent renders the prompt to
       // the Discord channel; the answer is collected out of band via answerGate().
       if (isGateRequestEvent(event)) {
+        if (!this.hostInfo.get(pending.hostId)?.capabilities.includes(GATE_PRESENTATION_CAPABILITY)) {
+          socket.close(1008, "gate presentation not negotiated");
+          return;
+        }
+        if (
+          pending.gatePresentation?.gateId === event.gateId &&
+          pending.gatePresentation.presentationId === event.presentationId
+        ) {
+          return;
+        }
+        this.#deactivateGateHandle(pending.gatePresentation ?? {}, "Replaced");
+        this.#abandonGate(pending, "replaced");
         pending.gatePending = true;
         pending.gateId = event.gateId;
         this.timers.clearTimeout(pending.idleTimer);
@@ -707,19 +763,44 @@ export class HostRegistry {
         const gate = {
             gateId: event.gateId,
             requestId: msg.requestId,
+            presentationId: event.presentationId,
             prompt: event.prompt,
             kind: event.kind,
+            multi: event.multi,
             choices: event.choices,
         };
+        const presentation = {
+          gateId: event.gateId,
+          presentationId: event.presentationId,
+          state: "awaiting_handle",
+        };
+        pending.gatePresentation = presentation;
         try {
-          if (typeof pending.onGate !== "function") {
-            this.#initiateCancellation(pending, "presentation_failed");
-            return;
-          }
-          Promise.resolve(pending.onGate(gate)).catch(() => {
+          if (typeof pending.onGate !== "function") throw new Error("missing gate presenter");
+          Promise.resolve(pending.onGate(gate)).then((handle) => {
+            if (pending.gatePresentation !== presentation) {
+              this.#deactivateGateHandle({ handle }, "Replaced");
+              return;
+            }
+            if (
+              !handle ||
+              typeof handle.messageId !== "string" ||
+              handle.messageId.length === 0 ||
+              typeof handle.activate !== "function" ||
+              typeof handle.update !== "function"
+            ) {
+              throw new Error("invalid gate presentation handle");
+            }
+            presentation.handle = handle;
+            this.#presentGate(pending, presentation);
+          }).catch(() => {
+            if (pending.gatePresentation !== presentation) return;
+            this.#deactivateGateHandle(presentation, "Presentation failed");
+            this.#abandonGate(pending, "send_failed");
             this.#initiateCancellation(pending, "presentation_failed");
           });
         } catch {
+          this.#abandonGate(pending, "send_failed");
           this.#initiateCancellation(pending, "presentation_failed");
         }
         return;
@@ -1750,8 +1831,10 @@ export class HostRegistry {
     if (
       !entry ||
       entry.socket !== socket ||
+      entry.connectionIdentity !== this.connectionIdentities.get(socket) ||
       entry.requestId !== requestId ||
-      entry.gateId !== event.gateId
+      entry.gateId !== event.gateId ||
+      entry.presentationId !== event.presentationId
     ) {
       return;
     }
@@ -1768,7 +1851,11 @@ export class HostRegistry {
     const pending = entry.pending;
     // The SDK may publish a successor before the predecessor's answer receipt
     // arrives. Retire only the exact accepted predecessor.
-    if (pending.gatePending && pending.gateId === entry.gateId) {
+    if (
+      pending.gatePending &&
+      pending.gateId === entry.gateId &&
+      pending.gatePresentation?.presentationId === entry.presentationId
+    ) {
       pending.gatePending = false;
       pending.gateId = undefined;
     }
@@ -1779,6 +1866,224 @@ export class HostRegistry {
     ) {
       this.#armIdleTimer(pending);
     }
+  }
+
+  #rememberGateReceipt(receipts, id, entry, accepted) {
+    const prior = receipts.get(id);
+    if (prior) {
+      return (
+        prior.accepted === accepted &&
+        prior.socket === entry.socket &&
+        prior.connectionIdentity === entry.connectionIdentity &&
+        prior.requestId === entry.requestId &&
+        prior.gateId === entry.gateId &&
+        prior.presentationId === entry.presentationId
+      );
+    }
+    if (receipts.size >= MAX_GATE_PRESENTATION_ATTEMPTS) return false;
+    receipts.set(id, { ...entry, accepted });
+    const timer = this.timers.setTimeout(() => receipts.delete(id), this.gatePresentationTimeoutMs);
+    timer?.unref?.();
+    return true;
+  }
+
+  #deactivateGateHandle(presentation, state) {
+    try {
+      void Promise.resolve(presentation.handle?.update(state)).catch(() => {});
+    } catch {
+      // Discord presentation updates are best effort and never alter authority.
+    }
+  }
+
+  #presentGate(pending, presentation) {
+    if (
+      this.pendingRequests.get(pending.requestId) !== pending ||
+      pending.gatePresentation !== presentation
+    ) return;
+    if (
+      pending.socket.readyState !== WebSocket.OPEN ||
+      this.connections.get(pending.hostId) !== pending.socket ||
+      this.pendingGatePresentations.size >= MAX_GATE_PRESENTATION_ATTEMPTS
+    ) {
+      this.#deactivateGateHandle(presentation, "Presentation failed");
+      this.#abandonGate(pending, "send_failed");
+      this.#initiateCancellation(pending, "presentation_failed");
+      return;
+    }
+    const presentationAttemptId = randomUUID();
+    const frame = {
+      type: MSG_TYPES.PRESENT_GATE,
+      requestId: pending.requestId,
+      gateId: presentation.gateId,
+      presentationId: presentation.presentationId,
+      presentationAttemptId,
+    };
+    if (!isPresentGateMessage(frame)) {
+      this.#deactivateGateHandle(presentation, "Presentation failed");
+      this.#abandonGate(pending, "send_failed");
+      this.#initiateCancellation(pending, "presentation_failed");
+      return;
+    }
+    const entry = {
+      ...frame,
+      socket: pending.socket,
+      connectionIdentity: pending.connectionIdentity,
+      pending,
+      timer: undefined,
+    };
+    presentation.presentationAttemptId = presentationAttemptId;
+    presentation.state = "awaiting_receipt";
+    this.pendingGatePresentations.set(presentationAttemptId, entry);
+    entry.timer = this.timers.setTimeout(() => {
+      if (this.pendingGatePresentations.get(presentationAttemptId) !== entry) return;
+      this.pendingGatePresentations.delete(presentationAttemptId);
+      this.#deactivateGateHandle(presentation, "Presentation timed out");
+      if (pending.gatePresentation !== presentation) return;
+      this.#abandonGate(pending, "presentation_timeout");
+      this.#initiateCancellation(pending, "presentation_failed");
+    }, this.gatePresentationTimeoutMs);
+    entry.timer?.unref?.();
+    try {
+      pending.socket.send(JSON.stringify(frame), (error) => {
+        if (!error || this.pendingGatePresentations.get(presentationAttemptId) !== entry) return;
+        this.timers.clearTimeout(entry.timer);
+        this.pendingGatePresentations.delete(presentationAttemptId);
+        this.#deactivateGateHandle(presentation, "Presentation failed");
+        if (pending.gatePresentation !== presentation) return;
+        this.#abandonGate(pending, "send_failed");
+        this.#initiateCancellation(pending, "presentation_failed");
+      });
+    } catch {
+      this.timers.clearTimeout(entry.timer);
+      this.pendingGatePresentations.delete(presentationAttemptId);
+      this.#deactivateGateHandle(presentation, "Presentation failed");
+      if (pending.gatePresentation !== presentation) return;
+      this.#abandonGate(pending, "send_failed");
+      this.#initiateCancellation(pending, "presentation_failed");
+    }
+  }
+
+  #acceptGatePresentationResult(socket, msg) {
+    const event = msg.event;
+    const entry = this.pendingGatePresentations.get(event.presentationAttemptId);
+    if (!entry) {
+      const prior = this.gatePresentationReceipts.get(event.presentationAttemptId);
+      if (
+        prior &&
+        !this.#rememberGateReceipt(this.gatePresentationReceipts, event.presentationAttemptId, {
+          socket, connectionIdentity: this.connectionIdentities.get(socket),
+          requestId: msg.requestId, gateId: event.gateId, presentationId: event.presentationId,
+        }, event.accepted)
+      ) {
+        socket.close(1008, "conflicting gate presentation result");
+      }
+      return;
+    }
+    if (
+      entry.socket !== socket ||
+      entry.connectionIdentity !== this.connectionIdentities.get(socket) ||
+      entry.requestId !== msg.requestId ||
+      entry.gateId !== event.gateId ||
+      entry.presentationId !== event.presentationId
+    ) {
+      socket.close(1008, "conflicting gate presentation result");
+      return;
+    }
+    this.timers.clearTimeout(entry.timer);
+    this.pendingGatePresentations.delete(event.presentationAttemptId);
+    this.#rememberGateReceipt(this.gatePresentationReceipts, event.presentationAttemptId, entry, event.accepted);
+    const presentation = entry.pending.gatePresentation;
+    if (!presentation || presentation.presentationAttemptId !== event.presentationAttemptId) return;
+    if (!event.accepted) {
+      this.#deactivateGateHandle(presentation, "Presentation rejected");
+      this.#abandonGate(entry.pending, "send_failed");
+      this.#initiateCancellation(entry.pending, "presentation_failed");
+      return;
+    }
+    presentation.state = "accepted";
+    try {
+      void Promise.resolve(presentation.handle.activate()).catch(() => {
+        if (entry.pending.gatePresentation !== presentation) return;
+        this.#deactivateGateHandle(presentation, "Presentation failed");
+        this.#abandonGate(entry.pending, "send_failed");
+        this.#initiateCancellation(entry.pending, "presentation_failed");
+      });
+    } catch {
+      this.#deactivateGateHandle(presentation, "Presentation failed");
+      this.#abandonGate(entry.pending, "send_failed");
+      this.#initiateCancellation(entry.pending, "presentation_failed");
+    }
+  }
+
+  #abandonGate(pending, reason) {
+    const presentation = pending.gatePresentation;
+    if (!presentation || presentation.abandonId || !presentation.presentationId) return;
+    if (
+      pending.socket.readyState !== WebSocket.OPEN ||
+      this.connections.get(pending.hostId) !== pending.socket ||
+      this.pendingGateAbandons.size >= MAX_GATE_PRESENTATION_ATTEMPTS
+    ) return;
+    const abandonId = randomUUID();
+    const frame = {
+      type: MSG_TYPES.ABANDON_GATE,
+      requestId: pending.requestId,
+      gateId: presentation.gateId,
+      presentationId: presentation.presentationId,
+      abandonId,
+      reason,
+    };
+    if (!isAbandonGateMessage(frame)) return;
+    const entry = {
+      ...frame,
+      socket: pending.socket,
+      connectionIdentity: pending.connectionIdentity,
+      timer: undefined,
+    };
+    presentation.abandonId = abandonId;
+    this.pendingGateAbandons.set(abandonId, entry);
+    entry.timer = this.timers.setTimeout(() => {
+      if (this.pendingGateAbandons.get(abandonId) === entry) {
+        this.pendingGateAbandons.delete(abandonId);
+      }
+    }, this.gatePresentationTimeoutMs);
+    entry.timer?.unref?.();
+    try {
+      pending.socket.send(JSON.stringify(frame));
+    } catch {
+      this.timers.clearTimeout(entry.timer);
+      this.pendingGateAbandons.delete(abandonId);
+    }
+  }
+
+  #acceptGateAbandonResult(socket, msg) {
+    const event = msg.event;
+    const entry = this.pendingGateAbandons.get(event.abandonId);
+    if (!entry) {
+      const prior = this.gateAbandonReceipts.get(event.abandonId);
+      if (
+        prior &&
+        !this.#rememberGateReceipt(this.gateAbandonReceipts, event.abandonId, {
+          socket, connectionIdentity: this.connectionIdentities.get(socket),
+          requestId: msg.requestId, gateId: event.gateId, presentationId: event.presentationId,
+        }, event.accepted)
+      ) {
+        socket.close(1008, "conflicting gate abandon result");
+      }
+      return;
+    }
+    if (
+      entry.socket !== socket ||
+      entry.connectionIdentity !== this.connectionIdentities.get(socket) ||
+      entry.requestId !== msg.requestId ||
+      entry.gateId !== event.gateId ||
+      entry.presentationId !== event.presentationId
+    ) {
+      socket.close(1008, "conflicting gate abandon result");
+      return;
+    }
+    this.timers.clearTimeout(entry.timer);
+    this.pendingGateAbandons.delete(event.abandonId);
+    this.#rememberGateReceipt(this.gateAbandonReceipts, event.abandonId, entry, event.accepted);
   }
 
   #armIdleTimer(pending) {
@@ -1810,6 +2115,12 @@ export class HostRegistry {
     entry.idleTimer = undefined;
     entry.hardCapTimer = undefined;
     entry.cancelReceiptTimer = undefined;
+    for (const [attemptId, presentation] of this.pendingGatePresentations) {
+      if (presentation.requestId !== requestId) continue;
+      this.timers.clearTimeout(presentation.timer);
+      this.pendingGatePresentations.delete(attemptId);
+    }
+
     this.pendingRequests.delete(requestId);
     const next = (this.pendingCountBySocket.get(entry.socket) ?? 0) - 1;
     if (next > 0) this.pendingCountBySocket.set(entry.socket, next);
@@ -1861,6 +2172,15 @@ export class HostRegistry {
       }, "disconnect");
       this.#deletePending(pending.requestId);
       return false;
+    }
+    if (pending.gatePending) {
+      this.#deactivateGateHandle(pending.gatePresentation ?? {}, "Expired");
+      this.#abandonGate(
+        pending,
+        reason === "presentation_failed"
+          ? "send_failed"
+          : "presentation_timeout"
+      );
     }
     const cancelId = this.cancelIdFactory();
     const cancelFrame = {
@@ -1964,6 +2284,7 @@ export class HostRegistry {
   #failPendingForSocket(socket, error) {
     for (const [requestId, pending] of this.pendingRequests) {
       if (pending.socket !== socket) continue;
+      this.#deactivateGateHandle(pending.gatePresentation ?? {}, "Disconnected");
       pending.resolve({
         ok: false,
         error: terminalError(
@@ -1983,6 +2304,16 @@ export class HostRegistry {
         error: "host disconnected before gate answer was confirmed",
         code: GATE_ANSWER_ERROR_CODES.FAILED,
       });
+    }
+    for (const [attemptId, presentation] of this.pendingGatePresentations) {
+      if (presentation.socket !== socket) continue;
+      this.timers.clearTimeout(presentation.timer);
+      this.pendingGatePresentations.delete(attemptId);
+    }
+    for (const [abandonId, abandonment] of this.pendingGateAbandons) {
+      if (abandonment.socket !== socket) continue;
+      this.timers.clearTimeout(abandonment.timer);
+      this.pendingGateAbandons.delete(abandonId);
     }
   }
 
@@ -2372,9 +2703,9 @@ export class HostRegistry {
  * @param {object} command
  * @param {(event: object) => void} onEvent
  * @param {number} timeoutMs Idle timeout: resets on each streamed event.
- * @param {(gate: { gateId: string, requestId: string, prompt: string, kind: string, choices?: {value: unknown, label: string}[] }) => void} [onGate]
- *   #35: invoked when the daemon opens a workflow gate; carries the requestId
- *   needed to route the answer back via answerGate().
+ * @param {(gate: { gateId: string, requestId: string, presentationId: string, prompt: string, kind: string, multi?: boolean, choices?: {value: unknown, label: string}[] }) => Promise<{messageId: string, activate: () => unknown, update: (state: string) => unknown}> | {messageId: string, activate: () => unknown, update: (state: string) => unknown}} [onGate]
+ *   Renders the exact Discord presentation and returns its inactive handle;
+ *   answer routing activates only after the daemon accepts present_gate.
  * @param {{ bindingId?: string, mappingId?: string, mappingGeneration?: number, mappingVersion?: number,
  *   sourcePlatform?: string, workspaceId?: string, workspaceGeneration?: number, authority?: object }} [routeIdentity]
  * @param {(requestId: string) => void} [onRequestCreated]
@@ -2482,6 +2813,17 @@ export class HostRegistry {
         remediationError(PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE)
       );
     }
+    const requiresGatePresentation =
+      command?.kind === "prompt" ||
+      command?.kind === "steer" ||
+      command?.kind === "follow_up";
+    const capabilities = this.hostInfo.get(hostId)?.capabilities ?? [];
+    if (requiresGatePresentation && !capabilities.includes(GATE_PRESENTATION_CAPABILITY)) {
+      return this.#denyInvoke(
+        hostId,
+        remediationError(PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE)
+      );
+    }
 
     // Bot-side network backpressure guard, NOT host-wide resource admission
     // authority. This per-socket pending cap bounds how many invokes the bot
@@ -2568,7 +2910,6 @@ export class HostRegistry {
         PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED
       );
     }
-    const capabilities = this.hostInfo.get(hostId)?.capabilities ?? [];
     if (
       !capabilities.includes(TERMINAL_DISPOSITION_CAPABILITY) ||
       !capabilities.includes(INVOKE_CANCELLATION_CAPABILITY)
@@ -2611,6 +2952,7 @@ export class HostRegistry {
         cancellation: undefined,
         gatePending: false,
         gateId: undefined,
+        gatePresentation: undefined,
         gateAnswers: new Map(),
         settle: (result, terminalPhase) => {
           if (settled) return;
@@ -2701,9 +3043,10 @@ export class HostRegistry {
    * @param {string} hostId
    * @param {string} requestId
    * @param {string} gateId
+   * @param {string} presentationId
    * @param {string} answer
    */
-  async answerGate(hostId, requestId, gateId, answer) {
+  async answerGate(hostId, requestId, gateId, presentationId, answer) {
     const pending = this.pendingRequests.get(requestId);
     if (!pending) {
       return { ok: false, error: "no in-flight request for that answer" };
@@ -2716,7 +3059,12 @@ export class HostRegistry {
     ) {
       return { ok: false, error: `host '${hostId}' is not connected` };
     }
-    if (!pending.gatePending || pending.gateId !== gateId) {
+    if (
+      !pending.gatePending ||
+      pending.gateId !== gateId ||
+      pending.gatePresentation?.presentationId !== presentationId ||
+      pending.gatePresentation?.state !== "accepted"
+    ) {
       return { ok: false, error: "no matching pending gate for that answer" };
     }
     if (pending.gateAnswers.has(gateId)) {
@@ -2735,6 +3083,7 @@ export class HostRegistry {
       type: MSG_TYPES.ANSWER,
       requestId,
       gateId,
+      presentationId,
       answerId,
       answer,
     };
@@ -2756,7 +3105,9 @@ export class HostRegistry {
         answerId,
         requestId,
         gateId,
+        presentationId,
         socket,
+        connectionIdentity: pending.connectionIdentity,
         pending,
         timer: undefined,
         resolve,

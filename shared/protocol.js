@@ -41,6 +41,14 @@ export const GATE_ANSWER_ERROR_CODES = Object.freeze({
   REJECTED: "GATE_ANSWER_REJECTED",
   FAILED: "GATE_ANSWER_FAILED",
 });
+export const GATE_PRESENTATION_CAPABILITY = "gate_presentation_v1";
+export const GATE_ABANDON_REASONS = Object.freeze([
+  "send_failed",
+  "presentation_timeout",
+  "replaced",
+  "invoke_terminal",
+  "disconnected",
+]);
 export const WORKSPACE_READINESS_CAPABILITY = "workspace_readiness_v2";
 export const WORKSPACE_READINESS_V2_CAPABILITY = WORKSPACE_READINESS_CAPABILITY;
 export const PROTOCOL_VERSION_V2 = 2;
@@ -595,6 +603,7 @@ export const CAPABILITIES = Object.freeze([
   "heartbeat",
   TERMINAL_DISPOSITION_CAPABILITY,
   INVOKE_CANCELLATION_CAPABILITY,
+  GATE_PRESENTATION_CAPABILITY,
 ]);
 
 /**
@@ -657,6 +666,10 @@ export const MSG_TYPES = Object.freeze({
   ANSWER: "answer",
   GATE_REQUEST: "gate_request",
   GATE_ANSWER_RESULT: "gate_answer_result",
+  PRESENT_GATE: "present_gate",
+  GATE_PRESENTATION_RESULT: "gate_presentation_result",
+  ABANDON_GATE: "abandon_gate",
+  GATE_ABANDON_RESULT: "gate_abandon_result",
   READINESS: "readiness",
   // S6f.1b (#81): workspace-lifecycle wire message contract. These are
   // CONTRACT-ONLY additions here; no orchestrator wiring lands until
@@ -1477,14 +1490,22 @@ export function isCancelResultMessage(value) {
  * channel requires the exact receipt-aware shape on both peers; `answerId` is
  * an opaque, per-attempt correlation id. There is no mixed-version negotiation,
  * so deploy the bot and daemon together before enabling workflow gates.
- * @typedef {{ type: "answer", requestId: string, gateId: string, answerId: string, answer: string }} AnswerMessage
+ * @typedef {{ type: "answer", requestId: string, gateId: string, presentationId: string, answerId: string, answer: string }} AnswerMessage
  */
 export function isAnswerMessage(value) {
   return (
-    hasExactFields(value, ["type", "requestId", "gateId", "answerId", "answer"]) &&
+    hasExactPlainOwnFields(value, [
+      "type",
+      "requestId",
+      "gateId",
+      "presentationId",
+      "answerId",
+      "answer",
+    ]) &&
     value.type === MSG_TYPES.ANSWER &&
     isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
     isBoundedString(value.gateId, V0_LIMITS.GATE_ID) &&
+    isBoundedString(value.presentationId, V0_LIMITS.REQUEST_ID) &&
     isBoundedString(value.answerId, V0_LIMITS.REQUEST_ID) &&
     isBoundedString(value.answer, V0_LIMITS.MESSAGE, true)
   );
@@ -1496,30 +1517,26 @@ export function isAnswerMessage(value) {
  * and attempt. Rejections expose only a fixed protocol code, never answer
  * content or an SDK/provider error.
  *
- * @typedef {{ type: "gate_answer_result", answerId: string, gateId: string, accepted: true }
- *   | { type: "gate_answer_result", answerId: string, gateId: string, accepted: false, errorCode: string }} GateAnswerResultEvent
+ * @typedef {{ type: "gate_answer_result", answerId: string, gateId: string, presentationId: string, accepted: true }
+ *   | { type: "gate_answer_result", answerId: string, gateId: string, presentationId: string, accepted: false, errorCode: string }} GateAnswerResultEvent
  */
 export function isGateAnswerResultEvent(value) {
   if (
-    !isObject(value) ||
+    !hasExactPlainOwnFields(value, value?.accepted
+      ? ["type", "answerId", "gateId", "presentationId", "accepted"]
+      : ["type", "answerId", "gateId", "presentationId", "accepted", "errorCode"]) ||
     value.type !== MSG_TYPES.GATE_ANSWER_RESULT ||
     !isBoundedString(value.answerId, V0_LIMITS.REQUEST_ID) ||
     !isBoundedString(value.gateId, V0_LIMITS.GATE_ID) ||
+    !isBoundedString(value.presentationId, V0_LIMITS.REQUEST_ID) ||
     typeof value.accepted !== "boolean"
   ) {
     return false;
   }
   if (value.accepted) {
-    return hasExactFields(value, ["type", "answerId", "gateId", "accepted"]);
+    return true;
   }
   return (
-    hasExactFields(value, [
-      "type",
-      "answerId",
-      "gateId",
-      "accepted",
-      "errorCode",
-    ]) &&
     isBoundedString(value.errorCode, V0_LIMITS.GATE_ERROR_CODE) &&
     Object.values(GATE_ANSWER_ERROR_CODES).includes(value.errorCode)
   );
@@ -1532,13 +1549,21 @@ export function isGateAnswerResultEvent(value) {
  * `choices` is present only for choice-style gates; `kind` mirrors the SDK
  * WorkflowGateKind. Unknown/legacy event payloads fail this check and are
  * treated as ordinary (ignorable) events by v0-aware peers.
- * @typedef {{ type: "gate_request", requestId?: string, gateId: string, prompt: string, kind: string, choices?: Array<{ value: unknown, label: string }> }} GateRequestEvent
+ * @typedef {{ type: "gate_request", requestId?: string, gateId: string, presentationId: string, prompt: string, kind: string, multi?: boolean, choices?: Array<{ value: unknown, label: string }> }} GateRequestEvent
  */
 export function isGateRequestEvent(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const fields = ["type", "gateId", "presentationId", "prompt", "kind"];
+  if (hasOwn(value, "requestId")) fields.push("requestId");
+  if (hasOwn(value, "multi")) fields.push("multi");
+  if (hasOwn(value, "choices")) fields.push("choices");
   if (
-    !isObject(value) ||
+    !hasExactPlainOwnFields(value, fields) ||
     value.type !== MSG_TYPES.GATE_REQUEST ||
     !isBoundedString(value.gateId, V0_LIMITS.GATE_ID) ||
+    !isBoundedString(value.presentationId, V0_LIMITS.REQUEST_ID) ||
     !isBoundedString(value.prompt, V0_LIMITS.GATE_PROMPT) ||
     (value.kind !== "question" &&
       value.kind !== "approval" &&
@@ -1549,14 +1574,14 @@ export function isGateRequestEvent(value) {
   if (hasOwn(value, "requestId") && !isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID)) {
     return false;
   }
+  if (hasOwn(value, "multi") && typeof value.multi !== "boolean") return false;
   if (hasOwn(value, "choices")) {
     if (!Array.isArray(value.choices) || value.choices.length > V0_LIMITS.MAX_CHOICES) {
       return false;
     }
     for (const choice of value.choices) {
       if (
-        !isObject(choice) ||
-        !hasOwn(choice, "value") ||
+        !hasExactPlainOwnFields(choice, ["value", "label"]) ||
         !isBoundedString(choice.label, V0_LIMITS.CHOICE_LABEL)
       ) {
         return false;
@@ -1564,6 +1589,102 @@ export function isGateRequestEvent(value) {
     }
   }
   return true;
+}
+
+/**
+ * bot -> daemon acknowledgement that a gate was rendered to the user.
+ * `presentationAttemptId` is an opaque per-send idempotency key.
+ * @typedef {{ type: "present_gate", requestId: string, gateId: string, presentationId: string, presentationAttemptId: string }} PresentGateMessage
+ */
+export function isPresentGateMessage(value) {
+  return (
+    hasExactPlainOwnFields(value, [
+      "type",
+      "requestId",
+      "gateId",
+      "presentationId",
+      "presentationAttemptId",
+    ]) &&
+    value.type === MSG_TYPES.PRESENT_GATE &&
+    isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.gateId, V0_LIMITS.GATE_ID) &&
+    isBoundedString(value.presentationId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.presentationAttemptId, V0_LIMITS.REQUEST_ID)
+  );
+}
+
+/**
+ * daemon -> bot receipt for a present_gate request. This is the complete outer
+ * event frame and intentionally has neither `done` nor `error`.
+ * @typedef {{ type: "event", requestId: string, event: { type: "gate_presentation_result", presentationAttemptId: string, gateId: string, presentationId: string, accepted: boolean } }} GatePresentationResultMessage
+ */
+export function isGatePresentationResultMessage(value) {
+  return (
+    hasExactPlainOwnFields(value, ["type", "requestId", "event"]) &&
+    value.type === MSG_TYPES.EVENT &&
+    isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
+    hasExactPlainOwnFields(value.event, [
+      "type",
+      "presentationAttemptId",
+      "gateId",
+      "presentationId",
+      "accepted",
+    ]) &&
+    value.event.type === MSG_TYPES.GATE_PRESENTATION_RESULT &&
+    isBoundedString(value.event.presentationAttemptId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.event.gateId, V0_LIMITS.GATE_ID) &&
+    isBoundedString(value.event.presentationId, V0_LIMITS.REQUEST_ID) &&
+    typeof value.event.accepted === "boolean"
+  );
+}
+
+/**
+ * bot -> daemon request to retire a previously presented gate.
+ * `abandonId` is an opaque per-attempt idempotency key.
+ * @typedef {{ type: "abandon_gate", requestId: string, gateId: string, presentationId: string, abandonId: string, reason: string }} AbandonGateMessage
+ */
+export function isAbandonGateMessage(value) {
+  return (
+    hasExactPlainOwnFields(value, [
+      "type",
+      "requestId",
+      "gateId",
+      "presentationId",
+      "abandonId",
+      "reason",
+    ]) &&
+    value.type === MSG_TYPES.ABANDON_GATE &&
+    isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.gateId, V0_LIMITS.GATE_ID) &&
+    isBoundedString(value.presentationId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.abandonId, V0_LIMITS.REQUEST_ID) &&
+    GATE_ABANDON_REASONS.includes(value.reason)
+  );
+}
+
+/**
+ * daemon -> bot receipt for an abandon_gate request. This is the complete
+ * outer event frame and intentionally has neither `done` nor `error`.
+ * @typedef {{ type: "event", requestId: string, event: { type: "gate_abandon_result", abandonId: string, gateId: string, presentationId: string, accepted: boolean } }} GateAbandonResultMessage
+ */
+export function isGateAbandonResultMessage(value) {
+  return (
+    hasExactPlainOwnFields(value, ["type", "requestId", "event"]) &&
+    value.type === MSG_TYPES.EVENT &&
+    isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
+    hasExactPlainOwnFields(value.event, [
+      "type",
+      "abandonId",
+      "gateId",
+      "presentationId",
+      "accepted",
+    ]) &&
+    value.event.type === MSG_TYPES.GATE_ABANDON_RESULT &&
+    isBoundedString(value.event.abandonId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.event.gateId, V0_LIMITS.GATE_ID) &&
+    isBoundedString(value.event.presentationId, V0_LIMITS.REQUEST_ID) &&
+    typeof value.event.accepted === "boolean"
+  );
 }
 
 export function normalizeProtocolError(value) {

@@ -37,6 +37,9 @@ const CLOSED_ACTIONS = new Set([
   "retire",
   "invoke",
   "cancel",
+  "present_gate",
+  "abandon_gate",
+  "gate_quarantine",
   ...Object.values(WORKSPACE_LIFECYCLE_OPERATIONS).flatMap((operations) => [
     ...operations,
   ]),

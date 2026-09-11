@@ -63,13 +63,28 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    disposed automatically. Live controls can be restored once upstream
    [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429) provides a
    supported submission-ownership lifecycle.
-   Workflow answers use correlated daemon receipts: sending an answer is not
-   acceptance. Rejected answers retain the same live gate for retry; a completed
-   or replaced gate is never silently answered by a retry or converted into a
-   new prompt. Deploy the bot and daemon together for this receipt contract.
-   Invokes require negotiated `terminal_disposition_v1` and
-   `invoke_cancellation_v1`; mixed bot/daemon peers refuse an invoke before
-   execution, so deploy them lockstep. A `cancel_invoke` has one of
+   Workflow gates require negotiated `gate_presentation_v1` in addition to
+   `terminal_disposition_v1` and `invoke_cancellation_v1`; mixed bot/daemon
+   peers refuse a gate-capable invoke before execution, so deploy them
+   lockstep. A daemon gate begins `awaiting_presentation`, owned by exact
+   `ownerId`, `gateId`, and `presentationId`. The bot renders a bounded Discord
+   gate message and attaches the complete wire-bounded prompt and options,
+   then sends `present_gate`. It becomes answerable only after the exact
+   accepted `gate_presentation_result`; presentation and abandonment receipts
+   are nonterminal. Buttons or select menus are used where suitable. An answer
+   binds the exact request/gate/presentation to the original gate message,
+   channel, and initiating user; free text must reply to that exact gate
+   message, and ordinary channel messages never satisfy a gate. The original
+   message is edited as Answering, Answered, Rejected—retry available,
+   Expired, Replaced, or Disconnected. Only an exact accepted answer receipt
+   retires that presentation; a rejected receipt restores that exact retry
+   route. Presentation send failure or timeout sends `abandon_gate` while the
+   socket is open and separately requests `presentation_failed` cancellation;
+   neither claims active work was interrupted. Duplicate attempt and answer IDs
+   replay exact receipts, conflicting reuse policy-closes, and bounded capacity
+   fails closed without evicting live entries. Oversized gate protocol content
+   is refused and quarantined rather than silently truncated; the bounded
+   Discord preview does not replace the complete attachment. A `cancel_invoke` has one of
    `idle_timeout`, `hard_cap`, `disconnect`, `user_cancelled`, or
    `presentation_failed` as its reason and receives exactly one
    `cancel_result`: `cancelled_before_start`, `cancellation_pending`,
@@ -90,12 +105,15 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    timeout is also only an unconfirmed local failure. An adapter timeout moves
    its session/activity hold into SessionPool retirement containment (#234)
    while cleanup settles, since continued work is possible. On a daemon socket
-   close, queued sibling invokes are synchronously revoked and each active
-   shared session enters #234 containment once; its leases and admission fence
-   remain until positive disposal proof. The existing #231 live-control
+   close, exact socket-generation gate owners are synchronously quarantined
+   before cancellation retirement and reconnect scheduling; queued sibling
+   invokes are synchronously revoked and each active shared session enters #234
+   containment once. Its leases and admission fence remain until positive
+   disposal proof. The existing #231 live-control
    containment remains in force: cancellation does not restore active
    `steer`/`follow_up` or unblock #231.
-3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
+3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, except an
+   exact reply to an answerable owned gate message, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`), `/gjc`,
    `/model`, `/hosts`, and `/cancel` as Discord slash commands. `/cancel` is
    authorized by the normal bot allowlist and may cancel only the caller's

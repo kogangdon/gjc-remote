@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Gate presentation protocol
+
+- Negotiate `gate_presentation_v1` with the terminal-disposition and invocation-
+  cancellation capabilities before serving a gate-capable invoke. Bot and daemon
+  deploy lockstep; a mixed peer fails closed before execution.
+- A workflow gate starts daemon-side as `awaiting_presentation`, owned by its
+  exact `ownerId`, `gateId`, and `presentationId`. The bot first renders a
+  bounded Discord gate message with the complete wire-bounded prompt and
+  options attached, then sends `present_gate`. The gate is answerable only
+  after the exact accepted `gate_presentation_result`; presentation and
+  abandonment receipts are nonterminal.
+- Gate answers bind the exact request, gate, and presentation identifiers to
+  the original Discord gate message, channel, and initiating user. Buttons or
+  select menus are used where suitable; free text must be an exact reply to
+  that gate message. Ordinary channel messages never answer a gate. The
+  original gate message is edited through Answering, Answered,
+  Rejected—retry available, Expired, Replaced, and Disconnected states.
+- Presentation send failure or timeout abandons the still-open exact gate with
+  `abandon_gate` and separately requests `presentation_failed` cancellation.
+  Neither request claims that active SDK work was interrupted. An accepted
+  answer receipt alone retires the exact presentation; a rejected receipt
+  re-enables that exact gate for retry.
+- Duplicate presentation, abandonment, and answer attempt IDs replay their
+  exact prior receipts. Conflicting reuse policy-closes the socket. Bounded
+  receipt/presentation capacity fails closed without evicting live entries.
+  Oversized gate protocol content is refused and quarantined rather than
+  silently truncated; Discord's inline preview is bounded while the complete
+  wire-bounded prompt and options remain in its attachment.
+- On daemon socket close, exact socket-generation owners are synchronously
+  gate-quarantined before cancellation retirement and reconnect scheduling.
+  Existing #234 disposal containment remains separate.
+
 ### Invocation cancellation and terminal disposition protocol
 
 - Negotiate both `terminal_disposition_v1` and `invoke_cancellation_v1` before
