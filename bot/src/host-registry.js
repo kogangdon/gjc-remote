@@ -14,6 +14,7 @@ import {
   READINESS_MAX_TTL_MS,
   PROTOCOL_ERROR_CODES,
   V0_LIMITS,
+  TERMINAL_DISPOSITION_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -22,6 +23,7 @@ import {
   isGateAnswerResultEvent,
   isGateRequestEvent,
   isInvokeMessage,
+  isInvokeTerminalEvent,
   isMappingGeneration,
   isMappingId,
   isMappingVersion,
@@ -74,7 +76,7 @@ const OBSERVABILITY_KEYS = Object.freeze(new Set([
   "schemaVersion", "component", "event", "phase", "observedAt", "receivedAt",
   "expiresAt", "requestAt", "deadlineAt", "durationMs", "hostId", "mappingId",
   "workspaceId", "bindingId", "fenceSequence", "socketGeneration", "revision",
-  "transactionId", "code",
+  "transactionId", "code", "terminalDisposition",
 ]));
 const OBSERVABILITY_CODES = Object.freeze(new Set([
   ...Object.values(PROTOCOL_ERROR_CODES),
@@ -162,33 +164,28 @@ export function freezeManagedAuthorityDescriptor(hostId, routeIdentity) {
   }
   return Object.freeze(authority);
 }
-function normalizeRemoteError(error) {
-  if (error && typeof error === "object") {
-    const code = typeof error.code === "string" ? error.code : undefined;
-    const remediation = code ? READINESS_REMEDIATIONS[code] : undefined;
-    return remediation
-      ? { code, ...remediation }
-      : { code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME, ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME] };
-  }
-  if (typeof error !== "string") {
-    return {
-      code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
-      ...READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME],
-    };
-  }
-  try {
-    const parsed = JSON.parse(error);
-    if (parsed && typeof parsed === "object") return normalizeRemoteError(parsed);
-  } catch {
-    // Legacy daemon errors are already bounded and sanitized by the daemon.
-  }
-  return error;
-}
 function remediationError(code) {
   return {
     ...(READINESS_REMEDIATIONS[code] ??
       READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME]),
     code,
+  };
+}
+function terminalError(disposition, code) {
+  const remediation = code
+    ? remediationError(code)
+    : READINESS_REMEDIATIONS[PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME];
+  return {
+    terminalDisposition: disposition,
+    ...remediation,
+  };
+}
+function localDeadlineError(kind) {
+  return {
+    localOutcome: kind,
+    code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+    retryable: false,
+    action: "verify_host_state",
   };
 }
 
@@ -561,9 +558,36 @@ export class HostRegistry {
       return;
     }
 
-    if (msg.error !== undefined) {
-      pending.resolve({ ok: false, error: normalizeRemoteError(msg.error) });
+    const isTerminal = msg.event?.type === "invoke_terminal";
+    if (isTerminal) {
+      if (
+        msg.error !== undefined ||
+        msg.done !== true ||
+        Object.keys(msg).length !== 4 ||
+        !isInvokeTerminalEvent(msg.event)
+      ) {
+        socket.close(1008, "invalid invoke terminal");
+        return;
+      }
+      const { disposition, code } = msg.event;
+      if (disposition === "completed") {
+        const text = pending.truncated
+          ? pending.text
+            ? `${pending.text}\n${OUTPUT_TRUNCATED_NOTICE}`
+            : OUTPUT_TRUNCATED_NOTICE
+          : pending.text;
+        pending.resolve({ ok: true, text, terminalDisposition: disposition });
+      } else {
+        pending.resolve({
+          ok: false,
+          error: terminalError(disposition, code),
+        });
+      }
       this.#deletePending(msg.requestId);
+      return;
+    }
+    if (msg.error !== undefined || msg.done !== undefined) {
+      socket.close(1008, "invalid invoke terminal");
       return;
     }
     if (msg.event !== undefined) {
@@ -607,15 +631,6 @@ export class HostRegistry {
       pending.onEvent(event);
       this.#armIdleTimer(pending);
     }
-    if (msg.done) {
-      const text = pending.truncated
-        ? pending.text
-          ? `${pending.text}\n${OUTPUT_TRUNCATED_NOTICE}`
-          : OUTPUT_TRUNCATED_NOTICE
-        : pending.text;
-      pending.resolve({ ok: true, text });
-      this.#deletePending(msg.requestId);
-    }
   }
 
   #bindingState(socket) {
@@ -649,6 +664,11 @@ export class HostRegistry {
     }
     if (fields.code !== undefined) {
       payload.code = fields.code === null ? null : boundedCode(fields.code);
+    }
+    if (fields.terminalDisposition !== undefined) {
+      payload.terminalDisposition = boundedOpaque(
+        fields.terminalDisposition
+      );
     }
     // Keep the explicit check close to the boundary; additions require a
     // deliberate schema review rather than accidentally leaking a field.
@@ -1672,7 +1692,7 @@ export class HostRegistry {
       pending.idleTimer = undefined;
       this.#deletePending(pending.requestId);
       pending.settle(
-        { ok: false, error: "timed out waiting for host response" },
+        { ok: false, error: localDeadlineError("idle_timeout") },
         "idle_timeout",
       );
     }, pending.idleMs);
@@ -1696,7 +1716,13 @@ export class HostRegistry {
   #failPendingForSocket(socket, error) {
     for (const [requestId, pending] of this.pendingRequests) {
       if (pending.socket !== socket) continue;
-      pending.resolve({ ok: false, error });
+      pending.resolve({
+        ok: false,
+        error: terminalError(
+          "disconnected",
+          typeof error?.code === "string" ? error.code : undefined
+        ),
+      });
       this.#deletePending(requestId);
     }
     for (const entry of [...this.pendingGateAnswers.values()]) {
@@ -2071,8 +2097,10 @@ export class HostRegistry {
 
 /**
  * Sends an invoke request to a host and resolves once the daemon reports
- * `done: true` for that requestId. Streamed events are delivered via onEvent
- * as they arrive, before the final resolution.
+ * an exact `invoke_terminal` event with `done: true` for that requestId.
+ * Streamed events are delivered via onEvent before that authoritative terminal
+ * frame. Bot-local idle and hard-cap expiry are unconfirmed wait failures, not
+ * daemon terminal dispositions.
  *
  * @param {string} hostId
  * @param {string} workDir
@@ -2256,6 +2284,16 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED
       );
     }
+    if (
+      !this.hostInfo.get(hostId)?.capabilities.includes(
+        TERMINAL_DISPOSITION_CAPABILITY
+      )
+    ) {
+      return this.#denyInvoke(
+        hostId,
+        remediationError(PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE)
+      );
+    }
 
     const invokeTelemetryContext = Object.freeze({
       hostId,
@@ -2307,6 +2345,9 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
             code: result.ok
               ? null
               : result.error?.code ?? PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+            terminalDisposition:
+              result.terminalDisposition ??
+              result.error?.terminalDisposition,
           });
           resolve(result);
         },
@@ -2315,7 +2356,7 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       pending.hardCapTimer = this.timers.setTimeout(() => {
         this.#deletePending(requestId);
         pending.settle(
-          { ok: false, error: "invoke exceeded absolute hard-cap" },
+          { ok: false, error: localDeadlineError("hard_cap") },
           "hard_cap",
         );
       }, this.invokeHardCapMs);

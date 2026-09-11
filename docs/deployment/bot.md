@@ -87,6 +87,18 @@ and workspace readiness are distinct:
 - Readiness alone does not authorize workspace serving; preserve the fail-closed
   mapping and receipt requirements described in [daemon deployment](daemon.md).
 
+For an invoke-capable host, registration must negotiate
+`terminal_disposition_v1`. The daemon's authoritative final response is an
+`event` containing `invoke_terminal`, `done: true`, and no top-level `error`.
+The first valid terminal frame wins and reports exactly one of `completed`,
+`failed`, `cancelled`, `paused`, `timed_out`, or `disconnected`. Discord
+delivery preserves `paused` and `cancelled` rather than calling them generic
+failures. Treat `timed_out` and `disconnected` as safety checks, not evidence
+that host-side SDK or process work stopped: inspect host state before retrying
+or starting a replacement request. A bot-local response timeout is also an
+unconfirmed local failure, not a daemon `timed_out` disposition. This reporting
+contract does not add cancellation support; #232 remains unimplemented.
+
 Alert separately for bot exit, listener failure, Discord disconnects, unknown
 or rejected host registrations, and absent expected daemons.
 
@@ -94,11 +106,14 @@ or rejected host registrations, and absent expected daemons.
 
 1. Record the deployed revision, Node version, configuration checksum (never
    secret contents), mapping revision, and connected-host baseline.
-2. Quiesce mapping changes, install the new checkout/dependencies, register
-   commands when their definition changed, and restart the bot through its
-   supervisor.
-3. Confirm listener startup, Discord login, expected mappings, and expected
-   daemon registrations before accepting traffic.
+2. Upgrade bot and daemon lockstep for `terminal_disposition_v1`. Quiesce
+   mapping changes, install the new checkout/dependencies, register commands
+   when their definition changed, and restart through their supervisors. A
+   mixed old/new pair fails closed; an old peer cannot serve invokes after the
+   other side updates.
+3. Confirm listener startup, Discord login, expected mappings, negotiated
+   invoke capability, and expected daemon registrations before accepting
+   traffic.
 4. Roll back only the bot executable/dependency revision while retaining the
    current protected configuration. Do not restore an older managed-authority
    snapshot or start an older reader after durable authority state advanced;

@@ -4,6 +4,7 @@ import WebSocket from "ws";
 import {
   CAPABILITIES,
   GATE_ANSWER_ERROR_CODES,
+  TERMINAL_DISPOSITION_CAPABILITY,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
   PONG,
@@ -53,7 +54,6 @@ import { SessionPool } from "./session-pool.js";
 import { invalidateBindingRequests as disposeReplacedBindingRequests } from "./binding-fence.js";
 import {
   AdmissionBudget,
-  LEGACY_RESOURCE_EXHAUSTED_ERROR,
 } from "./admission-budget.js";
 import { modelCommandDiagnostic, setSessionModel } from "./model-command.js";
 import {
@@ -918,6 +918,7 @@ function createReadinessState(connection) {
     revision: 0,
     committed: false,
     handshakeAccepted: false,
+    negotiatedCapabilities: new Set(),
     probeStarted: false,
     probePassed: false,
     timer: undefined,
@@ -1977,6 +1978,10 @@ async function handleMessage(
       closePolicyViolation(connection, PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE);
       return;
     }
+    const shared = negotiateCapabilities(
+      DAEMON_CAPABILITIES,
+      msg.capabilities
+    );
     readinessState.handshakeAccepted = true;
     // A denied registration remains denied across transport failures. Only a
     // successful registration clears the fixed-denial retry state.
@@ -1985,7 +1990,7 @@ async function handleMessage(
       DAEMON_PROTOCOL_VERSION,
       msg.protocolVersion ?? 0
     );
-    const shared = negotiateCapabilities(DAEMON_CAPABILITIES, msg.capabilities);
+    readinessState.negotiatedCapabilities = new Set(shared);
     readinessState.status.connection = "online";
     const readinessV2Committed = isReadinessCapabilityGate(
       readinessState.registration,
@@ -2600,26 +2605,43 @@ async function handleMessage(
     sendQueue = operation;
     return operation;
   };
+  const sendTerminalFailure = (code) =>
+    send(
+      {
+        type: "invoke_terminal",
+        disposition: "failed",
+        code,
+      },
+      { done: true }
+    );
   const releaseRequestId = requestIds.tryAcquire(requestId);
   if (!releaseRequestId) {
     invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.LEASE_CONFLICT);
     closePolicyViolation(connection, "duplicate request id");
     return;
   }
+  if (
+    !readinessState?.negotiatedCapabilities?.has(
+      TERMINAL_DISPOSITION_CAPABILITY
+    )
+  ) {
+    releaseRequestId();
+    invokeTelemetry.finish(
+      "refused",
+      PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE
+    );
+    await send(undefined, {
+      error: formatReadinessRejection(
+        makeReadinessError(PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE)
+      ),
+      done: true,
+    });
+    return;
+  }
   const releaseAdmission = admissionBudget.tryAcquireInvoke();
   if (!releaseAdmission) {
     releaseRequestId();
-    const exhausted = makeReadinessError(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
-    try {
-      await send(undefined, {
-        error: readinessState?.committed
-          ? formatReadinessRejection(exhausted)
-          : LEGACY_RESOURCE_EXHAUSTED_ERROR,
-        done: true,
-      });
-    } catch (error) {
-      throw error;
-    }
+    await sendTerminalFailure(PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
     invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
     return;
   }
@@ -2634,10 +2656,7 @@ async function handleMessage(
       if (admission.error) {
         invokeOutcome = "refused";
         invokeCode = admission.error.code;
-        await send(undefined, {
-          error: formatReadinessRejection(admission.error),
-          done: true,
-        });
+        await sendTerminalFailure(admission.error.code);
         return;
       }
       session = admission.session;
@@ -2653,12 +2672,9 @@ async function handleMessage(
       ) {
         invokeOutcome = "refused";
         invokeCode = PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED;
-        await send(undefined, {
-          error: formatReadinessRejection(
-            makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED)
-          ),
-          done: true,
-        });
+        await sendTerminalFailure(
+          PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED
+        );
         return;
       }
       const identity = admission.bindingState?.binding ?? readinessState;
@@ -2680,14 +2696,21 @@ async function handleMessage(
       bindingId: msg.bindingId,
     });
 
+    let commandResult;
     if (command.kind === "set_model") {
       await setSessionModel(session, command, (event) => send(event));
     } else {
       const rpcCommand = toRpcCommand(command);
-      await session.send(rpcCommand, (event) => send(event));
+      commandResult = await session.send(rpcCommand, (event) => send(event));
     }
 
-    await send(undefined, { done: true });
+    await send(
+      {
+        type: "invoke_terminal",
+        disposition: commandResult?.disposition ?? "completed",
+      },
+      { done: true }
+    );
     invokeOutcome = "succeeded";
     invokeCode = null;
   } catch (err) {
@@ -2698,26 +2721,43 @@ async function handleMessage(
         `daemon: set_model failed: ${sanitizeDaemonError(modelDiagnostic)}`
       );
     }
-    if (readinessState?.committed) {
-      invokeOutcome = "failed";
-      invokeCode = classifyReadinessError(
-        err,
-        PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
-      );
-      await send(undefined, {
-        error: formatReadinessRejection(
-          makeReadinessError(invokeCode)
-        ),
-        done: true,
-      });
-    } else {
-      invokeOutcome = "failed";
-      invokeCode = PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
-      await send(undefined, {
-        error: sanitizeDaemonError(normalizeProtocolError(err)),
-        done: true,
-      });
+    let terminalError = err;
+    if (
+      err?.terminalDisposition === "timed_out" &&
+      session
+    ) {
+      const retirementLease = activityLease;
+      activityLease = undefined;
+      try {
+        await pool.retireSession(session, {
+          holds: retirementLease
+            ? [() => retirementLease.release()]
+            : [],
+        });
+      } catch (retirementError) {
+        terminalError = retirementError;
+      }
     }
+    const disposition =
+      err?.terminalDisposition === "paused" ||
+      err?.terminalDisposition === "cancelled" ||
+      err?.terminalDisposition === "timed_out"
+        ? err.terminalDisposition
+        : "failed";
+    const terminalEvent = {
+      type: "invoke_terminal",
+      disposition,
+    };
+    if (disposition === "failed" || disposition === "timed_out") {
+      terminalEvent.code = classifyReadinessError(
+        terminalError,
+        PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME
+      );
+    }
+    invokeOutcome = "failed";
+    invokeCode =
+      terminalEvent.code ?? PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
+    await send(terminalEvent, { done: true });
   } finally {
     invokeTelemetry.finish(invokeOutcome, invokeCode);
     releaseRequestId();

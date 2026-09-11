@@ -17,6 +17,20 @@ A supported public ownership lifecycle is requested in
 remain fail-closed until it ships. See the
 [containment record](../../CHANGELOG.md#sdk-0166-containment).
 
+The bot and daemon must negotiate `terminal_disposition_v1` before serving an
+invoke. Its authoritative final frame is an `event` with an
+`invoke_terminal` event, `done: true`, and no top-level `error`; the first
+valid terminal frame wins. The only dispositions are `completed`, `failed`,
+`cancelled`, `paused`, `timed_out`, and `disconnected`. Preserve `paused` and
+`cancelled` as reported outcomes rather than flattening them to failure.
+Neither `timed_out` nor `disconnected` proves the underlying SDK or process
+was interrupted. A bot-local response timeout is likewise an unconfirmed local
+failure, not a daemon `timed_out` disposition. On adapter timeout, the daemon
+transfers the session/activity hold to SessionPool retirement containment (#234)
+while cleanup settles because work may continue. This does not add cancellation
+support: #232 remains unimplemented. The #231 live-control containment above
+remains active.
+
 This repository provides the foreground start command below; it does not ship a
 native service installer, service wrapper, or systemd unit, and this guide is
 not evidence of a completed live deployment.
@@ -102,13 +116,15 @@ blindly retry the operation or reuse the fenced session.
 
 Before an upgrade, record the deployed revision, Bun and SDK versions,
 `HOST_ID`, service-account identity, model profile, and protected-state backup
-status. Stop gracefully, install the new locked dependencies, restart, then
-confirm registration and a known authorized route. Roll back binaries only
-when the local persistence and mapping-authority state remain compatible. Do
-not treat copied `~/.gjc`, session state, or an old authority snapshot as a
-safe generic rollback: tokens may be account-bound and durable authority
-floors must not be rewound. Prefer forward recovery under the current authority
-contract.
+status. Deploy bot and daemon lockstep for `terminal_disposition_v1`: after one
+side updates, an old peer cannot serve invokes and the mixed pair fails closed.
+Stop gracefully, install the new locked dependencies, restart, then confirm
+registration, negotiated invoke capability, and a known authorized route. Roll
+back binaries only when the local persistence and mapping-authority state
+remain compatible. Do not treat copied `~/.gjc`, session state, or an old
+authority snapshot as a safe generic rollback: tokens may be account-bound and
+durable authority floors must not be rewound. Prefer forward recovery under the
+current authority contract.
 
 ## Native inventory and serving boundary
 

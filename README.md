@@ -67,6 +67,18 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    acceptance. Rejected answers retain the same live gate for retry; a completed
    or replaced gate is never silently answered by a retry or converted into a
    new prompt. Deploy the bot and daemon together for this receipt contract.
+   Invokes require the negotiated `terminal_disposition_v1` capability. Their
+   authoritative final frame is an `event` carrying `invoke_terminal` with
+   `done: true` and no top-level `error`; the first valid terminal frame wins.
+   Its disposition is exactly one of `completed`, `failed`, `cancelled`,
+   `paused`, `timed_out`, or `disconnected`. `paused` and `cancelled` remain
+   distinct results, not generic failures. `timed_out` and `disconnected` do
+   not prove that SDK or process work was interrupted; a bot-local response
+   timeout is also only an unconfirmed local failure. An adapter timeout moves
+   its session/activity hold into SessionPool retirement containment (#234)
+   while cleanup settles, since continued work is possible. This is not
+   cancellation support: #232 remains unimplemented. The existing #231
+   live-control containment remains in force.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`), `/gjc`,
    `/model`, and `/hosts` as Discord slash commands.
@@ -509,7 +521,10 @@ production sink wired by default.
   Each host is limited to 64 concurrent in-flight invokes; beyond that the bot
   fails new requests locally instead of growing its pending map.
   The daemon and bot exchange an additive protocol version and capability list
-  during registration; legacy daemons that omit them are treated as v0.
+  during registration. Invokes require the shared
+  `terminal_disposition_v1` capability: mixed old/new peers fail closed, so
+  after one side updates an old peer cannot serve invokes. Deploy bot and
+  daemon lockstep for this capability.
   Host tokens authenticate daemon identity but do not encrypt WebSocket
   traffic; use private `wss://`, a VPN, or a tunnel outside a single trusted
   network.

@@ -21,6 +21,7 @@ import {
   isRegisterOkMessage,
   negotiateCapabilities,
   PROTOCOL_ERROR_CODES,
+  TERMINAL_DISPOSITION_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
@@ -623,10 +624,308 @@ test("valid invoke events relay callbacks and assistant text", async () => {
 
     const event = { message: { role: "assistant", content: "answer" } };
     socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, event }));
-    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
 
-    assert.deepEqual(await resultPromise, { ok: true, text: "answer" });
+    assert.deepEqual(await resultPromise, { ok: true, text: "answer" , terminalDisposition: "completed"});
     assert.deepEqual(events, [event]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("terminal dispositions settle invokes without conflating completion", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    for (const disposition of [
+      "completed",
+      "failed",
+      "cancelled",
+      "paused",
+      "timed_out",
+      "disconnected",
+    ]) {
+      const invokeFrame = once(socket, "message");
+      const resultPromise = server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: disposition },
+        () => {},
+        1000
+      );
+      const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+      const event = { type: "invoke_terminal", disposition };
+      if (disposition === "failed") event.code = PROTOCOL_ERROR_CODES.DAEMON_FATAL;
+      if (disposition === "timed_out") {
+        event.code = PROTOCOL_ERROR_CODES.SESSION_CREATE_TIMEOUT;
+      }
+      socket.send(JSON.stringify({ type: "event", requestId, event, done: true }));
+      const result = await resultPromise;
+      if (disposition === "completed") {
+        assert.deepEqual(result, {
+          ok: true,
+          text: undefined,
+          terminalDisposition: "completed",
+        });
+      } else {
+        assert.equal(result.ok, false);
+        assert.equal(result.error.terminalDisposition, disposition);
+        assert.equal(typeof result.error.retryable, "boolean");
+        assert.equal(typeof result.error.action, "string");
+        if (event.code) assert.equal(result.error.code, event.code);
+        else assert.equal(result.error.code, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+      }
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test("terminal invokes reject legacy and non-exact terminal frames", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      1000
+    );
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    await expectPolicyClose(
+      socket,
+      JSON.stringify({
+        type: "event",
+        requestId,
+        event: { type: "invoke_terminal", disposition: "completed" },
+        done: true,
+        error: "contradictory",
+      })
+    );
+    assert.deepEqual(await resultPromise, {
+      ok: false,
+      error: {
+        terminalDisposition: "disconnected",
+        code: PROTOCOL_ERROR_CODES.CONNECTION_LOST,
+        retryable: true,
+        action: "retry_later",
+      },
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("terminal invokes reject legacy done frames", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hello" },
+      () => {},
+      1000
+    );
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    await expectPolicyClose(
+      socket,
+      JSON.stringify({ type: "event", requestId, done: true })
+    );
+    assert.equal((await resultPromise).ok, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("terminal invokes reject every non-exact outer frame", async () => {
+  const invalidFrames = [
+    {
+      event: { type: "invoke_terminal", disposition: "completed" },
+    },
+    {
+      event: { type: "invoke_terminal", disposition: "completed" },
+      done: false,
+    },
+    {
+      event: { type: "invoke_terminal", disposition: "completed" },
+      done: true,
+      extra: "forbidden",
+    },
+  ];
+
+  for (const invalid of invalidFrames) {
+    const server = await startRegistry();
+    try {
+      const socket = await server.connect("host-a", "token-a");
+      const invokeFrame = once(socket, "message");
+      const resultPromise = server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: "hello" },
+        () => {},
+        1000
+      );
+      const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+      await expectPolicyClose(
+        socket,
+        JSON.stringify({ type: "event", requestId, ...invalid })
+      );
+      assert.equal((await resultPromise).error.terminalDisposition, "disconnected");
+      assert.equal(server.registry.pendingRequests.size, 0);
+    } finally {
+      await server.close();
+    }
+  }
+});
+
+test("the first terminal outcome survives conflicts, disconnect, and cleared timers", async () => {
+  const timers = createManualTimers();
+  const observability = [];
+  const events = [];
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    onObservabilityEvent: (event) => observability.push(event),
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+
+    const completedFrame = once(socket, "message");
+    const completedPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "completed-first" },
+      (event) => events.push(event),
+      1000
+    );
+    const completedInvoke = JSON.parse((await completedFrame)[0].toString());
+    const completedPending = server.registry.pendingRequests.get(
+      completedInvoke.requestId
+    );
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId: completedInvoke.requestId,
+      event: { type: "invoke_terminal", disposition: "completed" },
+      done: true,
+    }));
+    const completed = await completedPromise;
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId: completedInvoke.requestId,
+      event: {
+        type: "invoke_terminal",
+        disposition: "failed",
+        code: PROTOCOL_ERROR_CODES.DAEMON_FATAL,
+      },
+      done: true,
+    }));
+    completedPending.resolve({
+      ok: false,
+      error: { terminalDisposition: "disconnected" },
+    });
+    timers.runClearedTimeouts();
+    assert.deepEqual(completed, {
+      ok: true,
+      text: undefined,
+      terminalDisposition: "completed",
+    });
+
+    const failedFrame = once(socket, "message");
+    const failedPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "failed-first" },
+      (event) => events.push(event),
+      1000
+    );
+    const failedInvoke = JSON.parse((await failedFrame)[0].toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId: failedInvoke.requestId,
+      event: {
+        type: "invoke_terminal",
+        disposition: "failed",
+        code: PROTOCOL_ERROR_CODES.DAEMON_FATAL,
+      },
+      done: true,
+    }));
+    const failed = await failedPromise;
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId: failedInvoke.requestId,
+      event: { type: "invoke_terminal", disposition: "completed" },
+      done: true,
+    }));
+    assert.equal(failed.error.terminalDisposition, "failed");
+
+    const disconnectedFrame = once(socket, "message");
+    const disconnectedPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "disconnect-first" },
+      (event) => events.push(event),
+      1000
+    );
+    const disconnectedInvoke = JSON.parse(
+      (await disconnectedFrame)[0].toString()
+    );
+    const disconnectedPending = server.registry.pendingRequests.get(
+      disconnectedInvoke.requestId
+    );
+    socket.terminate();
+    const disconnected = await disconnectedPromise;
+    disconnectedPending.resolve({
+      ok: true,
+      text: "late",
+      terminalDisposition: "completed",
+    });
+    timers.runClearedTimeouts();
+
+    assert.equal(disconnected.error.terminalDisposition, "disconnected");
+    assert.deepEqual(events, []);
+    assert.equal(server.registry.pendingRequests.size, 0);
+    assert.equal(timers.timeoutCount, 0);
+    const finishes = observability.filter(
+      (event) => event.event === "invoke.finish"
+    );
+    assert.equal(finishes.length, 3);
+    assert.deepEqual(
+      finishes.map((event) => event.terminalDisposition),
+      ["completed", "failed", "disconnected"]
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("invoke refuses hosts that did not negotiate terminal disposition", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a", {
+      capabilities: CAPABILITIES.filter(
+        (capability) => capability !== TERMINAL_DISPOSITION_CAPABILITY
+      ),
+    });
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: "hello" },
+        () => {}
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+          retryable: false,
+          action: "contact_admin",
+        },
+      }
+    );
+    socket.terminate();
   } finally {
     await server.close();
   }
@@ -654,11 +953,12 @@ test("truncated invoke events produce a bounded visible result notice", async ()
     };
 
     socket.send(JSON.stringify({ type: "event", requestId, event: truncated }));
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
 
     assert.deepEqual(await resultPromise, {
       ok: true,
       text: "[output truncated: too large]",
+      terminalDisposition: "completed",
     });
     assert.deepEqual(events, [truncated]);
   } finally {
@@ -690,11 +990,12 @@ test("truncation preserves assistant text and appends one notice", async () => {
     socket.send(JSON.stringify({ type: "event", requestId, event: assistant }));
     socket.send(JSON.stringify({ type: "event", requestId, event: truncated }));
     socket.send(JSON.stringify({ type: "event", requestId, event: truncated }));
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
 
     assert.deepEqual(await resultPromise, {
       ok: true,
       text: "answer\n[output truncated: too large]",
+      terminalDisposition: "completed",
     });
     assert.deepEqual(events, [assistant, truncated, truncated]);
   } finally {
@@ -702,7 +1003,7 @@ test("truncation preserves assistant text and appends one notice", async () => {
   }
 });
 
-test("truncation does not override errors or activate for near-match events", async () => {
+test("truncation does not override terminal failures or activate for near-match events", async () => {
   const server = await startRegistry();
   try {
     const socket = await server.connect("host-a", "token-a");
@@ -729,10 +1030,23 @@ test("truncation does not override errors or activate for near-match events", as
       JSON.stringify({
         type: "event",
         requestId: firstRequestId,
-        error: "remote failed",
+        event: {
+          type: "invoke_terminal",
+          disposition: "failed",
+          code: PROTOCOL_ERROR_CODES.DAEMON_FATAL,
+        },
+        done: true,
       })
     );
-    assert.deepEqual(await firstResult, { ok: false, error: "remote failed" });
+    assert.deepEqual(await firstResult, {
+      ok: false,
+      error: {
+        terminalDisposition: "failed",
+        code: PROTOCOL_ERROR_CODES.DAEMON_FATAL,
+        retryable: false,
+        action: "contact_admin",
+      },
+    });
 
     const secondFrame = once(socket, "message");
     const events = [];
@@ -759,11 +1073,11 @@ test("truncation does not override errors or activate for near-match events", as
       JSON.stringify({
         type: "event",
         requestId: secondRequestId,
-        done: true,
+        event: { type: "invoke_terminal", disposition: "completed" }, done: true,
       })
     );
 
-    assert.deepEqual(await secondResult, { ok: true, text: undefined });
+    assert.deepEqual(await secondResult, { ok: true, text: undefined , terminalDisposition: "completed"});
     assert.deepEqual(events, [nearMatch]);
   } finally {
     await server.close();
@@ -802,8 +1116,8 @@ test("managed v2 invokes carry the bindingId selected by readiness", async () =>
     const invoke = JSON.parse(raw.toString());
     assert.equal(invoke.bindingId, "binding-1");
     assert.equal(invoke.workspaceId, "workspace-1");
-    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
-    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined , terminalDisposition: "completed"});
   } finally {
     await server.close();
   }
@@ -845,8 +1159,8 @@ test("managed v2 invokes select the matching binding from multiple readiness fra
     const [raw] = await invokeFrame;
     const invoke = JSON.parse(raw.toString());
     assert.equal(invoke.bindingId, "binding-a");
-    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
-    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined , terminalDisposition: "completed"});
   } finally {
     await server.close();
   }
@@ -913,8 +1227,8 @@ test("managed v2 readiness gates and projects each binding independently", async
     const [raw] = await invokeFrame;
     const invoke = JSON.parse(raw.toString());
     assert.equal(invoke.bindingId, "binding-a");
-    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
-    assert.deepEqual(await readyResult, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await readyResult, { ok: true, text: undefined , terminalDisposition: "completed"});
 
     assert.deepEqual(
       await server.registry.invoke(
@@ -1358,8 +1672,8 @@ test("managed v2 invoke matches an explicit bindingId without workspace selector
     const [raw] = await invokeFrame;
     const invoke = JSON.parse(raw.toString());
     assert.equal(invoke.bindingId, "binding-a");
-    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, done: true }));
-    assert.deepEqual(await result, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId: invoke.requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await result, { ok: true, text: undefined , terminalDisposition: "completed"});
 
     assert.deepEqual(
       await server.registry.invoke(
@@ -1558,8 +1872,8 @@ test("invoke idle timer resets on each streamed event", async () => {
     }
     assert.equal(settled, false);
 
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
-    assert.deepEqual(await resultPromise, { ok: true, text: "still working" });
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: "still working" , terminalDisposition: "completed"});
   } finally {
     await server.close();
   }
@@ -1587,7 +1901,12 @@ test("invoke idle expiry fires with zero events", async () => {
     const result = await resultPromise;
     assert.deepEqual(result, {
       ok: false,
-      error: "timed out waiting for host response",
+      error: {
+        localOutcome: "idle_timeout",
+        code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+        retryable: false,
+        action: "verify_host_state",
+      },
     });
     assert.equal(server.registry.pendingRequests.size, 0);
     const finishes = observability.filter((event) => event.event === "invoke.finish");
@@ -1634,7 +1953,12 @@ test("invoke hard cap fires despite continuous activity", async () => {
 
     assert.deepEqual(await resultPromise, {
       ok: false,
-      error: "invoke exceeded absolute hard-cap",
+      error: {
+        localOutcome: "hard_cap",
+        code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+        retryable: false,
+        action: "verify_host_state",
+      },
     });
     const finishes = observability.filter((entry) => entry.event === "invoke.finish");
     assert.equal(finishes.length, 1);
@@ -1664,10 +1988,10 @@ test("invoke timers are cleared on normal resolve", async () => {
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
     assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [30, 200]);
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
 
     const result = await resultPromise;
-    assert.deepEqual(result, { ok: true, text: undefined });
+    assert.deepEqual(result, { ok: true, text: undefined , terminalDisposition: "completed"});
     assert.equal(server.registry.pendingRequests.size, 0);
     assert.equal(timers.timeoutCount, 0);
   } finally {
@@ -1693,9 +2017,9 @@ test("adversarial: a stale settle call after normal resolution is a safe no-op (
     const pendingEntry = server.registry.pendingRequests.get(requestId);
     assert.ok(pendingEntry);
 
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     const result = await resultPromise;
-    assert.deepEqual(result, { ok: true, text: undefined });
+    assert.deepEqual(result, { ok: true, text: undefined , terminalDisposition: "completed"});
     assert.equal(server.registry.pendingRequests.size, 0);
 
     // Simulate a stale idle/hard-cap timer firing after the real done already
@@ -1704,7 +2028,7 @@ test("adversarial: a stale settle call after normal resolution is a safe no-op (
     assert.doesNotThrow(() => {
       pendingEntry.settle({ ok: false, error: "invoke exceeded absolute hard-cap" });
     });
-    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined , terminalDisposition: "completed"});
     assert.equal(server.registry.pendingRequests.size, 0);
   } finally {
     await server.close();
@@ -1731,9 +2055,9 @@ test("adversarial: N sequential invokes leave no pending requests or armed timer
       );
       const [raw] = await invokeFrame;
       const { requestId } = JSON.parse(raw.toString());
-      socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+      socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
       const result = await resultPromise;
-      assert.deepEqual(result, { ok: true, text: undefined });
+      assert.deepEqual(result, { ok: true, text: undefined , terminalDisposition: "completed"});
       assert.equal(server.registry.pendingRequests.size, 0);
       assert.equal(server.registry.pendingCountBySocket.size, 0);
       assert.equal(timers.timeoutCount, 0);
@@ -1758,8 +2082,8 @@ test("adversarial: an event frame arriving after done is ignored and does not re
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
-    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined , terminalDisposition: "completed"});
     assert.equal(server.registry.pendingRequests.size, 0);
 
     // A late event frame for the same (now-settled) requestId must not crash,
@@ -1782,8 +2106,8 @@ test("adversarial: an event frame arriving after done is ignored and does not re
     );
     const [barrierRaw] = await barrierFrame;
     const barrierRequestId = JSON.parse(barrierRaw.toString()).requestId;
-    socket.send(JSON.stringify({ type: "event", requestId: barrierRequestId, done: true }));
-    assert.deepEqual(await barrierResult, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId: barrierRequestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await barrierResult, { ok: true, text: undefined , terminalDisposition: "completed"});
     assert.equal(server.registry.pendingRequests.size, 0);
     assert.equal(events.length, 0);
     assert.equal(socket.readyState, WebSocket.OPEN);
@@ -1896,24 +2220,44 @@ test("managed path-free routes fail with structured remediation on a legacy host
         perSocketBefore
       );
 
-      const barrierFrame = once(socket, "message");
+      const expectsTerminalCapability =
+        !Object.prototype.hasOwnProperty.call(register, "capabilities");
+      const barrierFrame = expectsTerminalCapability
+        ? once(socket, "message")
+        : undefined;
       const barrierResult = server.registry.invoke(
         "host-a",
         "/workspace",
         { kind: "prompt", message: "barrier" },
         () => {}
       );
-      const [barrierRaw] = await barrierFrame;
-      const barrier = JSON.parse(barrierRaw.toString());
-      assert.equal(barrier.workDir, "/workspace");
-      socket.send(
-        JSON.stringify({
-          type: "event",
-          requestId: barrier.requestId,
-          done: true,
-        })
-      );
-      assert.deepEqual(await barrierResult, { ok: true, text: undefined });
+      if (expectsTerminalCapability) {
+        const [barrierRaw] = await barrierFrame;
+        const barrier = JSON.parse(barrierRaw.toString());
+        assert.equal(barrier.workDir, "/workspace");
+        socket.send(
+          JSON.stringify({
+            type: "event",
+            requestId: barrier.requestId,
+            event: { type: "invoke_terminal", disposition: "completed" },
+            done: true,
+          })
+        );
+        assert.deepEqual(await barrierResult, {
+          ok: true,
+          text: undefined,
+          terminalDisposition: "completed",
+        });
+      } else {
+        assert.deepEqual(await barrierResult, {
+          ok: false,
+          error: {
+            code: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+            retryable: false,
+            action: "contact_admin",
+          },
+        });
+      }
       assert.equal(socket.readyState, WebSocket.OPEN);
       assert.equal(server.registry.pendingRequests.size, pendingBefore);
       assert.equal(
@@ -1953,8 +2297,7 @@ test("a different registered socket cannot spoof a pending requestId", async () 
       JSON.stringify({
         type: "event",
         requestId,
-        event: { message: { role: "assistant", content: "spoofed" } },
-        done: true,
+        event: { type: "invoke_terminal", disposition: "completed" }, done: true,
       })
     );
     const [closeCode] = await attackerClosed;
@@ -1962,8 +2305,8 @@ test("a different registered socket cannot spoof a pending requestId", async () 
     assert.equal(settled, false);
     assert.deepEqual(events, []);
 
-    owner.send(JSON.stringify({ type: "event", requestId, done: true }));
-    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    owner.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined , terminalDisposition: "completed"});
   } finally {
     await server.close();
   }
@@ -2029,7 +2372,12 @@ test("heartbeat timeout disconnects a host and fails its pending invoke", async 
 
     assert.deepEqual(await result, {
       ok: false,
-      error: { code: "HEARTBEAT_TIMEOUT", retryable: true, action: "retry_later" },
+      error: {
+        terminalDisposition: "disconnected",
+        code: "HEARTBEAT_TIMEOUT",
+        retryable: true,
+        action: "retry_later",
+      },
     });
     assert.equal(server.registry.isOnline("host-a"), false);
     assert.equal(server.registry.pendingRequests.size, 0);
@@ -2071,7 +2419,12 @@ test("replacement sockets are not removed by stale heartbeat state", async () =>
 
     assert.deepEqual(await originalResult, {
       ok: false,
-      error: { code: "CONNECTION_LOST", retryable: true, action: "retry_later" },
+      error: {
+        terminalDisposition: "disconnected",
+        code: "CONNECTION_LOST",
+        retryable: true,
+        action: "retry_later",
+      },
     });
     assert.equal(timers.timeoutCount, 0);
     timers.runClearedTimeouts();
@@ -2119,7 +2472,12 @@ test("registry shutdown clears heartbeat state and settles pending invokes", asy
 
   assert.deepEqual(await result, {
     ok: false,
-    error: { code: "CONNECTION_LOST", retryable: true, action: "retry_later" },
+    error: {
+      terminalDisposition: "disconnected",
+      code: "CONNECTION_LOST",
+      retryable: true,
+      action: "retry_later",
+    },
   });
   assert.equal(timers.intervalCount, 0);
   assert.equal(timers.timeoutCount, 0);
@@ -2209,7 +2567,7 @@ test("per-host in-flight invokes are capped and freed on completion", async () =
 
     const [freedRequestId] = [...server.registry.pendingRequests.keys()];
     socket.send(
-      JSON.stringify({ type: "event", requestId: freedRequestId, done: true })
+      JSON.stringify({ type: "event", requestId: freedRequestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true })
     );
     await waitFor(() => server.registry.pendingRequests.size === cap - 1);
 
@@ -2688,8 +3046,8 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
         event: { message: { role: "assistant", content: "done" } },
       })
     );
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
-    assert.deepEqual(await resultPromise, { ok: true, text: "done" });
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: "done" , terminalDisposition: "completed"});
   } finally {
     await server.close();
   }
@@ -2760,7 +3118,7 @@ test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and
       },
     }));
     assert.deepEqual(await answerResult, { ok: true });
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     await resultPromise;
   } finally {
     await server.close();
@@ -2852,7 +3210,12 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
     // Only confirmed acceptance re-arms the invoke idle timer.
     assert.deepEqual(await resultPromise, {
       ok: false,
-      error: "timed out waiting for host response",
+      error: {
+        localOutcome: "idle_timeout",
+        code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+        retryable: false,
+        action: "verify_host_state",
+      },
     });
   } finally {
     await server.close();
@@ -2896,7 +3259,7 @@ test("adversarial: DONE may precede an exact answer receipt without creating fal
     );
     const [rawAnswer] = await answerFrame;
     const answer = JSON.parse(rawAnswer.toString());
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     await resultPromise;
     assert.equal(server.registry.pendingGateAnswers.has(answer.answerId), true);
 
@@ -2959,7 +3322,7 @@ test("adversarial: a rejected receipt after DONE settles false without reviving 
     );
     const [rawAnswer] = await answerFrame;
     const answer = JSON.parse(rawAnswer.toString());
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     assert.equal((await resultPromise).ok, true);
     assert.equal(server.registry.pendingRequests.has(requestId), false);
 
@@ -3022,7 +3385,7 @@ test("receipt capacity remains bounded after DONE and is isolated by socket", as
     for (let i = 0; i < V0_LIMITS.MAX_PENDING_PER_HOST; i += 1) {
       const gate = await openGate("host-a", socket);
       retained.push(await submit("host-a", socket, gate));
-      socket.send(JSON.stringify({ type: "event", requestId: gate.requestId, done: true }));
+      socket.send(JSON.stringify({ type: "event", requestId: gate.requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
       await gate.done;
     }
     assert.equal(server.registry.pendingRequests.size, 0);
@@ -3117,7 +3480,7 @@ test("adversarial: a second answer for the same gate is rejected while its recei
       },
     }));
     assert.deepEqual(await firstAnswer, { ok: true });
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     await resultPromise;
   } finally {
     await server.close();
@@ -3206,7 +3569,7 @@ test("adversarial: a bounded answer-receipt timeout retains the gate and ignores
       },
     }));
     assert.deepEqual(await retryResult, { ok: true });
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     await resultPromise;
   } finally {
     await server.close();
@@ -3294,7 +3657,7 @@ test("adversarial: answer receipts are fenced by exact socket, request, gate, an
 
     socket.send(receipt());
     assert.deepEqual(await answerResult, { ok: true });
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     await resultPromise;
     otherSocket.terminate();
   } finally {
@@ -3477,7 +3840,7 @@ test("adversarial: accepting a predecessor receipt preserves a successor gate", 
     const second = JSON.parse(rawSecond.toString());
     sendAccepted(second);
     assert.deepEqual(await secondResult, { ok: true });
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
     assert.equal((await resultPromise).ok, true);
   } finally {
     await server.close();
@@ -5110,8 +5473,8 @@ test("invoke observability settles exactly once and exposes constant-shape gauge
     assert.ok(/^[0-9a-f-]{36}$/.test(start.transactionId));
 
     monotonic = 75;
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
-    assert.deepEqual(await resultPromise, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await resultPromise, { ok: true, text: undefined , terminalDisposition: "completed"});
     pending.settle({ ok: false, error: "late-secret-error" }, "hard_cap");
     const finishes = events.filter((event) => event.event === "invoke.finish");
     assert.equal(finishes.length, 1);
@@ -5136,15 +5499,17 @@ test("invoke observability settles exactly once and exposes constant-shape gauge
     socket.send(JSON.stringify({
       type: "event",
       requestId: remoteInvoke.requestId,
-      error: JSON.stringify({
+      event: {
+        type: "invoke_terminal",
+        disposition: "failed",
         code: PROTOCOL_ERROR_CODES.CONFIG_INVALID,
-        retryable: false,
-        action: "contact_admin",
-      }),
+      },
+      done: true,
     }));
     assert.deepEqual(await remoteResult, {
       ok: false,
       error: {
+        terminalDisposition: "failed",
         code: PROTOCOL_ERROR_CODES.CONFIG_INVALID,
         retryable: false,
         action: "contact_admin",
@@ -5178,7 +5543,7 @@ test("invoke observability settles exactly once and exposes constant-shape gauge
     const unknownFinish = events.filter(
       (event) => event.event === "invoke.finish",
     )[2];
-    assert.equal(unknownFinish.code, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+    assert.equal(unknownFinish.code, PROTOCOL_ERROR_CODES.CONNECTION_LOST);
     assert.equal(
       JSON.stringify(events).includes("ARBITRARY_AUTHENTICATED_CODE"),
       false,
@@ -5205,8 +5570,8 @@ test("observability sink failures cannot disrupt readiness, invoke, or snapshots
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
-    socket.send(JSON.stringify({ type: "event", requestId, done: true }));
-    assert.deepEqual(await result, { ok: true, text: undefined });
+    socket.send(JSON.stringify({ type: "event", requestId, event: { type: "invoke_terminal", disposition: "completed" }, done: true }));
+    assert.deepEqual(await result, { ok: true, text: undefined , terminalDisposition: "completed"});
     const snapshot = server.registry.getObservabilitySnapshot();
     assert.equal(Object.isFrozen(snapshot), true);
     assert.equal(Object.isFrozen(snapshot.gauges), true);
@@ -5415,9 +5780,9 @@ test("bound v3 receipt events retain receipt-local fences and reject mismatched 
     connection.socket.send(JSON.stringify({
       type: "event",
       requestId: invoke.requestId,
-      done: true,
+      event: { type: "invoke_terminal", disposition: "completed" }, done: true,
     }));
-    assert.deepEqual(await invokeResult, { ok: true, text: undefined });
+    assert.deepEqual(await invokeResult, { ok: true, text: undefined , terminalDisposition: "completed"});
     const finish = events.find((event) => event.event === "invoke.finish");
     for (const key of [
       "bindingId",
@@ -5525,7 +5890,7 @@ test("managed invoke never borrows host fences before binding readiness", async 
     connection.socket.send(JSON.stringify({
       type: "event",
       requestId: invoke.requestId,
-      done: true,
+      event: { type: "invoke_terminal", disposition: "completed" }, done: true,
     }));
     await result;
   } finally {

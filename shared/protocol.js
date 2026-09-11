@@ -29,6 +29,9 @@ export const V0_LIMITS = Object.freeze({
   // is user chat text routed back as a gate answer.
   GATE_ID: 128,
   GATE_ERROR_CODE: 64,
+  // Terminal invoke events expose only a known protocol code, never raw
+  // provider text.
+  TERMINAL_ERROR_CODE: 64,
   GATE_PROMPT: 16 * 1024,
   CHOICE_LABEL: 1024,
   MAX_CHOICES: 64,
@@ -231,6 +234,14 @@ export const PROTOCOL_ERROR_CODES = Object.freeze({
   UNHANDLED_REJECTION: "UNHANDLED_REJECTION",
   UNCAUGHT_EXCEPTION: "UNCAUGHT_EXCEPTION",
 });
+export const INVOKE_TERMINAL_DISPOSITIONS = Object.freeze([
+  "completed",
+  "failed",
+  "cancelled",
+  "paused",
+  "timed_out",
+  "disconnected",
+]);
 export const READINESS_ERROR_CODES = PROTOCOL_ERROR_CODES;
 export const READINESS_ERROR_TAXONOMY = Object.freeze({
   transport: Object.freeze([
@@ -559,8 +570,15 @@ export const READINESS_REMEDIATION_BY_CODE = READINESS_REMEDIATIONS;
  */
 export const PROTOCOL_VERSION = 1;
 
+export const TERMINAL_DISPOSITION_CAPABILITY = "terminal_disposition_v1";
+
 /** Capabilities this build advertises during the register handshake. */
-export const CAPABILITIES = Object.freeze(["invoke", "set_model", "heartbeat"]);
+export const CAPABILITIES = Object.freeze([
+  "invoke",
+  "set_model",
+  "heartbeat",
+  TERMINAL_DISPOSITION_CAPABILITY,
+]);
 
 /**
  * host -> bot, sent immediately after the daemon opens its WS connection.
@@ -641,6 +659,17 @@ function hasExactFields(value, fields) {
 
 function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function hasExactPlainOwnFields(value, fields) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype &&
+    Reflect.ownKeys(value).length === fields.length &&
+    fields.every((field) => hasOwn(value, field))
+  );
 }
 
 function isBoundedString(value, maxLength, allowEmpty = false) {
@@ -1360,6 +1389,36 @@ export function isInvokeMessage(value, context = undefined) {
     return isBoundedString(command.message, V0_LIMITS.MESSAGE, true);
   }
   return false;
+}
+
+/**
+ * The inner terminal event for an invoke. It rides an EventMessage; this
+ * validator intentionally does not validate the enclosing frame.
+ *
+ * Only failed and timed-out invocations may expose a fixed protocol error
+ * code. The code is never provider or SDK error text.
+ *
+ * @typedef {{ type: "invoke_terminal", disposition: string, code?: string }} InvokeTerminalEvent
+ */
+export function isInvokeTerminalEvent(value) {
+  if (
+    !hasExactPlainOwnFields(value, ["type", "disposition"]) &&
+    !hasExactPlainOwnFields(value, ["type", "disposition", "code"])
+  ) {
+    return false;
+  }
+  if (
+    value.type !== "invoke_terminal" ||
+    !INVOKE_TERMINAL_DISPOSITIONS.includes(value.disposition)
+  ) {
+    return false;
+  }
+  if (!hasOwn(value, "code")) return true;
+  return (
+    (value.disposition === "failed" || value.disposition === "timed_out") &&
+    isBoundedString(value.code, V0_LIMITS.TERMINAL_ERROR_CODE) &&
+    Object.values(PROTOCOL_ERROR_CODES).includes(value.code)
+  );
 }
 
 /**

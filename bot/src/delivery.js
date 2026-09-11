@@ -10,15 +10,31 @@ export function createTextAttachment(text, name) {
 }
 export function formatDeliveryError(error) {
   if (!error || typeof error !== "object") return String(error ?? "unknown error");
+  const localDeadlineWording = {
+    idle_timeout:
+      "The bot stopped waiting because the host produced no activity. Interruption is unconfirmed; verify the host state before retrying.",
+    hard_cap:
+      "The bot reached its absolute wait limit. Interruption is unconfirmed; verify the host state before retrying.",
+  }[error.localOutcome];
+  if (localDeadlineWording) return localDeadlineWording;
+  const terminalWording = {
+    failed: "The host reported that the request failed. Follow the safety guidance before retrying.",
+    cancelled: "The host reported that the request was cancelled. Verify the host state for safety before retrying.",
+    paused: "The host reported that the request was paused. Verify the host state for safety before starting a new request.",
+    timed_out: "The host reported that the request timed out. Interruption is unconfirmed; verify the host state for safety before retrying.",
+    disconnected: "The request became disconnected from its observer. Interruption is unconfirmed; verify the host state for safety before retrying.",
+  }[error.terminalDisposition];
   if (
     typeof error.code === "string" &&
     typeof error.retryable === "boolean" &&
     typeof error.action === "string"
   ) {
-    return `${error.code} (action: ${error.action}; ${
+    const structured = `${error.code} (action: ${error.action}; ${
       error.retryable ? "retryable" : "not retryable"
     })`;
+    return terminalWording ? `${terminalWording}\n${structured}` : structured;
   }
+  if (terminalWording) return terminalWording;
   try {
     return JSON.stringify(error);
   } catch {

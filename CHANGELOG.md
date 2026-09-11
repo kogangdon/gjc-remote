@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Terminal disposition protocol
+
+- Negotiate `terminal_disposition_v1` before an invoke. Mixed peers fail closed:
+  after either bot or daemon updates to this capability, an old peer cannot
+  serve invokes. Deploy bot and daemon together.
+- An invoke now ends with one authoritative final `event` frame whose event is
+  `invoke_terminal`, with `done: true` and no top-level `error`. The exact
+  dispositions are `completed`, `failed`, `cancelled`, `paused`, `timed_out`,
+  and `disconnected`; the first valid terminal frame wins. `paused` and
+  `cancelled` are preserved rather than flattened into generic failure.
+- `timed_out` and `disconnected` report a terminal protocol outcome, not proof
+  that underlying SDK or process work stopped. A bot-local response timeout is
+  likewise an unconfirmed local failure, not a daemon timeout disposition.
+  On an adapter timeout, the daemon transfers its session/activity hold into
+  SessionPool retirement containment tracked in #234, because work may
+  continue while retirement settles. This does not implement cancellation;
+  #232 remains unimplemented.
+
 ### SDK 0.16.6 containment
 
 - Reject `steer` and `follow_up` with `SDK_LIVE_CONTROL_UNSUPPORTED` while a

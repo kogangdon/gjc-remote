@@ -99,6 +99,7 @@ export class SessionPool {
     this.sessionTransitions = new Map();
     /** @type {Map<string, { session: object, generation: number, managedIdentity?: string, settlement: Promise<{ status: string }>, state: "pending" | "retired" | "failed" }>} */
     this.retirements = new Map();
+    this.retiredSessions = new WeakSet();
     this.receiptRetirements = new Map();
     this.creationHolds = new Map();
     this.nextRetirementGeneration = 1;
@@ -320,6 +321,7 @@ export class SessionPool {
     }
     retirement.settlement = disposal.settlement.then((result) => {
       if (result.status === "fulfilled") {
+        this.retiredSessions.add(session);
         if (this.retirements.get(workDir) === retirement) {
           this.retirements.delete(workDir);
         }
@@ -378,6 +380,26 @@ export class SessionPool {
       ? "SESSION_RETIREMENT_FAILED"
       : "SESSION_RETIREMENT_PENDING";
     return error;
+  }
+
+  async #awaitRetirement(retirement) {
+    if (retirement.state === "failed") {
+      throw this.#retirementError(retirement);
+    }
+    const result = await retirement.bounded;
+    if (result.status === "fulfilled") return;
+    const error = result.status === "rejected"
+      ? this.#retirementError({ state: "failed" })
+      : this.#retirementError(retirement);
+    if (result.status === "timed_out") {
+      error.pendingCleanup = retirement.settlement.then((settlement) => {
+        if (settlement.status === "rejected") {
+          throw this.#retirementError({ state: "failed" });
+        }
+        return settlement;
+      });
+    }
+    throw error;
   }
 
   async #createSessionBounded(workDir, managedIdentity) {
@@ -641,6 +663,46 @@ export class SessionPool {
     transition.operation = operation;
     this.sessionTransitions.set(canonicalWorkDir, transition);
     return await operation;
+  }
+
+  async retireSession(session, { holds } = {}) {
+    if (!session || (typeof session !== "object" && typeof session !== "function")) {
+      throw new TypeError("session must be an object");
+    }
+    let retirement;
+    for (const candidate of this.retirements.values()) {
+      if (candidate.session === session) {
+        this.#addRetirementHolds(candidate, holds);
+        retirement = candidate;
+        break;
+      }
+    }
+    if (!retirement) {
+      for (const [workDir, entry] of this.sessions) {
+        if (entry.session !== session) continue;
+        retirement = this.#retire(
+          session,
+          workDir,
+          "timeout containment",
+          entry.managedIdentity,
+          holds
+        );
+        break;
+      }
+    }
+    if (!retirement) {
+      if (!this.retiredSessions.has(session)) {
+        const error = new Error("SDK session is not owned by this pool");
+        error.code = "SESSION_RETIREMENT_FAILED";
+        throw error;
+      }
+      this.#addRetirementHolds(
+        { holds: new Set(), releasedHolds: new Set(), state: "retired" },
+        holds
+      );
+      return;
+    }
+    await this.#awaitRetirement(retirement);
   }
 
   async retireManagedReceipt(workDir, receiptIdentity, { holds } = {}) {
