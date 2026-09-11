@@ -59,6 +59,13 @@ commands.push(
     .toJSON()
 );
 
+commands.push(
+  new SlashCommandBuilder()
+    .setName("cancel")
+    .setDescription("Request cancellation of your active GJC request in this channel")
+    .toJSON()
+);
+
 const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
 const route = DISCORD_GUILD_ID

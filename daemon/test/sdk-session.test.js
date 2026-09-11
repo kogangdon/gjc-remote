@@ -1011,6 +1011,101 @@ test("SDK adapter serializes commands per session", async () => {
   await session.dispose();
 });
 
+test("owned queued tickets revoke before dispatch and let the FIFO tail advance", async () => {
+  const agent = new FakeAgentSession();
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    if (message === "first") await firstGate;
+    agent.emit(terminalEvent({ text: message }));
+  };
+  const session = new SdkSession(agent);
+
+  const first = session.send({ type: "prompt", message: "first" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const second = session.sendOwned("channel-1", { type: "prompt", message: "second" }, () => {});
+  const third = session.send({ type: "prompt", message: "third" }, () => {});
+
+  assert.equal(second.phase, "queued");
+  assert.equal(second.revokeBeforeStart(), true);
+  assert.equal(second.revokeBeforeStart(), false);
+  assert.equal(second.phase, "terminal");
+  assert.deepEqual(await second.result, { revokedBeforeStart: true });
+  assert.deepEqual(agent.calls, [["prompt", "first"]]);
+
+  releaseFirst();
+  await Promise.all([first, third]);
+  assert.deepEqual(agent.calls, [
+    ["prompt", "first"],
+    ["prompt", "third"],
+  ]);
+  assert.equal(session.queuedCommands, 0);
+  assert.equal(session.isBusy(), false);
+  await session.dispose();
+});
+
+test("owned ticket activation synchronously wins its revoke CAS", async () => {
+  const agent = new FakeAgentSession();
+  let activations = 0;
+  let releaseActive;
+  const activeGate = new Promise((resolve) => {
+    releaseActive = resolve;
+  });
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    if (message === "active") await activeGate;
+    agent.emit(terminalEvent({ text: message }));
+  };
+  const session = new SdkSession(agent);
+
+  const queued = session.sendOwned("channel-1", { type: "prompt", message: "queued" }, () => {});
+  assert.equal(queued.revokeBeforeStart(), true);
+  assert.deepEqual(await queued.result, { revokedBeforeStart: true });
+
+  const active = session.sendOwned(
+    "channel-1",
+    { type: "prompt", message: "active" },
+    () => {},
+    undefined,
+    { onActivate: () => { activations += 1; } }
+  );
+  await waitForImmediate(() => active.phase === "active");
+  assert.equal(activations, 1);
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+  assert.equal(active.revokeBeforeStart(), false);
+
+  releaseActive();
+  assert.deepEqual(await active.result, { disposition: "completed" });
+  assert.equal(active.phase, "terminal");
+  assert.equal(active.revokeBeforeStart(), false);
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+  await session.dispose();
+});
+
+test("dispose rejects owned queued tickets without dispatching them", async () => {
+  const agent = new FakeAgentSession();
+  agent.prompt = (message) => {
+    agent.calls.push(["prompt", message]);
+    return new Promise(() => {});
+  };
+  const session = new SdkSession(agent);
+
+  const active = session.send({ type: "prompt", message: "active" }, () => {}, 10_000);
+  await waitForImmediate(() => agent.calls.length === 1);
+  const queued = session.sendOwned("channel-1", { type: "prompt", message: "queued" }, () => {});
+  const activeRejected = assert.rejects(active, /disposed/);
+  const queuedRejected = assert.rejects(queued.result, /disposed/);
+
+  await session.dispose();
+  await Promise.all([activeRejected, queuedRejected]);
+  assert.equal(queued.phase, "terminal");
+  assert.equal(queued.revokeBeforeStart(), false);
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+});
+
 test("live steer and follow-up fail closed without calling SDK queue hooks", async () => {
   const agent = new FakeAgentSession();
   let finishPrompt;
@@ -1037,6 +1132,17 @@ test("live steer and follow-up fail closed without calling SDK queue hooks", asy
         return true;
       }
     );
+    const owned = session.sendOwned(
+      `owned-${type}`,
+      { type, message: "unsupported owned live control" },
+      () => {},
+      100
+    );
+    await assert.rejects(owned.result, (error) => {
+      assert.equal(error.code, "SDK_LIVE_CONTROL_UNSUPPORTED");
+      return true;
+    });
+    assert.equal(owned.phase, "terminal");
   }
   assert.deepEqual(agent.calls, [["prompt", "active"]]);
   assert.equal(session.closed, false);
@@ -1054,6 +1160,58 @@ test("live steer and follow-up fail closed without calling SDK queue hooks", asy
     ["prompt", "active"],
     ["prompt", "idle retry"],
   ]);
+  await session.dispose();
+});
+
+test("adjacent owned live controls cannot outrun prompt activation", async () => {
+  const agent = new FakeAgentSession();
+  let finishPrompt;
+  agent.prompt = (message) => {
+    agent.calls.push(["prompt", message]);
+    return new Promise((resolve) => {
+      finishPrompt = resolve;
+    });
+  };
+  const session = new SdkSession(agent);
+  const revoked = session.sendOwned(
+    "revoked-control-owner",
+    { type: "follow_up", message: "revoked before admission" },
+    () => {},
+    100
+  );
+  assert.equal(revoked.revokeBeforeStart(), true);
+  assert.deepEqual(await revoked.result, { revokedBeforeStart: true });
+  const prompt = session.sendOwned(
+    "prompt-owner",
+    { type: "prompt", message: "active" },
+    () => {},
+    100
+  );
+  const steer = session.sendOwned(
+    "steer-owner",
+    { type: "steer", message: "must not queue" },
+    () => {},
+    100
+  );
+  const followUp = session.sendOwned(
+    "follow-up-owner",
+    { type: "follow_up", message: "must not queue" },
+    () => {},
+    100
+  );
+
+  for (const ticket of [steer, followUp]) {
+    await assert.rejects(ticket.result, (error) => {
+      assert.equal(error.code, "SDK_LIVE_CONTROL_UNSUPPORTED");
+      return true;
+    });
+    assert.equal(ticket.phase, "terminal");
+  }
+  await waitForImmediate(() => prompt.phase === "active");
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+  agent.emit(terminalEvent());
+  finishPrompt();
+  await prompt.result;
   await session.dispose();
 });
 
@@ -1281,7 +1439,7 @@ test("adversarial: non-positive/NaN/undefined idle and hard-cap config fall back
     assert.equal(noOptions.idleTimeoutMs, DEFAULT_IDLE_MS);
     assert.equal(noOptions.hardCapMs, DEFAULT_HARD_CAP_MS);
 
-    for (const bad of [0, -1, Number.NaN, undefined]) {
+    for (const bad of [0, -1, 1.5, 86_400_001, Number.NaN, undefined]) {
       const session = new SdkSession(new FakeAgentSession(), {
         idleTimeoutMs: bad,
         hardCapMs: bad,
@@ -1289,6 +1447,12 @@ test("adversarial: non-positive/NaN/undefined idle and hard-cap config fall back
       assert.equal(session.idleTimeoutMs, DEFAULT_IDLE_MS);
       assert.equal(session.hardCapMs, DEFAULT_HARD_CAP_MS);
     }
+    const maximum = new SdkSession(new FakeAgentSession(), {
+      idleTimeoutMs: 86_400_000,
+      hardCapMs: 86_400_000,
+    });
+    assert.equal(maximum.idleTimeoutMs, 86_400_000);
+    assert.equal(maximum.hardCapMs, 86_400_000);
 
     // A non-numeric/non-positive env value is likewise ignored, falling back
     // to the default rather than throwing or coercing to NaN/negative delays.

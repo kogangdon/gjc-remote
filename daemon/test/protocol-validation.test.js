@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   CAPABILITIES,
+  INVOKE_CANCELLATION_CAPABILITY,
+  INVOKE_CANCELLATION_OUTCOMES,
+  INVOKE_CANCELLATION_REASONS,
+  INVOKE_OWNERSHIP_RETENTION_MS,
   TERMINAL_DISPOSITION_CAPABILITY,
   INVOKE_TERMINAL_DISPOSITIONS,
   MAX_WS_PAYLOAD_BYTES,
@@ -31,6 +35,8 @@ import {
   isGateAnswerResultEvent,
   isBindOkMessage,
   isBindWorkspaceMessage,
+  isCancelInvokeMessage,
+  isCancelResultMessage,
   isEventMessage,
   isGateRequestEvent,
   isInvokeMessage,
@@ -439,10 +445,7 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [
-        TERMINAL_DISPOSITION_CAPABILITY,
-        WORKSPACE_READINESS_CAPABILITY,
-      ],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     assert.equal((await registerOk).type, MSG_TYPES.READINESS);
 
@@ -481,10 +484,7 @@ test("v2 bind verifies the authority preimage before same-binding replay accepta
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [
-        TERMINAL_DISPOSITION_CAPABILITY,
-        WORKSPACE_READINESS_CAPABILITY,
-      ],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -511,10 +511,7 @@ test("v2 bind verifies an advanced authority before lease adoption", async () =>
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [
-        TERMINAL_DISPOSITION_CAPABILITY,
-        WORKSPACE_READINESS_CAPABILITY,
-      ],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -614,10 +611,7 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [
-        TERMINAL_DISPOSITION_CAPABILITY,
-        WORKSPACE_READINESS_CAPABILITY,
-      ],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await initialReadiness;
     const readinessPromise = waitForMessage(
@@ -1248,10 +1242,7 @@ test("daemon rejects an invoke with a stale workspace generation", async () => {
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [
-        TERMINAL_DISPOSITION_CAPABILITY,
-        WORKSPACE_READINESS_CAPABILITY,
-      ],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -1485,10 +1476,7 @@ test("daemon replaces an older binding for the same workspace after a generation
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [
-        TERMINAL_DISPOSITION_CAPABILITY,
-        WORKSPACE_READINESS_CAPABILITY,
-      ],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -1624,6 +1612,60 @@ test("malformed invoke closes with a policy violation", async () => {
   }
 });
 
+test("malformed cancellation closes with a policy violation", async () => {
+  const daemon = await startDaemon();
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: CAPABILITIES,
+    }));
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId: "request-1",
+      cancelId: "cancel-1",
+      reason: "user_cancelled",
+      extra: true,
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("conflicting reuse of a cancellation id closes the connection", async () => {
+  const daemon = await startDaemon();
+  try {
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.REGISTER_OK,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: CAPABILITIES,
+    }));
+    const receipt = onceMessage(daemon.peer, MSG_TYPES.EVENT);
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId: "request-1",
+      cancelId: "cancel-conflict",
+      reason: "user_cancelled",
+    }));
+    assert.equal((await receipt).event.outcome, "not_owned");
+
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify({
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId: "request-2",
+      cancelId: "cancel-conflict",
+      reason: "user_cancelled",
+    }));
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await daemon.close();
+  }
+});
+
 test("daemon closes a socket that reuses an in-flight requestId", async () => {
   const daemon = await startDaemon();
   try {
@@ -1650,7 +1692,7 @@ test("daemon closes a socket that reuses an in-flight requestId", async () => {
   }
 });
 
-test("daemon permits requestId reuse only after the prior invoke settles", async () => {
+test("daemon refuses requestId reuse while the terminal tombstone is retained", async () => {
   const daemon = await startDaemon();
   try {
     daemon.peer.send(JSON.stringify({
@@ -1665,21 +1707,23 @@ test("daemon permits requestId reuse only after the prior invoke settles", async
       command: { kind: "prompt", message: "fail setup" },
     };
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const response = once(daemon.peer, "message");
-      daemon.peer.send(JSON.stringify(invoke));
-      const [raw] = await response;
-      const event = JSON.parse(raw.toString());
-      assert.equal(event.requestId, invoke.requestId);
-      assert.equal(event.done, true);
-      assert.deepEqual(event.event, {
-        type: "invoke_terminal",
-        disposition: "failed",
-        code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
-      });
-      assert.equal(event.error, undefined);
-    }
-    assert.equal(daemon.peer.readyState, WebSocket.OPEN);
+    const response = once(daemon.peer, "message");
+    daemon.peer.send(JSON.stringify(invoke));
+    const [raw] = await response;
+    const event = JSON.parse(raw.toString());
+    assert.equal(event.requestId, invoke.requestId);
+    assert.equal(event.done, true);
+    assert.deepEqual(event.event, {
+      type: "invoke_terminal",
+      disposition: "failed",
+      code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+    });
+    assert.equal(event.error, undefined);
+
+    const closed = once(daemon.peer, "close");
+    daemon.peer.send(JSON.stringify(invoke));
+    const [code] = await closed;
+    assert.equal(code, 1008);
   } finally {
     await daemon.close();
   }
@@ -1808,6 +1852,135 @@ test("terminal disposition capability is frozen and advertised", () => {
   assert.equal(TERMINAL_DISPOSITION_CAPABILITY, "terminal_disposition_v1");
   assert.equal(Object.isFrozen(CAPABILITIES), true);
   assert.ok(CAPABILITIES.includes(TERMINAL_DISPOSITION_CAPABILITY));
+});
+
+test("invoke cancellation contract validates exact cancellation frames and receipts", () => {
+  const cancel = {
+    type: MSG_TYPES.CANCEL_INVOKE,
+    requestId: "request-1",
+    cancelId: "cancel-1",
+    reason: INVOKE_CANCELLATION_REASONS[0],
+  };
+  for (const reason of INVOKE_CANCELLATION_REASONS) {
+    assert.equal(isCancelInvokeMessage({ ...cancel, reason }), true, reason);
+  }
+  assert.equal(
+    isCancelInvokeMessage({
+      ...cancel,
+      requestId: "x".repeat(V0_LIMITS.REQUEST_ID),
+      cancelId: "x".repeat(V0_LIMITS.REQUEST_ID),
+    }),
+    true
+  );
+
+  const result = {
+    type: MSG_TYPES.EVENT,
+    requestId: "request-1",
+    event: {
+      type: MSG_TYPES.CANCEL_RESULT,
+      cancelId: "cancel-1",
+      outcome: INVOKE_CANCELLATION_OUTCOMES[0],
+    },
+  };
+  for (const outcome of INVOKE_CANCELLATION_OUTCOMES) {
+    assert.equal(isCancelResultMessage({
+      ...result,
+      event: { ...result.event, outcome },
+    }), true, outcome);
+  }
+  assert.equal(
+    isCancelResultMessage({
+      ...result,
+      requestId: "x".repeat(V0_LIMITS.REQUEST_ID),
+      event: { ...result.event, cancelId: "x".repeat(V0_LIMITS.REQUEST_ID) },
+    }),
+    true
+  );
+
+  for (const invalid of [
+    null,
+    [],
+    Object.create(null),
+    { type: MSG_TYPES.CANCEL_INVOKE },
+    { ...cancel, type: MSG_TYPES.INVOKE },
+    { ...cancel, requestId: "" },
+    { ...cancel, requestId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+    { ...cancel, cancelId: "" },
+    { ...cancel, cancelId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+    { ...cancel, reason: "" },
+    { ...cancel, reason: "unknown" },
+    { ...cancel, reason: 1 },
+    { ...cancel, extra: true },
+  ]) {
+    assert.equal(isCancelInvokeMessage(invalid), false);
+  }
+
+  for (const invalid of [
+    null,
+    [],
+    Object.create(null),
+    { type: MSG_TYPES.EVENT, requestId: "request-1" },
+    { ...result, type: MSG_TYPES.INVOKE },
+    { ...result, requestId: "" },
+    { ...result, requestId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+    { ...result, done: false },
+    { ...result, error: "must not be present" },
+    { ...result, extra: true },
+    { ...result, event: null },
+    { ...result, event: { type: MSG_TYPES.CANCEL_RESULT } },
+    { ...result, event: { ...result.event, type: MSG_TYPES.EVENT } },
+    { ...result, event: { ...result.event, cancelId: "" } },
+    {
+      ...result,
+      event: {
+        ...result.event,
+        cancelId: "x".repeat(V0_LIMITS.REQUEST_ID + 1),
+      },
+    },
+    { ...result, event: { ...result.event, outcome: "" } },
+    { ...result, event: { ...result.event, outcome: "unknown" } },
+    { ...result, event: { ...result.event, outcome: 1 } },
+    { ...result, event: { ...result.event, extra: true } },
+  ]) {
+    assert.equal(isCancelResultMessage(invalid), false);
+  }
+
+  const inheritedCancel = Object.create(cancel);
+  assert.equal(isCancelInvokeMessage(inheritedCancel), false);
+  const inheritedResult = Object.create(result);
+  assert.equal(isCancelResultMessage(inheritedResult), false);
+  const inheritedEvent = Object.create(result.event);
+  assert.equal(
+    isCancelResultMessage({ ...result, event: inheritedEvent }),
+    false
+  );
+  const symbol = Symbol("extra");
+  assert.equal(isCancelInvokeMessage({ ...cancel, [symbol]: true }), false);
+  assert.equal(
+    isCancelResultMessage({ ...result, event: { ...result.event, [symbol]: true } }),
+    false
+  );
+});
+
+test("invoke cancellation capability is frozen and advertised", () => {
+  assert.equal(INVOKE_CANCELLATION_CAPABILITY, "invoke_cancellation_v1");
+  assert.deepEqual(INVOKE_CANCELLATION_REASONS, [
+    "idle_timeout",
+    "hard_cap",
+    "disconnect",
+    "user_cancelled",
+    "presentation_failed",
+  ]);
+  assert.deepEqual(INVOKE_CANCELLATION_OUTCOMES, [
+    "cancelled_before_start",
+    "cancellation_pending",
+    "already_terminal",
+    "not_owned",
+  ]);
+  assert.equal(Object.isFrozen(INVOKE_CANCELLATION_REASONS), true);
+  assert.equal(Object.isFrozen(INVOKE_CANCELLATION_OUTCOMES), true);
+  assert.equal(INVOKE_OWNERSHIP_RETENTION_MS, 86_400_000);
+  assert.equal(CAPABILITIES.includes(INVOKE_CANCELLATION_CAPABILITY), true);
 });
 
 test("isAnswerMessage accepts a well-formed answer and rejects malformed ones (#35)", () => {

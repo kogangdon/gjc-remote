@@ -140,8 +140,19 @@ test("terminal failures use truthful fixed safety wording", () => {
   );
 });
 
-test("bot-local deadlines warn that interruption is unconfirmed", () => {
-  for (const localOutcome of ["idle_timeout", "hard_cap"]) {
+test("bot-local deadlines and cancellation uncertainty warn that interruption is unconfirmed", () => {
+  for (const localOutcome of [
+    "idle_timeout",
+    "hard_cap",
+    "cancellation_pending",
+    "cancellation_receipt_timeout",
+    "cancellation_terminal_timeout",
+    "cancellation_terminal_conflict",
+    "cancellation_send_failed",
+    "already_terminal",
+    "not_owned",
+    "cancellation_unconfirmed",
+  ]) {
     const rendered = formatDeliveryError({
       localOutcome,
       code: "UNKNOWN_RUNTIME",

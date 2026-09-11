@@ -15,6 +15,8 @@ import {
   PROTOCOL_ERROR_CODES,
   V0_LIMITS,
   TERMINAL_DISPOSITION_CAPABILITY,
+  INVOKE_CANCELLATION_CAPABILITY,
+  INVOKE_OWNERSHIP_RETENTION_MS,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -24,6 +26,8 @@ import {
   isGateRequestEvent,
   isInvokeMessage,
   isInvokeTerminalEvent,
+  isCancelInvokeMessage,
+  isCancelResultMessage,
   isMappingGeneration,
   isMappingId,
   isMappingVersion,
@@ -53,6 +57,8 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 const INVOKE_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const INVOKE_HARD_CAP_MS = 30 * 60 * 1000;
+const CANCEL_RECEIPT_TIMEOUT_MS = 10_000;
+const MAX_CANCEL_TOMBSTONES = 64;
 const GATE_ANSWER_TIMEOUT_MS = 30 * 1000;
 const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
@@ -85,7 +91,9 @@ const OBSERVABILITY_CODES = Object.freeze(new Set([
 ]));
 const MAX_UINT53 = Number.MAX_SAFE_INTEGER;
 const PING_PAYLOAD = JSON.stringify(PING);
-const V2_CAPABILITIES = Object.freeze([...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
+// Cancellation is a bot-owned admission requirement, deliberately not a
+const BOT_CAPABILITIES = CAPABILITIES;
+const V2_CAPABILITIES = Object.freeze([...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
 const V3_CAPABILITIES = Object.freeze([
   ...V2_CAPABILITIES,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
@@ -99,7 +107,11 @@ const SYSTEM_TIMERS = {
 };
 
 function isPositiveDuration(value) {
-  return Number.isFinite(value) && value > 0;
+  return (
+    Number.isInteger(value) &&
+    value > 0 &&
+    value <= INVOKE_OWNERSHIP_RETENTION_MS
+  );
 }
 function redactOpaqueId(value) {
   return isWorkspaceId(String(value)) ? String(value) : "[redacted-host]";
@@ -188,6 +200,14 @@ function localDeadlineError(kind) {
     action: "verify_host_state",
   };
 }
+function interruptionUnconfirmedError(kind) {
+  return {
+    localOutcome: kind,
+    code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+    retryable: false,
+    action: "verify_host_state",
+  };
+}
 
 /**
  * WS server that host daemons connect to (outbound from the daemon's side).
@@ -203,6 +223,9 @@ export class HostRegistry {
    *   heartbeatTimeoutMs?: number,
    *   invokeIdleTimeoutMs?: number,
    *   invokeHardCapMs?: number,
+   *   cancelReceiptTimeoutMs?: number,
+   *   cancelIdFactory?: () => string,
+   *   requestIdFactory?: () => string,
    *   gateAnswerTimeoutMs?: number,
    *   workspaceServingEnabled?: boolean,
    *   timers?: typeof SYSTEM_TIMERS,
@@ -219,6 +242,9 @@ export class HostRegistry {
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
     invokeIdleTimeoutMs = INVOKE_IDLE_TIMEOUT_MS,
     invokeHardCapMs = INVOKE_HARD_CAP_MS,
+    cancelReceiptTimeoutMs = CANCEL_RECEIPT_TIMEOUT_MS,
+    cancelIdFactory = randomUUID,
+    requestIdFactory = randomUUID,
     gateAnswerTimeoutMs = GATE_ANSWER_TIMEOUT_MS,
     workspaceServingEnabled = false,
     timers = SYSTEM_TIMERS,
@@ -242,6 +268,23 @@ export class HostRegistry {
     if (!isPositiveDuration(invokeHardCapMs)) {
       throw new Error("invokeHardCapMs must be a positive duration");
     }
+    if (!isPositiveDuration(cancelReceiptTimeoutMs)) {
+      throw new Error("cancelReceiptTimeoutMs must be a positive duration");
+    }
+    if (
+      invokeHardCapMs + cancelReceiptTimeoutMs >
+      INVOKE_OWNERSHIP_RETENTION_MS
+    ) {
+      throw new Error(
+        "invokeHardCapMs plus cancelReceiptTimeoutMs exceeds the safe timer bound"
+      );
+    }
+    if (typeof cancelIdFactory !== "function") {
+      throw new Error("cancelIdFactory must be a function");
+    }
+    if (typeof requestIdFactory !== "function") {
+      throw new Error("requestIdFactory must be a function");
+    }
     if (
       !Number.isInteger(gateAnswerTimeoutMs) ||
       gateAnswerTimeoutMs < 1 ||
@@ -254,6 +297,10 @@ export class HostRegistry {
     this.invokeIdleTimeoutMs = invokeIdleTimeoutMs;
     this.workspaceServingEnabled = workspaceServingEnabled === true;
     this.invokeHardCapMs = invokeHardCapMs;
+    this.cancelReceiptTimeoutMs = cancelReceiptTimeoutMs;
+    this.cancelTombstoneTtlMs = INVOKE_OWNERSHIP_RETENTION_MS;
+    this.cancelIdFactory = cancelIdFactory;
+    this.requestIdFactory = requestIdFactory;
     this.gateAnswerTimeoutMs = gateAnswerTimeoutMs;
     this.bindingDeadlineMs = BINDING_DEADLINE_MS;
     this.timers = timers;
@@ -261,10 +308,15 @@ export class HostRegistry {
     this.monotonicNow = monotonicNow;
     /** @type {Map<string, import("ws").WebSocket>} */
     this.connections = new Map();
+    /** @type {Map<import("ws").WebSocket, number>} */
+    this.connectionIdentities = new Map();
+    this.nextConnectionIdentity = 0;
     /** @type {Map<import("ws").WebSocket, { hostId: string, timeout?: object }>} */
     this.heartbeatStates = new Map();
     /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string, truncated?: boolean }>} */
     this.pendingRequests = new Map();
+    /** @type {Map<string, { socket: import("ws").WebSocket, cancelId: string, timer?: object }>} */
+    this.cancelTombstones = new Map();
     /** @type {Map<string, { answerId: string, requestId: string, gateId: string, socket: import("ws").WebSocket, pending: object, timer?: object, resolve: (v: any) => void }>} */
     this.pendingGateAnswers = new Map();
     /** @type {Map<import("ws").WebSocket, number>} */
@@ -352,7 +404,7 @@ export class HostRegistry {
         : {
             type: MSG_TYPES.REGISTER_OK,
             protocolVersion: PROTOCOL_VERSION,
-            capabilities: CAPABILITIES,
+            capabilities: BOT_CAPABILITIES,
           };
       if (!isRegisterOkMessage(registerOk)) {
         socket.close(1008, "invalid register response");
@@ -411,6 +463,8 @@ export class HostRegistry {
         this.reconnectCounts.set(hostId, 0);
       }
       this.connections.set(hostId, socket);
+      this.nextConnectionIdentity = Math.min(MAX_UINT53, this.nextConnectionIdentity + 1);
+      this.connectionIdentities.set(socket, this.nextConnectionIdentity);
       this.heartbeatStates.set(socket, { hostId });
       const readinessEnabled =
         isReadinessCapabilityGate(msg, registerOk) || bindingEnabled;
@@ -419,7 +473,7 @@ export class HostRegistry {
         msg.protocolVersion ?? 0
       );
       const capabilities = negotiateCapabilities(
-        bindingEnabled ? V3_CAPABILITIES : readinessEnabled ? V2_CAPABILITIES : CAPABILITIES,
+        bindingEnabled ? V3_CAPABILITIES : readinessEnabled ? V2_CAPABILITIES : BOT_CAPABILITIES,
         msg.capabilities
       );
       this.hostInfo.set(hostId, { protocolVersion, capabilities });
@@ -550,10 +604,41 @@ export class HostRegistry {
       this.#acceptGateAnswerResult(socket, msg.requestId, msg.event);
       return;
     }
+    if (msg.event?.type === MSG_TYPES.CANCEL_RESULT) {
+      if (!isCancelResultMessage(msg)) {
+        socket.close(1008, "invalid cancel result");
+        return;
+      }
+      this.#acceptCancelResult(socket, msg);
+      return;
+    }
 
     const pending = this.pendingRequests.get(msg.requestId);
-    if (!pending) return;
-    if (pending.socket !== socket) {
+    if (!pending) {
+      const tombstone = this.cancelTombstones.get(msg.requestId);
+      if (
+        tombstone?.socket === socket &&
+        tombstone.connectionIdentity === this.connectionIdentities.get(socket)
+      ) {
+        if (msg.event?.type === "invoke_terminal") {
+          if (
+            msg.done !== true ||
+            msg.error !== undefined ||
+            Object.keys(msg).length !== 4 ||
+            !isInvokeTerminalEvent(msg.event)
+          ) {
+            socket.close(1008, "invalid invoke terminal");
+            return;
+          }
+          this.#deleteCancelTombstone(msg.requestId);
+        }
+      }
+      return;
+    }
+    if (
+      pending.socket !== socket ||
+      pending.connectionIdentity !== this.connectionIdentities.get(socket)
+    ) {
       socket.close(1008, "request owner mismatch");
       return;
     }
@@ -567,6 +652,20 @@ export class HostRegistry {
         !isInvokeTerminalEvent(msg.event)
       ) {
         socket.close(1008, "invalid invoke terminal");
+        return;
+      }
+      if (
+        pending.cancellation?.receipt === "cancelled_before_start" &&
+        msg.event.disposition !== "cancelled"
+      ) {
+        pending.settle({
+          ok: false,
+          error: interruptionUnconfirmedError(
+            "cancellation_terminal_conflict"
+          ),
+        }, "cancellation_terminal_conflict");
+        this.#retireCancellationTracker(pending);
+        socket.close(1008, "conflicting cancellation terminal");
         return;
       }
       const { disposition, code } = msg.event;
@@ -584,6 +683,7 @@ export class HostRegistry {
         });
       }
       this.#deletePending(msg.requestId);
+      this.#deleteCancelTombstone(msg.requestId);
       return;
     }
     if (msg.error !== undefined || msg.done !== undefined) {
@@ -591,6 +691,7 @@ export class HostRegistry {
       return;
     }
     if (msg.event !== undefined) {
+      if (pending.cancellation) return;
       const event = msg.event;
       // #35: a gate_request means the daemon's agent loop is now blocked awaiting
       // a user answer. Suspend the invoke idle timer (the user may take minutes);
@@ -603,19 +704,23 @@ export class HostRegistry {
         pending.idleTimer = undefined;
         // Route to the dedicated gate callback (carries requestId, needed to send
         // the answer back). Not forwarded to onEvent — gates are not stream text.
-        try {
-          pending.onGate?.({
+        const gate = {
             gateId: event.gateId,
             requestId: msg.requestId,
             prompt: event.prompt,
             kind: event.kind,
             choices: event.choices,
+        };
+        try {
+          if (typeof pending.onGate !== "function") {
+            this.#initiateCancellation(pending, "presentation_failed");
+            return;
+          }
+          Promise.resolve(pending.onGate(gate)).catch(() => {
+            this.#initiateCancellation(pending, "presentation_failed");
           });
-        } catch (error) {
-          console.error(
-            "HostRegistry gate handler failed:",
-            error instanceof Error ? error.message : String(error)
-          );
+        } catch {
+          this.#initiateCancellation(pending, "presentation_failed");
         }
         return;
       }
@@ -1690,11 +1795,7 @@ export class HostRegistry {
         return;
       }
       pending.idleTimer = undefined;
-      this.#deletePending(pending.requestId);
-      pending.settle(
-        { ok: false, error: localDeadlineError("idle_timeout") },
-        "idle_timeout",
-      );
+      this.#initiateCancellation(pending, "idle_timeout");
     }, pending.idleMs);
     pending.idleTimer = idleTimer;
     idleTimer?.unref?.();
@@ -1705,12 +1806,159 @@ export class HostRegistry {
     if (!entry) return;
     this.timers.clearTimeout(entry.idleTimer);
     this.timers.clearTimeout(entry.hardCapTimer);
+    this.timers.clearTimeout(entry.cancelReceiptTimer);
     entry.idleTimer = undefined;
     entry.hardCapTimer = undefined;
+    entry.cancelReceiptTimer = undefined;
     this.pendingRequests.delete(requestId);
     const next = (this.pendingCountBySocket.get(entry.socket) ?? 0) - 1;
     if (next > 0) this.pendingCountBySocket.set(entry.socket, next);
     else this.pendingCountBySocket.delete(entry.socket);
+  }
+
+  #deleteCancelTombstone(requestId) {
+    const entry = this.cancelTombstones.get(requestId);
+    if (!entry) return;
+    this.timers.clearTimeout(entry.timer);
+    this.cancelTombstones.delete(requestId);
+  }
+
+  #retainCancelTombstone(pending) {
+    this.#deleteCancelTombstone(pending.requestId);
+    if (this.cancelTombstones.size >= MAX_CANCEL_TOMBSTONES) return false;
+    const entry = {
+      socket: pending.socket,
+      connectionIdentity: pending.connectionIdentity,
+      cancelId: pending.cancellation.cancelId,
+    };
+    const timer = this.timers.setTimeout(() => {
+      if (this.cancelTombstones.get(pending.requestId) === entry) {
+        this.cancelTombstones.delete(pending.requestId);
+      }
+    }, this.cancelTombstoneTtlMs);
+    entry.timer = timer;
+    timer?.unref?.();
+    this.cancelTombstones.set(pending.requestId, entry);
+    return true;
+  }
+
+  #retireCancellationTracker(pending) {
+    if (this.#retainCancelTombstone(pending)) {
+      this.#deletePending(pending.requestId);
+    }
+  }
+
+  #initiateCancellation(pending, reason) {
+    if (this.pendingRequests.get(pending.requestId) !== pending) return false;
+    if (pending.cancellation) return true;
+    if (
+      pending.socket.readyState !== WebSocket.OPEN ||
+      this.connections.get(pending.hostId) !== pending.socket
+    ) {
+      pending.settle({
+        ok: false,
+        error: terminalError("disconnected", PROTOCOL_ERROR_CODES.CONNECTION_LOST),
+      }, "disconnect");
+      this.#deletePending(pending.requestId);
+      return false;
+    }
+    const cancelId = this.cancelIdFactory();
+    const cancelFrame = {
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId: pending.requestId,
+      cancelId,
+      reason,
+    };
+    if (!isCancelInvokeMessage(cancelFrame)) {
+      pending.settle({ ok: false, error: interruptionUnconfirmedError("cancellation_unconfirmed") });
+      this.#deletePending(pending.requestId);
+      return false;
+    }
+    pending.cancellation = { cancelId, reason };
+    this.timers.clearTimeout(pending.idleTimer);
+    this.timers.clearTimeout(pending.hardCapTimer);
+    pending.idleTimer = undefined;
+    pending.hardCapTimer = undefined;
+    const receiptTimer = this.timers.setTimeout(() => {
+      if (
+        pending.cancelReceiptTimer !== receiptTimer ||
+        this.pendingRequests.get(pending.requestId) !== pending
+      ) return;
+      pending.cancelReceiptTimer = undefined;
+      pending.settle({
+        ok: false,
+        error: interruptionUnconfirmedError("cancellation_receipt_timeout"),
+      }, "cancellation_receipt_timeout");
+      this.#retireCancellationTracker(pending);
+    }, this.cancelReceiptTimeoutMs);
+    pending.cancelReceiptTimer = receiptTimer;
+    receiptTimer?.unref?.();
+    try {
+      pending.socket.send(JSON.stringify(cancelFrame));
+      return true;
+    } catch {
+      this.timers.clearTimeout(receiptTimer);
+      pending.cancelReceiptTimer = undefined;
+      pending.settle({
+        ok: false,
+        error: interruptionUnconfirmedError("cancellation_send_failed"),
+      }, "cancellation_send_failed");
+      this.#retireCancellationTracker(pending);
+      return false;
+    }
+  }
+
+  #acceptCancelResult(socket, msg) {
+    const pending = this.pendingRequests.get(msg.requestId);
+    if (
+      !pending ||
+      pending.socket !== socket ||
+      pending.connectionIdentity !== this.connectionIdentities.get(socket) ||
+      pending.cancellation?.cancelId !== msg.event.cancelId
+    ) return;
+    if (pending.cancellation.receipt !== undefined) {
+      if (pending.cancellation.receipt !== msg.event.outcome) {
+        socket.close(1008, "conflicting cancel result");
+      }
+      return;
+    }
+    this.timers.clearTimeout(pending.cancelReceiptTimer);
+    pending.cancelReceiptTimer = undefined;
+    if (msg.event.outcome === "cancelled_before_start") {
+      pending.cancellation.receipt = msg.event.outcome;
+      const terminalTimer = this.timers.setTimeout(() => {
+        if (
+          pending.cancelReceiptTimer !== terminalTimer ||
+          this.pendingRequests.get(pending.requestId) !== pending
+        ) {
+          return;
+        }
+        pending.cancelReceiptTimer = undefined;
+        pending.settle({
+          ok: false,
+          error: interruptionUnconfirmedError(
+            "cancellation_terminal_timeout"
+          ),
+        }, "cancellation_terminal_timeout");
+        this.#retireCancellationTracker(pending);
+      }, this.cancelReceiptTimeoutMs);
+      pending.cancelReceiptTimer = terminalTimer;
+      terminalTimer?.unref?.();
+      return;
+    }
+    if (msg.event.outcome === "cancellation_pending") {
+      pending.settle({
+        ok: false,
+        error: interruptionUnconfirmedError("cancellation_pending"),
+      }, "cancellation_pending");
+      this.#retireCancellationTracker(pending);
+      return;
+    }
+    pending.settle({
+      ok: false,
+      error: interruptionUnconfirmedError(msg.event.outcome),
+    }, msg.event.outcome);
+    this.#retireCancellationTracker(pending);
   }
 
   #failPendingForSocket(socket, error) {
@@ -1724,6 +1972,9 @@ export class HostRegistry {
         ),
       });
       this.#deletePending(requestId);
+    }
+    for (const [requestId, tombstone] of this.cancelTombstones) {
+      if (tombstone.socket === socket) this.#deleteCancelTombstone(requestId);
     }
     for (const entry of [...this.pendingGateAnswers.values()]) {
       if (entry.socket !== socket) continue;
@@ -1750,6 +2001,14 @@ export class HostRegistry {
   }
 
   #dropConnection(hostId, socket, error) {
+    // A replacement/heartbeat retirement can still have a live transport.
+    // Send the single ownership-revocation frame before clearing local owner
+    // state; a physical close has no writable transport and skips this path.
+    if (socket.readyState === WebSocket.OPEN) {
+      for (const pending of this.pendingRequests.values()) {
+        if (pending.socket === socket) this.#initiateCancellation(pending, "disconnect");
+      }
+    }
     const wasCurrent = this.connections.get(hostId) === socket;
     if (wasCurrent) {
       this.connections.delete(hostId);
@@ -1758,6 +2017,7 @@ export class HostRegistry {
       if (readiness) this.#markOfflineReadiness(readiness);
     }
     this.#clearHeartbeat(socket);
+    this.connectionIdentities.delete(socket);
     this.#failPendingForSocket(socket, error);
     return wasCurrent;
   }
@@ -1900,13 +2160,18 @@ export class HostRegistry {
     this.heartbeatTimer = undefined;
 
     for (const socket of this.wss.clients) {
+      for (const pending of this.pendingRequests.values()) {
+        if (pending.socket === socket) {
+          this.#initiateCancellation(pending, "disconnect");
+        }
+      }
       const state = this.heartbeatStates.get(socket);
       if (state) {
         this.#dropConnection(state.hostId, socket, remediationError(PROTOCOL_ERROR_CODES.CONNECTION_LOST));
       } else {
         this.#clearHeartbeat(socket);
       }
-      socket.terminate();
+      socket.close(1001, "bot shutting down");
     }
     for (const entry of [...this.pendingGateAnswers.values()]) {
       this.#settleGateAnswer(entry, {
@@ -2112,8 +2377,18 @@ export class HostRegistry {
  *   needed to route the answer back via answerGate().
  * @param {{ bindingId?: string, mappingId?: string, mappingGeneration?: number, mappingVersion?: number,
  *   sourcePlatform?: string, workspaceId?: string, workspaceGeneration?: number, authority?: object }} [routeIdentity]
+ * @param {(requestId: string) => void} [onRequestCreated]
  */
-invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, onGate, routeIdentity) {
+  async invoke(
+    hostId,
+    workDir,
+    command,
+    onEvent,
+    timeoutMs = this.invokeIdleTimeoutMs,
+    onGate,
+    routeIdentity,
+    onRequestCreated
+  ) {
     let managedAuthority;
     try {
       managedAuthority = freezeManagedAuthorityDescriptor(hostId, routeIdentity);
@@ -2231,7 +2506,16 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       );
     }
 
-    const requestId = randomUUID();
+    const requestId = this.requestIdFactory();
+    if (
+      this.pendingRequests.has(requestId) ||
+      this.cancelTombstones.has(requestId)
+    ) {
+      return this.#denyInvoke(
+        hostId,
+        remediationError(PROTOCOL_ERROR_CODES.LEASE_CONFLICT)
+      );
+    }
     const invoke = { type: MSG_TYPES.INVOKE, requestId, command };
     if (usesV2) {
       const {
@@ -2284,10 +2568,10 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED
       );
     }
+    const capabilities = this.hostInfo.get(hostId)?.capabilities ?? [];
     if (
-      !this.hostInfo.get(hostId)?.capabilities.includes(
-        TERMINAL_DISPOSITION_CAPABILITY
-      )
+      !capabilities.includes(TERMINAL_DISPOSITION_CAPABILITY) ||
+      !capabilities.includes(INVOKE_CANCELLATION_CAPABILITY)
     ) {
       return this.#denyInvoke(
         hostId,
@@ -2315,12 +2599,16 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       const monotonicStartedAt = this.monotonicNow();
       const pending = {
         requestId,
+        hostId,
         socket,
+        connectionIdentity: this.connectionIdentities.get(socket),
         onEvent,
         onGate,
         idleMs: timeoutMs,
         idleTimer: undefined,
         hardCapTimer: undefined,
+        cancelReceiptTimer: undefined,
+        cancellation: undefined,
         gatePending: false,
         gateId: undefined,
         gateAnswers: new Map(),
@@ -2354,11 +2642,7 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
         resolve: (result) => pending.settle(result),
       };
       pending.hardCapTimer = this.timers.setTimeout(() => {
-        this.#deletePending(requestId);
-        pending.settle(
-          { ok: false, error: localDeadlineError("hard_cap") },
-          "hard_cap",
-        );
+        this.#initiateCancellation(pending, "hard_cap");
       }, this.invokeHardCapMs);
       pending.hardCapTimer?.unref?.();
 
@@ -2374,7 +2658,38 @@ invoke(hostId, workDir, command, onEvent, timeoutMs = this.invokeIdleTimeoutMs, 
       });
 
       socket.send(payload);
+      try {
+        onRequestCreated?.(requestId);
+      } catch {
+        this.#initiateCancellation(pending, "presentation_failed");
+      }
     });
+  }
+
+  /**
+   * Begins cancellation of one exact, currently bot-owned invocation. The
+   * daemon terminal frame remains the only proof that it actually stopped.
+   *
+   * @param {string} hostId
+   * @param {string} requestId
+   * @param {"user_cancelled"|"presentation_failed"} reason
+   */
+  cancelInvoke(hostId, requestId, reason) {
+    if (reason !== "user_cancelled" && reason !== "presentation_failed") {
+      return { ok: false, error: "invalid cancellation reason" };
+    }
+    const pending = this.pendingRequests.get(requestId);
+    if (
+      !pending ||
+      pending.hostId !== hostId ||
+      this.connections.get(hostId) !== pending.socket
+    ) {
+      return { ok: false, error: "no owned in-flight request" };
+    }
+    const started = this.#initiateCancellation(pending, reason);
+    return started
+      ? { ok: true, cancelId: pending.cancellation.cancelId }
+      : { ok: false, error: "cancellation could not be sent" };
   }
 
   /**

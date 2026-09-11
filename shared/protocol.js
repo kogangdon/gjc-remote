@@ -571,6 +571,22 @@ export const READINESS_REMEDIATION_BY_CODE = READINESS_REMEDIATIONS;
 export const PROTOCOL_VERSION = 1;
 
 export const TERMINAL_DISPOSITION_CAPABILITY = "terminal_disposition_v1";
+export const INVOKE_CANCELLATION_CAPABILITY = "invoke_cancellation_v1";
+export const INVOKE_CANCELLATION_REASONS = Object.freeze([
+  "idle_timeout",
+  "hard_cap",
+  "disconnect",
+  "user_cancelled",
+  "presentation_failed",
+]);
+export const INVOKE_CANCELLATION_OUTCOMES = Object.freeze([
+  "cancelled_before_start",
+  "cancellation_pending",
+  "already_terminal",
+  "not_owned",
+]);
+/** Maximum invoke hard-cap plus cancellation-receipt retention horizon. */
+export const INVOKE_OWNERSHIP_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /** Capabilities this build advertises during the register handshake. */
 export const CAPABILITIES = Object.freeze([
@@ -578,6 +594,7 @@ export const CAPABILITIES = Object.freeze([
   "set_model",
   "heartbeat",
   TERMINAL_DISPOSITION_CAPABILITY,
+  INVOKE_CANCELLATION_CAPABILITY,
 ]);
 
 /**
@@ -628,6 +645,8 @@ export const MSG_TYPES = Object.freeze({
   UNBIND_OK: "unbind_ok",
   INVOKE: "invoke",
   EVENT: "event",
+  CANCEL_INVOKE: "cancel_invoke",
+  CANCEL_RESULT: "cancel_result",
   PING: "ping",
   PONG: "pong",
   // #35: additive ask/gate answer channel. ANSWER is a top-level bot->host
@@ -1418,6 +1437,38 @@ export function isInvokeTerminalEvent(value) {
     (value.disposition === "failed" || value.disposition === "timed_out") &&
     isBoundedString(value.code, V0_LIMITS.TERMINAL_ERROR_CODE) &&
     Object.values(PROTOCOL_ERROR_CODES).includes(value.code)
+  );
+}
+
+/**
+ * bot -> daemon cancellation request for a single invoke. `cancelId` is an
+ * opaque per-attempt receipt id; the first valid cancellation attempt wins.
+ * @typedef {{ type: "cancel_invoke", requestId: string, cancelId: string, reason: string }} CancelInvokeMessage
+ */
+export function isCancelInvokeMessage(value) {
+  return (
+    hasExactPlainOwnFields(value, ["type", "requestId", "cancelId", "reason"]) &&
+    value.type === MSG_TYPES.CANCEL_INVOKE &&
+    isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
+    isBoundedString(value.cancelId, V0_LIMITS.REQUEST_ID) &&
+    INVOKE_CANCELLATION_REASONS.includes(value.reason)
+  );
+}
+
+/**
+ * daemon -> bot receipt for a cancellation request. This is the complete
+ * outer event frame, rather than merely its inner event payload.
+ * @typedef {{ type: "event", requestId: string, event: { type: "cancel_result", cancelId: string, outcome: string } }} CancelResultMessage
+ */
+export function isCancelResultMessage(value) {
+  return (
+    hasExactPlainOwnFields(value, ["type", "requestId", "event"]) &&
+    value.type === MSG_TYPES.EVENT &&
+    isBoundedString(value.requestId, V0_LIMITS.REQUEST_ID) &&
+    hasExactPlainOwnFields(value.event, ["type", "cancelId", "outcome"]) &&
+    value.event.type === MSG_TYPES.CANCEL_RESULT &&
+    isBoundedString(value.event.cancelId, V0_LIMITS.REQUEST_ID) &&
+    INVOKE_CANCELLATION_OUTCOMES.includes(value.event.outcome)
   );
 }
 

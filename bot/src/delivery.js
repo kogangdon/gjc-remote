@@ -15,6 +15,22 @@ export function formatDeliveryError(error) {
       "The bot stopped waiting because the host produced no activity. Interruption is unconfirmed; verify the host state before retrying.",
     hard_cap:
       "The bot reached its absolute wait limit. Interruption is unconfirmed; verify the host state before retrying.",
+    cancellation_pending:
+      "The host acknowledged the cancellation request, but active work may still continue. Interruption is unconfirmed; verify the host state before retrying.",
+    cancellation_receipt_timeout:
+      "The bot did not receive a cancellation receipt from the host. Interruption is unconfirmed; verify the host state before retrying.",
+    cancellation_terminal_timeout:
+      "The host revoked queued work but did not deliver its terminal cancellation frame. Interruption is unconfirmed; verify the host state before retrying.",
+    cancellation_terminal_conflict:
+      "The host contradicted its queued-cancellation receipt. Interruption is unconfirmed; verify the host state before retrying.",
+    cancellation_send_failed:
+      "The bot could not deliver the cancellation request to the host. Interruption is unconfirmed; verify the host state before retrying.",
+    already_terminal:
+      "The host reported that the request was already terminal, but this observer did not receive its terminal outcome. Interruption is unconfirmed; verify the host state before retrying.",
+    not_owned:
+      "The host could not correlate the cancellation request to owned work. Interruption is unconfirmed; verify the host state before retrying.",
+    cancellation_unconfirmed:
+      "The cancellation request could not be established. Interruption is unconfirmed; verify the host state before retrying.",
   }[error.localOutcome];
   if (localDeadlineWording) return localDeadlineWording;
   const terminalWording = {

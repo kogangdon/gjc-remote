@@ -7,11 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Terminal disposition protocol
+### Invocation cancellation and terminal disposition protocol
 
-- Negotiate `terminal_disposition_v1` before an invoke. Mixed peers fail closed:
-  after either bot or daemon updates to this capability, an old peer cannot
-  serve invokes. Deploy bot and daemon together.
+- Negotiate both `terminal_disposition_v1` and `invoke_cancellation_v1` before
+  an invoke. Mixed bot/daemon peers fail closed before execution; deploy the
+  two components together.
+- Add `cancel_invoke` receipts. The exact reasons are `idle_timeout`,
+  `hard_cap`, `disconnect`, `user_cancelled`, and `presentation_failed`; the
+  exact `cancel_result` outcomes are `cancelled_before_start`,
+  `cancellation_pending`, `already_terminal`, and `not_owned`. A duplicate
+  `cancelId` replays its exact original receipt. Request and cancellation
+  tombstones are bounded and retained through the hard-cap/receipt horizon.
+- A queued cancellation is revoked before SDK, provider, or tool execution,
+  receives `cancelled_before_start`, and then receives the authoritative
+  terminal `cancelled` frame. Active cancellation receives only
+  `cancellation_pending`: SDK 0.16.6 has no supported active-control
+  interruption, so the eventual natural terminal remains authoritative. A
+  cancellation receipt is not terminal or quiescence proof.
+- Bot idle and hard-cap expiry, `/cancel`, presentation failure, and
+  shutdown/disconnect ownership transitions use that revocation path. Discord
+  says interruption is unconfirmed until a terminal outcome arrives; operators
+  must inspect host state before retrying. This does not restore active
+  `steer`/`follow_up` or unblock #231.
+- On daemon socket close, queued sibling invokes are synchronously revoked.
+  Each active shared session is retired once through #234 containment; leases
+  and admission fences remain until positive disposal proof, preventing owned
+  work from being downgraded or adopted by a successor.
 - An invoke now ends with one authoritative final `event` frame whose event is
   `invoke_terminal`, with `done: true` and no top-level `error`. The exact
   dispositions are `completed`, `failed`, `cancelled`, `paused`, `timed_out`,
@@ -22,8 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   likewise an unconfirmed local failure, not a daemon timeout disposition.
   On an adapter timeout, the daemon transfers its session/activity hold into
   SessionPool retirement containment tracked in #234, because work may
-  continue while retirement settles. This does not implement cancellation;
-  #232 remains unimplemented.
+  continue while retirement settles.
 
 ### SDK 0.16.6 containment
 

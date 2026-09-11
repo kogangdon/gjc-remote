@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import {
   PROTOCOL_ERROR_CODES,
   V0_LIMITS,
+  INVOKE_OWNERSHIP_RETENTION_MS,
   isGateRequestEvent,
 } from "@gjc-remote/shared";
 
@@ -36,7 +37,11 @@ const SDK_GATE_ANSWER_WINDOW_MS = 10 * 60 * 1000;
 function resolveDuration(optionValue, envValue, fallback, envName) {
   const candidates = [optionValue, Number(envValue), fallback];
   for (const candidate of candidates) {
-    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
+    if (
+      Number.isInteger(candidate) &&
+      candidate > 0 &&
+      candidate <= INVOKE_OWNERSHIP_RETENTION_MS
+    ) {
       return candidate;
     }
   }
@@ -615,6 +620,7 @@ export class SdkSession {
     this.closed = false;
     this.queue = Promise.resolve();
     this.queuedCommands = 0;
+    this.ownedQueueTickets = new Set();
     this.activePromptRuns = 0;
     this.adapterWaiterCancellations = new Set();
     this.inFlightGateAnswers = new Set();
@@ -686,12 +692,12 @@ export class SdkSession {
     if (this.closed) return Promise.reject(new Error("GJC SDK session is not running"));
 
     const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
-    if (!isLiveControl) return this.#enqueue(command, onEvent, timeoutMs);
+    if (!isLiveControl) return this.#enqueue(command, onEvent, timeoutMs).result;
 
     return Promise.resolve().then(() => {
       if (this.closed) throw new Error("GJC SDK session is not running");
       if (this.activePromptRuns <= 0) {
-        return this.#enqueue(command, onEvent, timeoutMs);
+        return this.#enqueue(command, onEvent, timeoutMs).result;
       }
       const error = new Error(
         `Live SDK ${command.type} is unavailable until the SDK exposes a supported queued-input ownership contract`
@@ -701,18 +707,130 @@ export class SdkSession {
     });
   }
 
-  #enqueue(command, onEvent, timeoutMs) {
+  sendOwned(
+    ownerId,
+    command,
+    onEvent,
+    timeoutMs = this.idleTimeoutMs,
+    { onActivate } = {}
+  ) {
+    const ticket = this.#createOwnedQueueTicket(ownerId);
+    if (typeof ownerId !== "string") {
+      this.#rejectOwnedQueueTicket(ticket, new Error("Invalid SDK queue owner"));
+      return ticket.publicTicket;
+    }
+    if (this.closed) {
+      this.#rejectOwnedQueueTicket(ticket, new Error("GJC SDK session is not running"));
+      return ticket.publicTicket;
+    }
+    if (onActivate !== undefined && typeof onActivate !== "function") {
+      this.#rejectOwnedQueueTicket(
+        ticket,
+        new Error("Invalid SDK queue activation callback")
+      );
+      return ticket.publicTicket;
+    }
+    const isLiveControl =
+      command?.type === "steer" || command?.type === "follow_up";
+    if (isLiveControl) {
+      this.ownedQueueTickets.add(ticket);
+      void Promise.resolve().then(() => {
+        if (ticket.phase !== "queued") return;
+        if (this.closed) {
+          this.#rejectOwnedQueueTicket(
+            ticket,
+            new Error("GJC SDK session is not running")
+          );
+          return;
+        }
+        if (this.activePromptRuns > 0) {
+          const error = new Error(
+            `Live SDK ${command.type} is unavailable until the SDK exposes a supported queued-input ownership contract`
+          );
+          error.code = LIVE_CONTROL_UNSUPPORTED_CODE;
+          this.#rejectOwnedQueueTicket(ticket, error);
+          return;
+        }
+        this.#enqueue(command, onEvent, timeoutMs, ticket, onActivate);
+      });
+      return ticket.publicTicket;
+    }
+    this.#enqueue(command, onEvent, timeoutMs, ticket, onActivate);
+    return ticket.publicTicket;
+  }
+
+  #createOwnedQueueTicket(ownerId) {
+    const ticket = {
+      ownerId,
+      phase: "queued",
+      settled: false,
+      resolve: undefined,
+      reject: undefined,
+      publicTicket: undefined,
+    };
+    const result = new Promise((resolve, reject) => {
+      ticket.resolve = resolve;
+      ticket.reject = reject;
+    });
+    ticket.publicTicket = {
+      result,
+      revokeBeforeStart: () => {
+        if (ticket.phase !== "queued") return false;
+        ticket.phase = "terminal";
+        ticket.settled = true;
+        this.ownedQueueTickets.delete(ticket);
+        ticket.resolve({ revokedBeforeStart: true });
+        return true;
+      },
+      get phase() {
+        return ticket.phase;
+      },
+    };
+    return ticket;
+  }
+
+  #resolveOwnedQueueTicket(ticket, value) {
+    if (ticket.settled) return;
+    ticket.phase = "terminal";
+    ticket.settled = true;
+    this.ownedQueueTickets.delete(ticket);
+    ticket.resolve(value);
+  }
+
+  #rejectOwnedQueueTicket(ticket, error) {
+    if (ticket.settled) return;
+    ticket.phase = "terminal";
+    ticket.settled = true;
+    this.ownedQueueTickets.delete(ticket);
+    ticket.reject(error);
+  }
+
+  #enqueue(
+    command,
+    onEvent,
+    timeoutMs,
+    ticket = this.#createOwnedQueueTicket(undefined),
+    onActivate
+  ) {
     this.queuedCommands += 1;
-    const result = this.queue
+    this.ownedQueueTickets.add(ticket);
+    const run = this.queue
       .then(async () => {
+        if (ticket.phase !== "queued") return;
         if (this.closed) throw new Error("GJC SDK session is not running");
+        ticket.phase = "active";
+        onActivate?.();
         return this.#dispatch(command, onEvent, timeoutMs);
       })
+      .then(
+        (value) => this.#resolveOwnedQueueTicket(ticket, value),
+        (error) => this.#rejectOwnedQueueTicket(ticket, error)
+      )
       .finally(() => {
         this.queuedCommands -= 1;
       });
-    this.queue = result.catch(() => {});
-    return result;
+    this.queue = run.catch(() => {});
+    return ticket.publicTicket;
   }
 
   async #dispatch(command, onEvent, timeoutMs) {
@@ -1315,6 +1433,9 @@ export class SdkSession {
     }
     this.pendingGates.clear();
     this.#discardDeferredGateCandidate();
+    for (const ticket of [...this.ownedQueueTickets]) {
+      if (ticket.phase === "queued") this.#rejectOwnedQueueTicket(ticket, error);
+    }
     for (const cancel of [...this.adapterWaiterCancellations]) {
       cancel(error);
     }

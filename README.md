@@ -67,21 +67,43 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    acceptance. Rejected answers retain the same live gate for retry; a completed
    or replaced gate is never silently answered by a retry or converted into a
    new prompt. Deploy the bot and daemon together for this receipt contract.
-   Invokes require the negotiated `terminal_disposition_v1` capability. Their
-   authoritative final frame is an `event` carrying `invoke_terminal` with
-   `done: true` and no top-level `error`; the first valid terminal frame wins.
+   Invokes require negotiated `terminal_disposition_v1` and
+   `invoke_cancellation_v1`; mixed bot/daemon peers refuse an invoke before
+   execution, so deploy them lockstep. A `cancel_invoke` has one of
+   `idle_timeout`, `hard_cap`, `disconnect`, `user_cancelled`, or
+   `presentation_failed` as its reason and receives exactly one
+   `cancel_result`: `cancelled_before_start`, `cancellation_pending`,
+   `already_terminal`, or `not_owned`. Duplicate cancel IDs replay the exact
+   original receipt. A queued request is revoked before SDK, provider, or tool
+   execution, receives `cancelled_before_start`, then receives terminal
+   `cancelled`. Active work receives only `cancellation_pending`: SDK 0.16.6
+   exposes no supported active-interruption control, and its natural terminal
+   remains authoritative. A receipt is neither a terminal result nor proof of
+   quiescence. Request/cancel tombstones are bounded and survive the
+   hard-cap/receipt horizon.
+   Their authoritative final frame is an `event` carrying `invoke_terminal`
+   with `done: true` and no top-level `error`; the first valid terminal frame wins.
    Its disposition is exactly one of `completed`, `failed`, `cancelled`,
    `paused`, `timed_out`, or `disconnected`. `paused` and `cancelled` remain
    distinct results, not generic failures. `timed_out` and `disconnected` do
    not prove that SDK or process work was interrupted; a bot-local response
    timeout is also only an unconfirmed local failure. An adapter timeout moves
    its session/activity hold into SessionPool retirement containment (#234)
-   while cleanup settles, since continued work is possible. This is not
-   cancellation support: #232 remains unimplemented. The existing #231
-   live-control containment remains in force.
+   while cleanup settles, since continued work is possible. On a daemon socket
+   close, queued sibling invokes are synchronously revoked and each active
+   shared session enters #234 containment once; its leases and admission fence
+   remain until positive disposal proof. The existing #231 live-control
+   containment remains in force: cancellation does not restore active
+   `steer`/`follow_up` or unblock #231.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`), `/gjc`,
-   `/model`, and `/hosts` as Discord slash commands.
+   `/model`, `/hosts`, and `/cancel` as Discord slash commands. `/cancel` is
+   authorized by the normal bot allowlist and may cancel only the caller's
+   active request in that channel. One user may own only one active request per
+   channel; a concurrent second request is refused rather than replacing the
+   cancellation target. `/cancel` acknowledges a request, not confirmed
+   interruption; Discord's “interruption is unconfirmed” wording requires
+   host-state verification before retrying.
 4. Each Discord channel configures one `{hostId, workDir}` input via
    `bot/channels.json`. The daemon canonicalizes `workDir`, so the effective
    session identity is `(hostId, canonical workDir)`. A host only accepts

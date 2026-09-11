@@ -88,16 +88,44 @@ and workspace readiness are distinct:
   mapping and receipt requirements described in [daemon deployment](daemon.md).
 
 For an invoke-capable host, registration must negotiate
-`terminal_disposition_v1`. The daemon's authoritative final response is an
-`event` containing `invoke_terminal`, `done: true`, and no top-level `error`.
+`terminal_disposition_v1` and `invoke_cancellation_v1`; a mixed peer refuses
+the invoke before execution. Deploy the bot and daemon lockstep. A
+`cancel_invoke` reason is exactly one of `idle_timeout`, `hard_cap`,
+`disconnect`, `user_cancelled`, or `presentation_failed`; its `cancel_result`
+is exactly one of `cancelled_before_start`, `cancellation_pending`,
+`already_terminal`, or `not_owned`. Repeating a cancel ID replays its exact
+receipt. Request/cancel tombstones are bounded and retained through the
+hard-cap/receipt horizon.
+
+A queued cancellation is revoked before SDK, provider, or tool execution. It
+receives `cancelled_before_start`, followed by the authoritative terminal
+`cancelled` frame. Active work can only receive nonterminal
+`cancellation_pending`: SDK 0.16.6 has no supported active-interruption
+control, and the natural terminal remains authoritative. A cancellation receipt
+does not prove a terminal outcome or host quiescence.
+
+The daemon's authoritative final response is an `event` containing
+`invoke_terminal`, `done: true`, and no top-level `error`.
 The first valid terminal frame wins and reports exactly one of `completed`,
 `failed`, `cancelled`, `paused`, `timed_out`, or `disconnected`. Discord
 delivery preserves `paused` and `cancelled` rather than calling them generic
 failures. Treat `timed_out` and `disconnected` as safety checks, not evidence
 that host-side SDK or process work stopped: inspect host state before retrying
 or starting a replacement request. A bot-local response timeout is also an
-unconfirmed local failure, not a daemon `timed_out` disposition. This reporting
-contract does not add cancellation support; #232 remains unimplemented.
+unconfirmed local failure, not a daemon `timed_out` disposition. The Discord
+wording “interruption is unconfirmed” applies to pending cancellation, missing
+receipts, and missing terminal frames: verify host state before retrying.
+
+`/cancel` is registered by the normal `register` command and uses the same
+allowlist authorization as every other interaction. It can target only the
+calling user's active request in the same channel. A second concurrent request
+from that user/channel is refused rather than overwriting cancellation
+ownership. The command then responds ephemerally
+that cancellation was requested—not that interruption occurred. Operators
+should use it for a known owned request, wait for its terminal outcome, and
+inspect the host before retrying. Bot idle/hard-cap expiry, presentation
+failure, and shutdown/disconnect ownership changes use the same revocation
+path. This does not restore active `steer`/`follow_up` or unblock #231.
 
 Alert separately for bot exit, listener failure, Discord disconnects, unknown
 or rejected host registrations, and absent expected daemons.
@@ -106,16 +134,19 @@ or rejected host registrations, and absent expected daemons.
 
 1. Record the deployed revision, Node version, configuration checksum (never
    secret contents), mapping revision, and connected-host baseline.
-2. Upgrade bot and daemon lockstep for `terminal_disposition_v1`. Quiesce
-   mapping changes, install the new checkout/dependencies, register commands
-   when their definition changed, and restart through their supervisors. A
-   mixed old/new pair fails closed; an old peer cannot serve invokes after the
-   other side updates.
+2. Upgrade bot and daemon lockstep for `terminal_disposition_v1` and
+   `invoke_cancellation_v1`. Quiesce mapping changes, drain in-flight requests
+   to terminal/quiescence evidence before rollback, install the new
+   checkout/dependencies, register commands when their definition changed, and
+   restart through their supervisors. A mixed old/new pair fails closed; an old
+   peer cannot serve invokes after the other side updates. Never downgrade
+   owned work: preserve #234 containment, leases, and fences until positive
+   disposal proof.
 3. Confirm listener startup, Discord login, expected mappings, negotiated
    invoke capability, and expected daemon registrations before accepting
    traffic.
-4. Roll back only the bot executable/dependency revision while retaining the
-   current protected configuration. Do not restore an older managed-authority
+4. Roll back bot and daemon together only after the drain. Retain the current
+   protected configuration and do not restore an older managed-authority
    snapshot or start an older reader after durable authority state advanced;
    use the authority recovery contract to roll forward instead.
 

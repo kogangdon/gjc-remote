@@ -7,6 +7,7 @@ import {
   CAPABILITIES,
   GATE_ANSWER_ERROR_CODES,
   MAX_WS_PAYLOAD_BYTES,
+  MSG_TYPES,
   PONG,
   PROTOCOL_VERSION,
   PROTOCOL_VERSION_V3,
@@ -22,6 +23,7 @@ import {
   negotiateCapabilities,
   PROTOCOL_ERROR_CODES,
   TERMINAL_DISPOSITION_CAPABILITY,
+  INVOKE_CANCELLATION_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
@@ -33,6 +35,8 @@ import {
   extractAssistantText,
   freezeManagedAuthorityDescriptor,
 } from "../src/host-registry.js";
+
+const BOT_CAPABILITIES = CAPABILITIES;
 
 function managedRoute(channelId, overrides = {}) {
   const authority = {
@@ -183,7 +187,7 @@ async function startRegistry(
           hostId,
           token,
           protocolVersion: PROTOCOL_VERSION,
-          capabilities: CAPABILITIES,
+          capabilities: BOT_CAPABILITIES,
           ...register,
         })
       );
@@ -191,7 +195,7 @@ async function startRegistry(
       assert.deepEqual(JSON.parse(raw.toString()), {
         type: "register_ok",
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: CAPABILITIES,
+        capabilities: BOT_CAPABILITIES,
       });
       registryBySocket.set(socket, { registry, hostId });
       return socket;
@@ -219,7 +223,7 @@ async function connectV2(server, hostId = "host-a", token = "token-a", register 
         hostId,
         token,
         protocolVersion: 2,
-        capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+        capabilities: [...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
         ...register,
       })
     );
@@ -242,7 +246,7 @@ async function connectV3(server, hostId = "host-a", token = "token-a", register 
     token,
     protocolVersion: PROTOCOL_VERSION_V3,
     capabilities: [
-      ...CAPABILITIES,
+      ...BOT_CAPABILITIES,
       WORKSPACE_READINESS_CAPABILITY,
       WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
       WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -414,6 +418,34 @@ test("adversarial: invoke and gate-answer durations must be positive finite valu
       /invokeHardCapMs must be a positive duration/
     );
   }
+  for (const cancelReceiptTimeoutMs of [
+    0,
+    -1,
+    1.5,
+    2_147_483_648,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+  ]) {
+    assert.throws(
+      () =>
+        new HostRegistry({
+          port: 0,
+          tokensByHostId,
+          cancelReceiptTimeoutMs,
+        }),
+      /cancelReceiptTimeoutMs must be a positive duration/
+    );
+  }
+  assert.throws(
+    () =>
+      new HostRegistry({
+        port: 0,
+        tokensByHostId,
+        invokeHardCapMs: 86_400_000,
+        cancelReceiptTimeoutMs: 1,
+      }),
+    /exceeds the safe timer bound/
+  );
   for (const gateAnswerTimeoutMs of [0, -1, 1.5, 30_001, Number.NaN, Number.POSITIVE_INFINITY]) {
     assert.throws(
       () => new HostRegistry({ port: 0, tokensByHostId, gateAnswerTimeoutMs }),
@@ -901,33 +933,38 @@ test("the first terminal outcome survives conflicts, disconnect, and cleared tim
   }
 });
 
-test("invoke refuses hosts that did not negotiate terminal disposition", async () => {
-  const server = await startRegistry();
-  try {
-    const socket = await server.connect("host-a", "token-a", {
-      capabilities: CAPABILITIES.filter(
-        (capability) => capability !== TERMINAL_DISPOSITION_CAPABILITY
-      ),
-    });
-    assert.deepEqual(
-      await server.registry.invoke(
-        "host-a",
-        "/workspace",
-        { kind: "prompt", message: "hello" },
-        () => {}
-      ),
-      {
-        ok: false,
-        error: {
-          code: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
-          retryable: false,
-          action: "contact_admin",
-        },
-      }
-    );
-    socket.terminate();
-  } finally {
-    await server.close();
+test("invoke refuses hosts missing either ownership capability", async () => {
+  for (const missing of [
+    TERMINAL_DISPOSITION_CAPABILITY,
+    INVOKE_CANCELLATION_CAPABILITY,
+  ]) {
+    const server = await startRegistry();
+    try {
+      const socket = await server.connect("host-a", "token-a", {
+        capabilities: CAPABILITIES.filter(
+          (capability) => capability !== missing
+        ),
+      });
+      assert.deepEqual(
+        await server.registry.invoke(
+          "host-a",
+          "/workspace",
+          { kind: "prompt", message: "hello" },
+          () => {}
+        ),
+        {
+          ok: false,
+          error: {
+            code: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+            retryable: false,
+            action: "contact_admin",
+          },
+        }
+      );
+      socket.terminate();
+    } finally {
+      await server.close();
+    }
   }
 });
 
@@ -1889,20 +1926,40 @@ test("invoke idle expiry fires with zero events", async () => {
     onObservabilityEvent: (event) => observability.push(event),
   });
   try {
-    await server.connect("host-a", "token-a");
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
     const resultPromise = server.registry.invoke(
       "host-a",
       "/workspace",
       { kind: "prompt", message: "hi" },
       () => {}
     );
+    const [invokeRaw] = await invokeFrame;
+    const { requestId } = JSON.parse(invokeRaw.toString());
     assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [20, 5000]);
+    const cancelFrame = once(socket, "message");
     timers.runTimeoutByDelay(20);
+    const cancel = JSON.parse((await cancelFrame)[0].toString());
+    assert.deepEqual(cancel, {
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId,
+      cancelId: cancel.cancelId,
+      reason: "idle_timeout",
+    });
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: cancel.cancelId,
+        outcome: "cancellation_pending",
+      },
+    }));
     const result = await resultPromise;
     assert.deepEqual(result, {
       ok: false,
       error: {
-        localOutcome: "idle_timeout",
+        localOutcome: "cancellation_pending",
         code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
         retryable: false,
         action: "verify_host_state",
@@ -1911,7 +1968,7 @@ test("invoke idle expiry fires with zero events", async () => {
     assert.equal(server.registry.pendingRequests.size, 0);
     const finishes = observability.filter((event) => event.event === "invoke.finish");
     assert.equal(finishes.length, 1);
-    assert.equal(finishes[0].phase, "idle_timeout");
+    assert.equal(finishes[0].phase, "cancellation_pending");
     assert.equal(finishes[0].code, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
   } finally {
     await server.close();
@@ -1949,12 +2006,25 @@ test("invoke hard cap fires despite continuous activity", async () => {
       assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [40, 1000]);
       assert.strictEqual(timers.timeoutHandleByDelay(40), hardCapTimer);
     }
+    const cancelFrame = once(socket, "message");
     timers.runTimeout(hardCapTimer);
-
+    const cancel = JSON.parse((await cancelFrame)[0].toString());
+    assert.equal(cancel.type, MSG_TYPES.CANCEL_INVOKE);
+    assert.equal(cancel.requestId, requestId);
+    assert.equal(cancel.reason, "hard_cap");
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: cancel.cancelId,
+        outcome: "cancellation_pending",
+      },
+    }));
     assert.deepEqual(await resultPromise, {
       ok: false,
       error: {
-        localOutcome: "hard_cap",
+        localOutcome: "cancellation_pending",
         code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
         retryable: false,
         action: "verify_host_state",
@@ -1962,8 +2032,476 @@ test("invoke hard cap fires despite continuous activity", async () => {
     });
     const finishes = observability.filter((entry) => entry.event === "invoke.finish");
     assert.equal(finishes.length, 1);
-    assert.equal(finishes[0].phase, "hard_cap");
+    assert.equal(finishes[0].phase, "cancellation_pending");
     assert.equal(finishes[0].code, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
+  } finally {
+    await server.close();
+  }
+});
+
+test("explicit cancellation remains pending until an authoritative terminal", async () => {
+  const observability = [];
+  const server = await startRegistry(undefined, {
+    cancelIdFactory: () => "cancel-explicit-1",
+    onObservabilityEvent: (event) => observability.push(event),
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    let createdRequestId;
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "active" },
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      (requestId) => {
+        createdRequestId = requestId;
+      }
+    );
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    assert.equal(createdRequestId, requestId);
+    const cancelFrame = once(socket, "message");
+    assert.deepEqual(
+      server.registry.cancelInvoke("host-a", requestId, "user_cancelled"),
+      { ok: true, cancelId: "cancel-explicit-1" }
+    );
+    assert.deepEqual(JSON.parse((await cancelFrame)[0].toString()), {
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId,
+      cancelId: "cancel-explicit-1",
+      reason: "user_cancelled",
+    });
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: "cancel-explicit-1",
+        outcome: "cancellation_pending",
+      },
+    }));
+    assert.deepEqual(await resultPromise, {
+      ok: false,
+      error: {
+        localOutcome: "cancellation_pending",
+        code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+        retryable: false,
+        action: "verify_host_state",
+      },
+    });
+    assert.equal(server.registry.pendingRequests.has(requestId), false);
+    assert.equal(server.registry.cancelTombstones.has(requestId), true);
+
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: { type: "invoke_terminal", disposition: "completed" },
+      done: true,
+    }));
+    await waitFor(() => !server.registry.cancelTombstones.has(requestId));
+    const finishes = observability.filter(
+      (event) => event.event === "invoke.finish"
+    );
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].phase, "cancellation_pending");
+  } finally {
+    await server.close();
+  }
+});
+
+test("cancelled-before-start waits for the daemon terminal cancellation proof", async () => {
+  const server = await startRegistry(undefined, {
+    cancelIdFactory: () => "cancel-queued-1",
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "queued" },
+      () => {}
+    );
+    let settled = false;
+    void resultPromise.finally(() => {
+      settled = true;
+    });
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    const cancelFrame = once(socket, "message");
+    server.registry.cancelInvoke("host-a", requestId, "user_cancelled");
+    await cancelFrame;
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: "cancel-queued-1",
+        outcome: "cancelled_before_start",
+      },
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(server.registry.pendingRequests.has(requestId), true);
+
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: { type: "invoke_terminal", disposition: "cancelled" },
+      done: true,
+    }));
+    const result = await resultPromise;
+    assert.equal(result.ok, false);
+    assert.equal(result.error.terminalDisposition, "cancelled");
+    assert.equal(server.registry.pendingRequests.has(requestId), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("request-presentation failure immediately revokes daemon ownership", async () => {
+  const server = await startRegistry(undefined, {
+    cancelIdFactory: () => "cancel-presentation-1",
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const frames = [];
+    socket.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "presentation" },
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        throw new Error("private presentation failure");
+      }
+    );
+    await waitFor(() => frames.length === 2);
+    const [invoke, cancel] = frames;
+    assert.equal(invoke.type, MSG_TYPES.INVOKE);
+    assert.deepEqual(cancel, {
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId: invoke.requestId,
+      cancelId: "cancel-presentation-1",
+      reason: "presentation_failed",
+    });
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId: invoke.requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: cancel.cancelId,
+        outcome: "cancellation_pending",
+      },
+    }));
+    assert.equal((await resultPromise).error.localOutcome, "cancellation_pending");
+  } finally {
+    await server.close();
+  }
+});
+
+test("asynchronous gate presentation failure revokes request ownership", async () => {
+  const server = await startRegistry(undefined, {
+    cancelIdFactory: () => "cancel-gate-presentation-1",
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "gate" },
+      () => {},
+      undefined,
+      async () => {
+        throw new Error("private Discord delivery failure");
+      }
+    );
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    const cancelFrame = once(socket, "message");
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "gate-presentation-1",
+        prompt: "Approve?",
+        kind: "approval",
+      },
+    }));
+    const cancel = JSON.parse((await cancelFrame)[0].toString());
+    assert.deepEqual(cancel, {
+      type: MSG_TYPES.CANCEL_INVOKE,
+      requestId,
+      cancelId: "cancel-gate-presentation-1",
+      reason: "presentation_failed",
+    });
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: cancel.cancelId,
+        outcome: "cancellation_pending",
+      },
+    }));
+    assert.equal((await resultPromise).error.localOutcome, "cancellation_pending");
+  } finally {
+    await server.close();
+  }
+});
+
+test("cancelled-before-start rejects a contradictory completed terminal", async () => {
+  const server = await startRegistry(undefined, {
+    cancelIdFactory: () => "cancel-conflicting-terminal-1",
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "queued" },
+      () => {}
+    );
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    const cancelFrame = once(socket, "message");
+    server.registry.cancelInvoke("host-a", requestId, "user_cancelled");
+    await cancelFrame;
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: "cancel-conflicting-terminal-1",
+        outcome: "cancelled_before_start",
+      },
+    }));
+    await waitFor(
+      () =>
+        server.registry.pendingRequests.get(requestId)?.cancellation
+          ?.receipt === "cancelled_before_start"
+    );
+    const closed = once(socket, "close");
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: { type: "invoke_terminal", disposition: "completed" },
+      done: true,
+    }));
+    assert.equal(
+      (await resultPromise).error.localOutcome,
+      "cancellation_terminal_conflict"
+    );
+    assert.equal((await closed)[0], 1008);
+  } finally {
+    await server.close();
+  }
+});
+
+test("cancelled-before-start terminal wait has a bounded unconfirmed timeout", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    cancelReceiptTimeoutMs: 25,
+    cancelIdFactory: () => "cancel-terminal-timeout-1",
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "queued" },
+      () => {}
+    );
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    const cancelFrame = once(socket, "message");
+    server.registry.cancelInvoke("host-a", requestId, "user_cancelled");
+    await cancelFrame;
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: "cancel-terminal-timeout-1",
+        outcome: "cancelled_before_start",
+      },
+    }));
+    await waitFor(
+      () =>
+        server.registry.pendingRequests.get(requestId)?.cancellation
+          ?.receipt === "cancelled_before_start"
+    );
+    const terminalTimer = timers.timeoutHandleByDelay(25);
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: "cancel-terminal-timeout-1",
+        outcome: "cancelled_before_start",
+      },
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(timers.timeoutHandleByDelay(25), terminalTimer);
+    timers.runTimeoutByDelay(25);
+    assert.equal(
+      (await resultPromise).error.localOutcome,
+      "cancellation_terminal_timeout"
+    );
+    assert.equal(server.registry.pendingRequests.size, 0);
+    assert.equal(server.registry.cancelTombstones.has(requestId), true);
+  } finally {
+    await server.close();
+  }
+});
+
+test("cancellation receipt timeout is bounded and interruption-unconfirmed", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(undefined, {
+    timers: timers.api,
+    cancelReceiptTimeoutMs: 25,
+    cancelIdFactory: () => "cancel-timeout-1",
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "active" },
+      () => {}
+    );
+    const { requestId } = JSON.parse((await invokeFrame)[0].toString());
+    const cancelFrame = once(socket, "message");
+    server.registry.cancelInvoke("host-a", requestId, "user_cancelled");
+    await cancelFrame;
+    timers.runTimeoutByDelay(25);
+    assert.deepEqual(await resultPromise, {
+      ok: false,
+      error: {
+        localOutcome: "cancellation_receipt_timeout",
+        code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
+        retryable: false,
+        action: "verify_host_state",
+      },
+    });
+    assert.equal(server.registry.pendingRequests.size, 0);
+    assert.equal(server.registry.cancelTombstones.has(requestId), true);
+  } finally {
+    await server.close();
+  }
+});
+
+test("retained cancellation tombstones refuse request-id reuse", async () => {
+  const server = await startRegistry(undefined, {
+    requestIdFactory: () => "retained-request-id",
+    cancelIdFactory: () => "retained-cancel-id",
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const first = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "first" },
+      () => {}
+    );
+    await invokeFrame;
+    const cancelFrame = once(socket, "message");
+    server.registry.cancelInvoke(
+      "host-a",
+      "retained-request-id",
+      "user_cancelled"
+    );
+    await cancelFrame;
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId: "retained-request-id",
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: "retained-cancel-id",
+        outcome: "cancellation_pending",
+      },
+    }));
+    await first;
+    assert.equal(
+      server.registry.cancelTombstones.has("retained-request-id"),
+      true
+    );
+    assert.deepEqual(
+      await server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: "must not dispatch" },
+        () => {}
+      ),
+      {
+        ok: false,
+        error: {
+          code: PROTOCOL_ERROR_CODES.LEASE_CONFLICT,
+          retryable: true,
+          action: "retry_later",
+        },
+      }
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("cancellation tombstone saturation keeps exact ownership without eviction", async () => {
+  let requestSequence = 0;
+  let cancelSequence = 0;
+  const server = await startRegistry(undefined, {
+    requestIdFactory: () => `bounded-request-${++requestSequence}`,
+    cancelIdFactory: () => `bounded-cancel-${++cancelSequence}`,
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    for (let index = 1; index <= 65; index += 1) {
+      const invokeFrame = once(socket, "message");
+      const resultPromise = server.registry.invoke(
+        "host-a",
+        "/workspace",
+        { kind: "prompt", message: `request-${index}` },
+        () => {}
+      );
+      const invoke = JSON.parse((await invokeFrame)[0].toString());
+      const cancelFrame = once(socket, "message");
+      server.registry.cancelInvoke(
+        "host-a",
+        invoke.requestId,
+        "user_cancelled"
+      );
+      const cancel = JSON.parse((await cancelFrame)[0].toString());
+      socket.send(JSON.stringify({
+        type: MSG_TYPES.EVENT,
+        requestId: invoke.requestId,
+        event: {
+          type: MSG_TYPES.CANCEL_RESULT,
+          cancelId: cancel.cancelId,
+          outcome: "cancellation_pending",
+        },
+      }));
+      await resultPromise;
+    }
+    assert.equal(server.registry.cancelTombstones.size, 64);
+    assert.equal(
+      server.registry.cancelTombstones.has("bounded-request-1"),
+      true
+    );
+    assert.equal(
+      server.registry.pendingRequests.has("bounded-request-65"),
+      true,
+      "the saturated tracker remains exact and blocks capacity"
+    );
   } finally {
     await server.close();
   }
@@ -2466,8 +3004,12 @@ test("registry shutdown clears heartbeat state and settles pending invokes", asy
   assert.equal(timers.intervalCount, 1);
   assert.equal(timers.timeoutCount, 3);
 
+  const cancelFrame = once(socket, "message");
   const closing = server.registry.close();
   assert.strictEqual(server.registry.close(), closing);
+  const cancel = JSON.parse((await cancelFrame)[0].toString());
+  assert.equal(cancel.type, MSG_TYPES.CANCEL_INVOKE);
+  assert.equal(cancel.reason, "disconnect");
   await closing;
 
   assert.deepEqual(await result, {
@@ -2767,7 +3309,7 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
     assert.deepEqual(JSON.parse(raw.toString()), {
       type: "register_ok",
       protocolVersion: PROTOCOL_VERSION,
-      capabilities: CAPABILITIES,
+      capabilities: BOT_CAPABILITIES,
     });
     assert.deepEqual(server.registry.getHostInfo("host-a"), {
       protocolVersion: 0,
@@ -3208,10 +3750,22 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
     assert.deepEqual(await validResult, { ok: true });
 
     // Only confirmed acceptance re-arms the invoke idle timer.
+    const cancel = JSON.parse((await once(socket, "message"))[0].toString());
+    assert.equal(cancel.type, MSG_TYPES.CANCEL_INVOKE);
+    assert.equal(cancel.reason, "idle_timeout");
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.CANCEL_RESULT,
+        cancelId: cancel.cancelId,
+        outcome: "cancellation_pending",
+      },
+    }));
     assert.deepEqual(await resultPromise, {
       ok: false,
       error: {
-        localOutcome: "idle_timeout",
+        localOutcome: "cancellation_pending",
         code: PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME,
         retryable: false,
         action: "verify_host_state",
