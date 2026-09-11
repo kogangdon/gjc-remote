@@ -6,6 +6,14 @@ const SET_ERROR = "Could not set the selected model.";
 const DISPLAY_PROVIDER_LENGTH = 64;
 const DISPLAY_ID_LENGTH = 96;
 const DISPLAY_NAME_LENGTH = 96;
+const REVOKED_BEFORE_START = "INVOKE_REVOKED_BEFORE_START";
+
+function rejectRevoked(result) {
+  if (result?.revokedBeforeStart !== true) return;
+  const error = new Error("Request ownership was revoked before SDK dispatch");
+  error.code = REVOKED_BEFORE_START;
+  throw error;
+}
 
 class ModelCommandError extends Error {
   constructor(message, operation, cause) {
@@ -42,12 +50,18 @@ function causeCategory(cause) {
  * @param {{send: (command: object, onEvent: (event: object) => void) => Promise<void>}} session
  * @param {{modelName?: unknown}} command
  * @param {(event: object) => void} onEvent
+ * @param {{sendCommand?: (command: object, onEvent: (event: object) => void) => Promise<unknown>}} [options]
  * @returns {Promise<void>}
  */
-export async function setSessionModel(session, command, onEvent) {
+export async function setSessionModel(
+  session,
+  command,
+  onEvent,
+  { sendCommand = (sdkCommand, handler) => session.send(sdkCommand, handler) } = {}
+) {
   let listResponse;
   try {
-    await session.send({ type: "get_available_models" }, (event) => {
+    const listResult = await sendCommand({ type: "get_available_models" }, (event) => {
       if (
         listResponse === undefined &&
         event?.command === "get_available_models" &&
@@ -57,6 +71,7 @@ export async function setSessionModel(session, command, onEvent) {
         listResponse = event;
       }
     });
+    rejectRevoked(listResult);
   } catch (cause) {
     throw new ModelCommandError(LIST_ERROR, "list_models", cause);
   }
@@ -72,10 +87,11 @@ export async function setSessionModel(session, command, onEvent) {
   if (result.status === "ambiguous") throw new Error(ambiguousMessage(result.candidates));
 
   try {
-    await session.send(
+    const setResult = await sendCommand(
       { type: "set_model", provider: result.provider, modelId: result.modelId },
       onEvent
     );
+    rejectRevoked(setResult);
   } catch (cause) {
     throw new ModelCommandError(SET_ERROR, "set_model", cause);
   }

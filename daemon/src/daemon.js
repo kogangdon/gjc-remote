@@ -4,6 +4,8 @@ import WebSocket from "ws";
 import {
   CAPABILITIES,
   GATE_ANSWER_ERROR_CODES,
+  INVOKE_CANCELLATION_CAPABILITY,
+  INVOKE_OWNERSHIP_RETENTION_MS,
   TERMINAL_DISPOSITION_CAPABILITY,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
@@ -30,6 +32,7 @@ import {
   isInventoryReceiptBindOkMessage,
   isInventoryReceiptCapabilityGate,
   isInventoryReceiptReadinessMessage,
+  isCancelInvokeMessage,
   isUnbindWorkspaceMessage,
   isInvokeMessage,
   isPingMessage,
@@ -215,7 +218,7 @@ const DAEMON_CAPABILITIES = Object.freeze(
           ? [WORKSPACE_INVENTORY_RECEIPT_CAPABILITY, WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY]
           : []),
       ])]
-    : [...CAPABILITIES]
+    : CAPABILITIES
 );
 
 function parseReadinessTtl(value) {
@@ -502,6 +505,119 @@ const requestIds = new RequestIdFence();
 // (which arrives as a separate message while the invoke is blocked on a gate)
 // can be routed to the session that owns the pending gate.
 const inFlightByRequestId = new Map();
+// Cancellation ownership is deliberately connection-local.  A request id is
+// not an authority token across a reconnect, even when a peer reuses it.
+const cancellationByConnection = new WeakMap();
+const cancellationRecords = new Set();
+const CANCELLATION_RETENTION_MS = INVOKE_OWNERSHIP_RETENTION_MS;
+const CANCELLATION_MAX_RECORDS = 1024;
+
+function cancellationStateFor(connection, socketGeneration) {
+  let state = cancellationByConnection.get(connection);
+  if (!state) {
+    state = { socketGeneration, records: new Map(), tombstones: new Map(), receipts: new Map() };
+    cancellationByConnection.set(connection, state);
+  }
+  return state;
+}
+
+function sweepCancellationState(state, now = Date.now()) {
+  for (const [requestId, tombstone] of state.tombstones) {
+    if (tombstone.expiresAt <= now) state.tombstones.delete(requestId);
+  }
+  for (const [cancelId, receipt] of state.receipts) {
+    if (receipt.expiresAt <= now) state.receipts.delete(cancelId);
+  }
+}
+
+function cancellationRecordPhase(record) {
+  if (record.phase === "terminal") return "terminal";
+  if (record.ticket?.phase === "active") record.phase = "active";
+  return record.phase;
+}
+
+function retainCancellationTerminal(state, record) {
+  record.phase = "terminal";
+  state.records.delete(record.requestId);
+  cancellationRecords.delete(record);
+  const sessionHardCapMs =
+    Number.isFinite(record.session?.hardCapMs) && record.session.hardCapMs > 0
+      ? record.session.hardCapMs
+      : 0;
+  state.tombstones.set(record.requestId, {
+    expiresAt:
+      Date.now() +
+      Math.max(CANCELLATION_RETENTION_MS, sessionHardCapMs + 10_000),
+  });
+}
+
+function sendCancellationReceipt(connection, state, msg, outcome) {
+  const frame = JSON.stringify({
+    type: MSG_TYPES.EVENT,
+    requestId: msg.requestId,
+    event: { type: MSG_TYPES.CANCEL_RESULT, cancelId: msg.cancelId, outcome },
+  });
+  state.receipts.set(msg.cancelId, {
+    requestId: msg.requestId,
+    reason: msg.reason,
+    frame,
+    expiresAt: Date.now() + CANCELLATION_RETENTION_MS,
+  });
+  if (connection.readyState === WebSocket.OPEN) {
+    try {
+      connection.send(frame, () => {});
+    } catch {
+      // Close containment owns transport failure; there is no retry channel.
+    }
+  }
+}
+
+function sendRevokedCancellationTerminal(record) {
+  if (record.terminalSent) return record.terminalSend ?? Promise.resolve();
+  record.phase = "terminal";
+  record.terminalSent = true;
+  record.terminalSend = record.send(
+    { type: "invoke_terminal", disposition: "cancelled" },
+    { done: true },
+  );
+  void record.terminalSend.catch(() => {});
+  return record.terminalSend;
+}
+
+function containCancellationOnClose(connection, readinessState) {
+  const state = cancellationByConnection.get(connection);
+  if (!state || state.socketGeneration !== readinessState?.socketGeneration) return;
+  const retirements = new Map();
+  for (const record of state.records.values()) {
+    if (record.connection !== connection || record.socketGeneration !== readinessState.socketGeneration) continue;
+    if (cancellationRecordPhase(record) === "queued") {
+      record.revoked = true;
+      record.ticket?.revokeBeforeStart?.();
+      continue;
+    }
+    if (record.phase !== "active" || !record.session) continue;
+    const holds = retirements.get(record.session) ?? [];
+    if (record.activityLease) holds.push(() => record.activityLease.release());
+    record.activityLease = undefined;
+    retirements.set(record.session, holds);
+  }
+  for (const [session, holds] of retirements) {
+    const sharedBySuccessor = [...cancellationRecords].some(
+      (record) =>
+        record.session === session &&
+        (record.connection !== connection ||
+          record.socketGeneration !== readinessState.socketGeneration),
+    );
+    if (sharedBySuccessor) {
+      // A session crossing socket ownership is unsafe to adopt after transport
+      // loss.  The retirement below fences it for every claimant.
+      console.error("daemon: unsafe shared session ownership during close containment");
+    }
+    // retireSession installs its fence synchronously.  Never await it from a
+    // close callback: reconnect scheduling must not race this containment.
+    void pool.retireSession(session, { holds }).catch(() => {});
+  }
+}
 const connections = new Set();
 let shuttingDown = false;
 let shutdownPromise = null;
@@ -1747,6 +1863,7 @@ async function admitReadyWorkload(state, workDir, message) {
     }
     return {
       session,
+      effectiveWorkDir,
       bindingState,
       bindingFingerprint: bindingFingerprintValue,
       activityLease,
@@ -1842,6 +1959,9 @@ function connectToBot() {
   );
 
   connection.on("close", () => {
+    // Revoke queued work before retiring active siblings.  This is synchronous
+    // so no queued SDK dispatch can slip through while reconnect is scheduled.
+    containCancellationOnClose(connection, readinessState);
     daemonObservability.finishInvokeTransactionsForConnection(
       connection,
       "failed",
@@ -2044,6 +2164,75 @@ async function handleMessage(
     connection.send(JSON.stringify(PONG));
     return;
   }
+  if (msg?.type === MSG_TYPES.CANCEL_INVOKE) {
+    if (
+      !readinessState?.negotiatedCapabilities?.has(
+        INVOKE_CANCELLATION_CAPABILITY
+      ) ||
+      !isCancelInvokeMessage(msg)
+    ) {
+      closePolicyViolation(connection, "invalid cancellation");
+      return;
+    }
+    const cancellationState = cancellationStateFor(
+      connection,
+      readinessState.socketGeneration,
+    );
+    sweepCancellationState(cancellationState);
+    const priorReceipt = cancellationState.receipts.get(msg.cancelId);
+    if (priorReceipt) {
+      if (
+        priorReceipt.requestId !== msg.requestId ||
+        priorReceipt.reason !== msg.reason
+      ) {
+        closePolicyViolation(connection, "conflicting cancellation receipt");
+        return;
+      }
+      if (connection.readyState === WebSocket.OPEN) {
+        try {
+          connection.send(priorReceipt.frame, () => {});
+        } catch {}
+      }
+      return;
+    }
+    if (
+      cancellationState.records.size +
+        cancellationState.tombstones.size +
+        cancellationState.receipts.size >=
+      CANCELLATION_MAX_RECORDS
+    ) {
+      closePolicyViolation(connection, "cancellation capacity exhausted");
+      return;
+    }
+    const record = cancellationState.records.get(msg.requestId);
+    let outcome;
+    if (!record || record.socketGeneration !== readinessState.socketGeneration) {
+      outcome = cancellationState.tombstones.has(msg.requestId)
+        ? "already_terminal"
+        : "not_owned";
+    } else if (cancellationRecordPhase(record) === "queued") {
+      // This is the cancellation linearization point.  Everything below it
+      // must recheck record.revoked before it can reach an SDK/provider call.
+      record.revoked = true;
+      record.ticket?.revokeBeforeStart?.();
+      outcome = "cancelled_before_start";
+    } else if (record.phase === "terminal") {
+      outcome = "already_terminal";
+    } else {
+      record.cancelPending = true;
+      outcome = "cancellation_pending";
+    }
+    sendCancellationReceipt(connection, cancellationState, msg, outcome);
+    if (outcome === "cancelled_before_start") {
+      void sendRevokedCancellationTerminal(record);
+    }
+    daemonObservability.emitOwnerEvent({
+      name: "daemon",
+      action: "cancel",
+      outcome,
+    });
+    return;
+  }
   if (isAnswerMessage(msg)) {
     // Route and receipt an exact gate-answer attempt. Rejections deliberately
     // collapse to fixed wire codes: SDK errors and answer content never cross
@@ -2051,7 +2240,10 @@ async function handleMessage(
     const request = inFlightByRequestId.get(msg.requestId);
     let accepted = false;
     let errorCode = GATE_ANSWER_ERROR_CODES.REJECTED;
-    if (request?.connection === connection) {
+    if (
+      request?.connection === connection &&
+      request.socketGeneration === readinessState?.socketGeneration
+    ) {
       try {
         const result = await request.session.answerGate(msg.gateId, msg.answer);
         accepted = result?.ok === true;
@@ -2561,6 +2753,14 @@ async function handleMessage(
   }
 
   const { requestId, workDir, command } = msg;
+  if (
+    !readinessState?.negotiatedCapabilities?.has(
+      INVOKE_CANCELLATION_CAPABILITY
+    )
+  ) {
+    closePolicyViolation(connection, "cancellation capability required");
+    return;
+  }
   const invokeTelemetry = daemonObservability.createInvokeTransaction(
     connection,
     requestId,
@@ -2605,17 +2805,32 @@ async function handleMessage(
     sendQueue = operation;
     return operation;
   };
+  let cancellationRecord;
+  const sendInvokeTerminal = (event) => {
+    if (cancellationRecord) cancellationRecord.phase = "terminal";
+    return send(event, { done: true });
+  };
   const sendTerminalFailure = (code) =>
-    send(
+    sendInvokeTerminal(
       {
         type: "invoke_terminal",
         disposition: "failed",
         code,
-      },
-      { done: true }
+      }
     );
   const releaseRequestId = requestIds.tryAcquire(requestId);
   if (!releaseRequestId) {
+    invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.LEASE_CONFLICT);
+    closePolicyViolation(connection, "duplicate request id");
+    return;
+  }
+  const cancellationState = cancellationStateFor(
+    connection,
+    readinessState.socketGeneration,
+  );
+  sweepCancellationState(cancellationState);
+  if (cancellationState.tombstones.has(requestId)) {
+    releaseRequestId();
     invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.LEASE_CONFLICT);
     closePolicyViolation(connection, "duplicate request id");
     return;
@@ -2645,14 +2860,62 @@ async function handleMessage(
     invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
     return;
   }
+  if (
+    cancellationState.records.size +
+      cancellationState.tombstones.size +
+      cancellationState.receipts.size >=
+    CANCELLATION_MAX_RECORDS
+  ) {
+    releaseAdmission();
+    releaseRequestId();
+    invokeTelemetry.finish("refused", PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED);
+    closePolicyViolation(connection, "cancellation capacity exhausted");
+    return;
+  }
+  cancellationRecord = {
+    connection,
+    socketGeneration: readinessState.socketGeneration,
+    requestId,
+    phase: "queued",
+    revoked: false,
+    cancelPending: false,
+    send,
+    session: undefined,
+    bindingId: msg.bindingId,
+    effectiveWorkDir: workDir,
+    activityLease: undefined,
+    ticket: undefined,
+    terminalSent: false,
+    terminalSend: undefined,
+  };
+  cancellationState.records.set(requestId, cancellationRecord);
+  cancellationRecords.add(cancellationRecord);
   let session;
   let activityLease;
   let invokeOutcome = "failed";
   let invokeCode = PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
 
   try {
+    if (cancellationRecord.revoked) {
+      invokeOutcome = "failed";
+      invokeCode = null;
+      if (connection.readyState === WebSocket.OPEN) {
+        await sendRevokedCancellationTerminal(cancellationRecord);
+      }
+      return;
+    }
     if (readinessState?.committed) {
       const admission = await admitReadyWorkload(readinessState, workDir, msg);
+      if (cancellationRecord.revoked) {
+        activityLease = admission.activityLease;
+        cancellationRecord.activityLease = activityLease;
+        invokeOutcome = "failed";
+        invokeCode = null;
+        if (connection.readyState === WebSocket.OPEN) {
+          await sendRevokedCancellationTerminal(cancellationRecord);
+        }
+        return;
+      }
       if (admission.error) {
         invokeOutcome = "refused";
         invokeCode = admission.error.code;
@@ -2661,6 +2924,9 @@ async function handleMessage(
       }
       session = admission.session;
       activityLease = admission.activityLease;
+      cancellationRecord.session = session;
+      cancellationRecord.activityLease = activityLease;
+      cancellationRecord.effectiveWorkDir = admission.effectiveWorkDir;
       if (
         admission.bindingState &&
         (!activityLease?.isCurrent() ||
@@ -2689,31 +2955,96 @@ async function handleMessage(
       });
     } else {
       session = await pool.ensureSession(workDir);
+      cancellationRecord.session = session;
+      if (cancellationRecord.revoked) {
+        invokeOutcome = "failed";
+        invokeCode = null;
+        if (connection.readyState === WebSocket.OPEN) {
+          await sendRevokedCancellationTerminal(cancellationRecord);
+        }
+        return;
+      }
     }
     inFlightByRequestId.set(requestId, {
       connection,
       session,
       bindingId: msg.bindingId,
+      socketGeneration: readinessState.socketGeneration,
     });
 
     let commandResult;
+    const sendOwnedCommand = (sdkCommand, onEvent) => {
+      if (typeof session.sendOwned !== "function") {
+        if (!SESSION_FACTORY_TEST_INJECTION_ENABLED) {
+          throw new Error("SDK session does not support request ownership");
+        }
+        cancellationRecord.phase = "active";
+        return session.send(sdkCommand, onEvent);
+      }
+      const ticket = session.sendOwned(
+        `${readinessState.socketGeneration}:${requestId}`,
+        sdkCommand,
+        onEvent,
+        undefined,
+        {
+          onActivate: () => {
+            if (cancellationRecord.phase === "queued") {
+              cancellationRecord.phase = "active";
+            }
+          },
+        }
+      );
+      cancellationRecord.ticket = ticket;
+      return ticket.result;
+    };
     if (command.kind === "set_model") {
-      await setSessionModel(session, command, (event) => send(event));
+      await setSessionModel(
+        session,
+        command,
+        (event) => send(event),
+        { sendCommand: sendOwnedCommand }
+      );
     } else {
       const rpcCommand = toRpcCommand(command);
-      commandResult = await session.send(rpcCommand, (event) => send(event));
+      if (cancellationRecord.revoked) {
+        invokeOutcome = "failed";
+        invokeCode = null;
+        if (connection.readyState === WebSocket.OPEN) {
+          await sendRevokedCancellationTerminal(cancellationRecord);
+        }
+        return;
+      }
+      commandResult = await sendOwnedCommand(
+        rpcCommand,
+        (event) => send(event)
+      );
+      if (commandResult?.revokedBeforeStart === true || cancellationRecord.revoked) {
+        invokeOutcome = "failed";
+        invokeCode = null;
+        if (connection.readyState === WebSocket.OPEN) {
+          await sendRevokedCancellationTerminal(cancellationRecord);
+        }
+        return;
+      }
     }
 
-    await send(
+    await sendInvokeTerminal(
       {
         type: "invoke_terminal",
         disposition: commandResult?.disposition ?? "completed",
-      },
-      { done: true }
+      }
     );
     invokeOutcome = "succeeded";
     invokeCode = null;
   } catch (err) {
+    if (cancellationRecord.revoked) {
+      invokeOutcome = "failed";
+      invokeCode = null;
+      if (connection.readyState === WebSocket.OPEN) {
+        await sendRevokedCancellationTerminal(cancellationRecord);
+      }
+      return;
+    }
     const modelDiagnostic =
       command.kind === "set_model" ? modelCommandDiagnostic(err) : undefined;
     if (modelDiagnostic !== undefined) {
@@ -2728,6 +3059,7 @@ async function handleMessage(
     ) {
       const retirementLease = activityLease;
       activityLease = undefined;
+      cancellationRecord.activityLease = undefined;
       try {
         await pool.retireSession(session, {
           holds: retirementLease
@@ -2757,16 +3089,20 @@ async function handleMessage(
     invokeOutcome = "failed";
     invokeCode =
       terminalEvent.code ?? PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME;
-    await send(terminalEvent, { done: true });
+    await sendInvokeTerminal(terminalEvent);
   } finally {
     invokeTelemetry.finish(invokeOutcome, invokeCode);
     releaseRequestId();
-    activityLease?.release();
+    if (cancellationRecord.activityLease === activityLease) {
+      activityLease?.release();
+      cancellationRecord.activityLease = undefined;
+    }
     releaseAdmission();
     const request = inFlightByRequestId.get(requestId);
     if (request?.connection === connection && request.session === session) {
       inFlightByRequestId.delete(requestId);
     }
+    retainCancellationTerminal(cancellationState, cancellationRecord);
   }
 }
 

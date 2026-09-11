@@ -128,6 +128,70 @@ test("setSessionModel sends the exact set_model payload and receipt after succes
   ]);
 });
 
+test("setSessionModel can route both SDK operations through an owned sender", async () => {
+  const commands = [];
+  const session = {
+    send() {
+      throw new Error("unowned SDK send must not be used");
+    },
+  };
+  await setSessionModel(
+    session,
+    { modelName: "openai:gpt-5" },
+    () => {},
+    {
+      async sendCommand(command, onEvent) {
+        commands.push(command);
+        if (command.type === "get_available_models") {
+          onEvent({
+            command: "get_available_models",
+            data: { models: MODELS },
+          });
+        }
+      },
+    }
+  );
+  assert.deepEqual(commands, [
+    { type: "get_available_models" },
+    { type: "set_model", provider: "openai", modelId: "gpt-5" },
+  ]);
+});
+
+test("setSessionModel never emits success for a revoked owned operation", async () => {
+  for (const revokeAt of ["list", "set"]) {
+    const events = [];
+    let sends = 0;
+    await assert.rejects(
+      setSessionModel(
+        { send() { throw new Error("unowned send"); } },
+        { modelName: "openai:gpt-5" },
+        (event) => events.push(event),
+        {
+          async sendCommand(command, onEvent) {
+            sends += 1;
+            if (command.type === "get_available_models") {
+              if (revokeAt === "list") return { revokedBeforeStart: true };
+              onEvent({
+                command: "get_available_models",
+                data: { models: MODELS },
+              });
+              return { disposition: "completed" };
+            }
+            return { revokedBeforeStart: true };
+          },
+        }
+      ),
+      /Could not (read the available model list|set the selected model)/
+    );
+    assert.equal(
+      events.some((event) => event.type === "model_resolved"),
+      false,
+      revokeAt
+    );
+    assert.equal(sends, revokeAt === "list" ? 1 : 2);
+  }
+});
+
 test("setSessionModel emits no success receipt when set_model fails", async () => {
   const events = [];
   const cause = new Error("raw provider failure");

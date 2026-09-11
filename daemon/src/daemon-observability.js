@@ -36,6 +36,7 @@ const CLOSED_ACTIONS = new Set([
   "invalidate",
   "retire",
   "invoke",
+  "cancel",
   ...Object.values(WORKSPACE_LIFECYCLE_OPERATIONS).flatMap((operations) => [
     ...operations,
   ]),
@@ -48,6 +49,10 @@ const CLOSED_OUTCOMES = new Set([
   "settled",
   "refused",
   "failed",
+  "cancelled_before_start",
+  "cancellation_pending",
+  "already_terminal",
+  "not_owned",
   "committed",
   "required",
 ]);

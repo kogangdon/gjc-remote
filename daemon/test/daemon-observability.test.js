@@ -621,6 +621,40 @@ test("owner constructors reject invalid observers before mutation", () => {
   );
 });
 
+test("cancellation outcomes use the bounded daemon owner taxonomy", () => {
+  const observability = new DaemonObservability();
+  const events = [];
+  observability.subscribe((event) => events.push(event));
+  for (const outcome of [
+    "cancelled_before_start",
+    "cancellation_pending",
+    "already_terminal",
+    "not_owned",
+  ]) {
+    observability.emitOwnerEvent({
+      name: "daemon",
+      action: "cancel",
+      outcome,
+    });
+  }
+  assert.deepEqual(
+    events.map((event) => event.outcome),
+    [
+      "cancelled_before_start",
+      "cancellation_pending",
+      "already_terminal",
+      "not_owned",
+    ]
+  );
+  assert.throws(() =>
+    observability.emitOwnerEvent({
+      name: "daemon",
+      action: "cancel",
+      outcome: "cancelled",
+    })
+  );
+});
+
 test("opaque owner IDs allow 128 characters and reject paths and controls", () => {
   const id128 = `a${"x".repeat(127)}`;
   assert.equal(isOpaqueId(id128), true);

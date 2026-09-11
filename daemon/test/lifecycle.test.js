@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
+  CAPABILITIES,
+  INVOKE_CANCELLATION_CAPABILITY,
   TERMINAL_DISPOSITION_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
@@ -181,6 +183,7 @@ async function startReadinessDaemon({
     protocolVersion: 2,
     capabilities: [
       TERMINAL_DISPOSITION_CAPABILITY,
+      INVOKE_CANCELLATION_CAPABILITY,
       WORKSPACE_READINESS_CAPABILITY,
     ],
   },
@@ -199,6 +202,7 @@ async function startReadinessDaemon({
   const telemetry = [];
   const policyCloses = [];
   const fixtureReceipts = [];
+  const cancellationFixtureEvents = [];
   const registrations = [];
   const sockets = [];
   const closes = [];
@@ -266,13 +270,18 @@ async function startReadinessDaemon({
     if (message?.type === "daemon_observability") telemetry.push(message.event);
     if (message?.type === "daemon_policy_close") policyCloses.push(message);
     if (message?.type === "invoke_admission_fixture_disposed") fixtureReceipts.push(message);
+    if (message?.type === "cancellation_fixture") {
+      cancellationFixtureEvents.push(message);
+    }
   });
 
   return {
+    child,
     frames,
     telemetry,
     policyCloses,
     fixtureReceipts,
+    cancellationFixtureEvents,
     registrations,
     sockets,
     closes,
@@ -303,6 +312,7 @@ test("daemon confirms actual gate acceptance and preserves rejected-answer retry
         "set_model",
         "heartbeat",
         TERMINAL_DISPOSITION_CAPABILITY,
+        INVOKE_CANCELLATION_CAPABILITY,
       ],
     },
     envOverrides: {
@@ -734,6 +744,7 @@ test("receipt-bound admitted invoke freezes daemon correlation without wire leak
       protocolVersion: 3,
       capabilities: [
         TERMINAL_DISPOSITION_CAPABILITY,
+        INVOKE_CANCELLATION_CAPABILITY,
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
         WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -1386,7 +1397,12 @@ test("daemon refuses invokes when the bot did not negotiate terminal disposition
     registerResponse: {
       type: "register_ok",
       protocolVersion: 1,
-      capabilities: ["invoke", "set_model", "heartbeat"],
+      capabilities: [
+        "invoke",
+        "set_model",
+        "heartbeat",
+        INVOKE_CANCELLATION_CAPABILITY,
+      ],
     },
     afterRegisterResponse(socket) {
       socket.send(JSON.stringify({
@@ -1409,6 +1425,630 @@ test("daemon refuses invokes when the bot did not negotiate terminal disposition
     assert.equal(refusal.event, undefined);
     assert.equal(JSON.parse(refusal.error).code, "PROTOCOL_INCOMPATIBLE");
     assert.equal(JSON.stringify(refusal).includes("must not execute"), false);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("daemon closes before invoke when cancellation was not negotiated", async () => {
+  const daemon = await startReadinessDaemon({
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: [
+        "invoke",
+        "set_model",
+        "heartbeat",
+        TERMINAL_DISPOSITION_CAPABILITY,
+      ],
+    },
+    afterRegisterResponse(socket) {
+      socket.send(JSON.stringify({
+        type: "invoke",
+        requestId: "legacy-cancellation/request",
+        workDir: process.cwd(),
+        command: { kind: "prompt", message: "must not execute" },
+      }));
+    },
+  });
+  try {
+    await waitForLength(daemon.closes, 1, "cancellation capability refusal");
+    assert.equal(daemon.closes[0].code, 1008);
+    assert.equal(daemon.frames.length, 0);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("cancellation before session admission terminalizes without execution", async () => {
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(
+      new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
+    ),
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: CAPABILITIES,
+    },
+    envOverrides: {
+      GJC_READINESS_V2: "0",
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+      GJC_CANCELLATION_FIXTURE_BLOCK_CREATION: "1",
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+    },
+  });
+  const requestId = "cancel-before-admission/request";
+  try {
+    await waitForLength(daemon.sockets, 1, "pre-admission cancellation socket");
+    await waitForDaemonOutput(daemon, "daemon: registration accepted");
+    const socket = daemon.sockets[0];
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId,
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "must-never-start" },
+    }));
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "creation_started",
+      "blocked session creation"
+    );
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId,
+      cancelId: "cancel-before-admission-1",
+      reason: "idle_timeout",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "invoke_terminal",
+      "pre-admission cancellation terminal"
+    );
+    assert.deepEqual(
+      daemon.frames
+        .filter((frame) => frame.requestId === requestId)
+        .map((frame) => frame.event),
+      [
+        {
+          type: "cancel_result",
+          cancelId: "cancel-before-admission-1",
+          outcome: "cancelled_before_start",
+        },
+        { type: "invoke_terminal", disposition: "cancelled" },
+      ]
+    );
+    daemon.child.send({ type: "cancellation_fixture_release_creation" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      daemon.cancellationFixtureEvents.some(
+        (event) =>
+          event.event === "prompt_started" &&
+          event.message === "must-never-start"
+      ),
+      false
+    );
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("request cancellation revokes queued work and leaves active work pending", async () => {
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(
+      new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
+    ),
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: CAPABILITIES,
+    },
+    envOverrides: {
+      GJC_READINESS_V2: "0",
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+    },
+  });
+  const firstRequestId = "cancel-active/request";
+  const secondRequestId = "cancel-queued/request";
+  try {
+    await waitForLength(daemon.sockets, 1, "cancellation fixture socket");
+    await waitForDaemonOutput(daemon, "daemon: registration accepted");
+    const socket = daemon.sockets[0];
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId: firstRequestId,
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "first" },
+    }));
+    try {
+      await waitForFrame(
+        daemon.cancellationFixtureEvents,
+        (event) => event.event === "prompt_started" && event.message === "first",
+        "first prompt start"
+      );
+    } catch (error) {
+      throw new Error(
+        `${error.message}: ${daemon.output()} closes=${JSON.stringify(
+          daemon.closes
+        )} frames=${JSON.stringify(daemon.frames)}`
+      );
+    }
+
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId: secondRequestId,
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "second" },
+    }));
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId: secondRequestId,
+      cancelId: "cancel-queued-1",
+      reason: "user_cancelled",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === secondRequestId &&
+        frame.event?.type === "invoke_terminal",
+      "queued cancellation terminal"
+    );
+    const queuedFrames = daemon.frames.filter(
+      (frame) => frame.requestId === secondRequestId
+    );
+    assert.deepEqual(queuedFrames.map((frame) => frame.event), [
+      {
+        type: "cancel_result",
+        cancelId: "cancel-queued-1",
+        outcome: "cancelled_before_start",
+      },
+      { type: "invoke_terminal", disposition: "cancelled" },
+    ]);
+    assert.equal(
+      daemon.cancellationFixtureEvents.some(
+        (event) => event.event === "prompt_started" && event.message === "second"
+      ),
+      false
+    );
+
+    const modelRequestId = "cancel-queued-model/request";
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId: modelRequestId,
+      workDir: process.cwd(),
+      command: { kind: "set_model", modelName: "fixture:model-a" },
+    }));
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId: modelRequestId,
+      cancelId: "cancel-queued-model-1",
+      reason: "user_cancelled",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === modelRequestId &&
+        frame.event?.type === "invoke_terminal",
+      "queued model cancellation terminal"
+    );
+    assert.deepEqual(
+      daemon.frames
+        .filter((frame) => frame.requestId === modelRequestId)
+        .map((frame) => frame.event),
+      [
+        {
+          type: "cancel_result",
+          cancelId: "cancel-queued-model-1",
+          outcome: "cancelled_before_start",
+        },
+        { type: "invoke_terminal", disposition: "cancelled" },
+      ]
+    );
+    assert.equal(
+      daemon.cancellationFixtureEvents.some(
+        (event) =>
+          event.event === "models_listed" || event.event === "model_set"
+      ),
+      false,
+      "revoked set_model must not reach either SDK operation"
+    );
+
+    const framesBeforeReplay = daemon.frames.length;
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId: secondRequestId,
+      cancelId: "cancel-queued-1",
+      reason: "user_cancelled",
+    }));
+    await waitForLength(
+      daemon.frames,
+      framesBeforeReplay + 1,
+      "duplicate cancel replay"
+    );
+    const replay = daemon.frames.filter(
+      (frame) =>
+        frame.requestId === secondRequestId &&
+        frame.event?.cancelId === "cancel-queued-1"
+    );
+    assert.equal(replay.length, 2);
+    assert.deepEqual(replay[0], replay[1]);
+
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId: secondRequestId,
+      cancelId: "cancel-queued-after-terminal",
+      reason: "user_cancelled",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.event?.cancelId === "cancel-queued-after-terminal",
+      "already-terminal cancellation receipt"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) => frame.event?.cancelId === "cancel-queued-after-terminal"
+      )?.event.outcome,
+      "already_terminal"
+    );
+
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId: "cancel-unknown/request",
+      cancelId: "cancel-unknown-1",
+      reason: "user_cancelled",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.cancelId === "cancel-unknown-1",
+      "not-owned cancellation receipt"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) => frame.event?.cancelId === "cancel-unknown-1"
+      )?.event.outcome,
+      "not_owned"
+    );
+
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId: firstRequestId,
+      cancelId: "cancel-active-1",
+      reason: "user_cancelled",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === firstRequestId &&
+        frame.event?.cancelId === "cancel-active-1",
+      "active cancellation receipt"
+    );
+    assert.deepEqual(
+      daemon.frames.find(
+        (frame) => frame.event?.cancelId === "cancel-active-1"
+      )?.event,
+      {
+        type: "cancel_result",
+        cancelId: "cancel-active-1",
+        outcome: "cancellation_pending",
+      }
+    );
+
+    daemon.child.send({
+      type: "cancellation_fixture_release_prompt",
+      message: "first",
+    });
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === firstRequestId &&
+        frame.event?.type === "invoke_terminal",
+      "active natural terminal"
+    );
+    assert.deepEqual(
+      daemon.frames.find(
+        (frame) =>
+          frame.requestId === firstRequestId &&
+          frame.event?.type === "invoke_terminal"
+      )?.event,
+      { type: "invoke_terminal", disposition: "completed" }
+    );
+
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId: "model-interleave-blocker/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "model-interleave-blocker" },
+    }));
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) =>
+        event.event === "prompt_started" &&
+        event.message === "model-interleave-blocker",
+      "model interleave blocker"
+    );
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId: "model-interleave/request",
+      workDir: process.cwd(),
+      command: { kind: "set_model", modelName: "fixture:model-a" },
+    }));
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId: "model-interleave-sibling/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "model-interleave-sibling" },
+    }));
+    daemon.child.send({
+      type: "cancellation_fixture_release_prompt",
+      message: "model-interleave-blocker",
+    });
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) =>
+        event.event === "prompt_started" &&
+        event.message === "model-interleave-sibling",
+      "model interleave sibling"
+    );
+    assert.equal(
+      daemon.cancellationFixtureEvents.some(
+        (event) => event.event === "model_set"
+      ),
+      false
+    );
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId: "model-interleave/request",
+      cancelId: "cancel-model-interleave-1",
+      reason: "user_cancelled",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.cancelId === "cancel-model-interleave-1",
+      "active model cancellation receipt"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) => frame.event?.cancelId === "cancel-model-interleave-1"
+      )?.event.outcome,
+      "cancellation_pending",
+      "the whole model invoke remains irreversibly active after list activation"
+    );
+    daemon.child.send({
+      type: "cancellation_fixture_release_prompt",
+      message: "model-interleave-sibling",
+    });
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "model_set",
+      "model set after active cancellation"
+    );
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === "model-interleave/request" &&
+        frame.event?.type === "invoke_terminal",
+      "model interleave terminal"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) =>
+          frame.requestId === "model-interleave/request" &&
+          frame.event?.type === "invoke_terminal"
+      )?.event.disposition,
+      "completed"
+    );
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("socket loss revokes queued siblings and fences successor session creation", async () => {
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(
+      new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
+    ),
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: CAPABILITIES,
+    },
+    envOverrides: {
+      GJC_READINESS_V2: "0",
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+      GJC_CANCELLATION_FIXTURE_BLOCK_DISPOSAL: "1",
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+    },
+  });
+  try {
+    await waitForLength(daemon.sockets, 1, "initial cancellation socket");
+    await waitForDaemonOutput(daemon, "daemon: registration accepted");
+    const firstSocket = daemon.sockets[0];
+    firstSocket.send(JSON.stringify({
+      type: "invoke",
+      requestId: "disconnect-active/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "disconnect-first" },
+    }));
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) =>
+        event.event === "prompt_started" &&
+        event.message === "disconnect-first",
+      "disconnect fixture first prompt"
+    );
+    firstSocket.send(JSON.stringify({
+      type: "invoke",
+      requestId: "disconnect-queued/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "disconnect-second" },
+    }));
+    firstSocket.terminate();
+
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "dispose_started",
+      "disconnect containment disposal"
+    );
+    assert.equal(
+      daemon.cancellationFixtureEvents.some(
+        (event) =>
+          event.event === "prompt_started" &&
+          event.message === "disconnect-second"
+      ),
+      false
+    );
+
+    await waitForLength(daemon.sockets, 2, "replacement cancellation socket");
+    const replacement = daemon.sockets[1];
+    await waitForLength(daemon.registrations, 2, "replacement registration");
+    replacement.send(JSON.stringify({
+      type: "invoke",
+      requestId: "disconnect-successor/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "disconnect-successor" },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      daemon.cancellationFixtureEvents.some(
+        (event) =>
+          event.event === "prompt_started" &&
+          event.message === "disconnect-successor"
+      ),
+      false,
+      "successor must wait for positive disposal fulfillment"
+    );
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === "disconnect-successor/request" &&
+        frame.event?.code === "SESSION_RETIREMENT_PENDING",
+      "successor retirement refusal"
+    );
+
+    daemon.child.send({ type: "cancellation_fixture_release_disposal" });
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "dispose_completed",
+      "positive disposal fulfillment"
+    );
+    replacement.send(JSON.stringify({
+      type: "invoke",
+      requestId: "disconnect-after-proof/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "disconnect-after-proof" },
+    }));
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) =>
+        event.event === "prompt_started" &&
+        event.message === "disconnect-after-proof",
+      "successor after disposal proof"
+    );
+    daemon.child.send({
+      type: "cancellation_fixture_release_prompt",
+      message: "disconnect-after-proof",
+    });
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === "disconnect-after-proof/request" &&
+        frame.event?.type === "invoke_terminal",
+      "successor terminal"
+    );
+    assert.equal(
+      daemon.cancellationFixtureEvents.filter(
+        (event) => event.event === "dispose_started"
+      ).length,
+      1
+    );
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("socket-loss disposal rejection permanently fences a successor", async () => {
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(
+      new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
+    ),
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities: CAPABILITIES,
+    },
+    envOverrides: {
+      GJC_READINESS_V2: "0",
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+      GJC_CANCELLATION_FIXTURE_REJECT_DISPOSAL: "1",
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+    },
+  });
+  try {
+    await waitForLength(daemon.sockets, 1, "rejected-disposal socket");
+    await waitForDaemonOutput(daemon, "daemon: registration accepted");
+    const firstSocket = daemon.sockets[0];
+    firstSocket.send(JSON.stringify({
+      type: "invoke",
+      requestId: "rejected-disposal-active/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "rejected-disposal-first" },
+    }));
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) =>
+        event.event === "prompt_started" &&
+        event.message === "rejected-disposal-first",
+      "rejected-disposal active prompt"
+    );
+    firstSocket.terminate();
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "dispose_started",
+      "rejected disposal attempt"
+    );
+
+    await waitForLength(daemon.sockets, 2, "rejected-disposal replacement");
+    await waitForLength(daemon.registrations, 2, "replacement registration");
+    daemon.sockets[1].send(JSON.stringify({
+      type: "invoke",
+      requestId: "rejected-disposal-successor/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "must-remain-fenced" },
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === "rejected-disposal-successor/request" &&
+        frame.event?.type === "invoke_terminal",
+      "failed-retirement successor refusal"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) =>
+          frame.requestId === "rejected-disposal-successor/request" &&
+          frame.event?.type === "invoke_terminal"
+      )?.event.code,
+      "SESSION_RETIREMENT_FAILED"
+    );
+    assert.equal(
+      daemon.cancellationFixtureEvents.some(
+        (event) =>
+          event.event === "prompt_started" &&
+          event.message === "must-remain-fenced"
+      ),
+      false
+    );
   } finally {
     await daemon.stop();
   }

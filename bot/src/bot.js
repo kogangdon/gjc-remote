@@ -38,6 +38,7 @@ import { HostRegistry, extractAssistantText } from "./host-registry.js";
 import { formatHostList } from "./host-projection.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
 import { ToolLogStore } from "./tool-log-store.js";
+import { InvocationOwnership } from "./invocation-ownership.js";
 import {
   extractToolCall,
   formatToolLog,
@@ -263,6 +264,10 @@ registry.setManagedRoutes(
   channelMapping.sourceKind === "managed-v1" ? channelMap : {}
 );
 const toolLogStore = new ToolLogStore();
+// Exact initiating user/channel ownership for the Discord `/cancel` surface.
+// Entries contain only opaque protocol IDs and are removed by the owning
+// run's finally block, so a late interaction cannot target a successor.
+const invocationOwnership = new InvocationOwnership();
 // #35: channelId -> { hostId, requestId, gateId } for a workflow gate currently
 // awaiting a user's answer in that channel. While an entry exists, the next
 // message in the channel is routed to the daemon as the gate answer rather than
@@ -304,6 +309,34 @@ async function handleChatInputInteraction(interaction) {
     await interaction.reply(noMentions(
       formatHostList(hosts)
     ));
+    return;
+  }
+  if (commandName === "cancel") {
+    const active = invocationOwnership.get(
+      interaction.channelId,
+      interaction.user.id
+    );
+    if (!active?.requestId) {
+      await interaction.reply(
+        noMentions("There is no active request owned by you in this channel.", {
+          ephemeral: true,
+        })
+      );
+      return;
+    }
+    const cancellation = registry.cancelInvoke(
+      active.hostId,
+      active.requestId,
+      "user_cancelled"
+    );
+    await interaction.reply(
+      noMentions(
+        cancellation.ok
+          ? "Cancellation requested. Interruption remains unconfirmed until the host reports a terminal outcome."
+          : "Cancellation could not be correlated to an active request.",
+        { ephemeral: true }
+      )
+    );
     return;
   }
 
@@ -447,6 +480,16 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   const toolCalls = [];
   const toolCallIndex = new Map();
   let modelReceipt;
+  const ownership =
+    channelId === undefined || userId === undefined
+      ? undefined
+      : invocationOwnership.reserve(channelId, userId, route.hostId);
+  if (channelId !== undefined && userId !== undefined && !ownership) {
+    await edit(
+      "You already have an active GJC request in this channel. Use `/cancel` to request cancellation."
+    ).catch(() => {});
+    return;
+  }
 
   let preview = "";
   const editProgress = (force = false) => {
@@ -515,10 +558,14 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
             workspaceId: route.workspaceId,
             workspaceGeneration: route.workspaceGeneration,
             authority: route.authority,
-          }
+          },
+      (requestId) => {
+        invocationOwnership.attachRequest(ownership, requestId);
+      }
     );
   } finally {
     clearInterval(heartbeat);
+    invocationOwnership.release(ownership);
     // #35: an invoke never settles with a gate still pending, but guard against a
     // leaked marker (timeout/hard-cap mid-gate) so a later message is not
     // misrouted as a stale answer. Only clear a marker this invoke owns.
@@ -557,10 +604,19 @@ function renderGateToChannel(channel, channelId, hostId, gate) {
   }
   if (!channel || typeof channel.send !== "function") {
     console.error("Failed to render workflow gate: channel is unavailable");
-    return Promise.resolve();
+    const marker = pendingGateByChannel.get(channelId);
+    if (marker?.requestId === gate.requestId) {
+      pendingGateByChannel.delete(channelId);
+    }
+    return Promise.reject(new Error("workflow gate channel is unavailable"));
   }
   return channel.send(noMentions(lines.join("\n"))).catch((error) => {
-    console.error("Failed to render workflow gate:", error);
+    const marker = pendingGateByChannel.get(channelId);
+    if (marker?.requestId === gate.requestId) {
+      pendingGateByChannel.delete(channelId);
+    }
+    console.error("Failed to render workflow gate");
+    throw new Error("workflow gate presentation failed", { cause: error });
   });
 }
 

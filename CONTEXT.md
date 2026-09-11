@@ -191,12 +191,29 @@ current transport lives in `daemon/src/sdk-session.js`.
    operation settles. Positive disposal fulfillment is the only authority for
    reuse; rejection leaves a permanent process-local fence, so a successor SDK
    session cannot overlap ownership with unproven prior work.
-8. **Terminal SDK outcomes lost their meaning at the relay boundary.** Current
-   bot and daemon peers require `terminal_disposition_v1` before admitting an
-   invoke. The daemon emits one exact completed, failed, cancelled, paused,
-   timed-out, or disconnected disposition; the bot accepts the first valid
-   terminal frame only. A timeout or transport loss does not prove interruption
-   and is rendered as unconfirmed until session retirement proves quiescence.
+8. **Terminal SDK outcomes and cancellation ownership lost their meaning at the
+   relay boundary.** Current bot and daemon peers require both
+   `terminal_disposition_v1` and `invoke_cancellation_v1` before admitting an
+   invoke, so mixed peers fail closed before execution. `cancel_invoke` reasons
+   are exactly `idle_timeout`, `hard_cap`, `disconnect`, `user_cancelled`, and
+   `presentation_failed`; `cancel_result` outcomes are exactly
+   `cancelled_before_start`, `cancellation_pending`, `already_terminal`, and
+   `not_owned`. A duplicate cancellation ID replays its original receipt, while
+   bounded request/cancel tombstones remain through the hard-cap/receipt
+   horizon. A queued request is revoked before SDK/provider/tool execution,
+   receives `cancelled_before_start`, and then terminal `cancelled`. An active
+   request receives only nonterminal `cancellation_pending`, because SDK 0.16.6
+   has no supported active interruption control; its natural terminal remains
+   authoritative. The daemon emits one exact completed, failed, cancelled,
+   paused, timed-out, or disconnected disposition; the bot accepts the first
+   valid terminal frame only. A receipt, timeout, or transport loss does not
+   prove interruption or quiescence and Discord renders it as unconfirmed.
+   Bot idle/hard-cap expiry, `/cancel`, presentation failure, and
+   shutdown/disconnect ownership changes request revocation. Daemon close
+   synchronously revokes queued siblings and retires each active shared session
+   once through #234 containment, retaining leases and admission fences until
+   positive disposal proof. This does not restore active `steer`/`follow_up`
+   and does not unblock #231.
 9. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.

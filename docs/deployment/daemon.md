@@ -17,8 +17,22 @@ A supported public ownership lifecycle is requested in
 remain fail-closed until it ships. See the
 [containment record](../../CHANGELOG.md#sdk-0166-containment).
 
-The bot and daemon must negotiate `terminal_disposition_v1` before serving an
-invoke. Its authoritative final frame is an `event` with an
+The bot and daemon must negotiate `terminal_disposition_v1` and
+`invoke_cancellation_v1` before serving an invoke; mixed peers refuse an
+invoke before execution, so deploy both components lockstep. `cancel_invoke`
+reasons are exactly `idle_timeout`, `hard_cap`, `disconnect`, `user_cancelled`,
+and `presentation_failed`; `cancel_result` outcomes are exactly
+`cancelled_before_start`, `cancellation_pending`, `already_terminal`, and
+`not_owned`. A duplicate cancel ID replays its exact receipt. Request/cancel
+tombstones are bounded and retained through the hard-cap/receipt horizon.
+
+A queued request is revoked before SDK, provider, or tool execution, receives
+`cancelled_before_start`, and then terminal `cancelled`. An active request
+receives only nonterminal `cancellation_pending`: SDK 0.16.6 has no supported
+active-interruption control, and its eventual natural terminal remains
+authoritative. A cancellation receipt is not terminal or quiescence proof.
+
+Its authoritative final frame is an `event` with an
 `invoke_terminal` event, `done: true`, and no top-level `error`; the first
 valid terminal frame wins. The only dispositions are `completed`, `failed`,
 `cancelled`, `paused`, `timed_out`, and `disconnected`. Preserve `paused` and
@@ -27,9 +41,12 @@ Neither `timed_out` nor `disconnected` proves the underlying SDK or process
 was interrupted. A bot-local response timeout is likewise an unconfirmed local
 failure, not a daemon `timed_out` disposition. On adapter timeout, the daemon
 transfers the session/activity hold to SessionPool retirement containment (#234)
-while cleanup settles because work may continue. This does not add cancellation
-support: #232 remains unimplemented. The #231 live-control containment above
-remains active.
+while cleanup settles because work may continue. On socket close, the daemon
+synchronously revokes queued sibling invokes and retires each active shared
+session once through #234 containment. It retains associated leases and
+admission fences until positive disposal proof; no successor may adopt or
+downgrade owned work. The #231 live-control containment above remains active:
+cancellation does not restore active `steer`/`follow_up` or unblock #231.
 
 This repository provides the foreground start command below; it does not ship a
 native service installer, service wrapper, or systemd unit, and this guide is
@@ -99,7 +116,9 @@ On a stop signal the daemon drains under `GJC_SHUTDOWN_TIMEOUT_MS`, default
 15,000 ms. The value is bounded (minimum 1,000 ms); configure the external
 service supervisor's stop timeout above it. Treat forced termination as an
 operational failure, because active workflows and local state may not have
-reached their normal cleanup boundary.
+reached their normal cleanup boundary. Socket close containment revokes queued
+siblings before execution and starts #234 retirement for active shared
+sessions; it is not proof that active SDK/provider work was interrupted.
 
 Monitor daemon process health, outbound WebSocket registration at the bot,
 provider/profile failures, and the expected mapped workspace state separately.
@@ -116,15 +135,18 @@ blindly retry the operation or reuse the fenced session.
 
 Before an upgrade, record the deployed revision, Bun and SDK versions,
 `HOST_ID`, service-account identity, model profile, and protected-state backup
-status. Deploy bot and daemon lockstep for `terminal_disposition_v1`: after one
-side updates, an old peer cannot serve invokes and the mixed pair fails closed.
-Stop gracefully, install the new locked dependencies, restart, then confirm
-registration, negotiated invoke capability, and a known authorized route. Roll
-back binaries only when the local persistence and mapping-authority state
-remain compatible. Do not treat copied `~/.gjc`, session state, or an old
-authority snapshot as a safe generic rollback: tokens may be account-bound and
-durable authority floors must not be rewound. Prefer forward recovery under the
-current authority contract.
+status. Deploy bot and daemon lockstep for `terminal_disposition_v1` and
+`invoke_cancellation_v1`: after one side updates, an old peer cannot serve
+invokes and the mixed pair fails closed. Drain in-flight requests to
+terminal/quiescence evidence before rollback; never downgrade owned work while
+#234 leases and fences await positive disposal proof. Stop gracefully, install
+the new locked dependencies, restart, then confirm registration, negotiated
+invoke capabilities, and a known authorized route. Roll back binaries only
+when the local persistence and mapping-authority state remain compatible. Do
+not treat copied `~/.gjc`, session state, or an old authority snapshot as a
+safe generic rollback: tokens may be account-bound and durable authority floors
+must not be rewound. Prefer forward recovery under the current authority
+contract.
 
 ## Native inventory and serving boundary
 
