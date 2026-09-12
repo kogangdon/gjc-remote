@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
 import {
   PROTOCOL_ERROR_CODES,
@@ -809,7 +809,7 @@ export class SdkSession {
     command,
     onEvent,
     timeoutMs,
-    ticket = this.#createOwnedQueueTicket(undefined),
+    ticket = this.#createOwnedQueueTicket(randomUUID()),
     onActivate
   ) {
     this.queuedCommands += 1;
@@ -820,7 +820,7 @@ export class SdkSession {
         if (this.closed) throw new Error("GJC SDK session is not running");
         ticket.phase = "active";
         onActivate?.();
-        return this.#dispatch(command, onEvent, timeoutMs);
+        return this.#dispatch(command, onEvent, timeoutMs, ticket.ownerId);
       })
       .then(
         (value) => this.#resolveOwnedQueueTicket(ticket, value),
@@ -833,7 +833,7 @@ export class SdkSession {
     return ticket.publicTicket;
   }
 
-  async #dispatch(command, onEvent, timeoutMs) {
+  async #dispatch(command, onEvent, timeoutMs, ownerId) {
     if (!command || typeof command !== "object") {
       throw new Error("Invalid SDK session command");
     }
@@ -875,20 +875,21 @@ export class SdkSession {
         return;
       }
       case "prompt":
-        return this.#runPromptCommand(command, onEvent, timeoutMs);
+        return this.#runPromptCommand(command, onEvent, timeoutMs, ownerId);
       case "steer":
       case "follow_up":
         return this.#runPromptCommand(
           { type: "prompt", message: command.message },
           onEvent,
-          timeoutMs
+          timeoutMs,
+          ownerId
         );
       default:
         throw new Error(`Unknown SDK session command: ${command.type}`);
     }
   }
 
-  async #runPromptCommand(command, onEvent, timeoutMs) {
+  async #runPromptCommand(command, onEvent, timeoutMs, ownerId) {
     let resolveAgentEnd;
     const agentEnd = new Promise((resolve) => {
       resolveAgentEnd = resolve;
@@ -905,7 +906,7 @@ export class SdkSession {
     // SDK 0.16.6 replays durable pending gates synchronously from
     // onGateEmitted(), so subscribing first would see no owner and quarantine a
     // valid resumed gate.
-    const gateRun = { onEvent, controller: undefined };
+    const gateRun = { ownerId, onEvent, controller: undefined };
     this.activeGateRuns.push(gateRun);
     this.#ensureGateSubscription();
     this.activePromptRuns += 1;
@@ -1059,9 +1060,9 @@ export class SdkSession {
     );
   }
 
-  // #35: a workflow gate opened during an active run. Register it, suspend the
-  // owning run's idle timer, and synthesize a clamped gate_request event onto
-  // that run's stream so the bot can render it and collect an answer.
+  // A workflow gate opened during an active run. Register it, suspend the
+  // owning run's idle timer, and synthesize one complete bounded gate_request;
+  // unrepresentable content is quarantined rather than truncated.
   #handleGateEmitted(gate, gateEmitter) {
     const gateId = gate?.gate_id;
     if (typeof gateId !== "string" || gateId.length === 0) return;
@@ -1091,7 +1092,7 @@ export class SdkSession {
     this.#presentGate(gate, gateEmitter);
   }
 
-  #presentGate(gate, gateEmitter, deferredOwner, deferredEvent) {
+  #presentGate(gate, gateEmitter, deferredOwner, deferredEvent, deferredPresentationId) {
     const gateId = gate.gate_id;
     // Attribute the gate to the most recently started run (gates emit while that
     // run's prompt() is executing). With no active run there is nothing to
@@ -1102,7 +1103,10 @@ export class SdkSession {
       this.#quarantineGate(gateEmitter, gateId);
       return;
     }
-    const event = deferredEvent ?? this.#buildGateRequestEvent(gate, gateId);
+    const presentationId = deferredPresentationId ?? randomUUID();
+    const event =
+      deferredEvent ??
+      this.#buildGateRequestEvent(gate, gateId, presentationId);
     if (!event) {
       // A malformed/oversized gate the bot could not render; do not hang the run.
       console.error(
@@ -1116,6 +1120,9 @@ export class SdkSession {
       emitter: gateEmitter,
       owner: gateRun,
       controller: gateRun.controller,
+      ownerId: gateRun.ownerId,
+      presentationId,
+      state: "awaiting_presentation",
     });
     for (const activeRun of this.activeGateRuns) {
       activeRun.controller?.suspendForGate();
@@ -1137,7 +1144,8 @@ export class SdkSession {
       return;
     }
     const owner = this.activeGateRuns[this.activeGateRuns.length - 1];
-    const event = this.#buildGateRequestEvent(gate, gateId);
+    const presentationId = randomUUID();
+    const event = this.#buildGateRequestEvent(gate, gateId, presentationId);
     if (!owner || !event) {
       this.#quarantineGate(gateEmitter, gateId);
       return;
@@ -1147,6 +1155,7 @@ export class SdkSession {
       emitter: gateEmitter,
       owner,
       event,
+      presentationId,
     };
   }
 
@@ -1157,29 +1166,40 @@ export class SdkSession {
     this.#quarantineGate(candidate.emitter, candidate.gate.gate_id);
   }
 
-  // #35: build a protocol-conforming gate_request event for one supported SDK
-  // schema, clamping its prompt and choices to V0_LIMITS. Returns undefined for
-  // an unknown kind/schema or an event that cannot be made to validate.
-  #buildGateRequestEvent(gate, gateId) {
-    if (!gateAnswerCodec(gate)) return undefined;
+  // Build a complete protocol-conforming gate request. Refuse rather than
+  // silently truncate any prompt, choice, or label outside the wire bounds.
+  #buildGateRequestEvent(gate, gateId, presentationId) {
+    const codec = gateAnswerCodec(gate);
+    if (!codec) return undefined;
     const kind = gate.kind;
-    const prompt = gatePrompt(gate).slice(0, V0_LIMITS.GATE_PROMPT);
+    const prompt = gatePrompt(gate);
     const options = Array.isArray(gate?.options) ? gate.options : [];
+    if (
+      prompt.length > V0_LIMITS.GATE_PROMPT ||
+      options.length > V0_LIMITS.MAX_CHOICES ||
+      options.some(
+        (option) =>
+          typeof option.label !== "string" ||
+          option.label.length === 0 ||
+          option.label.length > V0_LIMITS.CHOICE_LABEL
+      )
+    ) {
+      return undefined;
+    }
     const choices =
       options.length > 0
-        ? options.slice(0, V0_LIMITS.MAX_CHOICES).map((option) => ({
+        ? options.map((option) => ({
             value: option.value,
-            label:
-              typeof option.label === "string"
-                ? option.label.slice(0, V0_LIMITS.CHOICE_LABEL)
-                : String(option.label ?? "").slice(0, V0_LIMITS.CHOICE_LABEL),
+            label: option.label,
           }))
         : undefined;
     const event = {
       type: "gate_request",
       gateId,
+      presentationId,
       prompt,
       kind,
+      ...(codec.type === "ask" && codec.multi === true ? { multi: true } : {}),
       ...(choices ? { choices } : {}),
     };
     return isGateRequestEvent(event) ? event : undefined;
@@ -1236,7 +1256,8 @@ export class SdkSession {
       candidate.gate,
       candidate.emitter,
       candidate.owner,
-      candidate.event
+      candidate.event,
+      candidate.presentationId
     );
     return true;
   }
@@ -1252,13 +1273,94 @@ export class SdkSession {
     return true;
   }
 
-  // #35: resolve a pending gate with a user's answer (called from daemon message
-  // routing when an ANSWER frame arrives). Runs concurrently with the blocked
-  // prompt run that is awaiting the gate. A stale/unknown gateId is a safe no-op.
-  async answerGate(gateId, answer) {
+  presentGate(ownerId, gateId, presentationId, presentationAttemptId) {
+    if (
+      typeof ownerId !== "string" ||
+      typeof gateId !== "string" ||
+      gateId.length === 0 ||
+      gateId.length > V0_LIMITS.GATE_ID ||
+      typeof presentationId !== "string" ||
+      presentationId.length === 0 ||
+      presentationId.length > V0_LIMITS.REQUEST_ID ||
+      typeof presentationAttemptId !== "string" ||
+      presentationAttemptId.length === 0 ||
+      presentationAttemptId.length > V0_LIMITS.REQUEST_ID
+    ) {
+      return false;
+    }
+    const entry = this.pendingGates.get(gateId);
+    if (
+      !entry ||
+      entry.ownerId !== ownerId ||
+      entry.presentationId !== presentationId
+    ) {
+      return false;
+    }
+    if (entry.state === "answerable") {
+      return entry.presentationAttemptId === presentationAttemptId;
+    }
+    if (entry.state !== "awaiting_presentation") return false;
+    entry.presentationAttemptId = presentationAttemptId;
+    entry.state = "answerable";
+    return true;
+  }
+
+  abandonGate(ownerId, gateId, presentationId) {
+    if (
+      typeof ownerId !== "string" ||
+      typeof gateId !== "string" ||
+      gateId.length === 0 ||
+      gateId.length > V0_LIMITS.GATE_ID ||
+      typeof presentationId !== "string" ||
+      presentationId.length === 0 ||
+      presentationId.length > V0_LIMITS.REQUEST_ID
+    ) {
+      return false;
+    }
+    const entry = this.pendingGates.get(gateId);
+    if (
+      !entry ||
+      entry.ownerId !== ownerId ||
+      entry.presentationId !== presentationId ||
+      (entry.state !== "awaiting_presentation" && entry.state !== "answerable")
+    ) {
+      return false;
+    }
+    this.#retirePendingGate(gateId, entry);
+    this.#quarantineGate(entry.emitter, gateId);
+    return true;
+  }
+
+  quarantineOwnedGates(ownerId) {
+    if (typeof ownerId !== "string") return false;
+    let quarantined = false;
+    for (const [gateId, entry] of [...this.pendingGates]) {
+      if (
+        entry.ownerId !== ownerId ||
+        (entry.state !== "awaiting_presentation" && entry.state !== "answerable")
+      ) {
+        continue;
+      }
+      this.#retirePendingGate(gateId, entry);
+      this.#quarantineGate(entry.emitter, gateId);
+      quarantined = true;
+    }
+    return quarantined;
+  }
+
+  // Resolve an answerable, exactly-owned gate. Runs concurrently with the
+  // blocked prompt run that is awaiting the SDK resolution.
+  async answerGate(ownerId, gateId, presentationId, answer) {
     if (this.closed) return { ok: false, error: "session is closed" };
     const entry = this.pendingGates.get(gateId);
     if (!entry) return { ok: false, error: "no pending gate for id" };
+    if (
+      entry.ownerId !== ownerId ||
+      entry.presentationId !== presentationId ||
+      entry.state !== "answerable"
+    ) {
+      return { ok: false, error: "workflow gate is not answerable" };
+    }
     if (entry.resolving) {
       return { ok: false, error: "gate answer is already being resolved" };
     }
@@ -1366,7 +1468,7 @@ export class SdkSession {
       }
       return {
         ok: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: "workflow gate answer failed",
       };
     } finally {
       if (this.pendingGates.get(gateId) === entry) {

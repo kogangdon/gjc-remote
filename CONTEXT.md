@@ -67,20 +67,42 @@ explicitly historical.
    unowned completion and unrelated-terminal correlation. SDK failure outcomes
    reject the invocation. Each prompt receives its event stream. Idle sessions
    (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
-   Gate answers use per-attempt `answerId` receipts. Only confirmed acceptance
-   retires the exact presentation; rejection preserves a live retry route.
-   Late receipts cannot erase successor gates, and a failed reply is never
-   redispatched as a prompt. Receipt retention is capped at 64 per socket and
-   bounded by a 30-second deadline independently of invoke completion.
+   Gate-capable invokes require negotiated `gate_presentation_v1` as well as
+   terminal-disposition and cancellation capabilities; mixed peers fail closed
+   before execution and must be deployed lockstep. A gate begins
+   `awaiting_presentation`, bound to exact `ownerId`, `gateId`, and
+   `presentationId`. The bot renders a bounded Discord message with the
+   complete wire-bounded prompt/options in an attachment, then sends
+   `present_gate`; only its exact accepted presentation receipt makes the gate
+   answerable. Presentation and abandonment receipts are nonterminal. Answers
+   use per-attempt `answerId` receipts and bind the exact
+   request/gate/presentation to the original gate message, its channel, and
+   the initiating user. Buttons/select menus are used when suitable; free text
+   must be an exact reply to that gate message, and an ordinary channel message
+   never satisfies a gate. The original gate message is edited as Answering,
+   Answered, Rejected—retry available, Expired, Replaced, or Disconnected.
+   Only confirmed answer acceptance retires the exact presentation; rejection
+   preserves its live retry route. Late receipts cannot erase successor gates,
+   and a failed reply is never redispatched as a prompt. Presentation failure
+   or timeout sends `abandon_gate` while open and separately requests
+   `presentation_failed` cancellation without claiming interruption. Duplicate
+   attempt/answer IDs replay exact receipts; conflicts policy-close. Receipt
+   handling is layered: the bot caps 64 live presentation/abandon attempts with
+   a 30-second receipt deadline, while the daemon retains up to 1,024 exact
+   per-connection presentation/abandon/answer receipts for the 24-hour
+   ownership horizon. Both layers fail closed on live-capacity exhaustion;
+   terminal Discord tombstones alone may be reclaimed. Oversized gate protocol
+   content is refused/quarantined rather than silently truncated.
 3. `bot/` is the only component holding the Discord token. It runs a WS
    server (`bot/src/host-registry.js`) that daemons connect to, and maps
    each Discord channel to one validated `{hostId, workDir}` pair via
    `bot/channels.json` (gitignored — copy from `channels.example.json`). The bot
    watches the parent directory so editor replace/rename saves reload safely;
    an invalid reload keeps the last valid map.
-   In mapped channels, ordinary non-bot messages from allowed users are treated
-   as direct GJC prompts; slash commands remain available for skills, `/model`,
-   and `/hosts`.
+   In mapped channels, ordinary non-bot messages from allowed users are direct
+   GJC prompts unless they are an exact reply to that user's answerable gate
+   message; ordinary messages do not satisfy gates. Slash commands remain
+   available for skills, `/model`, and `/hosts`.
 
 **Ownership boundary.** This upgrade retains the existing in-process
 `AgentSession` embedding. `gjc-remote` owns host authentication, Discord route
@@ -210,10 +232,11 @@ current transport lives in `daemon/src/sdk-session.js`.
    prove interruption or quiescence and Discord renders it as unconfirmed.
    Bot idle/hard-cap expiry, `/cancel`, presentation failure, and
    shutdown/disconnect ownership changes request revocation. Daemon close
-   synchronously revokes queued siblings and retires each active shared session
-   once through #234 containment, retaining leases and admission fences until
-   positive disposal proof. This does not restore active `steer`/`follow_up`
-   and does not unblock #231.
+   synchronously quarantines exact socket-generation gate owners before
+   cancellation retirement/reconnect, revokes queued siblings, and retires each
+   active shared session once through #234 containment, retaining leases and
+   admission fences until positive disposal proof. This does not restore active
+   `steer`/`follow_up` and does not unblock #231.
 9. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.

@@ -544,19 +544,35 @@ async function probeGates(ownerRoot) {
       const gateEvents = [];
       const unsubscribeGate = emitter.onGateEmitted((gate) => rawGates.push(structuredClone(gate)));
       try {
+        const ownerId = "sdk-contract-probe-owner";
         const run = observe(
-          harness.adapter.send(
+          harness.adapter.sendOwned(
+            ownerId,
             { type: "prompt", message: "exercise real ask gates" },
             (event) => {
               if (event?.type === "gate_request") gateEvents.push(event);
             },
             5_000
-          )
+          ).result
         );
 
         await waitFor(() => gateEvents.length === 1 && rawGates.length === 1, "FIRST_GATE_NOT_EMITTED");
+        requireCondition(
+          harness.adapter.presentGate(
+            ownerId,
+            gateEvents[0].gateId,
+            gateEvents[0].presentationId,
+            "sdk-contract-presentation-1"
+          ) === true,
+          "SELECTION_GATE_PRESENTATION_REJECTED"
+        );
         const selection = await withDeadline(
-          harness.adapter.answerGate(gateEvents[0].gateId, "Beta"),
+          harness.adapter.answerGate(
+            ownerId,
+            gateEvents[0].gateId,
+            gateEvents[0].presentationId,
+            "Beta"
+          ),
           STEP_TIMEOUT_MS,
           "SELECTION_GATE_ANSWER_TIMEOUT"
         );
@@ -564,14 +580,33 @@ async function probeGates(ownerRoot) {
 
         await waitFor(() => gateEvents.length === 2 && rawGates.length === 2, "SUCCESSOR_GATE_NOT_EMITTED");
         requireCondition(gateEvents[0].gateId !== gateEvents[1].gateId, "SUCCESSOR_GATE_ID_REUSED");
+        requireCondition(
+          harness.adapter.presentGate(
+            ownerId,
+            gateEvents[1].gateId,
+            gateEvents[1].presentationId,
+            "sdk-contract-presentation-2"
+          ) === true,
+          "CUSTOM_GATE_PRESENTATION_REJECTED"
+        );
         const invalid = await withDeadline(
-          harness.adapter.answerGate(gateEvents[1].gateId, "   "),
+          harness.adapter.answerGate(
+            ownerId,
+            gateEvents[1].gateId,
+            gateEvents[1].presentationId,
+            "   "
+          ),
           STEP_TIMEOUT_MS,
           "INVALID_CUSTOM_GATE_ANSWER_TIMEOUT"
         );
         requireCondition(invalid?.ok === false, "INVALID_CUSTOM_GATE_ANSWER_ACCEPTED");
         const custom = await withDeadline(
-          harness.adapter.answerGate(gateEvents[1].gateId, customAnswer),
+          harness.adapter.answerGate(
+            ownerId,
+            gateEvents[1].gateId,
+            gateEvents[1].presentationId,
+            customAnswer
+          ),
           STEP_TIMEOUT_MS,
           "CUSTOM_GATE_ANSWER_TIMEOUT"
         );

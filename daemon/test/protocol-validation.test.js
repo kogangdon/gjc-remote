@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   CAPABILITIES,
+  GATE_ABANDON_REASONS,
   INVOKE_CANCELLATION_CAPABILITY,
   INVOKE_CANCELLATION_OUTCOMES,
   INVOKE_CANCELLATION_REASONS,
@@ -31,7 +32,10 @@ import {
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
   INVENTORY_RECEIPT_TTL_MS,
   GATE_ANSWER_ERROR_CODES,
+  GATE_PRESENTATION_CAPABILITY,
+  isAbandonGateMessage,
   isAnswerMessage,
+  isGateAbandonResultMessage,
   isGateAnswerResultEvent,
   isBindOkMessage,
   isBindWorkspaceMessage,
@@ -39,12 +43,14 @@ import {
   isCancelResultMessage,
   isEventMessage,
   isGateRequestEvent,
+  isGatePresentationResultMessage,
   isInvokeMessage,
   isInvokeTerminalEvent,
   isReadinessCapabilityGate,
   isReadinessMessage,
   isReadinessStatus,
   isReadinessTtl,
+  isPresentGateMessage,
   normalizeReadinessTtl,
   isRegisterMessage,
   isRegisterOkMessage,
@@ -445,7 +451,7 @@ test("daemon accepts path-free workspace binding without promoting readiness", a
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, GATE_PRESENTATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     assert.equal((await registerOk).type, MSG_TYPES.READINESS);
 
@@ -484,7 +490,7 @@ test("v2 bind verifies the authority preimage before same-binding replay accepta
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, GATE_PRESENTATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -511,7 +517,7 @@ test("v2 bind verifies an advanced authority before lease adoption", async () =>
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, GATE_PRESENTATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -611,7 +617,7 @@ test("daemon promotes workspace readiness only after local inventory proof", asy
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, GATE_PRESENTATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await initialReadiness;
     const readinessPromise = waitForMessage(
@@ -1242,7 +1248,7 @@ test("daemon rejects an invoke with a stale workspace generation", async () => {
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, GATE_PRESENTATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -1476,7 +1482,7 @@ test("daemon replaces an older binding for the same workspace after a generation
     daemon.peer.send(JSON.stringify({
       type: MSG_TYPES.REGISTER_OK,
       protocolVersion: PROTOCOL_VERSION_V2,
-      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [TERMINAL_DISPOSITION_CAPABILITY, INVOKE_CANCELLATION_CAPABILITY, GATE_PRESENTATION_CAPABILITY, WORKSPACE_READINESS_CAPABILITY],
     }));
     await onceMessage(daemon.peer, MSG_TYPES.READINESS);
     daemon.peer.send(JSON.stringify(validBinding));
@@ -1988,6 +1994,7 @@ test("isAnswerMessage accepts a well-formed answer and rejects malformed ones (#
     type: "answer",
     requestId: "request-1",
     gateId: "gate-1",
+    presentationId: "presentation-1",
     answerId: "answer-1",
     answer: "yes",
   };
@@ -2002,6 +2009,9 @@ test("isAnswerMessage accepts a well-formed answer and rejects malformed ones (#
     ["requestId", ""],
     ["gateId", ""],
     ["gateId", "x".repeat(V0_LIMITS.GATE_ID + 1)],
+    ["presentationId", undefined],
+    ["presentationId", ""],
+    ["presentationId", "x".repeat(V0_LIMITS.REQUEST_ID + 1)],
     ["answerId", undefined],
     ["answerId", ""],
     ["answerId", "x".repeat(V0_LIMITS.REQUEST_ID + 1)],
@@ -2017,6 +2027,7 @@ test("gate answer receipts require exact correlation and sanitized outcomes", ()
     type: "gate_answer_result",
     answerId: "attempt",
     gateId: "gate",
+    presentationId: "presentation",
     accepted: true,
   };
   assert.equal(isGateAnswerResultEvent(accepted), true);
@@ -2030,6 +2041,9 @@ test("gate answer receipts require exact correlation and sanitized outcomes", ()
     { ...accepted, answerId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
     { ...accepted, gateId: "" },
     { ...accepted, gateId: "x".repeat(V0_LIMITS.GATE_ID + 1) },
+    { ...accepted, presentationId: undefined },
+    { ...accepted, presentationId: "" },
+    { ...accepted, presentationId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
     { ...accepted, accepted: "true" },
     { ...accepted, accepted: false },
     { ...accepted, accepted: false, errorCode: "raw SDK details" },
@@ -2043,115 +2057,190 @@ test("gate answer receipts require exact correlation and sanitized outcomes", ()
 });
 
 test("isGateRequestEvent validates the gate_request event subtype incl. bounds and choices (#35)", () => {
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      requestId: "request-1",
-      gateId: "gate-1",
-      prompt: "Pick one",
-      kind: "question",
-      choices: [
-        { value: 0, label: "First" },
-        { value: "b", label: "Second" },
-      ],
-    }),
-    true
-  );
-  // requestId and choices are optional.
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      gateId: "g",
-      prompt: "Approve?",
-      kind: "approval",
-    }),
-    true
-  );
-  assert.equal(isGateRequestEvent({ type: "gate_request", gateId: "g", prompt: "p", kind: "execution" }), true);
-  assert.equal(isGateRequestEvent(null), false);
-  assert.equal(
-    isGateRequestEvent({ type: "gate_request", gateId: "g", prompt: "p", kind: "bogus" }),
-    false,
-    "unknown kind"
-  );
-  assert.equal(
-    isGateRequestEvent({ type: "gate_request", gateId: "", prompt: "p", kind: "question" }),
-    false,
-    "empty gateId"
-  );
-  assert.equal(
-    isGateRequestEvent({ type: "gate_request", gateId: "g", prompt: "", kind: "question" }),
-    false,
-    "empty prompt"
-  );
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      gateId: "g",
-      prompt: "x".repeat(V0_LIMITS.GATE_PROMPT + 1),
-      kind: "question",
-    }),
-    false,
-    "oversized prompt"
-  );
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      gateId: "g",
-      prompt: "p",
-      kind: "question",
-      requestId: "",
-    }),
-    false,
-    "present but empty requestId"
-  );
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      gateId: "g",
-      prompt: "p",
-      kind: "question",
-      choices: "not-an-array",
-    }),
-    false,
-    "choices must be an array"
-  );
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      gateId: "g",
-      prompt: "p",
-      kind: "question",
-      choices: Array.from({ length: V0_LIMITS.MAX_CHOICES + 1 }, (_, i) => ({
-        value: i,
-        label: `c${i}`,
-      })),
-    }),
-    false,
-    "too many choices"
-  );
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      gateId: "g",
-      prompt: "p",
-      kind: "question",
-      choices: [{ label: "missing value" }],
-    }),
-    false,
-    "choice missing value"
-  );
-  assert.equal(
-    isGateRequestEvent({
-      type: "gate_request",
-      gateId: "g",
-      prompt: "p",
-      kind: "question",
-      choices: [{ value: 1, label: 123 }],
-    }),
-    false,
-    "choice label must be a string"
-  );
+  const valid = {
+    type: "gate_request",
+    requestId: "request-1",
+    gateId: "gate-1",
+    presentationId: "presentation-1",
+    prompt: "Pick one",
+    kind: "question",
+    choices: [{ value: 0, label: "First" }],
+  };
+  assert.equal(isGateRequestEvent(valid), true);
+  assert.equal(isGateRequestEvent({ ...valid, multi: true }), true);
+  assert.equal(isGateRequestEvent({
+    type: "gate_request",
+    gateId: "g",
+    presentationId: "p",
+    prompt: "Approve?",
+    kind: "approval",
+  }), true);
+  assert.equal(isGateRequestEvent({
+    ...valid,
+    requestId: "x".repeat(V0_LIMITS.REQUEST_ID),
+    gateId: "x".repeat(V0_LIMITS.GATE_ID),
+    presentationId: "x".repeat(V0_LIMITS.REQUEST_ID),
+    prompt: "x".repeat(V0_LIMITS.GATE_PROMPT),
+  }), true);
+  for (const invalid of [
+    null,
+    { ...valid, presentationId: undefined },
+    { ...valid, presentationId: "" },
+    { ...valid, presentationId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+    { ...valid, gateId: "" },
+    { ...valid, gateId: "x".repeat(V0_LIMITS.GATE_ID + 1) },
+    { ...valid, prompt: "" },
+    { ...valid, prompt: "x".repeat(V0_LIMITS.GATE_PROMPT + 1) },
+    { ...valid, requestId: "" },
+    { ...valid, kind: "bogus" },
+    { ...valid, multi: "true" },
+    { ...valid, choices: "not-an-array" },
+    { ...valid, choices: [{ label: "missing value" }] },
+    { ...valid, choices: [{ value: 1, label: 123 }] },
+    { ...valid, choices: [{ value: 1, label: "x", extra: true }] },
+    { ...valid, choices: Array.from({ length: V0_LIMITS.MAX_CHOICES + 1 }, () => ({ value: 1, label: "x" })) },
+    { ...valid, extra: true },
+    { ...valid, [Symbol("extra")]: true },
+  ]) {
+    assert.equal(isGateRequestEvent(invalid), false);
+  }
+  assert.equal(isGateRequestEvent(Object.assign(Object.create(null), valid)), false);
+  assert.equal(isGateRequestEvent(Object.create(valid)), false);
+});
+
+test("gate presentation and abandonment frames require exact plain owned correlations", () => {
+  const present = {
+    type: "present_gate",
+    requestId: "request",
+    gateId: "gate",
+    presentationId: "presentation",
+    presentationAttemptId: "attempt",
+  };
+  const presentationResult = {
+    type: "event",
+    requestId: "request",
+    event: {
+      type: "gate_presentation_result",
+      presentationAttemptId: "attempt",
+      gateId: "gate",
+      presentationId: "presentation",
+      accepted: true,
+    },
+  };
+  const abandon = {
+    type: "abandon_gate",
+    requestId: "request",
+    gateId: "gate",
+    presentationId: "presentation",
+    abandonId: "abandon",
+    reason: "send_failed",
+  };
+  const abandonResult = {
+    type: "event",
+    requestId: "request",
+    event: {
+      type: "gate_abandon_result",
+      abandonId: "abandon",
+      gateId: "gate",
+      presentationId: "presentation",
+      accepted: false,
+    },
+  };
+  assert.equal(GATE_PRESENTATION_CAPABILITY, "gate_presentation_v1");
+  assert.equal(CAPABILITIES.includes(GATE_PRESENTATION_CAPABILITY), true);
+  assert.deepEqual(GATE_ABANDON_REASONS, [
+    "send_failed",
+    "presentation_timeout",
+    "replaced",
+    "invoke_terminal",
+    "disconnected",
+  ]);
+  assert.equal(Object.isFrozen(GATE_ABANDON_REASONS), true);
+  assert.equal(isPresentGateMessage(present), true);
+  assert.equal(isPresentGateMessage({
+    ...present,
+    requestId: "x".repeat(V0_LIMITS.REQUEST_ID),
+    gateId: "x".repeat(V0_LIMITS.GATE_ID),
+    presentationId: "x".repeat(V0_LIMITS.REQUEST_ID),
+    presentationAttemptId: "x".repeat(V0_LIMITS.REQUEST_ID),
+  }), true);
+  assert.equal(isGatePresentationResultMessage(presentationResult), true);
+  assert.equal(isGatePresentationResultMessage({
+    ...presentationResult,
+    event: { ...presentationResult.event, accepted: false },
+  }), true);
+  assert.equal(isAbandonGateMessage(abandon), true);
+  assert.equal(isGateAbandonResultMessage(abandonResult), true);
+  assert.equal(isGateAbandonResultMessage({
+    ...abandonResult,
+    event: { ...abandonResult.event, accepted: true },
+  }), true);
+
+  for (const [validate, valid, idField] of [
+    [isPresentGateMessage, present, "presentationAttemptId"],
+    [isAbandonGateMessage, abandon, "abandonId"],
+  ]) {
+    for (const invalid of [
+      null,
+      { ...valid, type: "unknown" },
+      { ...valid, requestId: "" },
+      { ...valid, requestId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+      { ...valid, gateId: "" },
+      { ...valid, gateId: "x".repeat(V0_LIMITS.GATE_ID + 1) },
+      { ...valid, presentationId: "" },
+      { ...valid, presentationId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+      { ...valid, [idField]: "" },
+      { ...valid, [idField]: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+      { ...valid, extra: true },
+      { ...valid, [Symbol("extra")]: true },
+      Object.assign(Object.create(null), valid),
+      Object.create(valid),
+    ]) {
+      assert.equal(validate(invalid), false);
+    }
+  }
+  for (const reason of GATE_ABANDON_REASONS) {
+    assert.equal(isAbandonGateMessage({ ...abandon, reason }), true);
+  }
+  for (const invalid of [
+    { ...abandon, reason: "" },
+    { ...abandon, reason: "unknown" },
+    { ...abandon, reason: 1 },
+  ]) {
+    assert.equal(isAbandonGateMessage(invalid), false);
+  }
+
+  for (const [validate, valid, attemptField] of [
+    [isGatePresentationResultMessage, presentationResult, "presentationAttemptId"],
+    [isGateAbandonResultMessage, abandonResult, "abandonId"],
+  ]) {
+    for (const invalid of [
+      null,
+      { ...valid, type: "unknown" },
+      { ...valid, requestId: "" },
+      { ...valid, requestId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) },
+      { ...valid, done: false },
+      { ...valid, error: "error" },
+      { ...valid, extra: true },
+      { ...valid, [Symbol("extra")]: true },
+      { ...valid, event: { ...valid.event, [attemptField]: "" } },
+      { ...valid, event: { ...valid.event, [attemptField]: "x".repeat(V0_LIMITS.REQUEST_ID + 1) } },
+      { ...valid, event: { ...valid.event, gateId: "" } },
+      { ...valid, event: { ...valid.event, gateId: "x".repeat(V0_LIMITS.GATE_ID + 1) } },
+      { ...valid, event: { ...valid.event, presentationId: "" } },
+      { ...valid, event: { ...valid.event, presentationId: "x".repeat(V0_LIMITS.REQUEST_ID + 1) } },
+      { ...valid, event: { ...valid.event, accepted: "true" } },
+      { ...valid, event: { ...valid.event, type: "unknown" } },
+      { ...valid, event: { ...valid.event, extra: true } },
+      { ...valid, event: { ...valid.event, [Symbol("extra")]: true } },
+      Object.assign(Object.create(null), valid),
+      { ...valid, event: Object.assign(Object.create(null), valid.event) },
+      Object.create(valid),
+      { ...valid, event: Object.create(valid.event) },
+    ]) {
+      assert.equal(validate(invalid), false);
+    }
+  }
 });
 
 test("adding #35 message types does not break backward-compat validators", () => {
@@ -2164,6 +2253,7 @@ test("adding #35 message types does not break backward-compat validators", () =>
   const gateRequest = {
     type: "gate_request",
     gateId: "g",
+    presentationId: "presentation",
     prompt: "p",
     kind: "question",
   };

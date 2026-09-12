@@ -9,12 +9,12 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   CAPABILITIES,
+  GATE_PRESENTATION_CAPABILITY,
   INVOKE_CANCELLATION_CAPABILITY,
   TERMINAL_DISPOSITION_CAPABILITY,
   WORKSPACE_READINESS_CAPABILITY,
   WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
   WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
-  isGateAnswerResultEvent,
 } from "@gjc-remote/shared";
 import {
   fingerprintManagedMappingRecord,
@@ -184,6 +184,7 @@ async function startReadinessDaemon({
     capabilities: [
       TERMINAL_DISPOSITION_CAPABILITY,
       INVOKE_CANCELLATION_CAPABILITY,
+      GATE_PRESENTATION_CAPABILITY,
       WORKSPACE_READINESS_CAPABILITY,
     ],
   },
@@ -203,6 +204,7 @@ async function startReadinessDaemon({
   const policyCloses = [];
   const fixtureReceipts = [];
   const cancellationFixtureEvents = [];
+  const gateFixtureEvents = [];
   const registrations = [];
   const sockets = [];
   const closes = [];
@@ -273,6 +275,7 @@ async function startReadinessDaemon({
     if (message?.type === "cancellation_fixture") {
       cancellationFixtureEvents.push(message);
     }
+    if (message?.type === "gate_fixture") gateFixtureEvents.push(message);
   });
 
   return {
@@ -282,6 +285,7 @@ async function startReadinessDaemon({
     policyCloses,
     fixtureReceipts,
     cancellationFixtureEvents,
+    gateFixtureEvents,
     registrations,
     sockets,
     closes,
@@ -294,16 +298,11 @@ async function startReadinessDaemon({
   };
 }
 
-test("daemon confirms actual gate acceptance and preserves rejected-answer retry", async () => {
+test("daemon refuses prompt admission from a peer without gate presentation negotiation", async () => {
   const workDir = await mkdtemp(join(tmpdir(), "gjc-gate-wire-"));
   const requestId = "gate-wire-request";
-  const answer = (socket, gateId, answerId, value) => socket.send(JSON.stringify({
-    type: "answer", requestId, gateId, answerId, answer: value,
-  }));
   const daemon = await startReadinessDaemon({
-    daemonEntryOverride: fileURLToPath(new URL("../test-fixtures/gate-answer-daemon.mjs", import.meta.url)),
     testInjection: false,
-    observabilityTestIpc: true,
     registerResponse: {
       type: "register_ok",
       protocolVersion: 1,
@@ -327,34 +326,494 @@ test("daemon confirms actual gate acceptance and preserves rejected-answer retry
         command: { kind: "prompt", message: "gate fixture" },
       }));
     },
-    onMessage(message, socket) {
-      if (message.event?.type === "gate_request") {
-        if (message.event.gateId === "first") answer(socket, "first", "invalid", "no");
-        else answer(socket, "second", "second-valid", "yes");
-      }
-      if (message.event?.type === "gate_answer_result" && message.event.answerId === "invalid") {
-        answer(socket, "first", "first-valid", "yes");
-      }
-    },
   });
   try {
     await waitForFrame(daemon.frames, (frame) =>
-      frame.event?.answerId === "second-valid", "successor answer receipt");
-    await waitForFrame(daemon.frames, (frame) => frame.requestId === requestId && frame.done === true, "completed gate fixture");
-    const receipts = daemon.frames.filter((frame) => frame.event?.type === "gate_answer_result");
-    assert.equal(receipts.length, 3);
-    for (const frame of receipts) {
-      assert.equal(frame.requestId, requestId);
-      assert.equal(isGateAnswerResultEvent(frame.event), true);
-    }
-    assert.equal(receipts.find((frame) => frame.event.answerId === "invalid").event.accepted, false);
-    assert.equal(receipts.find((frame) => frame.event.answerId === "first-valid").event.accepted, true);
-    assert.equal(receipts.find((frame) => frame.event.answerId === "second-valid").event.accepted, true);
-    assert.equal(JSON.stringify(daemon.frames).includes("fixture-private-rejection"), false);
-    assert.equal(daemon.frames.filter((frame) => frame.done === true).length, 1);
+      frame.requestId === requestId && frame.done === true,
+    "gate presentation capability refusal");
+    const terminal = daemon.frames.find((frame) =>
+      frame.requestId === requestId && frame.done === true,
+    );
+    assert.equal(JSON.parse(terminal.error).code, "PROTOCOL_INCOMPATIBLE");
+    assert.equal(
+      daemon.frames.some((frame) => frame.event?.type === "gate_request"),
+      false,
+    );
   } finally {
     await daemon.stop();
     await rm(workDir, { recursive: true, force: true });
+  }
+});
+
+async function startGateWireDaemon(capabilities = CAPABILITIES, extraEnv = {}) {
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(
+      new URL("../test-fixtures/gate-answer-daemon.mjs", import.meta.url)
+    ),
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 1,
+      capabilities,
+    },
+    envOverrides: {
+      GJC_READINESS_V2: "0",
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+      GJC_NATIVE_INVENTORY_MODE: "off",
+      GJC_NATIVE_WORKSPACE_SERVING: "0",
+      ...extraEnv,
+    },
+  });
+  await waitForLength(daemon.sockets, 1, "gate wire socket");
+  await waitForDaemonOutput(daemon, "daemon: registration accepted");
+  return daemon;
+}
+
+test("gate capability skew leaves set_model admission unaffected", async () => {
+  const daemon = await startGateWireDaemon(
+    CAPABILITIES.filter(
+      (capability) => capability !== GATE_PRESENTATION_CAPABILITY
+    )
+  );
+  const requestId = "gate-skew-model/request";
+  try {
+    daemon.sockets[0].send(JSON.stringify({
+      type: "invoke",
+      requestId,
+      workDir: process.cwd(),
+      command: { kind: "set_model", modelName: "fixture:model-a" },
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "invoke_terminal",
+      "gate-skew model terminal"
+    );
+    const terminal = daemon.frames.find(
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "invoke_terminal"
+    );
+    assert.equal(terminal.event.disposition, "completed");
+    assert.equal(
+      daemon.frames.some(
+        (frame) =>
+          frame.requestId === requestId &&
+          frame.event?.type === "gate_request"
+      ),
+      false
+    );
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("daemon activates only an exactly presented gate before answering", async () => {
+  const daemon = await startGateWireDaemon();
+  const requestId = "gate-present-answer/request";
+  try {
+    const socket = daemon.sockets[0];
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId,
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "gate" },
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "gate_request",
+      "gate request"
+    );
+    const gateFrame = daemon.frames.find(
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "gate_request"
+    );
+    const gate = gateFrame.event;
+    socket.send(JSON.stringify({
+      type: "answer",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      answerId: "answer-before-present",
+      answer: "yes",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.answerId === "answer-before-present",
+      "pre-presentation answer rejection"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) => frame.event?.answerId === "answer-before-present"
+      )?.event.accepted,
+      false
+    );
+
+    const present = {
+      type: "present_gate",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      presentationAttemptId: "present-attempt-1",
+    };
+    socket.send(JSON.stringify(present));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.presentationAttemptId === "present-attempt-1",
+      "presentation receipt"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) => frame.event?.presentationAttemptId === "present-attempt-1"
+      )?.event.accepted,
+      true
+    );
+    const framesBeforeReplay = daemon.frames.length;
+    socket.send(JSON.stringify(present));
+    await waitForLength(
+      daemon.frames,
+      framesBeforeReplay + 1,
+      "presentation receipt replay"
+    );
+    const presentationReceipts = daemon.frames.filter(
+      (frame) => frame.event?.presentationAttemptId === "present-attempt-1"
+    );
+    assert.equal(presentationReceipts.length, 2);
+    assert.deepEqual(presentationReceipts[0], presentationReceipts[1]);
+
+    const answer = {
+      type: "answer",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      answerId: "answer-after-present",
+      answer: "yes",
+    };
+    const framesBeforeAnswer = daemon.frames.length;
+    socket.send(JSON.stringify(answer));
+    socket.send(JSON.stringify(answer));
+    await waitForLength(
+      daemon.frames,
+      framesBeforeAnswer + 3,
+      "duplicate answer receipt and terminal"
+    );
+    const answerReceipts = daemon.frames.filter(
+      (frame) => frame.event?.answerId === "answer-after-present"
+    );
+    assert.equal(answerReceipts.length, 2);
+    assert.deepEqual(answerReceipts[0], answerReceipts[1]);
+    assert.equal(answerReceipts[0].event.accepted, true);
+    assert.equal(
+      daemon.gateFixtureEvents.filter(
+        (event) => event.event === "answer"
+      ).length,
+      2,
+      "one pre-presentation rejection and one idempotent accepted answer"
+    );
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "invoke_terminal",
+      "gate invoke terminal"
+    );
+    socket.send(JSON.stringify({ ...answer, answer: "no" }));
+    await waitForLength(
+      daemon.closes,
+      1,
+      "conflicting gate answer id"
+    );
+    assert.equal(daemon.closes[0].code, 1008);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("daemon abandons an exact open-transport gate idempotently", async () => {
+  const daemon = await startGateWireDaemon();
+  const requestId = "gate-abandon/request";
+  try {
+    const socket = daemon.sockets[0];
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId,
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "gate" },
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.type === "gate_request",
+      "abandon gate request"
+    );
+    const gate = daemon.frames.find(
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "gate_request"
+    ).event;
+    const abandon = {
+      type: "abandon_gate",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      abandonId: "abandon-attempt-1",
+      reason: "send_failed",
+    };
+    socket.send(JSON.stringify(abandon));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.abandonId === "abandon-attempt-1",
+      "abandon receipt"
+    );
+    assert.equal(
+      daemon.frames.find(
+        (frame) => frame.event?.abandonId === "abandon-attempt-1"
+      )?.event.accepted,
+      true
+    );
+    const beforeReplay = daemon.frames.length;
+    socket.send(JSON.stringify(abandon));
+    await waitForLength(
+      daemon.frames,
+      beforeReplay + 1,
+      "abandon receipt replay"
+    );
+    assert.equal(
+      daemon.frames.filter(
+        (frame) => frame.event?.abandonId === "abandon-attempt-1"
+      ).length,
+      2
+    );
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("daemon synchronously quarantines socket-owned gates on close", async () => {
+  const daemon = await startGateWireDaemon();
+  try {
+    const socket = daemon.sockets[0];
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId: "gate-close/request",
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "gate" },
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.type === "gate_request",
+      "close gate request"
+    );
+    socket.terminate();
+    await waitForFrame(
+      daemon.gateFixtureEvents,
+      (event) => event.event === "quarantine" && event.accepted === true,
+      "synchronous gate quarantine"
+    );
+    const quarantine = daemon.gateFixtureEvents.find(
+      (event) => event.event === "quarantine" && event.accepted === true
+    );
+    assert.match(quarantine.ownerId, /^[0-9]+:gate-close\/request$/);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("terminal-then-close retains gate ownership until answer recovery settles", async () => {
+  const daemon = await startGateWireDaemon(CAPABILITIES, {
+    GJC_GATE_FIXTURE_BLOCK_ANSWER: "1",
+  });
+  const requestId = "gate-terminal-close/request";
+  try {
+    const socket = daemon.sockets[0];
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId,
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "gate" },
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.type === "gate_request",
+      "terminal-close gate request"
+    );
+    const gate = daemon.frames.find(
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "gate_request"
+    ).event;
+    socket.send(JSON.stringify({
+      type: "present_gate",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      presentationAttemptId: "terminal-close-present",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.presentationAttemptId === "terminal-close-present",
+      "terminal-close presentation receipt"
+    );
+    socket.send(JSON.stringify({
+      type: "answer",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      answerId: "terminal-close-answer",
+      answer: "yes",
+    }));
+    await waitForFrame(
+      daemon.gateFixtureEvents,
+      (event) => event.event === "answer_started",
+      "blocked gate answer"
+    );
+    daemon.child.send({ type: "gate_fixture_force_terminal" });
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "invoke_terminal",
+      "terminal before answer recovery"
+    );
+    socket.terminate();
+    await waitForFrame(
+      daemon.gateFixtureEvents,
+      (event) => event.event === "quarantine" && event.accepted === true,
+      "retained owner close quarantine"
+    );
+    daemon.child.send({ type: "gate_fixture_release_answer" });
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("concurrent duplicate answers resolve once and replay one exact receipt", async () => {
+  const daemon = await startGateWireDaemon(CAPABILITIES, {
+    GJC_GATE_FIXTURE_BLOCK_ANSWER: "1",
+  });
+  const requestId = "gate-duplicate-answer/request";
+  try {
+    const socket = daemon.sockets[0];
+    socket.send(JSON.stringify({
+      type: "invoke",
+      requestId,
+      workDir: process.cwd(),
+      command: { kind: "prompt", message: "gate" },
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) => frame.event?.type === "gate_request",
+      "duplicate-answer gate request"
+    );
+    const gate = daemon.frames.find(
+      (frame) =>
+        frame.requestId === requestId &&
+        frame.event?.type === "gate_request"
+    ).event;
+    socket.send(JSON.stringify({
+      type: "present_gate",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      presentationAttemptId: "duplicate-answer-present",
+    }));
+    await waitForFrame(
+      daemon.frames,
+      (frame) =>
+        frame.event?.presentationAttemptId === "duplicate-answer-present",
+      "duplicate-answer presentation"
+    );
+    const answer = {
+      type: "answer",
+      requestId,
+      gateId: gate.gateId,
+      presentationId: gate.presentationId,
+      answerId: "duplicate-answer-attempt",
+      answer: "yes",
+    };
+    socket.send(JSON.stringify(answer));
+    socket.send(JSON.stringify(answer));
+    await waitForFrame(
+      daemon.gateFixtureEvents,
+      (event) => event.event === "answer_started",
+      "blocked duplicate answer"
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(
+      daemon.gateFixtureEvents.filter(
+        (event) => event.event === "answer_started"
+      ).length,
+      1
+    );
+    daemon.child.send({ type: "gate_fixture_release_answer" });
+    await waitForLength(
+      daemon.frames,
+      daemon.frames.length + 2,
+      "duplicate answer receipts"
+    );
+    const receipts = daemon.frames.filter(
+      (frame) => frame.event?.answerId === "duplicate-answer-attempt"
+    );
+    assert.equal(receipts.length, 2);
+    assert.deepEqual(receipts[0], receipts[1]);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("daemon gate receipt capacity replays retained ids then fails closed", async () => {
+  const daemon = await startGateWireDaemon();
+  try {
+    const socket = daemon.sockets[0];
+    for (let index = 0; index < 1024; index += 1) {
+      socket.send(JSON.stringify({
+        type: "present_gate",
+        requestId: "unknown-request",
+        gateId: "unknown-gate",
+        presentationId: "unknown-presentation",
+        presentationAttemptId: `capacity-attempt-${index}`,
+      }));
+    }
+    await waitForLength(
+      daemon.frames,
+      1024,
+      "bounded gate receipt capacity"
+    );
+    const first = daemon.frames.find(
+      (frame) =>
+        frame.event?.presentationAttemptId === "capacity-attempt-0"
+    );
+    assert.equal(first.event.accepted, false);
+    socket.send(JSON.stringify({
+      type: "present_gate",
+      requestId: "unknown-request",
+      gateId: "unknown-gate",
+      presentationId: "unknown-presentation",
+      presentationAttemptId: "capacity-attempt-0",
+    }));
+    await waitForLength(daemon.frames, 1025, "retained capacity replay");
+    assert.deepEqual(
+      daemon.frames.filter(
+        (frame) =>
+          frame.event?.presentationAttemptId === "capacity-attempt-0"
+      ),
+      [first, first]
+    );
+
+    socket.send(JSON.stringify({
+      type: "present_gate",
+      requestId: "unknown-request",
+      gateId: "unknown-gate",
+      presentationId: "unknown-presentation",
+      presentationAttemptId: "capacity-overflow",
+    }));
+    await waitForLength(daemon.closes, 1, "gate receipt capacity refusal");
+    assert.equal(daemon.closes[0].code, 1008);
+  } finally {
+    await daemon.stop();
   }
 });
 
@@ -745,6 +1204,7 @@ test("receipt-bound admitted invoke freezes daemon correlation without wire leak
       capabilities: [
         TERMINAL_DISPOSITION_CAPABILITY,
         INVOKE_CANCELLATION_CAPABILITY,
+        GATE_PRESENTATION_CAPABILITY,
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
         WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -1402,6 +1862,7 @@ test("daemon refuses invokes when the bot did not negotiate terminal disposition
         "set_model",
         "heartbeat",
         INVOKE_CANCELLATION_CAPABILITY,
+        GATE_PRESENTATION_CAPABILITY,
       ],
     },
     afterRegisterResponse(socket) {
@@ -1440,6 +1901,7 @@ test("daemon closes before invoke when cancellation was not negotiated", async (
         "set_model",
         "heartbeat",
         TERMINAL_DISPOSITION_CAPABILITY,
+        GATE_PRESENTATION_CAPABILITY,
       ],
     },
     afterRegisterResponse(socket) {

@@ -3,7 +3,13 @@ import "dotenv/config";
 import { existsSync, lstatSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, GatewayIntentBits } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  GatewayIntentBits,
+} from "discord.js";
 import { V0_LIMITS, isModelName } from "@gjc-remote/shared";
 import { createManagementNative } from "@gjc-remote/native-control";
 import { managedHostSetFingerprint } from "@gjc-remote/shared/mapping-envelope";
@@ -33,7 +39,12 @@ import {
   formatDeliveryError,
 } from "./delivery.js";
 import { GJC_SKILLS } from "./skills.js";
-import { deliverGateAnswer } from "./gate-answer.js";
+import {
+  GatePresentationStore,
+  classifyGateReply,
+  deliverGateAnswer,
+} from "./gate-answer.js";
+import { renderGatePresentation } from "./gate-presentation.js";
 import { HostRegistry, extractAssistantText } from "./host-registry.js";
 import { formatHostList } from "./host-projection.js";
 import { transformModelResult, validateModelResolvedEvent } from "./model-result.js";
@@ -268,12 +279,7 @@ const toolLogStore = new ToolLogStore();
 // Entries contain only opaque protocol IDs and are removed by the owning
 // run's finally block, so a late interaction cannot target a successor.
 const invocationOwnership = new InvocationOwnership();
-// #35: channelId -> { hostId, requestId, gateId } for a workflow gate currently
-// awaiting a user's answer in that channel. While an entry exists, the next
-// message in the channel is routed to the daemon as the gate answer rather than
-// starting a new prompt. Cleared only after confirmed acceptance or when the
-// invoke settles.
-const pendingGateByChannel = new Map();
+const gatePresentations = new GatePresentationStore();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -289,6 +295,7 @@ client.on("interactionCreate", async (interaction) => {
     interaction,
     authorization,
     onButton: handleButtonInteraction,
+    onSelect: handleGateSelectInteraction,
     onChatInput: handleChatInputInteraction,
   });
 });
@@ -392,7 +399,14 @@ async function handleChatInputInteraction(interaction) {
     edit: (content) => interaction.editReply(noMentions(content)),
     deliver: (result) => deliverInteraction(interaction, commandName, result),
     onGate: (gate) =>
-      renderGateToChannel(interaction.channel, interaction.channelId, route.hostId, gate),
+      renderGatePresentation({
+        store: gatePresentations,
+        channel: interaction.channel,
+        channelId: interaction.channelId,
+        hostId: route.hostId,
+        gate,
+        userId: interaction.user.id,
+      }),
   }).catch(async (error) => {
     console.error(`Failed to handle /${commandName} interaction:`, error);
     await interaction.editReply(noMentions("GJC request failed before a result could be delivered.")).catch((editError) => {
@@ -412,6 +426,41 @@ client.on("messageCreate", async (message) => {
 async function handleAuthorizedMessage(message) {
   const prompt = message.content.trim();
   if (!prompt) return;
+  const replyToMessageId = message.reference?.messageId;
+  const gateReply =
+    typeof replyToMessageId === "string"
+      ? classifyGateReply({
+          store: gatePresentations,
+          messageId: replyToMessageId,
+          channelId: message.channelId,
+          userId: message.author.id,
+        })
+      : { kind: "ordinary" };
+  if (gateReply.kind === "not_owned" || gateReply.kind === "retired") {
+    await message
+      .reply(
+        noMentions(
+          gateReply.kind === "not_owned"
+            ? "That gate belongs to a different initiating user. No prompt was sent."
+            : "That gate is no longer answerable. No prompt was sent."
+        )
+      )
+      .catch(() => {});
+    return;
+  }
+  if (gateReply.kind === "answerable") {
+    const gateHandled = await deliverGateAnswer({
+      store: gatePresentations,
+      token: gateReply.entry.token,
+      messageId: replyToMessageId,
+      userId: message.author.id,
+      replyToMessageId,
+      answer: prompt,
+      answerGate: registry.answerGate.bind(registry),
+      onState: (state, entry) => entry.updateState?.(state),
+    });
+    if (gateHandled) return;
+  }
   const routeSelection = resolveDispatchRoute(
     channelMap,
     message.channelId,
@@ -421,23 +470,6 @@ async function handleAuthorizedMessage(message) {
   );
   if (routeSelection.status !== "ready") return;
   const { route } = routeSelection;
-
-  // #35: if a workflow gate is awaiting an answer in this channel, route this
-  // message to the daemon as the gate answer instead of starting a new prompt.
-  const gateHandled = await deliverGateAnswer({
-    pendingGateByChannel,
-    channelId: message.channelId,
-    answer: prompt,
-    answerGate: registry.answerGate.bind(registry),
-    onAccepted: () => message.react("✅").catch(() => {}),
-    onRejected: ({ retryable }) =>
-      message.reply(
-        noMentions(retryable
-          ? "That answer was not accepted. Reply again to answer the same gate."
-          : "That answer was not accepted and the original gate is no longer available. No new prompt was sent.")
-      ).catch(() => {}),
-  });
-  if (gateHandled) return;
 
   if (!registry.isOnline(route.hostId)) {
     await message.reply(noMentions(`Host '${route.hostId}' is not connected right now.`)).catch(() => {});
@@ -456,7 +488,15 @@ async function handleAuthorizedMessage(message) {
     channelId: message.channelId,
     edit: (content) => progressMessage.edit(noMentions(content)),
     deliver: (result) => deliverMessage(progressMessage, result),
-    onGate: (gate) => renderGateToChannel(message.channel, message.channelId, route.hostId, gate),
+    onGate: (gate) =>
+      renderGatePresentation({
+        store: gatePresentations,
+        channel: message.channel,
+        channelId: message.channelId,
+        hostId: route.hostId,
+        gate,
+        userId: message.author.id,
+      }),
   }).catch(async (error) => {
     console.error("Failed to handle message delivery:", error);
     await progressMessage.edit(noMentions("GJC request failed before a result could be delivered.")).catch((editError) => {
@@ -510,16 +550,7 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   heartbeat.unref?.();
 
   let result;
-  // #35: the requestId of a gate this invoke raises, so the leaked-marker guard
-  // in `finally` only clears a marker THIS invoke owns (a concurrent invoke on
-  // the same channel must not have its live marker cross-deleted).
-  let ownedGateRequestId;
-  const trackedOnGate = onGate
-    ? (gate) => {
-        ownedGateRequestId = gate.requestId;
-        return onGate(gate);
-      }
-    : undefined;
+  const trackedOnGate = onGate;
   try {
     if (!dispatchGate(channelMapping, edit, verifyLegacyFence)) return;
     editProgress(true);
@@ -566,15 +597,6 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   } finally {
     clearInterval(heartbeat);
     invocationOwnership.release(ownership);
-    // #35: an invoke never settles with a gate still pending, but guard against a
-    // leaked marker (timeout/hard-cap mid-gate) so a later message is not
-    // misrouted as a stale answer. Only clear a marker this invoke owns.
-    if (channelId !== undefined && ownedGateRequestId !== undefined) {
-      const marker = pendingGateByChannel.get(channelId);
-      if (marker && marker.requestId === ownedGateRequestId) {
-        pendingGateByChannel.delete(channelId);
-      }
-    }
   }
   result = transformModelResult(command, result, modelReceipt);
 
@@ -582,42 +604,6 @@ async function runAndDeliver({ commandName, command, route, requestLabel, userId
   debugRemote("result", { requestLabel, ok: result?.ok, hasText: Boolean(result?.text), error: result?.error });
 
   await deliver(result);
-}
-
-// #35: render a workflow gate to its Discord channel and register the pending
-// state so the next message in the channel is routed back as the answer. The
-// marker is registered before the (async) send so an immediate reply is not lost.
-function renderGateToChannel(channel, channelId, hostId, gate) {
-  pendingGateByChannel.set(channelId, {
-    hostId,
-    requestId: gate.requestId,
-    gateId: gate.gateId,
-  });
-  const lines = [`**GJC needs your input** (${gate.kind}):`, gate.prompt];
-  if (Array.isArray(gate.choices) && gate.choices.length > 0) {
-    gate.choices.forEach((choice, index) => {
-      lines.push(`**${index + 1}.** ${choice.label}`);
-    });
-    lines.push("_Reply with the option number or its exact text._");
-  } else {
-    lines.push("_Reply in this channel with your answer._");
-  }
-  if (!channel || typeof channel.send !== "function") {
-    console.error("Failed to render workflow gate: channel is unavailable");
-    const marker = pendingGateByChannel.get(channelId);
-    if (marker?.requestId === gate.requestId) {
-      pendingGateByChannel.delete(channelId);
-    }
-    return Promise.reject(new Error("workflow gate channel is unavailable"));
-  }
-  return channel.send(noMentions(lines.join("\n"))).catch((error) => {
-    const marker = pendingGateByChannel.get(channelId);
-    if (marker?.requestId === gate.requestId) {
-      pendingGateByChannel.delete(channelId);
-    }
-    console.error("Failed to render workflow gate");
-    throw new Error("workflow gate presentation failed", { cause: error });
-  });
 }
 
 async function deliverInteraction(interaction, commandName, result) {
@@ -642,8 +628,79 @@ async function deliverMessage(message, result) {
   });
 }
 
-async function handleButtonInteraction(interaction) {
+function gateComponentSelection(interaction, kind) {
+  const parts = `${interaction.customId ?? ""}`.split(":");
+  if (parts.length !== 4 || parts[0] !== "gate" || parts[2] !== kind) {
+    return undefined;
+  }
+  const entry = gatePresentations.get(parts[1]);
+  const declaredIndex = Number(parts[3]);
+  const index =
+    kind === "choice"
+      ? declaredIndex
+      : Number(interaction.values?.[0]);
+  if (
+    !entry ||
+    entry.state !== "answerable" ||
+    entry.userId !== interaction.user.id ||
+    entry.channelId !== interaction.channelId ||
+    entry.messageId !== interaction.message?.id ||
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= (entry.choices?.length ?? 0) ||
+    (kind === "select" &&
+      (!Number.isInteger(declaredIndex) ||
+        index < declaredIndex ||
+        index >= declaredIndex + 25))
+  ) {
+    return undefined;
+  }
+  return { entry, answer: entry.choices[index].label };
+}
 
+async function handleGateComponent(interaction, kind) {
+  const selection = gateComponentSelection(interaction, kind);
+  if (!selection) {
+    await interaction
+      .reply(noMentions("This gate control is stale or is not owned by you.", {
+        ephemeral: true,
+      }))
+      .catch(() => {});
+    return;
+  }
+  await interaction.deferUpdate();
+  await deliverGateAnswer({
+    store: gatePresentations,
+    token: selection.entry.token,
+    messageId: interaction.message.id,
+    userId: interaction.user.id,
+    answer: selection.answer,
+    answerGate: registry.answerGate.bind(registry),
+    onState: async (state, entry) => {
+      await entry.updateState?.(state);
+      if (state === "rejected") {
+        await interaction
+          .followUp(
+            noMentions(
+              "That answer was rejected. The exact gate remains available for retry.",
+              { ephemeral: true }
+            )
+          )
+          .catch(() => {});
+      }
+    },
+  });
+}
+
+async function handleGateSelectInteraction(interaction) {
+  await handleGateComponent(interaction, "select");
+}
+
+async function handleButtonInteraction(interaction) {
+  if (interaction.customId.startsWith("gate:")) {
+    await handleGateComponent(interaction, "choice");
+    return;
+  }
   if (!interaction.customId.startsWith("tool-log:")) return;
   const id = interaction.customId.slice("tool-log:".length);
   const entry = toolLogStore.get(id);

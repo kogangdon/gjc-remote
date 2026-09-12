@@ -5,6 +5,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import {
   CAPABILITIES,
+  GATE_PRESENTATION_CAPABILITY,
   GATE_ANSWER_ERROR_CODES,
   MAX_WS_PAYLOAD_BYTES,
   MSG_TYPES,
@@ -37,6 +38,379 @@ import {
 } from "../src/host-registry.js";
 
 const BOT_CAPABILITIES = CAPABILITIES;
+
+test("gate presentation capability skew denies prompt before request-id allocation", async () => {
+  let allocated = 0;
+  const server = await startRegistry(undefined, {
+    requestIdFactory: () => {
+      allocated += 1;
+      return `request-${allocated}`;
+    },
+  });
+  try {
+    const socket = await server.connect("host-a", "token-a", {
+      capabilities: CAPABILITIES.filter(
+        (capability) => capability !== GATE_PRESENTATION_CAPABILITY
+      ),
+    });
+    const result = await server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "blocked" },
+      () => {}
+    );
+    assert.equal(result.ok, false);
+    assert.equal(allocated, 0);
+    const modelFrame = onceSocketFrame(
+      socket,
+      (frame) => frame.type === MSG_TYPES.INVOKE
+    );
+    const modelResult = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "set_model", modelName: "fixture:model-a" },
+      () => {}
+    );
+    const modelInvoke = await modelFrame;
+    assert.equal(allocated, 1);
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId: modelInvoke.requestId,
+      event: { type: "invoke_terminal", disposition: "completed" },
+      done: true,
+    }));
+    assert.equal((await modelResult).ok, true);
+    socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("gate answer is refused until its exact presentation receipt is accepted", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = once(socket, "message");
+    const handle = {
+      messageId: "discord-message-1",
+      activated: 0,
+      states: [],
+      activate() { this.activated += 1; },
+      update(state) { this.states.push(state); },
+    };
+    const done = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "hi" },
+      () => {},
+      undefined,
+      async () => handle
+    );
+    const [rawInvoke] = await invokeFrame;
+    const { requestId } = JSON.parse(rawInvoke.toString());
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "gate-1",
+        presentationId: "presentation-1",
+        prompt: "Approve?",
+        kind: "approval",
+      },
+    }));
+    const [rawPresent] = await once(socket, "message");
+    const present = JSON.parse(rawPresent.toString());
+    assert.deepEqual(
+      await server.registry.answerGate(
+        "host-a", requestId, "gate-1", "presentation-1", "yes"
+      ),
+      { ok: false, error: "no matching pending gate for that answer" }
+    );
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_presentation_result",
+        presentationAttemptId: present.presentationAttemptId,
+        gateId: "gate-1",
+        presentationId: "presentation-1",
+        accepted: true,
+      },
+    }));
+    await waitFor(() => handle.activated === 1);
+    const answerFrame = once(socket, "message");
+    const answerResult = server.registry.answerGate(
+      "host-a", requestId, "gate-1", "presentation-1", "yes"
+    );
+    const [rawAnswer] = await answerFrame;
+    const answer = JSON.parse(rawAnswer.toString());
+    assert.equal(answer.presentationId, "presentation-1");
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      event: {
+        type: "gate_answer_result",
+        answerId: answer.answerId,
+        gateId: "gate-1",
+        presentationId: "presentation-1",
+        accepted: true,
+      },
+    }));
+    assert.deepEqual(await answerResult, { ok: true });
+    socket.send(JSON.stringify({
+      type: "event",
+      requestId,
+      done: true,
+      event: { type: "invoke_terminal", disposition: "cancelled" },
+    }));
+    await done;
+    socket.terminate();
+  } finally {
+    await server.close();
+  }
+});
+
+test("active presentation receipt correlation conflicts close the socket", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = onceSocketFrame(
+      socket,
+      (frame) => frame.type === MSG_TYPES.INVOKE
+    );
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "gate" },
+      () => {},
+      undefined,
+      () => fakeGateHandle()
+    );
+    const { requestId } = await invokeFrame;
+    const presentFrame = onceSocketFrame(
+      socket,
+      (frame) => frame.type === MSG_TYPES.PRESENT_GATE
+    );
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "gate-1",
+        presentationId: "presentation-1",
+        prompt: "Approve?",
+        kind: "approval",
+      },
+    }));
+    const present = await presentFrame;
+    const closed = once(socket, "close");
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.GATE_PRESENTATION_RESULT,
+        presentationAttemptId: present.presentationAttemptId,
+        gateId: "wrong-gate",
+        presentationId: present.presentationId,
+        accepted: true,
+      },
+    }));
+    assert.equal((await closed)[0], 1008);
+    assert.equal((await resultPromise).ok, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("active abandonment receipt correlation conflicts close the socket", async () => {
+  const server = await startRegistry();
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const invokeFrame = onceSocketFrame(
+      socket,
+      (frame) => frame.type === MSG_TYPES.INVOKE
+    );
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "gate" },
+      () => {},
+      undefined,
+      async () => {
+        throw new Error("presentation failed");
+      }
+    );
+    const { requestId } = await invokeFrame;
+    const abandonFrame = onceSocketFrame(
+      socket,
+      (frame) => frame.type === MSG_TYPES.ABANDON_GATE
+    );
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "gate-1",
+        presentationId: "presentation-1",
+        prompt: "Approve?",
+        kind: "approval",
+      },
+    }));
+    const abandon = await abandonFrame;
+    const closed = once(socket, "close");
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.GATE_ABANDON_RESULT,
+        abandonId: abandon.abandonId,
+        gateId: abandon.gateId,
+        presentationId: "wrong-presentation",
+        accepted: true,
+      },
+    }));
+    assert.equal((await closed)[0], 1008);
+    assert.equal((await resultPromise).ok, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a stale predecessor presentation timeout cannot revoke its successor", async () => {
+  const timers = createManualTimers();
+  const server = await startRegistry(
+    new Map([["host-a", "token-a"]]),
+    { timers: timers.api, gatePresentationTimeoutMs: 30 }
+  );
+  try {
+    const socket = await server.connect("host-a", "token-a");
+    const registrySocket = server.registry.connections.get("host-a");
+    const originalSend = registrySocket.send.bind(registrySocket);
+    let predecessorSendCallback;
+    registrySocket.send = (data, callback) => {
+      const frame = JSON.parse(data.toString());
+      if (
+        frame.type === MSG_TYPES.PRESENT_GATE &&
+        frame.presentationId === "predecessor"
+      ) {
+        predecessorSendCallback = callback;
+        return originalSend(data);
+      }
+      return originalSend(data, callback);
+    };
+    const invokeFrame = onceSocketFrame(
+      socket,
+      (frame) => frame.type === MSG_TYPES.INVOKE
+    );
+    const resultPromise = server.registry.invoke(
+      "host-a",
+      "/workspace",
+      { kind: "prompt", message: "gate" },
+      () => {},
+      undefined,
+      () => fakeGateHandle()
+    );
+    const { requestId } = await invokeFrame;
+    const firstPresent = onceSocketFrame(
+      socket,
+      (frame) => frame.type === MSG_TYPES.PRESENT_GATE
+    );
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "gate",
+        presentationId: "predecessor",
+        prompt: "First",
+        kind: "question",
+      },
+    }));
+    await firstPresent;
+    const predecessorTimer = timers.timeoutHandleByDelay(30);
+    assert.ok(predecessorTimer);
+
+    const middlePresent = onceSocketFrame(
+      socket,
+      (frame) =>
+        frame.type === MSG_TYPES.PRESENT_GATE &&
+        frame.presentationId === "middle"
+    );
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "gate",
+        presentationId: "middle",
+        prompt: "Middle",
+        kind: "question",
+      },
+    }));
+    await middlePresent;
+
+    const successorPresent = onceSocketFrame(
+      socket,
+      (frame) =>
+        frame.type === MSG_TYPES.PRESENT_GATE &&
+        frame.presentationId === "successor"
+    );
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: "gate_request",
+        gateId: "gate",
+        presentationId: "successor",
+        prompt: "Second",
+        kind: "question",
+      },
+    }));
+    const successor = await successorPresent;
+    socket.send(JSON.stringify({
+      type: MSG_TYPES.EVENT,
+      requestId,
+      event: {
+        type: MSG_TYPES.GATE_PRESENTATION_RESULT,
+        presentationAttemptId: successor.presentationAttemptId,
+        gateId: successor.gateId,
+        presentationId: successor.presentationId,
+        accepted: true,
+      },
+    }));
+    await waitFor(
+      () =>
+        server.registry.pendingRequests.get(requestId)?.gatePresentation
+          ?.state === "accepted"
+    );
+    const cancelFramesBefore = [];
+    const collectCancel = (raw) => {
+      const frame = JSON.parse(raw.toString());
+      if (frame.type === MSG_TYPES.CANCEL_INVOKE) cancelFramesBefore.push(frame);
+    };
+    socket.on("message", collectCancel);
+    assert.equal(typeof predecessorSendCallback, "function");
+    predecessorSendCallback(new Error("late send failure"));
+    timers.runTimeoutByDelay(30);
+    await new Promise((resolve) => setImmediate(resolve));
+    socket.off("message", collectCancel);
+    assert.equal(cancelFramesBefore.length, 0);
+    assert.equal(
+      server.registry.pendingRequests.get(requestId)?.gatePresentation
+        ?.presentationId,
+      "successor"
+    );
+    assert.equal(
+      server.registry.pendingRequests.get(requestId)?.gatePending,
+      true
+    );
+    socket.terminate();
+    assert.equal((await resultPromise).ok, false);
+  } finally {
+    await server.close();
+  }
+});
 
 function managedRoute(channelId, overrides = {}) {
   const authority = {
@@ -163,6 +537,101 @@ async function waitFor(predicate, timeoutMs = 5000) {
   }
 }
 
+function onceSocketFrame(socket, predicate) {
+  return new Promise((resolve) => {
+    const onMessage = (raw) => {
+      const frame = JSON.parse(raw.toString());
+      if (!predicate(frame)) return;
+      socket.off("message", onMessage);
+      resolve(frame);
+    };
+    socket.on("message", onMessage);
+  });
+}
+
+let gateMessageSequence = 0;
+let gateActivationSequence = 0;
+
+function fakeGateHandle() {
+  gateMessageSequence += 1;
+  return {
+    messageId: `discord-gate-message-${gateMessageSequence}`,
+    activate() {
+      gateActivationSequence += 1;
+    },
+    update() {},
+  };
+}
+
+async function requestAndAcceptGate(socket, requestId, event) {
+  const activationBefore = gateActivationSequence;
+  socket.send(JSON.stringify({
+    type: "event",
+    requestId,
+    event,
+  }));
+  const present = await onceSocketFrame(
+    socket,
+    (frame) => frame.type === MSG_TYPES.PRESENT_GATE
+  );
+  assert.deepEqual(
+    {
+      type: present.type,
+      requestId: present.requestId,
+      gateId: present.gateId,
+      presentationId: present.presentationId,
+    },
+    {
+      type: MSG_TYPES.PRESENT_GATE,
+      requestId,
+      gateId: event.gateId,
+      presentationId: event.presentationId,
+    }
+  );
+  socket.send(JSON.stringify({
+    type: MSG_TYPES.EVENT,
+    requestId,
+    event: {
+      type: MSG_TYPES.GATE_PRESENTATION_RESULT,
+      presentationAttemptId: present.presentationAttemptId,
+      gateId: event.gateId,
+      presentationId: event.presentationId,
+      accepted: true,
+    },
+  }));
+  await waitFor(() => gateActivationSequence > activationBefore);
+  return present;
+}
+
+async function acceptGatePresentation(socket, requestId, gateId, presentationId) {
+  const activationBefore = gateActivationSequence;
+  const present = await onceSocketFrame(
+    socket,
+    (frame) => frame.type === MSG_TYPES.PRESENT_GATE
+  );
+  assert.deepEqual(
+    {
+      type: present.type,
+      requestId: present.requestId,
+      gateId: present.gateId,
+      presentationId: present.presentationId,
+    },
+    { type: MSG_TYPES.PRESENT_GATE, requestId, gateId, presentationId }
+  );
+  socket.send(JSON.stringify({
+    type: MSG_TYPES.EVENT,
+    requestId,
+    event: {
+      type: MSG_TYPES.GATE_PRESENTATION_RESULT,
+      presentationAttemptId: present.presentationAttemptId,
+      gateId,
+      presentationId,
+      accepted: true,
+    },
+  }));
+  await waitFor(() => gateActivationSequence > activationBefore);
+}
+
 async function startRegistry(
   tokens = new Map([["host-a", "token-a"]]),
   options = {}
@@ -181,13 +650,19 @@ async function startRegistry(
       const socket = new WebSocket(`ws://127.0.0.1:${port}`);
       await once(socket, "open");
       const response = once(socket, "message");
+      const capabilities = register.capabilities ?? BOT_CAPABILITIES;
+      const offeredCapabilities =
+        Object.hasOwn(register, "capabilities") &&
+        !Array.isArray(register.capabilities)
+          ? []
+          : capabilities;
       socket.send(
         JSON.stringify({
           type: "register",
           hostId,
           token,
           protocolVersion: PROTOCOL_VERSION,
-          capabilities: BOT_CAPABILITIES,
+          capabilities,
           ...register,
         })
       );
@@ -195,7 +670,10 @@ async function startRegistry(
       assert.deepEqual(JSON.parse(raw.toString()), {
         type: "register_ok",
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: BOT_CAPABILITIES,
+        capabilities: negotiateCapabilities(
+          BOT_CAPABILITIES,
+          offeredCapabilities
+        ),
       });
       registryBySocket.set(socket, { registry, hostId });
       return socket;
@@ -941,7 +1419,7 @@ test("invoke refuses hosts missing either ownership capability", async () => {
     const server = await startRegistry();
     try {
       const socket = await server.connect("host-a", "token-a", {
-        capabilities: CAPABILITIES.filter(
+        capabilities: BOT_CAPABILITIES.filter(
           (capability) => capability !== missing
         ),
       });
@@ -2223,18 +2701,37 @@ test("asynchronous gate presentation failure revokes request ownership", async (
       }
     );
     const { requestId } = JSON.parse((await invokeFrame)[0].toString());
-    const cancelFrame = once(socket, "message");
+    const frames = [];
+    socket.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
     socket.send(JSON.stringify({
       type: MSG_TYPES.EVENT,
       requestId,
       event: {
         type: "gate_request",
         gateId: "gate-presentation-1",
+        presentationId: "presentation-gate-presentation-1",
         prompt: "Approve?",
         kind: "approval",
       },
     }));
-    const cancel = JSON.parse((await cancelFrame)[0].toString());
+    await waitFor(() => frames.length === 2);
+    const [abandon, cancel] = frames;
+    assert.deepEqual(
+      {
+        type: abandon.type,
+        requestId: abandon.requestId,
+        gateId: abandon.gateId,
+        presentationId: abandon.presentationId,
+        reason: abandon.reason,
+      },
+      {
+        type: MSG_TYPES.ABANDON_GATE,
+        requestId,
+        gateId: "gate-presentation-1",
+        presentationId: "presentation-gate-presentation-1",
+        reason: "send_failed",
+      }
+    );
     assert.deepEqual(cancel, {
       type: MSG_TYPES.CANCEL_INVOKE,
       requestId,
@@ -2735,6 +3232,18 @@ test("managed path-free routes fail with structured remediation on a legacy host
         undefined,
         { ...managedIdentity, mappingId: null }
       );
+      const expectsTerminalCapability =
+        !Object.prototype.hasOwnProperty.call(register, "capabilities");
+      const invalidResult = expectsTerminalCapability
+        ? { ok: false, error: "invalid invoke request" }
+        : {
+            ok: false,
+            error: {
+              code: PROTOCOL_ERROR_CODES.PROTOCOL_INCOMPATIBLE,
+              retryable: false,
+              action: "contact_admin",
+            },
+          };
 
       assert.deepEqual(managed, {
         ok: false,
@@ -2744,22 +3253,14 @@ test("managed path-free routes fail with structured remediation on a legacy host
           action: "contact_admin",
         },
       });
-      assert.deepEqual(unrelatedInvalid, {
-        ok: false,
-        error: "invalid invoke request",
-      });
-      assert.deepEqual(malformedManaged, {
-        ok: false,
-        error: "invalid invoke request",
-      });
+      assert.deepEqual(unrelatedInvalid, invalidResult);
+      assert.deepEqual(malformedManaged, invalidResult);
       assert.equal(server.registry.pendingRequests.size, pendingBefore);
       assert.equal(
         server.registry.pendingCountBySocket.get(socket) ?? 0,
         perSocketBefore
       );
 
-      const expectsTerminalCapability =
-        !Object.prototype.hasOwnProperty.call(register, "capabilities");
       const barrierFrame = expectsTerminalCapability
         ? once(socket, "message")
         : undefined;
@@ -3309,7 +3810,7 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
     assert.deepEqual(JSON.parse(raw.toString()), {
       type: "register_ok",
       protocolVersion: PROTOCOL_VERSION,
-      capabilities: BOT_CAPABILITIES,
+      capabilities: [],
     });
     assert.deepEqual(server.registry.getHostInfo("host-a"), {
       protocolVersion: 0,
@@ -3332,7 +3833,7 @@ test("a legacy v0 daemon registers with version 0 and no shared capabilities", a
 test("workspace serving admits only the exact managed v3 registration floor", async () => {
   const server = await startRegistry(undefined, { workspaceServingEnabled: true });
   const managedCapabilities = [
-    ...CAPABILITIES,
+    ...BOT_CAPABILITIES,
     WORKSPACE_READINESS_CAPABILITY,
     WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
     WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
@@ -3341,13 +3842,13 @@ test("workspace serving admits only the exact managed v3 registration floor", as
     { name: "omitted protocol", register: {} },
     {
       name: "v1 protocol",
-      register: { protocolVersion: PROTOCOL_VERSION, capabilities: CAPABILITIES },
+      register: { protocolVersion: PROTOCOL_VERSION, capabilities: BOT_CAPABILITIES },
     },
     {
       name: "v2 protocol",
       register: {
         protocolVersion: 2,
-        capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+        capabilities: [...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
       },
     },
     ...[
@@ -3419,7 +3920,7 @@ test("future protocol versions fail closed", async () => {
         hostId: "host-a",
         token: "token-a",
         protocolVersion: PROTOCOL_VERSION + 5,
-        capabilities: CAPABILITIES,
+        capabilities: BOT_CAPABILITIES,
       })
     );
     await closed;
@@ -3446,7 +3947,7 @@ test("Finding-1: a binding-enabled peer missing the bind-authority-verification 
       token: "token-a",
       protocolVersion: PROTOCOL_VERSION_V3,
       capabilities: [
-        ...CAPABILITIES,
+        ...BOT_CAPABILITIES,
         WORKSPACE_READINESS_CAPABILITY,
         WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
       ],
@@ -3475,11 +3976,11 @@ test("Finding-1: a non-binding peer missing the bind-authority-verification capa
   try {
     const { socket, response } = await connectV2(server);
     assert.equal(response.protocolVersion, 2);
-    assert.deepEqual(response.capabilities, [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
+    assert.deepEqual(response.capabilities, [...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
     assert.equal(response.type, "register_ok");
     assert.deepEqual(server.registry.getHostInfo("host-a"), {
       protocolVersion: 2,
-      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
     });
     socket.terminate();
   } finally {
@@ -3508,7 +4009,10 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      (gate) => gates.push(gate)
+      (gate) => {
+        gates.push(gate);
+        return fakeGateHandle();
+      }
     );
     let settled = false;
     resultPromise.then(() => {
@@ -3524,11 +4028,12 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
     const gateEvent = {
       type: "gate_request",
       gateId: "g1",
+      presentationId: "presentation-g1",
       prompt: "Pick a fruit",
       kind: "question",
       choices: [{ value: "a", label: "Apple" }],
     };
-    socket.send(JSON.stringify({ type: "event", requestId, event: gateEvent }));
+    await requestAndAcceptGate(socket, requestId, gateEvent);
 
     await waitFor(() => gates.length === 1);
     assert.equal(gates[0].gateId, "g1");
@@ -3537,7 +4042,7 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
     assert.equal(gates[0].kind, "question");
     assert.deepEqual(gates[0].choices, [{ value: "a", label: "Apple" }]);
 
-    assert.deepEqual(timers.timeoutDelays, [5000]);
+    assert.deepEqual(timers.timeoutDelays.sort((a, b) => a - b), [5000, 30000]);
     timers.runClearedTimeouts();
     assert.equal(settled, false);
     assert.equal(server.registry.pendingRequests.has(requestId), true);
@@ -3548,6 +4053,7 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
       "host-a",
       requestId,
       "g1",
+      "presentation-g1",
       "Apple"
     );
     const [rawAnswer] = await answerFrame;
@@ -3556,6 +4062,7 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
       type: "answer",
       requestId,
       gateId: "g1",
+      presentationId: "presentation-g1",
       answerId: parsedAnswer.answerId,
       answer: "Apple",
     });
@@ -3563,7 +4070,7 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
     assert.ok(parsedAnswer.answerId.length <= V0_LIMITS.REQUEST_ID);
     assert.deepEqual(
       timers.timeoutDelays.sort((a, b) => a - b),
-      [1000, 5000]
+      [1000, 5000, 30000]
     );
     socket.send(JSON.stringify({
       type: "event",
@@ -3572,13 +4079,14 @@ test("#35 answerGate sends a correlated frame and resumes idle timing only after
         type: "gate_answer_result",
         answerId: parsedAnswer.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
     assert.deepEqual(await answerResult, { ok: true });
     assert.deepEqual(
       timers.timeoutDelays.sort((a, b) => a - b),
-      [40, 5000]
+      [40, 5000, 30000]
     );
 
     socket.send(
@@ -3606,37 +4114,37 @@ test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
 
-    assert.deepEqual(await server.registry.answerGate("host-a", "nope", "g1", "x"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", "nope", "g1", "presentation-g1", "x"), {
       ok: false,
       error: "no in-flight request for that answer",
     });
-    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "g1", "x"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "g1", "presentation-g1", "x"), {
       ok: false,
       error: "no matching pending gate for that answer",
     });
 
-    socket.send(
-      JSON.stringify({
-        type: "event",
-        requestId,
-        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
-      })
-    );
+    await requestAndAcceptGate(socket, requestId, {
+      type: "gate_request",
+      gateId: "g1",
+      presentationId: "presentation-g1",
+      prompt: "p",
+      kind: "question",
+    });
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
 
-    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "WRONG", "x"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "WRONG", "presentation-g1", "x"), {
       ok: false,
       error: "no matching pending gate for that answer",
     });
     assert.equal(
-      (await server.registry.answerGate("host-b", requestId, "g1", "x")).ok,
+      (await server.registry.answerGate("host-b", requestId, "g1", "presentation-g1", "x")).ok,
       false
     );
 
@@ -3645,6 +4153,7 @@ test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and
       "host-a",
       requestId,
       "g1",
+      "presentation-g1",
       "yes"
     );
     const [rawAnswer] = await answerFrame;
@@ -3656,6 +4165,7 @@ test("#35 answerGate rejects unknown requests, absent gates, stale gate ids, and
         type: "gate_answer_result",
         answerId: answer.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
@@ -3681,7 +4191,7 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -3690,9 +4200,10 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
       JSON.stringify({
         type: "event",
         requestId,
-        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+        event: { type: "gate_request", gateId: "g1", presentationId: "presentation-g1", prompt: "p", kind: "question" },
       })
     );
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
@@ -3701,7 +4212,7 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
     const invalidResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "invalid"
     );
     const [rawInvalid] = await invalidFrame;
@@ -3713,6 +4224,7 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
         type: "gate_answer_result",
         answerId: invalid.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: false,
         errorCode: GATE_ANSWER_ERROR_CODES.REJECTED,
       },
@@ -3731,7 +4243,7 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
     const validResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "valid"
     );
     const [rawValid] = await validFrame;
@@ -3744,6 +4256,7 @@ test("#35 a rejected answer retains the same gate so a valid retry can resume th
         type: "gate_answer_result",
         answerId: valid.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
@@ -3788,7 +4301,7 @@ test("adversarial: DONE may precede an exact answer receipt without creating fal
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -3797,9 +4310,10 @@ test("adversarial: DONE may precede an exact answer receipt without creating fal
       JSON.stringify({
         type: "event",
         requestId,
-        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+        event: { type: "gate_request", gateId: "g1", presentationId: "presentation-g1", prompt: "p", kind: "question" },
       })
     );
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
@@ -3808,7 +4322,7 @@ test("adversarial: DONE may precede an exact answer receipt without creating fal
     const answerResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "yes"
     );
     const [rawAnswer] = await answerFrame;
@@ -3824,12 +4338,13 @@ test("adversarial: DONE may precede an exact answer receipt without creating fal
         type: "gate_answer_result",
         answerId: answer.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
     assert.deepEqual(await answerResult, { ok: true });
 
-    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "g1", "late"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", requestId, "g1", "presentation-g1", "late"), {
       ok: false,
       error: "no in-flight request for that answer",
     });
@@ -3849,7 +4364,7 @@ test("adversarial: a rejected receipt after DONE settles false without reviving 
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -3859,10 +4374,12 @@ test("adversarial: a rejected receipt after DONE settles false without reviving 
       event: {
         type: "gate_request",
         gateId: "g1",
+        presentationId: "presentation-g1",
         prompt: "p",
         kind: "question",
       },
     }));
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
     );
@@ -3871,7 +4388,7 @@ test("adversarial: a rejected receipt after DONE settles false without reviving 
     const answerResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "invalid"
     );
     const [rawAnswer] = await answerFrame;
@@ -3887,6 +4404,7 @@ test("adversarial: a rejected receipt after DONE settles false without reviving 
         type: "gate_answer_result",
         answerId: answer.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: false,
         errorCode: GATE_ANSWER_ERROR_CODES.REJECTED,
       },
@@ -3916,24 +4434,29 @@ test("receipt capacity remains bounded after DONE and is isolated by socket", as
       if (JSON.parse(raw.toString()).type === "answer") sentAnswers += 1;
     });
     async function openGate(host, peer) {
-      const invokeFrame = once(peer, "message");
+      const invokeFrame = onceSocketFrame(
+        peer,
+        (frame) => frame.type === MSG_TYPES.INVOKE
+      );
       const done = server.registry.invoke(host, "/workspace",
-        { kind: "prompt", message: "gate" }, () => {}, undefined, () => {});
-      const [raw] = await invokeFrame;
-      const { requestId } = JSON.parse(raw.toString());
+        { kind: "prompt", message: "gate" }, () => {}, undefined, () => fakeGateHandle());
+      const { requestId } = await invokeFrame;
       peer.send(JSON.stringify({
         type: "event", requestId,
-        event: { type: "gate_request", gateId: "gate", prompt: "p", kind: "question" },
+        event: { type: "gate_request", gateId: "gate", presentationId: "presentation-gate", prompt: "p", kind: "question" },
       }));
+      await acceptGatePresentation(peer, requestId, "gate", "presentation-gate");
       await waitFor(() => server.registry.pendingRequests.get(requestId)?.gatePending);
       return { requestId, done };
     }
     async function submit(host, peer, gate) {
-      const frame = once(peer, "message");
-      const result = server.registry.answerGate(host, gate.requestId, "gate", "yes");
+      const frame = onceSocketFrame(
+        peer,
+        (candidate) => candidate.type === MSG_TYPES.ANSWER
+      );
+      const result = server.registry.answerGate(host, gate.requestId, "gate", "presentation-gate", "yes");
       outstanding.push(result);
-      const [raw] = await frame;
-      return { answer: JSON.parse(raw.toString()), result };
+      return { answer: await frame, result };
     }
     const retained = [];
     for (let i = 0; i < V0_LIMITS.MAX_PENDING_PER_HOST; i += 1) {
@@ -3945,7 +4468,7 @@ test("receipt capacity remains bounded after DONE and is isolated by socket", as
     assert.equal(server.registry.pendingRequests.size, 0);
     assert.equal(server.registry.pendingGateAnswers.size, V0_LIMITS.MAX_PENDING_PER_HOST);
     const overflow = await openGate("host-a", socket);
-    assert.deepEqual(await server.registry.answerGate("host-a", overflow.requestId, "gate", "yes"), {
+    assert.deepEqual(await server.registry.answerGate("host-a", overflow.requestId, "gate", "presentation-gate", "yes"), {
       ok: false, error: "host has too many unconfirmed gate answers",
     });
     assert.equal(sentAnswers, V0_LIMITS.MAX_PENDING_PER_HOST);
@@ -3959,7 +4482,13 @@ test("receipt capacity remains bounded after DONE and is isolated by socket", as
     const first = retained[0];
     socket.send(JSON.stringify({
       type: "event", requestId: first.answer.requestId,
-      event: { type: "gate_answer_result", answerId: first.answer.answerId, gateId: "gate", accepted: true },
+      event: {
+        type: "gate_answer_result",
+        answerId: first.answer.answerId,
+        gateId: "gate",
+        presentationId: "presentation-gate",
+        accepted: true,
+      },
     }));
     assert.deepEqual(await first.result, { ok: true });
     await submit("host-a", socket, overflow);
@@ -3985,7 +4514,7 @@ test("adversarial: a second answer for the same gate is rejected while its recei
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -3994,9 +4523,10 @@ test("adversarial: a second answer for the same gate is rejected while its recei
       JSON.stringify({
         type: "event",
         requestId,
-        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+        event: { type: "gate_request", gateId: "g1", presentationId: "presentation-g1", prompt: "p", kind: "question" },
       })
     );
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
@@ -4005,7 +4535,7 @@ test("adversarial: a second answer for the same gate is rejected while its recei
     const firstAnswer = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "yes"
     );
     const [rawAnswer] = await answerFrame;
@@ -4015,7 +4545,7 @@ test("adversarial: a second answer for the same gate is rejected while its recei
     const secondAnswer = await server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "yes-again"
     );
     assert.deepEqual(secondAnswer, {
@@ -4030,6 +4560,7 @@ test("adversarial: a second answer for the same gate is rejected while its recei
         type: "gate_answer_result",
         answerId: answer.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
@@ -4058,7 +4589,7 @@ test("adversarial: a bounded answer-receipt timeout retains the gate and ignores
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -4067,9 +4598,10 @@ test("adversarial: a bounded answer-receipt timeout retains the gate and ignores
       JSON.stringify({
         type: "event",
         requestId,
-        event: { type: "gate_request", gateId: "g1", prompt: "p", kind: "question" },
+        event: { type: "gate_request", gateId: "g1", presentationId: "presentation-g1", prompt: "p", kind: "question" },
       })
     );
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gatePending === true
     );
@@ -4078,7 +4610,7 @@ test("adversarial: a bounded answer-receipt timeout retains the gate and ignores
     const firstResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "first"
     );
     const [rawFirst] = await firstFrame;
@@ -4098,6 +4630,7 @@ test("adversarial: a bounded answer-receipt timeout retains the gate and ignores
         type: "gate_answer_result",
         answerId: first.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
@@ -4106,7 +4639,7 @@ test("adversarial: a bounded answer-receipt timeout retains the gate and ignores
     const retryResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "retry"
     );
     const [rawRetry] = await retryFrame;
@@ -4119,6 +4652,7 @@ test("adversarial: a bounded answer-receipt timeout retains the gate and ignores
         type: "gate_answer_result",
         answerId: retry.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
@@ -4147,7 +4681,7 @@ test("adversarial: answer receipts are fenced by exact socket, request, gate, an
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -4157,10 +4691,12 @@ test("adversarial: answer receipts are fenced by exact socket, request, gate, an
       event: {
         type: "gate_request",
         gateId: "g1",
+        presentationId: "presentation-g1",
         prompt: "p",
         kind: "question",
       },
     }));
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
     );
@@ -4169,7 +4705,7 @@ test("adversarial: answer receipts are fenced by exact socket, request, gate, an
     const answerResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "yes"
     );
     let answerSettled = false;
@@ -4185,6 +4721,7 @@ test("adversarial: answer receipts are fenced by exact socket, request, gate, an
         type: "gate_answer_result",
         answerId: answer.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
         ...overrides,
       },
@@ -4192,6 +4729,7 @@ test("adversarial: answer receipts are fenced by exact socket, request, gate, an
 
     socket.send(receipt({ answerId: "different-answer" }));
     socket.send(receipt({ gateId: "different-gate" }));
+    socket.send(receipt({ presentationId: "different-presentation" }));
     socket.send(JSON.stringify({
       type: "event",
       requestId: "different-request",
@@ -4199,6 +4737,7 @@ test("adversarial: answer receipts are fenced by exact socket, request, gate, an
         type: "gate_answer_result",
         answerId: answer.answerId,
         gateId: "g1",
+        presentationId: "presentation-g1",
         accepted: true,
       },
     }));
@@ -4230,7 +4769,7 @@ test("adversarial: disconnect settles an outstanding answer false and clears its
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -4240,10 +4779,12 @@ test("adversarial: disconnect settles an outstanding answer false and clears its
       event: {
         type: "gate_request",
         gateId: "g1",
+        presentationId: "presentation-g1",
         prompt: "p",
         kind: "question",
       },
     }));
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
     );
@@ -4252,7 +4793,7 @@ test("adversarial: disconnect settles an outstanding answer false and clears its
     const answerResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "yes"
     );
     await answerFrame;
@@ -4283,7 +4824,7 @@ test("adversarial: registry disposal settles an outstanding answer false", async
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      () => {}
+      () => fakeGateHandle()
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
@@ -4293,10 +4834,12 @@ test("adversarial: registry disposal settles an outstanding answer false", async
       event: {
         type: "gate_request",
         gateId: "g1",
+        presentationId: "presentation-g1",
         prompt: "p",
         kind: "question",
       },
     }));
+    await acceptGatePresentation(socket, requestId, "g1", "presentation-g1");
     await waitFor(
       () => server.registry.pendingRequests.get(requestId)?.gateId === "g1"
     );
@@ -4305,7 +4848,7 @@ test("adversarial: registry disposal settles an outstanding answer false", async
     const answerResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "yes"
     );
     await answerFrame;
@@ -4335,20 +4878,24 @@ test("adversarial: accepting a predecessor receipt preserves a successor gate", 
       { kind: "prompt", message: "hi" },
       () => {},
       undefined,
-      (gate) => gates.push(gate)
+      (gate) => { gates.push(gate); return fakeGateHandle(); }
     );
     const [raw] = await invokeFrame;
     const { requestId } = JSON.parse(raw.toString());
-    const sendGate = (gateId) => socket.send(JSON.stringify({
-      type: "event",
-      requestId,
-      event: {
-        type: "gate_request",
-        gateId,
-        prompt: gateId,
-        kind: "question",
-      },
-    }));
+    const sendGate = async (gateId, presentationId = `presentation-${gateId}`) => {
+      socket.send(JSON.stringify({
+        type: "event",
+        requestId,
+        event: {
+          type: "gate_request",
+          gateId,
+          presentationId,
+          prompt: gateId,
+          kind: "question",
+        },
+      }));
+      await acceptGatePresentation(socket, requestId, gateId, presentationId);
+    };
     const sendAccepted = (answer) => socket.send(JSON.stringify({
       type: "event",
       requestId,
@@ -4356,28 +4903,39 @@ test("adversarial: accepting a predecessor receipt preserves a successor gate", 
         type: "gate_answer_result",
         answerId: answer.answerId,
         gateId: answer.gateId,
+        presentationId: answer.presentationId,
         accepted: true,
       },
     }));
 
-    sendGate("g1");
+    await sendGate("g1");
     await waitFor(() => gates.length === 1);
     const firstFrame = once(socket, "message");
     const firstResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g1",
+      "g1", "presentation-g1",
       "first"
     );
     const [rawFirst] = await firstFrame;
     const first = JSON.parse(rawFirst.toString());
 
-    sendGate("g2");
+    await sendGate("g1", "presentation-successor");
     await waitFor(() => gates.length === 2);
-    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g2");
+    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g1");
+    assert.equal(
+      server.registry.pendingRequests.get(requestId)?.gatePresentation
+        ?.presentationId,
+      "presentation-successor"
+    );
     sendAccepted(first);
     assert.deepEqual(await firstResult, { ok: true });
-    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g2");
+    assert.equal(server.registry.pendingRequests.get(requestId)?.gateId, "g1");
+    assert.equal(
+      server.registry.pendingRequests.get(requestId)?.gatePresentation
+        ?.presentationId,
+      "presentation-successor"
+    );
     assert.equal(
       server.registry.pendingRequests.get(requestId)?.gatePending,
       true
@@ -4387,7 +4945,7 @@ test("adversarial: accepting a predecessor receipt preserves a successor gate", 
     const secondResult = server.registry.answerGate(
       "host-a",
       requestId,
-      "g2",
+      "g1", "presentation-successor",
       "second"
     );
     const [rawSecond] = await secondFrame;
@@ -4405,12 +4963,12 @@ test("phase 1 gates readiness capability advertisement atomically", async () => 
   const server = await startRegistry();
   try {
     const suppressed = await connectV2(server, "host-a", "token-a", {
-      capabilities: CAPABILITIES,
+      capabilities: BOT_CAPABILITIES,
     });
     assert.deepEqual(suppressed.response, {
       type: "register_ok",
       protocolVersion: PROTOCOL_VERSION,
-      capabilities: CAPABILITIES,
+      capabilities: BOT_CAPABILITIES,
     });
     suppressed.socket.terminate();
     await waitFor(() => server.registry.getHostInfo("host-a") === undefined);
@@ -4419,11 +4977,11 @@ test("phase 1 gates readiness capability advertisement atomically", async () => 
     assert.deepEqual(committed.response, {
       type: "register_ok",
       protocolVersion: 2,
-      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
     });
     assert.deepEqual(server.registry.getHostInfo("host-a"), {
       protocolVersion: 2,
-      capabilities: [...CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
+      capabilities: [...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY],
     });
   } finally {
     await server.close();
