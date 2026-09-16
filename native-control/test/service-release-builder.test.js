@@ -37,6 +37,7 @@ const POSITIVE_ARCHITECTURE = process.platform === 'win32'
   ? 'x64'
   : process.arch === 'arm64' ? 'arm64' : 'x64';
 const OTHER_PLATFORM = POSITIVE_PLATFORM === 'win32' ? 'linux' : 'win32';
+const OTHER_ARCHITECTURE = POSITIVE_ARCHITECTURE === 'arm64' ? 'x64' : 'arm64';
 const TARGET_SUFFIX = `${POSITIVE_PLATFORM}-${POSITIVE_ARCHITECTURE}`;
 const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.1-${TARGET_SUFFIX}.tar.gz`;
 const MANIFEST_NAME = `gjc-remote-service-${TARGET_SUFFIX}.manifest.json`;
@@ -1835,7 +1836,7 @@ test('dependency, SDK, native provenance and materialized-link tampering are rej
       platform: OTHER_PLATFORM,
     }, 'SERVICE_RELEASE_NATIVE_INVALID'],
     ['native manifest architecture drift', {}, {
-      architecture: 'arm64',
+      architecture: OTHER_ARCHITECTURE,
     }, 'SERVICE_RELEASE_NATIVE_INVALID'],
     ['bundled native trust differs from installed pins', {}, {},
       'SERVICE_RELEASE_NATIVE_INVALID', {
@@ -1865,7 +1866,10 @@ test('dependency, SDK, native provenance and materialized-link tampering are rej
     ['Windows target refuses case-variant native alias', {
       caseOnlyRootAlias: true,
     }, {
+      // Native tuple must match the win32/x64 target regardless of host
+      // architecture so the refusal comes from the closure walk.
       platform: 'win32',
+      architecture: 'x64',
     }, 'SERVICE_RELEASE_CLOSURE_INVALID', {
       models: caseOnlyModels,
       lockBytes: bunLock(caseOnlyModels),
