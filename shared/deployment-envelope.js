@@ -62,7 +62,6 @@ const exact = (value, keys) => plain(value) && Object.keys(value).length === key
 const fail = (message) => { throw new TypeError(`DEPLOYMENT_ENVELOPE_INVALID: ${message}`); };
 const positive = (value) => Number.isSafeInteger(value) && value >= 1;
 const nonnegative = (value) => Number.isSafeInteger(value) && value >= 0;
-const nullableHash = (value) => value === null || isHex64(value);
 
 function strictText(value, name, maxBytes, { allowEmpty = false } = {}) {
   try {
@@ -538,55 +537,6 @@ export function deploymentBootstrapAssetNames(platform, architecture) {
     shawlSignature: platform === "win32" ? "gjc-remote-shawl-win32-x64.manifest.json.sig" : null,
     shawlExecutable: platform === "win32" ? "gjc-remote-shawl-win32-x64.exe" : null,
   });
-}
-
-export function deploymentSequenceFloorFingerprint(floor) {
-  return fingerprint(floor, "floorFingerprint");
-}
-
-export function validateDeploymentSequenceFloor(floor) {
-  const keys = ["schemaVersion", "kind", "scope", "reservedSequence", "reservedManifestFingerprint", "reservationTransactionId", "committedSequence", "committedManifestFingerprint", "floorFingerprint"];
-  if (!exact(floor, keys) || floor.schemaVersion !== 1 || floor.kind !== "deployment-sequence-floor" ||
-      !/^(?:application:(?:linux:(?:x64|arm64)|win32:x64)|shawl:win32:x64)$/.test(floor.scope) ||
-      !nonnegative(floor.reservedSequence) || !nullableHash(floor.reservedManifestFingerprint) ||
-      (floor.reservationTransactionId !== null && (typeof floor.reservationTransactionId !== "string" || !SELECTOR.test(floor.reservationTransactionId))) ||
-      !nonnegative(floor.committedSequence) || !nullableHash(floor.committedManifestFingerprint) ||
-      !isHex64(floor.floorFingerprint)) fail("deployment sequence floor schema");
-  if ((floor.reservedSequence === 0) !== (floor.reservedManifestFingerprint === null) ||
-      (floor.committedSequence === 0) !== (floor.committedManifestFingerprint === null) ||
-      floor.committedSequence > floor.reservedSequence ||
-      (floor.committedSequence === floor.reservedSequence && floor.committedSequence > 0 && floor.committedManifestFingerprint !== floor.reservedManifestFingerprint) ||
-      (floor.committedSequence === floor.reservedSequence && floor.reservationTransactionId !== null) ||
-      (floor.reservedSequence > floor.committedSequence && floor.reservationTransactionId === null)) fail("deployment sequence floor relation");
-  if (deploymentSequenceFloorFingerprint(floor) !== floor.floorFingerprint) fail("deployment sequence floor fingerprint");
-  return floor;
-}
-
-export function buildDeploymentSequenceFloor(fields) {
-  const floor = { schemaVersion: 1, kind: "deployment-sequence-floor", ...fields, floorFingerprint: null };
-  floor.floorFingerprint = deploymentSequenceFloorFingerprint(floor);
-  return validateDeploymentSequenceFloor(floor);
-}
-
-export function assertDeploymentSequenceAdmission({ floor, candidateSequence, candidateManifestFingerprint, transactionId, operation, currentSequence = 0 }) {
-  validateDeploymentSequenceFloor(floor);
-  if (!positive(candidateSequence) || !isHex64(candidateManifestFingerprint) ||
-      typeof transactionId !== "string" || !SELECTOR.test(transactionId) ||
-      !["install", "update", "replay"].includes(operation) || !nonnegative(currentSequence)) fail("sequence admission input");
-  if (operation === "update" && candidateSequence <= currentSequence) fail("RELEASE_SEQUENCE_NOT_ADVANCING");
-  if (floor.reservationTransactionId !== null &&
-      (candidateSequence !== floor.reservedSequence ||
-       candidateManifestFingerprint !== floor.reservedManifestFingerprint ||
-       transactionId !== floor.reservationTransactionId)) fail("RELEASE_SEQUENCE_RESERVED");
-  if (candidateSequence < floor.reservedSequence || candidateSequence < floor.committedSequence) fail("RELEASE_SEQUENCE_DOWNGRADE");
-  if (candidateSequence === floor.reservedSequence && floor.reservedSequence > 0) {
-    if (candidateManifestFingerprint !== floor.reservedManifestFingerprint) fail("RELEASE_SEQUENCE_CONFLICT");
-    if (floor.reservationTransactionId !== null && transactionId !== floor.reservationTransactionId) fail("RELEASE_SEQUENCE_RESERVED");
-  }
-  if (candidateSequence === floor.committedSequence && floor.committedSequence > 0 && candidateManifestFingerprint !== floor.committedManifestFingerprint) {
-    fail("RELEASE_SEQUENCE_CONFLICT");
-  }
-  return true;
 }
 
 function findDomain(compatibility, component, domain) {

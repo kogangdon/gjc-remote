@@ -8,12 +8,10 @@ import {
   DEPLOYMENT_SIGNATURE_DOMAINS,
   SHAWL_UPSTREAM,
   applicationDeploymentManifestFingerprint,
-  assertDeploymentSequenceAdmission,
   assertReleaseTransitionCompatible,
   buildApplicationDeploymentManifest,
   buildBundleInventory,
   buildDeploymentCompatibility,
-  buildDeploymentSequenceFloor,
   buildSdkExternalStateContract,
   buildShawlDeploymentManifest,
   bundleInventoryFingerprint,
@@ -22,7 +20,6 @@ import {
   deploymentSignaturePreimage,
   validateApplicationDeploymentManifest,
   validateBundleInventory,
-  validateDeploymentSequenceFloor,
   validateDeploymentSignature,
   validateDeploymentSource,
   validateReleaseSelector,
@@ -347,32 +344,6 @@ test("deployment source and bootstrap schemas reject caller URLs and platform-in
     applicationSignaturePath: String.raw`C:\retained\app.sig`,
     applicationArchivePath: String.raw`C:\retained\app.tar.gz`,
   }, { platform: "win32", architecture: "x64" }));
-});
-
-test("sequence floor admits exact committed replay, reserves one transaction, and blocks conflicts", () => {
-  const committed = buildDeploymentSequenceFloor({
-    scope: "application:linux:x64",
-    reservedSequence: 3,
-    reservedManifestFingerprint: hex("3"),
-    reservationTransactionId: null,
-    committedSequence: 3,
-    committedManifestFingerprint: hex("3"),
-  });
-  assert.equal(validateDeploymentSequenceFloor(committed), committed);
-  assert.equal(assertDeploymentSequenceAdmission({ floor: committed, candidateSequence: 3, candidateManifestFingerprint: hex("3"), transactionId: "tx-new", operation: "install" }), true);
-  assert.throws(() => assertDeploymentSequenceAdmission({ floor: committed, candidateSequence: 3, candidateManifestFingerprint: hex("4"), transactionId: "tx-new", operation: "install" }), /RELEASE_SEQUENCE_CONFLICT/);
-  assert.throws(() => assertDeploymentSequenceAdmission({ floor: committed, candidateSequence: 2, candidateManifestFingerprint: hex("2"), transactionId: "tx-new", operation: "install" }), /RELEASE_SEQUENCE_DOWNGRADE/);
-  const reserved = buildDeploymentSequenceFloor({
-    scope: "application:linux:x64",
-    reservedSequence: 4,
-    reservedManifestFingerprint: hex("4"),
-    reservationTransactionId: "tx-owner",
-    committedSequence: 3,
-    committedManifestFingerprint: hex("3"),
-  });
-  assert.equal(assertDeploymentSequenceAdmission({ floor: reserved, candidateSequence: 4, candidateManifestFingerprint: hex("4"), transactionId: "tx-owner", operation: "update", currentSequence: 3 }), true);
-  assert.throws(() => assertDeploymentSequenceAdmission({ floor: reserved, candidateSequence: 4, candidateManifestFingerprint: hex("4"), transactionId: "tx-other", operation: "update", currentSequence: 3 }), /RELEASE_SEQUENCE_RESERVED/);
-  assert.throws(() => assertDeploymentSequenceAdmission({ floor: reserved, candidateSequence: 5, candidateManifestFingerprint: hex("5"), transactionId: "tx-other", operation: "update", currentSequence: 3 }), /RELEASE_SEQUENCE_RESERVED/);
 });
 
 test("release transition checks complete observed format sets and opaque SDK equality in both directions", () => {
