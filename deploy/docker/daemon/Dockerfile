@@ -36,7 +36,7 @@ RUN apt-get update \
       ca-certificates=20250419 \
       git=1:2.47.3-0+deb13u1 \
       libacl1=2.3.2-2+b1 \
-      tini=0.19.0-3+b7 \
+      tini=0.19.0-3+b8 \
     && groupadd --gid 1004 gjc \
     && useradd --uid 1004 --gid 1004 --create-home --home-dir /home/gjc --shell /usr/sbin/nologin gjc \
     && mkdir -p /workspaces /var/lib/gjc-remote/sessions /var/lib/gjc-remote/state /home/gjc/.gjc \
