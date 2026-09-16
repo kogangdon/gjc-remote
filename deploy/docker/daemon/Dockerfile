@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG BUN_IMAGE=oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
-ARG LOCK_SHA256=22d010f3cf7c3ac85a515bc75bd9837fb216959cc77036627b4f3ad9815e7173
+ARG LOCK_SHA256=67e12ae0b011e76ae03d64e3d7ade80a6fbf710a523be782104af80cfae9402e
 
 FROM ${BUN_IMAGE} AS deps
 ARG LOCK_SHA256
@@ -84,7 +84,7 @@ ENTRYPOINT ["/usr/bin/tini", "--", "bun", "/app/daemon/src/container-entrypoint.
 FROM native_control_bundle AS signed-native
 
 FROM runtime-base AS runtime
-ARG VERSION=0.3.1
+ARG VERSION=0.4.0-rc.1
 ARG REVISION
 ARG LOCK_SHA256
 RUN test -n "${REVISION}" && test "${REVISION}" != unknown

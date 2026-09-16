@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-09-16
+
+### Native service lifecycle contract (Issue #240)
+
+- Document the `@gjc-remote/native-control` `gjc-remote-service` boundary with
+  exactly six operations: `install`, `status`, `update`, `rollback`,
+  `uninstall`, and `recover`. The request is strict UTF-8 JSON on non-terminal
+  stdin; `status` is read-only and reports zero writes.
+- Pin Bun 1.4.0+ for the daemon and Node.js 26+ for the bot and lifecycle CLI.
+  `CHANNELS_CONFIG` is an absolute path to preprovisioned external state, and
+  daemon service identity derives from the exact `HOST_ID` plus its full
+  lower-case UTF-8 SHA-256 suffix.
+- Record immutable content-addressed release and predecessor pins, signed
+  application/Shawl asset requirements, byte-preserving external state, and
+  proof-bound recovery/manual-cleanup behavior. No drain, migration, or
+  automatic repair is implied.
+- Specify executable trial semantics: Linux disabled/unmasked with `Restart=no`
+  and no activator; Windows demand-start with empty actions; controller death
+  does not auto-stop a trial. Startup evidence is distinct from live health.
+- Clarify that G003 fake-driver/model evidence is not disposable-host,
+  production-signing, SCM, or systemd proof. Windows log/tree ABI gaps and
+  Linux shared-template/opaque zero-reference ambiguity remain safe refusals.
+
 ### Gate presentation protocol
 
 - Negotiate `gate_presentation_v1` with the terminal-disposition and invocation-
