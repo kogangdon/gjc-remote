@@ -1,6 +1,6 @@
 # Process supervision runbook
 
-Linux systemd is the approved production-oriented service path (contract below; the unit templates are not yet checked into this repository — see "Linux (systemd)"). Windows uses Shawl v1.9.0 as the selected primary supervisor; it is not a full production
+Linux systemd is the approved production-oriented service path (contract below; source unit templates are checked into `native-control/src/systemd/`, while rendered units and live host deployment remain separate authorized artifacts — see "Linux (systemd)"). Windows uses Shawl v1.9.0 as the selected primary supervisor; it is not a full production
 approval because the distributed binary is unsigned, and signed provenance remains a required, still-open release-owner item. Direct `sc.exe` service registration is the documented Windows fallback when Shawl is unsuitable; it provides no restart/backoff supervision semantics beyond `sc failure` recovery actions. The NSSM-based approach previously evaluated for this decision is discarded — no NSSM implementation exists in this repository (see [ADR 0001](adr/0001-process-supervision.md)). This runbook does not install
 any supervisor. See [ADR 0001](adr/0001-process-supervision.md) for the decision
 and [the pre-mortem](pre-mortem-process-supervision.md) for failure scenarios.
@@ -9,10 +9,10 @@ Platform evidence remains scoped to the checks explicitly recorded below.
 | Platform path | Status | Repository artifact/evidence boundary |
 | --- | --- | --- |
 | Linux foreground | Available | Node/Bun process behavior only; not boot-managed |
-| Linux systemd | Approved design path | No checked-in unit templates, renderer, installer, or production boot/readiness evidence |
+| Linux systemd | Approved design path | Source templates are checked in under `native-control/src/systemd/`; no renderer, installer, rendered units, live host deployment, or production boot/readiness evidence |
 | Windows foreground | Available on x64 | Node/Bun process behavior only; not boot-managed |
 | Windows Shawl | Evaluated candidate | v1.9.0 functional checks; unsigned binary and production identity/ACL evidence remain open |
-| Windows `sc.exe` | Documented degraded fallback | No checked-in installer/update/remove implementation |
+| Windows `sc.exe` | Documented degraded fallback | No production installer/update/remove script; host evidence remains open |
 | macOS launchd | Unsupported | No native-control target, plist, installer, or platform evidence |
 
 Component-specific guidance is indexed in
@@ -48,7 +48,7 @@ Run one bot service on the bot host and one daemon service for each exact valid 
 
 ## Before installing
 
-1. Use a disposable host or a documented maintenance window. Confirm Node `>=26` for the bot and Bun `>=1.3.14` plus the locked SDK for each daemon.
+1. Use a disposable host or a documented maintenance window. Confirm Node `>=26` for the bot and Bun `>=1.4.0` plus the locked SDK for each daemon.
 2. Create dedicated least-privilege service accounts. Windows uses `gjc-bot-svc` and `gjc-daemon-svc` with “Log on as a service”; Linux systemd uses `gjc-bot` and `gjc-daemon`. Do not use `LocalSystem` for a daemon. Provider login and profile setup must be performed as that identity so `HOME`/`~/.gjc` and work-directory session data are readable without copying credentials.
 3. Use exactly one protected secret source for the deployment mode: component-local `.env` for foreground/Shawl, mode-0600 `/etc/gjc-remote/*.env` files for systemd, or external secret files for the bot container. Do not put tokens, Discord credentials, provider credentials, prompts, or credential-bearing URLs in service metadata, command lines, journals, manifests, or evidence. Reject arbitrary dotenv paths and `DOTENV_CONFIG_PATH`; reject `BOT_WS_URL` userinfo, query, and fragment components.
 4. Protect profiles, `.gjc`, env/channels files, `.gjc-remote-session`, logs, manifests, and journals with the service account/SYSTEM and documented administrator recovery access. Remove inherited `Users`/`Everyone` access. Keep debug off (`GJC_REMOTE_DEBUG=0`).
@@ -62,7 +62,7 @@ baseline:
 ```text
 # from the repository root
 cd bot    && node src/bot.js
-cd daemon && bun src/daemon.js   # Bun >= 1.3.14
+cd daemon && bun src/daemon.js   # Bun >= 1.4.0
 ```
 
 A foreground process is intentionally not boot-managed. Use it when a supervisor
@@ -116,9 +116,13 @@ back to the foreground commands below.
 
 **Decision (2026-08-08):** The NSSM-based Windows supervision path is discarded. It was never merged into this repository — its install/update/remove/recovery scripts and supervision-contract test lived only in an untracked `ops/` tree that has since been archived outside the repository and deleted. No NSSM implementation, script, or test exists anywhere in this repository. The operator selected Shawl as the primary Windows supervisor, with direct `sc.exe` service registration as the documented fallback (see [ADR 0001](adr/0001-process-supervision.md)) instead of resuming NSSM work.
 
-### Windows: `sc.exe` fallback (not yet implemented)
+### Windows: `sc.exe` fallback (contract-only production gate)
 
-Use this path only when Shawl is unsuitable. Nothing below is implemented yet; there is no install/update/remove script for it in this repository — treat it as the contract a future script must satisfy.
+Use this path only when Shawl is unsuitable. The source tree contains the
+service lifecycle CLI, orchestration, and fake-driver contract implementation,
+but no production `sc.exe` installer/update/remove script or host evidence is
+claimed. Treat the following as the contract that an authorized deployment
+adapter must satisfy.
 
 #### Service contract
 
@@ -142,7 +146,7 @@ For a start, record the UTC boundary, boot identity, stdout/stderr offsets, serv
 
 ## Linux (systemd)
 
-**The unit templates below are not currently checked into this repository.** They previously lived only in an untracked `ops/` tree (render script plus `.service.in` templates) that has been archived outside the repository and deleted, alongside the discarded NSSM scripts. This section is the contract they must satisfy once they are added and checked in: render a bot unit and a true `gjc-remote-daemon@.service` template. The bot uses `User=gjc-bot`, an absolute Node entrypoint, component working directory, and `/etc/gjc-remote/bot.env`. The daemon uses `User=gjc-daemon`, an absolute Bun entrypoint, `/etc/gjc-remote/daemon-%i.env`, a per-instance `HOME`, and `SyslogIdentifier=gjc-remote-daemon-%i`. Render concrete instances and reject placeholders before installation.
+**The source unit templates are checked into `native-control/src/systemd/`.** They are source inputs, not rendered units or a live host deployment; no renderer, installer, or production boot/readiness evidence is shipped. This section is the contract they must satisfy when an authorized operator renders and deploys them: render a bot unit and a true `gjc-remote-daemon@.service` template. The bot uses `User=gjc-bot`, an absolute Node entrypoint, component working directory, and `/etc/gjc-remote/bot.env`. The daemon uses `User=gjc-daemon`, an absolute Bun entrypoint, `/etc/gjc-remote/daemon-%i.env`, a per-instance `HOME`, and `SyslogIdentifier=gjc-remote-daemon-%i`. Render concrete instances and reject placeholders before installation.
 
 Both units use:
 
@@ -165,7 +169,11 @@ The normal install consumes host-policy journald. Query unit-scoped records and 
 
 ## Transactions, recovery, and manual cleanup
 
-**No implementation of this transaction/journal/fault-injection protocol exists anywhere in this repository.** What follows is the contract a future implementation must satisfy before it may be used in production.
+The source tree contains the protected transaction/journal implementation and
+fake-native fault-injection coverage for this protocol. Those source-level
+contracts do not establish production deployment, signing, real systemd/SCM
+behavior, or disposable-host evidence. The following boundaries remain
+mandatory before the lifecycle can be used in production.
 
 Use per-service ACL/mode-protected storage (`C:\ProgramData\\gjc-remote\\transactions` or `/var/lib/gjc-remote/transactions`, mode 0700). Before every install/update/remove mutation, it must:
 

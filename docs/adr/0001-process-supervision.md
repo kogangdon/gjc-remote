@@ -3,7 +3,7 @@
 - **Status:** Revised design; Linux approved; Windows Shawl selected as the primary supervisor with `sc.exe` documented as the fallback; NSSM discarded
 - **Date:** 2026-08-01
 - **Amendment (2026-08-08):** The NSSM-based Windows supervision path recorded in the original decision is discarded. It was never merged into this repository — its install/update/remove/recovery scripts and supervision-contract test lived only in an untracked `ops/` tree that has since been archived outside the repository and deleted — and the operator selected a different Windows mechanism. No NSSM implementation exists anywhere in this repository. See "Windows: NSSM (discarded)" below. This amendment also supersedes this ADR's original prohibition on registering Bun or Node directly with `sc.exe` (they do not implement the Windows Service Control API); the Decision section below now names `sc.exe` as the documented Windows fallback and accepts, as the named cost of that reversal, that a directly registered service cannot acknowledge `SERVICE_CONTROL_STOP` and that its automatic restart is limited to the fixed, jitter-free `sc failure` recovery-action contract.
-- **Scope:** This ADR records the supervision decision and its operational documentation. The coordinated SDK pin update is separately verified in this PR; it does not authorize product-source, protocol, or lockfile changes beyond that dependency update.
+- **Scope:** This ADR records the supervision decision and its operational documentation. The host-local lifecycle contract and its six-operation CLI are recorded in [ADR 0006](0006-native-service-lifecycle.md); that contract does not by itself authorize service mutation or production deployment.
 
 ## Context
 
@@ -13,7 +13,18 @@ The design must not turn a service name into a host identity, leak credentials i
 
 ## Decision
 
-Use native systemd units as the Linux service path (contract below; the `.service.in` templates are not yet checked into this repository — see "Linux: systemd"). Use Shawl v1.9.0 as the selected primary Windows supervisor, not merely an evaluation adapter: its distributed win64 binary is unsigned, so signed provenance remains a required, still-open release-owner item, and every existing unsigned-binary caveat in this document continues to apply. Use direct `sc.exe` service registration as the named Windows fallback when Shawl is unsuitable, accepting a known cost: Bun and Node do not implement the Windows Service Control API, so a directly registered service cannot acknowledge `SERVICE_CONTROL_STOP` (the SCM instead force-ends the process tree after its own stop timeout), and automatic restart is limited to whatever `sc failure <service> actions=...` recovery-action flags provide — a fixed list with no jitter/backoff shaping and no coordination with the application's own reconnect/shutdown timers. That restart/backoff contract must be separately implemented (a thin wrapper) or explicitly accepted as absent before relying on the fallback in production. The production-primary design remains open to a future first-party signed service wrapper registered through the Windows SCM. Keep foreground/manual operation as the universal rollback. The NSSM-based approach evaluated for this ADR is discarded (see "Windows: NSSM (discarded)"); no NSSM implementation exists in this repository.
+Use native systemd units as the Linux service path. Source templates are now
+checked in under `native-control/src/systemd/`, but no installer or rendered
+host deployment is claimed. Use Shawl v1.9.0 as the selected primary Windows
+supervisor, not merely an evaluation adapter: its distributed win64 binary is
+unsigned, so signed provenance remains a required, still-open release-owner
+item, and every existing unsigned-binary caveat in this document continues to
+apply. Use direct `sc.exe` service registration as the named Windows fallback
+when Shawl is unsuitable, accepting its documented stop and fixed recovery
+action limitations; it is not equivalent to a service-aware wrapper. Keep
+foreground/manual operation as the universal rollback. The NSSM-based approach
+evaluated for this ADR is discarded (see "Windows: NSSM (discarded)"); no NSSM
+implementation exists in this repository.
 
 `sc.exe` is the registration/control layer for the fallback above, not a process wrapper; a directly registered Bun/Node service is the degraded contract described above, not equivalent to a service-aware wrapper. A first-party signed wrapper requires a separate ADR or explicit revision of this decision.
 
@@ -77,11 +88,36 @@ Before forcing, suppress restart and revalidate owner, service metadata/proof, r
 
 ### Linux: systemd
 
-Check in and render two units: `gjc-remote-bot.service.in` and the true instance template `gjc-remote-daemon@.service.in`. **These `.service.in` templates are not currently checked into this repository.** Like the discarded NSSM scripts, they previously lived only in an untracked `ops/` tree that has been archived outside the repository and deleted. This is the contract they must satisfy once they are added and checked in: the bot uses `User=gjc-bot`, its component directory, an absolute Node entrypoint, and `/etc/gjc-remote/bot.env`. The daemon uses `User=gjc-daemon`, an absolute Bun entrypoint, `/etc/gjc-remote/daemon-%i.env`, per-instance `HOME`, and `SyslogIdentifier=gjc-remote-daemon-%i`. Rendered paths, users, and instance keys must contain no placeholders.
+Source templates are checked in under `native-control/src/systemd/`; the
+`gjc-remote-service` lifecycle CLI may render them, but no installer or rendered
+host deployment is claimed. The bot uses `User=gjc-bot`, its component
+directory, an absolute Node entrypoint, and `/etc/gjc-remote/bot.env`. The
+daemon uses `User=gjc-daemon`, an absolute Bun entrypoint,
+`/etc/gjc-remote/daemon-%i.env`, per-instance `HOME`, and
+`SyslogIdentifier=gjc-remote-daemon-%i`. Rendered paths, users, and instance
+keys must contain no placeholders.
 
 Both units use network-online ordering, `Restart=on-failure`, `RestartSec=10s`, `StartLimitIntervalSec=600s`, `StartLimitBurst=5`, `KillSignal=SIGTERM`, `KillMode=control-group`, `TimeoutStopSec=35s`, and `UMask=0077`. These are systemd settings and must not be represented as Shawl or `sc.exe` guarantees, or vice versa. Render systemd `EnvironmentFile` separately from dotenv (`KEY=value`, no `export`, shell expansion, or command substitution); quote spaces, quotes, backslashes, and `#` correctly. Env files are mode 0600 and contain only the intended startup values.
 
 The default installation consumes the host's journald storage and retention policy. It does not create or edit global journald configuration and makes no per-unit retention/capacity claim. Unit-scoped queries and the host policy are recorded as evidence. A host-global drop-in is a separate, written-approval operation with baseline, diff, owned rollback, and evidence.
+
+The executable trial is deliberately separate from final activation. Linux
+trials are loaded, disabled but unmasked, `Restart=no`, free of false
+`Condition*`/`Assert*` and inbound activators; only an explicit fixed-argv
+`systemctl start` may run them. Windows trials are demand-start with empty
+failure actions and suppressed actions. Controller death does not stop a trial
+on either platform and is not a watchdog; reboot or an invalidated process
+epoch requires a fresh trial rather than retrospective readiness.
+
+The `@gjc-remote/native-control` package exposes these lifecycle operations as
+the `gjc-remote-service` CLI: exactly `install`, `status`, `update`,
+`rollback`, `uninstall`, and `recover`. Status separates a bounded startup
+receipt (current epoch, lineage, and continuous log/journal cursor) from live
+health; service state or an old marker is not readiness. Windows log/tree ABI
+gaps, PID-0 ambiguity, overflow, or surviving children refuse safely. Linux
+shared-template drift/reference and opaque zero-reference observations are not
+deletion authority; exact physical/reference/lock identities are required or
+the operation enters `manual-cleanup`.
 
 ### Current-run readiness
 
@@ -89,7 +125,10 @@ Readiness is a current-run property, not `active (running)` or a stale log line.
 
 ### Transaction ownership and recovery
 
-**No implementation of this transaction/journal/fault-injection protocol exists anywhere in this repository.** What follows is the contract a future implementation must satisfy before it may be used in production.
+The protected store, lifecycle coordinator, CLI, and platform-driver source now
+implement this contract boundary. They remain contract/fake-driver evidence:
+no production deployment, signing, or disposable-host fault-injection evidence
+is claimed. The following rules remain mandatory before production use.
 
 Install, update, and remove must use an ACL/mode-protected per-service transaction store (`C:\ProgramData\\gjc-remote\\transactions` on Windows; `/var/lib/gjc-remote/transactions` mode 0700 on Linux). Before mutation, it must acquire the per-key lock, generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters), and compute a versioned SHA-256 `resourceProof` over canonical, secret-free transaction/resource fields. It must never reuse a nonce.
 
@@ -122,7 +161,14 @@ users is therefore not a release gate for the dedicated-host model. Service-acco
 separation and protected credential/profile/session storage remain mandatory for any
 supervised deployment.
 
-Platform evidence is **pending**. This documentation-only change does not prove Shawl byte provenance, Windows stop/readiness, Linux boot/readiness, relay behavior, transaction fault injection, rotation, or secret scans. Release requires pinned Shawl source/release and executable-hash evidence for the Windows primary path, disposable Windows and pinned Ubuntu systemd evidence, current-run relay evidence, fault-injection matrices, and sanitized artifacts. Missing evidence escalates; it is not waived.
+Platform evidence is **pending**. G003 fake-native driver tests and modeled
+platform checks establish contract behavior only; they do not prove Shawl byte
+provenance, Windows stop/readiness, Linux boot/readiness, relay behavior,
+transaction fault injection, rotation, or secret scans. Release requires
+pinned Shawl source/release and executable-hash evidence for the Windows
+primary path, disposable Windows and pinned Ubuntu systemd evidence,
+current-run relay evidence, fault-injection matrices, and sanitized artifacts.
+Missing evidence escalates; it is not waived.
 The dedicated-host boundary above is an explicit scope decision, not a waiver of
 service-account or secret-storage controls. Re-open the multi-user evidence requirement
 before supporting a shared workstation or claiming Windows account/ACL isolation.

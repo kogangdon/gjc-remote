@@ -1,0 +1,42 @@
+# gjc-remote bot unit render template (issue #240).
+#
+# gjc-remote-service substitutes each declared GJC_REMOTE token below with an exact
+# preprovisioned value (absolute Bun/Node runtime, immutable release
+# entrypoint, stable external working directory, external HOME, absolute
+# external CHANNELS_CONFIG, restart policy, and proof/release fingerprints) and
+# refuses to publish the unit while any token remains. Rendered units are
+# byte-exact per transaction: the trial unit carries Restart=no and the final
+# unit carries Restart=on-failure; boot activation stays fenced until the
+# proof-owned multi-user.target.wants link is created after startup evidence.
+#
+# /etc/gjc-remote/bot.env is preprovisioned external state; it is never
+# written by the controller and must resolve CHANNELS_CONFIG to the same
+# absolute path pinned below.
+[Unit]
+Description=gjc-remote bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gjc-bot
+Slice=system.slice
+EnvironmentFile=/etc/gjc-remote/bot.env
+Environment=CHANNELS_CONFIG=@GJC_REMOTE_CHANNELS_CONFIG@
+Environment=HOME=@GJC_REMOTE_HOME_DIRECTORY@
+WorkingDirectory=@GJC_REMOTE_WORKING_DIRECTORY@
+ExecStart=@GJC_REMOTE_RUNTIME_PATH@ @GJC_REMOTE_ENTRYPOINT_PATH@
+Restart=@GJC_REMOTE_RESTART@
+RestartSec=10s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=35s
+UMask=0077
+SyslogIdentifier=gjc-remote-bot
+# gjc-remote-release: @GJC_REMOTE_RELEASE_FINGERPRINT@
+# gjc-remote-proof: @GJC_REMOTE_PROOF_FINGERPRINT@
+
+[Install]
+WantedBy=multi-user.target

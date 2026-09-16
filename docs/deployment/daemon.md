@@ -69,7 +69,8 @@ proof; no successor may adopt or downgrade owned work. The #231 live-control con
 cancellation does not restore active `steer`/`follow_up` or unblock #231.
 
 This repository provides the foreground start command below; it does not ship a
-native service installer, service wrapper, or systemd unit, and this guide is
+native service installer, service wrapper, or rendered systemd deployment
+(source templates are under `native-control/src/systemd/`), and this guide is
 not evidence of a completed live deployment.
 
 The integration boundary is unchanged by the SDK bump. `gjc-remote` owns host
@@ -124,6 +125,13 @@ logs, backups, or support archives. An outbound connection does not remove the
 need to restrict ingress to the bot listener; it means daemon hosts need only
 reach that private endpoint.
 
+For a supervised instance, `HOST_ID` is protected configuration input, not a
+service name. The service key is the lower-case display slug (at most 32 ASCII
+characters) followed by the full lower-case SHA-256 of the exact UTF-8
+`HOST_ID`. Do not trim, normalize, case-fold, or substitute the service key;
+the raw host ID is never emitted in service metadata, journals, manifests, or
+public status.
+
 Do not run the daemon as a user chosen merely for convenience. Its provider
 identity, `~/.gjc` state, and filesystem permissions define the work it can
 perform. The session storage and provider state are host-local and must be
@@ -132,13 +140,14 @@ onto a different account or path can invalidate ownership and provider access.
 
 ## Shutdown, monitoring, and recovery
 
-On a stop signal the daemon drains under `GJC_SHUTDOWN_TIMEOUT_MS`, default
-15,000 ms. The value is bounded (minimum 1,000 ms); configure the external
-service supervisor's stop timeout above it. Treat forced termination as an
-operational failure, because active workflows and local state may not have
-reached their normal cleanup boundary. Socket close containment revokes queued
-siblings before execution and starts #234 retirement for active shared
-sessions; it is not proof that active SDK/provider work was interrupted.
+On a stop signal the daemon begins its bounded shutdown procedure under
+`GJC_SHUTDOWN_TIMEOUT_MS`, default 15,000 ms. This is not a drain guarantee:
+pending invokes or gates may fail, and forced termination is an operational
+failure because active workflows and local state may not have reached their
+normal cleanup boundary. Configure the external service supervisor's stop
+timeout above it. Socket close containment revokes queued siblings before
+execution and starts #234 retirement for active shared sessions; it is not
+proof that active SDK/provider work was interrupted.
 
 Monitor daemon process health, outbound WebSocket registration at the bot,
 provider/profile failures, gate presentation/abandonment/answer receipt
@@ -160,9 +169,10 @@ Before an upgrade, record the deployed revision, Bun and SDK versions,
 `HOST_ID`, service-account identity, model profile, and protected-state backup
 status. Deploy bot and daemon lockstep for `terminal_disposition_v1` and
 `invoke_cancellation_v1`, and `gate_presentation_v1`: after one side updates,
-an old peer cannot serve invokes and the mixed pair fails closed. Drain
-in-flight requests to
-terminal/quiescence evidence before rollback; never downgrade owned work while
+an old peer cannot serve invokes and the mixed pair fails closed. Stop new
+in-flight admission and require positive terminal/quiescence evidence where
+available before rollback; this is not a supervisor drain guarantee and
+pending work may fail. Never downgrade owned work while
 #234 leases and fences await positive disposal proof. Stop gracefully, install
 the new locked dependencies, restart, then confirm registration, negotiated
 invoke capabilities, and a known authorized route. Roll back binaries only
@@ -171,6 +181,39 @@ not treat copied `~/.gjc`, session state, or an old authority snapshot as a
 safe generic rollback: tokens may be account-bound and durable authority floors
 must not be rewound. Prefer forward recovery under the current authority
 contract.
+
+## Native service lifecycle boundary
+
+The host-local controller is package **`@gjc-remote/native-control`**, exposed
+as **`gjc-remote-service`**. The exact six operations are `install`, `status`,
+`update`, `rollback`, `uninstall`, and `recover`; the executable accepts one
+operation and one strict JSON request on non-terminal stdin, with no flags or
+caller-selected URL/root. `status` is read-only and reports no writes.
+
+Install/update/rollback trial an immutable, content-addressed application
+release before automatic activation and retain the exact immediate predecessor.
+The controller references, but never creates or rewrites, the daemon's Bun
+runtime, account, HOME, `.gjc` provider state, `.env`, workspaces,
+`.gjc-remote-session`, logs, or mapping authority. A signed application asset,
+the purpose-specific application deployment key, and the platform human gate
+are release requirements; the repository does not claim a signed production
+release or real service run. The Windows Shawl asset uses a separate
+purpose-specific deployment key.
+
+Recovery is exact-transaction replay only. Missing, stale, foreign, hybrid,
+torn, or recreated records/resources enter durable `manual-cleanup` and remain
+untouched until the recorded operator action has produced the expected proof.
+Recovery never adopts by name, repairs external state, or claims migration or
+drain. Any pending work may be lost during stop; preserve external bytes and
+inspect host state before retrying.
+
+Lifecycle `status` separates startup evidence from live health. A fresh
+current-epoch receipt binds boot identity, InvocationID or wrapper/child epoch,
+exact process lineage, and a continuous log/journal cursor; after the bounded
+startup window it is historical, not a health protocol. Connectivity is only a
+last observation (`last-observed-connected`/`last-observed-disconnected`), and
+provider and workspace health remain `unknown`. A connected daemon or
+`active (running)` service therefore does not prove current readiness.
 
 ## Native inventory and serving boundary
 

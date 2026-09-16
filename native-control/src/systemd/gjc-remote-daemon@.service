@@ -1,0 +1,38 @@
+# gjc-remote daemon shared instance template (issue #240).
+#
+# This template is release-independent and invariant: it carries no release
+# pin and is byte-identical for every daemon instance and every release. Each
+# instance is pinned only by its proof-owned drop-in
+# /etc/systemd/system/gjc-remote-daemon@<instance-key>.service.d/50-gjc-release.conf
+# which resets ExecStart and binds the immutable release, stable external
+# working directory, and per-instance HOME.
+#
+# The ExecStart below is a fail-closed sentinel: it is never a release path
+# and always exits non-zero. An instance started without its owned drop-in
+# fails instead of running anything. The controller only ever starts exact
+# disabled-but-unmasked instances with Restart=no supplied by the drop-in;
+# automatic start is fenced until post-gate activation creates the proof-owned
+# multi-user.target.wants link.
+[Unit]
+Description=gjc-remote daemon (immutable release bound by owned instance drop-in)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gjc-daemon
+Slice=system.slice
+EnvironmentFile=/etc/gjc-remote/daemon-%i.env
+ExecStart=/usr/bin/false
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=35s
+UMask=0077
+SyslogIdentifier=gjc-remote-daemon-%i
+
+[Install]
+WantedBy=multi-user.target

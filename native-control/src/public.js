@@ -5,5 +5,6 @@ export {
   createInventoryReader,
   createManagementNative,
   createResidualProcessEnumerator,
+  createServiceNative,
   validateBuildManifest,
 } from "./index.js";
