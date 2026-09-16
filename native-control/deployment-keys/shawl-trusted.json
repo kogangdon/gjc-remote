@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "keys": [
+    {
+      "keyId": "shawl-offline-2026-09-r1",
+      "algorithm": "ed25519",
+      "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAd0JkMY7kY2DZ9Nh+EZYkEjIiaRd5BnRMHwfNstxgadw=\n-----END PUBLIC KEY-----\n"
+    }
+  ]
+}

@@ -27,8 +27,9 @@ the latter is tracked in
 See the [containment record](../../CHANGELOG.md#sdk-0166-containment).
 
 No guide in this directory claims a completed live deployment. The repository
-ships no native service installer, Windows service wrapper, or systemd unit;
-supervisor material is evaluation and operator guidance only.
+ships source systemd templates under `native-control/src/systemd/`, but no
+rendered units, live host deployment, native service installer, or Windows
+service wrapper; supervisor material is evaluation and operator guidance only.
 
 The daemon continues to embed the SDK in-process. `gjc-remote` owns host,
 route, and workspace policy; the SDK runtime owns model/provider catalogs,

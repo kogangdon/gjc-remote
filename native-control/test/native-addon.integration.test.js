@@ -14,6 +14,7 @@ import {
   capabilities,
   capabilitySignatures,
   contractRevision,
+  createServiceNative,
   validateBuildManifest,
 } from "../src/index.js";
 import * as publicApi from "../src/public.js";
@@ -86,11 +87,10 @@ test("contract-4 inventory ABI exposes only the frozen seven primitive signature
     "read_inventory_object",
     "publish_inventory_object_atomic",
   ];
-  // The seven inventory primitives now sit directly before the serving block
-  // (enumerate_workspace_process_holders), so they are the 7 capabilities ending
-  // one slot from the tail rather than the final 7.
-  assert.deepEqual(capabilities.slice(-inventory.length - 1, -1), inventory);
-  assert.equal(capabilities.at(-1), "enumerate_workspace_process_holders");
+  const inventoryStart = capabilities.indexOf(inventory[0]);
+  assert.ok(inventoryStart >= 0);
+  assert.deepEqual(capabilities.slice(inventoryStart, inventoryStart + inventory.length), inventory);
+  assert.equal(capabilities[inventoryStart + inventory.length], "enumerate_workspace_process_holders");
   assert.deepEqual(capabilitySignatures.enumerate_workspace_process_holders, ["workDir", "sourcePlatform"]);
   assert.deepEqual(Object.fromEntries(inventory.map((name) => [name, capabilitySignatures[name]])), {
     resolve_native_state_root: ["hostKey", "rootKind"],
@@ -103,7 +103,7 @@ test("contract-4 inventory ABI exposes only the frozen seven primitive signature
   });
 });
 
-test("staged public inventory adapters do not change the native ABI or expose low-level helpers", () => {
+test("public inventory adapters and service facade do not expose low-level helpers", () => {
   assert.deepEqual(Object.keys(publicApi).sort(), [
     "buildManifest",
     "createContainmentLowLevel",
@@ -111,16 +111,20 @@ test("staged public inventory adapters do not change the native ABI or expose lo
     "createInventoryReader",
     "createManagementNative",
     "createResidualProcessEnumerator",
+    "createServiceNative",
     "validateBuildManifest",
   ]);
   assert.equal(typeof publicApi.createContainmentLowLevel, "function");
   assert.equal(typeof publicApi.createResidualProcessEnumerator, "function");
   assert.equal(typeof publicApi.createInventoryPublisher, "function");
   assert.equal(typeof publicApi.createInventoryReader, "function");
+  assert.equal(typeof publicApi.createServiceNative, "function");
+  assert.equal(publicApi.createServiceNative, createServiceNative);
   assert.equal("createInventoryPublisherAdapter" in publicApi, false);
   assert.equal("createInventoryReaderAdapter" in publicApi, false);
+  assert.equal("createServiceNativeFactory" in publicApi, false);
   assert.equal(publicApi.buildManifest.contractVersion, 4);
-  assert.equal(publicApi.buildManifest.contractRevision, 3);
+  assert.equal(publicApi.buildManifest.contractRevision, 4);
   assert.deepEqual(publicApi.buildManifest.capabilities, capabilities);
   assert.deepEqual(publicApi.buildManifest.capabilitySignatures, capabilitySignatures);
 });
@@ -285,10 +289,11 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   const addonBytes = readFileSync(addonUrl);
   const manifest = JSON.parse(readFileSync(manifestUrl, "utf8"));
   const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
-  if (!validateBuildManifest(manifest, packageJson, addonBytes)) {
-    t.skip("native build belongs to a different platform or architecture");
-    return;
-  }
+  assert.equal(
+    validateBuildManifest(manifest, packageJson, addonBytes),
+    true,
+    "the present native build must be the current platform, architecture, and exact contract",
+  );
 
   const addon = require(fileURLToPath(addonUrl));
   const contract = addon.native_control_contract();
@@ -299,11 +304,16 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
   assert.deepEqual(contract.capabilitySignatures, capabilitySignatures);
   assert.equal(manifest.contractRevision, contractRevision);
   assert.equal(manifest.sha256, createHash("sha256").update(addonBytes).digest("hex"));
-  assert.equal(
-    validateBuildManifest({ ...manifest, contractRevision: contractRevision + 1 },
-      packageJson, addonBytes),
-    false,
-  );
+  for (const revision of [contractRevision - 1, contractRevision + 1]) {
+    assert.equal(
+      validateBuildManifest({ ...manifest, contractRevision: revision }, packageJson, addonBytes),
+      false,
+      `contract revision ${revision} must not be accepted alongside revision ${contractRevision}`,
+    );
+  }
+  const capabilityDrift = structuredClone(manifest);
+  capabilityDrift.capabilities.pop();
+  assert.equal(validateBuildManifest(capabilityDrift, packageJson, addonBytes), false);
   const signatureDrift = structuredClone(manifest);
   signatureDrift.capabilitySignatures.principal_access_check = ["path", "kind", "principal"];
   assert.equal(validateBuildManifest(signatureDrift, packageJson, addonBytes), false);
@@ -930,7 +940,12 @@ test("native source contains fail-closed ACL and publication guards", () => {
     "directory default ACL absence requires a successful zero-entry query");
   assert.doesNotMatch(source, /errno == ENODATA \|\| errno == EINVAL/,
     "default ACL query errors are never accepted as absence");
-  assert.doesNotMatch(source, /GetTickCount64|GetCurrentProcessId/,
+  const windowsRandomStart = source.indexOf("bool WindowsRandomName(");
+  const windowsRandomEnd = source.indexOf("std::wstring Wide(", windowsRandomStart);
+  assert.ok(windowsRandomStart >= 0 && windowsRandomEnd > windowsRandomStart);
+  const windowsRandom = source.slice(windowsRandomStart, windowsRandomEnd);
+  assert.match(windowsRandom, /BCryptGenRandom/);
+  assert.doesNotMatch(windowsRandom + inventoryPublish, /GetTickCount64|GetCurrentProcessId/,
     "Windows temporary names must not derive from process or clock state");
   const windowsAclStart = source.indexOf("napi_value VerifyInventoryAclWindows");
   const windowsAclEnd = source.indexOf("napi_value ReadInventoryObjectWindows", windowsAclStart);

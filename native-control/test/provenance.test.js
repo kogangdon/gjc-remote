@@ -14,8 +14,13 @@ import {
   capabilitySignatures,
   contractRevision,
   loadVerifiedAddon,
+  validateBuildManifest,
   verifyManifestSignature,
 } from '../src/index.js';
+import {
+  validateBuildManifest as validateBuildManifestCore,
+  verifyManifestSignature as verifyManifestSignatureCore,
+} from '../src/native-provenance.js';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const realAddonPath = join(packageRoot, 'build', 'Release', 'native_control.node');
@@ -37,6 +42,11 @@ function sidecarFor(key, algorithm, keyId, manifestBytes) {
 }
 
 // --- Pure verifyManifestSignature coverage -------------------------------------------------
+
+test('index tooling exports are the factored native provenance implementations', () => {
+  assert.equal(validateBuildManifest, validateBuildManifestCore);
+  assert.equal(verifyManifestSignature, verifyManifestSignatureCore);
+});
 
 test('verifyManifestSignature: valid ed25519 signature verifies against the pinned key', () => {
   const key = generateEd25519();
@@ -159,9 +169,65 @@ function loadOptions(fixture, extra) {
   };
 }
 
-test('contract revision 3 is the fence write-receipt provenance boundary', () => {
-  assert.equal(contractRevision, 3);
+test('contract revision 4 preserves the fence write-receipt provenance boundary', () => {
+  const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+  assert.equal(contractRevision, 4);
+  assert.equal(packageJson.nativeControlContract.revision, contractRevision);
   assert.deepEqual(capabilitySignatures.acquire_inventory_fence, ['path', 'roles']);
+});
+
+test('current manifest revision is the only accepted capability contract', () => {
+  const addonBytes = Buffer.from('current-native-addon');
+  const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+  const manifest = {
+    contractVersion: 4,
+    contractRevision,
+    package: packageJson.name,
+    version: packageJson.version,
+    napi: 8,
+    platform: 'linux',
+    arch: 'x64',
+    addon: 'native_control.node',
+    sha256: createHash('sha256').update(addonBytes).digest('hex'),
+    capabilities,
+    capabilitySignatures,
+  };
+
+  assert.equal(validateBuildManifest(manifest, packageJson, addonBytes, 'linux', 'x64'), true);
+  for (const revision of [contractRevision - 1, contractRevision + 1]) {
+    assert.equal(
+      validateBuildManifest({ ...manifest, contractRevision: revision }, packageJson, addonBytes, 'linux', 'x64'),
+      false,
+      `contract revision ${revision} must not be accepted alongside revision ${contractRevision}`,
+    );
+  }
+
+  const capabilityDrift = structuredClone(manifest);
+  capabilityDrift.capabilities.pop();
+  assert.equal(validateBuildManifest(capabilityDrift, packageJson, addonBytes, 'linux', 'x64'), false);
+
+  const signatureDrift = structuredClone(manifest);
+  signatureDrift.capabilitySignatures.acquire_inventory_fence = ['path'];
+  assert.equal(validateBuildManifest(signatureDrift, packageJson, addonBytes, 'linux', 'x64'), false);
+});
+
+test('loadVerifiedAddon: package contract revision drift refuses before addon loading', () => {
+  withFixtureDir((dir) => {
+    const addonBytes = Buffer.from('not-a-native-addon');
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    const fixture = writeManifestFixture(dir, { addonBytes, packageJson, copyAddon: true });
+    for (const revision of [contractRevision - 1, contractRevision + 1]) {
+      const driftedPackageJson = structuredClone(packageJson);
+      driftedPackageJson.nativeControlContract.revision = revision;
+      writeFileSync(fixture.packageJsonPath, JSON.stringify(driftedPackageJson));
+      assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+        assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+        assert.equal(error.reason, 'package native capability contract is invalid');
+        assert.equal(error.writes, 0);
+        return true;
+      });
+    }
+  });
 });
 
 test('loadVerifiedAddon: missing sidecar refuses when a key is pinned', (t) => {
@@ -244,7 +310,13 @@ test('loadVerifiedAddon: a pinned trusted key loads without any dev-key warning'
     writeFileSync(fixture.sidecarPath, JSON.stringify(sidecarFor(key, 'p256', 'prod-1', fixture.manifestBytes)));
     const warnings = [];
     const addon = loadVerifiedAddon(loadOptions(fixture, { warn: (message) => warnings.push(message) }));
-    assert.equal(typeof addon.native_control_contract, 'function');
+    assert.deepEqual(addon.native_control_contract(), {
+      contractVersion: 4,
+      contractRevision,
+      napi: 8,
+      capabilities,
+      capabilitySignatures,
+    });
     assert.equal(warnings.length, 0);
   });
 });

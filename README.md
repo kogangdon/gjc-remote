@@ -159,6 +159,36 @@ Docker status is recorded there without promoting design-only or unevidenced
 paths. These are foreground/operator guides, not evidence of a completed live
 deployment.
 
+### Native service lifecycle (issue #240)
+
+The host-local lifecycle boundary is the **`@gjc-remote/native-control`**
+package and its **`gjc-remote-service`** executable. It accepts exactly one
+positional operation — `install`, `status`, `update`, `rollback`, `uninstall`,
+or `recover` — and one strict UTF-8 JSON request on non-terminal stdin. There
+are no flags, URL sources, ambient role fallbacks, or portable filesystem
+fallback. `status` is read-only and reports `writes: 0`; the other operations
+are proof-bound transactions. This CLI contract is implemented, but a real
+service driver, production deployment asset, and disposable-host evidence are
+not claimed by this repository.
+
+The lifecycle controller owns only service resources and protected proof
+records. Runtime binaries, accounts, component configuration, credentials,
+provider profiles, HOME directories, logs, workspaces, mapping authority, and
+`.gjc-remote-session` are preprovisioned external state. It never creates or
+rewrites those inputs. Application bundles and the Windows Shawl bundle are
+separately signed, immutable, content-addressed releases; a service points at
+an exact release and retains its immediate predecessor. A daemon service key
+uses the display slug plus the full lower-case SHA-256 of the exact UTF-8
+`HOST_ID`; the raw `HOST_ID` never appears in service names or public receipts.
+
+The six operations do not promise a drain, migration, or automatic state
+repair. Pending invokes or gates may fail during a planned or forced stop.
+Missing, stale, foreign, hybrid, torn, or recreated evidence becomes durable
+`manual-cleanup`; recovery may continue only the exact active transaction and
+never adopts a resource by service name. External configuration and state are
+byte-preserved. Signed production keys, platform-specific human gates, and
+disposable Linux/Windows host evidence remain release requirements.
+
 ## Local quick start
 
 Install the repository prerequisites before running `bun install`:
@@ -299,7 +329,9 @@ not change Discord's stored commands.
 - **bot** — `DISCORD_GUILD_ID` registers slash commands to a single guild for
   instant propagation (global registration can take up to ~1h to appear);
   `GJC_REMOTE_DEBUG=1` logs Discord interaction lifecycle and relayed GJC event
-  summaries; `CHANNELS_CONFIG` overrides the `channels.json` path.
+  summaries; `CHANNELS_CONFIG` overrides the `channels.json` path and must be
+  an absolute path to pre-existing external state. The lifecycle controller
+  never creates, rewrites, or relocates that file or its parent.
 - **daemon** — `HOST_LABEL` sets a human-readable name shown in the bot's connect
   logs; `GJC_MODEL_PROFILE` overrides the activated model profile;
   `GJC_SHUTDOWN_TIMEOUT_MS` overrides the daemon shutdown deadline (default
@@ -427,7 +459,9 @@ service-account configuration, and production Windows evidence.
 
 This supervisor material is evaluation and operator guidance only. The
 repository ships no native service installer, Windows service wrapper, or
-systemd unit, and it does not claim a completed live supervised deployment.
+rendered systemd deployment (source templates are under
+`native-control/src/systemd/`), and it does not claim a completed live
+supervised deployment.
 
 Direct `sc.exe` service registration is the documented Windows fallback when
 Shawl is unsuitable, with a known cost: Bun/Node do not implement the Windows
@@ -440,8 +474,8 @@ its scripts lived only in an untracked, now-deleted `ops/` tree — and the
 operator selected Shawl/`sc.exe` instead.** No NSSM implementation exists in
 this repository. Linux systemd units (a bot unit plus a true
 `gjc-remote-daemon@.service` template) are documented as the Linux service
-path, but those `.service.in` templates are likewise not currently checked
-into this repository. The documents define
+path, and source templates are checked in under `native-control/src/systemd/`;
+no rendered host deployment or installer is claimed. The documents define
 account/profile/env/ACL boundaries, current-run readiness, restart/rotation,
 rollback, transaction proofs, and honest best-effort stop/manual-cleanup
 semantics. Host-policy journald is consumed by default; global changes need

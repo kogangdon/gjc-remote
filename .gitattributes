@@ -1,1 +1,7 @@
-bun.lock text eol=lf
+# Every text file is stored and checked out with LF. Byte-exact readers
+# (systemd unit templates, strict JSON, signing preimages) refuse CR, so a
+# Windows checkout must not rewrite line endings.
+* text=auto eol=lf
+*.png binary
+*.node binary
+*.tar.gz binary

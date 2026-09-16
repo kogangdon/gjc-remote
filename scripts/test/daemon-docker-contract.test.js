@@ -32,7 +32,7 @@ test("daemon image pins runtime, lock, SDK, source, and signed native inputs", (
   );
   assert.match(
     dockerfile,
-    /ARG LOCK_SHA256=22d010f3cf7c3ac85a515bc75bd9837fb216959cc77036627b4f3ad9815e7173/,
+    /ARG LOCK_SHA256=67e12ae0b011e76ae03d64e3d7ade80a6fbf710a523be782104af80cfae9402e/,
   );
   assert.match(dockerfile, /sha256sum --check --strict/);
   assert.match(dockerfile, /bun install --frozen-lockfile --production --ignore-scripts/);

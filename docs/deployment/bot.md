@@ -6,9 +6,10 @@ connections to this process.
 
 ## Prerequisites
 
-From a checkout with its workspace dependencies installed, provide Node >=26,
-Bun for workspace installation, and the native-control build prerequisites for
-your approved platform. Native-control supports Linux x64/arm64 and Windows x64
+From a checkout with its workspace dependencies installed, provide **Node.js
+26 or newer** for the bot and lifecycle CLI, **Bun 1.4.0 or newer** for
+workspace installation, and the native-control build prerequisites for your
+approved platform. Native-control supports Linux x64/arm64 and Windows x64
 only; macOS is unsupported. See the repository [local quick start](../../README.md#local-quick-start).
 
 Run the bot under a dedicated OS account and arrange durable, access-controlled
@@ -46,6 +47,14 @@ quick start. A legacy route maps one channel to exact `{hostId, workDir}` and
 does not become managed authority. Do not use that shortcut for a production
 deployment or after managed authority history exists.
 
+`CHANNELS_CONFIG`, when set, must be an absolute path to the externally
+preprovisioned `channels.json`; it is not a release-relative path. The
+directory containing that file is outside lifecycle ownership and must already
+be owned by the management principal. A missing, non-absolute, or incorrectly
+owned config parent is a fail-closed refusal. The lifecycle controller never
+creates, repairs, rewrites, or deletes this file, its parent, credentials, or
+other external state.
+
 The WebSocket listener uses `HOST_WS_PORT` (default `7711`). Native foreground
 configuration has no listener-address setting: protect that port at the host
 firewall and private/VPN network boundary, allow only daemon hosts, and never
@@ -55,6 +64,18 @@ all daemons authenticate with their per-host tokens.
 Enable the Discord Developer Portal **Message Content Intent** for plain-chat
 prompts. `DISCORD_GUILD_ID` is optional and limits command registration to one
 guild for fast propagation.
+
+## Native service lifecycle boundary
+
+The service controller is exposed by package **`@gjc-remote/native-control`**
+as **`gjc-remote-service`**. Its only operations are `install`, `status`,
+`update`, `rollback`, `uninstall`, and `recover`; each invocation supplies one
+strict JSON request on non-terminal stdin and no flags. It does not become
+mapping or route authority. Application and Shawl inputs are separately signed,
+immutable, content-addressed assets; the bot service points to an exact release
+and retains one immediate predecessor. Production signing keys and a human
+release/platform gate are still required; no signed production asset or live
+service deployment is claimed here.
 
 ## Register and start
 
@@ -158,8 +179,9 @@ content attachments, or receipt payloads that contain them.
    secret contents), mapping revision, and connected-host baseline.
 2. Upgrade bot and daemon lockstep for `gate_presentation_v1`,
    `terminal_disposition_v1`, and `invoke_cancellation_v1`. Quiesce mapping
-   changes, drain in-flight requests to terminal/quiescence evidence before
-   rollback, install the new checkout/dependencies, and restart through their
+   changes and stop new admission; require positive terminal/quiescence
+   evidence where available before rollback, without claiming a supervisor
+   drain. Install the new checkout/dependencies, and restart through their
    supervisors. Gate presentation does not change slash-command definitions,
    so command registration is unchanged for this rollout. A mixed old/new pair
    fails closed; an old peer cannot serve invokes after the other side updates.
@@ -169,7 +191,9 @@ content attachments, or receipt payloads that contain them.
 3. Confirm listener startup, Discord login, expected mappings, negotiated
    invoke capability, and expected daemon registrations before accepting
    traffic.
-4. Roll back bot and daemon together only after the drain. Retain the current
+4. Roll back bot and daemon together only after admission is quiesced and
+   available terminal/quiescence evidence is recorded; this is not a drain
+   claim. Retain the current
    protected configuration and do not restore an older managed-authority
    snapshot or start an older reader after durable authority state advanced;
    use the authority recovery contract to roll forward instead.

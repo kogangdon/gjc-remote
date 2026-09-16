@@ -3,9 +3,13 @@
     {
       "target_name": "native_control",
       "sources": [ "src/addon.cc" ],
-      "cflags_cc": [ "-std=c++17" ],
+      "cflags_cc!": [ "-fno-exceptions" ],
+      "cflags_cc": [ "-std=c++17", "-fexceptions" ],
       "msvs_settings": {
-        "VCCLCompilerTool": { "AdditionalOptions": [ "/std:c++17" ] }
+        "VCCLCompilerTool": {
+          "AdditionalOptions": [ "/std:c++17" ],
+          "ExceptionHandling": 1
+        }
       },
       "defines": [ "NAPI_VERSION=8" ],
       "configurations": {

@@ -26,6 +26,7 @@ test('production package surface excludes the low-level test adapter', () => {
       'createInventoryReader',
       'createManagementNative',
       'createResidualProcessEnumerator',
+      'createServiceNative',
       'validateBuildManifest',
     ],
   );

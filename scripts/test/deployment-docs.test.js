@@ -19,6 +19,8 @@ const deploymentFiles = [
 const contractFiles = [
   ...deploymentFiles,
   "deploy/docker/bot/README.md",
+  "docs/process-supervision.md",
+  "docs/adr/0006-native-service-lifecycle.md",
 ];
 const realRoot = await realpath(root);
 const repositoryReadme = (await readFile(path.join(root, "README.md"), "utf8")).replaceAll("\r\n", "\n");
@@ -96,9 +98,27 @@ test("daemon guidance matches the current fail-closed serving gate", () => {
 });
 
 test("platform status never promotes missing artifacts", () => {
-  assert.match(documents.get("docs/deployment/platforms/linux.md"), /No checked-in systemd unit template/);
+  assert.match(documents.get("docs/deployment/README.md"), /source systemd templates under `native-control\/src\/systemd\//);
+  assert.match(documents.get("docs/deployment/README.md"), /no\s+rendered units, live host deployment/);
   assert.match(documents.get("docs/deployment/platforms/macos.md"), /not a supported native-control/);
   assert.match(documents.get("docs/deployment/platforms/windows.md"), /Do not use NSSM/);
+});
+
+test("lifecycle guidance reflects source implementation without claiming production evidence", () => {
+  const lifecycleDocs = [
+    documents.get("docs/process-supervision.md"),
+    documents.get("docs/deployment/platforms/windows.md"),
+    documents.get("docs/adr/0006-native-service-lifecycle.md"),
+  ].join("\n");
+  assert.doesNotMatch(lifecycleDocs, /Bun\s+[^\n]*1\.3\.14/);
+  assert.doesNotMatch(lifecycleDocs, /No checked-in systemd unit template/i);
+  assert.doesNotMatch(lifecycleDocs, /No implementation of this transaction[\s\S]*exists/i);
+  assert.doesNotMatch(lifecycleDocs, /Nothing below is implemented yet/i);
+  assert.match(documents.get("docs/process-supervision.md"), /source unit templates are checked in/);
+  assert.match(documents.get("docs/process-supervision.md"), /source tree contains the protected transaction\/journal implementation/);
+  assert.match(documents.get("docs/deployment/platforms/windows.md"), /source-level lifecycle CLI/);
+  assert.match(documents.get("docs/adr/0006-native-service-lifecycle.md"), /source-level\s+lifecycle CLI\/entrypoint/);
+  assert.match(lifecycleDocs, /signed deployment assets[\s\S]+real systemd\/SCM/);
 });
 
 test("Docker guidance preserves scope, authority, secrets, and rollback boundaries", () => {

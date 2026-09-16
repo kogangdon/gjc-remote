@@ -776,7 +776,7 @@ test('Reader retains a verified floor but fails closed on identity or release er
   );
 });
 
-test('public module exposes only management plus staged inventory and containment factories', () => {
+test('public module exposes only management, staged inventory, containment, and service factories', () => {
   assert.deepEqual(Object.keys(publicApi).sort(), [
     'buildManifest',
     'createContainmentLowLevel',
@@ -784,12 +784,14 @@ test('public module exposes only management plus staged inventory and containmen
     'createInventoryReader',
     'createManagementNative',
     'createResidualProcessEnumerator',
+    'createServiceNative',
     'validateBuildManifest',
   ]);
   assert.equal(typeof publicApi.createContainmentLowLevel, 'function');
   assert.equal(typeof publicApi.createResidualProcessEnumerator, 'function');
   assert.equal(typeof publicApi.createInventoryPublisher, 'function');
   assert.equal(typeof publicApi.createInventoryReader, 'function');
+  assert.equal(typeof publicApi.createServiceNative, 'function');
   assert.equal('createInventoryPublisherAdapter' in publicApi, false);
   assert.equal('createInventoryReaderAdapter' in publicApi, false);
 });

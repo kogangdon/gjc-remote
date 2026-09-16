@@ -1,6 +1,6 @@
 name: release
 
-# Prepare a draft GitHub Release when a vX.Y.Z tag is pushed. The tag is
+# Prepare a draft prerelease when a vX.Y.Z tag is pushed. The tag is
 # produced locally by `node scripts/release.js <version>` (bumps workspace
 # versions in lockstep). Issue #55 promotion evidence must be verified before a
 # separate protected action publishes the draft.
@@ -49,6 +49,44 @@ jobs:
       - name: Build native-control addon
         run: npm run build --workspace @gjc-remote/native-control
 
+      # The release signer is intentionally outside CI. This packet is the exact unsigned
+      # native signing input plus public trust roots and source identity that the operator
+      # downloads before signing locally. It is transport evidence, not a releasable asset.
+      - name: Prepare unsigned native signing packet
+        env:
+          PACKET_DIR: ${{ runner.temp }}/gjc-remote-${{ github.ref_name }}-unsigned-native
+        run: |
+          set -euo pipefail
+          mkdir -p "$PACKET_DIR/native-control/build/Release" "$PACKET_DIR/trust"
+          cp native-control/build/Release/native_control.node "$PACKET_DIR/native-control/build/Release/"
+          cp native-control/build/Release/native-control.manifest.json "$PACKET_DIR/native-control/build/Release/"
+          cp native-control/deployment-keys/application-trusted.json "$PACKET_DIR/trust/"
+          cp native-control/deployment-keys/shawl-trusted.json "$PACKET_DIR/trust/"
+          cp native-control/release-keys/trusted.json "$PACKET_DIR/trust/native-trusted.json"
+          addon_sha256="$(sha256sum "$PACKET_DIR/native-control/build/Release/native_control.node" | cut -d' ' -f1)"
+          manifest_sha256="$(sha256sum "$PACKET_DIR/native-control/build/Release/native-control.manifest.json" | cut -d' ' -f1)"
+          package_version="$(node -p "require('./package.json').version")"
+          cat > "$PACKET_DIR/release-input.json" <<EOF
+          {"schemaVersion":1,"kind":"unsigned-native-release-signing-input","unsigned":true,"repository":"${GITHUB_REPOSITORY}","tag":"${GITHUB_REF_NAME}","commit":"${GITHUB_SHA}","packageVersion":"${package_version}","nativeAddonSha256":"${addon_sha256}","nativeManifestSha256":"${manifest_sha256}","signatureGenerated":false}
+          EOF
+          (cd "$PACKET_DIR" && sha256sum \
+            native-control/build/Release/native_control.node \
+            native-control/build/Release/native-control.manifest.json \
+            trust/application-trusted.json \
+            trust/shawl-trusted.json \
+            trust/native-trusted.json \
+            release-input.json > SHA256SUMS)
+          tar -C "$PACKET_DIR" -czf \
+            "$RUNNER_TEMP/gjc-remote-${GITHUB_REF_NAME}-unsigned-native-signing-input.tar.gz" .
+
+      - name: Upload unsigned native signing packet
+        uses: actions/upload-artifact@v4
+        with:
+          name: gjc-remote-${{ github.ref_name }}-unsigned-native-signing-input
+          path: ${{ runner.temp }}/gjc-remote-${{ github.ref_name }}-unsigned-native
+          if-no-files-found: error
+          retention-days: 14
+
       - run: npm test
 
       - name: Create draft GitHub Release
@@ -57,8 +95,18 @@ jobs:
         run: >-
           gh release create "$GITHUB_REF_NAME"
           --draft
+          --prerelease
           --title "$GITHUB_REF_NAME"
           --generate-notes
+
+      # The draft carries only the unsigned transport packet. Local signing must produce
+      # separately named signed assets; this workflow never overwrites the candidate.
+      - name: Attach unsigned signing packet to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "$GITHUB_REF_NAME"
+          "$RUNNER_TEMP/gjc-remote-${GITHUB_REF_NAME}-unsigned-native-signing-input.tar.gz"
 
       # npm publish is intentionally deferred: it will be added as a step here,
       # gated on a repository NPM_TOKEN secret and an owned @gjc-remote npm org,

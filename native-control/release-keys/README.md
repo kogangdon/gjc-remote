@@ -33,9 +33,10 @@ source control and is reviewed like any other change.
 - `keyId`: `prod-2026-08-r2`, algorithm `ed25519`. Signature enforcement is
   therefore LIVE: `loadVerifiedAddon()` refuses a missing, malformed, or
   invalid sidecar and refuses an unknown `keyId`.
-- The private key is held OUTSIDE this repository by the operator at
-  `~/.gjc/release-keys/gjc-remote-native-control-prod-r2.ed25519.key` with the
-  file ACL restricted to that account. It is never committed, never copied
+- The private key is held outside tracked source under the operator's local
+  signing directory at
+  `.local/release-signing/keys/native-addon-prod-2026-08-r2.ed25519.key` with
+  the file ACL restricted to that account. It is never committed, never copied
   into `build/`, and never needed to run the test suite.
 - Re-sign after every rebuild, because `--write-manifest` regenerates the
   manifest and deletes the stale sidecar:
@@ -43,7 +44,7 @@ source control and is reviewed like any other change.
   ```bash
   cd native-control
   node scripts/verify-build.mjs --write-manifest \
-    --sign-key ~/.gjc/release-keys/gjc-remote-native-control-prod-r2.ed25519.key \
+    --sign-key ../.local/release-signing/keys/native-addon-prod-2026-08-r2.ed25519.key \
     --key-id prod-2026-08-r2
   node scripts/verify-build.mjs --require-signature   # release gate
   ```
@@ -106,7 +107,7 @@ only through its PUBLIC fingerprint.
 # Encrypted backup for offline media / a password manager. Keep the working
 # copy unencrypted and ACL-restricted; only backups carry a passphrase.
 openssl pkcs8 -topk8 -v2 aes-256-cbc \
-  -in ~/.gjc/release-keys/gjc-remote-native-control-prod-r2.ed25519.key \
+  -in .local/release-signing/keys/native-addon-prod-2026-08-r2.ed25519.key \
   -out prod-2026-08-r2.key.enc.pem
 ```
 
@@ -120,7 +121,7 @@ this repository, in `build/`, or in CI secrets.
 openssl pkcs8 -in prod-2026-08-r2.key.enc.pem -out restored.key           # decrypt
 # confirm the fingerprint matches the table above, then prove it still signs:
 cd native-control
-node scripts/verify-build.mjs --write-manifest --sign-key ../restored.key --key-id prod-2026-08-r2
+node scripts/verify-build.mjs --write-manifest --sign-key ../.local/release-signing/keys/native-addon-prod-2026-08-r2.ed25519.key --key-id prod-2026-08-r2
 node scripts/verify-build.mjs --require-signature
 rm ../restored.key                                                     # discard the copy
 ```

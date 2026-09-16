@@ -5,18 +5,20 @@
     "": {
       "name": "gjc-remote",
       "devDependencies": {
+        "jsonc-parser": "3.3.1",
+        "semver": "7.8.5",
         "yaml": "2.8.1",
       },
     },
     "bot": {
       "name": "@gjc-remote/bot",
-      "version": "0.3.1",
+      "version": "0.4.0-rc.1",
       "bin": {
         "gjc-remote-admin": "./src/management-entrypoint.js",
       },
       "dependencies": {
         "@gjc-remote/native-control": "*",
-        "@gjc-remote/shared": "*",
+        "@gjc-remote/shared": "0.4.0-rc.1",
         "discord.js": "^14.16.3",
         "dotenv": "^16.4.5",
         "ws": "^8.18.0",
@@ -24,11 +26,11 @@
     },
     "daemon": {
       "name": "@gjc-remote/daemon",
-      "version": "0.3.1",
+      "version": "0.4.0-rc.1",
       "dependencies": {
         "@gajae-code/coding-agent": "0.16.6",
         "@gjc-remote/native-control": "*",
-        "@gjc-remote/shared": "*",
+        "@gjc-remote/shared": "0.4.0-rc.1",
         "dotenv": "^16.4.5",
         "ws": "^8.18.0",
       },
@@ -40,7 +42,8 @@
         "gjc-remote-inventory": "./src/inventory-entrypoint.js",
       },
       "dependencies": {
-        "@gjc-remote/shared": "*",
+        "@gjc-remote/shared": "0.4.0-rc.1",
+        "tar": "7.5.22",
       },
       "devDependencies": {
         "node-gyp": "12.4.0",
@@ -48,7 +51,7 @@
     },
     "shared": {
       "name": "@gjc-remote/shared",
-      "version": "0.3.1",
+      "version": "0.4.0-rc.1",
     },
   },
   "packages": {
@@ -369,6 +372,8 @@
     "jiti": ["jiti@2.7.0", "", { "bin": { "jiti": "lib/jiti-cli.mjs" } }, "sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ=="],
 
     "json-schema-to-ts": ["json-schema-to-ts@3.1.1", "", { "dependencies": { "@babel/runtime": "^7.18.3", "ts-algebra": "^2.0.0" } }, "sha512-+DWg8jCJG2TEnpy7kOm/7/AxaYoaRbjVB4LFZLySZlWn8exGs3A4OLJR966cVvU26N7X9TWxl+Jsw7dzAqKT6g=="],
+
+    "jsonc-parser": ["jsonc-parser@3.3.1", "", {}, "sha512-HUgH65KyejrUFPvHFPbqOY0rsFip3Bo5wb4ngvdi1EpCYWUQDC5V+Y7mZws+DLkr4M//zQJoanu1SP+87Dv1oQ=="],
 
     "jszip": ["jszip@3.10.1", "", { "dependencies": { "lie": "~3.3.0", "pako": "~1.0.2", "readable-stream": "~2.3.6", "setimmediate": "^1.0.5" } }, "sha512-xXDvecyTpGLrqFrvkrUSoxxfJI5AH7U8zxxtVclpsUtMCq4JQ290LY8AW5c7Ggnr/Y/oK+bQMbqK2qmtk3pN4g=="],
 

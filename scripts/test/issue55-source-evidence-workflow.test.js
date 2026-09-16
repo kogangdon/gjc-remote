@@ -285,7 +285,11 @@ test('Windows-style Git checkout preserves exact Bun lock bytes and Docker diges
 
   try {
     git('init');
-    writeFileSync(join(root, '.gitattributes'), attributes);
+    // The repository rule protects every text file, so the control must
+    // explicitly drop the eol pin (a later rule wins) to prove autocrlf is
+    // active in this model checkout while bun.lock stays byte-exact.
+    writeFileSync(join(root, '.gitattributes'),
+      Buffer.concat([attributes, Buffer.from('\ncontrol.txt text !eol\n')]));
     writeFileSync(join(root, 'bun.lock'), lock);
     writeFileSync(join(root, 'control.txt'), lock);
     git('add', '--', '.gitattributes', 'bun.lock', 'control.txt');
