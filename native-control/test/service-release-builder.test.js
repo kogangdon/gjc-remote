@@ -1365,7 +1365,6 @@ test('repository fsmonitor and replacement objects cannot alter captured Git ide
       'hostile-fsmonitor',
       marker,
     );
-    git(source.source, ['config', 'core.fsmonitor', fsmonitor]);
 
     write(
       join(source.source, 'shared/replacement-only.js'),
@@ -1387,6 +1386,11 @@ test('repository fsmonitor and replacement objects cannot alter captured Git ide
     git(source.source, ['reset', '--hard', originalCommit]);
     git(source.source, ['replace', originalCommit, replacementCommit]);
     assert.notEqual(replacementTree, originalTree);
+    // Arm the hostile fsmonitor only after fixture setup: the harness's own
+    // (unhardened) add/write-tree/reset would otherwise execute the hook on
+    // Linux and forge the marker the builder is being judged by.
+    git(source.source, ['config', 'core.fsmonitor', fsmonitor]);
+    assert.equal(existsSync(marker), false);
 
     const native = createNativeInputs(
       root,
@@ -1495,7 +1499,10 @@ test('budget admission sizes remain copy-time maxima before destination creation
         source.models.native,
       );
       const input = await inputFor(root, source.source, native);
-      const growingPath = join(source.source, 'bot', 'src', 'bot.js');
+      // The builder walks the canonical (realpath) source root, so compare
+      // against the canonical spelling: GitHub's Windows runner TEMP is not
+      // spelled the way realpath returns it.
+      const growingPath = join(input.sourceRoot, 'bot', 'src', 'bot.js');
       let observations = 0;
       let destinationOpens = 0;
       boundary = installFsPromisesBoundary(t, {
@@ -1546,17 +1553,18 @@ test('budget admission sizes remain copy-time maxima before destination creation
         source.models.native,
       );
       const input = await inputFor(root, source.source, native);
+      const nativeAddonPath = input.nativeAddonPath;
       let observations = 0;
       let destinationOpens = 0;
       boundary = installFsPromisesBoundary(t, {
         beforeLstat(path) {
-          if (String(path) !== native.nativeAddonPath) return;
+          if (String(path) !== nativeAddonPath) return;
           observations += 1;
           if (observations === 2) {
             writeFileSync(
-              native.nativeAddonPath,
+              nativeAddonPath,
               Buffer.concat([
-                readFileSync(native.nativeAddonPath),
+                readFileSync(nativeAddonPath),
                 Buffer.from('x'),
               ]),
             );
@@ -1564,7 +1572,7 @@ test('budget admission sizes remain copy-time maxima before destination creation
         },
         observeOpen(path) {
           const value = String(path);
-          if (value !== native.nativeAddonPath &&
+          if (value !== nativeAddonPath &&
               value.endsWith('native_control.node')) {
             destinationOpens += 1;
           }

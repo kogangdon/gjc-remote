@@ -1259,7 +1259,12 @@ async function createOwnedRoot() {
   let created;
   let identity = null;
   try {
-    created = await mkdtemp(join(tmpdir(), 'gjc-real-bun-release-fixture-'));
+    // mkdtemp echoes the TEMP spelling it was given; the identity must be
+    // captured on the canonical spelling or a differently-spelled TEMP
+    // (GitHub's Windows runner) makes every later exact-path check fail.
+    created = await realpath(
+      await mkdtemp(join(tmpdir(), 'gjc-real-bun-release-fixture-')),
+    );
     identity = await ownedDirectoryIdentity(created);
     if (identity === null) {
       fail('SERVICE_RELEASE_REAL_BUN_FIXTURE_OUTPUT_INVALID');
