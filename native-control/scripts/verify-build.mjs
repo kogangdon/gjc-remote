@@ -25,6 +25,28 @@ const capabilities = [
   'verify_inventory_acl', 'acquire_inventory_fence', 'read_inventory_object',
   'publish_inventory_object_atomic',
   'enumerate_workspace_process_holders',
+  'set_exact_service_acl', 'verify_exact_service_acl',
+  'read_file_facts_no_follow', 'read_boot_id', 'read_process_facts',
+  'enumerate_process_tree', 'read_linux_service_cgroup',
+  'terminate_linux_service_cgroup', 'open_win32_service',
+  'close_win32_service', 'query_win32_service',
+  'create_win32_service_disabled', 'protect_win32_service',
+  'set_win32_service_marker', 'configure_win32_service_launch',
+  'set_win32_service_start_type', 'set_win32_service_failure_actions',
+  'set_win32_service_failure_actions_flag', 'start_win32_service',
+  'stop_win32_service', 'delete_win32_service',
+  'terminate_win32_service_tree',
+  'open_service_root', 'open_service_directory',
+  'acquire_service_lock', 'close_service_handle',
+  'read_service_file', 'publish_service_file_atomic',
+  'remove_service_object_exact', 'list_service_directory',
+  'publish_service_directory_no_replace',
+  'open_linux_service_scope', 'read_linux_service_object',
+  'publish_linux_service_object', 'remove_linux_service_object',
+  'begin_service_artifact_write', 'write_service_artifact_chunk',
+  'finish_service_artifact_write', 'open_service_artifact_reader',
+  'read_service_artifact_chunk', 'remove_service_artifact_file_exact',
+  'seal_service_directory', 'open_service_artifact_source',
 ];
 const capabilitySignatures = {
   open_verified_parent: ['path'], open_no_follow: ['path'], read_identity: ['path'], read_acl: ['path'], path_exists_no_follow: ['path'],
@@ -49,6 +71,49 @@ const capabilitySignatures = {
   read_inventory_object: ['path', 'maxBytes', 'roles', 'profile'],
   publish_inventory_object_atomic: ['path', 'tempPrefix', 'bytes', 'expectedIdentity', 'roles', 'profile'],
   enumerate_workspace_process_holders: ['workDir', 'sourcePlatform'],
+  set_exact_service_acl: ['path', 'roles', 'profile'],
+  verify_exact_service_acl: ['path', 'roles', 'profile'],
+  read_file_facts_no_follow: ['path', 'maxBytes'],
+  read_boot_id: [],
+  read_process_facts: ['pid'],
+  enumerate_process_tree: ['rootPid', 'rootStartTime', 'rootExecutable', 'rootOwner'],
+  read_linux_service_cgroup: ['cgroupPath'],
+  terminate_linux_service_cgroup: ['cgroupPath', 'expectedDevice', 'expectedInode', 'expectedTreeFingerprint'],
+  open_win32_service: ['name', 'serviceRole', 'roles', 'access'],
+  close_win32_service: ['serviceHandle'],
+  query_win32_service: ['serviceHandle'],
+  create_win32_service_disabled: ['name', 'serviceRole', 'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory', 'runtimePath', 'runtimeSha256', 'entrypointPath', 'entrypointSha256', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig', 'servicePassword', 'roles'],
+  protect_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'transitionMarker'],
+  set_win32_service_marker: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'transitionMarker'],
+  configure_win32_service_launch: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory', 'runtimePath', 'runtimeSha256', 'entrypointPath', 'entrypointSha256', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig'],
+  set_win32_service_start_type: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'startType'],
+  set_win32_service_failure_actions: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'failurePolicy'],
+  set_win32_service_failure_actions_flag: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'enabled'],
+  start_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
+  stop_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
+  delete_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
+  terminate_win32_service_tree: ['serviceHandle', 'expectedConfigFingerprint', 'rootPid', 'rootStartTime', 'rootExecutable', 'rootOwner', 'expectedTreeFingerprint'],
+  open_service_root: ['rootKind', 'roles', 'access'],
+  open_service_directory: ['parentHandle', 'name', 'access', 'expectedIdentity', 'lockHandle'],
+  acquire_service_lock: ['controlRootHandle', 'scope', 'serviceKey', 'mode'],
+  close_service_handle: ['handle'],
+  read_service_file: ['parentHandle', 'name', 'maxBytes'],
+  publish_service_file_atomic: ['parentHandle', 'name', 'bytes', 'expected', 'lockHandle'],
+  remove_service_object_exact: ['parentHandle', 'name', 'expected', 'lockHandle'],
+  list_service_directory: ['directoryHandle', 'maxEntries', 'lockHandle'],
+  publish_service_directory_no_replace: ['sourceDirectoryHandle', 'destinationParentHandle', 'name', 'expectedSourceIdentity', 'artifactLockHandle'],
+  open_linux_service_scope: ['roles', 'serviceKey', 'access'],
+  read_linux_service_object: ['scopeHandle', 'objectKind'],
+  publish_linux_service_object: ['scopeHandle', 'objectKind', 'bytes', 'expected', 'lockHandle'],
+  remove_linux_service_object: ['scopeHandle', 'objectKind', 'expected', 'lockHandle'],
+  begin_service_artifact_write: ['parentHandle', 'name', 'expectedSize', 'expectedSha256', 'artifactLockHandle'],
+  write_service_artifact_chunk: ['writerHandle', 'expectedOffset', 'bytes'],
+  finish_service_artifact_write: ['writerHandle', 'finalProfile'],
+  open_service_artifact_reader: ['parentHandle', 'name', 'maxBytes', 'expectedFacts', 'artifactLockHandle'],
+  read_service_artifact_chunk: ['readerHandle', 'expectedOffset', 'maxBytes'],
+  remove_service_artifact_file_exact: ['parentHandle', 'name', 'expectedFacts', 'artifactLockHandle'],
+  seal_service_directory: ['directoryHandle', 'expectedIdentity', 'artifactLockHandle'],
+  open_service_artifact_source: ['path', 'maxBytes', 'expectedFacts', 'roles'],
 };
 
 function fail(message) {
@@ -228,7 +293,7 @@ const isMainModule = (() => {
 if (isMainModule) {
 
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
-  version: 4, revision: 3, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+  version: 4, revision: 4, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
 })) fail('package native capability contract is invalid');
 
 if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${process.arch}`)) {
@@ -238,7 +303,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
 } else {
   const expected = {
     contractVersion: 4,
-    contractRevision: 3,
+    contractRevision: 4,
     package: packageJson.name,
     version: packageJson.version,
     napi: 8,
@@ -287,7 +352,7 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     for (const name of capabilities) if (typeof loaded[name] !== 'function') fail(`native capability ${name} is missing`);
     let contract;
     try { contract = loaded.native_control_contract(); } catch { fail('native capability contract is missing or unreadable'); }
-    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 4, contractRevision: 3, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
+    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 4, contractRevision: 4, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
   }
   if (process.argv.includes('--write-manifest')) {
     if (!loaded || process.exitCode) process.exitCode = 1;
