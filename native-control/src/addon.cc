@@ -4932,6 +4932,8 @@ void AcquireFenceComplete(napi_env env, napi_status, void* data) {
   if (work->timed_out || work->failed) delete work->fence;
   delete work;
 }
+long RenameAt2(int from_parent, const std::string& from,
+               int to_parent, const std::string& to, unsigned int flags);
 long RenameAt2(int parent, const std::string& from, const std::string& to, unsigned int flags);
 napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
@@ -5084,12 +5086,17 @@ napi_value AcquireInventoryFencePosix(napi_env env, napi_callback_info info) {
   return promise;
 }
 
-long RenameAt2(int parent, const std::string& from, const std::string& to, unsigned int flags) {
+long RenameAt2(int from_parent, const std::string& from,
+               int to_parent, const std::string& to, unsigned int flags) {
 #ifdef __linux__
-  return syscall(SYS_renameat2, parent, from.c_str(), parent, to.c_str(), flags);
+  return syscall(SYS_renameat2, from_parent, from.c_str(), to_parent, to.c_str(), flags);
 #else
+  (void)from_parent; (void)from; (void)to_parent; (void)to; (void)flags;
   errno = ENOSYS; return -1;
 #endif
+}
+long RenameAt2(int parent, const std::string& from, const std::string& to, unsigned int flags) {
+  return RenameAt2(parent, from, parent, to, flags);
 }
 napi_value PublishInventoryObjectAtomicPosix(napi_env env, napi_callback_info info) {
   napi_value args[6]; std::string path, prefix, profile; InventoryRoles roles{}; std::vector<uint8_t> bytes;
