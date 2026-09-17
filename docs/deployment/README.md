@@ -10,7 +10,7 @@ code on that host. Read [Security](../../SECURITY.md) before provisioning.
 | Component | Native status | Container status | Supported platforms |
 | --- | --- | --- | --- |
 | Bot | Foreground command documented for Node.js >=26; no native service installer is shipped | Linux-only release candidate; no signed-image release evidence | Native-control: Linux x64/arm64, Windows x64 |
-| Daemon | Foreground command documented for Bun >=1.4.0 and SDK 0.16.6; no native service installer is shipped | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
+| Daemon | Foreground command documented for Bun >=1.4.0 and SDK 0.16.7; no native service installer is shipped | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
 | Native control | Observed only on the approved tuples | Used by the bot container candidate only with an externally verified bundle | Linux x64/arm64, Windows x64 |
 
 macOS is not supported for native-control. “Foreground command documented”
@@ -18,7 +18,7 @@ describes only the current command contract, not boot supervision, production
 promotion, or tenant isolation. “Release candidate” and “future phase” are
 design/release states, not observed production support.
 
-The installed SDK 0.16.6 pin keeps live controls fail-closed: an active
+The installed SDK 0.16.7 pin keeps live controls fail-closed: an active
 `steer` or `follow_up` is rejected before SDK queue admission, while an idle
 control remains prompt-equivalent FIFO work. The published package lacks the
 upstream late-follow-up continuation fix and a supported ownership lifecycle;

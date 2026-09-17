@@ -1,7 +1,7 @@
 # Native daemon foreground deployment
 
 Run one daemon on each host that owns mapped work directories. It embeds the
-pinned `@gajae-code/coding-agent` SDK **0.16.6** and requires **Bun 1.4.0 or
+pinned `@gajae-code/coding-agent` SDK **0.16.7** and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
 
@@ -11,7 +11,7 @@ Upstream issue
 [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is fixed on the
 development branch by
 [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that fix is
-absent from both the `v0.16.6` tag and the actual published 0.16.6 npm tarball.
+absent from both the `v0.16.7` tag and the actual published 0.16.7 npm tarball.
 A supported public ownership lifecycle is requested in
 [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429); live controls
 remain fail-closed until it ships. See the
@@ -47,7 +47,7 @@ tombstones are bounded and retained through the hard-cap/receipt horizon.
 
 A queued request is revoked before SDK, provider, or tool execution, receives
 `cancelled_before_start`, and then terminal `cancelled`. An active request
-receives only nonterminal `cancellation_pending`: SDK 0.16.6 has no supported
+receives only nonterminal `cancellation_pending`: SDK 0.16.7 has no supported
 active-interruption control, and its eventual natural terminal remains
 authoritative. A cancellation receipt is not terminal or quiescence proof.
 

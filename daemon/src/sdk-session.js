@@ -8,7 +8,7 @@ import {
 } from "@gjc-remote/shared";
 
 const GATE_KINDS = new Set(["question", "approval", "execution"]);
-// @gajae-code/agent-core 0.16.6 can emit an `agent_end` checkpoint before
+// @gajae-code/agent-core 0.16.7 can emit an `agent_end` checkpoint before
 // continuing these mid-run maintenance outcomes. AgentSession normally
 // suppresses them, but they still are not terminal if an injected/session seam
 // exposes one.
@@ -108,7 +108,7 @@ function sameArray(left, right) {
   );
 }
 
-// SDK 0.16.6 has two concrete gate-answer schema families. AskTool gates use
+// SDK 0.16.7 has two concrete gate-answer schema families. AskTool gates use
 // buildAskGateAnswerSchema() and approval/execution gates use decision objects.
 // Recognize only those producer shapes: inventing a scalar fallback would turn a
 // transport limitation into a workflow decision the SDK never received.
@@ -286,7 +286,7 @@ function matchGateChoice(options, text) {
 }
 
 // Encode the daemon's bounded text answer into the exact object unions emitted
-// by SDK 0.16.6. JSON objects are the explicit route for multi-select,
+// by SDK 0.16.7. JSON objects are the explicit route for multi-select,
 // clarification, custom-answer disambiguation, and decision comments/reasons.
 function encodeGateAnswer(gate, answer) {
   const codec = gateAnswerCodec(gate);
@@ -526,7 +526,7 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { se
   const sessionDir = resolveSdkSessionDirectory(workDir, sessionRoot);
   const { createAgentSession, SessionManager } = await loadSdk();
   const sessionManager = SessionManager.create(workDir, sessionDir);
-  // SDK 0.16.6 creates an isolated Settings.loadForScope({ cwd, agentDir })
+  // SDK 0.16.7 creates an isolated Settings.loadForScope({ cwd, agentDir })
   // instance when `settings` is omitted and closes that owned scope from
   // AgentSession.dispose(). Supplying a clone here would transfer ownership to
   // the daemon and bypass that lifecycle.
@@ -565,7 +565,7 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { se
  * Resolution reads the profile from the SDK-owned scope-local
  * `session.settings`, so a project-level `modelProfile.default` override is
  * honoured in that directory. `AgentSession.activateModelProfileForControl()`
- * is the 0.16.6 public nonvisual, session-scoped activation surface; it never
+ * is the 0.16.7 public nonvisual, session-scoped activation surface; it never
  * persists `modelProfile.default`. A misconfigured/uncredentialed profile
  * throws here, which fails session creation loudly instead of silently serving
  * a broken session.
@@ -903,7 +903,7 @@ export class SdkSession {
     let observedAgentEnds = 0;
     let resetIdle = () => {};
     // #35: track this run before registering the session-level gate listener.
-    // SDK 0.16.6 replays durable pending gates synchronously from
+    // SDK 0.16.7 replays durable pending gates synchronously from
     // onGateEmitted(), so subscribing first would see no owner and quarantine a
     // valid resumed gate.
     const gateRun = { ownerId, onEvent, controller: undefined };
@@ -1023,7 +1023,7 @@ export class SdkSession {
         if (entry.owner !== gateRun) continue;
         // answerGate owns cleanup while a direct resolution is in flight. The
         // accepted gate can wake the run before resolveGate returns its receipt;
-        // quarantining it in that window would race the 0.16.6 completion path.
+        // quarantining it in that window would race the 0.16.7 completion path.
         if (entry.resolving) continue;
         this.pendingGates.delete(gateId);
         for (const activeRun of this.activeGateRuns) {
@@ -1371,14 +1371,14 @@ export class SdkSession {
       gate_id: gateId,
       answer: encoded.answer,
       // One gate accepts one answer. Binding retries to its immutable gate id
-      // gives the 0.16.6 recovery APIs a stable idempotency identity without
+      // gives the 0.16.7 recovery APIs a stable idempotency identity without
       // retaining or hashing user answer content.
       idempotency_key: `gjc-remote:${gateId}`,
     };
     entry.response = response;
     try {
       // This adapter does not publish through the SDK presentation arbiter, so
-      // the direct-control proof is `not_published`, matching the SDK 0.16.6
+      // the direct-control proof is `not_published`, matching the SDK 0.16.7
       // workflow.gate_answer path. Without this proof resolveGate accepts the
       // answer durably and then rejects because no terminal controller exists.
       if (entry.emitter.prepareTerminalization?.(gateId, "not_published") !== true) {
@@ -1479,7 +1479,7 @@ export class SdkSession {
 
   #quarantineGate(gateEmitter, gateId) {
     try {
-      // SDK 0.16.6's quarantine surface revokes the continuation and rejects
+      // SDK 0.16.7's quarantine surface revokes the continuation and rejects
       // its waiter. Sending `answer:null` is not a rejection operation: schema
       // validation can leave the gate pending forever.
       gateEmitter?.quarantineGate?.(gateId);

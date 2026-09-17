@@ -398,7 +398,7 @@ test("release transition checks complete observed format sets and opaque SDK equ
 test("opaque SDK compatibility fingerprint binds package, integrity, schema, and audited source contracts", () => {
   const contract = buildSdkExternalStateContract({
     packageName: "@gajae-code/coding-agent",
-    packageVersion: "0.16.6",
+    packageVersion: "0.16.7",
     lockIntegrity: `sha512-${Buffer.alloc(64, 5).toString("base64")}`,
     configSchemaVersion: 2,
     sourceContracts: {

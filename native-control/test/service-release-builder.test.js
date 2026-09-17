@@ -41,9 +41,9 @@ const OTHER_ARCHITECTURE = POSITIVE_ARCHITECTURE === 'arm64' ? 'x64' : 'arm64';
 const TARGET_SUFFIX = `${POSITIVE_PLATFORM}-${POSITIVE_ARCHITECTURE}`;
 const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.1-${TARGET_SUFFIX}.tar.gz`;
 const MANIFEST_NAME = `gjc-remote-service-${TARGET_SUFFIX}.manifest.json`;
-const SDK_INTEGRITY = 'sha512-53/Mdppx1gDzdtslKpGpuhVEU9he5+G7WfaHCXdbXRBYAbjkKBVwL9xFN9bAlRbX+gwWRShvr/dnYmTV2PHrWw==';
+const SDK_INTEGRITY = 'sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==';
 const SDK_SOURCE_CONTRACT_DOMAIN = 'gjc-remote/sdk-external-state-source/v1';
-const SDK_ROOT_IDENTITY = '@gajae-code/coding-agent@0.16.6';
+const SDK_ROOT_IDENTITY = '@gajae-code/coding-agent@0.16.7';
 const SDK_SOURCES = Object.freeze({
   settings: Object.freeze({
     path: 'src/config/settings.ts',
@@ -133,7 +133,7 @@ function packageModels({
     daemon: {
       name: '@gjc-remote/daemon', version: '0.4.0-rc.1', private: true, type: 'module',
       dependencies: {
-        '@gajae-code/coding-agent': '0.16.6',
+        '@gajae-code/coding-agent': '0.16.7',
         '@gjc-remote/native-control': '*',
         '@gjc-remote/shared': '0.4.0-rc.1',
       },
@@ -159,7 +159,7 @@ function packageModels({
       os: [targetPlatform], cpu: [targetArchitecture],
     },
     sdk: {
-      name: '@gajae-code/coding-agent', version: '0.16.6', type: 'module',
+      name: '@gajae-code/coding-agent', version: '0.16.7', type: 'module',
       dependencies: { 'fixture-sdk-leaf': '1.0.0' },
       ...(sdkOptionalPeer ? {
         peerDependencies: { 'fixture-optional-peer': '^1.0.0' },
@@ -232,7 +232,7 @@ function bunLock(models = packageModels(), {
       '@gjc-remote/native-control': ['@gjc-remote/native-control@workspace:native-control'],
       '@gjc-remote/shared': ['@gjc-remote/shared@workspace:shared'],
       '@gajae-code/coding-agent': [
-        '@gajae-code/coding-agent@0.16.6', '',
+        '@gajae-code/coding-agent@0.16.7', '',
         {
           dependencies: models.sdk.dependencies,
           ...(models.sdk.peerDependencies ? {
@@ -401,7 +401,7 @@ function linkWorkspace(source, destination) {
 }
 
 function materializeModeledProduction(cwd, {
-  sdkVersion = '0.16.6',
+  sdkVersion = '0.16.7',
   sdkSchemaVersion = 2,
   transcriptVersion = 5,
   sdkLeafBytes = 'SDK transitive closure resource\n',
@@ -726,7 +726,7 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
     assert.equal(contract.repository, 'kogangdon/gjc-remote');
     assert.equal(contract.releaseVersion, '0.4.0-rc.1');
     assert.equal(contract.releaseTag, 'v0.4.0-rc.1');
-    assert.equal(contract.sdk.packageVersion, '0.16.6');
+    assert.equal(contract.sdk.packageVersion, '0.16.7');
     assert.equal(contract.sdk.configSchemaVersion, 2);
     assert.equal(contract.sdk.transcriptVersion, 5);
     assert.deepEqual(contract.sdk.sourceRoots, Object.fromEntries(
@@ -923,7 +923,7 @@ test('two clean modeled Bun-boundary builds are byte-identical and round-trip th
       },
       {
         packageName: '@gajae-code/coding-agent',
-        packageVersion: '0.16.6',
+        packageVersion: '0.16.7',
         lockIntegrity: SDK_INTEGRITY,
         configSchemaVersion: 2,
       },

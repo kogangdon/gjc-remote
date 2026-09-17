@@ -140,7 +140,7 @@ hard-cap/receipt horizon.
 A queued cancellation is revoked before SDK, provider, or tool execution. It
 receives `cancelled_before_start`, followed by the authoritative terminal
 `cancelled` frame. Active work can only receive nonterminal
-`cancellation_pending`: SDK 0.16.6 has no supported active-interruption
+`cancellation_pending`: SDK 0.16.7 has no supported active-interruption
 control, and the natural terminal remains authoritative. A cancellation receipt
 does not prove a terminal outcome or host quiescence.
 

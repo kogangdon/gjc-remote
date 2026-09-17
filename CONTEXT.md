@@ -11,16 +11,16 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (SDK 0.16.6; fail-closed live controls)
+## Architecture (SDK 0.16.7; fail-closed live controls)
 
-The daemon dependency, lockfile, and installed package are 0.16.6. The published
+The daemon dependency, lockfile, and installed package are 0.16.7. The published
 SDK can leave a late follow-up queued without a successor after
 `waitForIdle()`, so the adapter does not enter that path: `steer` and
 `follow_up` are rejected with `SDK_LIVE_CONTROL_UNSUPPORTED` whenever a prompt
 is active. Idle controls remain serialized prompt-equivalent work.
 
 Upstream issue `Yeachan-Heo/gajae-code#5351` was closed after PR #5371 was
-squash-merged to upstream `dev` on 2026-09-07, but the already published 0.16.6
+squash-merged to upstream `dev` on 2026-09-07, but the already published 0.16.7
 package does not contain that fix. Installed source still routes
 `#queueFollowUp()` only through the idle-gated
 `#scheduleQueuedFollowUpContinuation()` and lacks #5371's
@@ -110,7 +110,7 @@ selection, workDir canonicalization, workspace admission/lifecycle policy, and
 relay limits. The SDK runtime remains authoritative for provider/model
 catalogs, provider authentication, and agent-turn semantics; the bridge
 resolves remote selectors and schedules/relays controls without reimplementing
-those semantics. The Broker/Router surfaces in SDK 0.16.6 are reserved for a
+those semantics. The Broker/Router surfaces in SDK 0.16.7 are reserved for a
 separate evaluation as a possible future external-session path. No
 Broker/Router adapter, route, product-policy migration, or fallback is
 implemented.
@@ -131,7 +131,7 @@ implemented.
   $PATH: "tmux"`. Unrelated to the RPC socket issue above — two independent
   Windows gaps. Not used by this project's architecture at all (we drive skills
   through SDK `AgentSession` prompt methods, not via `gjc team`). SDK 0.16.4
-  had already retired `team`, and it remains absent in installed 0.16.6; the
+  had already retired `team`, and it remains absent in installed 0.16.7; the
   current bundled skill is `autoresearch`, and this historical Windows
   observation does not assess the current Broker/Router.
 - **One `gjc -p "..."` subprocess per Discord command** — this was the
@@ -224,7 +224,7 @@ current transport lives in `daemon/src/sdk-session.js`.
    bounded request/cancel tombstones remain through the hard-cap/receipt
    horizon. A queued request is revoked before SDK/provider/tool execution,
    receives `cancelled_before_start`, and then terminal `cancelled`. An active
-   request receives only nonterminal `cancellation_pending`, because SDK 0.16.6
+   request receives only nonterminal `cancellation_pending`, because SDK 0.16.7
    has no supported active interruption control; its natural terminal remains
    authoritative. The daemon emits one exact completed, failed, cancelled,
    paused, timed-out, or disconnected disposition; the bot accepts the first
@@ -245,7 +245,7 @@ current transport lives in `daemon/src/sdk-session.js`.
 
 ## Runtime: Bun vs Node
 
-The daemon pins `@gajae-code/coding-agent` 0.16.6, requires Bun 1.4.0 or newer,
+The daemon pins `@gajae-code/coding-agent` 0.16.7, requires Bun 1.4.0 or newer,
 and embeds GJC in-process. The bot and Node built-in test runner remain
 Node-compatible. `bun.lock` is the committed dependency lockfile;
 `package-lock.json` is gitignored.
@@ -268,7 +268,7 @@ loader is narrow.
 Every pooled `AgentSession` runs *in-process* inside the one daemon Bun process
 (see `session-pool.js` / `sdk-session.js`; `daemon/src` has no
 `spawn`/`child_process`/`--mode`). Multiple channels mapped to the same host
-therefore share **one JS event loop**. The 0.16.6 upgrade does not add an
+therefore share **one JS event loop**. The 0.16.7 upgrade does not add an
 external-session adapter. The current Windows A/B and B/A probe passes for
 scope-local settings, active/available model resolution, and registered-cwd
 capability lookup. This does not establish CPU parallelism or tenant isolation.
@@ -278,7 +278,7 @@ capability lookup. This does not establish CPU parallelism or tenant isolation.
 `.gjc-remote-session/*.jsonl` updated within seconds of each other, and both
 resident-cache directories carried the same daemon PID suffix
 (`…-<daemonPid>-1`, `…-<daemonPid>-2`). That observation showed distinct
-0.12.21 SDK sessions coexisting in one process; it is not a 0.16.6 isolation or
+0.12.21 SDK sessions coexisting in one process; it is not a 0.16.7 isolation or
 concurrency result.
 
 Constraint that follows:
@@ -292,7 +292,7 @@ Constraint that follows:
   independent SDK-owned `Settings.loadForScope` instances when settings were
   omitted. Both creation orders preserved scoped policies and available model
   resolution; unregistered cwd capability fallback and global introspection
-  were `LAST_CREATED`. A fresh 0.16.6 execution passes the same checks in both
+  were `LAST_CREATED`. A fresh 0.16.7 execution passes the same checks in both
   orders; the old receipt is not mechanically promoted. Unfiltered model
   catalogs are not availability/authorization
   decisions. Do not use unscoped APIs as per-workDir policy. Empty-fixture auth
@@ -302,7 +302,7 @@ Constraint that follows:
   [docs/verification/issue62-evidence.md](docs/verification/issue62-evidence.md).
 
 The current SDK pin is established independently in `daemon/package.json` and
-`bun.lock` (0.16.6). That pin is a runtime dependency fact; it is not isolation,
+`bun.lock` (0.16.7). That pin is a runtime dependency fact; it is not isolation,
 Broker/Router, or ACP conformance evidence.
 
 ### Historical ACP feasibility evidence (ca411c3; 2026-07-28)
@@ -310,7 +310,7 @@ Broker/Router, or ACP conformance evidence.
 Commit `ca411c3` records a source inspection requested on **2026-07-28**. The
 SDK version inspected for that note was **unknown/not established**. The
 following bullets are therefore historical feasibility evidence only; they do
-not establish the current 0.16.6 package's ACP conformance, behavior, or
+not establish the current 0.16.7 package's ACP conformance, behavior, or
 support contract.
 
 - The historical inspection reported that `gjc` was a spawnable bin and that the
@@ -348,7 +348,7 @@ reaping, stdio backpressure, and possible version drift between an on-PATH
 `gjc` child and the daemon's imported SDK.
 
 **Broker/Router is a separate evaluation, not a third implemented route.** The
-Broker/Router surfaces in SDK 0.16.6 may be assessed as a future
+Broker/Router surfaces in SDK 0.16.7 may be assessed as a future
 external-session path, but their presence does not establish ACP conformance,
 process isolation, authentication ownership, lifecycle compatibility, or
 product-policy fit. No such behavior is inferred or enabled by the dependency
@@ -426,8 +426,8 @@ Use these rules for Telegram delivery:
 ## What is NOT done yet (pick up here)
 
 1. **Historical Discord E2E: first manual canary passed 2026-07-28; formal
-   evidence table and 0.16.6 rerun still pending.** This predates both the
-   0.16.4 and 0.16.6 upgrades and is not current-SDK evidence. The non-Discord
+   evidence table and 0.16.7 rerun still pending.** This predates both the
+   0.16.4 and 0.16.7 upgrades and is not current-SDK evidence. The non-Discord
    relay path is designed to be covered by
    `npm run smoke:local` (local `HostRegistry` + `daemon/src/daemon.js` under Bun
    + real embedded GJC SDK session, asserting relayed assistant text). On
@@ -473,13 +473,13 @@ Use these rules for Telegram delivery:
    Shared/production deployment must also set
    `GJC_REMOTE_REQUIRE_ALLOWLIST=1`; local unrestricted mode remains available
    only for backward-compatible development and emits a startup warning.
-4. **Historical Linux run retained; 0.16.6 platform verification and the macOS
+4. **Historical Linux run retained; 0.16.7 platform verification and the macOS
    daemon path remain pending.** Built on native Windows (this repo's origin
    host). On 2026-07-25, a real local smoke passed on WSL2 Ubuntu 24.04 using
    the then-current Bun 1.3.14 (repo cloned to native ext4 `~/gjc-remote`,
    Windows `~/.gjc/agent` config + auth DBs copied to WSL `~/.gjc/agent`) —
    `SMOKE_OK`, protocol v1, profile activation against real Copilot creds. That
-   dated result is not evidence for SDK 0.16.6 or the Bun 1.4.0 minimum.
+   dated result is not evidence for SDK 0.16.7 or the Bun 1.4.0 minimum.
    Two useful fail-fast modes observed en route: no config → "No model
    selected"; profile without credentials → "requires credentials for:
    github-copilot". macOS remains unverified; run `npm run smoke:local` there
@@ -493,7 +493,7 @@ Use these rules for Telegram delivery:
    command) — manually verified 2026-07-28** against the real test guild (see
    item 1: `/hosts` online/offline, live progress edit + tool-call preview
    during a running prompt). Underlying `HostRegistry`/SDK session plumbing has
-   unit-test coverage, but no 0.16.6 adapter result is recorded here yet.
+   unit-test coverage, but no 0.16.7 adapter result is recorded here yet.
 7. **Remote host files are not attached automatically.** Assistant output may
    contain absolute paths from the daemon host, but the Discord bot treats those
    paths as text. It never reads matching paths from the bot host. A future
@@ -524,7 +524,7 @@ verification path because it starts the real Bun daemon and embedded agent.
 ## Historical Settings singleton finding (pre-0.16.4)
 
 The following API names, behavior, and probe result describe the older SDK used
-when the issue was found; they do not establish how current 0.16.6 scopes
+when the issue was found; they do not establish how current 0.16.7 scopes
 settings. The later 0.16.4 focused result is separately retained as historical
 evidence in `docs/verification/issue62-evidence.md`.
 `Settings.init({ cwd })` (and the `settings` a bare `createAgentSession`
@@ -539,7 +539,7 @@ each new session's activation clobber every other live session's roles. The fix
 `const scoped = await (await Settings.init()).cloneForCwd(workDir)` and passed
 `settings: scoped` to `createAgentSession`; `cloneForCwd` returned an
 independent instance (`ca===cb` false, override on one did not leak to another).
-Regenerate this reasoning with a probe before trusting 0.16.6 scoping
+Regenerate this reasoning with a probe before trusting 0.16.7 scoping
 assumptions.
 
 **Process note:** PR #24 was merged after only ad-hoc self-review; the missed
@@ -564,8 +564,8 @@ capability and model/provider registry retained process-global state, so
 concurrent pooled sessions with divergent `disabledProviders` or model policy
 could observe last-created-session behavior. The 0.12.21 result and old
 0.11.4/0.11.10 probe remain historical evidence only; they establish neither
-isolation nor state bleed for 0.16.6. The later 0.16.4 result is also historical;
-the fresh 0.16.6 divergent-session probe establishes the scoped boundary only,
+isolation nor state bleed for 0.16.7. The later 0.16.4 result is also historical;
+the fresh 0.16.7 divergent-session probe establishes the scoped boundary only,
 not full isolation or the disappearance of unscoped global behavior. Upstream fix reference:
 **Yeachan-Heo/gajae-code#2774**, merged through PR #2865.
 For the issue #62 boundary review, the source-controlled evidence now requires

@@ -49,7 +49,7 @@ function assistantMessage(text = "done", overrides = {}) {
   };
 }
 
-// AgentEvent.agent_end in @gajae-code/agent-core 0.16.6 always carries the
+// AgentEvent.agent_end in @gajae-code/agent-core 0.16.7 always carries the
 // run's messages. Tests use this source-shaped boundary instead of fabricating
 // a bare terminal that the installed SDK cannot emit.
 function terminalEvent({ text = "done", messages, ...overrides } = {}) {
@@ -82,7 +82,7 @@ function schemaHash(schema) {
   return createHash("sha256").update(canonicalJson(schema)).digest("hex");
 }
 
-// Exact output shape of SDK 0.16.6 buildAskGateAnswerSchema() and
+// Exact output shape of SDK 0.16.7 buildAskGateAnswerSchema() and
 // buildAskGateStageState(); see workflow-gate-types.ts:206-293. Keeping the
 // generated schema on every fake gate makes scalar-answer regressions visible.
 function sdkAskGate({
@@ -215,7 +215,7 @@ function sdkAskGate({
   return gate;
 }
 
-// Exact schemas/options from SDK 0.16.6 approval-gate.ts:54-94.
+// Exact schemas/options from SDK 0.16.7 approval-gate.ts:54-94.
 function sdkDecisionGate({ gate_id, kind, context = {} }) {
   const approval = kind === "approval";
   const decisions = approval
@@ -559,7 +559,7 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(
     Object.hasOwn(calls[1][1], "settings"),
     false,
-    "SDK 0.16.6 must own and close its Settings.loadForScope instance"
+    "SDK 0.16.7 must own and close its Settings.loadForScope instance"
   );
   assert.deepEqual(agent.profileCalls, ["copilot-claude"]);
   await session.dispose();
