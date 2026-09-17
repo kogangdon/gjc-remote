@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-09-17
+
 ### SDK 0.16.7 upgrade
 
 - `@gajae-code/coding-agent` is pinned to **0.16.7** in `daemon/package.json`
@@ -45,8 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   They had no caller; release-sequence admission is enforced only by the
   protected service store's reservation path, which additionally binds the
   retained transaction identity.
-
-## [0.4.0-rc.1] - 2026-09-16
 
 ### Native service lifecycle contract (Issue #240)
 
