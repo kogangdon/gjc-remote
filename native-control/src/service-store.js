@@ -7278,6 +7278,17 @@ class Session {
       }
       if (pair.historyPhase === 'stable') return this.readFloor(scope);
     }
+    // Downgrade/conflict protection compares only against the reserved
+    // high-water mark. That is sufficient solely because every persisted
+    // floor satisfies the relation enforced by validateServiceSequenceFloor
+    // (shared/service-lifecycle-envelope.js): committed <= highestReserved and
+    // equal sequences carry equal fingerprints. Re-assert it here so relaxing
+    // that relation cannot silently weaken these checks.
+    if (current.committedSequence > current.highestReservedSequence ||
+        (current.committedSequence === current.highestReservedSequence && current.committedSequence > 0 &&
+         current.committedManifestFingerprint !== current.highestReservedManifestFingerprint)) {
+      throwStore('SERVICE_STALE', `reserve_${kind}_sequence`, this.#calls.writes);
+    }
     if (sequence < current.highestReservedSequence) throwStore('RELEASE_SEQUENCE_DOWNGRADE', `reserve_${kind}_sequence`, this.#calls.writes);
     if (sequence === current.highestReservedSequence && current.highestReservedSequence > 0 &&
         manifestFingerprint !== current.highestReservedManifestFingerprint) {

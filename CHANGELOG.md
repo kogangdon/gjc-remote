@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `@gjc-remote/shared/deployment-envelope` no longer exports
+  `assertDeploymentSequenceAdmission`, `buildDeploymentSequenceFloor`,
+  `validateDeploymentSequenceFloor`, or `deploymentSequenceFloorFingerprint`.
+  They had no caller; release-sequence admission is enforced only by the
+  protected service store's reservation path, which additionally binds the
+  retained transaction identity.
+
 ## [0.4.0-rc.1] - 2026-09-16
 
 ### Native service lifecycle contract (Issue #240)
