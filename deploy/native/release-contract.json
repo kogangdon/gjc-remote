@@ -162,8 +162,8 @@
   ],
   "sdk": {
     "packageName": "@gajae-code/coding-agent",
-    "packageVersion": "0.16.6",
-    "lockIntegrity": "sha512-53/Mdppx1gDzdtslKpGpuhVEU9he5+G7WfaHCXdbXRBYAbjkKBVwL9xFN9bAlRbX+gwWRShvr/dnYmTV2PHrWw==",
+    "packageVersion": "0.16.7",
+    "lockIntegrity": "sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==",
     "configSchemaVersion": 2,
     "transcriptVersion": 5,
     "sourceRoots": {

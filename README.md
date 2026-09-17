@@ -2,19 +2,19 @@
 
 Discord-controlled remote GJC sessions.
 
-> **SDK 0.16.6 upgrade candidate: live controls fail closed.** The published SDK
+> **SDK 0.16.7 upgrade candidate: live controls fail closed.** The published SDK
 > can leave a late follow-up queued without a successor run after
 > `waitForIdle()` settles.
 > Upstream [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is
 > fixed on the development branch by
 > [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that
-> lifecycle wakeup fix is absent from both the `v0.16.6` tag and the actual
-> published `@gajae-code/coding-agent@0.16.6` npm tarball. The daemon therefore
+> lifecycle wakeup fix is absent from both the `v0.16.7` tag and the actual
+> published `@gajae-code/coding-agent@0.16.7` npm tarball. The daemon therefore
 > rejects `steer` and `follow_up` while a prompt is active instead of entering
 > the unsupported queue path. Idle controls remain prompt-equivalent FIFO work.
 > A supported ownership API is tracked upstream in
 > [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429). See
-> [CHANGELOG.md](CHANGELOG.md#sdk-0166-containment).
+> [CHANGELOG.md](CHANGELOG.md#sdk-0167-upgrade).
 
 > **⚠️ Security: this grants remote code execution.** A mapped Discord channel
 > runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
@@ -91,7 +91,7 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    `already_terminal`, or `not_owned`. Duplicate cancel IDs replay the exact
    original receipt. A queued request is revoked before SDK, provider, or tool
    execution, receives `cancelled_before_start`, then receives terminal
-   `cancelled`. Active work receives only `cancellation_pending`: SDK 0.16.6
+   `cancelled`. Active work receives only `cancellation_pending`: SDK 0.16.7
    exposes no supported active-interruption control, and its natural terminal
    remains authoritative. A receipt is neither a terminal result nor proof of
    quiescence. Request/cancel tombstones are bounded and survive the
@@ -275,7 +275,7 @@ bun run --filter '@gjc-remote/daemon' start
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
 daemon runs on Bun (>=1.4.0) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.16.6**
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.16.7**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
@@ -296,13 +296,13 @@ surfaces are reserved for separate evaluation as a possible future
 external-session path. Neither is wired into this repository, and this upgrade
 implements no Broker/Router or product-policy migration.
 
-SDK 0.16.6 retains the bundled catalog change introduced in 0.16.4: the retired
+SDK 0.16.7 retains the bundled catalog change introduced in 0.16.4: the retired
 `team` command is replaced by `autoresearch`. After deploying this upgrade, run
 `npm run register` from `bot/` to replace the guild slash-command catalog.
 Registration is an explicit operator action; upgrading dependencies alone does
 not change Discord's stored commands.
 
-> **SDK update status:** `@gajae-code/coding-agent` is pinned to **0.16.6** and
+> **SDK update status:** `@gajae-code/coding-agent` is pinned to **0.16.7** and
 > the daemon requires **Bun 1.4.0 or newer**. The
 > [current scoped isolation evidence](docs/verification/issue62-evidence.md)
 > distinguishes per-workDir policy from unscoped SDK state. Adapter regressions,
@@ -315,14 +315,14 @@ not change Discord's stored commands.
 > `waitForIdle()` resolving with the exact executable late follow-up still
 > queued and no successor run. Its receipt recorded `BLOCK`
 > (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). That is retained as
-> old-run evidence, not a current 0.16.6 oracle result.
+> old-run evidence, not a current 0.16.7 oracle result.
 >
 > **Historical 0.12.21 verification:** that pin superseded 0.12.7, and its
 > 2026-08-09 verification covered package/lock reconciliation, canonical SDK
 > imports, root/workspace regression suites, local smoke (`SMOKE_OK`), and
 > manual bot/daemon runtime execution. Provider/model switch coverage was
 > environment-dependent. This is retained as old-run evidence, not evidence for
-> 0.16.6.
+> 0.16.7.
 
 **Optional environment variables** — beyond the required keys above:
 

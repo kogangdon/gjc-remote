@@ -557,8 +557,8 @@ function parseContract(bytes) {
   if (!exact(contract.sdk, [
     'packageName', 'packageVersion', 'lockIntegrity', 'configSchemaVersion', 'transcriptVersion',
     'sourceRoots', 'sourceContractDomain', 'closureDomain',
-  ]) || contract.sdk.packageName !== '@gajae-code/coding-agent' || contract.sdk.packageVersion !== '0.16.6' ||
-      contract.sdk.lockIntegrity !== 'sha512-53/Mdppx1gDzdtslKpGpuhVEU9he5+G7WfaHCXdbXRBYAbjkKBVwL9xFN9bAlRbX+gwWRShvr/dnYmTV2PHrWw==' ||
+  ]) || contract.sdk.packageName !== '@gajae-code/coding-agent' || contract.sdk.packageVersion !== '0.16.7' ||
+      contract.sdk.lockIntegrity !== 'sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==' ||
       contract.sdk.configSchemaVersion !== 2 || contract.sdk.transcriptVersion !== 5 ||
       !exact(contract.sdk.sourceRoots, SDK_ROOTS) ||
       canonicalJsonHash(contract.sdk.sourceRoots) !== canonicalJsonHash({

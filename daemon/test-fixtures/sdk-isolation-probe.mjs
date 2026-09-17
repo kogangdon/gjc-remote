@@ -25,7 +25,7 @@ let registerProvider;
 
 const ISSUE = 62;
 const BASE_COMMIT = "a5bb530bd5a063b6571a7ba963e938bb6f97616f";
-const EXPECTED_SDK = "0.16.6";
+const EXPECTED_SDK = "0.16.7";
 const MIN_BUN = [1, 4, 0];
 const PROVIDER_A = "issue62-provider-a";
 const PROVIDER_B = "issue62-provider-b";

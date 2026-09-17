@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /*
- * Real installed SDK 0.16.6 contract oracle. It verifies fail-closed live
+ * Real installed SDK 0.16.7 contract oracle. It verifies fail-closed live
  * controls while retaining static evidence for upstream #5351/#5371 and #5429.
  * Stdout contains one bounded receipt.
  */
@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
-const EXPECTED_SDK_VERSION = "0.16.6";
+const EXPECTED_SDK_VERSION = "0.16.7";
 const HISTORICAL_SDK_VERSION = "0.16.4";
 const LATE_FOLLOW_UP_CODE =
   "SDK_0_16_6_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED";

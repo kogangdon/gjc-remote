@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SDK 0.16.7 upgrade
+
+- `@gajae-code/coding-agent` is pinned to **0.16.7** in `daemon/package.json`
+  and `bun.lock` (root integrity
+  `sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==`).
+  The published 0.16.6 → 0.16.7 tarball diff is one upstream fix
+  (`gjc --smoke-test` no longer leaves its isolated-shell worker behind) plus
+  the `@gajae-code/*` workspace version bumps; the daemon does not use that
+  surface. No SDK API the daemon consumes changed.
+- The live-control containment introduced with 0.16.6 stays in force unchanged:
+  the `#scheduleNonAdmittedQueuedContinuation` wakeup from upstream
+  [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371) is present on
+  upstream `dev` but absent from both the `v0.16.7` tag and the published
+  `@gajae-code/coding-agent@0.16.7` tarball, and
+  [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429) remains open.
+  Active-prompt `steer` / `follow_up` keep rejecting with
+  `SDK_LIVE_CONTROL_UNSUPPORTED`; the real-SDK oracle re-verifies this against
+  the installed 0.16.7 package.
+- Managed pins updated together: daemon Docker `LOCK_SHA256`
+  (`ac42d7875284b92183670dc96d30084627edb5a14f5563c3815f6aec61923e40`) and SDK
+  version guard/label, `deploy/native/release-contract.json` `sdk` block and
+  the service-release builder's pinned `lockIntegrity`, contract oracle and
+  isolation probe expected versions, README/CONTEXT/SECURITY/deployment docs.
+  Historical 0.16.4/0.16.6 evidence under `docs/verification/` is retained
+  as-is and is not relabeled.
+
 ### Removed
 
 - `@gjc-remote/shared/deployment-envelope` no longer exports
