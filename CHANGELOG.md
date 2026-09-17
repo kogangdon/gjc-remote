@@ -31,7 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the service-release builder's pinned `lockIntegrity`, contract oracle and
   isolation probe expected versions, README/CONTEXT/SECURITY/deployment docs.
   Historical 0.16.4/0.16.6 evidence under `docs/verification/` is retained
-  as-is and is not relabeled.
+  as-is and is not relabeled; the #62 isolation probe was rerun on 0.16.7 and
+  its evidence page updated to the current run.
+- `bun.lock` also picks up one unrelated catch-up hunk: the
+  `@gjc-remote/native-control` workspace entry gains the `gjc-remote-service`
+  bin already declared in its `package.json` on `main`. No dependency changes.
 
 ### Removed
 

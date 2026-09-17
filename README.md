@@ -304,7 +304,7 @@ not change Discord's stored commands.
 
 > **SDK update status:** `@gajae-code/coding-agent` is pinned to **0.16.7** and
 > the daemon requires **Bun 1.4.0 or newer**. The
-> [current scoped isolation evidence](docs/verification/issue62-evidence.md)
+> [scoped isolation evidence rerun on 0.16.7](docs/verification/issue62-evidence.md)
 > distinguishes per-workDir policy from unscoped SDK state. Adapter regressions,
 > the real-SDK contract oracle, canonical imports, and local smoke are separate
 > candidate checks; they do not establish tenant isolation or Broker/Router

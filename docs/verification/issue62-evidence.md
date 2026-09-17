@@ -1,10 +1,11 @@
 # Issue #62 SDK isolation probe
 
 Status: the focused real-SDK probe passes for the installed daemon
-dependency `@gajae-code/coding-agent` **0.16.6** with Bun **1.4.0 or newer**.
-The current parent-run wrapper passes all three tests on Windows x64 with
-Bun 1.4.0 and Node wrapper 26.7.0, including both creation orders and zero
-network attempts. This is scoped policy evidence, not tenant isolation.
+dependency `@gajae-code/coding-agent` **0.16.7** with Bun **1.4.0 or newer**.
+The current parent-run wrapper passes all three tests on Windows x64 (Bun
+1.4.2, Node wrapper 26.7.0) and on Linux x86_64 (WSL Ubuntu 24.04, Bun 1.4.2,
+Node wrapper 26.9.0), including both creation orders and zero network
+attempts. This is scoped policy evidence, not tenant isolation.
 Each receipt carries separate
 `approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of
 the approved base. The approved original base remains
@@ -27,13 +28,17 @@ The Bun fixture writes no repository artifact and emits a bounded structured rec
 These ignored mutable paths contain current-run receipts but are not permanent
 proof of any future checkout. A current receipt must independently report `sdkVersionExpected`,
 `sdkVersionObserved`, `daemonDependencyVersion`, and `lockfileVersionEvidence`
-as `0.16.6`, and its ordered working-tree digest must match the four live files.
+as `0.16.7`, and its ordered working-tree digest must match the four live files.
 The wrapper removes each stale order-specific output before running that order.
 
-## SDK 0.16.6 observed probe boundary
+## SDK 0.16.7 observed probe boundary
 
-The installed 0.16.6 package source and exports map were inspected before
-retargeting the probe. The scoped surfaces it exercises remain available:
+The installed 0.16.7 package source and exports map were inspected before
+retargeting the probe. The published 0.16.6 → 0.16.7 tarball diff touches only
+`src/exec/isolated-shell.ts` (CLI `--smoke-test` worker teardown), the
+package changelog, and `@gajae-code/*` workspace version pins; none of the
+surfaces below changed, so the 0.16.6 boundary inspection carries forward
+verbatim. The scoped surfaces it exercises remain available:
 
 - `@gajae-code/coding-agent/sdk` exports `createAgentSession` and `Settings`;
   omitted settings still select `Settings.loadForScope({ cwd, agentDir })`.
@@ -239,7 +244,7 @@ fixture stores only; no broker or credential claim is made.
 
 When executed against matching version and provenance, the probe measures the
 installed SDK behavior; it does not repair process-global
-capability/model-provider state or claim full isolation. Current 0.16.6
+capability/model-provider state or claim full isolation. Current 0.16.7
 receipts do not remove those limits. Preserve the requirement to rerun this focused
 probe after every SDK bump before changing the caveat. A reproducible global
 direction is evidence only for the exact observed upstream/architecture
