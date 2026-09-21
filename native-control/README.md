@@ -310,6 +310,30 @@ application and a final-directory profile transition under the actual M/S caller
 These do not prove cross-account recovery or workload access, protected-root
 bootstrap, artifact writes, sealing, GC, or service operation.
 
+## Native addon build reproducibility
+
+Windows Release builds deliberately replace, rather than append to, node-gyp's
+inherited compiler, librarian, and linker `AdditionalOptions`. The linker
+replacement contains `/Brepro` and `/PDBALTPATH:%_PDB%`: the first removes
+variation in linker-controlled PE/COFF metadata, while the second embeds only
+the PDB filename instead of an absolute build-machine path. Do not change the
+`AdditionalOptions=` keys to appending `AdditionalOptions`; doing so
+reintroduces Node's LLVM-only `-opt:lldltojobs=2` option and causes MSVC
+`link.exe` to fail with `LNK1117`.
+
+CI retains the unsigned addon and build manifest for all supported targets as
+`native-control-unsigned-linux-x64`,
+`native-control-unsigned-linux-arm64`, and
+`native-control-unsigned-win32-x64`. Matching bytes from clean builds with the
+same pinned source, toolchain, and checkout path demonstrate reproducibility only. They do not
+establish independent source provenance, and byte-for-byte identity is not
+promised across toolchain versions. External signing and independent provenance
+verification remain separate requirements.
+
+Local Windows checks produced identical binaries across two clean builds at
+one path. A build at a different checkout path still differed, despite the
+normalized embedded PDB filename. Cross-path reproducibility is not established.
+
 ## Unsigned application release tooling
 
 Repository-local `build:service-release` and `verify:service-release` npm scripts

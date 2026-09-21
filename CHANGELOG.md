@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Native addon build reproducibility
+
+- Windows Release linking now preserves the intentional node-gyp option
+  replacement while adding `/Brepro` and `/PDBALTPATH:%_PDB%`, making
+  linker-controlled PE/COFF metadata deterministic and removing the embedded
+  absolute PDB path without reintroducing LLVM-only options that MSVC rejects.
+- CI now retains unsigned native-control signing inputs for `linux-x64`,
+  `linux-arm64`, and `win32-x64` under explicit OS-and-architecture artifact
+  names. Reproducibility applies only to clean builds with the same pinned
+  toolchain and checkout path; it is not independent source provenance or a promise across
+  toolchain versions.
+
 ## [0.4.0-rc.1] - 2026-09-17
 
 ### SDK 0.16.7 upgrade

@@ -17,7 +17,9 @@
           "msvs_settings": {
             "VCCLCompilerTool": { "AdditionalOptions=": [] },
             "VCLibrarianTool": { "AdditionalOptions=": [] },
-            "VCLinkerTool": { "AdditionalOptions=": [] }
+            "VCLinkerTool": {
+              "AdditionalOptions=": [ "/Brepro", "/PDBALTPATH:%_PDB%" ]
+            }
           }
         }
       },
