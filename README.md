@@ -414,13 +414,17 @@ bun run smoke:local
 # Also verify model resolution and its structured success receipt:
 SMOKE_MODEL_QUERY=openai-codex:gpt-5.6-sol bun run smoke:local   # POSIX shell
 # PowerShell: $env:SMOKE_MODEL_QUERY="openai-codex:gpt-5.6-sol"; bun run smoke:local
+# Slow provider/session startup can use a longer smoke-only heartbeat bound:
+# PowerShell: $env:SMOKE_HEARTBEAT_TIMEOUT_MS="60000"; bun run smoke:local
 ```
 
 `smoke:local` starts a local `HostRegistry`, starts a real Bun daemon, routes one
 prompt through an embedded GJC SDK session, and asserts that the assistant text
 comes back through the relay. When `SMOKE_MODEL_QUERY` is set, it also performs
-a real model switch and requires a `model_resolved` receipt. It does not require
-Discord credentials.
+a real model switch and requires a `model_resolved` receipt. Its smoke-only
+heartbeat bound defaults to 30 seconds (`SMOKE_HEARTBEAT_TIMEOUT_MS`) so a slow
+provider response is not mistaken for a disconnected daemon. It does not
+require Discord credentials.
 
 ## Operations
 

@@ -25,7 +25,13 @@ if (resolve(workDir) === resolve(workDir2)) {
 const expected = "SMOKE_OK";
 const modelQuery = process.env.SMOKE_MODEL_QUERY;
 const heartbeatIntervalMs = 100;
-const heartbeatTimeoutMs = 5000;
+// Provider-backed SDK calls can occupy the daemon for longer than the
+// production heartbeat window while a pooled session is being created. Keep
+// this smoke-specific transport check bounded, but do not classify a slow
+// model response as a disconnected daemon.
+const heartbeatTimeoutMs = Number(
+  process.env.SMOKE_HEARTBEAT_TIMEOUT_MS || 30_000,
+);
 const heartbeatTimers = createObservedHeartbeatTimers();
 const daemonEnvironment = { ...process.env };
 for (const key of Object.keys(daemonEnvironment)) {
