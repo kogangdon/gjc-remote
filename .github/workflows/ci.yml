@@ -59,19 +59,6 @@ jobs:
 
       - run: npm test
 
-      # Offline release signing consumes these exact bytes. Upload only after
-      # the platform's behavior suite passes, so a failed run cannot publish
-      # an artifact that operators might sign.
-      - name: Upload unsigned native-control signing input
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-control-unsigned-${{ matrix.target }}
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            native-control/build/Release/native_control.node
-            native-control/build/Release/native-control.manifest.json
-
       # Guards released CHANGELOG.md history against silent deletion. Runs
       # once (Linux only) since it doesn't depend on the native addon build
       # and would otherwise duplicate work across the matrix. On a direct
@@ -81,6 +68,19 @@ jobs:
       - name: Guard changelog history
         if: matrix.os == 'ubuntu-latest'
         run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
+
+      # Offline release signing consumes these exact bytes. Upload only after
+      # every required suite/gate in this job passes, so a failed run cannot
+      # publish an artifact that operators might sign.
+      - name: Upload unsigned native-control signing input
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-control-unsigned-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            native-control/build/Release/native_control.node
+            native-control/build/Release/native-control.manifest.json
 
   bot-container-contract:
     strategy:

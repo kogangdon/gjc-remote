@@ -63,7 +63,7 @@ test('CI uploads one explicitly named unsigned artifact for every native target'
   ]);
 
   const uploadStep = suite.match(
-    /\n      - name: Upload unsigned native-control signing input\n[\s\S]+?(?=\n      - )/,
+    /\n      - name: Upload unsigned native-control signing input\n[\s\S]+?(?=\n      - |$)/,
   )?.[0];
   assert.ok(uploadStep);
   assert.match(uploadStep, /uses: actions\/upload-artifact@v4/);
