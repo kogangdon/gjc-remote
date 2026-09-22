@@ -9,6 +9,10 @@ const workflow = readFileSync(
   new URL('../../.github/workflows/ci.yml', import.meta.url),
   'utf8',
 ).replaceAll('\r\n', '\n');
+const dockerBotReadme = readFileSync(
+  new URL('../../deploy/docker/bot/README.md', import.meta.url),
+  'utf8',
+).replaceAll('\r\n', '\n');
 
 test('Windows Release build replaces inherited options with deterministic linker flags', () => {
   const target = binding.targets.find(({ target_name: name }) => (
@@ -78,4 +82,25 @@ test('CI uploads one explicitly named unsigned artifact for every native target'
     /native-control\/build\/Release\/native-control\.manifest\.json/,
   );
   assert.doesNotMatch(uploadStep, /^\s+if:/m);
+});
+
+test('Docker signing instructions use exact Linux workflow artifact names', () => {
+  for (const artifactName of [
+    'native-control-unsigned-linux-x64',
+    'native-control-unsigned-linux-arm64',
+  ]) {
+    assert.match(dockerBotReadme, new RegExp(`\`${artifactName}\``));
+  }
+  assert.match(
+    dockerBotReadme,
+    /separate Windows CI leg\s+uploads `native-control-unsigned-win32-x64`/,
+  );
+  assert.match(
+    dockerBotReadme,
+    /that bundle is not compatible with\s+this Linux-only Docker image/,
+  );
+  assert.doesNotMatch(
+    dockerBotReadme,
+    /native-control-unsigned-\{X64\|ARM64\}/,
+  );
 });
