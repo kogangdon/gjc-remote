@@ -94,9 +94,7 @@ daemon.stderr.on("data", captureDaemon);
 
 try {
   await waitForHost(registry, hostId, 10_000);
-  await new Promise((resolve) =>
-    setTimeout(resolve, heartbeatIntervalMs + heartbeatTimeoutMs + 100)
-  );
+  await waitForHeartbeatExchange(heartbeatTimers, heartbeatTimeoutMs);
   if (!registry.isOnline(hostId)) {
     throw new Error("host failed the application-level heartbeat");
   }
@@ -221,6 +219,20 @@ async function waitForTelemetry(events, predicate, count, timeoutMs) {
   }
 }
 
+async function waitForHeartbeatExchange(timerState, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (
+      timerState.scheduledTimeouts > 0 &&
+      timerState.clearedTimeouts > 0 &&
+      timerState.activeTimeouts === 0
+    ) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 function createObservedHeartbeatTimers() {
   const activeTimeouts = new Set();
   let scheduledTimeouts = 0;
@@ -250,6 +262,9 @@ function createObservedHeartbeatTimers() {
     },
     get clearedTimeouts() {
       return clearedTimeouts;
+    },
+    get activeTimeouts() {
+      return activeTimeouts.size;
     },
   };
 }
