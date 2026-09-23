@@ -27,14 +27,21 @@ Source-built unsigned CI addons are not release bundles. Until signed Linux
 amd64 and arm64 bundles and live container evidence exist, this deployment is a
 release candidate rather than a supported published image.
 
-Each Linux CI leg uploads a seven-day signing-input artifact containing the
-addon and manifest: `native-control-unsigned-linux-x64` for amd64, or
-`native-control-unsigned-linux-arm64` for arm64. The separate Windows CI leg
-uploads `native-control-unsigned-win32-x64`; that bundle is not compatible with
-this Linux-only Docker image. Sign the manifest bytes outside CI with the
-production key, extract the artifact into `native-control/build/Release`, then
-use the repository tooling to wrap the externally produced raw signature and
-verify the sidecar:
+Each CI suite leg first uploads a one-day platform-specific
+`native-control-staging-*` relay. Staging artifacts are CI-internal handoffs,
+can exist before the container jobs and promotion matrix finish, and must never
+be signed.
+
+After every suite and container-contract matrix succeeds, CI promotes a
+seven-day signing-input artifact containing the addon and manifest:
+`native-control-unsigned-linux-x64` for amd64, or
+`native-control-unsigned-linux-arm64` for arm64. The separate Windows promotion
+publishes `native-control-unsigned-win32-x64`; that bundle is not compatible
+with this Linux-only Docker image. Before signing, check that the overall CI
+workflow conclusion is `success`; the presence of an individual artifact is not
+sufficient. Sign the manifest bytes outside CI with the production key, extract
+the artifact into `native-control/build/Release`, then use the repository
+tooling to wrap the externally produced raw signature and verify the sidecar:
 
 ```sh
 node native-control/scripts/verify-build.mjs --write-manifest \\

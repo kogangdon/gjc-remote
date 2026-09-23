@@ -1,11 +1,18 @@
 import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
+import { performance } from "node:perf_hooks";
 import { HostRegistry } from "../bot/src/host-registry.js";
+import {
+  parseSmokeHeartbeatTimeout,
+  waitForHost,
+  waitForRegisteredHeartbeatPong,
+} from "./local-smoke-heartbeat.js";
 
 const port = Number(process.env.SMOKE_HOST_WS_PORT || 7788);
 const hostId = process.env.SMOKE_HOST_ID || "local-smoke";
 const token = process.env.SMOKE_HOST_TOKEN || "local-smoke-token";
+const hostStartupTimeoutMs = 10_000;
 // A second, distinct canonical workDir so the smoke drives two concurrent
 // pooled sessions (the SDK owns scope-local Settings for each cwd). This guards
 // against gross cross-session breakage: session A must keep working after
@@ -25,14 +32,13 @@ if (resolve(workDir) === resolve(workDir2)) {
 const expected = "SMOKE_OK";
 const modelQuery = process.env.SMOKE_MODEL_QUERY;
 const heartbeatIntervalMs = 100;
-// Provider-backed SDK calls can occupy the daemon for longer than the
-// production heartbeat window while a pooled session is being created. Keep
-// this smoke-specific transport check bounded, but do not classify a slow
-// model response as a disconnected daemon.
-const heartbeatTimeoutMs = Number(
-  process.env.SMOKE_HEARTBEAT_TIMEOUT_MS || 30_000,
+// This smoke-only bound keeps the application-level pong proof finite.
+// Increasing it provides diagnostic tolerance for a delayed local heartbeat;
+// it does not fix a transport/event-loop stall, and provider latency does not
+// inherently block heartbeat handling.
+const heartbeatTimeoutMs = parseSmokeHeartbeatTimeout(
+  process.env.SMOKE_HEARTBEAT_TIMEOUT_MS,
 );
-const heartbeatTimers = createObservedHeartbeatTimers();
 const daemonEnvironment = { ...process.env };
 for (const key of Object.keys(daemonEnvironment)) {
   if (
@@ -57,7 +63,6 @@ const registry = new HostRegistry({
   tokensByHostId: new Map([[hostId, token]]),
   heartbeatIntervalMs,
   heartbeatTimeoutMs,
-  timers: heartbeatTimers.api,
 });
 
 await once(registry.wss, "listening");
@@ -93,16 +98,16 @@ daemon.stdout.on("data", captureDaemon);
 daemon.stderr.on("data", captureDaemon);
 
 try {
-  await waitForHost(registry, hostId, 10_000);
-  await waitForHeartbeatExchange(heartbeatTimers, heartbeatTimeoutMs);
-  if (!registry.isOnline(hostId)) {
-    throw new Error("host failed the application-level heartbeat");
-  }
-  if (
-    heartbeatTimers.scheduledTimeouts === 0 ||
-    heartbeatTimers.clearedTimeouts === 0
-  ) {
-    throw new Error("application-level ping/pong exchange was not observed");
+  await waitForHost(registry, hostId, hostStartupTimeoutMs);
+  const heartbeatSocket = await waitForRegisteredHeartbeatPong(
+    registry,
+    hostId,
+    heartbeatTimeoutMs,
+  );
+  if (registry.connections.get(hostId) !== heartbeatSocket) {
+    throw new Error(
+      "host connection changed after the application-level heartbeat",
+    );
   }
 
   const promptExact = async (dir) => {
@@ -212,70 +217,16 @@ try {
 }
 
 async function waitForTelemetry(events, predicate, count, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (true) {
     if (events.filter(predicate).length >= count) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
-async function waitForHeartbeatExchange(timerState, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (
-      timerState.scheduledTimeouts > 0 &&
-      timerState.clearedTimeouts > 0 &&
-      timerState.activeTimeouts === 0
-    ) {
-      return;
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      throw new Error(
+        `expected ${count} matching daemon telemetry events within ${timeoutMs}ms`,
+      );
     }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
-function createObservedHeartbeatTimers() {
-  const activeTimeouts = new Set();
-  let scheduledTimeouts = 0;
-  let clearedTimeouts = 0;
-
-  return {
-    api: {
-      setInterval: (callback, delay) => setInterval(callback, delay),
-      clearInterval: (timer) => clearInterval(timer),
-      setTimeout(callback, delay) {
-        let timer;
-        timer = setTimeout(() => {
-          activeTimeouts.delete(timer);
-          callback();
-        }, delay);
-        activeTimeouts.add(timer);
-        scheduledTimeouts += 1;
-        return timer;
-      },
-      clearTimeout(timer) {
-        if (activeTimeouts.delete(timer)) clearedTimeouts += 1;
-        clearTimeout(timer);
-      },
-    },
-    get scheduledTimeouts() {
-      return scheduledTimeouts;
-    },
-    get clearedTimeouts() {
-      return clearedTimeouts;
-    },
-    get activeTimeouts() {
-      return activeTimeouts.size;
-    },
-  };
-}
-
-async function waitForHost(registry, id, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (!registry.isOnline(id)) {
-    if (Date.now() > deadline) {
-      throw new Error(`host '${id}' did not connect within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, remaining)));
   }
 }
 

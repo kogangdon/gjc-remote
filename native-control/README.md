@@ -321,11 +321,21 @@ the PDB filename instead of an absolute build-machine path. Do not change the
 reintroduces Node's LLVM-only `-opt:lldltojobs=2` option and causes MSVC
 `link.exe` to fail with `LNK1117`.
 
-CI retains the unsigned addon and build manifest for all supported targets as
+Each CI suite leg first uploads a one-day, platform-specific relay named
+`native-control-staging-linux-x64`,
+`native-control-staging-linux-arm64`, or
+`native-control-staging-win32-x64`. These staging artifacts can exist while a
+container job or another promotion leg later fails. They are CI-internal
+handoffs, not signing inputs, and must never be signed.
+
+Only after every suite and container-contract matrix succeeds does CI retain the
+unsigned addon and build manifest for all supported targets as
 `native-control-unsigned-linux-x64`,
 `native-control-unsigned-linux-arm64`, and
-`native-control-unsigned-win32-x64`. Matching bytes from clean builds with the
-same pinned source, toolchain, and checkout path demonstrate reproducibility only. They do not
+`native-control-unsigned-win32-x64`. Before signing, check that the overall CI
+workflow conclusion is `success`; the presence of an individual artifact is not
+sufficient. Matching bytes from clean builds with the same pinned source,
+toolchain, and checkout path demonstrate reproducibility only. They do not
 establish independent source provenance, and byte-for-byte identity is not
 promised across toolchain versions. External signing and independent provenance
 verification remain separate requirements.

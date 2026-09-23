@@ -69,15 +69,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
 
-      # Offline release signing consumes these exact bytes. Upload only after
-      # every required suite/gate in this job passes, so a failed run cannot
-      # publish an artifact that operators might sign.
-      - name: Upload unsigned native-control signing input
+      # Preserve each platform's exact build output for the promotion job.
+      # This short-lived relay is not a signing input: the operator-facing
+      # artifact is published only after every suite and container job passes.
+      - name: Stage unsigned native-control build output
         uses: actions/upload-artifact@v4
         with:
-          name: native-control-unsigned-${{ matrix.target }}
+          name: native-control-staging-${{ matrix.target }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
           path: |
             native-control/build/Release/native_control.node
             native-control/build/Release/native-control.manifest.json
@@ -304,13 +304,41 @@ jobs:
             fi
           done
 
+  # Promote the platform-specific relay artifacts only after the complete CI
+  # dependency set succeeds. These are the operator-facing offline signing
+  # inputs; the short-lived staging artifacts above must never be signed.
+  promote-native-control-signing-inputs:
+    if: ${{ success() }}
+    needs: [suite, bot-container-contract, daemon-container-contract]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x64, linux-arm64, win32-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download staged native-control build output
+        uses: actions/download-artifact@v4
+        with:
+          name: native-control-staging-${{ matrix.target }}
+          path: ${{ runner.temp }}/native-control-staging/${{ matrix.target }}
+
+      - name: Publish unsigned native-control signing input
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-control-unsigned-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/native-control-staging/${{ matrix.target }}/native_control.node
+            ${{ runner.temp }}/native-control-staging/${{ matrix.target }}/native-control.manifest.json
+
   # Aggregate gate. `test` is the required status check on main, so it must stay a
   # single stable context name even though the suite now fans out across a matrix.
-  # It fails unless every matrix leg succeeded, so a skipped or failed leg cannot
-  # be merged past.
+  # It fails unless every matrix leg and signing-input promotion succeeded, so a
+  # skipped or failed leg cannot be merged past.
   test:
     if: always()
-    needs: [suite, bot-container-contract, daemon-container-contract]
+    needs: [suite, bot-container-contract, daemon-container-contract, promote-native-control-signing-inputs]
     runs-on: ubuntu-latest
     steps:
       - name: Require every matrix leg to succeed
@@ -318,6 +346,8 @@ jobs:
           echo "suite result: ${{ needs.suite.result }}"
           echo "bot container contract result: ${{ needs.bot-container-contract.result }}"
           echo "daemon container contract result: ${{ needs.daemon-container-contract.result }}"
+          echo "native-control signing input promotion result: ${{ needs.promote-native-control-signing-inputs.result }}"
           test "${{ needs.suite.result }}" = "success"
           test "${{ needs.bot-container-contract.result }}" = "success"
           test "${{ needs.daemon-container-contract.result }}" = "success"
+          test "${{ needs.promote-native-control-signing-inputs.result }}" = "success"
