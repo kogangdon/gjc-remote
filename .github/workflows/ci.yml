@@ -70,14 +70,15 @@ jobs:
         run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
 
       # Preserve each platform's exact build output for the promotion job.
-      # This short-lived relay is not a signing input: the operator-facing
-      # artifact is published only after every suite and container job passes.
+      # This seven-day relay matches the supported promotion-rerun window. It is
+      # not a signing input: the operator-facing artifact is published only
+      # after every suite and container job passes.
       - name: Stage unsigned native-control build output
         uses: actions/upload-artifact@v4
         with:
           name: native-control-staging-${{ matrix.target }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           path: |
             native-control/build/Release/native_control.node
             native-control/build/Release/native-control.manifest.json

@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
-import { performance } from "node:perf_hooks";
 import { HostRegistry } from "../bot/src/host-registry.js";
 import {
   parseSmokeHeartbeatTimeout,
   waitForHost,
   waitForRegisteredHeartbeatPong,
+  waitForTelemetry,
 } from "./local-smoke-heartbeat.js";
 
 const port = Number(process.env.SMOKE_HOST_WS_PORT || 7788);
@@ -214,20 +214,6 @@ try {
 } finally {
   daemon.kill();
   await closeRegistry(registry);
-}
-
-async function waitForTelemetry(events, predicate, count, timeoutMs) {
-  const deadline = performance.now() + timeoutMs;
-  while (true) {
-    if (events.filter(predicate).length >= count) return;
-    const remaining = deadline - performance.now();
-    if (remaining <= 0) {
-      throw new Error(
-        `expected ${count} matching daemon telemetry events within ${timeoutMs}ms`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(10, remaining)));
-  }
 }
 
 async function closeRegistry(registry) {

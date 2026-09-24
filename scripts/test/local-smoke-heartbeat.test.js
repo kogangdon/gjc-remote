@@ -5,6 +5,7 @@ import {
   parseSmokeHeartbeatTimeout,
   waitForHost,
   waitForRegisteredHeartbeatPong,
+  waitForTelemetry,
 } from "../local-smoke-heartbeat.js";
 
 test("heartbeat timeout defaults and accepts its exact bounds", () => {
@@ -134,6 +135,103 @@ test("host startup wait has its own bounded monotonic deadline", async () => {
     /host 'host-a' did not connect within 250ms/,
   );
   assert.deepEqual(waits, [100, 100, 50]);
+});
+
+test("telemetry wait accepts the requested event count before its deadline", async () => {
+  let now = 0;
+  const events = [];
+  const matchingEvent = { outcome: "succeeded" };
+
+  await waitForTelemetry(
+    events,
+    (event) => event.outcome === "succeeded",
+    1,
+    100,
+    {
+      now: () => now,
+      wait: async (delay) => {
+        now += delay;
+        events.push(matchingEvent);
+      },
+    },
+  );
+
+  assert.equal(now, 10);
+});
+
+test("telemetry wait rejects events observed at or after its deadline", async () => {
+  for (const observedAt of [100, 101]) {
+    let now = 0;
+    const events = [];
+
+    await assert.rejects(
+      waitForTelemetry(
+        events,
+        (event) => event.outcome === "succeeded",
+        1,
+        100,
+        {
+          now: () => now,
+          wait: async () => {
+            now = observedAt;
+            events.push({ outcome: "succeeded" });
+          },
+        },
+      ),
+      /expected 1 matching daemon telemetry events within 100ms/,
+    );
+  }
+});
+
+test("telemetry wait counts only predicate matches toward the requested count", async () => {
+  let now = 0;
+  let waitCount = 0;
+  const events = [{ outcome: "succeeded" }];
+
+  await waitForTelemetry(
+    events,
+    (event) => event.outcome === "succeeded",
+    2,
+    100,
+    {
+      now: () => now,
+      wait: async (delay) => {
+        now += delay;
+        waitCount += 1;
+        events.push({
+          outcome: waitCount === 1 ? "failed" : "succeeded",
+        });
+      },
+    },
+  );
+
+  assert.equal(waitCount, 2);
+  assert.equal(events.length, 3);
+});
+
+test("telemetry wait fails when a timer callback runs after the deadline", async () => {
+  let now = 0;
+  const events = [];
+  const waits = [];
+
+  await assert.rejects(
+    waitForTelemetry(
+      events,
+      (event) => event.outcome === "succeeded",
+      1,
+      100,
+      {
+        now: () => now,
+        wait: async (delay) => {
+          waits.push(delay);
+          now = 150;
+          events.push({ outcome: "succeeded" });
+        },
+      },
+    ),
+    /expected 1 matching daemon telemetry events within 100ms/,
+  );
+  assert.deepEqual(waits, [10]);
 });
 
 function fakeRegistry(socket) {

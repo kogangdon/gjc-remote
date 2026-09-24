@@ -24,6 +24,7 @@ const nativeBuildFiles = [
   'native_control.node',
   'native-control.manifest.json',
 ];
+const nativeArtifactRerunWindowDays = 7;
 
 function namedStep(job, name) {
   const matches = job.steps.filter((step) => step.name === name);
@@ -88,7 +89,10 @@ test('CI promotes target-preserving signing inputs only after every dependency s
     'native-control-staging-${{ matrix.target }}',
   );
   assert.equal(stage.with['if-no-files-found'], 'error');
-  assert.equal(stage.with['retention-days'], 1);
+  assert.equal(
+    stage.with['retention-days'],
+    nativeArtifactRerunWindowDays,
+  );
   assert.deepEqual(blockScalarLines(stage.with.path), nativeBuildFiles.map(
     (file) => `native-control/build/Release/${file}`,
   ));
@@ -140,7 +144,15 @@ test('CI promotes target-preserving signing inputs only after every dependency s
     'native-control-unsigned-${{ matrix.target }}',
   );
   assert.equal(publish.with['if-no-files-found'], 'error');
-  assert.equal(publish.with['retention-days'], 7);
+  assert.equal(
+    publish.with['retention-days'],
+    nativeArtifactRerunWindowDays,
+  );
+  assert.equal(
+    stage.with['retention-days'],
+    publish.with['retention-days'],
+    'staging must remain available for the full signing-input rerun window',
+  );
   assert.deepEqual(blockScalarLines(publish.with.path), nativeBuildFiles.map(
     (file) => (
       '${{ runner.temp }}/native-control-staging/'
@@ -178,12 +190,12 @@ test('CI promotes target-preserving signing inputs only after every dependency s
     {
       jobName: 'suite',
       name: 'native-control-staging-${{ matrix.target }}',
-      retentionDays: 1,
+      retentionDays: nativeArtifactRerunWindowDays,
     },
     {
       jobName: 'promote-native-control-signing-inputs',
       name: 'native-control-unsigned-${{ matrix.target }}',
-      retentionDays: 7,
+      retentionDays: nativeArtifactRerunWindowDays,
     },
   ]);
 
@@ -221,6 +233,18 @@ test('signing instructions reject staging artifacts and require overall CI succe
     assert.match(
       documentation,
       /overall CI\s+workflow conclusion is `success`/i,
+    );
+    assert.match(
+      documentation,
+      /supported artifact-backed rerun window is seven days/i,
+    );
+    assert.match(
+      documentation,
+      /staging artifact has expired[\s\S]{0,300}`Re-run all jobs`/i,
+    );
+    assert.match(
+      documentation,
+      /promotion-only[\s\S]{0,100}(?:is\s+not supported|unsupported)/i,
     );
   }
 

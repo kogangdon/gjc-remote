@@ -55,6 +55,29 @@ export async function waitForHost(
   }
 }
 
+export async function waitForTelemetry(
+  events,
+  predicate,
+  count,
+  timeoutMs,
+  {
+    now = monotonicNow,
+    wait = sleep,
+  } = {},
+) {
+  const deadline = now() + timeoutMs;
+  while (true) {
+    const remaining = deadline - now();
+    if (remaining <= 0) {
+      throw new Error(
+        `expected ${count} matching daemon telemetry events within ${timeoutMs}ms`,
+      );
+    }
+    if (events.filter(predicate).length >= count) return;
+    await wait(Math.min(10, remaining));
+  }
+}
+
 export async function waitForRegisteredHeartbeatPong(
   registry,
   hostId,
