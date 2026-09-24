@@ -27,12 +27,41 @@ Source-built unsigned CI addons are not release bundles. Until signed Linux
 amd64 and arm64 bundles and live container evidence exist, this deployment is a
 release candidate rather than a supported published image.
 
-Each Linux CI leg uploads a seven-day
-`native-control-unsigned-{X64|ARM64}` signing-input artifact containing the
-addon and manifest. Sign the manifest bytes outside CI with the production key,
-extract the artifact into `native-control/build/Release`, then use the
-repository tooling to wrap the externally produced raw signature and verify
-the sidecar:
+Each CI suite leg first uploads a seven-day platform-specific
+`native-control-staging-*` relay. Staging artifacts are CI-internal handoffs,
+can exist before the container jobs and promotion matrix finish, and must never
+be signed.
+
+Pull requests exercise these staging paths, but promotion is intentionally
+skipped. Only a `push` run whose source ref is exactly `refs/heads/main`, and
+whose every suite and container-contract matrix succeeds, promotes a seven-day
+signing-input artifact containing the addon and manifest:
+`native-control-unsigned-linux-x64` for amd64, or
+`native-control-unsigned-linux-arm64` for arm64. The separate Windows promotion
+publishes `native-control-unsigned-win32-x64`; that bundle is not compatible
+with this Linux-only Docker image.
+
+Before signing, verify from GitHub's run metadata that the run belongs to the
+trusted repository `kogangdon/gjc-remote`, its event is exactly `push`, its exact
+source commit matches the proposed release commit, and its source ref is exactly
+`refs/heads/main`. Require both an overall CI workflow conclusion of `success`
+and separate explicit release authorization for that exact commit and ref. A
+green workflow, including a successful `pull_request` workflow from an untrusted
+source, is neither release provenance nor release authorization; the presence
+of an individual artifact is not sufficient.
+
+The supported artifact-backed rerun window is seven days from staging upload.
+Within that window, a failed promotion can reuse a retained staging artifact.
+After any required staging artifact has expired, use `Re-run all jobs` for the
+full CI workflow so every suite and container-contract matrix runs and produces
+fresh staging artifacts; a promotion-only or failed-jobs rerun after expiry is
+not supported. An expired promoted signing input also requires `Re-run all
+jobs`. Retention is bounded and does not bypass the overall-workflow success
+requirement.
+
+Sign the manifest bytes outside CI with the production key, extract the artifact
+into `native-control/build/Release`, then use the repository tooling to wrap the
+externally produced raw signature and verify the sidecar:
 
 ```sh
 node native-control/scripts/verify-build.mjs --write-manifest \\

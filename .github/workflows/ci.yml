@@ -18,7 +18,13 @@ jobs:
         # ubuntu-24.04-arm is a GitHub-hosted arm64 runner. Keep it as a
         # first-class leg: native-control's manifest and runnable integration
         # tests must execute on arm64 rather than relying on cross-compilation.
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: windows-latest
+            target: win32-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -51,20 +57,6 @@ jobs:
       - name: Build native-control addon
         run: npm run build --workspace @gjc-remote/native-control
 
-      # Offline release signing consumes these exact bytes. They are explicitly
-      # UNSIGNED CI artifacts and are never accepted by the runtime image until
-      # the external signer adds a trusted sidecar for the same manifest.
-      - name: Upload unsigned Linux native-control signing input
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-control-unsigned-${{ runner.arch }}
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            native-control/build/Release/native_control.node
-            native-control/build/Release/native-control.manifest.json
-
       - run: npm test
 
       # Guards released CHANGELOG.md history against silent deletion. Runs
@@ -76,6 +68,20 @@ jobs:
       - name: Guard changelog history
         if: matrix.os == 'ubuntu-latest'
         run: node scripts/changelog-history-guard.mjs --mode ${{ github.event_name == 'push' && 'push' || 'pr' }}
+
+      # Preserve each platform's exact build output for the promotion job.
+      # This seven-day relay matches the supported promotion-rerun window. It is
+      # not a signing input: the operator-facing artifact is published only
+      # after every suite and container job passes.
+      - name: Stage unsigned native-control build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-control-staging-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            native-control/build/Release/native_control.node
+            native-control/build/Release/native-control.manifest.json
 
   bot-container-contract:
     strategy:
@@ -299,13 +305,42 @@ jobs:
             fi
           done
 
+  # Promote the platform-specific relay artifacts only for a trusted main-branch
+  # push after the complete CI dependency set succeeds. Pull requests still
+  # exercise and stage every native build, but never produce operator-facing
+  # offline signing inputs.
+  promote-native-control-signing-inputs:
+    if: ${{ success() && github.repository == 'kogangdon/gjc-remote' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: [suite, bot-container-contract, daemon-container-contract]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x64, linux-arm64, win32-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download staged native-control build output
+        uses: actions/download-artifact@v4
+        with:
+          name: native-control-staging-${{ matrix.target }}
+          path: ${{ runner.temp }}/native-control-staging/${{ matrix.target }}
+
+      - name: Publish unsigned native-control signing input
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-control-unsigned-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/native-control-staging/${{ matrix.target }}/native_control.node
+            ${{ runner.temp }}/native-control-staging/${{ matrix.target }}/native-control.manifest.json
+
   # Aggregate gate. `test` is the required status check on main, so it must stay a
   # single stable context name even though the suite now fans out across a matrix.
-  # It fails unless every matrix leg succeeded, so a skipped or failed leg cannot
-  # be merged past.
+  # Every test dependency must succeed. Promotion must succeed for a main push;
+  # only a pull request may intentionally skip it.
   test:
     if: always()
-    needs: [suite, bot-container-contract, daemon-container-contract]
+    needs: [suite, bot-container-contract, daemon-container-contract, promote-native-control-signing-inputs]
     runs-on: ubuntu-latest
     steps:
       - name: Require every matrix leg to succeed
@@ -313,6 +348,15 @@ jobs:
           echo "suite result: ${{ needs.suite.result }}"
           echo "bot container contract result: ${{ needs.bot-container-contract.result }}"
           echo "daemon container contract result: ${{ needs.daemon-container-contract.result }}"
+          echo "native-control signing input promotion result: ${{ needs.promote-native-control-signing-inputs.result }}"
           test "${{ needs.suite.result }}" = "success"
           test "${{ needs.bot-container-contract.result }}" = "success"
           test "${{ needs.daemon-container-contract.result }}" = "success"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "${{ needs.promote-native-control-signing-inputs.result }}" = "skipped"
+          else
+            test "${{ github.repository }}" = "kogangdon/gjc-remote"
+            test "${{ github.event_name }}" = "push"
+            test "${{ github.ref }}" = "refs/heads/main"
+            test "${{ needs.promote-native-control-signing-inputs.result }}" = "success"
+          fi
