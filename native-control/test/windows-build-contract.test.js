@@ -25,6 +25,9 @@ const nativeBuildFiles = [
   'native-control.manifest.json',
 ];
 const nativeArtifactRerunWindowDays = 7;
+const trustedPromotionRepository = 'kogangdon/gjc-remote';
+const trustedPromotionEvent = 'push';
+const trustedPromotionRef = 'refs/heads/main';
 
 function namedStep(job, name) {
   const matches = job.steps.filter((step) => step.name === name);
@@ -34,6 +37,53 @@ function namedStep(job, name) {
 
 function blockScalarLines(value) {
   return value.trim().split('\n');
+}
+
+function evaluateConjunctiveWorkflowCondition(condition, context) {
+  const wrappedExpression = condition.match(/^\$\{\{\s*(.*?)\s*\}\}$/);
+  assert.ok(wrappedExpression, `invalid workflow condition: ${condition}`);
+
+  return wrappedExpression[1].split(/\s*&&\s*/).every((term) => {
+    if (term === 'success()') {
+      return context.dependenciesSucceeded;
+    }
+
+    const comparison = term.match(
+      /^github\.(repository|event_name|ref) == '([^']+)'$/,
+    );
+    assert.ok(comparison, `unsupported workflow condition term: ${term}`);
+    const actual = {
+      repository: context.repository,
+      event_name: context.eventName,
+      ref: context.ref,
+    }[comparison[1]];
+    return actual === comparison[2];
+  });
+}
+
+function aggregateGateAccepts({
+  repository,
+  eventName,
+  ref,
+  suiteResult = 'success',
+  botContainerResult = 'success',
+  daemonContainerResult = 'success',
+  promotionResult,
+}) {
+  return [
+    suiteResult,
+    botContainerResult,
+    daemonContainerResult,
+  ].every((result) => result === 'success')
+    && (
+      (eventName === 'pull_request' && promotionResult === 'skipped')
+      || (
+        repository === trustedPromotionRepository
+        && eventName === trustedPromotionEvent
+        && ref === trustedPromotionRef
+        && promotionResult === 'success'
+      )
+    );
 }
 
 test('Windows Release build replaces inherited options with deterministic linker flags', () => {
@@ -65,9 +115,11 @@ test('Windows Release build replaces inherited options with deterministic linker
   }
 });
 
-test('CI promotes target-preserving signing inputs only after every dependency succeeds', () => {
+test('CI promotes target-preserving signing inputs only for successful main pushes', () => {
   const { jobs } = workflowContract;
   const suite = jobs.suite;
+  assert.deepEqual(workflowContract.on.push.branches, ['main']);
+  assert.deepEqual(workflowContract.on.pull_request.branches, ['main']);
   const expectedSuiteLegs = [
     { os: 'ubuntu-latest', target: 'linux-x64' },
     { os: 'ubuntu-24.04-arm', target: 'linux-arm64' },
@@ -115,7 +167,62 @@ test('CI promotes target-preserving signing inputs only after every dependency s
     'daemon-container-contract',
   ];
   assert.deepEqual(promotion.needs, requiredDependencies);
-  assert.equal(promotion.if, '${{ success() }}');
+  assert.equal(
+    promotion.if,
+    "${{ success() && github.repository == 'kogangdon/gjc-remote'"
+      + " && github.event_name == 'push'"
+      + " && github.ref == 'refs/heads/main' }}",
+  );
+  for (const [
+    repository,
+    eventName,
+    ref,
+    dependenciesSucceeded,
+    expected,
+  ] of [
+    [
+      trustedPromotionRepository,
+      'pull_request',
+      'refs/pull/246/merge',
+      true,
+      false,
+    ],
+    [
+      trustedPromotionRepository,
+      trustedPromotionEvent,
+      trustedPromotionRef,
+      true,
+      true,
+    ],
+    [
+      'untrusted/fork',
+      trustedPromotionEvent,
+      trustedPromotionRef,
+      true,
+      false,
+    ],
+    [
+      trustedPromotionRepository,
+      trustedPromotionEvent,
+      'refs/heads/release-candidate',
+      true,
+      false,
+    ],
+    [
+      trustedPromotionRepository,
+      trustedPromotionEvent,
+      trustedPromotionRef,
+      false,
+      false,
+    ],
+  ]) {
+    assert.equal(evaluateConjunctiveWorkflowCondition(promotion.if, {
+      dependenciesSucceeded,
+      repository,
+      eventName,
+      ref,
+    }), expected);
+  }
   assert.equal(promotion['runs-on'], 'ubuntu-latest');
   assert.equal(promotion.strategy['fail-fast'], false);
   assert.deepEqual(promotion.strategy.matrix.target, nativeTargets);
@@ -209,20 +316,74 @@ test('CI promotes target-preserving signing inputs only after every dependency s
     aggregateGate,
     'Require every matrix leg to succeed',
   ).run;
-  for (const dependency of aggregateGate.needs) {
+  for (const dependency of requiredDependencies) {
     assert.ok(gateRun.includes(
       `test "\${{ needs.${dependency}.result }}" = "success"`,
     ));
   }
+  assert.ok(gateRun.includes([
+    'if [[ "${{ github.event_name }}" == "pull_request" ]]; then',
+    '  test "${{ needs.promote-native-control-signing-inputs.result }}" = "skipped"',
+    'else',
+    '  test "${{ github.repository }}" = "kogangdon/gjc-remote"',
+    '  test "${{ github.event_name }}" = "push"',
+    '  test "${{ github.ref }}" = "refs/heads/main"',
+    '  test "${{ needs.promote-native-control-signing-inputs.result }}" = "success"',
+    'fi',
+  ].join('\n')));
+
+  const pullRequestGate = {
+    repository: trustedPromotionRepository,
+    eventName: 'pull_request',
+    ref: 'refs/pull/246/merge',
+    promotionResult: 'skipped',
+  };
+  assert.equal(aggregateGateAccepts(pullRequestGate), true);
+  for (const failedResult of [
+    'suiteResult',
+    'botContainerResult',
+    'daemonContainerResult',
+  ]) {
+    assert.equal(
+      aggregateGateAccepts({ ...pullRequestGate, [failedResult]: 'failure' }),
+      false,
+      `pull request must reject ${failedResult}=failure`,
+    );
+  }
+  assert.equal(aggregateGateAccepts({
+    ...pullRequestGate,
+    promotionResult: 'success',
+  }), false);
+
+  const mainPushGate = {
+    repository: trustedPromotionRepository,
+    eventName: trustedPromotionEvent,
+    ref: trustedPromotionRef,
+    promotionResult: 'success',
+  };
+  assert.equal(aggregateGateAccepts(mainPushGate), true);
+  assert.equal(aggregateGateAccepts({
+    ...mainPushGate,
+    promotionResult: 'skipped',
+  }), false);
+  assert.equal(aggregateGateAccepts({
+    ...mainPushGate,
+    repository: 'untrusted/fork',
+  }), false);
+  assert.equal(aggregateGateAccepts({
+    ...mainPushGate,
+    ref: 'refs/heads/release-candidate',
+  }), false);
 });
 
-test('signing instructions reject staging artifacts and require overall CI success', () => {
+test('signing instructions require trusted main-push provenance and authorization', () => {
   const signingArtifactNames = [
     'native-control-unsigned-linux-x64',
     'native-control-unsigned-linux-arm64',
     'native-control-unsigned-win32-x64',
   ];
-  for (const documentation of [nativeControlReadme, dockerBotReadme]) {
+  for (const source of [nativeControlReadme, dockerBotReadme]) {
+    const documentation = source.replace(/\s+/g, ' ');
     for (const artifactName of signingArtifactNames) {
       assert.match(documentation, new RegExp(`\`${artifactName}\``));
     }
@@ -232,7 +393,16 @@ test('signing instructions reject staging artifacts and require overall CI succe
     );
     assert.match(
       documentation,
-      /overall CI\s+workflow conclusion is `success`/i,
+      /overall CI\s+workflow conclusion of `success`/i,
+    );
+    assert.match(documentation, /trusted repository `kogangdon\/gjc-remote`/i);
+    assert.match(documentation, /event is exactly `push`/i);
+    assert.match(documentation, /exact source commit/i);
+    assert.match(documentation, /source ref is exactly `refs\/heads\/main`/i);
+    assert.match(documentation, /explicit release authorization/i);
+    assert.match(
+      documentation,
+      /successful `pull_request` workflow[\s\S]{0,200}(?:not|neither)[\s\S]{0,100}release provenance/i,
     );
     assert.match(
       documentation,

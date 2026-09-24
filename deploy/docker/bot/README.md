@@ -32,14 +32,23 @@ Each CI suite leg first uploads a seven-day platform-specific
 can exist before the container jobs and promotion matrix finish, and must never
 be signed.
 
-After every suite and container-contract matrix succeeds, CI promotes a
-seven-day signing-input artifact containing the addon and manifest:
+Pull requests exercise these staging paths, but promotion is intentionally
+skipped. Only a `push` run whose source ref is exactly `refs/heads/main`, and
+whose every suite and container-contract matrix succeeds, promotes a seven-day
+signing-input artifact containing the addon and manifest:
 `native-control-unsigned-linux-x64` for amd64, or
 `native-control-unsigned-linux-arm64` for arm64. The separate Windows promotion
 publishes `native-control-unsigned-win32-x64`; that bundle is not compatible
-with this Linux-only Docker image. Before signing, check that the overall CI
-workflow conclusion is `success`; the presence of an individual artifact is not
-sufficient.
+with this Linux-only Docker image.
+
+Before signing, verify from GitHub's run metadata that the run belongs to the
+trusted repository `kogangdon/gjc-remote`, its event is exactly `push`, its exact
+source commit matches the proposed release commit, and its source ref is exactly
+`refs/heads/main`. Require both an overall CI workflow conclusion of `success`
+and separate explicit release authorization for that exact commit and ref. A
+green workflow, including a successful `pull_request` workflow from an untrusted
+source, is neither release provenance nor release authorization; the presence
+of an individual artifact is not sufficient.
 
 The supported artifact-backed rerun window is seven days from staging upload.
 Within that window, a failed promotion can reuse a retained staging artifact.

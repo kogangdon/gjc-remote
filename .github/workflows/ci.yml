@@ -305,11 +305,12 @@ jobs:
             fi
           done
 
-  # Promote the platform-specific relay artifacts only after the complete CI
-  # dependency set succeeds. These are the operator-facing offline signing
-  # inputs; the short-lived staging artifacts above must never be signed.
+  # Promote the platform-specific relay artifacts only for a trusted main-branch
+  # push after the complete CI dependency set succeeds. Pull requests still
+  # exercise and stage every native build, but never produce operator-facing
+  # offline signing inputs.
   promote-native-control-signing-inputs:
-    if: ${{ success() }}
+    if: ${{ success() && github.repository == 'kogangdon/gjc-remote' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     needs: [suite, bot-container-contract, daemon-container-contract]
     strategy:
       fail-fast: false
@@ -335,8 +336,8 @@ jobs:
 
   # Aggregate gate. `test` is the required status check on main, so it must stay a
   # single stable context name even though the suite now fans out across a matrix.
-  # It fails unless every matrix leg and signing-input promotion succeeded, so a
-  # skipped or failed leg cannot be merged past.
+  # Every test dependency must succeed. Promotion must succeed for a main push;
+  # only a pull request may intentionally skip it.
   test:
     if: always()
     needs: [suite, bot-container-contract, daemon-container-contract, promote-native-control-signing-inputs]
@@ -351,4 +352,11 @@ jobs:
           test "${{ needs.suite.result }}" = "success"
           test "${{ needs.bot-container-contract.result }}" = "success"
           test "${{ needs.daemon-container-contract.result }}" = "success"
-          test "${{ needs.promote-native-control-signing-inputs.result }}" = "success"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "${{ needs.promote-native-control-signing-inputs.result }}" = "skipped"
+          else
+            test "${{ github.repository }}" = "kogangdon/gjc-remote"
+            test "${{ github.event_name }}" = "push"
+            test "${{ github.ref }}" = "refs/heads/main"
+            test "${{ needs.promote-native-control-signing-inputs.result }}" = "success"
+          fi
