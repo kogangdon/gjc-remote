@@ -364,6 +364,62 @@ Local Windows checks produced identical binaries across two clean builds at
 one path. A build at a different checkout path still differed, despite the
 normalized embedded PDB filename. Cross-path reproducibility is not established.
 
+### Automated signed native verification
+
+`Signed native verification` is a manual-only Actions workflow. It runs the
+existing signed bytes on native Linux x64 (`ubuntu-24.04`), Linux ARM64
+(`ubuntu-24.04-arm`), and Windows x64 (`windows-2022`) runners with Node 26.7.0
+and Bun 1.4.2. Runner availability remains subject to repository entitlement.
+It has only read permissions and does not sign, build, publish, or install
+services.
+
+Dispatch `.github/workflows/signed-native-verification.yml` with:
+
+- The workflow must first land on the default `main` branch through an
+  authorized reviewed PR before GitHub exposes manual dispatch. Verification
+  requires dispatch from the exact current main workflow revision; feature
+  branches and stale workflow revisions are refused.
+- `source_run_id`: a completed successful trusted main `CI` push run.
+- `source_commit`: that run's exact 40-character commit.
+- `signatures_json`: one JSON object keyed by `linux-x64`, `linux-arm64`, and
+  `win32-x64`, whose values are the existing public
+  `native-control.manifest.json.sig` sidecars. Never submit private keys.
+
+The workflow refuses foreign repositories, PR runs, different commits,
+non-main runs, unsuccessful runs, missing/ambiguous/expired inputs, and staging
+artifacts. It downloads the three promoted `native-control-unsigned-*`
+artifacts from the specified run. No rebuild or re-signing occurs: signatures
+must verify over those exact manifest bytes against committed production trust.
+The checked-out verifier/trust revision is recorded separately from the
+artifact source commit; a commit label is not embedded source provenance.
+Expired inputs require the existing full-CI rerun procedure, not a trust bypass.
+
+The verifier checks platform identity, addon hash and manifest contract,
+production signature, normal loader exports, and in-memory tampering rejection
+for addon, manifest, and signature. Per-platform artifacts preserve Node/Bun
+receipts and source-run metadata even when a later step fails. A partial
+receipt artifact is not a passing matrix: require all three jobs and both
+runtime receipts to succeed. A missing receipt or failed job is not success.
+
+For local verification of an already signed directory:
+
+```sh
+node scripts/verify-signed-native.mjs --input-dir /path/to/signed-target \
+  --target linux-x64 --source-commit <40-character-commit> --output /new/receipt.json
+```
+
+Use `bun` instead of `node` for the second runtime. Receipt paths must be new;
+the signed originals are not overwritten. The repository's shared workspace
+package must be resolvable. The workflow links only that local package and
+does not install or execute the SDK dependency tree.
+
+This establishes signed native runtime compatibility, not an independent
+source rebuild, application/Shawl signing, service lifecycle evidence, or
+release authorization. Local Node 26.7.0 container validation found the current
+Linux x64 addon requires `GLIBC_2.38`: Debian Bookworm could not load it;
+Debian Trixie/glibc 2.41 loaded it. Do not infer compatibility with every Linux
+distribution from the Ubuntu runner result.
+
 ## Unsigned application release tooling
 
 Repository-local `build:service-release` and `verify:service-release` npm scripts
