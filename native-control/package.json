@@ -30,7 +30,7 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "@gjc-remote/shared": "0.4.0-rc.1",
+    "@gjc-remote/shared": "0.4.0-rc.2",
     "tar": "7.5.22"
   },
   "devDependencies": {

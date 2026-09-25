@@ -431,6 +431,10 @@ Output must be a new directory outside the source tree.
 
 `deploy/native/release-contract.json` fixes the repository, release tag, supported
 tuples, Bun 1.4.2 recipe, runtime versions, source selection, and format registry.
+The current candidate contract is `v0.4.0-rc.2`. The tag workflow uses the same
+Bun 1.4.2 producer version. Existing rc.1 releases and artifacts remain historical
+inputs, not renamed rc.2 candidates; every rc.2 application archive must be built
+from a clean checkout of the exact rc.2 tag.
 The source must be clean Git state at that tag with canonical `bun.lock` and
 both separate public trust resources tracked. Git hooks/fsmonitor and replacement
 objects cannot supply authority; configured executable filters refuse before

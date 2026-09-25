@@ -30,6 +30,13 @@ test("tag workflow creates only a draft release", async () => {
   );
 });
 
+test("tag workflow uses the canonical candidate producer Bun version", async () => {
+  const workflow = await readFile(new URL("../../.github/workflows/release.yml", import.meta.url), "utf8");
+  const contract = JSON.parse(await readFile(new URL("../../deploy/native/release-contract.json", import.meta.url), "utf8"));
+  const versions = [...workflow.matchAll(/bun-version:\s*'([^']+)'/g)].map(match => match[1]);
+  assert.deepEqual(versions, [contract.producer.bunVersion]);
+});
+
 // --- --no-verify / --push exclusivity ---------------------------------------
 
 test("checkFlagExclusivity rejects --no-verify combined with --push", () => {
