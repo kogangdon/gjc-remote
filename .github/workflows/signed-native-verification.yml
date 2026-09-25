@@ -1,0 +1,170 @@
+name: Signed native verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful trusted main CI run containing promoted unsigned inputs
+        required: true
+        type: string
+      source_commit:
+        description: Exact 40-character source commit approved for verification
+        required: true
+        type: string
+      signatures_json:
+        description: Public signature sidecar object keyed by linux-x64, linux-arm64, win32-x64 (never private keys)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      verifier-commit: ${{ steps.source.outputs.verifier-commit }}
+      source-commit: ${{ steps.source.outputs.source-commit }}
+      source-run-id: ${{ steps.source.outputs.source-run-id }}
+    steps:
+      - name: Validate trusted main CI source
+        id: source
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        with:
+          script: |
+            const repository = 'kogangdon/gjc-remote';
+            if (`${context.repo.owner}/${context.repo.repo}` !== repository) throw new Error('Untrusted repository');
+            if (context.ref !== 'refs/heads/main' || !/^[0-9a-f]{40}$/.test(context.sha) ||
+                context.sha !== process.env.WORKFLOW_SHA) throw new Error('Verifier must be exact main workflow revision');
+            const { data: main } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
+            if (main.object?.sha !== context.sha) throw new Error('Verifier must be current main');
+            const runId = process.env.SOURCE_RUN_ID;
+            const commit = process.env.SOURCE_COMMIT;
+            if (!/^[1-9][0-9]{0,15}$/.test(runId) || !Number.isSafeInteger(Number(runId))) throw new Error('Invalid run id');
+            if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('Invalid source commit');
+            const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: Number(runId) });
+            if (run.repository?.full_name !== repository || run.head_repository?.full_name !== repository ||
+                run.event !== 'push' || run.head_branch !== 'main' || run.head_sha !== commit ||
+                run.status !== 'completed' || run.conclusion !== 'success' || run.path !== '.github/workflows/ci.yml') {
+              throw new Error('Source must be the exact successful trusted main CI push');
+            }
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: Number(runId), per_page: 100,
+            });
+            for (const target of ['linux-x64', 'linux-arm64', 'win32-x64']) {
+              const matches = artifacts.filter(a => a.name === `native-control-unsigned-${target}`);
+              if (matches.length !== 1 || matches[0].expired || matches[0].workflow_run?.head_sha !== commit) {
+                throw new Error(`Missing, ambiguous, expired, or mismatched promoted input: ${target}`);
+              }
+            }
+            core.setOutput('source-commit', commit);
+            core.setOutput('source-run-id', runId);
+            core.setOutput('verifier-commit', context.sha);
+
+  verify:
+    needs: validate
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: windows-2022
+            target: win32-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout verifier and committed production trust
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.validate.outputs.verifier-commit }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '26.7.0'
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.2'
+
+      - name: Download exact promoted input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-control-unsigned-${{ matrix.target }}
+          path: verification-input
+          github-token: ${{ github.token }}
+          repository: kogangdon/gjc-remote
+          run-id: ${{ needs.validate.outputs.source-run-id }}
+
+      - name: Prepare public signatures and shared package
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SIGNATURES_JSON: ${{ inputs.signatures_json }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const { pathToFileURL } = require('node:url');
+            fs.mkdirSync('node_modules/@gjc-remote', { recursive: true });
+            fs.symlinkSync(path.resolve('shared'), 'node_modules/@gjc-remote/shared', process.platform === 'win32' ? 'junction' : 'dir');
+            const { parseSignaturesJson } = await import(pathToFileURL(path.resolve('scripts/verify-signed-native.mjs')).href);
+            const text = process.env.SIGNATURES_JSON;
+            parseSignaturesJson(text);
+            fs.writeFileSync('verification-signatures.json', text, { flag: 'wx' });
+            fs.mkdirSync('verification-results');
+            fs.writeFileSync('verification-results/source.json', JSON.stringify({
+              repository: 'kogangdon/gjc-remote',
+              sourceRunId: '${{ needs.validate.outputs.source-run-id }}',
+              sourceCommit: '${{ needs.validate.outputs.source-commit }}',
+              verifierCommit: '${{ needs.validate.outputs.verifier-commit }}',
+              verificationRunId: context.runId,
+              runnerOS: process.env.RUNNER_OS,
+              runnerArchitecture: process.env.RUNNER_ARCH,
+              scope: 'Native signature and runtime contract only; no service lifecycle or independent rebuild proof',
+            }, null, 2), { flag: 'wx' });
+
+      - name: Verify signed addon with Node
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source-commit }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: >-
+          node scripts/verify-signed-native.mjs
+          --input-dir verification-input --target "$TARGET"
+          --source-commit "$SOURCE_COMMIT"
+          --signatures-file verification-signatures.json
+          --output verification-results/node.json
+
+      - name: Verify signed addon with Bun
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source-commit }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: >-
+          bun scripts/verify-signed-native.mjs
+          --input-dir verification-input --target "$TARGET"
+          --source-commit "$SOURCE_COMMIT"
+          --signatures-file verification-signatures.json
+          --output verification-results/bun.json
+
+      - name: Preserve verification receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-native-verification-${{ matrix.target }}-${{ github.run_attempt }}
+          path: verification-results/*.json
+          if-no-files-found: warn
+          retention-days: 30
