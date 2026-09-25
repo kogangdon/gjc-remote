@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.2] - 2026-09-25
+
+### Signed native verification and candidate preparation
+
+- Add manual verification of existing production-signed native inputs on Linux
+  x64, Linux ARM64, and Windows x64 with Node 26.7.0 and Bun 1.4.2. Validate
+  trusted source runs, production signatures, hashes, capability contracts,
+  real loader behavior, and tamper rejection without private keys or deployment.
+- Align application workspace versions and the canonical candidate builder
+  contract with `v0.4.0-rc.2`; align the tag workflow with the Bun 1.4.2 producer.
+  Candidates remain draft prereleases, not service lifecycle or GA evidence.
+- Bound smoke heartbeat timeout configuration and require a pong from the
+  current connection using monotonic deadlines. The intermittent real-SDK
+  disconnect investigation remains deferred in issue #247; this is not a
+  claimed fix for its underlying cause.
+
 ### Native addon build reproducibility
 
 - Windows Release linking now preserves the intentional node-gyp option

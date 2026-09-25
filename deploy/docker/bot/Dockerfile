@@ -19,7 +19,7 @@ RUN bun install --frozen-lockfile --production --ignore-scripts \
 FROM native_control_bundle AS signed-native
 
 FROM ${NODE_IMAGE} AS runtime
-ARG VERSION=0.4.0-rc.1
+ARG VERSION=0.4.0-rc.2
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="gjc-remote bot" \
       org.opencontainers.image.version="${VERSION}" \
