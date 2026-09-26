@@ -707,6 +707,11 @@ test('Linux facade and Windows HOME binding fail safely without exercising host 
   assert.match(source, /add\("USERPROFILE", launch\.home_directory\);/);
   assert.match(
     source,
+    /\{"HOME", launch\.home_directory\},\s*\{"USERPROFILE", launch\.home_directory\},/,
+    'the emitted --env vector binds HOME and USERPROFILE, not only the policy-fingerprint map',
+  );
+  assert.match(
+    source,
     /arguments\.push_back\("--env"\);\s*arguments\.push_back\(entry\.first \+ "=" \+ entry\.second\);/,
   );
   assert.match(
