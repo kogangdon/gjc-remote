@@ -111,7 +111,9 @@ test("public inventory adapters and service facade do not expose low-level helpe
     "createInventoryReader",
     "createManagementNative",
     "createResidualProcessEnumerator",
+    "createSelfProcessObserver",
     "createServiceNative",
+    "createServiceStartupObserver",
     "validateBuildManifest",
   ]);
   assert.equal(typeof publicApi.createContainmentLowLevel, "function");

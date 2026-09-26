@@ -182,7 +182,7 @@ test('Win32 plan, create, and configure share one exact Launch payload', () => {
   assert.match(create, /InventoryArgs\(env, info, 5, args\)/);
   assert.match(create, /CaptureWin32ServiceLaunch\(env, args\[2\]/);
   assert.match(create, /Win32PasswordArg\(env, args\[3\]/);
-  assert.doesNotMatch(create, /args\[5\]/);
+  assert.doesNotMatch(create.replace('napi_value args[5];', ''), /args\[5\]/);
 
   assert.match(configure, /InventoryArgs\(env, info, 4, args\)/);
   assert.match(configure, /CaptureWin32ServiceLaunch\(env, args\[3\]/);

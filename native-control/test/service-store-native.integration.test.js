@@ -703,11 +703,15 @@ test('Linux facade and Windows HOME binding fail safely without exercising host 
     );
   }
   const source = readFileSync(sourcePath, 'utf8');
-  assert.match(source, /"--env", "HOME=" \+ launch->home_directory/);
-  assert.match(source, /"--env", "USERPROFILE=" \+ launch->home_directory/);
+  assert.match(source, /add\("HOME", launch\.home_directory\);/);
+  assert.match(source, /add\("USERPROFILE", launch\.home_directory\);/);
   assert.match(
     source,
-    /arguments\.push_back\(launch->runtime_path\);\s*if \(role == "daemon"\) arguments\.push_back\("--no-env-file"\);\s*arguments\.push_back\(launch->entrypoint_path\);/,
+    /arguments\.push_back\("--env"\);\s*arguments\.push_back\(entry\.first \+ "=" \+ entry\.second\);/,
+  );
+  assert.match(
+    source,
+    /if \(role == "bot"\) \{\s*return \{launch\.runtime_path, launch\.entrypoint_path\};\s*\}\s*return \{launch\.runtime_path, "--config", launch\.runtime_config_path,\s*"--no-env-file", launch\.entrypoint_path\};/,
     'only the Bun daemon suppresses automatic dotenv layers before the entrypoint',
   );
   assert.doesNotMatch(source, /wrapperEpochObserved/);
