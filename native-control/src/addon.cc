@@ -10617,9 +10617,13 @@ bool WindowsPrincipalHasDirectoryAccess(
   PSID sid = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   PACL dacl = nullptr;
+  // AuthzAccessCheck rejects a descriptor without owner and group
+  // (ERROR_INVALID_PARAMETER), so the full access-check triple is required.
   if (!ConvertStringSidToSidW(Wide(sid_text).c_str(), &sid) ||
       GetSecurityInfo(
-          directory, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+          directory, SE_FILE_OBJECT,
+          OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+              DACL_SECURITY_INFORMATION,
           nullptr, nullptr, &dacl, nullptr, &descriptor) !=
           ERROR_SUCCESS ||
       !dacl) {
@@ -15830,9 +15834,14 @@ bool ServiceSelfDenyCurrentAccess(
     HANDLE object, const ACCESS_MASK* forbidden, size_t forbidden_count) {
   PACL dacl = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
+  // AccessCheck fails with ERROR_INVALID_SECURITY_DESCR unless the
+  // descriptor carries owner and group; the owner also contributes its
+  // implicit WRITE_DAC, which a takeover-denial proof must observe.
   if (object == INVALID_HANDLE_VALUE ||
       GetSecurityInfo(
-          object, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+          object, SE_FILE_OBJECT,
+          OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+              DACL_SECURITY_INFORMATION,
           nullptr, nullptr, &dacl, nullptr, &descriptor) != ERROR_SUCCESS ||
       descriptor == nullptr) {
     if (descriptor) LocalFree(descriptor);

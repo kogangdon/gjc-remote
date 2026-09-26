@@ -91,6 +91,16 @@ producer never creates, copies, or relaxes them:
   config path.
 - The exact Node/Bun runtime binary at `runtimePath`, whose hash is bound into
   the Launch.
+- Every ancestor of `workingDirectory`, including the drive root, must grant
+  the service account `READ_CONTROL` and traversal but deny it write-data,
+  write-EA, write-attributes, delete, delete-child, `WRITE_DAC` and
+  `WRITE_OWNER`, and must not be owned by it; the working directory itself
+  must also deny append/add-subdirectory. The service re-proves this chain on
+  every start and refuses with `SERVICE_ACCESS_DENIED` otherwise. Default ACLs
+  commonly fail it: a non-system drive root grants `Authenticated Users`
+  Modify, and `C:\ProgramData` grants `Users` write-data. Install does not yet
+  preflight this chain, so provision it explicitly (for example a protected
+  top-level directory on the system drive).
 
 Install reads and validates these write-free before any mutation. Other
 operations reuse the configuration retained in the current service manifest

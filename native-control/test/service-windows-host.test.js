@@ -63,8 +63,16 @@ function fakeNative(files) {
     },
     read_service_external_object(handle, relative, mode, maximum) {
       calls.push(['read', `${handle.absolutePath}\\${relative}`, mode, maximum]);
+      // Mirror the native argument contract: bytes reads need 1..1 MiB.
+      if (mode === 'bytes' && (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 1024 * 1024)) {
+        throw Object.assign(new Error('read_service_external_object failed'), { code: 'SERVICE_INVALID', reason: 'invalid-input', writes: 0 });
+      }
       const file = files[`${handle.absolutePath}\\${relative}`];
+      if (file?.error) throw Object.assign(new Error('read_service_external_object failed'), { ...file.error, writes: 0 });
       if (file === undefined) return { kind: 'absent', identity: null, absence: { kind: 'absent' }, bytes: null, entries: null, writes: 0 };
+      if (Buffer.byteLength(file.text) > maximum) {
+        throw Object.assign(new Error('read_service_external_object failed'), { code: 'SERVICE_OUTPUT_LIMIT', reason: 'limit', writes: 0 });
+      }
       return { kind: 'file', identity: identity(file.fileId), absence: null, bytes: Buffer.from(file.text), entries: null, writes: 0 };
     },
     close_service_handle(handle) { calls.push(['close', handle.id]); handles -= 1; },
@@ -79,10 +87,10 @@ function fakeNative(files) {
   return { native, calls, openHandles: () => handles };
 }
 
-function harness({ component = 'bot', env = 'DISCORD_TOKEN=secret\n', bunfig = '', scope } = {}) {
+function harness({ component = 'bot', env = 'DISCORD_TOKEN=secret\n', bunfig = '', bunfigError, scope } = {}) {
   const configuration = component === 'bot' ? botConfiguration : daemonConfiguration;
   const files = { [`${configuration.workingDirectory}\\.env`]: { fileId: 'c'.repeat(32), text: env } };
-  if (component === 'daemon') files[`${configuration.workingDirectory}\\runtime-config\\.bunfig.toml`] = { fileId: 'd'.repeat(32), text: bunfig };
+  if (component === 'daemon') files[`${configuration.workingDirectory}\\runtime-config\\.bunfig.toml`] = { fileId: 'd'.repeat(32), text: bunfig, error: bunfigError };
   const fake = fakeNative(files);
   const drivers = [];
   const compatibility = [];
@@ -216,6 +224,10 @@ test('daemon Launch binds runtime config identities, SDK profile and exact targe
   const h = harness({ component: 'daemon', env: 'HOST_ID=host-a\nBOT_WS_URL=wss://bot.example/ws\nHOST_TOKEN=t\n' });
   const operation = h.create();
   await operation.effectiveConfigPreflight(context(h));
+  assert.deepEqual(
+    h.fake.calls.filter(([kind, path]) => kind === 'read' && path.endsWith('.bunfig.toml')),
+    [['read', 'C:\\GJC\\daemon\\runtime-config\\.bunfig.toml', 'bytes', 1]],
+  );
   const options = operation.lifecycleOptions(context(h));
   options.createWindowsDriver({ session: session(daemonKey), request: h.request, release: releaseFor('daemon'), locks: {} });
   const { launch } = h.drivers[0];
@@ -243,7 +255,15 @@ test('reserved, conflicting or invalid effective config refuses write-free at pr
   const daemon = harness({ component: 'daemon', env: 'HOST_ID=a\n' });
   await refusal(daemon.create().effectiveConfigPreflight(context(daemon)), 'SERVICE_INVALID', 'daemon-target-invalid');
   const bunfig = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', bunfig: 'x' });
-  await refusal(bunfig.create().effectiveConfigPreflight(context(bunfig)), 'SERVICE_STALE');
+  await refusal(bunfig.create().effectiveConfigPreflight(context(bunfig)), 'SERVICE_INVALID', 'runtime-config-policy');
+  const largeBunfig = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', bunfig: 'xy' });
+  await refusal(largeBunfig.create().effectiveConfigPreflight(context(largeBunfig)), 'SERVICE_INVALID', 'runtime-config-policy');
+  // Only the size limit is a policy verdict; other native failures propagate unchanged.
+  for (const error of [{ code: 'SERVICE_ACCESS_DENIED', reason: 'access' }, { code: 'SERVICE_STALE', reason: 'identity' }]) {
+    const failing = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', bunfigError: error });
+    await assert.rejects(failing.create().effectiveConfigPreflight(context(failing)),
+      (thrown) => thrown.code === error.code && thrown.reason === error.reason);
+  }
   const scope = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', scope: { scopeFingerprint: hex('4'), sdkProfileRoot: null } });
   await refusal(scope.create().effectiveConfigPreflight(context(scope)), 'SERVICE_PENDING', 'scope-catalog');
 });

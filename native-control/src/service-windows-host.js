@@ -34,7 +34,10 @@ import {
 
 export const WINDOWS_HOST_LIMITS = Object.freeze({
   envBytes: 256 * 1024,
-  runtimeConfigBytes: 0,
+  // The policy requires an empty .bunfig.toml, but native bytes reads require
+  // a positive maximum. One byte is the smallest read that still proves
+  // emptiness; any content is refused by runtime-config-policy below.
+  runtimeConfigBytes: 1,
   runtimeBytes: 512 * 1024 * 1024,
 });
 
@@ -173,7 +176,14 @@ function captureAuthority(dependencies, native, { component, serviceKey, roles, 
   let runtimeConfig = null;
   if (component === 'daemon') {
     const root = `${workingDirectory}\\runtime-config`;
-    const file = readProtectedFile(native, root, '.bunfig.toml', WINDOWS_HOST_LIMITS.runtimeConfigBytes, operation);
+    let file;
+    try {
+      file = readProtectedFile(native, root, '.bunfig.toml', WINDOWS_HOST_LIMITS.runtimeConfigBytes, operation);
+    } catch (error) {
+      // Content longer than the one-byte probe is a policy violation, not I/O.
+      if (error?.code === 'SERVICE_OUTPUT_LIMIT') refuse('SERVICE_INVALID', operation, 'runtime-config-policy');
+      throw error;
+    }
     if (file.bytes.byteLength !== 0) refuse('SERVICE_INVALID', operation, 'runtime-config-policy');
     runtimeConfig = Object.freeze({
       root,

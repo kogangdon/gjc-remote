@@ -233,3 +233,33 @@ test('native malformed handle/profile tuples fail before observation and report 
     );
   }
 });
+
+test('every Windows access check receives a descriptor with owner, group and DACL', () => {
+  // AuthzAccessCheck (ERROR_INVALID_PARAMETER) and AccessCheck
+  // (ERROR_INVALID_SECURITY_DESCR) reject owner-less or group-less
+  // descriptors, which silently denied every bootstrap-anchor traversal proof
+  // and every service self-observation.
+  const functionStart = /^(?:static )?(?:bool|napi_value|[A-Za-z_][\w:<>]*) [A-Za-z_]\w*\([^;]*?\)\s*\{/gm;
+  const starts = [...source.matchAll(functionStart)].map((match) => match.index);
+  const calls = [...source.matchAll(/\b(?:Authz)?AccessCheck\(/g)];
+  const functions = new Set();
+  for (const call of calls) {
+    const start = starts.filter((offset) => offset < call.index).at(-1);
+    assert.notEqual(start, undefined, `enclosing function for access check at offset ${call.index}`);
+    functions.add(start);
+    const body = source.slice(start, call.index);
+    const argsEnd = source.indexOf(';', call.index);
+    const args = source.slice(call.index, argsEnd);
+    const descriptor = call[0].startsWith('Authz')
+      ? args.split(',')[4].trim()
+      : args.slice(call[0].length).split(',')[0].trim();
+    const queries = [...body.matchAll(/GetSecurityInfo\(([^;]*?)&(\w+)\)/g)]
+      .filter((query) => query[2] === descriptor);
+    assert.equal(queries.length, 1, `one GetSecurityInfo fills ${descriptor} before access check at offset ${call.index}`);
+    for (const flag of ['OWNER_SECURITY_INFORMATION', 'GROUP_SECURITY_INFORMATION', 'DACL_SECURITY_INFORMATION']) {
+      assert.ok(queries[0][1].includes(flag), `${flag} requested for access check at offset ${call.index}`);
+    }
+  }
+  assert.equal(calls.length, 4, 'all Windows access-check calls are covered');
+  assert.equal(functions.size, 3, 'all Windows access-check functions are covered');
+});

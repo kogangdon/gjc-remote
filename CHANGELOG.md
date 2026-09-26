@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signed-addon, SCM, account/ACL, reboot, or actual service lifecycle evidence;
   those qualifications remain separate human-gated steps.
 
+### Fixed
+
+- Fix two native defects that made Windows install/status/start fail on every
+  host. Native access
+  checks now pass owner, group and DACL to `AuthzAccessCheck`/`AccessCheck`
+  (a DACL-only descriptor made every bootstrap-anchor proof and service
+  self-observation refuse with `SERVICE_ACCESS_DENIED`), and the daemon
+  `.bunfig.toml` read uses a 1-byte bound instead of the invalid 0
+  (`SERVICE_INVALID`). Found by `v0.4.0-rc.3` live SCM qualification; requires
+  a new signed native addon and live requalification. The Windows guide now
+  documents the working-directory ancestor ACL precondition.
+
 ## [0.4.0-rc.2] - 2026-09-25
 
 ### Signed native verification and candidate preparation
