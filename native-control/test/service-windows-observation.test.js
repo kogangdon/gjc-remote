@@ -233,3 +233,20 @@ test('native malformed handle/profile tuples fail before observation and report 
     );
   }
 });
+
+test('every Windows AuthzAccessCheck receives a descriptor with owner, group and DACL', () => {
+  // AuthzAccessCheck fails with ERROR_INVALID_PARAMETER for a DACL-only
+  // descriptor, which silently denied every bootstrap-anchor traversal proof.
+  let checks = 0;
+  for (let index = source.indexOf('AuthzAccessCheck('); index !== -1;
+    index = source.indexOf('AuthzAccessCheck(', index + 1)) {
+    const query = source.lastIndexOf('GetSecurityInfo(', index);
+    assert.notEqual(query, -1, 'AuthzAccessCheck descriptor source exists');
+    const flags = source.slice(query, source.indexOf(';', query));
+    for (const flag of ['OWNER_SECURITY_INFORMATION', 'GROUP_SECURITY_INFORMATION', 'DACL_SECURITY_INFORMATION']) {
+      assert.ok(flags.includes(flag), `${flag} requested before AuthzAccessCheck at offset ${index}`);
+    }
+    checks += 1;
+  }
+  assert.equal(checks, 2, 'both Windows access-check call sites are covered');
+});

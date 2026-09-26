@@ -10617,9 +10617,13 @@ bool WindowsPrincipalHasDirectoryAccess(
   PSID sid = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   PACL dacl = nullptr;
+  // AuthzAccessCheck rejects a descriptor without owner and group
+  // (ERROR_INVALID_PARAMETER), so the full access-check triple is required.
   if (!ConvertStringSidToSidW(Wide(sid_text).c_str(), &sid) ||
       GetSecurityInfo(
-          directory, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+          directory, SE_FILE_OBJECT,
+          OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+              DACL_SECURITY_INFORMATION,
           nullptr, nullptr, &dacl, nullptr, &descriptor) !=
           ERROR_SUCCESS ||
       !dacl) {

@@ -63,8 +63,15 @@ function fakeNative(files) {
     },
     read_service_external_object(handle, relative, mode, maximum) {
       calls.push(['read', `${handle.absolutePath}\\${relative}`, mode, maximum]);
+      // Mirror the native argument contract: bytes reads need 1..1 MiB.
+      if (mode === 'bytes' && (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 1024 * 1024)) {
+        throw Object.assign(new Error('read_service_external_object failed'), { code: 'SERVICE_INVALID', reason: 'invalid-input', writes: 0 });
+      }
       const file = files[`${handle.absolutePath}\\${relative}`];
       if (file === undefined) return { kind: 'absent', identity: null, absence: { kind: 'absent' }, bytes: null, entries: null, writes: 0 };
+      if (Buffer.byteLength(file.text) > maximum) {
+        throw Object.assign(new Error('read_service_external_object failed'), { code: 'SERVICE_OUTPUT_LIMIT', reason: 'limit', writes: 0 });
+      }
       return { kind: 'file', identity: identity(file.fileId), absence: null, bytes: Buffer.from(file.text), entries: null, writes: 0 };
     },
     close_service_handle(handle) { calls.push(['close', handle.id]); handles -= 1; },
@@ -243,7 +250,9 @@ test('reserved, conflicting or invalid effective config refuses write-free at pr
   const daemon = harness({ component: 'daemon', env: 'HOST_ID=a\n' });
   await refusal(daemon.create().effectiveConfigPreflight(context(daemon)), 'SERVICE_INVALID', 'daemon-target-invalid');
   const bunfig = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', bunfig: 'x' });
-  await refusal(bunfig.create().effectiveConfigPreflight(context(bunfig)), 'SERVICE_STALE');
+  await refusal(bunfig.create().effectiveConfigPreflight(context(bunfig)), 'SERVICE_INVALID', 'runtime-config-policy');
+  const largeBunfig = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', bunfig: 'xy' });
+  await refusal(largeBunfig.create().effectiveConfigPreflight(context(largeBunfig)), 'SERVICE_INVALID', 'runtime-config-policy');
   const scope = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', scope: { scopeFingerprint: hex('4'), sdkProfileRoot: null } });
   await refusal(scope.create().effectiveConfigPreflight(context(scope)), 'SERVICE_PENDING', 'scope-catalog');
 });
