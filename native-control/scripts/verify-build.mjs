@@ -50,6 +50,7 @@ const capabilities = [
   'seal_service_directory', 'open_service_artifact_source',
   'plan_service_artifact_location', 'resolve_service_artifact_location',
   'open_service_external_root', 'read_service_external_object',
+  'open_win32_service_log_observer', 'read_win32_service_log_observer',
   'read_win32_boot_clock', 'observe_self_process_epoch', 'read_self_service_config',
 ];
 const capabilitySignatures = {
@@ -123,6 +124,8 @@ const capabilitySignatures = {
   resolve_service_artifact_location: ['directoryHandle', 'relativePath', 'expectedFileSha256'],
   open_service_external_root: ['absolutePath', 'profile', 'roles'],
   read_service_external_object: ['externalRootHandle', 'relativePath', 'mode', 'maxBytes'],
+  open_win32_service_log_observer: ['serviceHandle', 'launch', 'resumeCursor'],
+  read_win32_service_log_observer: ['observerHandle', 'expectedCursorFingerprint', 'maxBytes'],
   read_win32_boot_clock: [],
   observe_self_process_epoch: [],
   read_self_service_config: [],

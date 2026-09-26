@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import YAML from 'yaml';
+import { capabilities, capabilitySignatures } from '../src/capabilities.js';
 
 const binding = JSON.parse(
   readFileSync(new URL('../binding.gyp', import.meta.url), 'utf8'),
@@ -490,5 +491,25 @@ test('signing instructions require trusted main-push provenance and authorizatio
   assert.doesNotMatch(
     dockerBotReadme,
     /native-control-unsigned-\{X64\|ARM64\}/,
+  );
+});
+
+test('build verifier capability list and signatures match the public capability contract', () => {
+  const listStart = nativeBuildVerifier.indexOf('const capabilities = [');
+  const signatureStart = nativeBuildVerifier.indexOf('const capabilitySignatures = {');
+  assert.ok(listStart > 0 && signatureStart > listStart);
+  const listSource = nativeBuildVerifier.slice(listStart, signatureStart);
+  const signatureSource = nativeBuildVerifier.slice(signatureStart, nativeBuildVerifier.indexOf('\n};', signatureStart));
+  const verifierCapabilities = [...listSource.matchAll(/'([a-z0-9_]+)'/g)].map((match) => match[1]);
+  const verifierSignatures = Object.fromEntries(
+    [...signatureSource.matchAll(/([a-z0-9_]+):\s*\[([^\]]*)\]/g)].map((match) => [
+      match[1],
+      [...match[2].matchAll(/'([A-Za-z0-9_]+)'/g)].map((arg) => arg[1]),
+    ]),
+  );
+  assert.deepEqual(verifierCapabilities, [...capabilities]);
+  assert.deepEqual(
+    verifierSignatures,
+    Object.fromEntries(Object.entries(capabilitySignatures).map(([name, args]) => [name, [...args]])),
   );
 });
