@@ -26,6 +26,9 @@ export const approvedNativePlatforms = Object.freeze([
   'win32-x64',
 ]);
 
+const nativeContractVersion = 5;
+const nativeNapiVersion = 8;
+
 const nativeTrustPath = fileURLToPath(
   new URL('../release-keys/trusted.json', import.meta.url),
 );
@@ -198,12 +201,13 @@ export function verifyManifestSignature(manifestBytes, sidecar, trustStore) {
 }
 
 export function validateNativePackageContract(packageJson) {
-  if (!plain(packageJson)) return false;
+  if (!plain(packageJson) || packageJson.name !== nativePackageName ||
+      packageJson.version !== '2.0.0') return false;
   try {
     return sameNativeMetadata(packageJson.nativeControlContract, {
-      version: 4,
+      version: nativeContractVersion,
       revision: contractRevision,
-      napi: 8,
+      napi: nativeNapiVersion,
       platforms: approvedNativePlatforms,
     });
   } catch {
@@ -219,15 +223,16 @@ export function validateBuildManifestMetadata(
   platform = process.platform,
   architecture = process.arch,
 ) {
-  if (!plain(manifest) || !plain(packageJson) || !isHex64(manifest.sha256)) {
+  if (!plain(manifest) || !validateNativePackageContract(packageJson) ||
+      !isHex64(manifest.sha256)) {
     return false;
   }
   const expected = {
-    contractVersion: 4,
+    contractVersion: nativeContractVersion,
     contractRevision,
     package: packageJson.name,
     version: packageJson.version,
-    napi: 8,
+    napi: nativeNapiVersion,
     platform,
     arch: architecture,
     addon: 'native_control.node',
@@ -268,9 +273,9 @@ export function validateBuildManifest(
 
 export function validateNativeAddonContract(contract) {
   try {
-    return contract?.contractVersion === 4 &&
+    return contract?.contractVersion === nativeContractVersion &&
       contract.contractRevision === contractRevision &&
-      contract.napi === 8 &&
+      contract.napi === nativeNapiVersion &&
       sameNativeMetadata(contract.capabilities, capabilities) &&
       sameNativeMetadata(contract.capabilitySignatures, capabilitySignatures);
   } catch {

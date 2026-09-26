@@ -162,10 +162,10 @@ function populateExactSyntheticSource(root) {
     'utf8',
   );
   const manifestBytes = canonicalJsonBytes({
-    contractVersion: 4,
+    contractVersion: 5,
     contractRevision,
     package: '@gjc-remote/native-control',
-    version: '1.0.0',
+    version: '2.0.0',
     napi: 8,
     platform: process.platform,
     arch: process.arch,

@@ -402,6 +402,7 @@ class ArtifactAccessState {
     this.assetFacts = null;
     this.expected = null;
     this.inventoryBytes = null;
+    this.inventory = null;
     this.written = new Set();
     this.candidateDirectories = new Map();
     this.candidateSealed = false;
@@ -1003,7 +1004,7 @@ class ArtifactAccessState {
     if ([...expected.keys()].some((path) => relativeSegments(path) === null)) {
       this.fail('SERVICE_SCOPE_MISMATCH', operation);
     }
-    return { bytes, expected };
+    return { bytes, expected, inventory };
   }
 
   prepareCandidate(inventoryBytes) {
@@ -1024,6 +1025,7 @@ class ArtifactAccessState {
     if (this.purpose === 'application') {
       const prepared = this.expectedInventory(inventoryBytes, operation);
       this.inventoryBytes = prepared.bytes;
+      this.inventory = prepared.inventory;
       this.expected = prepared.expected;
     } else {
       if (inventoryBytes !== null) this.fail('SERVICE_INVALID', operation);
@@ -1353,7 +1355,7 @@ class ArtifactAccessState {
     return this.destinationRoot;
   }
 
-  observeExistingTarget(destination, operation) {
+  observeExistingTarget(destination, operation, disposition) {
     const entry = this.findEntry(destination.handle, this.publicationName, operation);
     if (entry === null) return null;
     if (entry.identity.profile !== 'service-release-directory') this.markManual(operation);
@@ -1371,6 +1373,8 @@ class ArtifactAccessState {
         this.manifestAuthority,
         target.identity,
         operation,
+        disposition,
+        this.inventory,
       );
     } finally {
       this.closeNative(target.handle, operation);
@@ -1385,6 +1389,7 @@ class ArtifactAccessState {
       const observed = this.observeExistingTarget(
         this.destinationRoot,
         operation,
+        'published',
       );
       if (observed === null) this.markManual(operation);
       return observed;
@@ -1396,7 +1401,7 @@ class ArtifactAccessState {
       this.fail('SERVICE_PENDING', operation);
     }
     const destination = this.openDestination(operation, true);
-    const reused = this.observeExistingTarget(destination, operation);
+    const reused = this.observeExistingTarget(destination, operation, 'reused');
     if (reused !== null) {
       this.published = true;
       return reused;
@@ -1425,7 +1430,7 @@ class ArtifactAccessState {
     this.verifyTree(this.candidate.handle, '', true, operation);
     this.closeNative(this.candidate.handle, operation);
     this.candidate = null;
-    const observed = this.observeExistingTarget(destination, operation);
+    const observed = this.observeExistingTarget(destination, operation, 'published');
     if (observed === null) this.markManual(operation);
     this.published = true;
     return observed;
@@ -1465,6 +1470,7 @@ class ArtifactAccessState {
     if (first !== null) throw first;
     this.closed = true;
     this.inventoryBytes = null;
+    this.inventory = null;
     this.expected = null;
     this.candidateDirectories.clear();
     this.onClose();

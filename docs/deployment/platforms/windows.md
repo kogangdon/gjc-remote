@@ -60,8 +60,57 @@ Windows startup evidence is deliberately conservative. A marker-only SCM
 snapshot cannot substitute for the service-scoped log epoch/cursor ABI. Missing
 or gapped stdout/stderr log epochs, ambiguous PID-0 or process-tree evidence,
 overflow, or a surviving child are safe refusals (`manual-cleanup`/pending),
-not reasons to infer readiness or an empty tree. The log/tree ABI is a release
-gate and is not supplied by the current fake driver.
+not reasons to infer readiness or an empty tree. The two-family Shawl log
+observer ABI (`open_win32_service_log_observer`/`read_win32_service_log_observer`,
+native contract 5 revision 1) exists in source but must be compiled and
+qualified on a real host before it counts as release evidence.
+
+## Production host composition (source level)
+
+With no injected lifecycle, the Windows x64 direct CLI composes one
+operation-scoped host producer (`native-control/src/service-windows-host.js`).
+It binds the validated request, captures protected authority only through
+native read-only external roots, and derives the exact Launch from the signed
+`windowsServiceBootstrap` release metadata: guard path/hash, static closure
+fingerprint, and Node 26.7.0 / Bun 1.4.2 runtime policy. The route stays
+SCM → Shawl → Node/Bun → application; there is no extra resident wrapper,
+health endpoint, or `sc.exe` bypass.
+
+The operator must provision the following before the first install. The
+producer never creates, copies, or relaxes them:
+
+- `<workingDirectory>\.env`: the component effective configuration. Keys
+  with the `GJC_REMOTE_`, `NODE_`, or `BUN_` prefix and
+  HOME/USERPROFILE/XDG_CONFIG_HOME/`GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR`
+  are refused, as is a bot `CHANNELS_CONFIG` that conflicts with the
+  configured value. A daemon `.env` must define `HOST_ID` and `BOT_WS_URL`.
+- `<workingDirectory>\service-authority.json`: the declared service-scope
+  catalog (daemon: including the provisioned service SDK profile root).
+- Daemon only: `<workingDirectory>\runtime-config\.bunfig.toml`, one
+  protected zero-byte file shared by `XDG_CONFIG_HOME` and the explicit Bun
+  config path.
+- The exact Node/Bun runtime binary at `runtimePath`, whose hash is bound into
+  the Launch.
+
+Install reads and validates these write-free before any mutation. Other
+operations reuse the configuration retained in the current service manifest
+and re-capture the same host authority (including the protected `.env` and
+runtime binary) to derive the exact Launch, so status, uninstall and recovery
+refuse rather than guess when that authority has drifted or been removed.
+Windows `update` re-observes the declared scope and requires the signed
+candidate to read every observed retained format and keep the target, runtime,
+native-control, wire, entrypoint and SDK external-state contracts of the
+authenticated current release (which stays the rollback predecessor); any
+crossing refuses before any journal, metadata or service write. Bot readiness is listener + Discord
+login + the exact configured connected-host set/count. Daemon readiness is the
+current exact-target accepted registration. Provider and workspace health
+stay `unknown`.
+
+`npm run smoke:windows-host-fixture` is a credential-free foreground fixture.
+It drives the real bot/daemon startup reporters through the production
+observation reducer. Its evidence class is `foreground-fixture`, not an
+actual service lifecycle: it uses no SCM, Shawl, account, ACL, native addon,
+bootstrap guard, Discord, SDK, or provider.
 
 ## Identity, storage, and evidence limits
 

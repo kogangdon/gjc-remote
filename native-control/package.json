@@ -1,19 +1,20 @@
 {
   "name": "@gjc-remote/native-control",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "main": "./src/public.js",
   "exports": {
-    ".": "./src/public.js"
+    ".": "./src/public.js",
+    "./service-bootstrap": "./src/service-bootstrap.js"
   },
   "bin": {
     "gjc-remote-inventory": "./src/inventory-entrypoint.js",
     "gjc-remote-service": "./src/service-entrypoint.js"
   },
   "nativeControlContract": {
-    "version": 4,
-    "revision": 4,
+    "version": 5,
+    "revision": 1,
     "napi": 8,
     "platforms": [
       "linux-x64",
@@ -30,7 +31,10 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "@gjc-remote/shared": "0.4.0-rc.2",
+    "@gjc-remote/shared": "0.4.0-rc.3",
+    "dotenv": "16.6.1",
+    "jsonc-parser": "3.3.1",
+    "semver": "7.8.5",
     "tar": "7.5.22"
   },
   "devDependencies": {

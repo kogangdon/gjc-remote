@@ -1,13 +1,13 @@
 services:
   bot:
-    image: ${GJC_BOT_IMAGE:-gjc-remote-bot:0.4.0-rc.2}
+    image: ${GJC_BOT_IMAGE:-gjc-remote-bot:0.4.0-rc.3}
     build:
       context: ../../..
       dockerfile: deploy/docker/bot/Dockerfile
       additional_contexts:
         native_control_bundle: ${GJC_NATIVE_CONTROL_BUNDLE_DIR:?set GJC_NATIVE_CONTROL_BUNDLE_DIR}
       args:
-        VERSION: ${GJC_BOT_VERSION:-0.4.0-rc.2}
+        VERSION: ${GJC_BOT_VERSION:-0.4.0-rc.3}
         REVISION: ${GJC_BOT_REVISION:-local}
     restart: "on-failure:5"
     stop_grace_period: 30s

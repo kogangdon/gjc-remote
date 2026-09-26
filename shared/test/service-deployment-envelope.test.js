@@ -8,6 +8,7 @@ import {
   DEPLOYMENT_SIGNATURE_DOMAINS,
   SHAWL_UPSTREAM,
   applicationDeploymentManifestFingerprint,
+  assertFirstServiceInstallCompatible,
   assertReleaseTransitionCompatible,
   buildApplicationDeploymentManifest,
   buildBundleInventory,
@@ -25,6 +26,9 @@ import {
   validateReleaseSelector,
   validateSdkExternalStateContract,
   validateShawlDeploymentManifest,
+  WINDOWS_SERVICE_BOOTSTRAP_EXTERNAL_BUN_CONFIG,
+  WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES,
+  windowsServiceBootstrapClosureFingerprint,
 } from "../deployment-envelope.js";
 import {
   SERVICE_STATUS_VALUES,
@@ -166,14 +170,55 @@ function applicationManifest({
       nativeControl: {
         manifestPath: "native-control/build/Release/native-control.manifest.json",
         manifestFingerprint: hex("5"),
-        contractVersion: 4,
-        contractRevision: 4,
+        contractVersion: 5,
+        contractRevision: 1,
       },
       wireCapabilities: ["gate_presentation_v1", "terminal_disposition_v1"],
       compatibility: deploymentCompatibility,
     }),
     inventory: files,
   };
+}
+
+function firstInstallScopeReceipt({ component, observedRetainedFormats, sdkExternalStateContractFingerprint = null, rootObservation = undefined }) {
+  const receipt = {
+    schemaVersion: 1,
+    serviceKey: component === "bot" ? "bot" : `daemon-${hex("a")}`,
+    scopeFingerprint: hex("b"),
+    rootObservations: [rootObservation ?? {
+      rootId: "service-working-directory",
+      profile: "config",
+      pathFingerprint: hex("c"),
+      rootIdentityFingerprint: hex("d"),
+      absenceFingerprint: null,
+      listingFingerprint: hex("e"),
+      entryCount: 1,
+      markerBytes: 24,
+    }],
+    observedRetainedFormats,
+    sdkExternalStateContractFingerprint,
+    coverage: "declared-roots-only",
+    receiptFingerprint: null,
+  };
+  receipt.receiptFingerprint = canonicalJsonHash(
+    Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== "receiptFingerprint")),
+  );
+  return receipt;
+}
+
+function sdkExternalStateContractFixture() {
+  return buildSdkExternalStateContract({
+    packageName: "@gajae-code/coding-agent",
+    packageVersion: "0.16.7",
+    lockIntegrity: `sha512-${Buffer.alloc(64, 5).toString("base64")}`,
+    configSchemaVersion: 2,
+    sourceContracts: {
+      settings: hex("1"),
+      model: hex("2"),
+      auth: hex("3"),
+      session: hex("4"),
+    },
+  });
 }
 
 function shawlManifest() {
@@ -393,6 +438,131 @@ test("release transition checks complete observed format sets and opaque SDK equ
     observedRetainedFormats: { "daemon-app-session": [], "workspace-lifecycle": [] },
     sdkExternalStateContractFingerprint: hex("8"),
   }), /SDK external-state contract mismatch/);
+});
+
+test("first-install compatibility validates a declared scope without a predecessor", () => {
+  const botFormats = { "bot-mapping-reader": ["mapping-v1"] };
+  const bot = applicationManifest({
+    platform: "win32",
+    deploymentCompatibility: compatibility(),
+  }).manifest;
+  const botReceipt = firstInstallScopeReceipt({ component: "bot", observedRetainedFormats: botFormats });
+  assert.equal(assertFirstServiceInstallCompatible({
+    candidate: bot,
+    component: "bot",
+    scopeReceipt: botReceipt,
+    observedRetainedFormats: botFormats,
+    observedSdkContract: null,
+  }), bot);
+
+  const sdk = sdkExternalStateContractFixture();
+  const daemonFormats = { "daemon-app-session": ["session-v1"], "workspace-lifecycle": ["workspace-v1"] };
+  const daemon = applicationManifest({
+    platform: "win32",
+    deploymentCompatibility: compatibility({ sdkFingerprint: sdk.sdkExternalStateContractFingerprint }),
+  }).manifest;
+  const daemonReceipt = firstInstallScopeReceipt({
+    component: "daemon",
+    observedRetainedFormats: daemonFormats,
+    sdkExternalStateContractFingerprint: sdk.sdkExternalStateContractFingerprint,
+  });
+  assert.equal(assertFirstServiceInstallCompatible({
+    candidate: daemon,
+    component: "daemon",
+    scopeReceipt: daemonReceipt,
+    observedRetainedFormats: daemonFormats,
+    observedSdkContract: sdk,
+  }), daemon);
+});
+
+test("first-install compatibility refuses unknown, unreadable, mixed, tampered, and incomplete scope evidence", () => {
+  const candidate = applicationManifest({
+    platform: "win32",
+    deploymentCompatibility: compatibility({ mappingReadable: ["mapping-v1", "mapping-v2"] }),
+  }).manifest;
+  const observed = { "bot-mapping-reader": ["mapping-v1"] };
+  const receipt = firstInstallScopeReceipt({ component: "bot", observedRetainedFormats: observed });
+  const verify = (patch = {}) => assertFirstServiceInstallCompatible({
+    candidate,
+    component: "bot",
+    scopeReceipt: receipt,
+    observedRetainedFormats: observed,
+    observedSdkContract: null,
+    ...patch,
+  });
+
+  assert.throws(() => verify({ observedRetainedFormats: { "bot-mapping-reader": ["mapping-future"] } }), /scope receipt retained format relation/);
+  const unreadableFormats = { "bot-mapping-reader": ["mapping-future"] };
+  const unreadableReceipt = firstInstallScopeReceipt({
+    component: "bot",
+    observedRetainedFormats: unreadableFormats,
+  });
+  assert.throws(() => verify({
+    scopeReceipt: unreadableReceipt,
+    observedRetainedFormats: unreadableFormats,
+  }), /candidate cannot read/);
+  assert.throws(() => verify({ scopeReceipt: { ...receipt, scopeFingerprint: hex("f") } }), /scope receipt fingerprint/);
+  assert.throws(() => verify({ scopeReceipt: { ...receipt, rootObservations: [{
+    ...receipt.rootObservations[0], listingFingerprint: null,
+  }] } }), /root observation fields/);
+  assert.throws(() => verify({ scopeReceipt: { ...receipt, rootObservations: [{
+    ...receipt.rootObservations[0], profile: "personal-profile",
+  }] } }), /root observation fields/);
+  let getterReads = 0;
+  const getterFormats = Object.defineProperty({}, "bot-mapping-reader", {
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return ["mapping-v1"];
+    },
+  });
+  assert.throws(() => verify({ observedRetainedFormats: getterFormats }), /observed retained formats schema/);
+  const getterList = ["mapping-v1"];
+  Object.defineProperty(getterList, "0", {
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      return "mapping-v1";
+    },
+  });
+  assert.throws(() => verify({ observedRetainedFormats: { "bot-mapping-reader": getterList } }), /observed retained formats bot-mapping-reader schema/);
+  assert.equal(getterReads, 0);
+  assert.throws(() => verify({ observedSdkContract: {} }), /bot first-install SDK contract/);
+  assert.throws(() => verify({ candidate: { ...candidate, target: { platform: "linux", architecture: "x64" } } }), /DEPLOYMENT_ENVELOPE_INVALID/);
+});
+
+test("first-install daemon compatibility requires the observed SDK contract to match candidate and scope", () => {
+  const sdk = sdkExternalStateContractFixture();
+  const formats = { "daemon-app-session": [], "workspace-lifecycle": [] };
+  const candidate = applicationManifest({
+    platform: "win32",
+    deploymentCompatibility: compatibility({ sdkFingerprint: sdk.sdkExternalStateContractFingerprint }),
+  }).manifest;
+  const receipt = firstInstallScopeReceipt({
+    component: "daemon",
+    observedRetainedFormats: formats,
+    sdkExternalStateContractFingerprint: sdk.sdkExternalStateContractFingerprint,
+  });
+  const input = {
+    candidate,
+    component: "daemon",
+    scopeReceipt: receipt,
+    observedRetainedFormats: formats,
+    observedSdkContract: sdk,
+  };
+  assert.equal(assertFirstServiceInstallCompatible(input), candidate);
+  assert.throws(() => assertFirstServiceInstallCompatible({
+    ...input,
+    observedSdkContract: { ...sdk, packageVersion: "0.16.8" },
+  }), /DEPLOYMENT_ENVELOPE_INVALID: SDK external-state contract fingerprint/);
+  assert.throws(() => assertFirstServiceInstallCompatible({
+    ...input,
+    scopeReceipt: { ...receipt, sdkExternalStateContractFingerprint: hex("8") },
+  }), /scope receipt fingerprint/);
+  assert.throws(() => assertFirstServiceInstallCompatible({
+    ...input,
+    observedSdkContract: null,
+  }), /SDK external-state contract/);
 });
 
 test("opaque SDK compatibility fingerprint binds package, integrity, schema, and audited source contracts", () => {
@@ -1395,4 +1565,54 @@ test("artifact cleanup records are an exact published/scratch discriminated unio
     phase: "asset-removing",
     revision: 2,
   }));
+});
+
+function windowsBootstrapMetadata(overrides = {}) {
+  const staticClosure = [
+    { relativePath: "node_modules/@gjc-remote/native-control/package.json", sha256: hex("6") },
+    { relativePath: "node_modules/@gjc-remote/native-control/src/service-bootstrap.js", sha256: hex("7") },
+  ];
+  return {
+    schemaVersion: 1,
+    guardPath: "node_modules/@gjc-remote/native-control/src/service-bootstrap.js",
+    staticClosure,
+    staticClosureFingerprint: windowsServiceBootstrapClosureFingerprint(staticClosure),
+    runtimePolicies: {
+      bot: { ...WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES.bot },
+      daemon: { ...WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES.daemon },
+    },
+    externalBunConfig: { ...WINDOWS_SERVICE_BOOTSTRAP_EXTERNAL_BUN_CONFIG },
+    ...overrides,
+  };
+}
+
+function withWindowsBootstrap(metadata, platform = "win32") {
+  const { manifest } = applicationManifest({ platform });
+  const { schemaVersion, kind, manifestFingerprint, ...fields } = manifest;
+  return buildApplicationDeploymentManifest({ ...fields, windowsServiceBootstrap: metadata });
+}
+
+test("signed Windows service bootstrap metadata is optional, closed, and fingerprint-bound", () => {
+  const manifest = withWindowsBootstrap(windowsBootstrapMetadata());
+  assert.equal(manifest.windowsServiceBootstrap.guardPath.endsWith("/src/service-bootstrap.js"), true);
+  assert.equal(Object.hasOwn(applicationManifest({ platform: "win32" }).manifest, "windowsServiceBootstrap"), false);
+  // Same fingerprint domain/encoding as the native-control guard policy.
+  const pairs = manifest.windowsServiceBootstrap.staticClosure.map((entry) => [entry.relativePath, entry.sha256]);
+  assert.equal(manifest.windowsServiceBootstrap.staticClosureFingerprint,
+    sha256(Buffer.from(`gjc-remote/windows-service-bootstrap-closure/v1\n${JSON.stringify(pairs)}`, "utf8")));
+
+  const invalid = [
+    () => withWindowsBootstrap(windowsBootstrapMetadata(), "linux"),
+    () => withWindowsBootstrap(windowsBootstrapMetadata({ schemaVersion: 2 })),
+    () => withWindowsBootstrap(windowsBootstrapMetadata({ staticClosureFingerprint: hex("9") })),
+    () => withWindowsBootstrap(windowsBootstrapMetadata({ guardPath: "node_modules/@gjc-remote/native-control/src/other.js" })),
+    () => withWindowsBootstrap(windowsBootstrapMetadata({ guardPath: "node_modules/@gjc-remote/native-control/lib/service-bootstrap.js" })),
+    () => withWindowsBootstrap(windowsBootstrapMetadata({ runtimePolicies: { bot: { runtime: "node", version: "26.0.0", sourceRevision: "b4f23d3619c98bed09af93a21192f6080197a8c6" }, daemon: { ...WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES.daemon } } })),
+    () => withWindowsBootstrap(windowsBootstrapMetadata({ externalBunConfig: { relativePath: "runtime-config/.bunfig.toml", sha256: hex("1"), byteLength: 0 } })),
+    () => withWindowsBootstrap({ ...windowsBootstrapMetadata(), extra: true }),
+    () => withWindowsBootstrap(windowsBootstrapMetadata({ staticClosure: [...windowsBootstrapMetadata().staticClosure].reverse() })),
+  ];
+  for (const build of invalid) assert.throws(build);
+  // The inventory relation binds every closure file to its signed payload hash.
+  assert.throws(() => validateApplicationDeploymentManifest(manifest, inventory("win32")), /windows service bootstrap payload relation/);
 });

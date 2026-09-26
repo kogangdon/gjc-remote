@@ -19,6 +19,8 @@ import {
   buildServiceStoreRegistration,
   buildServiceStoreRegistrationIncarnation,
   buildServiceZeroReferenceObservation,
+  validateServiceTrialBoundary,
+  validateServiceTrialBoundarySuccessor,
   serviceKeyForTarget,
   serviceArtifactPhysicalTargetFingerprint,
   serviceNativeIdentityFingerprint,
@@ -51,9 +53,12 @@ import {
   validateServiceTransitionProof,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import { createHash } from 'node:crypto';
+import { win32 as windowsPath } from 'node:path';
 import {
+  APPLICATION_BUNDLE_INVENTORY_PATH,
   DEPLOYMENT_ENVELOPE_LIMITS,
   validateApplicationDeploymentManifest,
+  validateBundleInventory,
   validateShawlDeploymentManifest,
 } from '@gjc-remote/shared/deployment-envelope';
 import {
@@ -83,6 +88,7 @@ export const SERVICE_STORE_LAYOUT = Object.freeze({
   manifestFiles: Object.freeze({ current: 'current.json', previous: 'previous.json' }),
   resourceFiles: Object.freeze({ current: 'current-resource.json', previous: 'previous-resource.json' }),
   startup: 'startup.json',
+  trialBoundary: 'trial-boundary.json',
   journalHead: 'head.json',
   tombstone: 'current.json',
   manualCleanup: 'current.json',
@@ -118,10 +124,14 @@ const OPTIONAL_NATIVE = Object.freeze([
   'open_linux_service_scope',
   'read_linux_service_object',
 ]);
+const WINDOWS_LOCATION_NATIVE = Object.freeze([
+  'plan_service_artifact_location',
+  'resolve_service_artifact_location',
+]);
 const ROLE_KEYS = Object.freeze(['management', 'bot', 'recovery', 'daemon', 'system']);
 const OPEN_NAMESPACES = Object.freeze(['transaction', 'manifest', 'reference', 'tombstone', 'floor', 'manual']);
 const SERVICE_DIRECT = Object.freeze(['transaction', 'manifest', 'tombstone', 'manual']);
-const MANIFEST_FILE_SET = new Set(['current.json', 'previous.json', 'current-resource.json', 'previous-resource.json', 'startup.json']);
+const MANIFEST_FILE_SET = new Set(['current.json', 'previous.json', 'current-resource.json', 'previous-resource.json', 'startup.json', SERVICE_STORE_LAYOUT.trialBoundary]);
 const SINGLE_FILE_SET = new Set(['current.json']);
 const MANUAL_FILE_SET = new Set([
   SERVICE_STORE_LAYOUT.manualCleanup,
@@ -165,9 +175,38 @@ const JSON_LIMITS = Object.freeze({
   maxDepth: SERVICE_STORE_LIMITS.jsonDepth,
   maxNodes: SERVICE_STORE_LIMITS.jsonNodes,
 });
+const INVENTORY_LIMITS = Object.freeze({
+  maxBytes: DEPLOYMENT_ENVELOPE_LIMITS.inventoryBytes,
+  maxDepth: 16,
+  maxNodes: DEPLOYMENT_ENVELOPE_LIMITS.payloadEntries * 6 + 32,
+});
 const receiptBindings = new WeakMap();
 const publicationBindings = new WeakMap();
+const locationIntentBindings = new WeakMap();
+const publishedLocationBindings = new WeakMap();
 const driverLockBindings = new WeakMap();
+const LOCATION_INTENT_KEYS = Object.freeze([
+  'schemaVersion',
+  'rootKind',
+  'artifactFingerprint',
+  'relativePath',
+  'absoluteRoot',
+  'absolutePath',
+  'anchorIdentityFingerprint',
+  'missingSegments',
+  'existingDirectoryIdentity',
+  'intentFingerprint',
+  'writes',
+]);
+const PUBLISHED_LOCATION_KEYS = Object.freeze([
+  'schemaVersion',
+  'publishedPath',
+  'absolutePath',
+  'directoryIdentity',
+  'fileIdentity',
+  'fileSha256',
+  'writes',
+]);
 
 function plain(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
@@ -241,14 +280,31 @@ function sameJson(left, right) {
   try { return canonicalJson(left, JSON_LIMITS) === canonicalJson(right, JSON_LIMITS); } catch { return false; }
 }
 
-function captureNative(native) {
+function artifactFactsMatchIdentity(facts, identity) {
+  return facts?.kind === 'win32-file-v1' &&
+    identity?.kind === 'win32-service-object-v1' &&
+    facts.volumeSerial === identity.volumeSerial &&
+    facts.fileId === identity.fileId &&
+    facts.attributes === identity.attributes &&
+    facts.owner === identity.owner &&
+    facts.securitySha256 === identity.securitySha256;
+}
+
+function locationIntentKey(purpose, manifestFingerprint, relativePath) {
+  return canonicalJson([purpose, manifestFingerprint, relativePath]);
+}
+
+function captureNative(native, platform) {
   if (native === null || (typeof native !== 'object' && typeof native !== 'function')) {
     throwStore('SERVICE_INVALID', 'create_service_store');
   }
   let descriptors;
   try { descriptors = Object.getOwnPropertyDescriptors(native); } catch { throwStore('SERVICE_INVALID', 'create_service_store'); }
   const captured = Object.create(null);
-  for (const name of REQUIRED_NATIVE) {
+  for (const name of [
+    ...REQUIRED_NATIVE,
+    ...(platform === 'win32' ? WINDOWS_LOCATION_NATIVE : []),
+  ]) {
     const descriptor = descriptors[name];
     if (!descriptor || descriptor.get !== undefined || descriptor.set !== undefined ||
         !Object.hasOwn(descriptor, 'value') || typeof descriptor.value !== 'function') {
@@ -1064,7 +1120,7 @@ function optionsSnapshot(options) {
     throwStore('SERVICE_INVALID', 'create_service_store', 0, false, error);
   }
   return {
-    native: captureNative(values.native),
+    native: captureNative(values.native, values.platform),
     roles: cloneJson(roles),
     platform: values.platform,
     architecture: values.architecture,
@@ -1295,6 +1351,7 @@ class Session {
   #journal;
   #references;
   #observedPublications = new Map();
+  #plannedArtifactLocations = new Map();
   #observedSharedTemplateBindings = new Set();
   #driverLockHandoff;
   #provisionalMetadata = null;
@@ -1353,6 +1410,9 @@ class Session {
       readStartupProof: () => self.readStartupProof(),
       publishStartupProof: (value, expected) => self.publishStartupProof(value, expected),
       removeStartupProof: (expected) => self.removeStartupProof(expected),
+      readTrialBoundary: () => self.readTrialBoundary(),
+      publishTrialBoundary: (value, expectedReceipt) => self.publishTrialBoundary(value, expectedReceipt),
+      removeTrialBoundary: (expectedReceipt) => self.removeTrialBoundary(expectedReceipt),
       readJournal: () => self.readJournal(),
       appendJournal: (value) => self.appendJournal(value),
       retainDeploymentEnvelope: (input) => self.retainDeploymentEnvelope(input),
@@ -1366,6 +1426,7 @@ class Session {
       readReferences: () => self.readReferences(),
       readSiblingReferences: () => self.readSiblingReferences(),
       readPublicationReceipt: (input) => self.readPublicationReceipt(input),
+      planArtifactLocation: (...args) => self.planArtifactLocation(...args),
       publishReferences: (value, expected) => self.publishReferences(value, expected),
       observeZeroReferences: (artifact) => self.observeZeroReferences(artifact),
       collectPublishedArtifact: (...args) =>
@@ -2100,14 +2161,18 @@ class Session {
     const previousResource = this.readResourceProof('previous');
     const startup = this.readStartupProof();
     const journal = this.readJournal();
+    const trialBoundary = this.#readTrialBoundary(journal, 'validate_service_records');
     this.#references = this.readReferences();
     const latestTransaction = journal.entries.at(-1);
+    if (startup.present && this.#config.platform === 'win32') {
+      this.#assertWindowsStartupProofBoundary(startup.value, trialBoundary, 'validate_service_records');
+    }
     const lifecyclePending = journal.pending !== null ||
       (latestTransaction !== undefined && latestTransaction.phase !== 'committed');
     if (latestTransaction === undefined &&
         (currentManifest.present || previousManifest.present ||
          currentResource.present || previousResource.present || startup.present ||
-         this.#references.present || this.#tombstone.present || this.#manual.present)) {
+         trialBoundary.present || this.#references.present || this.#tombstone.present || this.#manual.present)) {
       throwStore('SERVICE_MANUAL_CLEANUP', 'validate_service_records', this.#calls.writes, true);
     }
     for (const [manifest, resource] of [
@@ -2632,7 +2697,7 @@ class Session {
     }
     if (this.#tombstone.present &&
         (transaction.operation !== 'uninstall' ||
-         ['publish_service_manifest', 'publish_service_resource_proof', 'publish_startup_proof']
+         ['publish_service_manifest', 'publish_service_resource_proof', 'publish_startup_proof', 'publish_trial_boundary']
            .includes(operation))) {
       throwStore('SERVICE_TOMBSTONED', operation, this.#calls.writes);
     }
@@ -2659,6 +2724,13 @@ class Session {
          value.applicationManifestFingerprint !==
            transaction.final.applicationManifestFingerprint ||
          value.resourceProof !== transaction.final.resourceProof)) {
+      throwStore('SERVICE_PENDING', operation, this.#calls.writes);
+    }
+    if (['publish_trial_boundary', 'remove_trial_boundary'].includes(operation) &&
+        (transaction.operation === 'uninstall' ||
+         value.transactionId !== transaction.transactionId ||
+         value.transactionNonce !== transaction.transactionNonce ||
+         value.transitionFingerprint !== transaction.transition.transitionFingerprint)) {
       throwStore('SERVICE_PENDING', operation, this.#calls.writes);
     }
     if (['remove_service_manifest', 'remove_service_resource_proof', 'remove_startup_proof']
@@ -2721,6 +2793,7 @@ class Session {
       ...[...this.#serviceDirectories.values()].map((directory) => directory.handle),
     ];
     closeReverse(this.#calls, handles);
+    this.#plannedArtifactLocations.clear();
     this.#closed = true;
   }
 
@@ -2815,14 +2888,24 @@ class Session {
 
   readStartupProof() {
     const receipt = this.#readService('manifest', SERVICE_STORE_LAYOUT.startup, validateServiceStartupProof, 'startup-proof');
-    if (receipt.present) this.#scope(receipt.value, 'read_startup_proof');
+    if (receipt.present) {
+      this.#scope(receipt.value, 'read_startup_proof');
+      if (this.#config.platform === 'win32') {
+        this.#assertWindowsStartupProofBoundary(receipt.value, this.readTrialBoundary(), 'read_startup_proof');
+      }
+    }
     return receipt;
   }
 
   publishStartupProof(value, expected) {
+    try { validateServiceStartupProof(value); }
+    catch (error) { throwStore('SERVICE_INVALID', 'publish_startup_proof', this.#calls.writes, false, error); }
     value = this.#snapshot(value, validateServiceStartupProof, 'publish_startup_proof');
     this.#scope(value, 'publish_startup_proof');
     this.#authorizeRecoveryRecord('publish_startup_proof', value);
+    if (this.#config.platform === 'win32') {
+      this.#assertWindowsStartupProofBoundary(value, this.readTrialBoundary(), 'publish_startup_proof');
+    }
     const resource = this.readResourceProof('current');
     const provisional = this.#provisionalMetadata;
     const provisionalMatch = provisional !== null &&
@@ -2847,6 +2930,173 @@ class Session {
       expected.value,
     );
     return this.#remove(directory.handle, SERVICE_STORE_LAYOUT.startup, expected, 'startup-proof');
+  }
+
+  #trialBoundaryFailure(operation, code = 'SERVICE_SCOPE_MISMATCH') {
+    if (['validate_service_records', 'read_startup_proof'].includes(operation)) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    throwStore(code, operation, this.#calls.writes);
+  }
+
+  #assertWindowsStartupProofBoundary(proof, boundaryReceipt, operation) {
+    if (!boundaryReceipt.present) this.#trialBoundaryFailure(operation, 'SERVICE_PENDING');
+    const boundary = boundaryReceipt.value;
+    if (boundary.phase !== 'observed' || proof.clockKind !== 'windows-boot-tick' ||
+        proof.boundaryFingerprint !== boundary.boundaryFingerprint ||
+        proof.bootFingerprint !== boundary.bootFingerprint ||
+        proof.observedTickMs < boundary.lastTickMs ||
+        proof.observedTickMs > boundary.deadlineTickMs ||
+        proof.deadlineTickMs !== boundary.deadlineTickMs ||
+        proof.applicationManifestFingerprint !== boundary.applicationManifestFingerprint) {
+      this.#trialBoundaryFailure(operation);
+    }
+  }
+
+  #validateTrialBoundaryBinding(boundary, journal, operation) {
+    if (this.#config.platform !== 'win32') {
+      this.#trialBoundaryFailure(operation, 'SERVICE_UNSUPPORTED');
+    }
+    if (boundary.serviceKey !== this.#config.serviceKey) this.#trialBoundaryFailure(operation);
+    const versions = journal.entries.filter((entry) =>
+      entry.transactionId === boundary.transactionId &&
+      entry.transactionNonce === boundary.transactionNonce);
+    const transaction = versions.at(-1);
+    const latest = journal.entries.at(-1);
+    if (!transaction || !latest ||
+        transaction.serviceKey !== boundary.serviceKey ||
+        transaction.transition.transitionFingerprint !== boundary.transitionFingerprint ||
+        transaction.candidate.disposition !== 'release' ||
+        transaction.candidate.applicationManifestFingerprint !== boundary.applicationManifestFingerprint ||
+        transaction.transition.platformResourceFingerprint !== boundary.resourceFingerprint ||
+        this.#transactionIdentity(transaction) !== this.#transactionIdentity(latest)) {
+      this.#trialBoundaryFailure(operation);
+    }
+
+    // The protected resource record is checked when it still describes this
+    // transaction.  After recorded quiescence/finalization it may have been
+    // restored or removed; that does not turn its historical boundary into
+    // live process evidence.
+    const currentResource = this.readResourceProof('current');
+    const provisionalResource = this.#provisionalMetadata?.resource ?? null;
+    const resource = provisionalResource?.transactionId === transaction.transactionId &&
+      provisionalResource.transactionNonce === transaction.transactionNonce
+      ? provisionalResource
+      : currentResource.present && currentResource.value.transactionId === transaction.transactionId &&
+          currentResource.value.transactionNonce === transaction.transactionNonce
+        ? currentResource.value
+        : null;
+    const terminalOrQuiescent = ['quiescent', 'activation-observed', 'committed', 'tombstoned', 'resource-removed', 'references-released', 'manual-cleanup'].includes(latest.phase);
+    if (resource === null) {
+      if (!terminalOrQuiescent) this.#trialBoundaryFailure(operation, 'SERVICE_PENDING');
+    } else if (resource.serviceGeneration !== transaction.serviceGeneration ||
+        resource.operation !== transaction.operation ||
+        resource.applicationManifestFingerprint !== boundary.applicationManifestFingerprint ||
+        resource.shawlManifestFingerprint !== transaction.candidate.shawlManifestFingerprint ||
+        resource.platformResourceFingerprint !== boundary.resourceFingerprint ||
+        resource.configurationFingerprint !== boundary.effectiveConfigFingerprint ||
+        resource.serviceKey !== boundary.serviceKey) {
+      this.#trialBoundaryFailure(operation);
+    } else {
+      const manifest = this.readManifest('current');
+      if (!manifest.present || manifest.value.serviceGeneration !== transaction.serviceGeneration ||
+          manifest.value.applicationManifestFingerprint !== boundary.applicationManifestFingerprint ||
+          manifest.value.shawlManifestFingerprint !== transaction.candidate.shawlManifestFingerprint ||
+          manifest.value.configurationFingerprint !== boundary.effectiveConfigFingerprint ||
+          manifest.value.resourceProof !== resource.resourceProof) {
+        this.#trialBoundaryFailure(operation, 'SERVICE_PENDING');
+      }
+    }
+    return { transaction, latest, resource };
+  }
+
+  #readTrialBoundary(journal, operation) {
+    const receipt = this.#readService(
+      'manifest',
+      SERVICE_STORE_LAYOUT.trialBoundary,
+      validateServiceTrialBoundary,
+      'trial-boundary',
+    );
+    if (receipt.present) this.#validateTrialBoundaryBinding(receipt.value, journal, operation);
+    return receipt;
+  }
+
+  readTrialBoundary() {
+    const journal = this.readJournal();
+    return this.#readTrialBoundary(journal, 'read_trial_boundary');
+  }
+
+  publishTrialBoundary(value, expectedReceipt) {
+    this.#ensureWritable('publish_trial_boundary');
+    try {
+      // Validate the caller's object before #snapshot/canonical JSON can read
+      // any field.  In particular, getter-backed or exotic records are not a
+      // supported boundary representation.
+      validateServiceTrialBoundary(value);
+    } catch (error) {
+      throwStore('SERVICE_INVALID', 'publish_trial_boundary', this.#calls.writes, false, error);
+    }
+    value = this.#snapshot(value, validateServiceTrialBoundary, 'publish_trial_boundary');
+    const prior = this.#boundReceipt(expectedReceipt, 'trial-boundary', 'publish_trial_boundary');
+    const previousValue = expectedReceipt.value;
+    const journal = this.readJournal();
+    const binding = this.#validateTrialBoundaryBinding(value, journal, 'publish_trial_boundary');
+    this.#authorizeRecoveryRecord('publish_trial_boundary', value);
+    if (prior.native === null) {
+      if (value.revision !== 1 || value.attempt !== 1 || value.previousBoundaryFingerprint !== null ||
+          value.phase !== 'captured' || binding.latest.phase !== 'resource-published') {
+        throwStore('SERVICE_PENDING', 'publish_trial_boundary', this.#calls.writes);
+      }
+    } else {
+      validateServiceTrialBoundary(previousValue);
+      try { validateServiceTrialBoundarySuccessor(previousValue, value); }
+      catch (error) {
+        throwStore('SERVICE_STALE', 'publish_trial_boundary', this.#calls.writes, false, error);
+      }
+      if (value.attempt > previousValue.attempt) {
+        if (binding.latest.phase !== 'quiescent' || binding.latest.substep !== 'observed' ||
+            binding.resource === null || value.phase !== 'captured' ||
+            this.#transactionIdentity(binding.transaction) !== this.#transactionIdentity(
+              journal.entries.find((entry) => entry.transactionId === previousValue.transactionId &&
+                entry.transactionNonce === previousValue.transactionNonce) ?? binding.transaction,
+            )) {
+          throwStore('SERVICE_PENDING', 'publish_trial_boundary', this.#calls.writes);
+        }
+      } else if (value.phase === 'captured'
+        ? !['resource-published', 'trial-start-intent'].includes(binding.latest.phase)
+        : !['trial-start-observed', 'starting', 'startup-observed', 'activation-observed'].includes(binding.latest.phase)) {
+        throwStore('SERVICE_PENDING', 'publish_trial_boundary', this.#calls.writes);
+      }
+    }
+    return this.#publishService(
+      'manifest',
+      SERVICE_STORE_LAYOUT.trialBoundary,
+      value,
+      validateServiceTrialBoundary,
+      expectedReceipt,
+      'trial-boundary',
+    );
+  }
+
+  removeTrialBoundary(expectedReceipt) {
+    const prior = this.#boundReceipt(expectedReceipt, 'trial-boundary', 'remove_trial_boundary');
+    if (prior.native === null) throwStore('SERVICE_STALE', 'remove_trial_boundary', this.#calls.writes);
+    const journal = this.readJournal();
+    const boundary = expectedReceipt.value;
+    const binding = this.#validateTrialBoundaryBinding(boundary, journal, 'remove_trial_boundary');
+    if (!['activation-observed', 'committed', 'tombstoned', 'resource-removed', 'references-released'].includes(binding.latest.phase) ||
+        binding.latest.substep !== 'observed') {
+      throwStore('SERVICE_PENDING', 'remove_trial_boundary', this.#calls.writes);
+    }
+    this.#authorizeRecoveryRecord('remove_trial_boundary', boundary);
+    const directory = this.#serviceDirectory('manifest', false);
+    if (!directory) throwStore('SERVICE_STALE', 'remove_trial_boundary', this.#calls.writes);
+    return this.#remove(
+      directory.handle,
+      SERVICE_STORE_LAYOUT.trialBoundary,
+      expectedReceipt,
+      'trial-boundary',
+    );
   }
 
   readTombstone() {
@@ -4447,10 +4697,19 @@ class Session {
         identities.delete(handle);
         readers.delete(handle);
       }),
-      observePublication: (purpose, manifest, identity, operation) =>
-        operationCall(operation, () => purpose === 'application'
-          ? this.observeApplicationPublication(manifest, identity)
-          : this.observeShawlPublication(manifest, identity)),
+      observePublication: (
+        purpose,
+        manifest,
+        identity,
+        operation,
+        disposition,
+        inventory,
+      ) => operationCall(operation, () => this.#observePublication(
+        manifest,
+        identity,
+        purpose,
+        { disposition, inventory },
+      )),
       fail: (code, operation, ambiguous = false) => {
         throwStore(code, operation, this.#calls.writes, ambiguous);
       },
@@ -6389,6 +6648,419 @@ class Session {
     return Object.freeze(siblings);
   }
 
+  #locationManifestPaths(manifest, purpose, operation) {
+    const paths = new Map();
+    const add = (relativePath, expectedFileSha256 = null) => {
+      if (typeof relativePath !== 'string' ||
+          (expectedFileSha256 !== null && !isHex64(expectedFileSha256))) {
+        throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+      }
+      const prior = paths.get(relativePath);
+      if (prior !== undefined && expectedFileSha256 !== null && prior !== null &&
+          prior !== expectedFileSha256) {
+        throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+      }
+      paths.set(relativePath, expectedFileSha256 ?? prior ?? null);
+    };
+
+    if (purpose === 'shawl') {
+      add(manifest.executable.name, manifest.executable.sha256);
+      return paths;
+    }
+
+    add(manifest.entrypoints[this.#config.component]);
+    add(manifest.nativeControl.manifestPath);
+    if (!Object.hasOwn(manifest, 'windowsServiceBootstrap')) return paths;
+
+    const bootstrap = dataValues(manifest.windowsServiceBootstrap, [
+      'schemaVersion',
+      'guardPath',
+      'staticClosure',
+      'staticClosureFingerprint',
+      'runtimePolicies',
+      'externalBunConfig',
+    ]);
+    if (bootstrap === null || bootstrap.schemaVersion !== 1 ||
+        !Array.isArray(bootstrap.staticClosure)) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    let previousPath = null;
+    let guardFound = false;
+    for (const item of bootstrap.staticClosure) {
+      const closure = dataValues(item, ['relativePath', 'sha256']);
+      if (closure === null || typeof closure.relativePath !== 'string' ||
+          !isHex64(closure.sha256) ||
+          (previousPath !== null && utf8Compare(previousPath, closure.relativePath) >= 0)) {
+        throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+      }
+      previousPath = closure.relativePath;
+      add(closure.relativePath, closure.sha256);
+      if (closure.relativePath === bootstrap.guardPath) guardFound = true;
+    }
+    if (typeof bootstrap.guardPath !== 'string' || !guardFound) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    add(bootstrap.guardPath);
+    return paths;
+  }
+
+  #artifactLocationRequests(manifest, purpose, inventory, operation) {
+    if (purpose === 'application') {
+      try {
+        validateBundleInventory(inventory, { platform: 'win32' });
+        validateApplicationDeploymentManifest(manifest, inventory);
+      } catch (error) {
+        throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true, error);
+      }
+    }
+    const declared = this.#locationManifestPaths(manifest, purpose, operation);
+    const records = purpose === 'application'
+      ? new Map(inventory.payloadEntries.map((record) => [record.path, record]))
+      : null;
+    const requests = [];
+    for (const [relativePath, signedHash] of declared) {
+      if (purpose === 'shawl') {
+        requests.push(Object.freeze({
+          relativePath,
+          expectedFileSha256: manifest.executable.sha256,
+          profile: 'service-release-executable',
+        }));
+        continue;
+      }
+      const record = records.get(relativePath);
+      if (!record || (signedHash !== null && record.sha256 !== signedHash)) {
+        throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+      }
+      requests.push(Object.freeze({
+        relativePath,
+        expectedFileSha256: record.sha256,
+        profile: record.executablePolicy === 'required'
+          ? 'service-release-executable'
+          : 'service-release-file',
+      }));
+    }
+    return requests;
+  }
+
+  #readPublishedBundleInventory(
+    directoryHandle,
+    directoryIdentity,
+    manifest,
+    operation,
+  ) {
+    const bridge = this.#artifactBridge();
+    const listing = validateArtifactListResult(
+      this.#calls,
+      this.#calls.invoke(
+        'list_service_directory',
+        directoryHandle,
+        ARTIFACT_DIRECTORY_ENTRIES,
+        this.#artifact.handle,
+      ),
+      this.#config.platform,
+      directoryIdentity,
+    );
+    const entry = listing.entries.find(
+      ({ name }) => name === APPLICATION_BUNDLE_INVENTORY_PATH,
+    ) ?? null;
+    if (entry === null || entry.identity.profile !== 'service-release-file') {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    validateServiceNativeIdentity(
+      entry.identity,
+      this.#config.platform,
+      'service-release-file',
+    );
+    if (entry.identity.owner !== this.#config.roles.management.value) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+
+    const reader = bridge.openReader(
+      directoryHandle,
+      APPLICATION_BUNDLE_INVENTORY_PATH,
+      manifest.inventory.byteLength,
+      null,
+      operation,
+    );
+    if (reader === null || reader.facts.size !== manifest.inventory.byteLength ||
+        reader.facts.sha256 !== manifest.inventory.sha256 ||
+        !artifactFactsMatchIdentity(reader.facts, entry.identity)) {
+      if (reader !== null) bridge.closeHandle(reader.handle, operation);
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+
+    const parts = [];
+    let offset = 0;
+    try {
+      let eof = false;
+      while (!eof) {
+        const result = bridge.readChunk(
+          reader.handle,
+          offset,
+          ARTIFACT_CHUNK_BYTES,
+          operation,
+        );
+        offset = result.nextOffset;
+        eof = result.eof;
+        if (result.bytes.length !== 0) parts.push(result.bytes);
+      }
+    } finally {
+      bridge.closeHandle(reader.handle, operation);
+    }
+    if (offset !== manifest.inventory.byteLength) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    const bytes = Buffer.concat(parts, offset);
+    if (createHash('sha256').update(bytes).digest('hex') !==
+        manifest.inventory.sha256) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    let inventory;
+    try {
+      inventory = parseCanonicalJsonBytes(bytes, INVENTORY_LIMITS);
+      validateBundleInventory(inventory, { platform: 'win32' });
+      validateApplicationDeploymentManifest(manifest, inventory);
+    } catch (error) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true, error);
+    }
+    return inventory;
+  }
+
+  #resolvePublishedLocations(binding, manifest, directoryHandle, inventory, operation) {
+    if (this.#config.platform !== 'win32') return Object.freeze([]);
+    if (!['application', 'shawl'].includes(binding.artifactKind) ||
+        binding.manifestFingerprint !== manifest.manifestFingerprint ||
+        !this.#artifactMatchesDeployment(
+          binding,
+          binding.artifactKind,
+          manifest,
+        ) ||
+        binding.rootKind !== (binding.artifactKind === 'application' ? 'releases' : 'shawl') ||
+        binding.artifactFingerprint !== (binding.artifactKind === 'application'
+          ? manifest.archive.sha256
+          : manifest.executable.sha256)) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    if (binding.artifactKind === 'application' && inventory === null) {
+      inventory = this.#readPublishedBundleInventory(
+        directoryHandle,
+        binding.directoryIdentity,
+        manifest,
+        operation,
+      );
+    }
+    const requests = this.#artifactLocationRequests(
+      manifest,
+      binding.artifactKind,
+      inventory,
+      operation,
+    );
+    const locations = [];
+    for (const request of requests) {
+      const raw = this.#calls.invoke(
+        'resolve_service_artifact_location',
+        directoryHandle,
+        request.relativePath,
+        request.expectedFileSha256,
+      );
+      const result = dataValues(raw, PUBLISHED_LOCATION_KEYS);
+      let valid = result !== null && result.schemaVersion === 1 &&
+        result.publishedPath === request.relativePath &&
+        typeof result.absolutePath === 'string' &&
+        windowsPath.isAbsolute(result.absolutePath) &&
+        result.absolutePath.length <= 32768 &&
+        !result.absolutePath.includes('\0') &&
+        result.absolutePath.toLowerCase().endsWith(
+          `\\${request.relativePath.replaceAll('/', '\\')}`.toLowerCase(),
+        ) &&
+        result.fileSha256 === request.expectedFileSha256 &&
+        result.writes === 0;
+      if (valid) {
+        try {
+          validateServiceNativeIdentity(
+            result.directoryIdentity,
+            'win32',
+            'service-release-directory',
+          );
+          validateServiceNativeIdentity(
+            result.fileIdentity,
+            'win32',
+            request.profile,
+          );
+        } catch {
+          valid = false;
+        }
+      }
+      if (!valid || result.directoryIdentity.owner !== this.#config.roles.management.value ||
+          result.fileIdentity.owner !== this.#config.roles.management.value) {
+        throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+      }
+
+      const planned = this.#plannedArtifactLocations.get(locationIntentKey(
+        binding.artifactKind,
+        manifest.manifestFingerprint,
+        request.relativePath,
+      )) ?? null;
+      if (planned !== null) {
+        const intent = locationIntentBindings.get(planned);
+        if (!intent || intent.token !== this.#token ||
+            intent.rootKind !== binding.rootKind ||
+            intent.artifactFingerprint !== binding.artifactFingerprint ||
+            intent.relativePath !== result.publishedPath ||
+            intent.absolutePath !== result.absolutePath) {
+          throwStore('SERVICE_STALE', operation, this.#calls.writes);
+        }
+      }
+
+      const location = Object.freeze({
+        binding: cloneJson(binding),
+        schemaVersion: result.schemaVersion,
+        publishedPath: result.publishedPath,
+        absolutePath: result.absolutePath,
+        directoryIdentity: cloneJson(result.directoryIdentity),
+        fileIdentity: cloneJson(result.fileIdentity),
+        fileSha256: result.fileSha256,
+        writes: result.writes,
+      });
+      publishedLocationBindings.set(location, {
+        token: this.#token,
+        bindingFingerprint: binding.bindingFingerprint,
+        purpose: binding.artifactKind,
+        manifestFingerprint: manifest.manifestFingerprint,
+        relativePath: result.publishedPath,
+        fileSha256: result.fileSha256,
+        intent: planned,
+      });
+      locations.push(location);
+    }
+    return Object.freeze(locations);
+  }
+
+  planArtifactLocation(input) {
+    const operation = 'plan_service_artifact_location';
+    this.#ensureOpen(operation);
+    const fields = dataValues(input, ['purpose', 'manifest', 'relativePath']);
+    if (arguments.length !== 1 || fields === null ||
+        !['application', 'shawl'].includes(fields.purpose) ||
+        typeof fields.relativePath !== 'string') {
+      throwStore('SERVICE_INVALID', operation, this.#calls.writes);
+    }
+    if (this.#config.platform !== 'win32') {
+      throwStore('SERVICE_UNSUPPORTED', operation, this.#calls.writes);
+    }
+    this.#assertPinnedManifest(fields.manifest, fields.purpose);
+    const manifest = this.#snapshot(
+      fields.manifest,
+      fields.purpose === 'application'
+        ? validateApplicationDeploymentManifest
+        : validateShawlDeploymentManifest,
+      operation,
+    );
+    if (manifest.target.platform !== 'win32' ||
+        manifest.target.architecture !== this.#config.architecture ||
+        (fields.purpose === 'shawl' && this.#config.architecture !== 'x64')) {
+      throwStore('SERVICE_SCOPE_MISMATCH', operation, this.#calls.writes);
+    }
+    const declared = this.#locationManifestPaths(manifest, fields.purpose, operation);
+    if (!declared.has(fields.relativePath)) {
+      throwStore('SERVICE_SCOPE_MISMATCH', operation, this.#calls.writes);
+    }
+    const rootKind = fields.purpose === 'application' ? 'releases' : 'shawl';
+    const artifactFingerprint = fields.purpose === 'application'
+      ? manifest.archive.sha256
+      : manifest.executable.sha256;
+    const raw = this.#calls.invoke(
+      'plan_service_artifact_location',
+      rootKind,
+      artifactFingerprint,
+      fields.relativePath,
+    );
+    const result = dataValues(raw, LOCATION_INTENT_KEYS);
+    let valid = result !== null && result.schemaVersion === 1 &&
+      result.rootKind === rootKind &&
+      result.artifactFingerprint === artifactFingerprint &&
+      result.relativePath === fields.relativePath &&
+      typeof result.absoluteRoot === 'string' &&
+      typeof result.absolutePath === 'string' &&
+      windowsPath.isAbsolute(result.absoluteRoot) &&
+      windowsPath.isAbsolute(result.absolutePath) &&
+      result.absoluteRoot.length <= 32768 &&
+      result.absolutePath.length <= 32768 &&
+      !result.absoluteRoot.includes('\0') &&
+      !result.absolutePath.includes('\0') &&
+      isHex64(result.anchorIdentityFingerprint) &&
+      isHex64(result.intentFingerprint) &&
+      Array.isArray(result.missingSegments) &&
+      result.missingSegments.length > 0 &&
+      result.missingSegments.every((segment) => typeof segment === 'string' &&
+        segment.length > 0 && !/[\\/:\0]/.test(segment) &&
+        segment !== '.' && segment !== '..') &&
+      result.writes === 0;
+    if (valid) {
+      const rootPrefix = result.absoluteRoot.endsWith('\\')
+        ? result.absoluteRoot
+        : `${result.absoluteRoot}\\`;
+      const targetSuffix = `${artifactFingerprint}\\${fields.relativePath.replaceAll('/', '\\')}`;
+      valid = result.absolutePath.toLowerCase().startsWith(rootPrefix.toLowerCase()) &&
+        result.absolutePath.toLowerCase().endsWith(targetSuffix.toLowerCase());
+    }
+    if (valid && result.existingDirectoryIdentity !== null) {
+      try {
+        validateServiceNativeIdentity(
+          result.existingDirectoryIdentity,
+          'win32',
+          'service-release-directory',
+        );
+        valid = result.existingDirectoryIdentity.owner ===
+          this.#config.roles.management.value;
+      } catch {
+        valid = false;
+      }
+    }
+    if (!valid) {
+      throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+    }
+    const key = locationIntentKey(
+      fields.purpose,
+      manifest.manifestFingerprint,
+      fields.relativePath,
+    );
+    const prior = this.#plannedArtifactLocations.get(key);
+    if (prior !== undefined) {
+      const priorState = locationIntentBindings.get(prior);
+      if (!priorState || priorState.token !== this.#token ||
+          priorState.intentFingerprint !== result.intentFingerprint) {
+        throwStore('SERVICE_STALE', operation, this.#calls.writes);
+      }
+      return prior;
+    }
+    const intent = cloneJson({
+      schemaVersion: result.schemaVersion,
+      rootKind: result.rootKind,
+      artifactFingerprint: result.artifactFingerprint,
+      relativePath: result.relativePath,
+      absoluteRoot: result.absoluteRoot,
+      absolutePath: result.absolutePath,
+      anchorIdentityFingerprint: result.anchorIdentityFingerprint,
+      missingSegments: result.missingSegments,
+      existingDirectoryIdentity: result.existingDirectoryIdentity,
+      intentFingerprint: result.intentFingerprint,
+      writes: result.writes,
+    });
+    locationIntentBindings.set(intent, {
+      token: this.#token,
+      purpose: fields.purpose,
+      manifestFingerprint: manifest.manifestFingerprint,
+      rootKind,
+      artifactFingerprint,
+      relativePath: fields.relativePath,
+      absolutePath: result.absolutePath,
+      intentFingerprint: result.intentFingerprint,
+    });
+    this.#plannedArtifactLocations.set(key, intent);
+    return intent;
+  }
+
   readPublicationReceipt(input) {
     this.#ensureOpen('read_publication_receipt');
     if (!plain(input) || Reflect.ownKeys(input).length !== 2 ||
@@ -6402,8 +7074,22 @@ class Session {
     const binding = slot?.artifacts?.find((artifact) => artifact.artifactKind === input.artifactKind) ?? null;
     if (binding === null) throwStore('SERVICE_STALE', 'read_publication_receipt', this.#calls.writes);
     const rootKind = input.artifactKind === 'application' ? 'releases' : 'shawl';
+    let manifest = null;
+    if (this.#config.platform === 'win32') {
+      const retained = this.#readVerifiedRetainedDeploymentForArtifact(
+        input.artifactKind,
+        binding.manifestFingerprint,
+        'read_publication_receipt',
+      );
+      manifest = retained.verified.manifest;
+      this.#assertPinnedManifest(manifest, input.artifactKind);
+      if (!this.#artifactMatchesDeployment(binding, input.artifactKind, manifest)) {
+        throwStore('SERVICE_MANUAL_CLEANUP', 'read_publication_receipt', this.#calls.writes, true);
+      }
+    }
     let root = null;
     let directory = null;
+    let locations = null;
     try {
       root = validateOwnedRootResult(
         this.#calls,
@@ -6423,14 +7109,29 @@ class Session {
           canonicalJsonHash(directory.identity) !== binding.directoryIdentityFingerprint) {
         throwStore('SERVICE_MANUAL_CLEANUP', 'read_publication_receipt', this.#calls.writes, true);
       }
+      if (manifest !== null) {
+        locations = this.#resolvePublishedLocations(
+          binding,
+          manifest,
+          directory.handle,
+          null,
+          'read_publication_receipt',
+        );
+      }
     } finally {
       if (directory?.handle) { try { this.#calls.invoke('close_service_handle', directory.handle); } catch {} }
       if (root?.handle) { try { this.#calls.invoke('close_service_handle', root.handle); } catch {} }
     }
-    const receipt = Object.freeze({ binding: cloneJson(binding) });
+    const receipt = locations === null
+      ? Object.freeze({ binding: cloneJson(binding) })
+      : Object.freeze({ binding: cloneJson(binding), locations });
     publicationBindings.set(receipt, {
       token: this.#token,
       fingerprint: binding.bindingFingerprint,
+      manifest,
+      referenceRecordFingerprint: references.value.referenceRecordFingerprint,
+      referenceSlot: input.slot,
+      locations,
     });
     this.#observedPublications.set(binding.bindingFingerprint, receipt);
     return receipt;
@@ -6440,7 +7141,7 @@ class Session {
     return this.#observeZeroReferences(artifact);
   }
 
-  #observePublication(manifest, identity, kind) {
+  #observePublication(manifest, identity, kind, artifactObservation = null) {
     const operation = `observe_${kind}_publication`;
     this.#ensureOpen(operation);
     if (this.#artifactCollectionActive) {
@@ -6455,6 +7156,7 @@ class Session {
       );
     }
     this.#assertPinnedManifest(manifest, kind);
+    const manifestAuthority = manifest;
     manifest = this.#snapshot(
       manifest,
       kind === 'application' ? validateApplicationDeploymentManifest : validateShawlDeploymentManifest,
@@ -6471,6 +7173,20 @@ class Session {
     if (kind === 'shawl' && this.#config.platform !== 'win32') throwStore('SERVICE_SCOPE_MISMATCH', operation, this.#calls.writes);
     const rootKind = kind === 'application' ? 'releases' : 'shawl';
     const artifactFingerprint = kind === 'application' ? manifest.archive.sha256 : manifest.executable.sha256;
+    let inventory = null;
+    let disposition = null;
+    if (artifactObservation !== null) {
+      const observation = dataValues(artifactObservation, ['disposition', 'inventory']);
+      if (observation === null ||
+          !['published', 'reused'].includes(observation.disposition) ||
+          (kind === 'application' &&
+            (observation.inventory === null || !plain(observation.inventory))) ||
+          (kind === 'shawl' && observation.inventory !== null)) {
+        throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
+      }
+      inventory = observation.inventory;
+      disposition = observation.disposition;
+    }
     let root;
     let directory;
     try {
@@ -6503,12 +7219,32 @@ class Session {
         binding,
         operation,
       );
+      const locations = this.#config.platform === 'win32'
+        ? this.#resolvePublishedLocations(
+          binding,
+          manifest,
+          directory.handle,
+          inventory,
+          operation,
+        )
+        : null;
       this.#calls.invoke('close_service_handle', directory.handle);
       directory = undefined;
       this.#calls.invoke('close_service_handle', root.handle);
       root = undefined;
-      const receipt = Object.freeze({ binding: cloneJson(binding) });
-      publicationBindings.set(receipt, { token: this.#token, fingerprint: binding.bindingFingerprint });
+      const receipt = locations === null
+        ? Object.freeze({ binding: cloneJson(binding) })
+        : Object.freeze({
+          binding: cloneJson(binding),
+          locations,
+        });
+      publicationBindings.set(receipt, {
+        token: this.#token,
+        fingerprint: binding.bindingFingerprint,
+        manifest: manifestAuthority,
+        disposition,
+        locations,
+      });
       this.#observedPublications.set(binding.bindingFingerprint, receipt);
       return receipt;
     } finally {
@@ -7350,8 +8086,26 @@ class Session {
   #publication(receipt, manifestFingerprint, kind, operation) {
     const state = publicationBindings.get(receipt);
     if (!state || state.token !== this.#token || receipt.binding.artifactKind !== kind ||
-        receipt.binding.manifestFingerprint !== manifestFingerprint || state.fingerprint !== receipt.binding.bindingFingerprint) {
+        receipt.binding.manifestFingerprint !== manifestFingerprint ||
+        state.fingerprint !== receipt.binding.bindingFingerprint ||
+        (state.locations !== null && state.locations !== undefined &&
+          (receipt.locations !== state.locations ||
+           state.locations.some((location) => {
+             const authority = publishedLocationBindings.get(location);
+             return !authority || authority.token !== this.#token ||
+               authority.bindingFingerprint !== state.fingerprint ||
+               authority.purpose !== kind ||
+               authority.manifestFingerprint !== manifestFingerprint;
+           })))) {
       throwStore('SERVICE_STALE', operation, this.#calls.writes);
+    }
+    if (state.referenceRecordFingerprint !== undefined) {
+      const references = this.readReferences();
+      if (!references.present ||
+          references.value.referenceRecordFingerprint !==
+            state.referenceRecordFingerprint) {
+        throwStore('SERVICE_STALE', operation, this.#calls.writes);
+      }
     }
     return receipt.binding;
   }

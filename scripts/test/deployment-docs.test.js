@@ -102,6 +102,7 @@ test("platform status never promotes missing artifacts", () => {
   assert.match(documents.get("docs/deployment/README.md"), /no\s+rendered units, live host deployment/);
   assert.match(documents.get("docs/deployment/platforms/macos.md"), /not a supported native-control/);
   assert.match(documents.get("docs/deployment/platforms/windows.md"), /Do not use NSSM/);
+  assert.match(documents.get("docs/deployment/platforms/windows.md"), /evidence class is `foreground-fixture`, not an\s+actual service lifecycle/);
 });
 
 test("lifecycle guidance reflects source implementation without claiming production evidence", () => {

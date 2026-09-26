@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { canonicalJsonBytes, canonicalJsonHash, isHex64, utf8Compare, assertStrictText } from "./strict-json.js";
 
 export const DEPLOYMENT_ENVELOPE_LIMITS = Object.freeze({
@@ -32,7 +33,7 @@ export const SHAWL_UPSTREAM = Object.freeze({
   commit: "dbc4014c6d67027dc75a565d79fe9f493e897eb2",
 });
 export const APPLICATION_BUNDLE_INVENTORY_PATH = "bundle-files.json";
-export const REQUIRED_NATIVE_CONTROL_CONTRACT = Object.freeze({ version: 4, revision: 4 });
+export const REQUIRED_NATIVE_CONTROL_CONTRACT = Object.freeze({ version: 5, revision: 1 });
 
 const INVENTORY_CANONICAL_LIMITS = Object.freeze({
   maxBytes: DEPLOYMENT_ENVELOPE_LIMITS.inventoryBytes,
@@ -389,8 +390,60 @@ export function applicationDeploymentManifestFingerprint(manifest) {
   return fingerprint(manifest, "manifestFingerprint");
 }
 
+export const WINDOWS_SERVICE_BOOTSTRAP_CLOSURE_DOMAIN = "gjc-remote/windows-service-bootstrap-closure/v1";
+export const WINDOWS_SERVICE_BOOTSTRAP_EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+export const WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES = Object.freeze({
+  bot: Object.freeze({ runtime: "node", version: "26.7.0", sourceRevision: "b4f23d3619c98bed09af93a21192f6080197a8c6" }),
+  daemon: Object.freeze({ runtime: "bun", version: "1.4.2", sourceRevision: "744846f844374847c902b5e7fd59b4342a51ef99" }),
+});
+export const WINDOWS_SERVICE_BOOTSTRAP_EXTERNAL_BUN_CONFIG = Object.freeze({
+  relativePath: "runtime-config/.bunfig.toml",
+  sha256: WINDOWS_SERVICE_BOOTSTRAP_EMPTY_FILE_SHA256,
+  byteLength: 0,
+});
+const WINDOWS_SERVICE_BOOTSTRAP_KEYS = ["schemaVersion", "guardPath", "staticClosure", "staticClosureFingerprint", "runtimePolicies", "externalBunConfig"];
+
+// Same fingerprint as native-control service-bootstrap-policy
+// serviceBootstrapClosureFingerprint. The host derives the Launch value from
+// this signed metadata; the guard only checks the pinned env shape at launch.
+export function windowsServiceBootstrapClosureFingerprint(staticClosure) {
+  if (!Array.isArray(staticClosure) || staticClosure.length === 0) fail("windows service bootstrap closure");
+  let previous = null;
+  const pairs = staticClosure.map((entry) => {
+    if (!exact(entry, ["relativePath", "sha256"]) || typeof entry.relativePath !== "string" || !isHex64(entry.sha256) ||
+        (previous !== null && utf8Compare(previous, entry.relativePath) >= 0)) fail("windows service bootstrap closure");
+    previous = entry.relativePath;
+    return [entry.relativePath, entry.sha256];
+  });
+  return createHash("sha256").update(`${WINDOWS_SERVICE_BOOTSTRAP_CLOSURE_DOMAIN}\n${JSON.stringify(pairs)}`, "utf8").digest("hex");
+}
+
+function validateWindowsServiceBootstrap(metadata, platform) {
+  if (platform !== "win32" || !exact(metadata, WINDOWS_SERVICE_BOOTSTRAP_KEYS) || metadata.schemaVersion !== 1 ||
+      typeof metadata.guardPath !== "string" || !metadata.guardPath.endsWith("/src/service-bootstrap.js")) fail("windows service bootstrap");
+  validateBundlePath(metadata.guardPath, platform, "windows service bootstrap guard path");
+  for (const entry of metadata.staticClosure ?? []) validateBundlePath(entry?.relativePath, platform, "windows service bootstrap closure path");
+  if (windowsServiceBootstrapClosureFingerprint(metadata.staticClosure) !== metadata.staticClosureFingerprint ||
+      !metadata.staticClosure.some((entry) => entry.relativePath === metadata.guardPath)) fail("windows service bootstrap closure");
+  if (!exact(metadata.runtimePolicies, ["bot", "daemon"]) ||
+      ["bot", "daemon"].some((component) => {
+        const policy = metadata.runtimePolicies[component];
+        const expected = WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES[component];
+        return !exact(policy, ["runtime", "version", "sourceRevision"]) || policy.runtime !== expected.runtime ||
+          policy.version !== expected.version || policy.sourceRevision !== expected.sourceRevision;
+      }) ||
+      !exact(metadata.externalBunConfig, ["relativePath", "sha256", "byteLength"]) ||
+      metadata.externalBunConfig.relativePath !== WINDOWS_SERVICE_BOOTSTRAP_EXTERNAL_BUN_CONFIG.relativePath ||
+      metadata.externalBunConfig.sha256 !== WINDOWS_SERVICE_BOOTSTRAP_EXTERNAL_BUN_CONFIG.sha256 ||
+      metadata.externalBunConfig.byteLength !== 0) fail("windows service bootstrap policy");
+  return metadata;
+}
+
 export function validateApplicationDeploymentManifest(manifest, inventory = undefined) {
-  const keys = ["schemaVersion", "kind", "signingKeyId", "releaseId", "releaseVersion", "releaseSequence", "source", "target", "archive", "inventory", "entrypoints", "runtimes", "nativeControl", "wireCapabilities", "compatibility", "manifestFingerprint"];
+  const baseKeys = ["schemaVersion", "kind", "signingKeyId", "releaseId", "releaseVersion", "releaseSequence", "source", "target", "archive", "inventory", "entrypoints", "runtimes", "nativeControl", "wireCapabilities", "compatibility"];
+  const keys = manifest !== null && typeof manifest === "object" && Object.hasOwn(manifest, "windowsServiceBootstrap")
+    ? [...baseKeys, "windowsServiceBootstrap", "manifestFingerprint"]
+    : [...baseKeys, "manifestFingerprint"];
   if (!exact(manifest, keys) || manifest.schemaVersion !== 1 || manifest.kind !== "application-deployment-manifest" ||
       typeof manifest.signingKeyId !== "string" || !KEY_ID.test(manifest.signingKeyId) ||
       typeof manifest.releaseVersion !== "string" || !SEMVER.test(manifest.releaseVersion) ||
@@ -405,6 +458,7 @@ export function validateApplicationDeploymentManifest(manifest, inventory = unde
   validateNativeControlContract(manifest.nativeControl, manifest.target.platform);
   validateWireCapabilities(manifest.wireCapabilities);
   validateDeploymentCompatibility(manifest.compatibility);
+  if (Object.hasOwn(manifest, "windowsServiceBootstrap")) validateWindowsServiceBootstrap(manifest.windowsServiceBootstrap, manifest.target.platform);
   if (applicationDeploymentManifestFingerprint(manifest) !== manifest.manifestFingerprint) fail("application manifest fingerprint");
   assertCanonicalSize(manifest, DEPLOYMENT_ENVELOPE_LIMITS.manifestBytes, "application manifest");
   if (inventory !== undefined) {
@@ -416,6 +470,12 @@ export function validateApplicationDeploymentManifest(manifest, inventory = unde
     const payloadPaths = new Set(inventory.payloadEntries.map((entry) => entry.path));
     for (const path of [manifest.entrypoints.bot, manifest.entrypoints.daemon, manifest.nativeControl.manifestPath]) {
       if (!payloadPaths.has(path)) fail("manifest required payload relation");
+    }
+    if (Object.hasOwn(manifest, "windowsServiceBootstrap")) {
+      const payloadHashes = new Map(inventory.payloadEntries.map((entry) => [entry.path, entry.sha256]));
+      for (const entry of manifest.windowsServiceBootstrap.staticClosure) {
+        if (payloadHashes.get(entry.relativePath) !== entry.sha256) fail("windows service bootstrap payload relation");
+      }
     }
   }
   return manifest;
@@ -577,5 +637,157 @@ export function assertReleaseTransitionCompatible({ current, candidate, predeces
   if (component === "daemon") sdkValues.push(sdkExternalStateContractFingerprint);
   if (sdkValues.some((value) => value !== sdkValues[0])) fail("SDK external-state contract mismatch");
   if (component === "bot" && sdkExternalStateContractFingerprint !== null) fail("bot SDK external-state contract");
+  return candidate;
+}
+
+const SERVICE_SCOPE_ROOT_PROFILES = new Set(["config", "retained-state", "sdk-install"]);
+const SERVICE_SCOPE_ROOT_KEYS = [
+  "rootId", "profile", "pathFingerprint", "rootIdentityFingerprint", "absenceFingerprint",
+  "listingFingerprint", "entryCount", "markerBytes",
+];
+const SERVICE_SCOPE_RECEIPT_KEYS = [
+  "schemaVersion", "serviceKey", "scopeFingerprint", "rootObservations", "observedRetainedFormats",
+  "sdkExternalStateContractFingerprint", "coverage", "receiptFingerprint",
+];
+
+function captureExactRecord(value, keys, name) {
+  if (!plain(value)) fail(`${name} schema`);
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== "string" || !keys.includes(key))) {
+    fail(`${name} schema`);
+  }
+  const result = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) fail(`${name} schema`);
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function captureExactArray(value, maximum, name) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) fail(`${name} schema`);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value") ||
+      !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0 ||
+      lengthDescriptor.value > maximum) fail(`${name} schema`);
+  const length = lengthDescriptor.value;
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== length + 1 || ownKeys.some((key) => typeof key !== "string")) {
+    fail(`${name} schema`);
+  }
+  const result = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) fail(`${name} schema`);
+    result.push(descriptor.value);
+  }
+  return result;
+}
+
+function validateFirstInstallFormats(value, component, name) {
+  const input = captureExactRecord(value, FORMAT_DOMAINS[component], name);
+  const snapshot = {};
+  for (const domain of FORMAT_DOMAINS[component]) {
+    const values = captureExactArray(input[domain], DEPLOYMENT_ENVELOPE_LIMITS.formatsPerDomain, `${name} ${domain}`);
+    validateSortedUniqueStrings(values, `${name} ${domain}`, (format) =>
+      Buffer.byteLength(format, "utf8") <= DEPLOYMENT_ENVELOPE_LIMITS.formatIdBytes && FORMAT_ID.test(format),
+    DEPLOYMENT_ENVELOPE_LIMITS.formatsPerDomain, true);
+    snapshot[domain] = [...values];
+  }
+  return snapshot;
+}
+
+function validateFirstInstallScopeReceipt(value, component) {
+  const receipt = captureExactRecord(value, SERVICE_SCOPE_RECEIPT_KEYS, "first-install scope receipt");
+  if (receipt.schemaVersion !== 1 || !isHex64(receipt.scopeFingerprint) ||
+      receipt.coverage !== "declared-roots-only" || !isHex64(receipt.receiptFingerprint)) {
+    fail("first-install scope receipt fields");
+  }
+  validateServiceScopeKey(receipt.serviceKey, component);
+  const formats = validateFirstInstallFormats(receipt.observedRetainedFormats, component, "scope receipt formats");
+  if (component === "bot" ? receipt.sdkExternalStateContractFingerprint !== null :
+      !isHex64(receipt.sdkExternalStateContractFingerprint)) fail("first-install scope receipt SDK contract");
+  const rootObservations = captureExactArray(
+    receipt.rootObservations,
+    DEPLOYMENT_ENVELOPE_LIMITS.payloadEntries,
+    "first-install root observations",
+  );
+  if (rootObservations.length === 0) {
+    fail("first-install root observations");
+  }
+  let previousRootId = null;
+  const rootIds = new Set();
+  for (const candidate of rootObservations) {
+    const root = captureExactRecord(candidate, SERVICE_SCOPE_ROOT_KEYS, "first-install root observation");
+    strictText(root.rootId, "first-install root id", 128);
+    if (!/^[A-Za-z][A-Za-z0-9._:-]{0,127}$/.test(root.rootId) || rootIds.has(root.rootId) ||
+        !SERVICE_SCOPE_ROOT_PROFILES.has(root.profile) || !isHex64(root.pathFingerprint) ||
+        !nonnegative(root.entryCount) || root.entryCount > DEPLOYMENT_ENVELOPE_LIMITS.payloadEntries ||
+        !nonnegative(root.markerBytes) || root.markerBytes > 64 * 1024 * 1024 ||
+        (root.rootIdentityFingerprint === null) === (root.absenceFingerprint === null) ||
+        (root.rootIdentityFingerprint !== null && !isHex64(root.rootIdentityFingerprint)) ||
+        (root.absenceFingerprint !== null && !isHex64(root.absenceFingerprint)) ||
+        (root.rootIdentityFingerprint === null
+          ? root.listingFingerprint !== null || root.entryCount !== 0 || root.markerBytes !== 0
+          : !isHex64(root.listingFingerprint))) {
+      fail("first-install root observation fields");
+    }
+    if (previousRootId !== null && utf8Compare(previousRootId, root.rootId) >= 0) {
+      fail("first-install root observation ordering");
+    }
+    previousRootId = root.rootId;
+    rootIds.add(root.rootId);
+  }
+  if (fingerprint(receipt, "receiptFingerprint") !== receipt.receiptFingerprint) {
+    fail("first-install scope receipt fingerprint");
+  }
+  return { receipt, formats };
+}
+
+function validateServiceScopeKey(serviceKey, component) {
+  if (component === "bot" ? serviceKey !== "bot" :
+      typeof serviceKey !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?-[0-9a-f]{64}$/.test(serviceKey)) {
+    fail("first-install service key");
+  }
+}
+
+/**
+ * Independently validate a signed candidate against the complete retained
+ * format set for a genuinely absent first service install. Unlike a release
+ * transition this has no current/predecessor manifest to invent or compare.
+ * `scopeReceipt` is a verifier input, not a native-provenance brand; callers
+ * must pass only the operation-bound receipt produced by the native observer.
+ */
+export function assertFirstServiceInstallCompatible(input) {
+  const fields = captureExactRecord(input, [
+    "candidate", "component", "scopeReceipt", "observedRetainedFormats", "observedSdkContract",
+  ], "first-install compatibility input");
+  const { candidate, component } = fields;
+  if (!FORMAT_DOMAINS[component]) fail("first-install component");
+  validateApplicationDeploymentManifest(candidate);
+  if (candidate.target.platform !== "win32" || candidate.target.architecture !== "x64" ||
+      candidate.entrypoints[component] === undefined) fail("first-install target/component");
+  const { receipt, formats } = validateFirstInstallScopeReceipt(fields.scopeReceipt, component);
+  const observedFormats = validateFirstInstallFormats(fields.observedRetainedFormats, component, "observed retained formats");
+  if (canonicalJsonHash(formats) !== canonicalJsonHash(observedFormats)) {
+    fail("scope receipt retained format relation");
+  }
+  const candidateRole = candidate.compatibility.roles[component];
+  for (const domain of FORMAT_DOMAINS[component]) {
+    assertContainsAll(candidateRole.domains.find((entry) => entry.domain === domain).readableFormats,
+      new Set(observedFormats[domain]), `candidate cannot read ${domain}`);
+  }
+  if (component === "bot") {
+    if (fields.observedSdkContract !== null || receipt.sdkExternalStateContractFingerprint !== null ||
+        candidateRole.sdkExternalStateContractFingerprint !== null) fail("bot first-install SDK contract");
+  } else {
+    const observedSdkContract = validateSdkExternalStateContract(fields.observedSdkContract);
+    const sdkFingerprint = observedSdkContract.sdkExternalStateContractFingerprint;
+    if (sdkFingerprint !== receipt.sdkExternalStateContractFingerprint ||
+        sdkFingerprint !== candidateRole.sdkExternalStateContractFingerprint) {
+      fail("first-install SDK external-state contract mismatch");
+    }
+  }
   return candidate;
 }

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { capabilitySignatures, contractRevision } from '../src/index.js';
+import { capabilities, capabilitySignatures, contractRevision } from '../src/index.js';
 import { createOfflineDeploymentSource } from '../src/service-offline-source.js';
 
 const require = createRequire(import.meta.url);
@@ -40,8 +40,17 @@ const storeSignatures = {
 };
 
 function addon() {
-  assert.equal(existsSync(addonPath), true, 'revision-4 native addon must be built before this integration gate');
-  return require(addonPath);
+  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 1 native addon must be built before this integration gate');
+  const native = require(addonPath);
+  const contract = native.native_control_contract();
+  assert.deepEqual(contract, {
+    contractVersion: 5,
+    contractRevision,
+    napi: 8,
+    capabilities,
+    capabilitySignatures,
+  });
+  return native;
 }
 
 function sourceReaderRoles(native) {
@@ -85,8 +94,8 @@ function sourceReaderRoles(native) {
   };
 }
 
-test('revision 4 exposes the exact service store and Linux object substrate', () => {
-  assert.equal(contractRevision, 4);
+test('ABI 5 revision 1 exposes the exact service store and Linux object substrate', () => {
+  assert.equal(contractRevision, 1);
   assert.deepEqual(
     Object.fromEntries(Object.keys(storeSignatures).map((name) => [name, capabilitySignatures[name]])),
     storeSignatures,
@@ -694,11 +703,20 @@ test('Linux facade and Windows HOME binding fail safely without exercising host 
     );
   }
   const source = readFileSync(sourcePath, 'utf8');
-  assert.match(source, /"--env", "HOME=" \+ launch->home_directory/);
-  assert.match(source, /"--env", "USERPROFILE=" \+ launch->home_directory/);
+  assert.match(source, /add\("HOME", launch\.home_directory\);/);
+  assert.match(source, /add\("USERPROFILE", launch\.home_directory\);/);
   assert.match(
     source,
-    /arguments\.push_back\(launch->runtime_path\);\s*if \(role == "daemon"\) arguments\.push_back\("--no-env-file"\);\s*arguments\.push_back\(launch->entrypoint_path\);/,
+    /\{"HOME", launch\.home_directory\},\s*\{"USERPROFILE", launch\.home_directory\},/,
+    'the emitted --env vector binds HOME and USERPROFILE, not only the policy-fingerprint map',
+  );
+  assert.match(
+    source,
+    /arguments\.push_back\("--env"\);\s*arguments\.push_back\(entry\.first \+ "=" \+ entry\.second\);/,
+  );
+  assert.match(
+    source,
+    /if \(role == "bot"\) \{\s*return \{launch\.runtime_path, launch\.entrypoint_path\};\s*\}\s*return \{launch\.runtime_path, "--config", launch\.runtime_config_path,\s*"--no-env-file", launch\.entrypoint_path\};/,
     'only the Bun daemon suppresses automatic dotenv layers before the entrypoint',
   );
   assert.doesNotMatch(source, /wrapperEpochObserved/);

@@ -48,7 +48,7 @@ function manifestFor(
   overrides = {},
 ) {
   return {
-    contractVersion: 4,
+    contractVersion: 5,
     contractRevision,
     package: packageJson.name,
     version: packageJson.version,
@@ -70,7 +70,7 @@ function manifestBytes(manifest) {
 function signedInput(installation, {
   manifest = manifestFor(),
   manifestRaw = manifestBytes(manifest),
-  packageRaw = packageBytes,
+  packageRaw = installation.nativePackageBytes ?? packageBytes,
   bundledTrustBytes = installation.bundledNativeTrustBytes,
   platform = process.platform,
   architecture = process.arch,
@@ -176,7 +176,7 @@ test('pinned metadata verifier remains private and returns an explicit frozen no
       addonSha256: 'a'.repeat(64),
       platform: process.platform,
       architecture: process.arch,
-      contractVersion: 4,
+      contractVersion: 5,
       contractRevision,
       napi: 8,
       signingKeyId: sidecar.keyId,
@@ -433,6 +433,7 @@ test('signed manifest field, ABI, and capability-table drift is rejected', async
   await withNativeInstallation(async (installation) => {
     const cases = [
       ['contract version', { contractVersion: 3 }],
+      ['legacy contract version', { contractVersion: 4 }],
       ['contract revision', { contractRevision: contractRevision + 1 }],
       ['N-API version', { napi: 7 }],
       ['package name', { package: '@foreign/native-control' }],
@@ -511,6 +512,16 @@ test('package bytes must be strict JSON with the exact current native contract',
         ...packageJson.nativeControlContract,
         trustOverride: true,
       } },
+      {
+        ...packageJson,
+        version: '1.0.0',
+        nativeControlContract: {
+          version: 4,
+          revision: 4,
+          napi: 8,
+          platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+        },
+      },
     ];
     for (const drifted of contractCases) {
       const matchingManifest = manifestFor(process.platform, process.arch, {
@@ -527,6 +538,28 @@ test('package bytes must be strict JSON with the exact current native contract',
         'NATIVE_PROVENANCE_MANIFEST_INVALID',
       );
     }
+
+    const legacyPackage = {
+      ...packageJson,
+      version: '1.0.0',
+      nativeControlContract: {
+        version: 4,
+        revision: 4,
+        napi: 8,
+        platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+      },
+    };
+    assertFailure(
+      () => installation.nativeProvenance.verifyPinnedNativeBuildManifest(signedInput(installation, {
+        manifest: manifestFor(process.platform, process.arch, {
+          version: '1.0.0',
+          contractVersion: 4,
+          contractRevision: 4,
+        }),
+        packageRaw: Buffer.from(JSON.stringify(legacyPackage), 'utf8'),
+      })),
+      'NATIVE_PROVENANCE_MANIFEST_INVALID',
+    );
 
     for (const packageRaw of [
       Buffer.from('{"name":"first","name":"second"}', 'utf8'),

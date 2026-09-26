@@ -13,12 +13,14 @@ import {
   buildShawlDeploymentManifest,
 } from '@gjc-remote/shared/deployment-envelope';
 import {
+  buildServiceArtifactBinding,
   buildServiceCandidateProof,
   buildServiceFinalProof,
   buildServiceOldProof,
   buildServicePlatformState,
   buildServiceTransaction,
   buildServiceTransitionProof,
+  serviceNativeIdentityFingerprint,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import {
   canonicalJsonBytes,
@@ -116,9 +118,9 @@ function portableGzip(bytes) {
 function nativePackageBytes() {
   return canonicalJsonBytes({
     name: '@gjc-remote/native-control',
-    version: '1.0.0',
+    version: '2.0.0',
     nativeControlContract: {
-      version: 4,
+      version: 5,
       revision: contractRevision,
       napi: 8,
       platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
@@ -128,10 +130,10 @@ function nativePackageBytes() {
 
 function nativeManifestBytes(addonBytes, platform, architecture, claimedAddon = addonBytes) {
   return canonicalJsonBytes({
-    contractVersion: 4,
+    contractVersion: 5,
     contractRevision,
     package: '@gjc-remote/native-control',
-    version: '1.0.0',
+    version: '2.0.0',
     napi: 8,
     platform,
     arch: architecture,
@@ -346,7 +348,7 @@ function buildRelease({
     nativeControl: {
       manifestPath: 'native-control/build/Release/native-control.manifest.json',
       manifestFingerprint: sha256(manifestBytes),
-      contractVersion: 4,
+      contractVersion: 5,
       contractRevision,
     },
     wireCapabilities: ['gate_presentation_v1'],
@@ -571,8 +573,11 @@ function modeledSession(release, prepared, {
   retainFailure = null,
   failWritePath = null,
   failPublish = false,
+  mutateIntent = null,
+  mutatePublication = null,
 } = {}) {
   let remainingAccessCloseFailures = accessCloseFailures;
+  const plannedLocations = new Map();
   const state = {
     writes: initialWrites,
     journal: prepared,
@@ -590,6 +595,35 @@ function modeledSession(release, prepared, {
   const candidateFingerprint = (transaction, purpose) => purpose === 'application'
     ? transaction.candidate.applicationManifestFingerprint
     : transaction.candidate.shawlManifestFingerprint;
+  const windowsIdentity = (profile, path, attributes) => {
+    const facts = modeledFileFacts(path, Buffer.alloc(0), 'win32', 0);
+    return Object.freeze({
+      profile, kind: 'win32-service-object-v1', attributes,
+      volumeSerial: facts.volumeSerial, fileId: facts.fileId,
+      owner: facts.owner, securitySha256: facts.securitySha256,
+    });
+  };
+  const planArtifactLocation = ({ purpose, manifest, relativePath }) => {
+    installation.provenance.assertPinnedDeploymentManifest(manifest, purpose);
+    assert.deepEqual(manifest, expectedManifest(purpose));
+    assert.equal(typeof relativePath, 'string');
+    assert.ok(relativePath.length > 0);
+    const rootKind = purpose === 'application' ? 'releases' : 'shawl';
+    const artifactFingerprint = purpose === 'application' ? manifest.archive.sha256 : manifest.executable.sha256;
+    const absoluteRoot = `C:\\ProgramData\\gjc-remote\\${rootKind === 'shawl' ? 'supervisors\\shawl' : 'releases'}`;
+    const absolutePath = `${absoluteRoot}\\${artifactFingerprint}\\${relativePath.replaceAll('/', '\\')}`;
+    const fields = {
+      schemaVersion: 1, rootKind, artifactFingerprint, relativePath, absoluteRoot, absolutePath,
+      anchorIdentityFingerprint: serviceNativeIdentityFingerprint(windowsIdentity('service-release-directory', absoluteRoot, 16), 'win32'),
+      missingSegments: Object.freeze([artifactFingerprint, ...relativePath.split('/')]),
+      existingDirectoryIdentity: null, writes: 0,
+    };
+    const intent = Object.freeze({ ...fields, intentFingerprint: canonicalJsonHash(fields) });
+    if (!plannedLocations.has(purpose)) plannedLocations.set(purpose, new Map());
+    plannedLocations.get(purpose).set(relativePath, intent);
+    state.log.push(`plan:${purpose}:${relativePath}`);
+    return mutateIntent === null ? intent : mutateIntent(intent);
+  };
   const assertTransaction = (transaction, phase) => {
     if (!sameJson(transaction, state.journal) || transaction.phase !== phase) {
       throw sessionError(state, 'SERVICE_PENDING');
@@ -751,14 +785,34 @@ function modeledSession(release, prepared, {
             [...expected.keys()].some((path) => !written.has(path))) {
           throw sessionError(state, 'SERVICE_PENDING');
         }
-        const publication = Object.freeze({
+        let publication = Object.freeze({
           purpose,
           manifestFingerprint: manifest.manifestFingerprint,
           bindingFingerprint: sha256(Buffer.from(`${purpose}:${manifest.manifestFingerprint}`)),
         });
+        if (release.platform === 'win32') {
+          const intents = [...(plannedLocations.get(purpose)?.values() ?? [])];
+          assert.ok(intents.length > 0, 'Windows publication requires prior signed path intents');
+          const directoryIdentity = windowsIdentity('service-release-directory', `${intents[0].absoluteRoot}\\${intents[0].artifactFingerprint}`, 16);
+          const binding = Object.freeze(buildServiceArtifactBinding({
+            artifactKind: purpose, rootKind: intents[0].rootKind,
+            artifactFingerprint: intents[0].artifactFingerprint,
+            manifestFingerprint: manifest.manifestFingerprint,
+            treeFingerprint: purpose === 'application' ? manifest.inventory.treeFingerprint : null,
+            directoryIdentity,
+            directoryIdentityFingerprint: serviceNativeIdentityFingerprint(directoryIdentity, 'win32'),
+          }, 'win32'));
+          const locations = Object.freeze(intents.map((intent) => Object.freeze({
+            binding, schemaVersion: 1, publishedPath: intent.relativePath,
+            absolutePath: intent.absolutePath, directoryIdentity,
+            fileIdentity: windowsIdentity('service-release-file', intent.absolutePath, 32),
+            fileSha256: sha256(written.get(intent.relativePath)), writes: 0,
+          })));
+          publication = Object.freeze({ binding, locations });
+        }
         state.log.push(`publish:${purpose}`);
         state.writes += 1;
-        return publication;
+        return mutatePublication === null ? publication : mutatePublication(publication);
       },
       close() {
         if (closed) return;
@@ -803,7 +857,7 @@ function modeledSession(release, prepared, {
     assertTransaction(input.transaction, 'sequence-reserved');
     if (state.borrowed !== 0) throw sessionError(state, 'SERVICE_PENDING');
     if (!sameJson(input.manifest, expectedManifest(purpose)) ||
-        input.publication.purpose !== purpose) {
+        (release.platform === 'win32' ? input.publication.binding.artifactKind : input.publication.purpose) !== purpose) {
       throw sessionError(state, 'SERVICE_STALE');
     }
     state.log.push(`commit:${purpose}`);
@@ -827,6 +881,7 @@ function modeledSession(release, prepared, {
     },
   };
   if (release.platform === 'win32') {
+    session.planArtifactLocation = planArtifactLocation;
     session.reserveShawlSequence = (input) => reservePurpose('shawl', input);
     session.commitShawlSequence = (input) => commitPurpose('shawl', input);
   }
@@ -1280,7 +1335,19 @@ test('modeled composition: Windows retains both envelopes before either floor an
     release.paths.applicationSignaturePath,
     release.paths.shawlManifestPath,
     release.paths.shawlSignaturePath,
+    release.paths.applicationArchivePath,
   ]);
+  // The read-only archive pre-inspection yields the signed entrypoint digest
+  // for launch planning without any store write or reservation.
+  const entrypointPath = read.application.entrypoints[harness.prepared.component];
+  assert.deepEqual(read.signedEntrypoint, {
+    path: entrypointPath,
+    sha256: sha256(release.payload.find((item) => item.path === entrypointPath).bytes),
+    size: release.payload.find((item) => item.path === entrypointPath).bytes.length,
+  });
+  assert.equal(Object.isFrozen(read.signedEntrypoint), true);
+  assert.equal(harness.offline.handles.size, 0);
+  assert.equal(harness.session.controls.state.log.some((entry) => /^(reserve|publish|commit|stage)/.test(entry)), false);
   const reserve = harness.acquisition.reserve({
     transaction: harness.prepared,
     currentApplicationSequence: 1,
@@ -1298,14 +1365,74 @@ test('modeled composition: Windows retains both envelopes before either floor an
   const published = await harness.acquisition.publish({ transaction: harness.reserved });
   assert.equal(published.application.manifest, read.application);
   assert.equal(published.shawl.manifest, read.shawl);
-  assert.equal(published.shawl.publication.purpose, 'shawl');
+  assert.equal(published.shawl.publication.binding.artifactKind, 'shawl');
   const log = harness.session.controls.state.log;
+  for (const purpose of ['application', 'shawl']) {
+    const manifest = read[purpose];
+    const path = purpose === 'application' ? manifest.entrypoints[harness.prepared.component] : manifest.executable.name;
+    const receipt = published[purpose].publication;
+    const location = receipt.locations.find((item) => item.publishedPath === path);
+    assert.ok(location, 'signed launch file has an observed location');
+    assert.equal(location.binding, receipt.binding);
+    const bytes = purpose === 'application' ? release.payload.find((item) => item.path === path).bytes : release.shawlBytes;
+    assert.equal(location.fileSha256, sha256(bytes));
+    if (purpose === 'application') assert.equal(location.fileSha256, read.signedEntrypoint.sha256);
+    assert.equal(receipt.binding.artifactFingerprint, purpose === 'application' ? manifest.archive.sha256 : manifest.executable.sha256);
+    assert.notEqual(receipt.binding.artifactFingerprint, manifest.manifestFingerprint);
+    assert.ok(log.indexOf(`plan:${purpose}:${path}`) < log.indexOf(`publish:${purpose}`));
+    assert.equal(location.writes, 0);
+  }
   assert.ok(log.indexOf('commit:application') < log.indexOf('root:shawl'));
   assert.ok(log.indexOf('publish:shawl') < log.indexOf('access:shawl:close'));
   assert.ok(log.indexOf('access:shawl:close') < log.indexOf('commit:shawl'));
   assert.equal(harness.session.controls.state.borrowed, 0);
   assert.equal(harness.offline.handles.size, 0);
   await harness.acquisition.close();
+});
+
+test('Windows acquisition refuses altered path intents and publication evidence before committing', async (t) => {
+  const cases = [
+    ['wrong intent root', { mutateIntent: (intent) => ({ ...intent, rootKind: 'control' }) }, false],
+    ['wrong observed path', { mutatePublication: (receipt) => ({
+      ...receipt,
+      locations: receipt.locations.map((location) => ({ ...location, absolutePath: 'C:\\outside\\entry.js' })),
+    }) }, true],
+    ['wrong signed file hash', { mutatePublication: (receipt) => ({
+      ...receipt,
+      locations: receipt.locations.map((location) => ({ ...location, fileSha256: '0'.repeat(64) })),
+    }) }, true],
+    ['missing location', { mutatePublication: (receipt) => ({
+      ...receipt, locations: receipt.locations.slice(1),
+    }) }, true],
+    ['duplicate location', { mutatePublication: (receipt) => ({
+      ...receipt, locations: [...receipt.locations, receipt.locations[0]],
+    }) }, true],
+    ['foreign location binding', { mutatePublication: (receipt) => ({
+      ...receipt,
+      locations: receipt.locations.map((location) => ({
+        ...location, binding: { ...location.binding, bindingFingerprint: '0'.repeat(64) },
+      })),
+    }) }, true],
+  ];
+  for (const [name, options, publicationOccurred] of cases) {
+    await t.test(name, async () => {
+      const harness = createHarness(buildRelease({ platform: 'win32' }), options);
+      try {
+        await reserveAndJournal(harness);
+        await assert.rejects(
+          harness.acquisition.publish({ transaction: harness.reserved }),
+          acquisitionError('SERVICE_ACQUISITION_NATIVE_METADATA_INVALID', 'publish_service_acquisition'),
+        );
+        const { state } = harness.session.controls;
+        assert.equal(state.log.includes('publish:application'), publicationOccurred);
+        assert.equal(state.log.some((entry) => entry.startsWith('commit:')), false);
+        assert.equal(state.borrowed, 0);
+        assert.equal(harness.offline.handles.size, 0);
+      } finally {
+        await harness.acquisition.close();
+      }
+    });
+  }
 });
 
 test('asset bodies and staging roots remain inaccessible before both reservation and the sequence-reserved journal', async (t) => {

@@ -126,7 +126,7 @@ function validReader(reader) {
 
 function validSelfTest(receipt) {
   const values = exactDataValues(receipt, SELF_TEST_KEYS, true);
-  return values && values.role === 'daemon' && values.contractVersion === 4 && values.writes === 0;
+  return values && values.role === 'daemon' && values.contractVersion === 5 && values.writes === 0;
 }
 
 export async function initializeInventoryConfig(

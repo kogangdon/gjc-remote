@@ -4,8 +4,13 @@ import {
   buildServicePlatformState,
   buildServiceStartupProof,
   buildServiceTransaction,
+  buildServiceTrialBoundary,
+  validateServiceBootClock,
+  validateServiceCursorSet,
   validateServiceKey,
+  validateServiceLogEvidence,
   validateServiceRoles,
+  validateServiceTrialBoundary,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import { canonicalJsonHash } from '@gjc-remote/shared/strict-json';
 
@@ -20,8 +25,14 @@ export const WINDOWS_DRIVER_LIMITS = Object.freeze({
   startPollMs: 250,
   startupWindowMs: 60_000,
   stopWindowMs: 35_000,
-  logBytes: 16 * 1024 * 1024,
-  logRotateBytes: 2_097_152,
+  // One native observer page.  The gate reads at most startupReadPages pages
+  // inside the boot-monotonic 60s budget; the recorded boundary deadline, not
+  // the page count, is the authority for timeout.
+  logReadBytes: 1024 * 1024,
+  startupReadPages: 512,
+  // Half the 2 MiB per-file cursor bound: Shawl rotates only after a write
+  // crosses this size, so the crossing record must still fit the cursor.
+  logRotateBytes: 1_048_576,
   logRetain: 2,
 });
 
@@ -44,45 +55,39 @@ export const WINDOWS_DRIVER_REASONS = Object.freeze([
   'stale-epoch',
 ]);
 
-export function windowsLogEpochFingerprint(epoch) {
-  if (!exact(epoch, ['bootId', 'pid', 'startTime', 'files'])) throw new TypeError('invalid Windows log epoch');
-  if (typeof epoch.bootId !== 'string' || !Number.isSafeInteger(epoch.pid) || epoch.pid <= 0 || typeof epoch.startTime !== 'string' || !Array.isArray(epoch.files)) throw new TypeError('invalid Windows log epoch');
-  return canonicalJsonHash({ kind: 'windows-log-epoch/v1', ...epoch });
-}
-
-export function validateWindowsLogEvidence(evidence) {
-  if (!exact(evidence, ['epoch', 'cursor', 'records', 'rotationChain'])) throw new TypeError('invalid Windows log evidence');
-  const epochFingerprint = windowsLogEpochFingerprint(evidence.epoch);
-  if (!Number.isSafeInteger(evidence.cursor) || evidence.cursor < 0 || !Array.isArray(evidence.records) || evidence.records.length === 0 || !Array.isArray(evidence.rotationChain) || evidence.epoch.files.length !== 2 || evidence.epoch.files[0] !== 'stdout' || evidence.epoch.files[1] !== 'stderr') throw new TypeError('invalid Windows log evidence');
-  let offset = evidence.cursor;
-  for (const record of evidence.records) {
-    if (!exact(record, ['offset', 'length', 'epochFingerprint', 'marker'])) throw new TypeError('invalid Windows log record');
-    if (!Number.isSafeInteger(record.offset) || !Number.isSafeInteger(record.length) || record.offset !== offset || record.length <= 0 || record.offset > WINDOWS_DRIVER_LIMITS.logBytes || record.length > WINDOWS_DRIVER_LIMITS.logBytes - record.offset || record.epochFingerprint !== epochFingerprint || record.marker !== 'gjc-remote:v1:ready') throw new TypeError('invalid Windows log record');
-    offset = record.offset + record.length;
-  }
-  let previous = null;
-  for (const segment of evidence.rotationChain) {
-    if (!exact(segment, ['identity', 'startOffset', 'endOffset', 'sha256'])) throw new TypeError('invalid Windows log rotation');
-    if (typeof segment.identity !== 'string' || !/^(?:stdout|stderr)\.\d+$/.test(segment.identity) || !Number.isSafeInteger(segment.startOffset) || !Number.isSafeInteger(segment.endOffset) || segment.startOffset < 0 || segment.endOffset < segment.startOffset || segment.endOffset > WINDOWS_DRIVER_LIMITS.logBytes || !validHash(segment.sha256) || (previous !== null && segment.startOffset !== previous)) throw new TypeError('invalid Windows log rotation');
-    previous = segment.endOffset;
-  }
-  return Object.freeze({ epochFingerprint, endOffset: offset });
-}
-
 const NATIVE = Object.freeze([
   'open_win32_service', 'close_win32_service', 'query_win32_service',
-  'create_win32_service_disabled', 'protect_win32_service',
+  'plan_win32_service_resource', 'create_win32_service_disabled', 'protect_win32_service',
   'set_win32_service_marker', 'configure_win32_service_launch',
   'set_win32_service_start_type', 'set_win32_service_failure_actions',
   'set_win32_service_failure_actions_flag', 'start_win32_service',
   'stop_win32_service', 'delete_win32_service', 'terminate_win32_service_tree',
   'read_boot_id', 'read_process_facts', 'enumerate_process_tree',
-  'read_file_facts_no_follow',
+  'read_file_facts_no_follow', 'read_win32_boot_clock',
+  'open_win32_service_log_observer', 'read_win32_service_log_observer',
+  'close_service_handle',
 ]);
-const SESSION_METHODS = Object.freeze(['readJournal', 'appendJournal', 'readStartupProof', 'publishStartupProof', 'readReferences']);
+const SESSION_METHODS = Object.freeze(['readJournal', 'appendJournal', 'readStartupProof', 'publishStartupProof', 'readReferences', 'readTrialBoundary', 'publishTrialBoundary']);
+const OBSERVER_OPEN_KEYS = Object.freeze(['handle', 'clock', 'cursor', 'wrapperEpochFingerprint', 'childEpochFingerprint', 'treeFingerprint', 'writes']);
+const OBSERVER_READ_KEYS = Object.freeze(['clock', 'beforeCursor', 'afterCursor', 'wrapperEpochFingerprint', 'childEpochFingerprint', 'treeFingerprint', 'chunks', 'eof', 'continuity', 'writes']);
 const SERVICE_NAME_BOT = 'GJCRemoteBot';
 const MARKER_PREFIX = 'gjc-remote:v1:';
 const HEX = /^[0-9a-f]{64}$/;
+const HEX40 = /^[0-9a-f]{40}$/;
+const EMPTY_FILE_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+const NODE_RUNTIME = Object.freeze({ version: '26.7.0', sourceRevision: 'b4f23d3619c98bed09af93a21192f6080197a8c6' });
+const BUN_RUNTIME = Object.freeze({ version: '1.4.2', sourceRevision: '744846f844374847c902b5e7fd59b4342a51ef99' });
+const LAUNCH_KEYS = Object.freeze([
+  'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory',
+  'runtimePath', 'runtimeSha256', 'runtimeVersion', 'runtimeSourceRevision',
+  'entrypointPath', 'entrypointSha256', 'bootstrapPath', 'bootstrapSha256',
+  'bootstrapClosureFingerprint', 'runtimeConfigRoot',
+  'runtimeConfigRootIdentityFingerprint', 'runtimeConfigPath',
+  'runtimeConfigSha256', 'runtimeConfigIdentityFingerprint', 'sdkProfilePath',
+  'scopeFingerprint', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig',
+  'effectiveConfigFingerprint', 'configSourceIdentityFingerprint',
+  'runtimePolicyFingerprint',
+]);
 const START_TYPES = new Set(['disabled', 'demand', 'auto']);
 const SERVICE_STATES = new Set(['stopped', 'start-pending', 'running', 'stop-pending', 'continue-pending', 'pause-pending', 'paused']);
 const WIN_BOOT = /^win32:[0-9]+$/;
@@ -99,9 +104,30 @@ const RUNTIME_KEYS = Object.freeze([
   'state', 'controlsAccepted', 'win32ExitCode', 'serviceExitCode',
   'checkpoint', 'waitHint', 'processId', 'serviceFlags', 'fingerprint',
 ]);
+const RESOURCE_DESCRIPTOR_KEYS = Object.freeze([
+  'name', 'component', 'serviceKey', 'serviceRole', 'serviceType', 'startType',
+  'errorControl', 'tagId', 'binaryPath', 'loadOrderGroup', 'dependencies',
+  'accountName', 'displayName', 'description', 'delayedAutoStart',
+  'failureResetPeriod', 'failureRebootMessage', 'failureCommand',
+  'failureActionsOnNonCrashFailures', 'failureActions', 'failurePolicy',
+  'serviceSidType', 'requiredPrivileges', 'triggerCount', 'preshutdownTimeout',
+  'securitySha256', 'aclMatches', 'accountMatchesRole', 'configFingerprint',
+  'runtimeFingerprint',
+]);
 
 function plain(value) { return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function exact(value, keys) { return plain(value) && Reflect.ownKeys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key)); }
+function exactDataValues(value, keys) {
+  if (!exact(value, keys)) return null;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const values = Object.create(null);
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (!descriptor || descriptor.enumerable !== true || descriptor.get || descriptor.set || !Object.hasOwn(descriptor, 'value')) return null;
+    values[key] = descriptor.value;
+  }
+  return values;
+}
 function freeze(value) {
   if (Array.isArray(value)) return Object.freeze(value.map(freeze));
   if (plain(value)) {
@@ -117,6 +143,12 @@ function marker(fingerprint) { return `${MARKER_PREFIX}${fingerprint}`; }
 function validMarker(value) { return typeof value === 'string' && value.startsWith(MARKER_PREFIX) && validHash(value.slice(MARKER_PREFIX.length)); }
 function validPath(value) { return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= SERVICE_LIFECYCLE_LIMITS.pathBytes && /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/]+)/.test(value); }
 function validHash(value) { return typeof value === 'string' && HEX.test(value); }
+function validCanonicalWindowsPath(value) {
+  if (typeof value !== 'string' || !validPath(value) || !/^[A-Z]:\\/.test(value) || value.includes('/') || value.endsWith('\\')) return false;
+  const parts = value.slice(3).split('\\');
+  if (parts.length === 0 || parts.some((part) => part === '' || part === '.' || part === '..' || /[<>:"|?*\u0000-\u001f]/.test(part) || /[. ]$/.test(part))) return false;
+  return true;
+}
 // CommandLineToArgvW-compatible serialization used by addon.cc.  The native
 // side quotes every argument (including arguments without whitespace), doubles
 // trailing backslashes, and escapes backslashes immediately preceding quotes.
@@ -155,25 +187,154 @@ export function windowsServiceName(component, serviceKey) {
   throw new TypeError('invalid Windows service key');
 }
 
-export function buildWindowsShawlArgv(input) {
-  if (!exact(input, ['component', 'serviceKey', 'shawlPath', 'workingDirectory', 'homeDirectory', 'runtimePath', 'entrypointPath', 'logDirectory', 'channelsConfig'])) throw new TypeError('invalid Shawl input');
-  const { component, serviceKey, shawlPath, workingDirectory, homeDirectory, runtimePath, entrypointPath, logDirectory, channelsConfig } = input;
+function launchFields(value, component, serviceKey, requirePolicy) {
+  const policyKeys = LAUNCH_KEYS.filter((key) => key !== 'runtimePolicyFingerprint');
+  const fields = requirePolicy
+    ? exactDataValues(value, LAUNCH_KEYS)
+    : exactDataValues(value, LAUNCH_KEYS) ?? exactDataValues(value, policyKeys);
+  if (!fields || (component !== 'bot' && component !== 'daemon')) throw new TypeError('invalid Windows Launch');
+  if (!requirePolicy) delete fields.runtimePolicyFingerprint;
   windowsServiceName(component, serviceKey);
-  for (const value of [shawlPath, workingDirectory, homeDirectory, runtimePath, entrypointPath, logDirectory]) if (!validPath(value)) throw new TypeError('invalid Shawl path');
-  if ((component === 'bot' && !validPath(channelsConfig)) || (component === 'daemon' && channelsConfig !== null)) throw new TypeError('invalid channels config');
+  const pathKeys = [
+    'supervisorPath', 'workingDirectory', 'homeDirectory', 'runtimePath',
+    'entrypointPath', 'bootstrapPath', 'logDirectory',
+  ];
+  if (pathKeys.some((key) => !validCanonicalWindowsPath(fields[key]))) throw new TypeError('invalid Windows Launch path');
+  const runtime = component === 'bot' ? NODE_RUNTIME : BUN_RUNTIME;
+  const hashKeys = [
+    'supervisorSha256', 'runtimeSha256', 'entrypointSha256', 'bootstrapSha256',
+    'bootstrapClosureFingerprint', 'scopeFingerprint',
+    'effectiveConfigFingerprint', 'configSourceIdentityFingerprint',
+  ];
+  if (hashKeys.some((key) => !validHash(fields[key])) ||
+      fields.runtimeVersion !== runtime.version || fields.runtimeSourceRevision !== runtime.sourceRevision ||
+      !HEX40.test(fields.runtimeSourceRevision) ||
+      (component === 'bot' && (fields.runtimeConfigRoot !== null ||
+        fields.runtimeConfigRootIdentityFingerprint !== null || fields.runtimeConfigPath !== null ||
+        fields.runtimeConfigSha256 !== null || fields.runtimeConfigIdentityFingerprint !== null ||
+        fields.sdkProfilePath !== null || !validCanonicalWindowsPath(fields.channelsConfig))) ||
+      (component === 'daemon' && (!validCanonicalWindowsPath(fields.runtimeConfigRoot) ||
+        !validHash(fields.runtimeConfigRootIdentityFingerprint) ||
+        !validCanonicalWindowsPath(fields.runtimeConfigPath) || fields.runtimeConfigSha256 !== EMPTY_FILE_SHA256 ||
+        !validHash(fields.runtimeConfigIdentityFingerprint) || !validCanonicalWindowsPath(fields.sdkProfilePath) ||
+        fields.channelsConfig !== null ||
+        fields.runtimeConfigRoot !== `${fields.workingDirectory}\\runtime-config` ||
+        fields.runtimeConfigPath !== `${fields.runtimeConfigRoot}\\.bunfig.toml`)) ||
+      !validCanonicalWindowsPath(fields.bootstrapPath) ||
+      (component === 'bot' ? !validCanonicalWindowsPath(fields.channelsConfig) : fields.channelsConfig !== null) ||
+      !validWin32Leaf(fields.supervisorPath, 'shawl.exe') ||
+      !validWin32Leaf(fields.runtimePath, component === 'bot' ? 'node.exe' : 'bun.exe') ||
+      !validWin32Leaf(fields.entrypointPath, component === 'bot' ? 'bot.js' : 'daemon.js') ||
+      !validWin32Leaf(fields.bootstrapPath, 'service-bootstrap.js') ||
+      fields.logAs !== expectedLogAs(component, serviceKey) ||
+      fields.logCmdAs !== expectedLogCmdAs(component, serviceKey) ||
+      (requirePolicy && !validHash(fields.runtimePolicyFingerprint))) {
+    throw new TypeError('invalid Windows Launch policy');
+  }
+  return fields;
+}
+
+function validWin32Leaf(value, expected) {
+  const leaf = value.slice(value.lastIndexOf('\\') + 1).toLowerCase();
+  return leaf === expected;
+}
+
+function serviceEnvironment(launch, component, serviceKey, launchFingerprint, policyTemplate) {
+  const environment = [
+    ['HOME', launch.homeDirectory], ['USERPROFILE', launch.homeDirectory],
+    ['NODE_OPTIONS', ''], ['NODE_PATH', ''],
+  ];
+  if (component === 'daemon') {
+    environment.push(
+      ['BUN_OPTIONS', ''], ['BUN_INSPECT_PRELOAD', launch.bootstrapPath],
+      ['XDG_CONFIG_HOME', launch.runtimeConfigRoot], ['BUN_INSPECT', ''],
+      ['BUN_INSPECT_CONNECT_TO', ''], ['GJC_CODING_AGENT_DIR', launch.sdkProfilePath],
+    );
+  } else {
+    environment.push(['CHANNELS_CONFIG', launch.channelsConfig]);
+  }
+  environment.push(
+    ['GJC_REMOTE_SERVICE_COMPONENT', component],
+    ['GJC_REMOTE_SERVICE_KEY', serviceKey],
+    ['GJC_REMOTE_SUPERVISOR_SHA256', launch.supervisorSha256],
+    ['GJC_REMOTE_RUNTIME_VERSION', launch.runtimeVersion],
+    ['GJC_REMOTE_RUNTIME_SOURCE_REVISION', launch.runtimeSourceRevision],
+    ['GJC_REMOTE_RUNTIME_SHA256', launch.runtimeSha256],
+    ['GJC_REMOTE_ENTRYPOINT_SHA256', launch.entrypointSha256],
+    ['GJC_REMOTE_BOOTSTRAP_PATH', launch.bootstrapPath],
+    ['GJC_REMOTE_BOOTSTRAP_SHA256', launch.bootstrapSha256],
+    ['GJC_REMOTE_BOOTSTRAP_CLOSURE_FINGERPRINT', launch.bootstrapClosureFingerprint],
+    ['GJC_REMOTE_RUNTIME_CONFIG_ROOT_IDENTITY_FINGERPRINT', launch.runtimeConfigRootIdentityFingerprint ?? ''],
+    ['GJC_REMOTE_RUNTIME_CONFIG_PATH', launch.runtimeConfigPath ?? ''],
+    ['GJC_REMOTE_RUNTIME_CONFIG_SHA256', launch.runtimeConfigSha256 ?? ''],
+    ['GJC_REMOTE_RUNTIME_CONFIG_IDENTITY_FINGERPRINT', launch.runtimeConfigIdentityFingerprint ?? ''],
+    ['GJC_REMOTE_SDK_PROFILE_PATH', launch.sdkProfilePath ?? ''],
+    ['GJC_REMOTE_SCOPE_FINGERPRINT', launch.scopeFingerprint],
+    ['GJC_REMOTE_EFFECTIVE_CONFIG_FINGERPRINT', launch.effectiveConfigFingerprint],
+    ['GJC_REMOTE_CONFIG_SOURCE_IDENTITY_FINGERPRINT', launch.configSourceIdentityFingerprint],
+    ['GJC_REMOTE_LAUNCH_FINGERPRINT', launchFingerprint],
+    ['GJC_REMOTE_RUNTIME_POLICY_FINGERPRINT', policyTemplate ? '@runtime-policy-fingerprint' : launch.runtimePolicyFingerprint],
+  );
+  return Object.freeze(environment.map((entry) => Object.freeze(entry)));
+}
+
+function childArguments(launch, component) {
+  return component === 'bot'
+    ? [launch.runtimePath, launch.entrypointPath]
+    : [launch.runtimePath, '--config', launch.runtimeConfigPath, '--no-env-file', launch.entrypointPath];
+}
+
+export function windowsServiceLaunchFingerprint(value, component, serviceKey) {
+  const launch = launchFields(value, component, serviceKey, true);
+  const fields = Object.fromEntries(LAUNCH_KEYS.filter((key) => key !== 'runtimePolicyFingerprint').map((key) => [key, launch[key]]));
+  return canonicalJsonHash({
+    kind: 'gjc-remote/windows-service-launch/v1', component, serviceKey, launch: fields,
+  });
+}
+
+export function windowsServiceRuntimePolicyFingerprint(value, component, serviceKey) {
+  const launch = launchFields(value, component, serviceKey, false);
+  const fields = Object.fromEntries(LAUNCH_KEYS.filter((key) => key !== 'runtimePolicyFingerprint').map((key) => [key, launch[key]]));
+  const launchFingerprint = canonicalJsonHash({
+    kind: 'gjc-remote/windows-service-launch/v1', component, serviceKey, launch: fields,
+  });
+  const environment = Object.fromEntries(serviceEnvironment(
+    launch, component, serviceKey, launchFingerprint, true,
+  ));
+  return canonicalJsonHash({
+    argv: childArguments(launch, component), component, environment,
+    kind: 'gjc-remote/windows-runtime-policy/v1', launchFingerprint,
+    runtimeSourceRevision: launch.runtimeSourceRevision,
+    runtimeVersion: launch.runtimeVersion, serviceKey,
+  });
+}
+
+export function buildWindowsShawlArgv(input) {
+  if (!exact(input, ['component', 'serviceKey', 'launch'])) throw new TypeError('invalid Shawl input');
+  const { component, serviceKey } = input;
+  const launch = launchFields(input.launch, component, serviceKey, true);
+  windowsServiceName(component, serviceKey);
+  // Fingerprint helpers revalidate a plain caller record; `launch` is the
+  // null-prototype captured copy, so hash the same captured values via a
+  // plain snapshot rather than re-reading the caller object.
+  const snapshot = { ...launch };
+  const policyFingerprint = windowsServiceRuntimePolicyFingerprint(snapshot, component, serviceKey);
+  if (launch.runtimePolicyFingerprint !== policyFingerprint) throw new TypeError('invalid Windows runtime policy fingerprint');
+  const launchFingerprint = windowsServiceLaunchFingerprint(snapshot, component, serviceKey);
   const timeout = expectedStopTimeout(component);
   const argv = [
-    shawlPath, 'run', '--name', windowsServiceName(component, serviceKey), '--cwd', workingDirectory,
-    '--env', `HOME=${homeDirectory}`, '--env', `USERPROFILE=${homeDirectory}`,
+    launch.supervisorPath, 'run', '--name', windowsServiceName(component, serviceKey), '--cwd', launch.workingDirectory,
+  ];
+  for (const [key, value] of serviceEnvironment(launch, component, serviceKey, launchFingerprint, false)) {
+    argv.push('--env', `${key}=${value}`);
+  }
+  argv.push(
     '--kill-process-tree', '--restart-if-not', '0', '--restart-delay', '10000', '--stop-timeout', String(timeout),
-    '--log-dir', logDirectory, '--log-as', expectedLogAs(component, serviceKey), '--log-cmd-as', expectedLogCmdAs(component, serviceKey),
+    '--log-dir', launch.logDirectory, '--log-as', launch.logAs, '--log-cmd-as', launch.logCmdAs,
     '--log-rotate', `bytes=${WINDOWS_DRIVER_LIMITS.logRotateBytes}`,
     '--log-retain', String(WINDOWS_DRIVER_LIMITS.logRetain),
-  ];
-  if (component === 'bot') argv.push('--env', `CHANNELS_CONFIG=${channelsConfig}`);
-  argv.push('--', runtimePath);
-  if (component === 'daemon') argv.push('--no-env-file');
-  argv.push(entrypointPath);
+    '--', ...childArguments(launch, component),
+  );
   return Object.freeze(argv);
 }
 
@@ -234,24 +395,65 @@ function validateSnapshot(snapshot, op) {
   return snapshot;
 }
 
+function validateResourceDescriptor(value, component, serviceKey, op) {
+  if (!exact(value, RESOURCE_DESCRIPTOR_KEYS) || value.component !== component ||
+      value.serviceKey !== serviceKey || value.serviceRole !== component ||
+      typeof value.name !== 'string' || value.name !== windowsServiceName(component, serviceKey) ||
+      !Number.isSafeInteger(value.serviceType) || value.serviceType !== 0x10 ||
+      !START_TYPES.has(value.startType) || !Number.isSafeInteger(value.errorControl) || value.errorControl !== 1 ||
+      !Number.isSafeInteger(value.tagId) || value.tagId !== 0 || typeof value.binaryPath !== 'string' ||
+      typeof value.loadOrderGroup !== 'string' || !Array.isArray(value.dependencies) ||
+      !value.dependencies.every((item) => typeof item === 'string') ||
+      typeof value.accountName !== 'string' || value.accountName.length === 0 ||
+      typeof value.displayName !== 'string' || typeof value.description !== 'string' ||
+      typeof value.delayedAutoStart !== 'boolean' || !Number.isSafeInteger(value.failureResetPeriod) || value.failureResetPeriod < 0 ||
+      typeof value.failureRebootMessage !== 'string' || typeof value.failureCommand !== 'string' ||
+      typeof value.failureActionsOnNonCrashFailures !== 'boolean' || !Array.isArray(value.failureActions) ||
+      !value.failureActions.every((action) => exact(action, ['type', 'delayMs']) &&
+        typeof action.type === 'string' && Number.isSafeInteger(action.delayMs) && action.delayMs >= 0) ||
+      !['none', 'restart-3x-10s', 'other'].includes(value.failurePolicy) ||
+      !Number.isSafeInteger(value.serviceSidType) || value.serviceSidType < 0 ||
+      !Array.isArray(value.requiredPrivileges) || !value.requiredPrivileges.every((item) => typeof item === 'string') ||
+      !Number.isSafeInteger(value.triggerCount) || value.triggerCount < 0 ||
+      !Number.isSafeInteger(value.preshutdownTimeout) || value.preshutdownTimeout < 0 ||
+      !validHash(value.securitySha256) || typeof value.aclMatches !== 'boolean' ||
+      typeof value.accountMatchesRole !== 'boolean' || !validHash(value.configFingerprint) ||
+      value.runtimeFingerprint !== null) fail('SERVICE_INVALID', op, 0, true);
+  return value;
+}
+
 export function createWindowsServiceDriver(options) {
   const op = 'create_windows_service_driver';
-  const optionKeys = ['native', 'session', 'locks', 'roles', 'configuration', 'release', 'shawl', 'clock', 'sleep'];
+  const optionKeys = ['native', 'session', 'locks', 'roles', 'configuration', 'launch', 'shawl', 'clock', 'sleep'];
   const optionalKeys = ['servicePassword', 'servicePasswordRequired'];
   if (!plain(options) || Reflect.ownKeys(options).some((key) => !optionKeys.includes(key) && !optionalKeys.includes(key)) || optionKeys.some((key) => !Object.hasOwn(options, key))) fail('SERVICE_INVALID', op);
-  const { native, session, locks, roles, configuration, release, shawl } = options;
+  const { native, session, locks, roles, configuration, launch: launchInput, shawl } = options;
   const servicePassword = options.servicePassword;
   const servicePasswordRequired = options.servicePasswordRequired === true;
   const nowMs = options.clock ?? (() => Date.now());
   const sleepMs = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   if (typeof nowMs !== 'function' || typeof sleepMs !== 'function') fail('SERVICE_INVALID', op);
-  if ((native === null || (typeof native !== 'object' && typeof native !== 'function')) || !plain(session) || !plain(locks) || !plain(release) || !plain(shawl)) fail('SERVICE_INVALID', op);
+  if ((native === null || (typeof native !== 'object' && typeof native !== 'function')) || !plain(session) || !plain(locks) || !plain(shawl)) fail('SERVICE_INVALID', op);
   for (const method of SESSION_METHODS) if (typeof session[method] !== 'function') fail('SERVICE_INVALID', op);
   if (session.platform !== 'win32' || session.architecture !== 'x64' || (session.component !== 'bot' && session.component !== 'daemon')) fail('SERVICE_INVALID', op);
   const component = session.component; const serviceKey = session.serviceKey;
   try { validateServiceKey(serviceKey, component); validateServiceRoles(roles, 'win32'); } catch { fail('SERVICE_INVALID', op); }
-  if (!validateConfiguration(configuration, component) || !exact(release, ['entrypointPath', 'applicationManifestFingerprint']) || !validPath(release.entrypointPath) || !validHash(release.applicationManifestFingerprint)) fail('SERVICE_INVALID', op);
+  if (!validateConfiguration(configuration, component)) fail('SERVICE_INVALID', op);
   if (!exact(shawl, ['path', 'sha256', 'runtimeSha256', 'entrypointSha256']) || !contentAddressedShawlPath(shawl.path, shawl.sha256) || !validHash(shawl.runtimeSha256) || !validHash(shawl.entrypointSha256)) fail('SERVICE_INVALID', op);
+  let launch;
+  try {
+    launch = Object.freeze({ ...launchFields(launchInput, component, serviceKey, true) });
+    if (launch.supervisorPath !== shawl.path || launch.supervisorSha256 !== shawl.sha256 ||
+        launch.workingDirectory !== configuration.workingDirectory || launch.homeDirectory !== configuration.homeDirectory ||
+        launch.runtimePath !== configuration.runtimePath || launch.runtimeSha256 !== shawl.runtimeSha256 ||
+        launch.entrypointSha256 !== shawl.entrypointSha256 || launch.logDirectory !== configuration.logDirectory ||
+        launch.channelsConfig !== (component === 'bot' ? configuration.channelsConfig : null) ||
+        launch.runtimePolicyFingerprint !== windowsServiceRuntimePolicyFingerprint(launch, component, serviceKey)) {
+      fail('SERVICE_INVALID', op);
+    }
+  } catch {
+    fail('SERVICE_INVALID', op);
+  }
   if (!exact(locks, ['artifact', 'sharedTemplate', 'serviceKey']) || Object.values(locks).some((v) => v === null || typeof v !== 'object' || Reflect.ownKeys(v).length === 0)) fail('SERVICE_INVALID', op);
   if (servicePassword !== undefined && (typeof servicePassword !== 'string' || servicePassword.length === 0 || Buffer.byteLength(servicePassword, 'utf8') > SERVICE_LIFECYCLE_LIMITS.servicePasswordBytes || servicePassword.includes('\0'))) fail('SERVICE_INVALID', op);
   if (servicePasswordRequired && servicePassword === undefined) fail('SERVICE_INVALID', op, 0, false, 'service-password-required');
@@ -259,6 +461,10 @@ export function createWindowsServiceDriver(options) {
   for (const name of NATIVE) { const d = descriptors[name]; if (!d || d.get || d.set || !Object.hasOwn(d, 'value') || typeof d.value !== 'function') fail('SERVICE_INVALID', op); calls[name] = d.value; }
   let driverWrites = 0; const name = windowsServiceName(component, serviceKey); const expectedOwner = roles[component].value;
   let activeTrial = null;
+  // Controller-private native log observer for the active trial.  The handle
+  // never leaves the driver; callers only see validated LogRead pages through
+  // the injected observeApplication factory.
+  let activeObserver = null;
   const logFamily = { stdout: `child-${serviceKey}-stdout`, stderr: `child-${serviceKey}-stderr`, wrapper: `shawl-${serviceKey}` };
 
   function nativeCall(method, ...args) { try { const value = Reflect.apply(calls[method], undefined, args); if (plain(value) && Object.hasOwn(value, 'writes')) driverWrites += writesOf(value.writes); return value; } catch (error) { driverWrites += writesOf(error?.writes); const code = WINDOWS_SERVICE_ERROR_CODES.includes(error?.code) ? error.code : 'SERVICE_IO_FAILED'; fail(code, typeof error?.operation === 'string' ? error.operation : method, driverWrites, error?.ambiguous === true || !Number.isSafeInteger(error?.writes)); } }
@@ -345,9 +551,198 @@ export function createWindowsServiceDriver(options) {
   // the real facade reject the call before SCM access.
   function handle(access, operation) { const value = nativeCall('open_win32_service', name, component, access); if (value === null) return null; if (value === undefined || (typeof value !== 'object' && typeof value !== 'function')) fail('SERVICE_INVALID', operation, driverWrites, true); return value; }
   function close(value) { if (value !== null) { try { nativeCall('close_win32_service', value); } catch { /* preserve primary error */ } } }
+  function closeObserverHandle(value) { if (value !== null && value !== undefined) { try { nativeCall('close_service_handle', value); } catch { /* preserve primary error */ } } }
+  function releaseObserver() { const current = activeObserver; activeObserver = null; if (current !== null) closeObserverHandle(current.handle); }
+  function bootClock(value, operation) {
+    try { validateServiceBootClock(value); } catch { fail('SERVICE_IO_FAILED', operation, driverWrites, true); }
+    return value;
+  }
+  function readBootClock(operation) { return bootClock(nativeCall('read_win32_boot_clock'), operation); }
+  function boundCursor(cursor, bootFingerprint, operation) {
+    try { validateServiceCursorSet(cursor); } catch { fail('SERVICE_STALE', operation, driverWrites, true, 'log-cursor-invalid'); }
+    if (cursor.bootFingerprint !== bootFingerprint || cursor.serviceKey !== serviceKey || cursor.configFingerprint !== launch.effectiveConfigFingerprint) fail('SERVICE_STALE', operation, driverWrites, true, 'log-cursor-invalid');
+    return cursor;
+  }
+  // Epochs are either all absent (no wrapper/child yet) or three hashes with
+  // distinct wrapper and child identities.  Any mixed shape is refused.
+  function liveEpochs(value, operation) {
+    const fields = [value.wrapperEpochFingerprint, value.childEpochFingerprint, value.treeFingerprint];
+    if (fields.every((field) => field === null)) return null;
+    if (!fields.every(validHash) || value.wrapperEpochFingerprint === value.childEpochFingerprint) fail('SERVICE_STALE', operation, driverWrites, true, 'log-epoch-invalid');
+    return Object.freeze({ wrapperEpochFingerprint: value.wrapperEpochFingerprint, childEpochFingerprint: value.childEpochFingerprint, treeFingerprint: value.treeFingerprint });
+  }
+  function openObserver(service, resumeCursor, operation) {
+    const value = nativeCall('open_win32_service_log_observer', service, { ...launch }, resumeCursor);
+    if (!exact(value, OBSERVER_OPEN_KEYS) || value.writes !== 0 || value.handle === null || (typeof value.handle !== 'object' && typeof value.handle !== 'function')) {
+      closeObserverHandle(plain(value) ? value.handle : null);
+      fail('SERVICE_IO_FAILED', operation, driverWrites, true);
+    }
+    try {
+      const clock = bootClock(value.clock, operation);
+      const cursor = boundCursor(value.cursor, clock.bootFingerprint, operation);
+      // A resumed observer starts exactly at the protected cursor; evidence
+      // must never begin after bytes this controller did not reduce.
+      if (resumeCursor !== null && cursor.cursorFingerprint !== resumeCursor.cursorFingerprint) fail('SERVICE_STALE', operation, driverWrites, true, 'log-cursor-invalid');
+      return Object.freeze({ handle: value.handle, clock, cursor, epoch: liveEpochs(value, operation) });
+    } catch (error) { closeObserverHandle(value.handle); throw error; }
+  }
+  function readObserverPage(observer) {
+    return nativeCall('read_win32_service_log_observer', observer.handle, observer.cursorFingerprint, WINDOWS_DRIVER_LIMITS.logReadBytes);
+  }
+  // Driver-side structural check of a LogRead page used for final activation
+  // rechecks.  The startup gate delegates full page validation to the
+  // injected startup observer.
+  function validatePage(read, boundary, observer, operation) {
+    if (!exact(read, OBSERVER_READ_KEYS) || read.writes !== 0 || read.continuity !== 'complete' || typeof read.eof !== 'boolean' || !Array.isArray(read.chunks)) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+    const clock = bootClock(read.clock, operation);
+    const before = boundCursor(read.beforeCursor, boundary.bootFingerprint, operation);
+    const after = boundCursor(read.afterCursor, boundary.bootFingerprint, operation);
+    if (clock.bootFingerprint !== boundary.bootFingerprint || before.cursorFingerprint !== observer.cursorFingerprint) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+    const epoch = liveEpochs(read, operation);
+    if (epoch === null || epoch.wrapperEpochFingerprint !== boundary.wrapperEpochFingerprint || epoch.childEpochFingerprint !== boundary.childEpochFingerprint) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
+    for (let index = 0; index < 2; index += 1) {
+      if (after.families[index].directoryIdentityFingerprint !== before.families[index].directoryIdentityFingerprint || after.families[index].nextLogicalOffset < before.families[index].nextLogicalOffset) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-offset-gap');
+    }
+    return Object.freeze({ clock, after, epoch, eof: read.eof });
+  }
+  function readBoundary(operation) {
+    const receipt = session.readTrialBoundary();
+    if (!plain(receipt) || typeof receipt.present !== 'boolean') fail('SERVICE_IO_FAILED', operation, driverWrites, true);
+    if (!receipt.present) return receipt;
+    try { validateServiceTrialBoundary(receipt.value); } catch { fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid'); }
+    return receipt;
+  }
+  function boundaryFields(boundary) {
+    return {
+      serviceKey: boundary.serviceKey, transactionId: boundary.transactionId, transactionNonce: boundary.transactionNonce,
+      transitionFingerprint: boundary.transitionFingerprint, attempt: boundary.attempt, revision: boundary.revision,
+      previousBoundaryFingerprint: boundary.previousBoundaryFingerprint, phase: boundary.phase,
+      bootFingerprint: boundary.bootFingerprint, startTickMs: boundary.startTickMs, lastTickMs: boundary.lastTickMs,
+      applicationManifestFingerprint: boundary.applicationManifestFingerprint, resourceFingerprint: boundary.resourceFingerprint,
+      effectiveConfigFingerprint: boundary.effectiveConfigFingerprint, configSourceIdentityFingerprint: boundary.configSourceIdentityFingerprint,
+      wrapperEpochFingerprint: boundary.wrapperEpochFingerprint, childEpochFingerprint: boundary.childEpochFingerprint,
+      initialCursor: boundary.initialCursor, childCursor: boundary.childCursor,
+    };
+  }
+  function boundaryMatches(boundary, transaction, applicationManifestFingerprint) {
+    return boundary.serviceKey === serviceKey && boundary.transactionId === transaction.transactionId &&
+      boundary.transactionNonce === transaction.transactionNonce &&
+      boundary.transitionFingerprint === transaction.transition.transitionFingerprint &&
+      boundary.applicationManifestFingerprint === applicationManifestFingerprint &&
+      boundary.resourceFingerprint === transaction.transition.platformResourceFingerprint &&
+      boundary.effectiveConfigFingerprint === launch.effectiveConfigFingerprint &&
+      boundary.configSourceIdentityFingerprint === launch.configSourceIdentityFingerprint;
+  }
+  function publishBoundary(fields, prior, operation) {
+    let boundary;
+    try { boundary = buildServiceTrialBoundary(fields); } catch { fail('SERVICE_INVALID', operation, driverWrites); }
+    session.publishTrialBoundary(boundary, prior);
+    const published = readBoundary(operation);
+    if (!published.present || published.value.boundaryFingerprint !== boundary.boundaryFingerprint) fail('SERVICE_STALE', operation, driverWrites, true, 'log-cursor-invalid');
+    return published;
+  }
+  // Capture (or, for a crash before StartService, reuse) the pre-start
+  // boundary.  The 60s budget starts here, before the native start.
+  function captureBoundary(service, transaction, applicationManifestFingerprint, operation) {
+    const existing = readBoundary(operation);
+    if (existing.present) {
+      const boundary = existing.value;
+      if (boundary.phase !== 'captured' || !boundaryMatches(boundary, transaction, applicationManifestFingerprint)) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+      const opened = openObserver(service, boundary.initialCursor, operation);
+      closeObserverHandle(opened.handle);
+      if (opened.clock.bootFingerprint !== boundary.bootFingerprint) fail('SERVICE_TRIAL_NOT_OBSERVED', operation, driverWrites, true, 'reboot');
+      if (opened.epoch !== null) fail('SERVICE_STALE', operation, driverWrites, true, 'stale-epoch');
+      if (opened.clock.tickMs > boundary.deadlineTickMs) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
+      return existing;
+    }
+    const opened = openObserver(service, null, operation);
+    closeObserverHandle(opened.handle);
+    if (opened.epoch !== null) fail('SERVICE_STALE', operation, driverWrites, true, 'stale-epoch');
+    return publishBoundary({
+      serviceKey, transactionId: transaction.transactionId, transactionNonce: transaction.transactionNonce,
+      transitionFingerprint: transaction.transition.transitionFingerprint, attempt: 1, revision: 1,
+      previousBoundaryFingerprint: null, phase: 'captured', bootFingerprint: opened.clock.bootFingerprint,
+      startTickMs: opened.clock.tickMs, lastTickMs: opened.clock.tickMs, applicationManifestFingerprint,
+      resourceFingerprint: transaction.transition.platformResourceFingerprint,
+      effectiveConfigFingerprint: launch.effectiveConfigFingerprint,
+      configSourceIdentityFingerprint: launch.configSourceIdentityFingerprint,
+      wrapperEpochFingerprint: null, childEpochFingerprint: null, initialCursor: opened.cursor, childCursor: null,
+    }, existing, operation);
+  }
+  // Open the observer at the boundary resume cursor against a live wrapper
+  // and child.  Returns null when epochs are not (yet) available.
+  function openLiveObserver(service, boundary, operation) {
+    const opened = openObserver(service, boundary.childCursor ?? boundary.initialCursor, operation);
+    if (opened.clock.bootFingerprint !== boundary.bootFingerprint) { closeObserverHandle(opened.handle); fail('SERVICE_TRIAL_NOT_OBSERVED', operation, driverWrites, true, 'reboot'); }
+    if (opened.clock.tickMs > boundary.deadlineTickMs) { closeObserverHandle(opened.handle); fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated'); }
+    if (opened.epoch === null) { closeObserverHandle(opened.handle); return null; }
+    if (boundary.phase === 'observed' && (opened.epoch.wrapperEpochFingerprint !== boundary.wrapperEpochFingerprint || opened.epoch.childEpochFingerprint !== boundary.childEpochFingerprint)) {
+      closeObserverHandle(opened.handle); fail('SERVICE_STALE', operation, driverWrites, true, 'process-epoch-changed');
+    }
+    return opened;
+  }
+  // Promote a captured boundary to observed with the unique live epochs.  An
+  // already observed boundary is reused unchanged.
+  function observeBoundary(receipt, opened, operation) {
+    const boundary = receipt.value;
+    if (boundary.phase === 'observed') return receipt;
+    return publishBoundary({
+      ...boundaryFields(boundary), revision: boundary.revision + 1,
+      previousBoundaryFingerprint: boundary.boundaryFingerprint, phase: 'observed',
+      lastTickMs: Math.max(boundary.lastTickMs, opened.clock.tickMs),
+      wrapperEpochFingerprint: opened.epoch.wrapperEpochFingerprint,
+      childEpochFingerprint: opened.epoch.childEpochFingerprint, childCursor: opened.cursor,
+    }, receipt, operation);
+  }
+  function bindObserver(opened, boundary) {
+    releaseObserver();
+    activeObserver = { handle: opened.handle, boundaryFingerprint: boundary.boundaryFingerprint, cursorFingerprint: (boundary.childCursor ?? boundary.initialCursor).cursorFingerprint, startupProof: null };
+  }
+  // Final activation rechecks the same observer: identical epochs, same
+  // boot, bounded clock, continuous cursor through EOF.  A lost observer is
+  // a retriable pending state; a changed epoch or expired deadline
+  // invalidates the startup receipt.
+  function recheckLogCursor(operation) {
+    const observer = activeObserver;
+    if (observer === null || observer.startupProof === null) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+    const receipt = readBoundary(operation);
+    const proof = session.readStartupProof();
+    if (!receipt.present || receipt.value.boundaryFingerprint !== observer.boundaryFingerprint || !proof?.present || proof.value?.startupProof !== observer.startupProof) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+    const boundary = receipt.value;
+    try {
+      for (let page = 0; page < WINDOWS_DRIVER_LIMITS.startupReadPages; page += 1) {
+        let read;
+        try { read = readObserverPage(observer); } catch (error) {
+          if (error?.code === 'SERVICE_STALE') fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
+          fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+        }
+        const checked = validatePage(read, boundary, observer, operation);
+        if (checked.clock.tickMs > boundary.deadlineTickMs) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
+        observer.cursorFingerprint = checked.after.cursorFingerprint;
+        if (checked.eof) return;
+      }
+    } catch (error) { releaseObserver(); throw error; }
+    releaseObserver();
+    fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+  }
   function query(service, operation) { if (service === null) return null; return validateSnapshot(nativeCall('query_win32_service', service), operation); }
-  function expectedBinary(entrypointPath) { return serializeWindowsCommandLine(buildWindowsShawlArgv({ component, serviceKey, shawlPath: shawl.path, workingDirectory: configuration.workingDirectory, homeDirectory: configuration.homeDirectory, runtimePath: configuration.runtimePath, entrypointPath, logDirectory: configuration.logDirectory, channelsConfig: component === 'bot' ? configuration.channelsConfig : null })); }
+  function expectedBinary(entrypointPath) {
+    if (entrypointPath !== launch.entrypointPath) return null;
+    return serializeWindowsCommandLine(buildWindowsShawlArgv({ component, serviceKey, launch }));
+  }
   const expectedBinaryFor = expectedBinary;
+  function resourcePlan(phase, applicationManifestFingerprint, operation) {
+    if (!['trial', 'final-auto', 'final'].includes(phase) || !validHash(applicationManifestFingerprint)) fail('SERVICE_INVALID', operation, driverWrites);
+    const value = nativeCall('plan_win32_service_resource', name, component, launch,
+      applicationManifestFingerprint, phase);
+    if (!exact(value, ['descriptor', 'configFingerprint', 'writes']) || value.writes !== 0 ||
+        value.configFingerprint !== value.descriptor?.configFingerprint) fail('SERVICE_INVALID', operation, driverWrites, true);
+    const resourceDescriptor = validateResourceDescriptor(value.descriptor, component, serviceKey, operation);
+    return freeze({
+      resourceFingerprint: windowsServiceResourceFingerprint(resourceDescriptor),
+      resourceDescriptor,
+    });
+  }
   function descriptor(snapshot) {
     return { name, component, serviceKey, serviceRole: snapshot?.serviceRole ?? null, serviceType: snapshot?.serviceType ?? null, startType: snapshot?.startType ?? 'absent', errorControl: snapshot?.errorControl ?? null, tagId: snapshot?.tagId ?? null, binaryPath: snapshot?.binaryPath ?? null, loadOrderGroup: snapshot?.loadOrderGroup ?? null, dependencies: snapshot?.dependencies ?? [], accountName: snapshot?.accountName ?? null, displayName: snapshot?.displayName ?? null, description: snapshot?.description ?? null, delayedAutoStart: snapshot?.delayedAutoStart ?? false, failureResetPeriod: snapshot?.failureResetPeriod ?? 0, failureRebootMessage: snapshot?.failureRebootMessage ?? null, failureCommand: snapshot?.failureCommand ?? null, failureActionsOnNonCrashFailures: snapshot?.failureActionsOnNonCrashFailures ?? false, failureActions: snapshot?.failureActions ?? [], failurePolicy: snapshot?.failurePolicy ?? 'none', serviceSidType: snapshot?.serviceSidType ?? null, requiredPrivileges: snapshot?.requiredPrivileges ?? [], triggerCount: snapshot?.triggerCount ?? null, preshutdownTimeout: snapshot?.preshutdownTimeout ?? null, securitySha256: snapshot?.securitySha256 ?? null, aclMatches: snapshot?.aclMatches ?? false, accountMatchesRole: snapshot?.accountMatchesRole ?? false, configFingerprint: snapshot?.configFingerprint ?? null, runtimeFingerprint: null }; }
   function resourceIdentity(value) { if (!plain(value)) return null; const copy = { ...value, runtimeFingerprint: null }; return windowsServiceResourceFingerprint(copy); }
@@ -392,22 +787,32 @@ export function createWindowsServiceDriver(options) {
       fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
     }
     const observedResource = windowsServiceResourceFingerprint(descriptor(snapshot));
+    // Activation only changes start type and failure actions.  Project an
+    // AUTO/final resource back onto its suppressed trial shape so the
+    // journaled trial CAS still authenticates the full command line after
+    // armFinalRestart/enableFinal.
+    const projectedResource = snapshot.startType === 'auto'
+      ? windowsServiceResourceFingerprint({ ...descriptor(snapshot), startType: 'demand', failureResetPeriod: 0, failureActions: [], failurePolicy: 'none' })
+      : null;
     const expectedResources = applicationManifestFingerprint === candidate
-      ? [transaction.transition?.platformResourceFingerprint, transaction.transition?.expectedAfterResourceFingerprint, transaction.final?.resourceProof]
-      : [transaction.transition?.expectedBeforeResourceFingerprint, transaction.old?.resourceProof];
-    const matches = [...new Set(expectedResources.filter((value) => validHash(value)))].filter((value) => value === observedResource);
+      ? [transaction.transition?.platformResourceFingerprint, transaction.transition?.expectedAfterResourceFingerprint]
+      : [transaction.transition?.expectedBeforeResourceFingerprint];
+    const matches = [...new Set(expectedResources.filter((value) => validHash(value)))].filter((value) => value === observedResource || value === projectedResource);
     if (matches.length !== 1) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
     const entrypointPath = commandLineEntrypoint(snapshot.binaryPath);
     if (entrypointPath === null) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
     return Object.freeze({ entrypointPath, applicationManifestFingerprint });
   }
-  function evaluate(snapshot, expectedEntrypointPath) {
+  // The journaled resource CAS covers the complete SCM command line, so a
+  // binding derived by deriveReleaseBinding authenticates the observed
+  // launch even when this controller was constructed for another release.
+  function evaluate(snapshot, binding) {
     if (snapshot === null) return { phase: 'absent', state: buildServicePlatformState('win32', 'absent'), reasons: [] };
     if (snapshot.serviceRole !== component || typeof snapshot.accountName !== 'string' || snapshot.accountName.length === 0 || !validMarker(snapshot.description)) return { phase: null, state: null, reasons: [snapshot.serviceRole === component ? 'unmarked-resource' : 'foreign-resource'] };
-    if (!validPath(expectedEntrypointPath)) return { phase: null, state: null, reasons: ['resource-drift'] };
+    if (binding === null || !validPath(binding.entrypointPath)) return { phase: null, state: null, reasons: ['resource-drift'] };
     const noActions = snapshot.failureActions.length === 0 && snapshot.failureResetPeriod === 0 && snapshot.failureRebootMessage === '' && snapshot.failureCommand === '';
     const restartActions = snapshot.failureResetPeriod === 600 && snapshot.failureRebootMessage === '' && snapshot.failureCommand === '' && snapshot.failureActions.length === 4 && snapshot.failureActions[0].type === 'restart' && snapshot.failureActions[1].type === 'restart' && snapshot.failureActions[2].type === 'restart' && snapshot.failureActions[3].type === 'none' && snapshot.failureActions.slice(0, 3).every((a) => a.delayMs === 10000) && snapshot.failureActions[3].delayMs === 0;
-    if (!snapshot.aclMatches || !snapshot.accountMatchesRole || snapshot.binaryPath !== expectedBinary(expectedEntrypointPath) || snapshot.failureActionsOnNonCrashFailures || snapshot.dependencies.length !== 0 || (snapshot.failurePolicy === 'none' && !noActions) || (snapshot.failurePolicy === actionPolicy(true) && !restartActions)) return { phase: null, state: null, reasons: ['resource-drift'] };
+    if (!snapshot.aclMatches || !snapshot.accountMatchesRole || commandLineEntrypoint(snapshot.binaryPath) !== binding.entrypointPath || snapshot.failureActionsOnNonCrashFailures || snapshot.dependencies.length !== 0 || (snapshot.failurePolicy === 'none' && !noActions) || (snapshot.failurePolicy === actionPolicy(true) && !restartActions)) return { phase: null, state: null, reasons: ['resource-drift'] };
     const startType = snapshot.startType; const policy = snapshot.failurePolicy;
     const phase = startType === 'disabled' && policy === 'none' ? 'created-protected' : startType === 'demand' && policy === 'none' ? 'trial' : startType === 'auto' && policy === 'none' ? 'final-auto' : startType === 'auto' && policy === actionPolicy(true) ? 'final' : null;
     return phase === null ? { phase: null, state: null, reasons: ['resource-drift'] } : { phase, state: buildServicePlatformState('win32', phase), reasons: [] };
@@ -422,7 +827,7 @@ export function createWindowsServiceDriver(options) {
     try {
       const snapshot = query(service, operation);
       const binding = deriveReleaseBinding(transaction, snapshot, operation);
-      const evaluation = evaluate(snapshot, binding?.entrypointPath ?? null);
+      const evaluation = evaluate(snapshot, binding);
       const bootId = nativeCall('read_boot_id'); if (typeof bootId !== 'string' || !WIN_BOOT.test(bootId)) fail('SERVICE_IO_FAILED', 'read_boot_id', driverWrites, true);
       const process = processEvidence(snapshot, operation); const descriptorValue = descriptor(snapshot);
       return freeze({ bootId, service: snapshot, platformState: evaluation.state, platformPhase: evaluation.phase, driftReasons: evaluation.reasons, releaseBinding: binding, resourceDescriptor: descriptorValue, resourceFingerprint: windowsServiceResourceFingerprint(descriptorValue), process, logFamily: { ...logFamily } });
@@ -477,10 +882,7 @@ export function createWindowsServiceDriver(options) {
     }
     const expectedBinary = expectedBinaryFor(input.release.entrypointPath);
     ensure((value) => value.binaryPath === expectedBinary, 'configure_win32_service_launch', [
-      shawl.path, shawl.sha256, configuration.workingDirectory, configuration.homeDirectory,
-      configuration.runtimePath, shawl.runtimeSha256, input.release.entrypointPath,
-      shawl.entrypointSha256, configuration.logDirectory, expectedLogAs(component, serviceKey),
-      expectedLogCmdAs(component, serviceKey), component === 'bot' ? configuration.channelsConfig : null,
+      launch,
     ]);
     ensure((value) => value.description === marker(input.release.applicationManifestFingerprint), 'set_win32_service_marker', [marker(input.release.applicationManifestFingerprint)]);
     ensure((value) => value.startType === 'demand', 'set_win32_service_start_type', ['demand']);
@@ -512,7 +914,7 @@ export function createWindowsServiceDriver(options) {
     if (tree.processCount !== 0) fail('SERVICE_TREE_SURVIVOR', operation, driverWrites, true, 'tree-survivor');
     return Object.freeze({ tree: 'empty', forced, terminated: captured.tree?.processCount ?? 0, writes: 1 });
   }
-  function freshActivationReceipt(service, before, transaction, operation, requireFinal = true) {
+  function freshActivationReceipt(service, before, transaction, operation) {
     const after = query(service, operation);
     const boot = nativeCall('read_boot_id');
     const live = probe(operation, transaction);
@@ -524,28 +926,33 @@ export function createWindowsServiceDriver(options) {
     }
     if (live.process.pid <= 0 || live.process.facts === null || live.process.tree === null || !validHash(live.process.tree.treeFingerprint)) fail('SERVICE_PENDING', operation, driverWrites, true, 'invocation-not-observed');
     if (live.service?.configFingerprint !== after.configFingerprint || live.service?.runtime?.fingerprint !== after.runtime.fingerprint) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, true, 'activation-drift');
-    if (requireFinal && live.resourceFingerprint !== transaction.final.resourceProof) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
     return live;
-  }
-  // The Windows facade currently exposes no service-scoped native log cursor
-  // or epoch receipt.  A marker-only SCM snapshot cannot prove that the live
-  // wrapper emitted a current-run ready record, so final activation remains a
-  // recoverable pending/manual state until that ABI exists.
-  function requireAuthoritativeLogCursor(operation) {
-    fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
   }
   function reconstructTrial(transaction, observed, operation) {
     if (!observed || observed.platformPhase !== 'trial' || observed.process.pid <= 0 || observed.process.facts === null || observed.process.tree === null) return null;
     const binding = deriveReleaseBinding(transaction, observed.service, operation);
-    if (binding === null || observed.resourceFingerprint !== transaction.transition.platformResourceFingerprint ||
-        observed.resourceDescriptor.binaryPath !== expectedBinaryFor(binding.entrypointPath)) return null;
+    if (binding === null || observed.resourceFingerprint !== transaction.transition.platformResourceFingerprint) return null;
     const releaseFingerprint = binding.applicationManifestFingerprint;
     if (!validHash(releaseFingerprint) || !validHash(observed.resourceFingerprint)) return null;
+    // A fresh controller resumes only the exact protected boundary: same boot,
+    // live deadline, and (once observed) identical wrapper/child epochs.  The
+    // new observer starts at the protected child cursor.
+    const receipt = readBoundary(operation);
+    if (!receipt.present || !boundaryMatches(receipt.value, transaction, releaseFingerprint)) return null;
+    const service = handle('query', operation);
+    if (service === null) return null;
+    let opened;
+    try {
+      try { opened = openLiveObserver(service, receipt.value, operation); } catch { return null; }
+    } finally { close(service); }
+    if (opened === null) return null;
+    let boundary;
+    try { boundary = observeBoundary(receipt, opened, operation).value; } catch (error) { closeObserverHandle(opened.handle); throw error; }
+    bindObserver(opened, boundary);
     const trial = freeze({
       serviceName: name,
       bootId: observed.bootId,
-      boundaryMs: nowMs(),
-      preStartLogCursor: 0,
+      boundaryFingerprint: boundary.boundaryFingerprint,
       binaryPath: observed.resourceDescriptor.binaryPath,
       resourceFingerprint: observed.resourceFingerprint,
       resourceDescriptor: observed.resourceDescriptor,
@@ -580,15 +987,28 @@ export function createWindowsServiceDriver(options) {
     if (transaction.transition.candidateFingerprint !== transaction.candidate.candidateFingerprint || transaction.transition.oldFingerprint !== transaction.old.oldFingerprint || transaction.final.applicationManifestFingerprint !== transaction.candidate.applicationManifestFingerprint) fail('SERVICE_STALE', 'publish_suppressed_resource', driverWrites, true, 'resource-drift');
     return transaction;
   }
+  function validateOperationRelease(value, operation) {
+    if (!exact(value, ['entrypointPath', 'applicationManifestFingerprint']) ||
+        !validCanonicalWindowsPath(value.entrypointPath) || !validHash(value.applicationManifestFingerprint) ||
+        value.entrypointPath !== launch.entrypointPath) fail('SERVICE_INVALID', operation, driverWrites);
+    return value;
+  }
 
   const api = {
     get writes() { return driverWrites; },
     serviceName: name,
     unitName: name,
+    launchFingerprint: windowsServiceLaunchFingerprint(launch, component, serviceKey),
+    planResource(input) {
+      const operation = 'plan_win32_service_resource';
+      if (!exact(input, ['phase', 'applicationManifestFingerprint'])) fail('SERVICE_INVALID', operation, driverWrites);
+      return resourcePlan(input.phase, input.applicationManifestFingerprint, operation);
+    },
     probe() { return probe(); },
     publishSuppressedResource(input) {
       const operation = 'publish_suppressed_resource'; if (!exact(input, ['phase', 'release', 'expectedCurrentSha256'])) fail('SERVICE_INVALID', operation, driverWrites);
-      if (!['transition-marker-intent', 'resource-published'].includes(input.phase) || (input.expectedCurrentSha256 !== null && !validHash(input.expectedCurrentSha256)) || !exact(input.release, ['entrypointPath', 'applicationManifestFingerprint']) || !validPath(input.release.entrypointPath) || !validHash(input.release.applicationManifestFingerprint)) fail('SERVICE_INVALID', operation, driverWrites);
+      if (!['transition-marker-intent', 'resource-published'].includes(input.phase) || (input.expectedCurrentSha256 !== null && !validHash(input.expectedCurrentSha256))) fail('SERVICE_INVALID', operation, driverWrites);
+      validateOperationRelease(input.release, operation);
       const transaction = assertHead(operation, [
         { phase: 'prepared', substep: 'none' }, { phase: 'sequence-reserved' },
         { phase: 'release-published' }, { phase: 'transition-marker-intent' },
@@ -596,6 +1016,11 @@ export function createWindowsServiceDriver(options) {
         { phase: 'resource-published' },
       ]);
       const transitionReplay = transaction.phase === 'transition-marker-intent' && ['intent', 'action'].includes(transaction.substep) && input.expectedCurrentSha256 === transaction.transition.expectedBeforeResourceFingerprint;
+      const planned = resourcePlan('trial', input.release.applicationManifestFingerprint, operation);
+      const expectedPlanned = transaction.transition.expectedAfterResourceFingerprint ?? transaction.transition.platformResourceFingerprint;
+      if (planned.resourceFingerprint !== expectedPlanned || planned.resourceFingerprint !== transaction.transition.platformResourceFingerprint) {
+        fail('SERVICE_STALE', operation, driverWrites, true, 'resource-drift');
+      }
       // The operation's release is authoritative for this transaction.  A
       // fresh controller's constructor release may be a different candidate
       // (notably on rollback), so never use it to reject the recorded old T
@@ -662,7 +1087,7 @@ export function createWindowsServiceDriver(options) {
       }
       const headBeforeCreate = journal().entries.at(-1);
       if (headBeforeCreate.phase !== 'transition-marker-intent' || substepOrder[headBeforeCreate.substep] < substepOrder.action) append('transition-marker-intent', 'action');
-      const created = nativeCall('create_win32_service_disabled', name, component, shawl.path, shawl.sha256, configuration.workingDirectory, configuration.homeDirectory, configuration.runtimePath, shawl.runtimeSha256, input.release.entrypointPath, shawl.entrypointSha256, configuration.logDirectory, expectedLogAs(component, serviceKey), expectedLogCmdAs(component, serviceKey), component === 'bot' ? configuration.channelsConfig : null, servicePassword ?? null);
+      const created = nativeCall('create_win32_service_disabled', name, component, launch, servicePassword ?? null);
       if (!created) fail('SERVICE_IO_FAILED', operation, driverWrites, true);
       try {
         const initial = query(created, operation);
@@ -687,8 +1112,10 @@ export function createWindowsServiceDriver(options) {
         { phase: 'trial-start-intent', substep: 'intent' }, { phase: 'trial-start-intent', substep: 'action' },
         { phase: 'trial-start-observed', substep: 'observed' }, { phase: 'starting', substep: 'intent' }, { phase: 'starting', substep: 'action' },
       ]);
+      const planned = resourcePlan('trial', transaction.candidate.applicationManifestFingerprint, operation);
       const before = probe(operation, transaction); if (!['trial', 'created-protected'].includes(before.platformPhase)) fail('SERVICE_STALE', operation, driverWrites);
       if (before.platformPhase === 'created-protected') fail('SERVICE_STALE', operation, driverWrites, false, 'activation-drift');
+      if (planned.resourceFingerprint !== before.resourceFingerprint || planned.resourceFingerprint !== transaction.transition.platformResourceFingerprint) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
       if (input.expectedResourceFingerprint !== undefined && input.expectedResourceFingerprint !== before.resourceFingerprint) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
       if (before.resourceFingerprint !== transaction.transition.platformResourceFingerprint) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
       const service = handle('mutate', operation);
@@ -707,15 +1134,16 @@ export function createWindowsServiceDriver(options) {
         const retrialPhase = ['trial-start-observed', 'starting'].includes(startHead.phase);
         const replayStart = actionAlreadyJournaled && before.service.runtime.processId === 0 && before.service.runtime.state === 'stopped';
         if (!actionAlreadyJournaled || replayStart) {
+          // A dead wrapper after a durable observed/starting head needs a new
+          // attempt, which the protected boundary only admits after an
+          // observed quiescent edge.  Never restart it under the old budget.
+          if (retrialPhase) fail('SERVICE_PENDING', operation, driverWrites, true, 'controller-loss');
+          captureBoundary(service, transaction, before.releaseBinding.applicationManifestFingerprint, operation);
           if (!actionAlreadyJournaled && startHead.phase === 'resource-published') {
             if (startHead.phase !== 'trial-start-intent' || substepOrder[startHead.substep] < substepOrder.intent) append('trial-start-intent', 'intent');
             if (journal().entries.at(-1).phase !== 'trial-start-intent' || substepOrder[journal().entries.at(-1).substep] < substepOrder.action) append('trial-start-intent', 'action');
           }
-          if (startHead.phase === 'trial-start-observed' || startHead.phase === 'starting') {
-            if (startHead.phase === 'trial-start-observed') append('starting', 'intent');
-            if (startHead.phase === 'starting' && substepOrder[startHead.substep] < substepOrder.action) append('starting', 'action');
-            if (journal().entries.at(-1).phase !== 'starting' || substepOrder[journal().entries.at(-1).substep] < substepOrder.action) append('starting', 'action');
-          }
+          if (startHead.phase === 'trial-start-intent' && startHead.substep === 'intent') append('trial-start-intent', 'action');
           mutation('start_win32_service', [service, before.service.configFingerprint, before.service.runtime.fingerprint], operation);
         }
         let observed = null;
@@ -728,96 +1156,158 @@ export function createWindowsServiceDriver(options) {
         const process = processEvidence(observed, operation);
         const bootId = nativeCall('read_boot_id');
         if (bootId !== before.bootId) fail('SERVICE_TRIAL_NOT_OBSERVED', operation, driverWrites, true, 'reboot');
-        if (retrialPhase) {
-          if (journal().entries.at(-1).phase === 'starting') append('starting', 'observed');
-        } else {
+        const captured = readBoundary(operation);
+        if (!captured.present || captured.value.phase !== 'captured' || !boundaryMatches(captured.value, transaction, before.releaseBinding.applicationManifestFingerprint)) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+        let opened = null;
+        for (let attempt = 0; attempt < WINDOWS_DRIVER_LIMITS.startPollAttempts && opened === null; attempt += 1) {
+          opened = openLiveObserver(service, captured.value, operation);
+          if (opened === null) await sleepMs(WINDOWS_DRIVER_LIMITS.startPollMs);
+        }
+        if (opened === null) fail('SERVICE_TRIAL_NOT_OBSERVED', operation, driverWrites, false, 'invocation-not-observed');
+        let observedBoundary;
+        try {
           if (journal().entries.at(-1).phase === 'trial-start-intent') append('trial-start-intent', 'observed');
           append('trial-start-observed', 'observed');
-        }
+          observedBoundary = observeBoundary(captured, opened, operation).value;
+        } catch (error) { closeObserverHandle(opened.handle); throw error; }
+        bindObserver(opened, observedBoundary);
         const observedTransaction = journal().entries.at(-1);
-        const trial = freeze({ serviceName: name, bootId, boundaryMs: nowMs(), preStartLogCursor: 0, binaryPath: before.resourceDescriptor.binaryPath, resourceFingerprint: transaction.transition.platformResourceFingerprint, resourceDescriptor: before.resourceDescriptor, configFingerprint: before.resourceDescriptor.configFingerprint, releaseFingerprint: before.releaseBinding.applicationManifestFingerprint, releaseBinding: before.releaseBinding, transactionFingerprint: observedTransaction.transactionFingerprint, transitionFingerprint: observedTransaction.transition.transitionFingerprint, wrapper: { pid: observed.runtime.processId, fingerprint: observed.runtime.fingerprint }, process, logFamily });
+        const trial = freeze({ serviceName: name, bootId, boundaryFingerprint: observedBoundary.boundaryFingerprint, binaryPath: before.resourceDescriptor.binaryPath, resourceFingerprint: transaction.transition.platformResourceFingerprint, resourceDescriptor: before.resourceDescriptor, configFingerprint: before.resourceDescriptor.configFingerprint, releaseFingerprint: before.releaseBinding.applicationManifestFingerprint, releaseBinding: before.releaseBinding, transactionFingerprint: observedTransaction.transactionFingerprint, transitionFingerprint: observedTransaction.transition.transitionFingerprint, wrapper: { pid: observed.runtime.processId, fingerprint: observed.runtime.fingerprint }, process, logFamily });
         activeTrial = trial;
         return trial;
       } finally { close(service); }
     },
     async runStartupGate(input) {
       const operation = 'run_startup_gate'; if (!exact(input, ['trial', 'observeApplication']) || typeof input.observeApplication !== 'function') fail('SERVICE_INVALID', operation, driverWrites);
-      const trial = input.trial; if (!plain(trial) || activeTrial === null || !sameJson(trial, activeTrial) || typeof trial.bootId !== 'string' || !Number.isSafeInteger(trial.preStartLogCursor) || trial.preStartLogCursor < 0 || !plain(trial.process) || !Number.isSafeInteger(trial.process.pid) || !plain(trial.process.facts) || typeof trial.process.facts.startTime !== 'string' || !plain(trial.process.tree) || !validHash(trial.process.tree.treeFingerprint) || !validHash(trial.resourceFingerprint) || !validHash(trial.releaseFingerprint) || !plain(trial.releaseBinding) || !validPath(trial.releaseBinding.entrypointPath) || trial.releaseBinding.applicationManifestFingerprint !== trial.releaseFingerprint || !validHash(trial.transactionFingerprint) || !validHash(trial.transitionFingerprint)) fail('SERVICE_INVALID', operation, driverWrites);
+      const trial = input.trial; if (!plain(trial) || activeTrial === null || !sameJson(trial, activeTrial) || typeof trial.bootId !== 'string' || !validHash(trial.boundaryFingerprint) || !plain(trial.process) || !Number.isSafeInteger(trial.process.pid) || !plain(trial.process.facts) || typeof trial.process.facts.startTime !== 'string' || !plain(trial.process.tree) || !validHash(trial.process.tree.treeFingerprint) || !validHash(trial.resourceFingerprint) || !validHash(trial.releaseFingerprint) || !plain(trial.releaseBinding) || !validPath(trial.releaseBinding.entrypointPath) || trial.releaseBinding.applicationManifestFingerprint !== trial.releaseFingerprint || !validHash(trial.transactionFingerprint) || !validHash(trial.transitionFingerprint)) fail('SERVICE_INVALID', operation, driverWrites);
       const trialTransaction = assertHead(operation, [
         { phase: 'trial-start-observed', substep: 'observed' },
         { phase: 'starting', substep: 'intent' }, { phase: 'starting', substep: 'action' }, { phase: 'starting', substep: 'observed' },
       ]);
       const declaredRelease = trialTransaction.candidate.applicationManifestFingerprint === trial.releaseFingerprint || trialTransaction.old.applicationManifestFingerprint === trial.releaseFingerprint;
       if (!declaredRelease || trial.transactionFingerprint !== trialTransaction.transactionFingerprint || trial.transitionFingerprint !== trialTransaction.transition.transitionFingerprint || trial.resourceFingerprint !== trialTransaction.transition.platformResourceFingerprint || trialTransaction.transition.candidateFingerprint !== trialTransaction.candidate.candidateFingerprint || trialTransaction.transition.oldFingerprint !== trialTransaction.old.oldFingerprint) fail('SERVICE_STALE', operation, driverWrites, true, 'resource-drift');
+      const observer = activeObserver;
+      if (observer === null || observer.boundaryFingerprint !== trial.boundaryFingerprint) fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+      const receipt = readBoundary(operation);
+      if (!receipt.present || receipt.value.phase !== 'observed' || receipt.value.boundaryFingerprint !== trial.boundaryFingerprint || !boundaryMatches(receipt.value, trialTransaction, trial.releaseFingerprint)) {
+        releaseObserver(); fail('SERVICE_PENDING', operation, driverWrites, true, 'log-cursor-invalid');
+      }
+      const boundary = receipt.value;
       if (trialTransaction.phase === 'trial-start-observed') append('starting', 'intent');
-      const started = nowMs(); let application; while (nowMs() - started <= WINDOWS_DRIVER_LIMITS.startupWindowMs) { application = await input.observeApplication(Object.freeze({ serviceName: name, bootId: trial.bootId, process: trial.process, resourceFingerprint: trial.resourceFingerprint, releaseFingerprint: trial.releaseFingerprint, preStartLogCursor: trial.preStartLogCursor, logFamily })); if (!plain(application) || application.logEvidence === undefined) { await sleepMs(WINDOWS_DRIVER_LIMITS.startPollMs); continue; } try { const log = validateWindowsLogEvidence(application.logEvidence); if (application.logEvidence.epoch.bootId !== trial.bootId || application.logEvidence.epoch.pid !== trial.wrapper.pid || application.logEvidence.epoch.startTime !== trial.process.facts.startTime || application.logEvidence.cursor !== trial.preStartLogCursor) throw new TypeError('epoch mismatch'); if (application.logEvidence.records[0].offset < application.logEvidence.cursor || log.endOffset > WINDOWS_DRIVER_LIMITS.logBytes) throw new TypeError('cursor mismatch'); } catch { fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'log-epoch-invalid'); } if (application.ready === true) break; await sleepMs(WINDOWS_DRIVER_LIMITS.startPollMs); }
-      if (!plain(application) || application.ready !== true) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
-      if (journal().entries.at(-1).phase === 'starting' && substepOrder[journal().entries.at(-1).substep] < substepOrder.action) append('starting', 'action');
-      const fresh = probe(operation, trialTransaction); if (fresh.bootId !== trial.bootId || !sameJson(fresh.releaseBinding, trial.releaseBinding) || resourceIdentity(fresh.resourceDescriptor) !== resourceIdentity(trial.resourceDescriptor) || fresh.resourceDescriptor.binaryPath !== trial.binaryPath || fresh.resourceDescriptor.configFingerprint !== trial.configFingerprint || fresh.process.pid !== trial.wrapper.pid || fresh.process.facts?.startTime !== trial.process.facts.startTime || fresh.process.tree?.treeFingerprint !== trial.process.tree.treeFingerprint) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, true, 'startup-receipt-invalidated');
-      const transaction = transactionBinding(journal().entries.at(-1), operation);
-      const observedAtMs = nowMs();
-      let proof;
+      // The caller supplies only an observer factory.  It receives the
+      // protected trial observation and returns the page reducer; the native
+      // observer handle and its cursor stay private to this driver.
+      let observe;
       try {
-        proof = buildServiceStartupProof({
-          component, serviceKey, platform: 'win32', architecture: 'x64',
-          serviceGeneration: transaction.serviceGeneration,
-          transactionId: transaction.transactionId,
-          resourceProof: transaction.transition.platformResourceFingerprint,
-          applicationManifestFingerprint: trial.releaseFingerprint,
-          bootFingerprint: canonicalJsonHash({ kind: 'windows-boot/v1', bootId: trial.bootId }),
-          processEpochFingerprint: canonicalJsonHash({ kind: 'windows-process-epoch/v1', wrapper: trial.wrapper, tree: trial.process.tree }),
-          platformEvidenceFingerprint: canonicalJsonHash({ kind: 'windows-platform-evidence/v1', serviceName: name, wrapperPid: trial.wrapper.pid, logFamily }),
-          applicationEvidenceFingerprint: application.applicationEvidenceFingerprint ?? canonicalJsonHash(application),
-          platformState: buildServicePlatformState('win32', 'trial'),
-          startBoundaryMs: trial.boundaryMs,
-          observedAtMs,
-          expiresAtMs: Math.min(started + WINDOWS_DRIVER_LIMITS.startupWindowMs, trial.boundaryMs + WINDOWS_DRIVER_LIMITS.startupWindowMs),
-          startupEvidence: 'fresh-current-epoch',
-          connectivityObservation: component === 'bot' ? 'last-observed-connected' : 'startup-only',
-        });
-      } catch { fail('SERVICE_INVALID', operation, driverWrites); }
-      session.publishStartupProof(proof, session.readStartupProof()); append('startup-observed', 'observed'); return freeze(proof);
+        observe = await input.observeApplication(Object.freeze({
+          component, serviceKey, serviceName: name,
+          bootFingerprint: boundary.bootFingerprint,
+          wrapperEpochFingerprint: boundary.wrapperEpochFingerprint,
+          childEpochFingerprint: boundary.childEpochFingerprint,
+          resourceFingerprint: boundary.resourceFingerprint,
+          applicationManifestFingerprint: boundary.applicationManifestFingerprint,
+          effectiveConfigFingerprint: boundary.effectiveConfigFingerprint,
+          boundaryReceipt: Object.freeze({ present: true, value: boundary }),
+        }));
+      } catch { releaseObserver(); fail('SERVICE_INVALID', operation, driverWrites); }
+      if (typeof observe !== 'function') { releaseObserver(); fail('SERVICE_INVALID', operation, driverWrites); }
+      let application = null;
+      let treeFingerprint = null;
+      try {
+        for (let page = 0; page < WINDOWS_DRIVER_LIMITS.startupReadPages && application === null; page += 1) {
+          let read;
+          try { read = readObserverPage(observer); } catch (error) {
+            fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, error?.code === 'SERVICE_STALE' ? 'process-epoch-changed' : 'log-epoch-invalid');
+          }
+          if (!plain(read) || !plain(read.clock) || !Number.isSafeInteger(read.clock.tickMs)) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'log-epoch-invalid');
+          if (read.clock.tickMs >= boundary.deadlineTickMs) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
+          let result;
+          try { result = await observe(read); } catch { fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'log-epoch-invalid'); }
+          // The observer validated beforeCursor continuity, epochs, and the
+          // afterCursor binding; advance only after that acceptance.
+          observer.cursorFingerprint = read.afterCursor.cursorFingerprint;
+          treeFingerprint = read.treeFingerprint;
+          if (result !== null) { application = result; break; }
+          if (read.eof) await sleepMs(WINDOWS_DRIVER_LIMITS.startPollMs);
+        }
+        if (application === null) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
+        if (!exact(application, ['ready', 'logEvidence', 'applicationEvidenceFingerprint']) || application.ready !== true || !validHash(application.applicationEvidenceFingerprint)) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'startup-receipt-invalidated');
+        try { validateServiceLogEvidence(application.logEvidence, boundary); } catch { fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, false, 'log-epoch-invalid'); }
+        if (journal().entries.at(-1).phase === 'starting' && substepOrder[journal().entries.at(-1).substep] < substepOrder.action) append('starting', 'action');
+        const fresh = probe(operation, trialTransaction); if (fresh.bootId !== trial.bootId || !sameJson(fresh.releaseBinding, trial.releaseBinding) || resourceIdentity(fresh.resourceDescriptor) !== resourceIdentity(trial.resourceDescriptor) || fresh.resourceDescriptor.binaryPath !== trial.binaryPath || fresh.resourceDescriptor.configFingerprint !== trial.configFingerprint || fresh.process.pid !== trial.wrapper.pid || fresh.process.facts?.startTime !== trial.process.facts.startTime || fresh.process.tree?.treeFingerprint !== trial.process.tree.treeFingerprint) fail('SERVICE_STARTUP_TIMEOUT', operation, driverWrites, true, 'startup-receipt-invalidated');
+        const transaction = transactionBinding(journal().entries.at(-1), operation);
+        let proof;
+        try {
+          proof = buildServiceStartupProof({
+            component, serviceKey, platform: 'win32', architecture: 'x64',
+            serviceGeneration: transaction.serviceGeneration,
+            transactionId: transaction.transactionId,
+            resourceProof: transaction.transition.platformResourceFingerprint,
+            applicationManifestFingerprint: trial.releaseFingerprint,
+            bootFingerprint: boundary.bootFingerprint,
+            processEpochFingerprint: canonicalJsonHash({ kind: 'windows-process-epoch/v1', wrapperEpochFingerprint: boundary.wrapperEpochFingerprint, childEpochFingerprint: boundary.childEpochFingerprint, wrapper: trial.wrapper, tree: trial.process.tree }),
+            platformEvidenceFingerprint: canonicalJsonHash({ kind: 'windows-platform-evidence/v1', serviceName: name, wrapperPid: trial.wrapper.pid, boundaryFingerprint: boundary.boundaryFingerprint, logTreeFingerprint: treeFingerprint }),
+            applicationEvidenceFingerprint: application.applicationEvidenceFingerprint,
+            platformState: buildServicePlatformState('win32', 'trial'),
+            startupEvidence: 'fresh-current-epoch',
+            connectivityObservation: component === 'bot' ? 'last-observed-connected' : 'startup-only',
+            clockKind: 'windows-boot-tick',
+            boundaryFingerprint: boundary.boundaryFingerprint,
+            observedTickMs: application.logEvidence.observedTickMs,
+            deadlineTickMs: boundary.deadlineTickMs,
+            logEvidenceFingerprint: application.logEvidence.evidenceFingerprint,
+          });
+        } catch { fail('SERVICE_INVALID', operation, driverWrites); }
+        session.publishStartupProof(proof, session.readStartupProof()); append('startup-observed', 'observed');
+        observer.startupProof = proof.startupProof;
+        return freeze(proof);
+      } catch (error) { releaseObserver(); throw error; }
     },
     armFinalRestart() {
       const operation = 'arm_final_restart'; const transaction = assertHead(operation, [{ phase: 'startup-observed', substep: 'observed' }, { phase: 'activation-observed', substep: 'intent' }, { phase: 'activation-observed', substep: 'action' }]);
       if (transaction.phase === 'activation-observed' && transaction.substep === 'action') fail('SERVICE_PENDING', operation, driverWrites, true, 'controller-loss');
-      requireAuthoritativeLogCursor(operation);
+      recheckLogCursor(operation);
+      const plannedFinalAuto = resourcePlan('final-auto', transaction.candidate.applicationManifestFingerprint, operation);
       const beforeProbe = probe(operation, transaction); const activationMarkers = new Set([transaction.candidate.applicationManifestFingerprint, transaction.old.applicationManifestFingerprint].filter((value) => value !== null).map(marker));
-      const declaredResources = [transaction.transition.expectedAfterResourceFingerprint, transaction.transition.expectedBeforeResourceFingerprint].filter((value) => validHash(value));
-      if (beforeProbe.resourceFingerprint !== transaction.transition.platformResourceFingerprint || !declaredResources.includes(transaction.final.resourceProof) || beforeProbe.platformPhase !== 'trial' || !beforeProbe.service || !activationMarkers.has(beforeProbe.service.description) || (activeTrial && resourceIdentity(beforeProbe.resourceDescriptor) !== resourceIdentity(activeTrial.resourceDescriptor))) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
+      if (beforeProbe.resourceFingerprint !== transaction.transition.platformResourceFingerprint || beforeProbe.platformPhase !== 'trial' || !beforeProbe.service || !activationMarkers.has(beforeProbe.service.description) || (activeTrial && resourceIdentity(beforeProbe.resourceDescriptor) !== resourceIdentity(activeTrial.resourceDescriptor))) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
       const service = handle('mutate', operation); if (service === null) fail('SERVICE_NOT_FOUND', operation, driverWrites, true); try {
         const before = query(service, operation);
         if (journal().entries.at(-1).phase !== 'activation-observed' || substepOrder[journal().entries.at(-1).substep] < substepOrder.intent) append('activation-observed', 'intent');
         if (journal().entries.at(-1).phase !== 'activation-observed' || substepOrder[journal().entries.at(-1).substep] < substepOrder.action) append('activation-observed', 'action');
         mutation('set_win32_service_start_type', [service, before.configFingerprint, before.runtime.fingerprint, 'auto'], operation);
-        const live = freshActivationReceipt(service, before, transaction, operation, false);
-        if (live.platformPhase !== 'final-auto') fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'activation-drift');
+        const live = freshActivationReceipt(service, before, transaction, operation);
+        if (live.platformPhase !== 'final-auto' || live.resourceFingerprint !== plannedFinalAuto.resourceFingerprint) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'activation-drift');
         append('activation-observed', 'observed'); return live;
       } finally { close(service); }
     },
     enableFinal() {
       const operation = 'enable_final'; const transaction = assertHead(operation, [{ phase: 'activation-observed', substep: 'observed' }]);
-      requireAuthoritativeLogCursor(operation);
+      recheckLogCursor(operation);
+      const plannedFinalAuto = resourcePlan('final-auto', transaction.candidate.applicationManifestFingerprint, operation);
+      const plannedFinal = resourcePlan('final', transaction.candidate.applicationManifestFingerprint, operation);
       const beforeProbe = probe(operation, transaction); const activationMarkers = new Set([transaction.candidate.applicationManifestFingerprint, transaction.old.applicationManifestFingerprint].filter((value) => value !== null).map(marker));
-      const declaredResources = [transaction.transition.expectedAfterResourceFingerprint, transaction.transition.expectedBeforeResourceFingerprint].filter((value) => validHash(value));
-      if (!declaredResources.includes(beforeProbe.resourceFingerprint) || !declaredResources.includes(transaction.final.resourceProof) || beforeProbe.platformPhase !== 'final-auto' || !beforeProbe.service || !activationMarkers.has(beforeProbe.service.description)) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
+      if (beforeProbe.resourceFingerprint !== plannedFinalAuto.resourceFingerprint || beforeProbe.platformPhase !== 'final-auto' || !beforeProbe.service || !activationMarkers.has(beforeProbe.service.description)) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
       const service = handle('mutate', operation); if (service === null) fail('SERVICE_NOT_FOUND', operation, driverWrites, true); try {
         const before = query(service, operation);
         append('activation-observed', 'intent'); append('activation-observed', 'action');
         mutation('set_win32_service_failure_actions', [service, before.configFingerprint, before.runtime.fingerprint, actionPolicy(true)], operation);
-        const auto = freshActivationReceipt(service, before, transaction, operation, false);
-        if (auto.platformPhase !== 'final-auto') fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'activation-drift');
+        const auto = freshActivationReceipt(service, before, transaction, operation);
+        // The non-crash flag was cleared at creation, so restart actions
+        // alone already evaluate as the final shape; the flag write below
+        // re-asserts it against concurrent drift.
+        if (auto.platformPhase !== 'final') fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'activation-drift');
         append('activation-observed', 'observed');
         append('activation-observed', 'intent'); append('activation-observed', 'action');
         const after = query(service, operation);
         mutation('set_win32_service_failure_actions_flag', [service, after.configFingerprint, after.runtime.fingerprint, false], operation);
-        const live = freshActivationReceipt(service, after, transaction, operation, true);
-        if (live.platformPhase !== 'final') fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'activation-drift');
-        append('activation-observed', 'observed'); return live;
+        const live = freshActivationReceipt(service, after, transaction, operation);
+        if (live.platformPhase !== 'final' || live.resourceFingerprint !== plannedFinal.resourceFingerprint) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'activation-drift');
+        append('activation-observed', 'observed'); releaseObserver(); return live;
       } finally { close(service); }
     },
     async stopAndQuiesce(input = {}) {
       const operation = 'stop_and_quiesce';
+      releaseObserver();
       if (!plain(input) || Reflect.ownKeys(input).some((key) => key !== 'deadlineMs' && key !== 'expectedResourceFingerprint')) fail('SERVICE_INVALID', operation, driverWrites);
       const deadline = input.deadlineMs ?? WINDOWS_DRIVER_LIMITS.stopWindowMs;
       if (!Number.isSafeInteger(deadline) || deadline < 1 || deadline > WINDOWS_DRIVER_LIMITS.stopWindowMs) fail('SERVICE_INVALID', operation, driverWrites);
@@ -989,7 +1479,7 @@ export function createWindowsServiceDriver(options) {
       if (observed.platformPhase === null) return freeze({ ...observed, recovery: 'manual-cleanup', reason: observed.driftReasons[0] ?? 'resource-drift' });
       if (observed.platformPhase === 'final') {
         const markerSet = new Set([transaction.candidate.applicationManifestFingerprint, transaction.old.applicationManifestFingerprint].filter((value) => value !== null).map(marker));
-        if (transaction.phase !== 'committed' || transaction.final.resourceProof !== observed.resourceFingerprint || !observed.service || !markerSet.has(observed.service.description) || observed.process.pid <= 0 || observed.process.tree === null) return freeze({ ...observed, recovery: 'pending', reason: 'log-cursor-invalid' });
+        if (transaction.phase !== 'committed' || !observed.service || !markerSet.has(observed.service.description) || observed.process.pid <= 0 || observed.process.tree === null) return freeze({ ...observed, recovery: 'pending', reason: 'log-cursor-invalid' });
         // No authoritative service-scoped log cursor/epoch exists in this ABI;
         // a final-looking marker is never promoted to stable on that basis.
         return freeze({ ...observed, recovery: 'pending', reason: 'log-cursor-invalid' });
@@ -1011,9 +1501,9 @@ export function createWindowsServiceDriver(options) {
       }
       const proof = session.readStartupProof();
       const latest = journal().entries.at(-1);
-      const persistedBoot = proof?.present ? proof.value?.bootFingerprint : null;
-      const currentBoot = canonicalJsonHash({ kind: 'windows-boot/v1', bootId: observed.bootId });
-      if (persistedBoot !== null && persistedBoot !== currentBoot) return freeze({ ...observed, recovery: 'retrial', reason: 'reboot' });
+      const boundaryReceipt = readBoundary(operation);
+      const persistedBoot = proof?.present ? proof.value?.bootFingerprint : (boundaryReceipt.present ? boundaryReceipt.value.bootFingerprint : null);
+      if (persistedBoot !== null && persistedBoot !== readBootClock(operation).bootFingerprint) return freeze({ ...observed, recovery: 'retrial', reason: 'reboot' });
       if (latest?.phase === 'trial-start-intent') {
         if (latest.substep === 'action' && observed.process.pid > 0) {
           // The native start crossed the ABI before the controller was lost.

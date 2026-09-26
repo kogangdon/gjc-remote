@@ -26,6 +26,14 @@ export function isPrincipal(value) {
   return hasExactKeys(value, ["kind", "value"]) && isOpaqueIdentity(value.value) && isCanonicalPrincipal(value);
 }
 
+export function isCanonicalWindowsSid(value) {
+  if (!isPrincipal({ kind: "sid", value })) return false;
+  const fields = value.split("-");
+  if (fields.length < 4 || fields.length > 18 || fields[1] !== "1") return false;
+  return BigInt(fields[2]) <= 281474976710655n &&
+    fields.slice(3).every((field) => BigInt(field) <= 4294967295n);
+}
+
 export function isProvisioningSource(value) {
   if (!hasExactKeys(value, ["kind", "fingerprint"])) return false;
   return typeof value.kind === "string" && value.kind.length > 0 && isHex64(value.fingerprint);

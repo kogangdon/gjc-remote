@@ -27,6 +27,16 @@ const compose = normalizeLines(composeRaw);
 const dockerignore = normalizeLines(dockerignoreRaw);
 const deploymentReadme = normalizeLines(deploymentReadmeRaw);
 
+test("bot image VERSION default equals the actual application source version", async () => {
+  const versions = await Promise.all(["package.json", "bot/package.json", "shared/package.json"].map(async (relative) => (
+    JSON.parse(await readFile(fileURLToPath(new URL(`../../${relative}`, import.meta.url)), "utf8")).version
+  )));
+  assert.equal(new Set(versions).size, 1, "root, bot and shared source versions must agree");
+  const declared = dockerfile.match(/^ARG VERSION=(\S+)$/m);
+  assert.ok(declared, "bot Dockerfile must declare a VERSION default");
+  assert.equal(declared[1], versions[0]);
+});
+
 test("bot image pins Bun and Node indexes and never rebuilds signed native code", () => {
   assert.match(
     dockerfile,

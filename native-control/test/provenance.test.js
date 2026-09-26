@@ -125,7 +125,12 @@ function withFixtureDir(fn) {
   try { return fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-function writeManifestFixture(dir, { addonBytes, packageJson, copyAddon = false }) {
+function writeManifestFixture(dir, {
+  addonBytes,
+  packageJson,
+  copyAddon = false,
+  manifestOverrides = {},
+}) {
   const releaseDir = join(dir, 'release');
   const releaseKeysDir = join(dir, 'release-keys');
   writeFileSync(join(dir, '.keep'), '');
@@ -141,10 +146,11 @@ function writeManifestFixture(dir, { addonBytes, packageJson, copyAddon = false 
   if (copyAddon) writeFileSync(addonPath, addonBytes);
   writeFileSync(packageJsonPath, JSON.stringify(packageJson));
   const manifest = {
-    contractVersion: 4, contractRevision, package: packageJson.name, version: packageJson.version, napi: 8,
+    contractVersion: 5, contractRevision, package: packageJson.name, version: packageJson.version, napi: 8,
     platform: process.platform, arch: process.arch, addon: 'native_control.node',
     sha256: createHash('sha256').update(addonBytes).digest('hex'),
     capabilities, capabilitySignatures,
+    ...manifestOverrides,
   };
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   writeFileSync(manifestPath, manifestBytes);
@@ -169,18 +175,20 @@ function loadOptions(fixture, extra) {
   };
 }
 
-test('contract revision 4 preserves the fence write-receipt provenance boundary', () => {
+test('contract revision 1 preserves the fence write-receipt provenance boundary', () => {
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
-  assert.equal(contractRevision, 4);
+  assert.equal(packageJson.version, '2.0.0');
+  assert.equal(packageJson.nativeControlContract.version, 5);
+  assert.equal(contractRevision, 1);
   assert.equal(packageJson.nativeControlContract.revision, contractRevision);
   assert.deepEqual(capabilitySignatures.acquire_inventory_fence, ['path', 'roles']);
 });
 
-test('current manifest revision is the only accepted capability contract', () => {
+test('native contract 5 revision 1 is the only accepted capability contract', () => {
   const addonBytes = Buffer.from('current-native-addon');
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
   const manifest = {
-    contractVersion: 4,
+    contractVersion: 5,
     contractRevision,
     package: packageJson.name,
     version: packageJson.version,
@@ -209,6 +217,7 @@ test('current manifest revision is the only accepted capability contract', () =>
   const signatureDrift = structuredClone(manifest);
   signatureDrift.capabilitySignatures.acquire_inventory_fence = ['path'];
   assert.equal(validateBuildManifest(signatureDrift, packageJson, addonBytes, 'linux', 'x64'), false);
+  assert.equal(validateBuildManifest({ ...manifest, contractVersion: 4 }, packageJson, addonBytes, 'linux', 'x64'), false);
 });
 
 test('loadVerifiedAddon: package contract revision drift refuses before addon loading', () => {
@@ -227,6 +236,36 @@ test('loadVerifiedAddon: package contract revision drift refuses before addon lo
         return true;
       });
     }
+  });
+});
+
+test('loadVerifiedAddon refuses the coherent historical native 1.0.0 contract-4 package before addon loading', () => {
+  withFixtureDir((dir) => {
+    const addonBytes = Buffer.from('not-a-native-addon');
+    const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+    packageJson.version = '1.0.0';
+    packageJson.nativeControlContract = {
+      version: 4,
+      revision: 4,
+      napi: 8,
+      platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+    };
+    const fixture = writeManifestFixture(dir, {
+      addonBytes,
+      packageJson,
+      copyAddon: true,
+      manifestOverrides: {
+        contractVersion: 4,
+        contractRevision: 4,
+        version: '1.0.0',
+      },
+    });
+    assert.throws(() => loadVerifiedAddon(loadOptions(fixture)), (error) => {
+      assert.equal(error.code, 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.equal(error.reason, 'package native capability contract is invalid');
+      assert.equal(error.writes, 0);
+      return true;
+    });
   });
 });
 
@@ -311,7 +350,7 @@ test('loadVerifiedAddon: a pinned trusted key loads without any dev-key warning'
     const warnings = [];
     const addon = loadVerifiedAddon(loadOptions(fixture, { warn: (message) => warnings.push(message) }));
     assert.deepEqual(addon.native_control_contract(), {
-      contractVersion: 4,
+      contractVersion: 5,
       contractRevision,
       napi: 8,
       capabilities,

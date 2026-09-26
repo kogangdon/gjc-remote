@@ -5,7 +5,6 @@ import { createLinuxServiceDriver } from './service-linux.js';
 import { createServiceAcquisition } from './service-acquisition.js';
 import { createServiceLifecycle } from './service-lifecycle.js';
 import { createServiceStore } from './service-store.js';
-import { createWindowsServiceDriver } from './service-windows.js';
 import {
   REQUEST_LIMITS,
   runServiceCli,
@@ -114,7 +113,9 @@ function productionLifecycle({ options, operation, request, platform, architectu
   if (mutation && operation !== 'uninstall' && typeof options.planResource !== 'function') {
     unavailable('release resource planner authority is unavailable');
   }
-  if (platform === 'win32' && mutation && !options.shawl) {
+  // Windows drivers are bound to a per-release Launch derived by the host
+  // producer (service-windows-host.js); there is no static release/shawl.
+  if (platform === 'win32' && typeof options.createWindowsDriver !== 'function') {
     unavailable('windows service driver authority is unavailable');
   }
   // This is the sole production composition boundary.  Each layer receives
@@ -162,12 +163,7 @@ function productionLifecycle({ options, operation, request, platform, architectu
         templates: options.templates ?? undefined,
       });
     }
-    const windowsOptions = {
-      ...common, release: release ?? options.release, clock: options.clock, sleep: options.sleep,
-      shawl: options.shawl, servicePasswordRequired: options.servicePasswordRequired,
-    };
-    if (operation === 'install') windowsOptions.servicePassword = request.servicePassword;
-    return createWindowsServiceDriver(windowsOptions);
+    return options.createWindowsDriver({ session, request, release, locks });
   };
   const composed = createServiceLifecycle({
     platform, architecture, native, store, acquisition, createDriver,
@@ -217,19 +213,34 @@ export async function runServiceEntrypoint({
   }
   let receipt;
   const mutation = MUTATION_SET.has(argv?.[0]);
-  receipt = await runServiceCli({
-    argv,
-    input: bytes,
-    lifecycle,
-    lifecycleFactory: lifecycle === undefined
-      ? (context) => productionLifecycle({ options: lifecycleOptions, ...context, platform, architecture })
-      : undefined,
-    effectiveConfigPreflight: lifecycle === undefined && mutation ? lifecycleOptions?.effectiveConfigPreflight : undefined,
-    platform,
-    architecture,
-    stdinIsTTY,
-    signal,
-  });
+  // The real Windows host composes its authorities from one operation-scoped
+  // producer. It is loaded only on win32 and only when nothing was injected.
+  let host = null;
+  if (lifecycle === undefined && lifecycleOptions === undefined && platform === 'win32') {
+    const { createWindowsHostOperation } = await import('./service-windows-host.js');
+    host = createWindowsHostOperation();
+  }
+  const hostPreflight = host !== null ? host.effectiveConfigPreflight : lifecycleOptions?.effectiveConfigPreflight;
+  try {
+    receipt = await runServiceCli({
+      argv,
+      input: bytes,
+      lifecycle,
+      lifecycleFactory: lifecycle === undefined
+        ? (context) => productionLifecycle({
+          options: host !== null ? host.lifecycleOptions(context) : lifecycleOptions,
+          ...context, platform, architecture,
+        })
+        : undefined,
+      effectiveConfigPreflight: lifecycle === undefined && mutation ? hostPreflight : undefined,
+      platform,
+      architecture,
+      stdinIsTTY,
+      signal,
+    });
+  } finally {
+    host?.close();
+  }
   let encoded = serviceReceiptBytes(receipt);
   if (encoded.length > REQUEST_LIMITS.maxBytes + 1) {
     receipt = failureReceipt('SERVICE_OUTPUT_LIMIT');

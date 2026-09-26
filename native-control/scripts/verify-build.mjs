@@ -30,6 +30,7 @@ const capabilities = [
   'enumerate_process_tree', 'read_linux_service_cgroup',
   'terminate_linux_service_cgroup', 'open_win32_service',
   'close_win32_service', 'query_win32_service',
+  'plan_win32_service_resource',
   'create_win32_service_disabled', 'protect_win32_service',
   'set_win32_service_marker', 'configure_win32_service_launch',
   'set_win32_service_start_type', 'set_win32_service_failure_actions',
@@ -47,6 +48,10 @@ const capabilities = [
   'finish_service_artifact_write', 'open_service_artifact_reader',
   'read_service_artifact_chunk', 'remove_service_artifact_file_exact',
   'seal_service_directory', 'open_service_artifact_source',
+  'plan_service_artifact_location', 'resolve_service_artifact_location',
+  'open_service_external_root', 'read_service_external_object',
+  'open_win32_service_log_observer', 'read_win32_service_log_observer',
+  'read_win32_boot_clock', 'observe_self_process_epoch', 'read_self_service_config',
 ];
 const capabilitySignatures = {
   open_verified_parent: ['path'], open_no_follow: ['path'], read_identity: ['path'], read_acl: ['path'], path_exists_no_follow: ['path'],
@@ -82,10 +87,11 @@ const capabilitySignatures = {
   open_win32_service: ['name', 'serviceRole', 'roles', 'access'],
   close_win32_service: ['serviceHandle'],
   query_win32_service: ['serviceHandle'],
-  create_win32_service_disabled: ['name', 'serviceRole', 'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory', 'runtimePath', 'runtimeSha256', 'entrypointPath', 'entrypointSha256', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig', 'servicePassword', 'roles'],
+  plan_win32_service_resource: ['name', 'serviceRole', 'launch', 'applicationManifestFingerprint', 'phase', 'roles'],
+  create_win32_service_disabled: ['name', 'serviceRole', 'launch', 'servicePassword', 'roles'],
   protect_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'transitionMarker'],
   set_win32_service_marker: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'transitionMarker'],
-  configure_win32_service_launch: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory', 'runtimePath', 'runtimeSha256', 'entrypointPath', 'entrypointSha256', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig'],
+  configure_win32_service_launch: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'launch'],
   set_win32_service_start_type: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'startType'],
   set_win32_service_failure_actions: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'failurePolicy'],
   set_win32_service_failure_actions_flag: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'enabled'],
@@ -114,7 +120,20 @@ const capabilitySignatures = {
   remove_service_artifact_file_exact: ['parentHandle', 'name', 'expectedFacts', 'artifactLockHandle'],
   seal_service_directory: ['directoryHandle', 'expectedIdentity', 'artifactLockHandle'],
   open_service_artifact_source: ['path', 'maxBytes', 'expectedFacts', 'roles'],
+  plan_service_artifact_location: ['rootKind', 'artifactFingerprint', 'relativePath', 'roles'],
+  resolve_service_artifact_location: ['directoryHandle', 'relativePath', 'expectedFileSha256'],
+  open_service_external_root: ['absolutePath', 'profile', 'roles'],
+  read_service_external_object: ['externalRootHandle', 'relativePath', 'mode', 'maxBytes'],
+  open_win32_service_log_observer: ['serviceHandle', 'launch', 'resumeCursor'],
+  read_win32_service_log_observer: ['observerHandle', 'expectedCursorFingerprint', 'maxBytes'],
+  read_win32_boot_clock: [],
+  observe_self_process_epoch: [],
+  read_self_service_config: [],
 };
+
+const nativeContractVersion = 5;
+const nativeContractRevision = 1;
+const nativeNapiVersion = 8;
 
 function fail(message) {
   process.stderr.write(`native-control verification failed: ${message}\n`);
@@ -265,7 +284,7 @@ function printSuccessReceipt({ manifestRewritten, addonSha256, signInfo, verifyI
     'native-control build verified',
     `  platform: ${process.platform}-${process.arch}`,
     `  addon sha256: ${addonSha256.slice(0, 12)}\u2026`,
-    '  contract: v4',
+    `  contract: v${nativeContractVersion}`,
     `  manifest rewritten: ${manifestRewritten ? 'yes' : 'no'}`,
     `  signature: ${describeSignatureOutcome(signInfo, verifyInfo)}`,
   ];
@@ -292,8 +311,12 @@ const isMainModule = (() => {
 })();
 if (isMainModule) {
 
+if (packageJson.version !== '2.0.0') fail('native-control source package version is invalid');
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
-  version: 4, revision: 4, napi: 8, platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+  version: nativeContractVersion,
+  revision: nativeContractRevision,
+  napi: nativeNapiVersion,
+  platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
 })) fail('package native capability contract is invalid');
 
 if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${process.arch}`)) {
@@ -302,11 +325,11 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
   fail('native_control.node is missing');
 } else {
   const expected = {
-    contractVersion: 4,
-    contractRevision: 4,
+    contractVersion: nativeContractVersion,
+    contractRevision: nativeContractRevision,
     package: packageJson.name,
     version: packageJson.version,
-    napi: 8,
+    napi: nativeNapiVersion,
     platform: process.platform,
     arch: process.arch,
     addon: 'native_control.node',
@@ -352,7 +375,13 @@ if (!['linux-x64', 'linux-arm64', 'win32-x64'].includes(`${process.platform}-${p
     for (const name of capabilities) if (typeof loaded[name] !== 'function') fail(`native capability ${name} is missing`);
     let contract;
     try { contract = loaded.native_control_contract(); } catch { fail('native capability contract is missing or unreadable'); }
-    if (!contract || JSON.stringify(contract) !== JSON.stringify({ contractVersion: 4, contractRevision: 4, napi: 8, capabilities, capabilitySignatures })) fail('native capability contract does not match the expected function signatures');
+    if (!contract || JSON.stringify(contract) !== JSON.stringify({
+      contractVersion: nativeContractVersion,
+      contractRevision: nativeContractRevision,
+      napi: nativeNapiVersion,
+      capabilities,
+      capabilitySignatures,
+    })) fail('native capability contract does not match the expected function signatures');
   }
   if (process.argv.includes('--write-manifest')) {
     if (!loaded || process.exitCode) process.exitCode = 1;

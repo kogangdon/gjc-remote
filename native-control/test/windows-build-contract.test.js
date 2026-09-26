@@ -2,10 +2,22 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import YAML from 'yaml';
+import { capabilities, capabilitySignatures } from '../src/capabilities.js';
 
 const binding = JSON.parse(
   readFileSync(new URL('../binding.gyp', import.meta.url), 'utf8'),
 );
+const nativeControlPackage = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+);
+const nativeBuildVerifier = readFileSync(
+  new URL('../scripts/verify-build.mjs', import.meta.url),
+  'utf8',
+).replaceAll('\r\n', '\n');
+const nativeProvenance = readFileSync(
+  new URL('../src/native-provenance.js', import.meta.url),
+  'utf8',
+).replaceAll('\r\n', '\n');
 const workflow = readFileSync(
   new URL('../../.github/workflows/ci.yml', import.meta.url),
   'utf8',
@@ -28,6 +40,49 @@ const nativeArtifactRerunWindowDays = 7;
 const trustedPromotionRepository = 'kogangdon/gjc-remote';
 const trustedPromotionEvent = 'push';
 const trustedPromotionRef = 'refs/heads/main';
+
+test('native source package, verifier, and signed metadata use only contract 5 revision 1', () => {
+  assert.equal(nativeControlPackage.version, '2.0.0');
+  assert.deepEqual(nativeControlPackage.nativeControlContract, {
+    version: 5,
+    revision: 1,
+    napi: 8,
+    platforms: nativeTargets,
+  });
+  assert.deepEqual(nativeControlPackage.dependencies, {
+    '@gjc-remote/shared': '0.4.0-rc.3',
+    dotenv: '16.6.1',
+    'jsonc-parser': '3.3.1',
+    semver: '7.8.5',
+    tar: '7.5.22',
+  });
+
+  assert.match(nativeBuildVerifier, /const nativeContractVersion = 5;/);
+  assert.match(nativeBuildVerifier, /const nativeContractRevision = 1;/);
+  assert.match(nativeBuildVerifier, /const nativeNapiVersion = 8;/);
+  assert.match(nativeBuildVerifier, /packageJson\.version !== '2\.0\.0'/);
+  assert.match(nativeBuildVerifier, /plan_win32_service_resource: \['name', 'serviceRole', 'launch', 'applicationManifestFingerprint', 'phase', 'roles'\]/);
+  assert.match(nativeBuildVerifier, /create_win32_service_disabled: \['name', 'serviceRole', 'launch', 'servicePassword', 'roles'\]/);
+  assert.match(nativeBuildVerifier, /configure_win32_service_launch: \['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'launch'\]/);
+  for (const capability of [
+    'plan_service_artifact_location',
+    'resolve_service_artifact_location',
+    'open_service_external_root',
+    'read_service_external_object',
+    'read_win32_boot_clock',
+    'observe_self_process_epoch',
+    'read_self_service_config',
+  ]) assert.ok(nativeBuildVerifier.includes(`'${capability}'`), `${capability} must be in the exact build ABI`);
+
+  assert.match(nativeProvenance, /const nativeContractVersion = 5;/);
+  assert.match(nativeProvenance, /const nativeNapiVersion = 8;/);
+  assert.match(nativeProvenance, /packageJson\.version !== '2\.0\.0'/);
+  assert.match(nativeProvenance, /contractVersion: nativeContractVersion/);
+  assert.match(nativeProvenance, /contract\?\.contractVersion === nativeContractVersion/);
+  assert.match(nativeProvenance, /verifyPinnedNativeBuildManifest\(input\)/);
+  assert.doesNotMatch(nativeProvenance, /contractVersion: 4|contractVersion === 4/);
+  assert.doesNotMatch(nativeBuildVerifier, /contractVersion: 4|version: 4, revision: 4|contract: v4/);
+});
 
 function namedStep(job, name) {
   const matches = job.steps.filter((step) => step.name === name);
@@ -436,5 +491,25 @@ test('signing instructions require trusted main-push provenance and authorizatio
   assert.doesNotMatch(
     dockerBotReadme,
     /native-control-unsigned-\{X64\|ARM64\}/,
+  );
+});
+
+test('build verifier capability list and signatures match the public capability contract', () => {
+  const listStart = nativeBuildVerifier.indexOf('const capabilities = [');
+  const signatureStart = nativeBuildVerifier.indexOf('const capabilitySignatures = {');
+  assert.ok(listStart > 0 && signatureStart > listStart);
+  const listSource = nativeBuildVerifier.slice(listStart, signatureStart);
+  const signatureSource = nativeBuildVerifier.slice(signatureStart, nativeBuildVerifier.indexOf('\n};', signatureStart));
+  const verifierCapabilities = [...listSource.matchAll(/'([a-z0-9_]+)'/g)].map((match) => match[1]);
+  const verifierSignatures = Object.fromEntries(
+    [...signatureSource.matchAll(/([a-z0-9_]+):\s*\[([^\]]*)\]/g)].map((match) => [
+      match[1],
+      [...match[2].matchAll(/'([A-Za-z0-9_]+)'/g)].map((arg) => arg[1]),
+    ]),
+  );
+  assert.deepEqual(verifierCapabilities, [...capabilities]);
+  assert.deepEqual(
+    verifierSignatures,
+    Object.fromEntries(Object.entries(capabilitySignatures).map(([name, args]) => [name, [...args]])),
   );
 });

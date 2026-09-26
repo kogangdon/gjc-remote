@@ -25,6 +25,9 @@ import {
   buildServiceOldProof,
   buildServicePlatformState,
   buildServiceResourceProof,
+  buildServiceCursorSet,
+  buildServiceFamilyCursor,
+  buildServiceFileCursor,
   buildServiceStartupProof,
   buildServiceReferenceRecord,
   buildServiceReferenceSlot,
@@ -34,6 +37,7 @@ import {
   deriveServiceInstanceKey,
   serviceConfigurationFingerprint,
   serviceRolesFingerprint,
+  buildServiceTrialBoundary,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import { assertPinnedDeploymentManifest as assertProductionPinnedDeploymentManifest } from '../src/deployment-provenance.js';
 import { createPinnedDeploymentInstallation } from '../test-fixtures/pinned-deployment-installation.mjs';
@@ -130,6 +134,8 @@ class FakeServiceNative {
       remove_service_artifact_file_exact: this.remove_service_artifact_file_exact.bind(this),
       seal_service_directory: this.seal_service_directory.bind(this),
       open_service_artifact_source: this.open_service_artifact_source.bind(this),
+      plan_service_artifact_location: this.plan_service_artifact_location.bind(this),
+      resolve_service_artifact_location: this.resolve_service_artifact_location.bind(this),
       open_linux_service_scope: this.open_linux_service_scope.bind(this),
       read_linux_service_object: this.read_linux_service_object.bind(this),
     });
@@ -179,6 +185,7 @@ class FakeServiceNative {
     const data = Buffer.from(bytes);
     return {
       type: 'file',
+      profile,
       identity,
       bytes: data,
       facts: this.facts(identity, data),
@@ -700,6 +707,127 @@ class FakeServiceNative {
     throw nativeError('SERVICE_INVALID', 'open_service_artifact_source');
   }
 
+  plan_service_artifact_location(rootKind, artifactFingerprint, relativePath) {
+    if (arguments.length !== 3) {
+      throw nativeError('SERVICE_INVALID', 'plan_service_artifact_location');
+    }
+    if (this.platform !== 'win32') {
+      throw nativeError('SERVICE_UNSUPPORTED', 'plan_service_artifact_location');
+    }
+    const components = relativePath.split('/');
+    if (!['releases', 'shawl'].includes(rootKind) ||
+        !/^[0-9a-f]{64}$/.test(artifactFingerprint) ||
+        components.length === 0 || components.some((part) =>
+          part.length === 0 || part === '.' || part === '..' || /[\\:\0]/.test(part))) {
+      throw nativeError('SERVICE_INVALID', 'plan_service_artifact_location');
+    }
+    const root = this.roots.get(rootKind) ?? null;
+    const absoluteRoot = root?.binding.rootPath ?? (rootKind === 'shawl'
+      ? 'C:\\ProgramData\\gjc-remote\\supervisors\\shawl'
+      : 'C:\\ProgramData\\gjc-remote\\releases');
+    let existingDirectoryIdentity = root?.node.identity ?? null;
+    let missingSegments = [artifactFingerprint, ...components];
+    let current = root?.node ?? null;
+    if (current !== null) {
+      const pathComponents = [artifactFingerprint, ...components];
+      for (let index = 0; index < pathComponents.length - 1; index += 1) {
+        const child = current.entries.get(pathComponents[index]);
+        if (!child) {
+          missingSegments = pathComponents.slice(index);
+          existingDirectoryIdentity = current.identity;
+          break;
+        }
+        if (child.type !== 'directory') {
+          throw nativeError('SERVICE_STALE', 'plan_service_artifact_location');
+        }
+        current = child;
+        existingDirectoryIdentity = current.identity;
+        missingSegments = [];
+      }
+      if (missingSegments.length === 0) {
+        const target = current.entries.get(pathComponents.at(-1));
+        if (target) {
+          throw nativeError('SERVICE_PENDING', 'plan_service_artifact_location', 0, true);
+        }
+        missingSegments = [pathComponents.at(-1)];
+      }
+    }
+    const anchorIdentityFingerprint = sha256(Buffer.from(
+      JSON.stringify(existingDirectoryIdentity ?? { rootKind, absoluteRoot }),
+    ));
+    const absolutePath = `${absoluteRoot.replace(/[\\/]$/, '')}\\${artifactFingerprint}\\${components.join('\\')}`;
+    const intent = {
+      schemaVersion: 1,
+      rootKind,
+      artifactFingerprint,
+      relativePath,
+      absoluteRoot,
+      absolutePath,
+      anchorIdentityFingerprint,
+      missingSegments,
+      existingDirectoryIdentity: existingDirectoryIdentity === null
+        ? null
+        : clone(existingDirectoryIdentity),
+      intentFingerprint: sha256(Buffer.from(JSON.stringify({
+        rootKind,
+        artifactFingerprint,
+        relativePath,
+        absolutePath,
+        missingSegments,
+      }))),
+      writes: 0,
+    };
+    this.calls.push(`plan-location:${rootKind}:${artifactFingerprint}:${relativePath}`);
+    return intent;
+  }
+
+  resolve_service_artifact_location(directory, relativePath, expectedFileSha256) {
+    if (arguments.length !== 3) {
+      throw nativeError('SERVICE_INVALID', 'resolve_service_artifact_location');
+    }
+    if (this.platform !== 'win32') {
+      throw nativeError('SERVICE_UNSUPPORTED', 'resolve_service_artifact_location');
+    }
+    this.assertHandle(directory);
+    const components = relativePath.split('/');
+    if (directory.kind !== 'directory' ||
+        directory.node.rootKind !== 'releases' && directory.node.rootKind !== 'shawl' ||
+        directory.node.profile !== 'service-release-directory' ||
+        components.length === 0 || components.some((part) =>
+          part.length === 0 || part === '.' || part === '..' || /[\\:\0]/.test(part)) ||
+        !/^[0-9a-f]{64}$/.test(expectedFileSha256)) {
+      throw nativeError('SERVICE_INVALID', 'resolve_service_artifact_location');
+    }
+    let parent = directory.node;
+    for (const component of components.slice(0, -1)) {
+      const child = parent.entries.get(component);
+      if (!child || child.type !== 'directory' ||
+          child.profile !== 'service-release-directory' || child.reparse === true) {
+        throw nativeError('SERVICE_STALE', 'resolve_service_artifact_location', 0, true);
+      }
+      parent = child;
+    }
+    const file = parent.entries.get(components.at(-1));
+    if (!file || file.type !== 'file' ||
+        file.reparse === true ||
+        !['service-release-file', 'service-release-executable'].includes(file.profile) ||
+        file.bytes.length !== file.facts.size ||
+        file.facts.sha256 !== expectedFileSha256 ||
+        sha256(file.bytes) !== expectedFileSha256) {
+      throw nativeError('SERVICE_STALE', 'resolve_service_artifact_location', 0, true);
+    }
+    const rootPath = this.roots.get(directory.node.rootKind).binding.rootPath;
+    return {
+      schemaVersion: 1,
+      publishedPath: relativePath,
+      absolutePath: `${rootPath.replace(/[\\/]$/, '')}\\${directory.node.name}\\${components.join('\\')}`,
+      directoryIdentity: clone(parent.identity),
+      fileIdentity: clone(file.identity),
+      fileSha256: file.facts.sha256,
+      writes: 0,
+    };
+  }
+
   assertHandle(handle) {
     if (!handle || handle.closed) throw nativeError('SERVICE_INVALID', 'fake_handle');
   }
@@ -837,7 +965,7 @@ class FakeServiceNative {
     };
     target.entries.set('bundle-files.json', inventoryFile);
     for (const record of inventory.payloadEntries) {
-      put(record.path, record, Buffer.alloc(record.size));
+      put(record.path, record, applicationPayloadBytes(record.path));
     }
     return identity;
   }
@@ -851,7 +979,7 @@ class FakeServiceNative {
       manifest.executable.sha256,
     );
     const executable = this.file(
-      Buffer.alloc(manifest.executable.byteLength),
+      Buffer.from(SHAWL_FIXTURE_BYTES),
       'service-release-executable',
     );
     executable.facts = {
@@ -885,12 +1013,21 @@ function compatibility() {
 }
 
 function applicationInventory(platform) {
+  const payloadEntries = [
+    'bot/src/bot.js',
+    'daemon/src/daemon.js',
+    'native-control/build/Release/native-control.manifest.json',
+  ].map((path) => {
+    const bytes = applicationPayloadBytes(path);
+    return {
+      path,
+      size: bytes.length,
+      sha256: sha256(bytes),
+      executablePolicy: 'forbidden',
+    };
+  });
   const inventory = buildBundleInventory({
-    payloadEntries: [
-      { path: 'bot/src/bot.js', size: 1, sha256: hash('1'), executablePolicy: 'forbidden' },
-      { path: 'daemon/src/daemon.js', size: 1, sha256: hash('2'), executablePolicy: 'forbidden' },
-      { path: 'native-control/build/Release/native-control.manifest.json', size: 1, sha256: hash('3'), executablePolicy: 'forbidden' },
-    ],
+    payloadEntries,
   }, { platform });
   return Object.freeze({
     inventory,
@@ -919,10 +1056,10 @@ function applicationManifest({
     source: { repository: 'kogangdon/gjc-remote', tag: `v${version}`, commit: '1'.repeat(40), tree: '2'.repeat(40), bunLockSha256: hash('3') },
     target: { platform, architecture },
     archive: { name: `gjc-remote-service-${version}-${platform}-${architecture}.tar.gz`, mediaType: 'application/gzip', byteLength: 100, sha256: archiveHash, entryCount: 4 },
-    inventory: { path: 'bundle-files.json', byteLength: inventoryBytes.length, sha256: sha256(inventoryBytes), payloadEntryCount: 3, unpackedPayloadBytes: 3, treeFingerprint: files.treeFingerprint },
+    inventory: { path: 'bundle-files.json', byteLength: inventoryBytes.length, sha256: sha256(inventoryBytes), payloadEntryCount: files.payloadEntryCount, unpackedPayloadBytes: files.unpackedPayloadBytes, treeFingerprint: files.treeFingerprint },
     entrypoints: { bot: 'bot/src/bot.js', daemon: 'daemon/src/daemon.js' },
     runtimes: { node: { minimumVersion: '26.0.0' }, bun: { minimumVersion: '1.4.0' } },
-    nativeControl: { manifestPath: 'native-control/build/Release/native-control.manifest.json', manifestFingerprint: hash('5'), contractVersion: 4, contractRevision: 4 },
+    nativeControl: { manifestPath: 'native-control/build/Release/native-control.manifest.json', manifestFingerprint: hash('5'), contractVersion: 5, contractRevision: 1 },
     wireCapabilities: ['gate_presentation_v1'],
     compatibility: compatibility(),
   }));
@@ -1024,8 +1161,8 @@ function realArchiveApplication({
       nativeControl: {
         manifestPath: 'native-control/build/Release/native-control.manifest.json',
         manifestFingerprint: hash('5'),
-        contractVersion: 4,
-        contractRevision: 4,
+        contractVersion: 5,
+        contractRevision: 1,
       },
       wireCapabilities: ['gate_presentation_v1'],
       compatibility: compatibility(),
@@ -1200,7 +1337,13 @@ function scratchEntries(model) {
   return model.fake.roots.get('staging')?.node.entries ?? new Map();
 }
 
-function shawlManifest({ sequence = 1, executableHash = hash('6') } = {}) {
+const SHAWL_FIXTURE_BYTES = Buffer.alloc(100, 0x6);
+
+function applicationPayloadBytes(path) {
+  return Buffer.from(`service-store fixture payload: ${path}`);
+}
+
+function shawlManifest({ sequence = 1 } = {}) {
   return pinnedInstallation.verifyManifest(buildShawlDeploymentManifest({
     signingKeyId: 'deployment-test',
     releaseSequence: sequence,
@@ -1216,7 +1359,7 @@ function shawlManifest({ sequence = 1, executableHash = hash('6') } = {}) {
     executable: {
       name: 'shawl.exe',
       byteLength: 100,
-      sha256: executableHash,
+      sha256: sha256(SHAWL_FIXTURE_BYTES),
       version: '1.9.0',
       versionOutput: 'shawl 1.9.0',
       authenticode: 'unsigned',
@@ -1256,6 +1399,7 @@ function transactionFixture({
   serviceKey = component === 'bot' ? 'bot' : deriveServiceInstanceKey('daemon sibling'),
   finalManifestFingerprint = hash('1'),
   finalResourceProof = hash('2'),
+  platformResourceFingerprint = hash('f'),
 } = {}) {
   const oldProof = old ?? (operation === 'install'
     ? buildServiceOldProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, platform)
@@ -1273,7 +1417,7 @@ function transactionFixture({
     candidateFingerprint: candidate.candidateFingerprint,
     expectedBeforeResourceFingerprint: operation === 'install' ? null : hash('d'),
     expectedAfterResourceFingerprint: hash('e'),
-    platformResourceFingerprint: hash('f'),
+    platformResourceFingerprint,
     platformState: buildServicePlatformState(platform, 'trial'),
   }, platform);
   const final = buildServiceFinalProof({
@@ -1407,6 +1551,56 @@ function startupProofFor(transaction, resource) {
       ? 'last-observed-connected'
       : 'startup-only',
   });
+}
+
+function trialCursorSet({ bootFingerprint = hash('1'), configFingerprint, wrapperOffset = 4_096, childOffset = 4_096 } = {}) {
+  const family = (name, offset, identity) => buildServiceFamilyCursor({
+    family: name,
+    baseName: `gjc-remote-bot-${name}`,
+    directoryIdentityFingerprint: hash(name === 'wrapper' ? 'a' : 'b'),
+    files: [buildServiceFileCursor({
+      identityFingerprint: hash(identity),
+      logicalStartOffset: offset,
+      observedLength: 128,
+      prefixSha256: hash(name === 'wrapper' ? 'c' : 'd'),
+    })],
+    nextLogicalOffset: offset + 128,
+    partialLineBytes: 4,
+    absenceFingerprint: null,
+  });
+  return buildServiceCursorSet({
+    bootFingerprint,
+    serviceKey: 'bot',
+    configFingerprint,
+    families: [family('wrapper', wrapperOffset, 'e'), family('child', childOffset, 'f')],
+  });
+}
+
+function trialBoundaryFor(transaction, resource, fields = {}) {
+  const values = {
+    serviceKey: transaction.serviceKey,
+    transactionId: transaction.transactionId,
+    transactionNonce: transaction.transactionNonce,
+    transitionFingerprint: transaction.transition.transitionFingerprint,
+    attempt: 1,
+    revision: 1,
+    previousBoundaryFingerprint: null,
+    phase: 'captured',
+    bootFingerprint: hash('1'),
+    startTickMs: 1_000,
+    lastTickMs: 1_000,
+    applicationManifestFingerprint: transaction.candidate.applicationManifestFingerprint,
+    resourceFingerprint: transaction.transition.platformResourceFingerprint,
+    effectiveConfigFingerprint: resource.configurationFingerprint,
+    configSourceIdentityFingerprint: hash('5'),
+    wrapperEpochFingerprint: null,
+    childEpochFingerprint: null,
+    initialCursor: trialCursorSet({ configFingerprint: resource.configurationFingerprint }),
+    childCursor: null,
+    ...fields,
+  };
+  for (const generated of ['schemaVersion', 'kind', 'deadlineTickMs', 'boundaryFingerprint']) delete values[generated];
+  return buildServiceTrialBoundary(values);
 }
 
 function floorHistoryDirectoryName(scope, revision, action, transaction) {
@@ -2009,6 +2203,7 @@ function publishCommittedWindowsInstallation(
     releaseTreeFingerprint: deploymentManifest.inventory.treeFingerprint,
     finalManifestFingerprint: manifest.manifestFingerprint,
     finalResourceProof: resource.resourceProof,
+    platformResourceFingerprint: resource.platformResourceFingerprint,
   });
   session.appendJournal(transaction);
   for (const envelope of retainedEnvelopes) {
@@ -4770,8 +4965,8 @@ test('model: sibling committed application is reusable above this service and id
     platform: 'win32',
     shawlManifestFingerprint: shawl.manifestFingerprint,
   });
-  const appIdentity = windowsFake.seedPublication('releases', windowsApplication.archive.sha256);
-  const shawlIdentity = windowsFake.seedPublication('shawl', shawl.executable.sha256);
+  const appIdentity = windowsFake.seedApplicationPublication(windowsApplication);
+  const shawlIdentity = windowsFake.seedShawlPublication(shawl);
   const windowsDaemon = windowsDaemonStore.openMutation();
   windowsDaemon.reserveApplicationSequence({
     manifest: windowsApplication,
@@ -5240,6 +5435,191 @@ test('model: sequence commit requires same-session re-opened immutable publicati
   session.close();
 });
 
+test('model: Windows location planning is closed, pinned, pre-publication, and matches the observed native path', () => {
+  const fake = new FakeServiceNative('win32');
+  const store = bootstrap(fake);
+  const manifest = applicationManifest({ platform: 'win32' });
+  const session = store.openMutation();
+  const beforeWrites = session.writes;
+  const beforeNativeWrites = fake.totalWrites;
+  const intent = session.planArtifactLocation({
+    purpose: 'application',
+    manifest,
+    relativePath: 'bot/src/bot.js',
+  });
+  assert.equal(Object.isFrozen(intent), true);
+  assert.equal(intent.rootKind, 'releases');
+  assert.equal(intent.relativePath, 'bot/src/bot.js');
+  assert.equal(session.writes, beforeWrites);
+  assert.equal(fake.totalWrites, beforeNativeWrites);
+
+  const planCalls = fake.calls.filter((call) => call.startsWith('plan-location:')).length;
+  expectCode(() => session.planArtifactLocation({
+    purpose: 'application',
+    manifest: clone(manifest),
+    relativePath: 'bot/src/bot.js',
+  }), 'DEPLOYMENT_PINNED_PROVENANCE_REQUIRED');
+  expectCode(() => session.planArtifactLocation({
+    purpose: 'application',
+    manifest,
+    relativePath: 'Bot/src/bot.js',
+  }), 'SERVICE_SCOPE_MISMATCH');
+  expectCode(() => session.planArtifactLocation({
+    purpose: 'application',
+    manifest,
+    relativePath: 'bot/src/bot.js',
+  }, 'caller-root-is-not-accepted'), 'SERVICE_INVALID');
+  expectCode(() => session.planArtifactLocation({
+    purpose: 'application',
+    manifest,
+    relativePath: 'bot/src/bot.js',
+    absoluteRoot: 'C:\\caller-selected-root',
+  }), 'SERVICE_INVALID');
+  assert.equal(
+    fake.calls.filter((call) => call.startsWith('plan-location:')).length,
+    planCalls,
+  );
+  assert.equal(session.writes, beforeWrites);
+  assert.equal(fake.totalWrites, beforeNativeWrites);
+
+  const identity = fake.seedApplicationPublication(manifest);
+  const publication = session.observeApplicationPublication(manifest, identity);
+  const entrypoint = publication.locations.find((location) =>
+    location.publishedPath === 'bot/src/bot.js');
+  assert.ok(entrypoint);
+  assert.equal(entrypoint.absolutePath, intent.absolutePath);
+  assert.equal(entrypoint.fileSha256, applicationInventory('win32').inventory.payloadEntries
+    .find((record) => record.path === 'bot/src/bot.js').sha256);
+  assert.equal(Object.isFrozen(entrypoint), true);
+  assert.deepEqual(entrypoint.binding, publication.binding);
+  session.close();
+
+  const incompleteNative = { ...fake.facade };
+  delete incompleteNative.plan_service_artifact_location;
+  assert.throws(
+    () => createServiceStore({
+      native: incompleteNative,
+      roles: windowsRoles,
+      target: { component: 'bot' },
+      platform: 'win32',
+      architecture: 'x64',
+    }),
+    (error) => error.code === 'SERVICE_INVALID',
+  );
+});
+
+test('model: retained Windows publication receipts resolve signed application and Shawl locations', () => {
+  const fake = new FakeServiceNative('win32');
+  const store = bootstrap(fake);
+  const application = applicationManifest({ platform: 'win32' });
+  const shawl = shawlManifest();
+  const applicationIdentity = fake.seedApplicationPublication(application);
+  const shawlIdentity = fake.seedShawlPublication(shawl);
+  const session = store.openMutation();
+  const installed = publishCommittedWindowsInstallation(
+    session,
+    application,
+    applicationIdentity,
+    shawl,
+    shawlIdentity,
+    {
+      transactionId: 'tx-retained-locations',
+      transactionNonce: 'b'.repeat(32),
+      retainedEnvelopes: [
+        signedEnvelope('application', application),
+        signedEnvelope('shawl', shawl),
+      ],
+    },
+  );
+
+  const appReceipt = session.readPublicationReceipt({
+    slot: 'current',
+    artifactKind: 'application',
+  });
+  const shawlReceipt = session.readPublicationReceipt({
+    slot: 'current',
+    artifactKind: 'shawl',
+  });
+  assert.deepEqual(
+    appReceipt.locations.map((location) => location.publishedPath),
+    ['bot/src/bot.js', 'native-control/build/Release/native-control.manifest.json'],
+  );
+  assert.equal(shawlReceipt.locations.length, 1);
+  assert.equal(shawlReceipt.locations[0].publishedPath, 'shawl.exe');
+  assert.equal(shawlReceipt.locations[0].fileSha256, shawl.executable.sha256);
+  assert.equal(Object.isFrozen(appReceipt.locations), true);
+  assert.equal(Object.isFrozen(shawlReceipt.locations[0]), true);
+  expectCode(() => session.commitApplicationSequence({
+    manifest: application,
+    transaction: installed.transaction,
+    publication: clone(appReceipt),
+  }), 'SERVICE_STALE');
+
+  const alternate = applicationManifest({
+    sequence: 2,
+    version: '2.0.0',
+    platform: 'win32',
+    archiveHash: hash('4'),
+  });
+  const alternateIdentity = fake.seedApplicationPublication(alternate);
+  const alternateBinding = session.observeApplicationPublication(
+    alternate,
+    alternateIdentity,
+  ).binding;
+  const references = session.readReferences();
+  const provisional = buildServiceReferenceSlot({
+    serviceGeneration: 2,
+    transactionId: 'tx-reference-cas',
+    transactionNonce: 'c'.repeat(32),
+    artifacts: [alternateBinding, installed.supervisor],
+  }, { platform: 'win32', component: 'bot' });
+  const rewrittenReferences = buildServiceReferenceRecord({
+    ...references.value,
+    provisional,
+  });
+  const storedReferences = fake.namespace('reference').entries.get('bot.json');
+  storedReferences.bytes = canonicalJsonBytes(rewrittenReferences);
+  storedReferences.facts = fake.facts(storedReferences.identity, storedReferences.bytes);
+  expectCode(() => session.commitApplicationSequence({
+    manifest: application,
+    transaction: installed.transaction,
+    publication: appReceipt,
+  }), 'SERVICE_STALE');
+  session.close();
+});
+
+test('model: Windows native path resolution rejects changed roots, hashes, and reparse components', () => {
+  const observe = (mutate) => {
+    const fake = new FakeServiceNative('win32');
+    const store = bootstrap(fake);
+    const manifest = applicationManifest({ platform: 'win32' });
+    const identity = fake.seedApplicationPublication(manifest);
+    const target = fake.roots.get('releases').node.entries.get(
+      manifest.archive.sha256,
+    );
+    mutate(fake, target);
+    const session = store.openMutation();
+    const beforeWrites = fake.totalWrites;
+    expectCode(
+      () => session.observeApplicationPublication(manifest, identity),
+      'SERVICE_STALE',
+    );
+    assert.equal(fake.totalWrites, beforeWrites);
+    session.close();
+  };
+
+  observe((fake, target) => {
+    target.identity = fake.identity('service-release-directory', target.identity);
+  });
+  observe((_fake, target) => {
+    target.entries.get('bot').entries.get('src').entries.get('bot.js')
+      .facts.sha256 = hash('e');
+  });
+  observe((_fake, target) => {
+    target.entries.get('bot').entries.get('src').reparse = true;
+  });
+});
+
 test('model: Windows application and Shawl floors reserve and commit independently', () => {
   const fake = new FakeServiceNative('win32');
   const store = bootstrap(fake);
@@ -5249,7 +5629,7 @@ test('model: Windows application and Shawl floors reserve and commit independent
     archiveHash: hash('4'),
     platform: 'win32',
   });
-  const shawl = shawlManifest({ sequence: 7, executableHash: hash('6') });
+  const shawl = shawlManifest({ sequence: 7 });
   const transaction = transactionFixture({
     transactionId: 'tx-windows',
     transactionNonce: '8'.repeat(32),
@@ -5258,8 +5638,8 @@ test('model: Windows application and Shawl floors reserve and commit independent
     platform: 'win32',
     shawlManifestFingerprint: shawl.manifestFingerprint,
   });
-  const applicationIdentity = fake.seedPublication('releases', application.archive.sha256);
-  const shawlIdentity = fake.seedPublication('shawl', shawl.executable.sha256);
+  const applicationIdentity = fake.seedApplicationPublication(application);
+  const shawlIdentity = fake.seedShawlPublication(shawl);
   const session = store.openMutation();
   session.reserveApplicationSequence({ manifest: application, transaction, currentSequence: 0 });
   session.reserveShawlSequence({ manifest: shawl, transaction, currentSequence: 0 });
@@ -5847,7 +6227,6 @@ test('model: generation-three tombstoned uninstall recovers through committed ab
 test('model: different Shawl provenance for one physical executable remains referenced', () => {
   const fake = new FakeServiceNative('win32');
   const botStore = bootstrap(fake);
-  const executableHash = hash('6');
   const botApplication = applicationManifest({
     sequence: 2,
     version: '2.0.0',
@@ -5860,15 +6239,12 @@ test('model: different Shawl provenance for one physical executable remains refe
     platform: 'win32',
     archiveHash: hash('5'),
   });
-  const botShawl = shawlManifest({ sequence: 4, executableHash });
-  const daemonShawl = shawlManifest({ sequence: 5, executableHash });
-  const candidateShawl = shawlManifest({ sequence: 6, executableHash });
-  const botApplicationIdentity = fake.seedPublication('releases', botApplication.archive.sha256);
-  const daemonApplicationIdentity = fake.seedPublication(
-    'releases',
-    daemonApplication.archive.sha256,
-  );
-  const sharedShawlIdentity = fake.seedPublication('shawl', executableHash);
+  const botShawl = shawlManifest({ sequence: 4 });
+  const daemonShawl = shawlManifest({ sequence: 5 });
+  const candidateShawl = shawlManifest({ sequence: 6 });
+  const botApplicationIdentity = fake.seedApplicationPublication(botApplication);
+  const daemonApplicationIdentity = fake.seedApplicationPublication(daemonApplication);
+  const sharedShawlIdentity = fake.seedShawlPublication(botShawl);
   const bot = botStore.openMutation();
   publishCommittedWindowsInstallation(
     bot,
@@ -6335,4 +6711,158 @@ test('model: shared-template binding rejects caller-supplied digest authority', 
   assert.equal(binding.artifactKind, 'shared-template');
   assert.equal(binding.artifactFingerprint, sha256(Buffer.from('daemon-template')));
   session.close();
+});
+
+test('model: Windows trial boundary is durable, CAS-branded, and never resets a same-attempt budget', () => {
+  const fake = new FakeServiceNative('win32');
+  const store = bootstrap(fake);
+  const application = applicationManifest({ platform: 'win32' });
+  const shawl = shawlManifest();
+  const applicationIdentity = fake.seedApplicationPublication(application);
+  const shawlIdentity = fake.seedShawlPublication(shawl);
+  let session = store.openMutation();
+  const installed = publishCommittedWindowsInstallation(
+    session,
+    application,
+    applicationIdentity,
+    shawl,
+    shawlIdentity,
+    { transactionId: 'tx-trial-boundary', transactionNonce: 'a'.repeat(32) },
+  );
+  const resourcePublished = nextJournal(installed.committed, 'resource-published', 'observed');
+  session.appendJournal(resourcePublished);
+
+  const captured = trialBoundaryFor(resourcePublished, installed.resource);
+  const absent = session.readTrialBoundary();
+  assert.equal(absent.present, false);
+  const capturedReceipt = session.publishTrialBoundary(captured, absent);
+  assert.equal(capturedReceipt.value.boundaryFingerprint, captured.boundaryFingerprint);
+  expectCode(() => session.publishTrialBoundary(captured, absent), 'SERVICE_STALE');
+
+  const startIntent = nextJournal(resourcePublished, 'trial-start-intent', 'intent');
+  session.appendJournal(startIntent);
+  const startObserved = nextJournal(startIntent, 'trial-start-observed', 'observed');
+  session.appendJournal(startObserved);
+  const observed = trialBoundaryFor(resourcePublished, installed.resource, {
+    ...captured,
+    phase: 'observed',
+    revision: 2,
+    previousBoundaryFingerprint: captured.boundaryFingerprint,
+    lastTickMs: 1_500,
+    wrapperEpochFingerprint: hash('6'),
+    childEpochFingerprint: hash('7'),
+    childCursor: trialCursorSet({
+      bootFingerprint: captured.bootFingerprint,
+      configFingerprint: captured.effectiveConfigFingerprint,
+      wrapperOffset: 4_200,
+      childOffset: 4_200,
+    }),
+  });
+  session.publishTrialBoundary(observed, session.readTrialBoundary());
+  const starting = nextJournal(startObserved, 'starting', 'intent');
+  session.appendJournal(starting);
+  const replacedChild = trialBoundaryFor(resourcePublished, installed.resource, {
+    ...observed,
+    revision: 3,
+    previousBoundaryFingerprint: observed.boundaryFingerprint,
+    lastTickMs: 5_000,
+    childEpochFingerprint: hash('8'),
+    childCursor: trialCursorSet({
+      bootFingerprint: observed.bootFingerprint,
+      configFingerprint: observed.effectiveConfigFingerprint,
+      wrapperOffset: 4_300,
+      childOffset: 4_300,
+    }),
+  });
+  session.publishTrialBoundary(replacedChild, session.readTrialBoundary());
+  assert.equal(replacedChild.startTickMs, captured.startTickMs);
+  assert.equal(replacedChild.deadlineTickMs, captured.deadlineTickMs);
+  assert.equal(replacedChild.initialCursor.cursorFingerprint, captured.initialCursor.cursorFingerprint);
+  assert.equal(replacedChild.childEpochFingerprint, hash('8'));
+
+  const retry = trialBoundaryFor(resourcePublished, installed.resource, {
+    ...replacedChild,
+    attempt: 2,
+    revision: 4,
+    previousBoundaryFingerprint: replacedChild.boundaryFingerprint,
+    phase: 'captured',
+    startTickMs: 6_000,
+    lastTickMs: 6_000,
+    wrapperEpochFingerprint: null,
+    childEpochFingerprint: null,
+    initialCursor: trialCursorSet({
+      bootFingerprint: replacedChild.bootFingerprint,
+      configFingerprint: replacedChild.effectiveConfigFingerprint,
+      wrapperOffset: 4_500,
+      childOffset: 4_500,
+    }),
+    childCursor: null,
+  });
+  const writesBeforePrematureRetry = session.writes;
+  expectCode(
+    () => session.publishTrialBoundary(retry, session.readTrialBoundary()),
+    'SERVICE_PENDING',
+  );
+  assert.equal(session.writes, writesBeforePrematureRetry);
+
+  const quiescent = nextJournal(starting, 'quiescent', 'observed');
+  session.appendJournal(quiescent);
+  session.publishTrialBoundary(retry, session.readTrialBoundary());
+  const committed = nextJournal(quiescent, 'committed', 'observed');
+  session.appendJournal(committed);
+  session.close();
+
+  const readOnly = store.openReadOnly();
+  const persisted = readOnly.readTrialBoundary();
+  assert.equal(persisted.present, true);
+  assert.equal(persisted.value.attempt, 2);
+  assert.equal(persisted.value.startTickMs, 6_000);
+  const writesBeforeReadOnlyAttempt = readOnly.writes;
+  expectCode(() => readOnly.publishTrialBoundary(retry, persisted), 'SERVICE_ACCESS_DENIED');
+  assert.equal(readOnly.writes, writesBeforeReadOnlyAttempt);
+  readOnly.close();
+
+  session = store.openMutation();
+  expectCode(() => session.removeTrialBoundary(persisted), 'SERVICE_STALE');
+  const expected = session.readTrialBoundary();
+  fake.recreateRecordSameBytes('manifest', 'bot', SERVICE_STORE_LAYOUT.trialBoundary);
+  expectCode(() => session.removeTrialBoundary(expected), 'SERVICE_STALE');
+  session.removeTrialBoundary(session.readTrialBoundary());
+  assert.equal(session.readTrialBoundary().present, false);
+  session.close();
+
+  const reopened = store.openReadOnly();
+  assert.equal(reopened.readTrialBoundary().present, false);
+  assert.equal(reopened.writes, 0);
+  reopened.close();
+});
+
+test('model: torn Windows trial boundary is classified as protected-store corruption', () => {
+  const fake = new FakeServiceNative('win32');
+  const store = bootstrap(fake);
+  fake.putRaw(
+    'manifest',
+    'bot',
+    SERVICE_STORE_LAYOUT.trialBoundary,
+    Buffer.from('{"schemaVersion":1,"kind":"windows-service-trial-boundary"'),
+  );
+  expectCode(() => store.openReadOnly(), 'SERVICE_MANUAL_CLEANUP');
+});
+
+test('model: Linux store remains write-free with no Windows trial boundary', () => {
+  const fake = new FakeServiceNative();
+  const store = bootstrap(fake);
+  const readOnly = store.openReadOnly();
+  assert.deepEqual(readOnly.readTrialBoundary(), { present: false, value: null });
+  assert.equal(readOnly.writes, 0);
+  readOnly.close();
+  const mutation = store.openMutation();
+  const captured = trialBoundaryFor(transactionFixture({ platform: 'win32' }), {
+    configurationFingerprint: hash('9'),
+  });
+  expectCode(
+    () => mutation.publishTrialBoundary(captured, mutation.readTrialBoundary()),
+    'SERVICE_UNSUPPORTED',
+  );
+  mutation.close();
 });

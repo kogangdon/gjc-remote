@@ -5,6 +5,7 @@ import { buildManifest, validateBuildManifest } from '../src/index.js';
 import { capabilities, managementCapabilities } from '../src/capabilities.js';
 import { createManagementNativeForTest } from './helpers/management-native.js';
 import * as publicApi from '../src/public.js';
+import nativePackageJson from '../package.json' with { type: 'json' };
 import { ManagementRuntime } from '../../bot/src/management-runtime.js';
 import { canonicalJson, canonicalJsonHash } from '@gjc-remote/shared/strict-json';
 import { attestTokenFloor, buildAttestedTokenFloorProof, commitTokenFloor } from '@gjc-remote/shared/genesis-envelope';
@@ -26,7 +27,9 @@ test('production package surface excludes the low-level test adapter', () => {
       'createInventoryReader',
       'createManagementNative',
       'createResidualProcessEnumerator',
+      'createSelfProcessObserver',
       'createServiceNative',
+      'createServiceStartupObserver',
       'validateBuildManifest',
     ],
   );
@@ -1003,27 +1006,27 @@ test('accepts Linux POSIX UID roles and normalizes exact decimal inputs', async 
     () => createManagementNativeForTest({ lowLevel, configPath: '/state/channels.json', roles: { ...roles, recoverySid: 'uid:100' }, platform: 'linux' }),
     /root UID role configuration/,
   );
-  assert.equal(validateBuildManifest({ ...buildManifest, package: '@gjc-remote/native-control', version: '1.0.0', platform: 'linux', arch: 'x64', addon: 'native_control.node', sha256: sha(Buffer.from('native-addon')) }, { name: '@gjc-remote/native-control', version: '1.0.0' }, Buffer.from('native-addon'), 'linux', 'x64'), true);
+  assert.equal(validateBuildManifest({ ...buildManifest, package: '@gjc-remote/native-control', version: '2.0.0', platform: 'linux', arch: 'x64', addon: 'native_control.node', sha256: sha(Buffer.from('native-addon')) }, nativePackageJson, Buffer.from('native-addon'), 'linux', 'x64'), true);
 });
 test('refuses manifest package, N-API, platform, hash, capability, and signature drift', () => {
   const addonBytes = Buffer.from('native-addon');
   const manifest = {
-    ...buildManifest, package: '@gjc-remote/native-control', version: '1.0.0',
+    ...buildManifest, package: '@gjc-remote/native-control', version: '2.0.0',
     platform: 'linux', arch: 'x64', addon: 'native_control.node', sha256: sha(addonBytes),
   };
-  assert.equal(validateBuildManifest(manifest, { name: manifest.package, version: manifest.version }, addonBytes, 'linux', 'x64'), true);
+  assert.equal(validateBuildManifest(manifest, nativePackageJson, addonBytes, 'linux', 'x64'), true);
   const win32Manifest = { ...manifest, platform: 'win32' };
-  assert.equal(validateBuildManifest(win32Manifest, { name: manifest.package, version: manifest.version }, addonBytes, 'win32', 'x64'), true);
-  assert.equal(validateBuildManifest({ ...win32Manifest, arch: 'arm64' }, { name: manifest.package, version: manifest.version }, addonBytes, 'win32', 'arm64'), false);
-  assert.equal(validateBuildManifest(win32Manifest, { name: manifest.package, version: manifest.version }, addonBytes, 'linux', 'x64'), false);
+  assert.equal(validateBuildManifest(win32Manifest, nativePackageJson, addonBytes, 'win32', 'x64'), true);
+  assert.equal(validateBuildManifest({ ...win32Manifest, arch: 'arm64' }, nativePackageJson, addonBytes, 'win32', 'arm64'), false);
+  assert.equal(validateBuildManifest(win32Manifest, nativePackageJson, addonBytes, 'linux', 'x64'), false);
   for (const field of ['package', 'version', 'napi', 'platform', 'arch', 'addon', 'sha256', 'capabilities', 'capabilitySignatures']) {
     const altered = structuredClone(manifest);
     altered[field] = field === 'napi' ? 7 : field === 'capabilities' ? [] : field === 'capabilitySignatures' ? {} : 'wrong';
-    assert.equal(validateBuildManifest(altered, { name: manifest.package, version: manifest.version }, addonBytes, 'linux', 'x64'), false, field);
+    assert.equal(validateBuildManifest(altered, nativePackageJson, addonBytes, 'linux', 'x64'), false, field);
   }
   const signatureDrift = structuredClone(manifest);
   signatureDrift.capabilitySignatures.principal_access_check = ['path', 'kind', 'principal'];
-  assert.equal(validateBuildManifest(signatureDrift, { name: manifest.package, version: manifest.version }, addonBytes, 'linux', 'x64'), false);
+  assert.equal(validateBuildManifest(signatureDrift, nativePackageJson, addonBytes, 'linux', 'x64'), false);
 });
 test('successor recovery keeps retained proof source-aware for B and management-only for recovery', async () => {
   const { files, lowLevel, roles } = fake();

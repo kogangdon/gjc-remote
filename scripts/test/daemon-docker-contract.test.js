@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -30,10 +31,6 @@ test("daemon image pins runtime, lock, SDK, source, and signed native inputs", (
     dockerfile,
     /ARG BUN_IMAGE=oven\/bun:1\.4\.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6/,
   );
-  assert.match(
-    dockerfile,
-    /ARG LOCK_SHA256=e699a1a9f6cc400a25d2782a52b9e932e40b0704a1df41d01d8bf956fbe64af2/,
-  );
   assert.match(dockerfile, /sha256sum --check --strict/);
   assert.match(dockerfile, /bun install --frozen-lockfile --production --ignore-scripts/);
   assert.match(dockerfile, /--filter @gjc-remote\/daemon/);
@@ -49,6 +46,23 @@ test("daemon image pins runtime, lock, SDK, source, and signed native inputs", (
   assert.match(dockerfile, /bun native-control\/scripts\/verify-build\.mjs --require-signature/);
   assert.match(dockerfile, /test "\$\{REVISION\}" != unknown/);
   assert.doesNotMatch(dockerfile, /node-gyp|npm run build|bun run build/);
+});
+
+test("daemon image lock pin matches the raw workspace lock bytes", async () => {
+  const bytes = await readFile(fileURLToPath(new URL("../../bun.lock", import.meta.url)));
+  const declared = dockerfile.match(/^ARG LOCK_SHA256=([a-f0-9]{64})$/m);
+  assert.ok(declared, "Dockerfile must declare exactly a SHA-256 lock pin");
+  assert.equal(declared[1], createHash("sha256").update(bytes).digest("hex"));
+});
+
+test("daemon image VERSION default equals the actual application source version", async () => {
+  const versions = await Promise.all(["package.json", "daemon/package.json", "shared/package.json"].map(async (relative) => (
+    JSON.parse(await read(relative)).version
+  )));
+  assert.equal(new Set(versions).size, 1, "root, daemon and shared source versions must agree");
+  const declared = dockerfile.match(/^ARG VERSION=(\S+)$/m);
+  assert.ok(declared, "daemon Dockerfile must declare a VERSION default");
+  assert.equal(declared[1], versions[0]);
 });
 
 test("daemon image fixes the non-root identity and preflight entrypoint", () => {

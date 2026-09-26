@@ -1,6 +1,6 @@
 {
   "name": "@gjc-remote/daemon",
-  "version": "0.4.0-rc.2",
+  "version": "0.4.0-rc.3",
   "private": true,
   "type": "module",
   "main": "src/daemon.js",
@@ -15,7 +15,7 @@
   "dependencies": {
     "@gajae-code/coding-agent": "0.16.7",
     "@gjc-remote/native-control": "*",
-    "@gjc-remote/shared": "0.4.0-rc.2",
+    "@gjc-remote/shared": "0.4.0-rc.3",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0"
   }

@@ -99,7 +99,7 @@ export function loadVerifiedAddon({
   return addon;
 }
 export const buildManifest = Object.freeze({
-  contractVersion: 4, contractRevision, napi: 8, capabilities, capabilitySignatures,
+  contractVersion: 5, contractRevision, napi: 8, capabilities, capabilitySignatures,
 });
 
 export const createServiceNative = createServiceNativeFactory(loadVerifiedAddon);

@@ -8,3 +8,5 @@ export {
   createServiceNative,
   validateBuildManifest,
 } from "./index.js";
+export { createServiceStartupObserver } from "./service-startup-observer.js";
+export { createSelfProcessObserver } from "./service-native.js";

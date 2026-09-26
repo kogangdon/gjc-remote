@@ -430,11 +430,14 @@ release. Build takes exactly `--source`, `--output`, `--platform`,
 Output must be a new directory outside the source tree.
 
 `deploy/native/release-contract.json` fixes the repository, release tag, supported
-tuples, Bun 1.4.2 recipe, runtime versions, source selection, and format registry.
-The current candidate contract is `v0.4.0-rc.2`. The tag workflow uses the same
-Bun 1.4.2 producer version. Existing rc.1 releases and artifacts remain historical
-inputs, not renamed rc.2 candidates; every rc.2 application archive must be built
-from a clean checkout of the exact rc.2 tag.
+tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
+format registry is code-owned (`shared/deployment-format-registry.js`) and is
+injected by the builder; the serialized contract must not carry it.
+The current candidate contract is `v0.4.0-rc.3` with native-control 2.0.0
+(contract 5, revision 1). The tag workflow uses the same Bun 1.4.2 producer
+version. Existing rc.1/rc.2 releases and artifacts remain historical, immutable
+inputs, not renamed rc.3 candidates; every rc.3 application archive must be built
+from a clean checkout of the exact rc.3 tag.
 The source must be clean Git state at that tag with canonical `bun.lock` and
 both separate public trust resources tracked. Git hooks/fsmonitor and replacement
 objects cannot supply authority; configured executable filters refuse before

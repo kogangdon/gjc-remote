@@ -25,6 +25,7 @@ import {
   validateApplicationDeploymentManifest,
   validateSdkExternalStateContract,
 } from '@gjc-remote/shared/deployment-envelope';
+import { DEPLOYMENT_FORMAT_REGISTRY } from '@gjc-remote/shared/deployment-format-registry';
 import {
   canonicalJsonBytes,
   canonicalJsonHash,
@@ -480,7 +481,6 @@ function validateContractShape(contract, platform, architecture) {
     'nativeControl',
     'wireCapabilities',
     'sdk',
-    'formatRegistry',
   ]) || contract.schemaVersion !== 1 ||
       contract.kind !== 'gjc-remote-application-release-contract' ||
       contract.repository !== 'kogangdon/gjc-remote' ||
@@ -516,6 +516,8 @@ function validateContractShape(contract, platform, architecture) {
     }
     seen.add(workspace.path);
   }
+  // The format registry is code-owned; the serialized contract must not carry it.
+  contract = { ...contract, formatRegistry: DEPLOYMENT_FORMAT_REGISTRY };
   const excluded = new Set(contract.excludedSegments?.map((value) =>
     typeof value === 'string' ? value.toLowerCase() : null));
   for (const segment of [

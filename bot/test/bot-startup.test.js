@@ -170,3 +170,17 @@ test("a signal-initiated shutdown keeps exit 0 when a fatal event follows", asyn
   assert.equal(fatal.event, "discord_login_failed");
   assert.doesNotMatch(stderr, /definitely-invalid-token/);
 });
+
+test("a service-claimed launch is refused by the bootstrap guard before dotenv or services start", () => {
+  const result = spawnSync(process.execPath, ["src/bot.js"], {
+    cwd: botDir,
+    env: startupEnv({ GJC_REMOTE_SERVICE_COMPONENT: "bot", NODE_OPTIONS: "", NODE_PATH: "" }),
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ERR_NATIVE_CONTROL_REFUSED|SERVICE_BOOTSTRAP_REFUSED/);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /HostRegistry|Loaded channel map|Logged in/);
+  assert.doesNotMatch(result.stderr, /secret-a|secret-b|definitely-invalid-token/);
+});

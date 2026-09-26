@@ -1,3 +1,4 @@
+import { consumeServiceBootstrapContext } from "@gjc-remote/native-control/service-bootstrap";
 import "dotenv/config";
 import { createHash } from "node:crypto";
 import WebSocket from "ws";
@@ -109,6 +110,11 @@ import {
   createReconnectScheduler,
 } from "./reconnect.js";
 import { assertNoRemovedDevFlags } from "./workspace-removed-flags.js";
+import { createDaemonServiceStartupReporter } from "./service-startup-reporter.js";
+
+// Verified Windows service launch context, or null outside a service launch.
+// Under Bun the same guard module already ran as BUN_INSPECT_PRELOAD.
+const serviceBootstrapContext = consumeServiceBootstrapContext();
 
 let daemonConnectionConfig;
 try {
@@ -156,6 +162,18 @@ const daemonSensitiveValues = [
 function sanitizeDaemonError(error) {
   return sanitizeErrorMessage(error, daemonSensitiveValues);
 }
+const serviceStartupReporter = serviceBootstrapContext === null
+  ? null
+  : createDaemonServiceStartupReporter({
+      context: serviceBootstrapContext,
+      botWsUrl: BOT_WS_URL,
+      hostId: HOST_ID,
+      writable: process.stdout,
+      onFailure: () => {
+        console.error("daemon: service startup observation failed");
+        process.exit(1);
+      },
+    });
 const readinessV2Advertised = process.env.GJC_READINESS_V2 === "1";
 const READINESS_TEST_INJECTION_ENABLED =
   process.env.GJC_READINESS_TEST_INJECTION === "1";
@@ -2050,6 +2068,7 @@ function connectToBot() {
     };
     readinessState.registration = registration;
     connection.send(JSON.stringify(registration));
+    readinessState.serviceStartupGeneration = serviceStartupReporter?.registrationAttempted() ?? null;
     console.log(
       `daemon: connected to bot at ${sanitizeDaemonError(BOT_WS_URL)}, ` +
         `registering as '${sanitizeDaemonError(HOST_ID)}'`
@@ -2085,6 +2104,7 @@ function connectToBot() {
     );
     clearReadinessTimer(readinessState);
     readinessState.committed = false;
+    serviceStartupReporter?.connectionClosed(readinessState.serviceStartupGeneration ?? null);
     if (readinessState.receiptCommitted) {
       for (const [bindingId, bindingState] of readinessState.bindings) {
         invalidateBindingRequests(readinessState, bindingState);
@@ -2217,6 +2237,7 @@ async function handleMessage(
       msg.capabilities
     );
     readinessState.handshakeAccepted = true;
+    serviceStartupReporter?.registrationAccepted(readinessState.serviceStartupGeneration ?? null);
     // A denied registration remains denied across transport failures. Only a
     // successful registration clears the fixed-denial retry state.
     retryScheduler.markAccepted();
@@ -2251,6 +2272,7 @@ async function handleMessage(
     return;
   }
   if (isRegisterDeniedMessage(msg)) {
+    serviceStartupReporter?.registrationDenied(readinessState?.serviceStartupGeneration ?? null);
     if (!wasDenied()) {
       markDenied();
       const hasSafeReason = hasRegistrationReason(msg.reason);

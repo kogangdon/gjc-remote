@@ -13,20 +13,21 @@ import {
   stat,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, posix as pathPosix, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getNodeValue, parseTree } from 'jsonc-parser';
-import semver from 'semver';
 import { create as createTar } from 'tar';
 import {
   DEPLOYMENT_ENVELOPE_LIMITS,
   buildApplicationDeploymentManifest,
   buildBundleInventory,
   buildDeploymentCompatibility,
-  buildSdkExternalStateContract,
   bundleTreeFingerprint,
   validateApplicationDeploymentManifest,
+  WINDOWS_SERVICE_BOOTSTRAP_EXTERNAL_BUN_CONFIG,
+  WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES,
+  windowsServiceBootstrapClosureFingerprint,
 } from '@gjc-remote/shared/deployment-envelope';
+import { DEPLOYMENT_FORMAT_REGISTRY } from '@gjc-remote/shared/deployment-format-registry';
 import {
   canonicalJsonBytes,
   canonicalJsonHash,
@@ -36,6 +37,18 @@ import {
   utf8Compare,
 } from '@gjc-remote/shared/strict-json';
 import { verifyPinnedNativeBuildManifest } from '../src/native-provenance.js';
+import { SERVICE_BOOTSTRAP_STATIC_CLOSURE } from '../src/service-bootstrap-policy.js';
+import {
+  deriveSdkExternalStateContract,
+  SDK_EXTERNAL_STATE_REQUIREMENTS,
+} from '../src/service-sdk-contract.js';
+import {
+  collectBunPackageClosure,
+  bunPackageRootForPath,
+  parseBunProductionLock as parseProductionLock,
+  resolveBunProductionClosure,
+  SERVICE_PRODUCTION_WORKSPACES,
+} from '../src/service-production-closure.js';
 import { consumeApplicationArchive, inspectApplicationArchive } from '../src/service-archive.js';
 
 const CONTRACT_PATH = fileURLToPath(new URL('../../deploy/native/release-contract.json', import.meta.url));
@@ -47,8 +60,6 @@ const LOCK_LIMIT = 16 * 1024 * 1024;
 const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 const PROCESS_TIMEOUT_MS = 10 * 60_000;
 const SOURCE_FILE_LIMIT = 256 * 1024 * 1024;
-const MAX_LOCK_NODES = 1_000_000;
-const MAX_LOCK_DEPTH = 64;
 const CHUNK_BYTES = 64 * 1024;
 const REGISTRY = 'https://registry.npmjs.org';
 const FIXED_REMOTE = 'https://github.com/kogangdon/gjc-remote.git';
@@ -56,15 +67,9 @@ const MUTABLE_SEGMENTS = new Set([
   '.cache', '.env', '.git', '.gjc', '.gjc-remote-session',
   'credentials', 'logs', 'sessions',
 ]);
-const SOURCE_WORKSPACES = ['bot', 'daemon', 'native-control', 'shared'];
-const WORKSPACE_PACKAGES = new Map([
-  ['bot', '@gjc-remote/bot'],
-  ['daemon', '@gjc-remote/daemon'],
-  ['native-control', '@gjc-remote/native-control'],
-  ['shared', '@gjc-remote/shared'],
-]);
+const SOURCE_WORKSPACES = SERVICE_PRODUCTION_WORKSPACES;
 const NATIVE_ALIAS = 'node_modules/@gjc-remote/native-control';
-const SDK_ROOTS = ['settings', 'model', 'auth', 'session'];
+const SDK_ROOTS = Object.keys(SDK_EXTERNAL_STATE_REQUIREMENTS.sourceRoots);
 const TARGETS = new Set(['linux:arm64', 'linux:x64', 'win32:x64']);
 const CODES = Object.freeze({
   input: 'SERVICE_RELEASE_INPUT_INVALID',
@@ -162,10 +167,6 @@ function comparePath(left, right) {
   return utf8Compare(left, right);
 }
 
-function posixPath(path) {
-  return path.split(sep).join('/');
-}
-
 function inside(root, path) {
   const rel = relative(root, path);
   return rel !== '' && !rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel);
@@ -177,11 +178,6 @@ function sameOrInside(root, path) {
 
 function exactAbsolutePath(value) {
   return typeof value === 'string' && value.length > 0 && isAbsolute(value) && resolve(value) === value;
-}
-
-function safeMap(value) {
-  return plain(value) && Object.entries(value).every(([key, item]) =>
-    typeof key === 'string' && key.length > 0 && typeof item === 'string' && item.length > 0);
 }
 
 function readOnlyNoFollowFlags() {
@@ -456,12 +452,12 @@ function parseContract(bytes) {
     'schemaVersion', 'kind', 'limits', 'repository', 'releaseVersion', 'releaseTag', 'producer',
     'targets', 'sourceWorkspaces', 'sourceRootFiles', 'excludedSegments',
     'entrypoints', 'runtimes', 'nativeControl',
-    'wireCapabilities', 'sdk', 'formatRegistry',
+    'wireCapabilities', 'sdk',
   ];
   if (!exact(contract, keys) || contract.schemaVersion !== 1 ||
       contract.kind !== 'gjc-remote-application-release-contract' ||
-      contract.repository !== 'kogangdon/gjc-remote' || contract.releaseVersion !== '0.4.0-rc.2' ||
-      contract.releaseTag !== 'v0.4.0-rc.2' || !exact(contract.entrypoints, ['bot', 'daemon']) ||
+      contract.repository !== 'kogangdon/gjc-remote' || contract.releaseVersion !== '0.4.0-rc.3' ||
+      contract.releaseTag !== 'v0.4.0-rc.3' || !exact(contract.entrypoints, ['bot', 'daemon']) ||
       contract.entrypoints.bot !== 'bot/src/bot.js' || contract.entrypoints.daemon !== 'daemon/src/daemon.js' ||
       !exact(contract.runtimes, ['node', 'bun']) || contract.runtimes.node?.minimumVersion !== '26.0.0' ||
       contract.runtimes.bun?.minimumVersion !== '1.4.0') fail(CODES.contract);
@@ -516,14 +512,14 @@ function parseContract(bytes) {
         'path', 'packageName', 'packageVersion', 'productionRoots',
       ]) || workspace.path !== SOURCE_WORKSPACES[index] || !Array.isArray(workspace.productionRoots))) fail(CODES.contract);
   const expectedWorkspace = [
-    ['bot', '@gjc-remote/bot', '0.4.0-rc.2', ['package.json', 'src']],
-    ['daemon', '@gjc-remote/daemon', '0.4.0-rc.2', ['package.json', 'src']],
-    ['native-control', '@gjc-remote/native-control', '1.0.0', [
+    ['bot', '@gjc-remote/bot', '0.4.0-rc.3', ['package.json', 'src']],
+    ['daemon', '@gjc-remote/daemon', '0.4.0-rc.3', ['package.json', 'src']],
+    ['native-control', '@gjc-remote/native-control', '2.0.0', [
       'deployment-keys/application-trusted.json',
       'deployment-keys/shawl-trusted.json', 'package.json',
       'release-keys/trusted.json', 'src',
     ]],
-    ['shared', '@gjc-remote/shared', '0.4.0-rc.2', ['package.json', '*.js']],
+    ['shared', '@gjc-remote/shared', '0.4.0-rc.3', ['package.json', '*.js']],
   ];
   if (contract.sourceWorkspaces.some((workspace, index) =>
     workspace.path !== expectedWorkspace[index][0] || workspace.packageName !== expectedWorkspace[index][1] ||
@@ -537,14 +533,14 @@ function parseContract(bytes) {
     'contractVersion', 'contractRevision', 'napi', 'executablePolicy',
   ];
   if (!exact(contract.nativeControl, nativeKeys) || contract.nativeControl.packageName !== '@gjc-remote/native-control' ||
-      contract.nativeControl.packageVersion !== '1.0.0' ||
+      contract.nativeControl.packageVersion !== '2.0.0' ||
       contract.nativeControl.manifestPath !== 'native-control/build/Release/native-control.manifest.json' ||
       contract.nativeControl.signaturePath !== 'native-control/build/Release/native-control.manifest.json.sig' ||
       contract.nativeControl.addonPath !== 'native-control/build/Release/native_control.node' ||
       contract.nativeControl.applicationTrustPath !== 'native-control/deployment-keys/application-trusted.json' ||
       contract.nativeControl.shawlTrustPath !== 'native-control/deployment-keys/shawl-trusted.json' ||
       contract.nativeControl.trustPath !== 'native-control/release-keys/trusted.json' ||
-      contract.nativeControl.contractVersion !== 4 || contract.nativeControl.contractRevision !== 4 ||
+      contract.nativeControl.contractVersion !== 5 || contract.nativeControl.contractRevision !== 1 ||
       contract.nativeControl.napi !== 8 || contract.nativeControl.executablePolicy !== 'required') fail(CODES.contract);
   if (!Array.isArray(contract.wireCapabilities) || contract.wireCapabilities.length === 0 ||
       contract.wireCapabilities.some((value, index) => typeof value !== 'string' ||
@@ -557,23 +553,21 @@ function parseContract(bytes) {
   if (!exact(contract.sdk, [
     'packageName', 'packageVersion', 'lockIntegrity', 'configSchemaVersion', 'transcriptVersion',
     'sourceRoots', 'sourceContractDomain', 'closureDomain',
-  ]) || contract.sdk.packageName !== '@gajae-code/coding-agent' || contract.sdk.packageVersion !== '0.16.7' ||
-      contract.sdk.lockIntegrity !== 'sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==' ||
-      contract.sdk.configSchemaVersion !== 2 || contract.sdk.transcriptVersion !== 5 ||
+  ]) || contract.sdk.packageName !== SDK_EXTERNAL_STATE_REQUIREMENTS.packageName ||
+      contract.sdk.packageVersion !== SDK_EXTERNAL_STATE_REQUIREMENTS.packageVersion ||
+      contract.sdk.lockIntegrity !== SDK_EXTERNAL_STATE_REQUIREMENTS.lockIntegrity ||
+      contract.sdk.configSchemaVersion !== SDK_EXTERNAL_STATE_REQUIREMENTS.configSchemaVersion ||
+      contract.sdk.transcriptVersion !== SDK_EXTERNAL_STATE_REQUIREMENTS.transcriptVersion ||
       !exact(contract.sdk.sourceRoots, SDK_ROOTS) ||
-      canonicalJsonHash(contract.sdk.sourceRoots) !== canonicalJsonHash({
-        settings: 'src/config/settings.ts',
-        model: 'src/config/model-registry.ts',
-        auth: 'src/session/auth-storage.ts',
-        session: 'src/session/session-manager.ts',
-      }) ||
-      contract.sdk.sourceContractDomain !== 'gjc-remote/sdk-external-state-source/v1' ||
-      contract.sdk.closureDomain !== 'gjc-remote/sdk-production-closure/v1') fail(CODES.contract);
-  if (!exact(contract.formatRegistry, ['bot', 'daemonAppSession', 'workspaceLifecycle'])) fail(CODES.contract);
+      canonicalJsonHash(contract.sdk.sourceRoots) !== canonicalJsonHash(SDK_EXTERNAL_STATE_REQUIREMENTS.sourceRoots) ||
+      contract.sdk.sourceContractDomain !== SDK_EXTERNAL_STATE_REQUIREMENTS.sourceContractDomain ||
+      contract.sdk.closureDomain !== SDK_EXTERNAL_STATE_REQUIREMENTS.closureDomain) fail(CODES.contract);
+  const formatRegistry = DEPLOYMENT_FORMAT_REGISTRY;
+  if (!exact(formatRegistry, ['bot', 'daemonAppSession', 'workspaceLifecycle'])) fail(CODES.contract);
   for (const [name, expectedDomain] of [
     ['bot', 'bot-mapping-reader'], ['daemonAppSession', 'daemon-app-session'], ['workspaceLifecycle', 'workspace-lifecycle'],
   ]) {
-    const domain = contract.formatRegistry[name];
+    const domain = formatRegistry[name];
     if (!exact(domain, ['domain', 'formats']) || domain.domain !== expectedDomain || !Array.isArray(domain.formats) ||
         domain.formats.length === 0 || domain.formats.length > 256) fail(CODES.contract);
     const ids = new Set();
@@ -585,94 +579,19 @@ function parseContract(bytes) {
       ids.add(record.formatId);
     }
   }
-  return deepFreeze(contract);
+  return deepFreeze({ ...contract, formatRegistry });
 }
 
 export async function loadServiceReleaseContract() {
   return parseContract(await readRegularBytes(CONTRACT_PATH, PACKAGE_LIMIT, CODES.contract));
 }
 
-function treeValue(node, state, depth = 0) {
-  if (!node || depth > MAX_LOCK_DEPTH) fail(CODES.lock);
-  state.nodes += 1;
-  if (state.nodes > MAX_LOCK_NODES) fail(CODES.lock);
-  if (node.type === 'object') {
-    const value = {};
-    const names = new Set();
-    for (const property of node.children ?? []) {
-      if (property.type !== 'property' || property.children?.length !== 2 || property.children[0].type !== 'string') fail(CODES.lock);
-      const name = property.children[0].value;
-      if (typeof name !== 'string' || names.has(name) || ['__proto__', 'constructor', 'prototype'].includes(name)) fail(CODES.lock);
-      names.add(name);
-      Object.defineProperty(value, name, {
-        value: treeValue(property.children[1], state, depth + 1),
-        enumerable: true,
-        configurable: false,
-        writable: false,
-      });
-    }
-    return value;
-  }
-  if (node.type === 'array') return (node.children ?? []).map((child) => treeValue(child, state, depth + 1));
-  if (!['string', 'number', 'boolean', 'null'].includes(node.type)) fail(CODES.lock);
-  const value = getNodeValue(node);
-  if (typeof value === 'string') {
-    try { assertStrictText(value, 'Bun lock string', LOCK_LIMIT); } catch { fail(CODES.lock); }
-  }
-  if (typeof value === 'number' && !Number.isSafeInteger(value)) fail(CODES.lock);
-  return value;
-}
-
-function decodeUtf8(bytes, code) {
-  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { fail(code); }
-}
-
-function validSri(value) {
-  if (typeof value !== 'string' || !value.startsWith('sha512-')) return false;
-  let decoded;
-  try { decoded = Buffer.from(value.slice(7), 'base64'); } catch { return false; }
-  return decoded.length === 64 && `sha512-${decoded.toString('base64')}` === value;
-}
-
 export function parseBunProductionLock(bytes) {
-  if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > LOCK_LIMIT) fail(CODES.lock);
-  const text = decodeUtf8(bytes, CODES.lock);
-  const errors = [];
-  const root = parseTree(text, errors, { allowTrailingComma: true, disallowComments: false, allowEmptyContent: false });
-  if (!root || errors.length !== 0) fail(CODES.lock);
-  const lock = treeValue(root, { nodes: 0 });
-  if (!exact(lock, ['lockfileVersion', 'configVersion', 'workspaces', 'packages']) ||
-      lock.lockfileVersion !== 1 || lock.configVersion !== 0 || !plain(lock.workspaces) || !plain(lock.packages) ||
-      JSON.stringify(Object.keys(lock.workspaces).sort(comparePath)) !== JSON.stringify(['', ...SOURCE_WORKSPACES].sort(comparePath))) fail(CODES.lock);
-
-  const identities = new Map();
-  const names = new Map();
-  const workspaces = new Map();
-  for (const [key, record] of Object.entries(lock.packages)) {
-    if (!Array.isArray(record) || record.length === 0 || typeof record[0] !== 'string') fail(CODES.lock);
-    const identity = record[0];
-    const workspaceMatch = /^(@[^/]+\/[^@]+|[^@/]+)@workspace:(bot|daemon|native-control|shared)$/.exec(identity);
-    if (workspaceMatch) {
-      if (record.length !== 1 || key !== workspaceMatch[1] || workspaces.has(workspaceMatch[1])) fail(CODES.lock);
-      workspaces.set(workspaceMatch[1], Object.freeze({ key, identity, workspace: workspaceMatch[2] }));
-      continue;
-    }
-    if (record.length !== 4 || record[1] !== '' || !plain(record[2]) || !validSri(record[3])) fail(CODES.lock);
-    const separator = identity.lastIndexOf('@');
-    if (separator <= 0 || separator === identity.length - 1) fail(CODES.lock);
-    const name = identity.slice(0, separator);
-    const version = identity.slice(separator + 1);
-    if ((name.startsWith('@') && !/^@[^/]+\/[^/]+$/.test(name)) ||
-        (!name.startsWith('@') && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) ||
-        semver.valid(version) !== version) fail(CODES.lock);
-    const item = Object.freeze({ key, identity, name, version, metadata: record[2], integrity: record[3] });
-    if (!identities.has(identity)) identities.set(identity, []);
-    identities.get(identity).push(item);
-    if (!names.has(name)) names.set(name, []);
-    names.get(name).push(item);
+  try {
+    return parseProductionLock(bytes);
+  } catch {
+    fail(CODES.lock);
   }
-  if (workspaces.size !== SOURCE_WORKSPACES.length) fail(CODES.lock);
-  return Object.freeze({ lock: deepFreeze(lock), identities, names, workspaces, sha256: hashBytes(bytes) });
 }
 
 async function inspectGitSource(sourceRoot, contract, scratch) {
@@ -814,198 +733,6 @@ function parsePackage(bytes, code = CODES.closure) {
   }
 }
 
-function sameStringMap(left, right) {
-  const a = left === undefined ? {} : left;
-  const b = right === undefined ? {} : right;
-  return safeMap(a) && safeMap(b) && canonicalJsonHash(a) === canonicalJsonHash(b);
-}
-
-function packageTargetApplies(packageJson, platform, architecture) {
-  const applies = (rules, value) => {
-    if (rules === undefined) return true;
-    const values = typeof rules === 'string' ? [rules] : rules;
-    if (!Array.isArray(values) || values.some((rule) => typeof rule !== 'string' || rule.length === 0)) fail(CODES.closure);
-    const positive = values.filter((rule) => !rule.startsWith('!'));
-    if (values.includes(`!${value}`)) return false;
-    return positive.length === 0 || positive.includes(value);
-  };
-  return applies(packageJson.os, platform) && applies(packageJson.cpu, architecture);
-}
-
-function targetRules(value) {
-  if (value === undefined) return [];
-  const rules = typeof value === 'string' ? [value] : value;
-  if (!Array.isArray(rules) || rules.some((rule) =>
-    typeof rule !== 'string' || !/^!?[A-Za-z0-9_-]+$/.test(rule))) fail(CODES.closure);
-  return [...rules].sort(comparePath);
-}
-
-function dependencyCategories(packageJson, lockMetadata) {
-  // Bun's frozen lockfile records dependency metadata from registry resolution,
-  // which can legitimately contain entries the published package.json omits
-  // (observed: debug@4.4.3 ships only peerDependenciesMeta while the lock
-  // carries peerDependencies { "supports-color": "*" } plus optionalPeers).
-  // The lock is the traversal authority; every edge the installed package
-  // declares must still appear in the lock with an identical specifier.
-  for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
-    const packageEdges = packageJson[field];
-    const lockEdges = lockMetadata[field];
-    if (packageEdges !== undefined &&
-        (!plain(packageEdges) || Object.entries(packageEdges).some(([name, specifier]) =>
-          typeof specifier !== 'string' || specifier.length === 0 ||
-          !plain(lockEdges) || lockEdges[name] !== specifier))) fail(CODES.lock);
-    if (lockEdges !== undefined && !sameStringMapEntries(lockEdges)) fail(CODES.lock);
-  }
-  if (canonicalJsonHash(targetRules(packageJson.os)) !== canonicalJsonHash(targetRules(lockMetadata.os)) ||
-      canonicalJsonHash(targetRules(packageJson.cpu)) !== canonicalJsonHash(targetRules(lockMetadata.cpu))) fail(CODES.lock);
-  const optionalPeers = new Set(Array.isArray(lockMetadata.optionalPeers) ? lockMetadata.optionalPeers : []);
-  if ([...optionalPeers].some((name) => typeof name !== 'string')) fail(CODES.lock);
-  const lockPeers = plain(lockMetadata.peerDependencies) ? lockMetadata.peerDependencies : {};
-  const peerMeta = plain(packageJson.peerDependenciesMeta) ? packageJson.peerDependenciesMeta : {};
-  for (const [name, metadata] of Object.entries(peerMeta)) {
-    if (!exact(metadata, ['optional']) || metadata.optional !== true || !optionalPeers.has(name) ||
-        lockPeers[name] === undefined) fail(CODES.lock);
-  }
-  if ([...optionalPeers].some((name) => peerMeta[name]?.optional !== true)) fail(CODES.lock);
-  const edges = [];
-  const lockDependencies = plain(lockMetadata.dependencies) ? lockMetadata.dependencies : {};
-  for (const [name, specifier] of Object.entries(lockDependencies)) {
-    edges.push({ name, specifier, kind: 'dependency', optional: false, allowAbsent: false });
-  }
-  const lockOptional = plain(lockMetadata.optionalDependencies) ? lockMetadata.optionalDependencies : {};
-  for (const [name, specifier] of Object.entries(lockOptional)) {
-    edges.push({ name, specifier, kind: 'optional', optional: true, allowAbsent: false });
-  }
-  for (const [name, specifier] of Object.entries(lockPeers)) {
-    const optional = optionalPeers.has(name);
-    edges.push({
-      name,
-      specifier,
-      kind: optional ? 'optional-peer' : 'peer',
-      optional,
-      allowAbsent: optional,
-    });
-  }
-  return edges.sort((left, right) => comparePath(`${left.kind}:${left.name}`, `${right.kind}:${right.name}`));
-}
-
-function sameStringMapEntries(value) {
-  return Object.entries(value).every(([name, specifier]) =>
-    name.length > 0 && typeof specifier === 'string' && specifier.length > 0);
-}
-
-function edgeAcceptsVersion(edge, version) {
-  if (typeof edge.specifier !== 'string' || semver.valid(version) !== version) {
-    return false;
-  }
-  const range = semver.validRange(edge.specifier);
-  return range !== null && semver.satisfies(version, range);
-}
-
-function workspaceLockForEdge(lock, edge) {
-  const workspace = lock.workspaces.get(edge.name);
-  if (!workspace) return null;
-  const record = lock.lock.workspaces[workspace.workspace];
-  if (!plain(record) || record.name !== edge.name ||
-      !edgeAcceptsVersion(edge, record.version)) fail(CODES.lock);
-  return Object.freeze({ workspace, version: record.version });
-}
-
-function bunLockKeyForRelativePackagePath(relativePath) {
-  if (relativePath.startsWith('../') || relativePath === '..' ||
-      relativePath.startsWith('/') || relativePath.length === 0 ||
-      relativePath.includes('\\')) {
-    fail(CODES.closure);
-  }
-  const segments = relativePath.split('/');
-  const chain = [];
-  let index = segments.indexOf('node_modules');
-  if (index < 0) fail(CODES.closure);
-  const workspacePrefix = segments.slice(0, index).join('/');
-  if (workspacePrefix.length > 0) {
-    const workspaceName = WORKSPACE_PACKAGES.get(workspacePrefix);
-    if (!workspaceName) fail(CODES.closure);
-    chain.push(workspaceName);
-  }
-  while (index < segments.length) {
-    if (segments[index] !== 'node_modules') fail(CODES.closure);
-    index += 1;
-    if (index >= segments.length) fail(CODES.closure);
-    let name = segments[index];
-    if (name.startsWith('@')) {
-      if (index + 1 >= segments.length) fail(CODES.closure);
-      name = `${name}/${segments[index + 1]}`;
-      index += 2;
-    } else {
-      index += 1;
-    }
-    dependencySegments(name);
-    chain.push(name);
-  }
-  return chain.join('/');
-}
-
-function bunLockKeyForPackagePath(materialRootPath, packageRoot) {
-  return bunLockKeyForRelativePackagePath(
-    posixPath(relative(materialRootPath, packageRoot)),
-  );
-}
-
-function externalLockForEdge(
-  lock,
-  edge,
-  packageJson,
-  platform,
-  architecture,
-  selectedLockKey,
-) {
-  if (packageJson.name !== edge.name ||
-      !edgeAcceptsVersion(edge, packageJson.version)) fail(CODES.closure);
-  const candidates = (lock.names.get(edge.name) ?? []).filter((candidate) =>
-    candidate.key === selectedLockKey &&
-    candidate.version === packageJson.version &&
-    packageTargetApplies(
-      { os: candidate.metadata.os, cpu: candidate.metadata.cpu },
-      platform,
-      architecture,
-    ));
-  if (candidates.length !== 1) fail(CODES.lock);
-  return candidates[0];
-}
-
-function dependencySegments(name) {
-  if (/^@[^/]+\/[^/]+$/.test(name)) return name.split('/');
-  if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return [name];
-  fail(CODES.closure);
-}
-
-async function resolveDependencyLocation(materialRoot, consumerRoot, name) {
-  const parts = dependencySegments(name);
-  let current = consumerRoot;
-  while (sameOrInside(materialRoot, current)) {
-    const candidate = join(current, 'node_modules', ...parts);
-    try {
-      await lstat(candidate);
-      return candidate;
-    } catch (error) {
-      if (error?.code !== 'ENOENT') fail(CODES.closure);
-    }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = basename(parent) === 'node_modules' ? dirname(parent) : parent;
-  }
-  return null;
-}
-
-function applicableLockCandidate(lock, edge, platform, architecture) {
-  if (workspaceLockForEdge(lock, edge) !== null) return true;
-  return (lock.names.get(edge.name) ?? []).some((candidate) => {
-    const metadata = candidate.metadata;
-    return edgeAcceptsVersion(edge, candidate.version) &&
-      packageTargetApplies({ os: metadata.os, cpu: metadata.cpu }, platform, architecture);
-  });
-}
-
 async function packageRootFacts(materialRoot, logicalRoot) {
   let realRoot;
   let facts;
@@ -1018,7 +745,7 @@ async function packageRootFacts(materialRoot, logicalRoot) {
   }
   if (!facts.isDirectory()) fail(CODES.closure);
   const packageBytes = await readRegularBytes(join(realRoot, 'package.json'), PACKAGE_LIMIT, CODES.closure);
-  return { realRoot, packageBytes, packageJson: parsePackage(packageBytes) };
+  return { realRoot, packageBytes };
 }
 
 function packageBinTargets(packageJson) {
@@ -1108,139 +835,61 @@ async function readDirectoryBounded(path, maximumEntries, code) {
 }
 
 async function buildProductionClosure({ materialRoot, lock, contract, platform, architecture, sourceRecords, addSpec }) {
-  const workspaceByName = new Map();
-  const nodes = new Map();
-  const queue = [];
-  for (const workspace of contract.sourceWorkspaces) {
-    const root = join(materialRoot, workspace.path);
-    const packageBytes = await readRegularBytes(join(root, 'package.json'), PACKAGE_LIMIT, CODES.closure);
-    const packageJson = parsePackage(packageBytes);
-    const lockWorkspace = lock.lock.workspaces[workspace.path];
-    if (packageJson.name !== workspace.packageName || packageJson.version !== workspace.packageVersion ||
-        !plain(lockWorkspace) || lockWorkspace.name !== workspace.packageName || lockWorkspace.version !== workspace.packageVersion ||
-        !sameStringMap(packageJson.dependencies, lockWorkspace.dependencies) ||
-        lock.workspaces.get(workspace.packageName)?.workspace !== workspace.path) fail(CODES.lock);
-    const node = {
-      key: `workspace:${workspace.path}`,
-      logicalRoot: root,
-      realRoot: root,
-      packageJson,
-      packageBytes,
-      name: workspace.packageName,
-      version: workspace.packageVersion,
-      identity: `${workspace.packageName}@workspace:${workspace.path}`,
-      integrity: null,
-      lockMetadata: lockWorkspace,
-      workspace: workspace.path,
-      edges: [],
-      files: [],
-    };
-    nodes.set(node.key, node);
-    workspaceByName.set(node.name, node);
-    queue.push(node);
+  const factsByRoot = new Map();
+  const readPackageRoot = async (packageRoot) => {
+    const existing = factsByRoot.get(packageRoot);
+    if (existing) return existing;
+    const logicalRoot = join(materialRoot, ...packageRoot.split('/'));
+    try {
+      await lstat(logicalRoot);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return null;
+      fail(CODES.closure);
+    }
+    const facts = await packageRootFacts(materialRoot, logicalRoot);
+    factsByRoot.set(packageRoot, facts);
+    return facts;
+  };
+  let nodes;
+  try {
+    ({ nodes } = await resolveBunProductionClosure({
+      lock,
+      contract,
+      platform,
+      architecture,
+      readPackageRoot,
+      requireWorkspaceRealRoot: true,
+    }));
+  } catch (error) {
+    fail(error?.code === 'SERVICE_PRODUCTION_LOCK_INVALID' ? CODES.lock : CODES.closure);
   }
-
   const sourceByWorkspace = new Map(SOURCE_WORKSPACES.map((workspace) => [workspace, []]));
   for (const record of sourceRecords) sourceByWorkspace.get(record.path.split('/')[0])?.push(record);
-
-  while (queue.length > 0) {
-    const node = queue.shift();
-    const lockMeta = node.lockMetadata;
-    const edges = dependencyCategories(node.packageJson, lockMeta);
-    for (const edge of edges) {
-      const workspaceEdge = workspaceLockForEdge(lock, edge);
-      const logical = await resolveDependencyLocation(materialRoot, node.logicalRoot, edge.name);
-      if (logical === null) {
-        if (edge.allowAbsent ||
-            (edge.optional &&
-              !applicableLockCandidate(lock, edge, platform, architecture))) {
-          continue;
-        }
-        fail(CODES.closure);
+  for (const node of nodes.values()) {
+    if (node.workspace !== null && node.key !== `workspace:${node.workspace}`) {
+      for (const source of sourceByWorkspace.get(node.workspace)) {
+        const local = source.path.slice(node.workspace.length + 1);
+        addSpec({
+          path: `${node.root}/${local}`,
+          source: source.source,
+          executablePolicy: source.executablePolicy,
+          size: source.size,
+          sha256: source.sha256,
+          ownerKey: node.key,
+          packageRelativePath: local,
+        });
       }
-      const facts = await packageRootFacts(materialRoot, logical);
-      if (facts.packageJson.name !== edge.name ||
-          !edgeAcceptsVersion(edge, facts.packageJson.version)) fail(CODES.closure);
-      if (!packageTargetApplies(facts.packageJson, platform, architecture)) {
-        if (edge.optional) continue;
-        fail(CODES.closure);
-      }
-      let target;
-      if (workspaceEdge !== null) {
-        const workspace = workspaceByName.get(edge.name);
-        if (!workspace || facts.packageJson.version !== workspaceEdge.version ||
-            facts.realRoot !== workspace.realRoot) fail(CODES.closure);
-        const rel = posixPath(relative(materialRoot, logical));
-        if (!rel.includes('/node_modules/') && !rel.startsWith('node_modules/')) fail(CODES.closure);
-        const key = `location:${rel}`;
-        target = nodes.get(key);
-        if (!target) {
-          target = {
-            ...workspace,
-            key,
-            logicalRoot: logical,
-            edges: [],
-            files: [],
-          };
-          nodes.set(key, target);
-          queue.push(target);
-          for (const source of sourceByWorkspace.get(workspace.workspace)) {
-            const local = source.path.slice(workspace.workspace.length + 1);
-            addSpec({
-              path: `${rel}/${local}`,
-              source: source.source,
-              executablePolicy: source.executablePolicy,
-              size: source.size,
-              sha256: source.sha256,
-              ownerKey: key,
-              packageRelativePath: local,
-            });
-          }
-        }
-      } else {
-        const locked = externalLockForEdge(
-          lock,
-          edge,
-          facts.packageJson,
-          platform,
-          architecture,
-          bunLockKeyForPackagePath(materialRoot, logical),
-        );
-        const identity = locked.identity;
-        const rel = posixPath(relative(materialRoot, logical));
-        const key = `location:${rel}`;
-        target = nodes.get(key);
-        if (!target) {
-          target = {
-            key,
-            logicalRoot: logical,
-            realRoot: facts.realRoot,
-            packageJson: facts.packageJson,
-            packageBytes: facts.packageBytes,
-            name: facts.packageJson.name,
-            version: facts.packageJson.version,
-            identity,
-            integrity: locked.integrity,
-            lockMetadata: locked.metadata,
-            workspace: null,
-            edges: [],
-            files: [],
-          };
-          nodes.set(key, target);
-          queue.push(target);
-          await walkPackageFiles({
-            materialRoot,
-            realRoot: target.realRoot,
-            outputPrefix: rel,
-            ownerKey: key,
-            packageJson: target.packageJson,
-          }, addSpec);
-        }
-      }
-      node.edges.push(Object.freeze({ kind: edge.kind, name: edge.name, targetKey: target.key, targetIdentity: target.identity }));
+    } else if (node.workspace === null) {
+      await walkPackageFiles({
+        materialRoot,
+        realRoot: node.realRoot,
+        outputPrefix: node.root,
+        ownerKey: node.key,
+        packageJson: node.packageJson,
+      }, addSpec);
     }
   }
-  if (![...nodes.values()].some((node) => node.logicalRoot && posixPath(relative(materialRoot, node.logicalRoot)) === NATIVE_ALIAS)) fail(CODES.closure);
+  if (![...nodes.values()].some((node) => node.root === NATIVE_ALIAS)) fail(CODES.closure);
   return { nodes };
 }
 
@@ -1251,59 +900,18 @@ async function sdkContractFor({ nodes, recordsByOwner, contract, readRecordBytes
   const root = nodes.get(sdkEdge.targetKey);
   if (!root || root.identity !== `${contract.sdk.packageName}@${contract.sdk.packageVersion}` ||
       root.integrity !== contract.sdk.lockIntegrity) fail(CODES.sdk);
-  const reachable = new Set();
-  const visit = (node) => {
-    if (!node || reachable.has(node.key)) return;
-    reachable.add(node.key);
-    for (const edge of node.edges) visit(nodes.get(edge.targetKey));
-  };
-  visit(root);
-  const byIdentity = new Map();
-  for (const key of reachable) {
-    const node = nodes.get(key);
-    if (!node || node.workspace !== null) fail(CODES.sdk);
-    const files = (recordsByOwner.get(key) ?? []).map((record) => ({
-      path: record.packageRelativePath,
-      size: record.size,
-      sha256: record.sha256,
-      executablePolicy: record.executablePolicy,
-    })).sort((left, right) => comparePath(left.path, right.path));
-    if (files.length === 0) fail(CODES.sdk);
-    const item = {
-      identity: node.identity,
-      integrity: node.integrity,
-      files,
-      edges: node.edges.map((edge) => ({ kind: edge.kind, name: edge.name, targetIdentity: edge.targetIdentity }))
-        .sort((left, right) => comparePath(`${left.kind}:${left.name}:${left.targetIdentity}`, `${right.kind}:${right.name}:${right.targetIdentity}`)),
-    };
-    const encoded = canonicalJsonBytes(item, { maxBytes: DEPLOYMENT_ENVELOPE_LIMITS.inventoryBytes, maxDepth: 16, maxNodes: 1_000_000 });
-    const existing = byIdentity.get(node.identity);
-    if (existing && !existing.equals(encoded)) fail(CODES.sdk);
-    byIdentity.set(node.identity, encoded);
+  let sdkClosure;
+  try {
+    sdkClosure = collectBunPackageClosure({
+      nodes,
+      rootKey: root.key,
+      recordsByOwner,
+      requireExternal: true,
+    });
+  } catch {
+    fail(CODES.sdk);
   }
-  const packages = [...byIdentity.values()].map((bytes) => parseCanonicalJsonBytes(bytes, {
-    maxBytes: DEPLOYMENT_ENVELOPE_LIMITS.inventoryBytes, maxDepth: 16, maxNodes: 1_000_000,
-  })).sort((left, right) => comparePath(left.identity, right.identity));
-  const closureBytes = canonicalJsonBytes({ packages }, {
-    maxBytes: DEPLOYMENT_ENVELOPE_LIMITS.inventoryBytes, maxDepth: 16, maxNodes: 1_000_000,
-  });
-  const closureFingerprint = createHash('sha256')
-    .update(contract.sdk.closureDomain, 'utf8').update(Buffer.from([0])).update(closureBytes).digest('hex');
-  const rootRecords = recordsByOwner.get(root.key) ?? [];
-  const sourceContracts = {};
-  for (const domain of SDK_ROOTS) {
-    const path = contract.sdk.sourceRoots[domain];
-    const record = rootRecords.find((candidate) => candidate.packageRelativePath === path);
-    if (!record) fail(CODES.sdk);
-    sourceContracts[domain] = createHash('sha256')
-      .update(`${contract.sdk.sourceContractDomain}/${domain}`, 'utf8').update(Buffer.from([0]))
-      .update(canonicalJsonBytes({
-        rootIdentity: root.identity,
-        sourcePath: path,
-        sourceSha256: record.sha256,
-        closureFingerprint,
-      })).digest('hex');
-  }
+  const rootRecords = sdkClosure.recordsByOwner.get(root.key) ?? [];
   const configRecord = rootRecords.find((record) => record.packageRelativePath === 'src/config/config-schema-version.ts');
   const sessionRecord = rootRecords.find((record) => record.packageRelativePath === 'src/session/session-manager.ts');
   if (!configRecord || !sessionRecord) fail(CODES.sdk);
@@ -1311,18 +919,17 @@ async function sdkContractFor({ nodes, recordsByOwner, contract, readRecordBytes
     readRecordBytes(configRecord),
     readRecordBytes(sessionRecord),
   ]);
-  const configText = decodeUtf8(configBytes, CODES.sdk);
-  const sessionText = decodeUtf8(sessionBytes, CODES.sdk);
-  if ((configText.match(/export const CONFIG_SCHEMA_VERSION = 2;/g) ?? []).length !== 1 ||
-      (sessionText.match(/export const CURRENT_SESSION_VERSION = 5;/g) ?? []).length !== 1) fail(CODES.sdk);
-  const sdkContract = buildSdkExternalStateContract({
-    packageName: contract.sdk.packageName,
-    packageVersion: contract.sdk.packageVersion,
-    lockIntegrity: contract.sdk.lockIntegrity,
-    configSchemaVersion: contract.sdk.configSchemaVersion,
-    sourceContracts,
-  });
-  return Object.freeze({ sdkContract: deepFreeze(sdkContract), closureFingerprint, packageCount: packages.length });
+  let provenance;
+  try {
+    provenance = deriveSdkExternalStateContract({
+      packages: sdkClosure.packages,
+      configSchemaVersionSource: configBytes,
+      sessionManagerSource: sessionBytes,
+    });
+  } catch {
+    fail(CODES.sdk);
+  }
+  return Object.freeze(provenance);
 }
 
 function compatibilityFor(contract, sdkFingerprint) {
@@ -1649,21 +1256,6 @@ function expectedCompatibility(contract, fingerprint) {
   return compatibilityFor(contract, fingerprint);
 }
 
-function archivePackageRoot(path) {
-  for (const workspace of SOURCE_WORKSPACES) {
-    if (path === `${workspace}/package.json`) return workspace;
-  }
-  if (!path.endsWith('/package.json')) return null;
-  const segments = path.split('/');
-  for (let index = segments.length - 2; index >= 0; index -= 1) {
-    if (segments[index] !== 'node_modules') continue;
-    const packageLength = segments[index + 1]?.startsWith('@') ? 2 : 1;
-    if (index + packageLength + 1 !== segments.length - 1) continue;
-    return segments.slice(0, index + packageLength + 1).join('/');
-  }
-  return null;
-}
-
 function archiveOwnRecords(inspection, root) {
   const prefix = `${root}/`;
   return inspection.files
@@ -1679,134 +1271,28 @@ function archiveOwnRecords(inspection, root) {
     }));
 }
 
-function resolveArchiveDependency(packageRoots, consumerRoot, name) {
-  dependencySegments(name);
-  let directory = consumerRoot;
-  while (true) {
-    const candidate = directory === '' ? `node_modules/${name}` : `${directory}/node_modules/${name}`;
-    if (packageRoots.has(candidate)) return candidate;
-    if (directory === '') return null;
-    const parent = pathPosix.dirname(directory);
-    directory = pathPosix.basename(parent) === 'node_modules'
-      ? pathPosix.dirname(parent)
-      : parent;
-    if (directory === '.') directory = '';
+async function buildArchiveClosure({ inspection, packageBytesByRoot, lock, contract, platform, architecture }) {
+  let closure;
+  try {
+    closure = await resolveBunProductionClosure({
+      lock,
+      contract,
+      platform,
+      architecture,
+      packageRoots: new Set(packageBytesByRoot.keys()),
+      readPackageRoot: async (root) => {
+        const packageBytes = packageBytesByRoot.get(root);
+        if (!packageBytes) return null;
+        return { realRoot: root, packageBytes };
+      },
+    });
+  } catch (error) {
+    fail(error?.code === 'SERVICE_PRODUCTION_LOCK_INVALID' ? CODES.lock : CODES.closure);
   }
-}
-
-function buildArchiveClosure({ inspection, packageBytesByRoot, lock, contract, platform, architecture }) {
-  const nodes = new Map();
-  const workspaceByName = new Map();
-  const recordsByOwner = new Map();
-  const queue = [];
-  for (const workspace of contract.sourceWorkspaces) {
-    const packageBytes = packageBytesByRoot.get(workspace.path);
-    if (!packageBytes) fail(CODES.closure);
-    const packageJson = parsePackage(packageBytes);
-    const lockWorkspace = lock.lock.workspaces[workspace.path];
-    if (packageJson.name !== workspace.packageName || packageJson.version !== workspace.packageVersion ||
-        !plain(lockWorkspace) || lockWorkspace.name !== workspace.packageName ||
-        lockWorkspace.version !== workspace.packageVersion ||
-        !sameStringMap(packageJson.dependencies, lockWorkspace.dependencies) ||
-        lock.workspaces.get(workspace.packageName)?.workspace !== workspace.path) fail(CODES.lock);
-    const node = {
-      key: `workspace:${workspace.path}`,
-      root: workspace.path,
-      packageJson,
-      name: workspace.packageName,
-      version: workspace.packageVersion,
-      identity: `${workspace.packageName}@workspace:${workspace.path}`,
-      integrity: null,
-      lockMetadata: lockWorkspace,
-      workspace: workspace.path,
-      edges: [],
-    };
-    nodes.set(node.key, node);
-    workspaceByName.set(node.name, node);
-    recordsByOwner.set(node.key, archiveOwnRecords(inspection, workspace.path));
-    queue.push(node);
-  }
-
-  const admittedRoots = new Set(SOURCE_WORKSPACES);
-  while (queue.length > 0) {
-    const node = queue.shift();
-    for (const edge of dependencyCategories(node.packageJson, node.lockMetadata)) {
-      const workspaceEdge = workspaceLockForEdge(lock, edge);
-      const root = resolveArchiveDependency(packageBytesByRoot, node.root, edge.name);
-      if (root === null) {
-        if (edge.allowAbsent ||
-            (edge.optional &&
-              !applicableLockCandidate(lock, edge, platform, architecture))) {
-          continue;
-        }
-        fail(CODES.closure);
-      }
-      const packageJson = parsePackage(packageBytesByRoot.get(root));
-      if (packageJson.name !== edge.name ||
-          !edgeAcceptsVersion(edge, packageJson.version)) fail(CODES.closure);
-      if (!packageTargetApplies(packageJson, platform, architecture)) {
-        if (edge.optional) continue;
-        fail(CODES.closure);
-      }
-      const key = `location:${root}`;
-      let target = nodes.get(key);
-      if (workspaceEdge !== null) {
-        const workspace = workspaceByName.get(edge.name);
-        if (!workspace || packageJson.version !== workspaceEdge.version) {
-          fail(CODES.closure);
-        }
-        if (!target) {
-          target = {
-            ...workspace,
-            key,
-            root,
-            packageJson,
-            edges: [],
-          };
-          nodes.set(key, target);
-          recordsByOwner.set(key, archiveOwnRecords(inspection, root));
-          queue.push(target);
-        }
-      } else {
-        const locked = externalLockForEdge(
-          lock,
-          edge,
-          packageJson,
-          platform,
-          architecture,
-          bunLockKeyForRelativePackagePath(root),
-        );
-        const identity = locked.identity;
-        if (!target) {
-          target = {
-            key,
-            root,
-            packageJson,
-            name: packageJson.name,
-            version: packageJson.version,
-            identity,
-            integrity: locked.integrity,
-            lockMetadata: locked.metadata,
-            workspace: null,
-            edges: [],
-          };
-          nodes.set(key, target);
-          recordsByOwner.set(key, archiveOwnRecords(inspection, root));
-          queue.push(target);
-        }
-      }
-      admittedRoots.add(root);
-      node.edges.push(Object.freeze({
-        kind: edge.kind,
-        name: edge.name,
-        targetKey: target.key,
-        targetIdentity: target.identity,
-      }));
-    }
-  }
-  for (const root of packageBytesByRoot.keys()) {
-    if (!admittedRoots.has(root)) fail(CODES.closure);
-  }
+  const { nodes, admittedRoots } = closure;
+  const recordsByOwner = new Map([...nodes.values()].map((node) =>
+    [node.key, archiveOwnRecords(inspection, node.root)]));
+  for (const root of packageBytesByRoot.keys()) if (!admittedRoots.has(root)) fail(CODES.closure);
   const ownedPaths = new Set(['package.json', 'bun.lock']);
   for (const records of recordsByOwner.values()) {
     for (const record of records) {
@@ -1836,7 +1322,7 @@ async function captureCandidateEvidence({ archivePath, manifest, inspection, con
     '/src/session/session-manager.ts',
   ];
   for (const record of inspection.files) {
-    if (archivePackageRoot(record.path) !== null && !wanted.has(record.path)) {
+    if (bunPackageRootForPath(record.path) !== null && !wanted.has(record.path)) {
       wanted.set(record.path, { maximum: PACKAGE_LIMIT, chunks: [], size: 0, code: CODES.closure });
     }
     if (sdkContentSuffixes.some((suffix) => record.path.endsWith(suffix)) &&
@@ -1887,6 +1373,51 @@ async function captureCandidateEvidence({ archivePath, manifest, inspection, con
   if (addonBytes === 0 || addonHash.digest('hex') !== receipt.addonSha256 ||
       receipt.manifestFingerprint !== manifest.nativeControl.manifestFingerprint) fail(CODES.native);
   return Object.freeze({ values });
+}
+
+// Signed Windows service guard metadata: the static closure of the guard as
+// the release runtime resolves it (package aliases under root node_modules),
+// never the source-tree paths. Component-local aliases would shadow the
+// declared guard for one entrypoint, so they are refused.
+export function windowsServiceBootstrapMetadata(payloadEntries) {
+  const byPath = new Map(payloadEntries.map((entry) => [entry.path, entry]));
+  for (const entry of payloadEntries) {
+    if (/^(?:bot|daemon)\/(?:src\/)?node_modules\/(?:@gjc-remote\/(?:native-control|shared)|dotenv)\//.test(entry.path)) fail(CODES.native);
+  }
+  const guardDirectory = `${NATIVE_ALIAS}/src`;
+  const resolvePackage = (name) => {
+    const segments = guardDirectory.split('/');
+    for (let length = segments.length; length >= 0; length -= 1) {
+      if (length > 0 && segments[length - 1] === 'node_modules') continue;
+      const base = [...segments.slice(0, length), 'node_modules', name].join('/');
+      if (byPath.has(`${base}/package.json`)) return base;
+    }
+    fail(CODES.native);
+  };
+  const roots = [
+    ['native-control/', `${NATIVE_ALIAS}/`],
+    ['shared/', `${resolvePackage('@gjc-remote/shared')}/`],
+    ['node_modules/dotenv/', `${resolvePackage('dotenv')}/`],
+  ];
+  const staticClosure = SERVICE_BOOTSTRAP_STATIC_CLOSURE.map((sourcePath) => {
+    const root = roots.find(([prefix]) => sourcePath.startsWith(prefix));
+    if (!root) fail(CODES.native);
+    const relativePath = `${root[1]}${sourcePath.slice(root[0].length)}`;
+    const record = byPath.get(relativePath);
+    if (!record) fail(CODES.native);
+    return { relativePath, sha256: record.sha256 };
+  }).sort((left, right) => utf8Compare(left.relativePath, right.relativePath));
+  return {
+    schemaVersion: 1,
+    guardPath: `${guardDirectory}/service-bootstrap.js`,
+    staticClosure,
+    staticClosureFingerprint: windowsServiceBootstrapClosureFingerprint(staticClosure),
+    runtimePolicies: {
+      bot: { ...WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES.bot },
+      daemon: { ...WINDOWS_SERVICE_BOOTSTRAP_RUNTIME_POLICIES.daemon },
+    },
+    externalBunConfig: { ...WINDOWS_SERVICE_BOOTSTRAP_EXTERNAL_BUN_CONFIG },
+  };
 }
 
 function verifyNativeAliases(inspection, platform) {
@@ -1996,10 +1527,10 @@ export async function verifyUnsignedServiceRelease(input = {}) {
     const lock = parseBunProductionLock(lockBytes);
     const packageBytesByRoot = new Map();
     for (const [path, bytes] of evidence.values) {
-      const root = archivePackageRoot(path);
+      const root = bunPackageRootForPath(path);
       if (root !== null) packageBytesByRoot.set(root, bytes);
     }
-    const closure = buildArchiveClosure({
+    const closure = await buildArchiveClosure({
       inspection,
       packageBytesByRoot,
       lock,
@@ -2209,6 +1740,9 @@ export async function buildUnsignedServiceRelease(input) {
       },
       wireCapabilities: contract.wireCapabilities,
       compatibility,
+      ...(input.platform === 'win32'
+        ? { windowsServiceBootstrap: windowsServiceBootstrapMetadata(inventory.payloadEntries) }
+        : {}),
     });
     await assertOutputDirectory(input.outputDirectory, outputIdentity);
     await writeExclusive(join(input.outputDirectory, names.manifest), canonicalJsonBytes(manifest, {

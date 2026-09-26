@@ -1,5 +1,7 @@
 import { validateServiceRoles } from '@gjc-remote/shared/service-lifecycle-envelope';
+import { isCanonicalWindowsSid } from '@gjc-remote/shared/identity';
 import { capabilitySignatures, serviceCapabilities } from './capabilities.js';
+import { createServiceBootstrapNative } from './service-bootstrap-native.js';
 
 const FACTORY_KEYS = Object.freeze(['roles']);
 const ROLE_KEYS = Object.freeze(['management', 'bot', 'recovery', 'daemon', 'system']);
@@ -16,6 +18,34 @@ function serviceError(code, operation) {
   error.ambiguous = false;
   throw error;
 }
+
+export function createSelfProcessObserverFactory(loadBootstrapNative) {
+  if (typeof loadBootstrapNative !== 'function') {
+    serviceError('SERVICE_INVALID', 'create_self_process_observer');
+  }
+  return function createSelfProcessObserver() {
+    if (arguments.length !== 0) serviceError('SERVICE_INVALID', 'create_self_process_observer');
+    const projection = loadBootstrapNative();
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(projection, 'observeSelfProcessEpoch');
+    } catch {
+      serviceError('SERVICE_INVALID', 'create_self_process_observer');
+    }
+    if (typeof descriptor?.value !== 'function') {
+      serviceError('SERVICE_INVALID', 'create_self_process_observer');
+    }
+    const observe = descriptor.value;
+    return Object.freeze({
+      observeSelfProcessEpoch() {
+        if (arguments.length !== 0) serviceError('SERVICE_INVALID', 'observe_self_process_epoch');
+        return observe();
+      },
+    });
+  };
+}
+
+export const createSelfProcessObserver = createSelfProcessObserverFactory(createServiceBootstrapNative);
 
 function refused(reason) {
   const error = new Error(`create_service_native refused: ${reason}`);
@@ -47,20 +77,6 @@ function exactDataValues(value, keys) {
   }
 }
 
-function isWindowsSidShape(value) {
-  const fields = value.split('-');
-  if (fields.length < 4 || fields.length > 18 ||
-      fields[0] !== 'S' || fields[1] !== '1') return false;
-  const decimal = /^(0|[1-9][0-9]*)$/;
-  if (!fields.slice(2).every((field) => decimal.test(field))) return false;
-  try {
-    if (BigInt(fields[2]) > 281474976710655n) return false;
-    return fields.slice(3).every((field) => BigInt(field) <= 4294967295n);
-  } catch {
-    return false;
-  }
-}
-
 function principalSnapshot(value) {
   const values = exactDataValues(value, PRINCIPAL_KEYS);
   return values ? Object.freeze({ kind: values.kind, value: values.value }) : null;
@@ -87,7 +103,7 @@ function roleSnapshot(options) {
   // Windows-only bound mirrors the native SID parser's numeric/count limits so
   // a role tuple that native code cannot represent is refused before loading.
   if (process.platform === 'win32' &&
-      !ROLE_KEYS.every((role) => isWindowsSidShape(roles[role].value))) {
+      !ROLE_KEYS.every((role) => isCanonicalWindowsSid(roles[role].value))) {
     serviceError('SERVICE_INVALID', 'create_service_native');
   }
   return roles;

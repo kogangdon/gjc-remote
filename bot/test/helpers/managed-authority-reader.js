@@ -1,6 +1,6 @@
 import { authoritySuccessorPreviousLeaseBindingFingerprint, buildAuthoritySuccessorRecord, validateAuthoritySuccessorBundle } from "@gjc-remote/shared/successor-envelope";
 import { isHex64 } from "@gjc-remote/shared/strict-json";
-import { validateManagedProof } from "../../src/managed-authority-reader.js";
+import { validateManagedProof } from "@gjc-remote/shared/managed-authority-proof";
 const WRAPPER_NAMES = new Set(["managed-v1-wrapper.json", "legacy-retained.json"]);
 const CONTROL_ROOT_NAME = "control-root.json";
 
