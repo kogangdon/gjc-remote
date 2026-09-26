@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.4] - 2026-09-27
+
+Supersedes the unpublished `v0.4.0-rc.3` draft, whose native addon cannot
+qualify Windows services (see Fixed).
+
 ### Windows production service-host composition (source level)
 
 - Compose the Windows x64 direct lifecycle CLI from one operation-scoped host
@@ -16,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the signed same-process service bootstrap guard with the Node 26.7.0 /
   Bun 1.4.2 runtime policy. Bot and daemon now report real startup events, and
   the two-family Shawl log observer lives in native contract 5 revision 1
-  (native 2.0.0, application 0.4.0-rc.3).
+  (native 2.0.0, application 0.4.0-rc.4).
 - Add the credential-free `smoke:windows-host-fixture` foreground fixture.
   The native addon was only compiled unsigned for local audit; none of this is
   signed-addon, SCM, account/ACL, reboot, or actual service lifecycle evidence;
