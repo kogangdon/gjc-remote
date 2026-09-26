@@ -84,7 +84,7 @@ ENTRYPOINT ["/usr/bin/tini", "--", "bun", "/app/daemon/src/container-entrypoint.
 FROM native_control_bundle AS signed-native
 
 FROM runtime-base AS runtime
-ARG VERSION=0.4.0-rc.3
+ARG VERSION=0.4.0-rc.4
 ARG REVISION
 ARG LOCK_SHA256
 RUN test -n "${REVISION}" && test "${REVISION}" != unknown

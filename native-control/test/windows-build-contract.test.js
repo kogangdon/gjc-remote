@@ -50,7 +50,7 @@ test('native source package, verifier, and signed metadata use only contract 5 r
     platforms: nativeTargets,
   });
   assert.deepEqual(nativeControlPackage.dependencies, {
-    '@gjc-remote/shared': '0.4.0-rc.3',
+    '@gjc-remote/shared': '0.4.0-rc.4',
     dotenv: '16.6.1',
     'jsonc-parser': '3.3.1',
     semver: '7.8.5',

@@ -1,6 +1,6 @@
 {
   "name": "@gjc-remote/shared",
-  "version": "0.4.0-rc.3",
+  "version": "0.4.0-rc.4",
   "private": true,
   "type": "module",
   "main": "protocol.js",
