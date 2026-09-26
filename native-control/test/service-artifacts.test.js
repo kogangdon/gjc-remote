@@ -162,8 +162,8 @@ function applicationFixture() {
     nativeControl: {
       manifestPath: 'native-control/build/Release/native-control.manifest.json',
       manifestFingerprint: hash('4'),
-      contractVersion: 4,
-      contractRevision: 4,
+      contractVersion: 5,
+      contractRevision: 1,
     },
     wireCapabilities: ['gate_presentation_v1'],
     compatibility: compatibility(),
@@ -262,6 +262,7 @@ class ArtifactNativeModel {
     this.readerChunkBytes = null;
     this.activeReaders = 0;
     this.publications = 0;
+    this.lastPublicationObservation = null;
   }
 
   profileMode(profile) {
@@ -685,13 +686,18 @@ class ArtifactNativeModel {
         }
         model.log.push(`close:${handle.node.name}`);
       },
-      observePublication(purpose, manifest, identity) {
+      observePublication(purpose, manifest, identity, operation, disposition, inventory) {
         const rootKind = purpose === 'application' ? 'releases' : 'shawl';
         const name = purpose === 'application' ? manifest.archive.sha256 : manifest.executable.sha256;
         const node = model.roots.get(rootKind)?.entries.get(name);
         if (!node || !same(node.identity, identity)) {
           throw error('SERVICE_STALE', 'observe_service_publication', model.writes);
         }
+        model.lastPublicationObservation = Object.freeze({
+          purpose,
+          disposition,
+          inventory,
+        });
         return Object.freeze({
           purpose,
           manifestFingerprint: manifest.manifestFingerprint,
@@ -890,6 +896,9 @@ test('artifact access streams, rereads twice, writes empty files, seals bottom-u
   await prepareApplication(access, fixture);
   const publication = access.publishCandidate();
   assert.equal(publication.manifestFingerprint, fixture.manifest.manifestFingerprint);
+  assert.equal(model.lastPublicationObservation.purpose, 'application');
+  assert.equal(model.lastPublicationObservation.disposition, 'published');
+  assert.deepEqual(model.lastPublicationObservation.inventory, fixture.inventory);
   const writesAfterPublication = model.writes;
   access.publishCandidate();
   assert.equal(model.writes, writesAfterPublication);
@@ -1045,6 +1054,8 @@ test('artifact access reuses only an exact immutable target and refuses drift', 
   await prepareApplication(access, fixture);
   access.publishCandidate();
   assert.equal(model.publications, 1);
+  assert.equal(model.lastPublicationObservation.disposition, 'reused');
+  assert.deepEqual(model.lastPublicationObservation.inventory, fixture.inventory);
   access.close();
 
   const drift = new ArtifactNativeModel();
@@ -1869,8 +1880,8 @@ function realApplicationFixture() {
     nativeControl: {
       manifestPath: 'native-control/build/Release/native-control.manifest.json',
       manifestFingerprint: hash('4'),
-      contractVersion: 4,
-      contractRevision: 4,
+      contractVersion: 5,
+      contractRevision: 1,
     },
     wireCapabilities: ['gate_presentation_v1'],
     compatibility: compatibility(),

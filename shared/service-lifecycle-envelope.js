@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { canonicalJsonBytes, canonicalJsonHash, isHex64, utf8Compare, assertStrictText } from "./strict-json.js";
-import { isPrincipal } from "./identity.js";
+import { isCanonicalWindowsSid, isPrincipal } from "./identity.js";
 import { DEPLOYMENT_ENVELOPE_LIMITS, validateDeploymentSource } from "./deployment-envelope.js";
 
 export const SERVICE_LIFECYCLE_LIMITS = Object.freeze({
@@ -12,6 +12,11 @@ export const SERVICE_LIFECYCLE_LIMITS = Object.freeze({
   servicePasswordBytes: 16 * 1024,
   protectedRecordBytes: 16 * 1024 * 1024,
   startupWindowMs: 60_000,
+  startupCursorFilesPerFamily: 3,
+  startupCursorFileBytes: 2 * 1024 * 1024,
+  startupCursorLogicalBytes: 16 * 1024 * 1024,
+  startupCursorBytes: 16 * 1024 * 1024,
+  startupPartialLineBytes: 16_384,
   expectedHostCount: 100_000,
 });
 
@@ -126,6 +131,70 @@ function strictText(value, name, maxBytes, { allowEmpty = false } = {}) {
   try { assertStrictText(value, name, maxBytes); } catch { fail(name); }
   if (!allowEmpty && value.length === 0) fail(name);
   return value;
+}
+
+// New Windows readiness records are security boundaries, not ordinary input
+// objects.  Inspect descriptors before reading a property so an accessor cannot
+// run as part of validation or fingerprinting.
+function strictDataTree(value, seen = new Set(), depth = 0, nodes = { count: 0 }) {
+  if (depth > 64 || ++nodes.count > 100_000) fail("record complexity");
+  if (value === null || typeof value !== "object") return;
+  if (seen.has(value)) fail("cyclic record");
+  seen.add(value);
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) fail("record array prototype");
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== value.length + 1 || !keys.includes("length")) fail("record array properties");
+    const length = Object.getOwnPropertyDescriptor(value, "length");
+    if (!length || length.enumerable || !Object.hasOwn(length, "value") || length.value !== value.length) fail("record array length");
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) fail("record array element");
+      strictDataTree(descriptor.value, seen, depth + 1, nodes);
+    }
+  } else {
+    if (Object.getPrototypeOf(value) !== Object.prototype) fail("record object prototype");
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") fail("record symbol property");
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) fail("record data property");
+      strictDataTree(descriptor.value, seen, depth + 1, nodes);
+    }
+  }
+  seen.delete(value);
+}
+
+function strictExact(value, keys) {
+  if (!plain(value)) return false;
+  const own = Reflect.ownKeys(value);
+  if (own.length !== keys.length || own.some((key) => typeof key !== "string") ||
+      !keys.every((key) => Object.hasOwn(value, key))) return false;
+  try {
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return false;
+      strictDataTree(descriptor.value);
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function strictFields(fields, keys, name) {
+  if (!strictExact(fields, keys)) fail(name);
+  return Object.fromEntries(keys.map((key) => [key, Object.getOwnPropertyDescriptor(fields, key).value]));
+}
+
+function strictFingerprint(record, field) {
+  if (!plain(record)) fail(`${field} preimage`);
+  strictDataTree(record);
+  if (!Object.hasOwn(record, field)) fail(`${field} preimage`);
+  const preimage = {};
+  for (const key of Reflect.ownKeys(record)) {
+    if (key !== field) preimage[key] = Object.getOwnPropertyDescriptor(record, key).value;
+  }
+  return canonicalJsonHash(preimage);
 }
 
 function fingerprint(record, field) {
@@ -503,31 +572,346 @@ export function buildServiceTransaction(fields) {
   return validateServiceTransaction(transaction);
 }
 
-export function serviceStartupProofFingerprint(proof) { return fingerprint(proof, "startupProof"); }
+const STARTUP_PROOF_COMMON_KEYS = ["schemaVersion", "kind", "component", "serviceKey", "platform", "architecture", "serviceGeneration", "transactionId", "resourceProof", "applicationManifestFingerprint", "bootFingerprint", "processEpochFingerprint", "platformEvidenceFingerprint", "applicationEvidenceFingerprint", "platformState", "startupEvidence", "connectivityObservation", "startupProof"];
+const LINUX_STARTUP_PROOF_KEYS = [...STARTUP_PROOF_COMMON_KEYS.slice(0, -1), "startBoundaryMs", "observedAtMs", "expiresAtMs", ...STARTUP_PROOF_COMMON_KEYS.slice(-1)];
+const WINDOWS_STARTUP_PROOF_KEYS = [...STARTUP_PROOF_COMMON_KEYS.slice(0, -1), "clockKind", "boundaryFingerprint", "observedTickMs", "deadlineTickMs", "logEvidenceFingerprint", ...STARTUP_PROOF_COMMON_KEYS.slice(-1)];
+const WINDOWS_STARTUP_PROOF_FIELD_KEYS = WINDOWS_STARTUP_PROOF_KEYS.filter((key) => !["schemaVersion", "kind", "startupProof"].includes(key));
+
+export function serviceStartupProofFingerprint(proof) {
+  const platform = proof !== null && typeof proof === "object"
+    ? Object.getOwnPropertyDescriptor(proof, "platform")
+    : null;
+  if (platform && !Object.hasOwn(platform, "value")) fail("service startup proof platform");
+  return platform?.value === "win32" ? strictFingerprint(proof, "startupProof") : fingerprint(proof, "startupProof");
+}
 
 export function validateServiceStartupProof(proof) {
-  const keys = ["schemaVersion", "kind", "component", "serviceKey", "platform", "architecture", "serviceGeneration", "transactionId", "resourceProof", "applicationManifestFingerprint", "bootFingerprint", "processEpochFingerprint", "platformEvidenceFingerprint", "applicationEvidenceFingerprint", "platformState", "startBoundaryMs", "observedAtMs", "expiresAtMs", "startupEvidence", "connectivityObservation", "startupProof"];
-  if (!exact(proof, keys) || proof.schemaVersion !== 1 || proof.kind !== "service-startup-proof" ||
+  const platformDescriptor = proof !== null && typeof proof === "object"
+    ? Object.getOwnPropertyDescriptor(proof, "platform")
+    : null;
+  if (!platformDescriptor || !Object.hasOwn(platformDescriptor, "value")) fail("service startup proof platform");
+  const windows = platformDescriptor.value === "win32";
+  const keys = windows ? WINDOWS_STARTUP_PROOF_KEYS : LINUX_STARTUP_PROOF_KEYS;
+  if (!(windows ? strictExact(proof, keys) : exact(proof, keys)) ||
+      proof.schemaVersion !== 1 || proof.kind !== "service-startup-proof" ||
       !positive(proof.serviceGeneration) || typeof proof.transactionId !== "string" || !SAFE_ID.test(proof.transactionId) ||
       [proof.resourceProof, proof.applicationManifestFingerprint, proof.bootFingerprint, proof.processEpochFingerprint, proof.platformEvidenceFingerprint, proof.applicationEvidenceFingerprint, proof.startupProof].some((value) => !isHex64(value)) ||
-      !nonnegative(proof.startBoundaryMs) || !nonnegative(proof.observedAtMs) || !nonnegative(proof.expiresAtMs) ||
       proof.startupEvidence !== "fresh-current-epoch" || !SERVICE_STATUS_VALUES.connectivityObservation.includes(proof.connectivityObservation)) fail("service startup proof schema");
+  if (windows) {
+    if (proof.clockKind !== "windows-boot-tick" || !isHex64(proof.boundaryFingerprint) ||
+        !nonnegative(proof.observedTickMs) || !nonnegative(proof.deadlineTickMs) ||
+        proof.observedTickMs > proof.deadlineTickMs || !isHex64(proof.logEvidenceFingerprint)) {
+      fail("Windows startup proof clock evidence");
+    }
+  } else if (!nonnegative(proof.startBoundaryMs) || !nonnegative(proof.observedAtMs) || !nonnegative(proof.expiresAtMs)) {
+    fail("Linux startup proof clock evidence");
+  }
   validateTuple(proof.platform, proof.architecture);
   validateComponentAndKey(proof.component, proof.serviceKey);
   validateServicePlatformState(proof.platformState, proof.platform);
   if (proof.platformState.phase !== "trial" || proof.platformState.activation !== "suppressed-controller-startable") fail("startup proof trial state");
-  if (proof.observedAtMs < proof.startBoundaryMs || proof.observedAtMs > proof.expiresAtMs ||
+  if (!windows && (proof.observedAtMs < proof.startBoundaryMs || proof.observedAtMs > proof.expiresAtMs ||
       proof.expiresAtMs <= proof.startBoundaryMs ||
-      proof.expiresAtMs - proof.startBoundaryMs > SERVICE_LIFECYCLE_LIMITS.startupWindowMs) fail("startup proof time window");
+      proof.expiresAtMs - proof.startBoundaryMs > SERVICE_LIFECYCLE_LIMITS.startupWindowMs)) {
+    fail("Linux startup proof time window");
+  }
   if (proof.component === "bot" ? proof.connectivityObservation !== "last-observed-connected" : proof.connectivityObservation !== "startup-only") fail("startup proof application evidence relation");
   if (serviceStartupProofFingerprint(proof) !== proof.startupProof) fail("service startup proof fingerprint");
   return proof;
 }
 
 export function buildServiceStartupProof(fields) {
+  const platformDescriptor = fields !== null && typeof fields === "object"
+    ? Object.getOwnPropertyDescriptor(fields, "platform")
+    : null;
+  if (!platformDescriptor || !Object.hasOwn(platformDescriptor, "value")) fail("service startup proof fields");
+  if (platformDescriptor.value === "win32") {
+    const values = strictFields(fields, WINDOWS_STARTUP_PROOF_FIELD_KEYS, "Windows startup proof fields");
+    const proof = { schemaVersion: 1, kind: "service-startup-proof", ...values, startupProof: null };
+    proof.startupProof = serviceStartupProofFingerprint(proof);
+    return validateServiceStartupProof(proof);
+  }
   const proof = { schemaVersion: 1, kind: "service-startup-proof", ...fields, startupProof: null };
   proof.startupProof = serviceStartupProofFingerprint(proof);
   return validateServiceStartupProof(proof);
+}
+
+const BOOT_CLOCK_KEYS = ["schemaVersion", "bootFingerprint", "tickMs", "writes"];
+const FILE_CURSOR_KEYS = ["identityFingerprint", "logicalStartOffset", "observedLength", "prefixSha256"];
+const FAMILY_CURSOR_KEYS = ["family", "baseName", "directoryIdentityFingerprint", "files", "nextLogicalOffset", "partialLineBytes", "absenceFingerprint"];
+const CURSOR_SET_KEYS = ["schemaVersion", "bootFingerprint", "serviceKey", "configFingerprint", "families", "cursorFingerprint"];
+const TRIAL_BOUNDARY_KEYS = ["schemaVersion", "kind", "serviceKey", "transactionId", "transactionNonce", "transitionFingerprint", "attempt", "revision", "previousBoundaryFingerprint", "phase", "bootFingerprint", "startTickMs", "deadlineTickMs", "lastTickMs", "applicationManifestFingerprint", "resourceFingerprint", "effectiveConfigFingerprint", "configSourceIdentityFingerprint", "wrapperEpochFingerprint", "childEpochFingerprint", "initialCursor", "childCursor", "boundaryFingerprint"];
+const TRIAL_BOUNDARY_FIELD_KEYS = TRIAL_BOUNDARY_KEYS.filter((key) => !["schemaVersion", "kind", "deadlineTickMs", "boundaryFingerprint"].includes(key));
+const LOG_EVIDENCE_KEYS = ["schemaVersion", "boundaryFingerprint", "bootFingerprint", "observedTickMs", "wrapperEpochFingerprint", "childEpochFingerprint", "treeFingerprint", "fromCursorFingerprint", "toCursor", "completeEof", "applicationStateFingerprint", "evidenceFingerprint"];
+const LOG_EVIDENCE_FIELD_KEYS = LOG_EVIDENCE_KEYS.filter((key) => !["schemaVersion", "evidenceFingerprint"].includes(key));
+const LOG_FAMILY_BASE = /^gjc-remote-(?:bot|daemon-[a-z0-9][a-z0-9.-]{0,159})-(wrapper|child)$/;
+
+export function validateServiceBootClock(clock) {
+  if (!strictExact(clock, BOOT_CLOCK_KEYS) || clock.schemaVersion !== 1 ||
+      !isHex64(clock.bootFingerprint) || !nonnegative(clock.tickMs) || clock.writes !== 0) {
+    fail("service boot clock");
+  }
+  return clock;
+}
+
+export function buildServiceBootClock(fields) {
+  const values = strictFields(fields, ["bootFingerprint", "tickMs"], "service boot clock fields");
+  const clock = { schemaVersion: 1, ...values, writes: 0 };
+  return validateServiceBootClock(clock);
+}
+
+export function validateServiceFileCursor(cursor) {
+  if (!strictExact(cursor, FILE_CURSOR_KEYS) || !isHex64(cursor.identityFingerprint) ||
+      !nonnegative(cursor.logicalStartOffset) || cursor.logicalStartOffset > SERVICE_LIFECYCLE_LIMITS.startupCursorLogicalBytes ||
+      !nonnegative(cursor.observedLength) || cursor.observedLength > SERVICE_LIFECYCLE_LIMITS.startupCursorFileBytes ||
+      !Number.isSafeInteger(cursor.logicalStartOffset + cursor.observedLength) ||
+      cursor.logicalStartOffset + cursor.observedLength > SERVICE_LIFECYCLE_LIMITS.startupCursorLogicalBytes ||
+      !isHex64(cursor.prefixSha256)) {
+    fail("service file cursor");
+  }
+  return cursor;
+}
+
+export function buildServiceFileCursor(fields) {
+  const cursor = strictFields(fields, FILE_CURSOR_KEYS, "service file cursor fields");
+  return validateServiceFileCursor(cursor);
+}
+
+export function validateServiceFamilyCursor(cursor) {
+  if (!strictExact(cursor, FAMILY_CURSOR_KEYS) || !["wrapper", "child"].includes(cursor.family) ||
+      typeof cursor.baseName !== "string" || !LOG_FAMILY_BASE.test(cursor.baseName) ||
+      cursor.baseName.endsWith(`-${cursor.family}`) === false ||
+      !isHex64(cursor.directoryIdentityFingerprint) || !Array.isArray(cursor.files) ||
+      cursor.files.length > SERVICE_LIFECYCLE_LIMITS.startupCursorFilesPerFamily ||
+      !nonnegative(cursor.nextLogicalOffset) || cursor.nextLogicalOffset > SERVICE_LIFECYCLE_LIMITS.startupCursorLogicalBytes ||
+      !nonnegative(cursor.partialLineBytes) ||
+      cursor.partialLineBytes > SERVICE_LIFECYCLE_LIMITS.startupPartialLineBytes ||
+      !nullableHash(cursor.absenceFingerprint)) fail("service family cursor");
+  let end = null;
+  let totalBytes = 0;
+  const identities = new Set();
+  for (const file of cursor.files) {
+    validateServiceFileCursor(file);
+    if (identities.has(file.identityFingerprint)) fail("service family cursor file identity");
+    identities.add(file.identityFingerprint);
+    if (end !== null && file.logicalStartOffset !== end) fail("service family cursor continuity");
+    end = file.logicalStartOffset + file.observedLength;
+    totalBytes += file.observedLength;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > SERVICE_LIFECYCLE_LIMITS.startupCursorBytes) {
+      fail("service family cursor byte limit");
+    }
+  }
+  if (cursor.files.length === 0) {
+    if (cursor.absenceFingerprint === null || cursor.nextLogicalOffset !== 0 || cursor.partialLineBytes !== 0) {
+      fail("service absent family cursor");
+    }
+  } else if (cursor.absenceFingerprint !== null || cursor.nextLogicalOffset !== end ||
+      cursor.partialLineBytes > cursor.nextLogicalOffset) {
+    fail("service present family cursor");
+  }
+  return cursor;
+}
+
+export function buildServiceFamilyCursor(fields) {
+  const cursor = strictFields(fields, FAMILY_CURSOR_KEYS, "service family cursor fields");
+  return validateServiceFamilyCursor(cursor);
+}
+
+export function serviceCursorSetFingerprint(cursorSet) {
+  return strictFingerprint(cursorSet, "cursorFingerprint");
+}
+
+export function validateServiceCursorSet(cursorSet) {
+  if (!strictExact(cursorSet, CURSOR_SET_KEYS) || cursorSet.schemaVersion !== 1 ||
+      !isHex64(cursorSet.bootFingerprint) || !isHex64(cursorSet.configFingerprint) ||
+      !Array.isArray(cursorSet.families) || cursorSet.families.length !== 2 ||
+      !isHex64(cursorSet.cursorFingerprint)) fail("service cursor set");
+  validateServiceKey(cursorSet.serviceKey);
+  if (cursorSet.families[0].family !== "wrapper" || cursorSet.families[1].family !== "child") {
+    fail("service cursor family order");
+  }
+  let totalBytes = 0;
+  for (const family of cursorSet.families) {
+    validateServiceFamilyCursor(family);
+    const expectedBase = cursorSet.serviceKey === "bot"
+      ? `gjc-remote-bot-${family.family}`
+      : `gjc-remote-daemon-${cursorSet.serviceKey}-${family.family}`;
+    if (family.baseName !== expectedBase) fail("service cursor family identity");
+    for (const file of family.files) {
+      totalBytes += file.observedLength;
+      if (!Number.isSafeInteger(totalBytes) || totalBytes > SERVICE_LIFECYCLE_LIMITS.startupCursorBytes) {
+        fail("service cursor set byte limit");
+      }
+    }
+  }
+  if (serviceCursorSetFingerprint(cursorSet) !== cursorSet.cursorFingerprint) fail("service cursor set fingerprint");
+  return cursorSet;
+}
+
+export function buildServiceCursorSet(fields) {
+  const values = strictFields(fields, ["bootFingerprint", "serviceKey", "configFingerprint", "families"], "service cursor set fields");
+  const cursorSet = { schemaVersion: 1, ...values, cursorFingerprint: null };
+  cursorSet.cursorFingerprint = serviceCursorSetFingerprint(cursorSet);
+  return validateServiceCursorSet(cursorSet);
+}
+
+export function serviceTrialDeadlineTickMs(startTickMs) {
+  if (!nonnegative(startTickMs) || startTickMs > Number.MAX_SAFE_INTEGER - SERVICE_LIFECYCLE_LIMITS.startupWindowMs) {
+    fail("service trial deadline overflow");
+  }
+  return startTickMs + SERVICE_LIFECYCLE_LIMITS.startupWindowMs;
+}
+
+export function serviceTrialBoundaryFingerprint(boundary) {
+  return strictFingerprint(boundary, "boundaryFingerprint");
+}
+
+export function validateServiceTrialBoundary(boundary) {
+  if (!strictExact(boundary, TRIAL_BOUNDARY_KEYS) || boundary.schemaVersion !== 1 ||
+      boundary.kind !== "windows-service-trial-boundary" ||
+      typeof boundary.transactionId !== "string" || !SAFE_ID.test(boundary.transactionId) ||
+      typeof boundary.transactionNonce !== "string" || !NONCE.test(boundary.transactionNonce) ||
+      !isHex64(boundary.transitionFingerprint) || !positive(boundary.attempt) ||
+      !positive(boundary.revision) || !nullableHash(boundary.previousBoundaryFingerprint) ||
+      !["captured", "observed"].includes(boundary.phase) || !isHex64(boundary.bootFingerprint) ||
+      !nonnegative(boundary.startTickMs) || !nonnegative(boundary.deadlineTickMs) ||
+      !nonnegative(boundary.lastTickMs) || !isHex64(boundary.applicationManifestFingerprint) ||
+      !isHex64(boundary.resourceFingerprint) || !isHex64(boundary.effectiveConfigFingerprint) ||
+      !isHex64(boundary.configSourceIdentityFingerprint) ||
+      !nullableHash(boundary.wrapperEpochFingerprint) || !nullableHash(boundary.childEpochFingerprint) ||
+      !isHex64(boundary.boundaryFingerprint) || boundary.attempt > boundary.revision ||
+      (boundary.revision === 1) !== (boundary.previousBoundaryFingerprint === null) ||
+      (boundary.revision === 1 && boundary.attempt !== 1)) fail("service trial boundary");
+  validateServiceKey(boundary.serviceKey);
+  if (boundary.deadlineTickMs !== serviceTrialDeadlineTickMs(boundary.startTickMs) ||
+      boundary.lastTickMs < boundary.startTickMs || boundary.lastTickMs > boundary.deadlineTickMs) {
+    fail("service trial boundary clock window");
+  }
+  validateServiceCursorSet(boundary.initialCursor);
+  if (boundary.initialCursor.bootFingerprint !== boundary.bootFingerprint ||
+      boundary.initialCursor.serviceKey !== boundary.serviceKey ||
+      boundary.initialCursor.configFingerprint !== boundary.effectiveConfigFingerprint) {
+    fail("service trial boundary initial cursor binding");
+  }
+  if (boundary.phase === "captured") {
+    if (boundary.wrapperEpochFingerprint !== null || boundary.childEpochFingerprint !== null || boundary.childCursor !== null) {
+      fail("captured service trial boundary epoch relation");
+    }
+  } else {
+    if (!isHex64(boundary.wrapperEpochFingerprint) || !isHex64(boundary.childEpochFingerprint) ||
+        boundary.wrapperEpochFingerprint === boundary.childEpochFingerprint ||
+        boundary.childCursor === null) fail("observed service trial boundary epochs");
+    validateServiceCursorSet(boundary.childCursor);
+    if (boundary.childCursor.bootFingerprint !== boundary.bootFingerprint ||
+        boundary.childCursor.serviceKey !== boundary.serviceKey ||
+        boundary.childCursor.configFingerprint !== boundary.effectiveConfigFingerprint) {
+      fail("service trial boundary child cursor binding");
+    }
+  }
+  if (boundary.boundaryFingerprint !== serviceTrialBoundaryFingerprint(boundary)) {
+    fail("service trial boundary fingerprint");
+  }
+  return boundary;
+}
+
+export function buildServiceTrialBoundary(fields) {
+  const values = strictFields(fields, TRIAL_BOUNDARY_FIELD_KEYS, "service trial boundary fields");
+  const boundary = {
+    schemaVersion: 1,
+    kind: "windows-service-trial-boundary",
+    ...values,
+    deadlineTickMs: serviceTrialDeadlineTickMs(values.startTickMs),
+    boundaryFingerprint: null,
+  };
+  boundary.boundaryFingerprint = serviceTrialBoundaryFingerprint(boundary);
+  return validateServiceTrialBoundary(boundary);
+}
+
+export function validateServiceTrialBoundarySuccessor(previous, next) {
+  validateServiceTrialBoundary(previous);
+  validateServiceTrialBoundary(next);
+  const sameBoot = next.bootFingerprint === previous.bootFingerprint;
+  if (next.previousBoundaryFingerprint !== previous.boundaryFingerprint ||
+      previous.revision === Number.MAX_SAFE_INTEGER || next.revision !== previous.revision + 1 ||
+      (next.attempt === previous.attempt && next.lastTickMs < previous.lastTickMs)) {
+    fail("service trial boundary revision chain");
+  }
+  if (next.attempt === previous.attempt) {
+    const immutable = ["serviceKey", "transactionId", "transactionNonce", "transitionFingerprint", "bootFingerprint", "startTickMs", "deadlineTickMs", "applicationManifestFingerprint", "resourceFingerprint", "effectiveConfigFingerprint", "configSourceIdentityFingerprint"];
+    for (const key of immutable) if (next[key] !== previous[key]) fail("service trial boundary attempt identity");
+    if (canonicalJsonHash(next.initialCursor) !== canonicalJsonHash(previous.initialCursor) ||
+        previous.phase === "observed" && next.phase !== "observed") fail("service trial boundary original cursor or phase");
+    if (previous.phase === "observed" && next.wrapperEpochFingerprint !== previous.wrapperEpochFingerprint) {
+      fail("service trial boundary wrapper replacement");
+    }
+    if (previous.phase === "observed") {
+      for (let index = 0; index < 2; index += 1) {
+        const oldFamily = previous.childCursor.families[index];
+        const newFamily = next.childCursor.families[index];
+        if (oldFamily.family !== newFamily.family ||
+            oldFamily.baseName !== newFamily.baseName ||
+            oldFamily.directoryIdentityFingerprint !== newFamily.directoryIdentityFingerprint ||
+            newFamily.nextLogicalOffset < oldFamily.nextLogicalOffset) {
+          fail("service trial boundary cursor regression");
+        }
+      }
+    }
+  } else if (previous.attempt === Number.MAX_SAFE_INTEGER || next.attempt !== previous.attempt + 1 ||
+      next.phase !== "captured" || (sameBoot &&
+        (next.startTickMs < previous.lastTickMs || next.lastTickMs < previous.lastTickMs))) {
+    fail("service trial boundary attempt relation");
+  }
+  return next;
+}
+
+export function serviceLogEvidenceFingerprint(evidence) {
+  return strictFingerprint(evidence, "evidenceFingerprint");
+}
+
+export function validateServiceLogEvidence(evidence, boundary = undefined) {
+  if (!strictExact(evidence, LOG_EVIDENCE_KEYS) || evidence.schemaVersion !== 1 ||
+      !isHex64(evidence.boundaryFingerprint) || !isHex64(evidence.bootFingerprint) ||
+      !nonnegative(evidence.observedTickMs) || !isHex64(evidence.wrapperEpochFingerprint) ||
+      !isHex64(evidence.childEpochFingerprint) || !isHex64(evidence.treeFingerprint) ||
+      !isHex64(evidence.fromCursorFingerprint) || evidence.completeEof !== true ||
+      !isHex64(evidence.applicationStateFingerprint) || !isHex64(evidence.evidenceFingerprint)) {
+    fail("service log evidence");
+  }
+  if (evidence.wrapperEpochFingerprint === evidence.childEpochFingerprint) fail("service log evidence epoch relation");
+  validateServiceCursorSet(evidence.toCursor);
+  if (evidence.toCursor.bootFingerprint !== evidence.bootFingerprint) fail("service log evidence cursor boot");
+  if (serviceLogEvidenceFingerprint(evidence) !== evidence.evidenceFingerprint) fail("service log evidence fingerprint");
+  if (boundary !== undefined) {
+    validateServiceTrialBoundary(boundary);
+    const resumeCursor = boundary.childCursor ?? boundary.initialCursor;
+    if (boundary.phase !== "observed" || evidence.boundaryFingerprint !== boundary.boundaryFingerprint ||
+        evidence.bootFingerprint !== boundary.bootFingerprint ||
+        evidence.observedTickMs < boundary.lastTickMs || evidence.observedTickMs > boundary.deadlineTickMs ||
+        evidence.wrapperEpochFingerprint !== boundary.wrapperEpochFingerprint ||
+        evidence.childEpochFingerprint !== boundary.childEpochFingerprint ||
+        evidence.fromCursorFingerprint !== resumeCursor.cursorFingerprint ||
+        evidence.toCursor.serviceKey !== boundary.serviceKey ||
+        evidence.toCursor.configFingerprint !== boundary.effectiveConfigFingerprint) {
+      fail("service log evidence boundary binding");
+    }
+    for (let index = 0; index < 2; index += 1) {
+      const from = resumeCursor.families[index];
+      const to = evidence.toCursor.families[index];
+      if (from.family !== to.family || from.baseName !== to.baseName ||
+          from.directoryIdentityFingerprint !== to.directoryIdentityFingerprint ||
+          to.nextLogicalOffset < from.nextLogicalOffset) {
+        fail("service log evidence cursor progression");
+      }
+    }
+  }
+  return evidence;
+}
+
+export function buildServiceLogEvidence(fields, boundary = undefined) {
+  const values = strictFields(fields, LOG_EVIDENCE_FIELD_KEYS, "service log evidence fields");
+  const evidence = { schemaVersion: 1, ...values, evidenceFingerprint: null };
+  evidence.evidenceFingerprint = serviceLogEvidenceFingerprint(evidence);
+  return validateServiceLogEvidence(evidence, boundary);
 }
 
 export function serviceTombstoneFingerprint(tombstone) { return fingerprint(tombstone, "tombstoneFingerprint"); }
@@ -627,6 +1011,32 @@ const SERVICE_IDENTITY_PROFILES = new Set([
   "service-release-executable",
   "service-bot-log-directory",
   "service-daemon-log-directory",
+  "service-external-anchor-directory",
+  "service-bot-config-directory",
+  "service-bot-config-file",
+  "service-daemon-config-directory",
+  "service-daemon-config-file",
+  "service-sdk-install-directory",
+  "service-sdk-install-file",
+  "service-bot-retained-directory",
+  "service-bot-retained-file",
+  "service-daemon-retained-directory",
+  "service-daemon-retained-file",
+  "service-preserved-container-directory",
+]);
+const WINDOWS_ONLY_SERVICE_IDENTITY_PROFILES = new Set([
+  "service-external-anchor-directory",
+  "service-bot-config-directory",
+  "service-bot-config-file",
+  "service-daemon-config-directory",
+  "service-daemon-config-file",
+  "service-sdk-install-directory",
+  "service-sdk-install-file",
+  "service-bot-retained-directory",
+  "service-bot-retained-file",
+  "service-daemon-retained-directory",
+  "service-daemon-retained-file",
+  "service-preserved-container-directory",
 ]);
 const FLOOR_SCOPE = /^(?:application:(?:linux:(?:x64|arm64)|win32:x64)|shawl:win32:x64)$/;
 const REFERENCE_SLOTS = Object.freeze(["current", "previous", "provisional"]);
@@ -645,7 +1055,8 @@ export function validateServiceNativeIdentity(identity, platform, expectedProfil
   if (!commonValid) fail("native service identity");
   strictText(identity.owner, "native service identity owner", SERVICE_LIFECYCLE_LIMITS.principalBytes);
   if (platform === "linux") {
-    if (!exact(identity, ["profile", "kind", "device", "inode", "mode", "owner", "securitySha256"]) ||
+    if (WINDOWS_ONLY_SERVICE_IDENTITY_PROFILES.has(identity.profile) ||
+        !exact(identity, ["profile", "kind", "device", "inode", "mode", "owner", "securitySha256"]) ||
         identity.kind !== "linux-service-object-v1" || !uint64Text(identity.device) ||
         !uint64Text(identity.inode) || !Number.isSafeInteger(identity.mode) ||
         identity.mode < 0 || identity.mode > 0xffffffff ||
@@ -665,6 +1076,24 @@ export function validateServiceNativeIdentity(identity, platform, expectedProfil
 export function serviceNativeIdentityFingerprint(identity, platform, expectedProfile = undefined) {
   validateServiceNativeIdentity(identity, platform, expectedProfile);
   return canonicalJsonHash(identity);
+}
+
+const WIN32_PHYSICAL_SECURITY_IDENTITY_KEYS = Object.freeze([
+  "attributes", "fileId", "kind", "owner", "securitySha256", "volumeSerial",
+]);
+
+// Correlates OS facts only. The controller must retain and revalidate its
+// separate, role-profiled ACL evidence before using this value at any edge.
+export function win32PhysicalSecurityIdentityFingerprint(facts) {
+  const values = strictFields(facts, WIN32_PHYSICAL_SECURITY_IDENTITY_KEYS, "Windows physical-security identity");
+  if (values.kind !== "gjc-remote/win32-physical-security-identity/v1" ||
+      !Number.isSafeInteger(values.attributes) || values.attributes < 0 || values.attributes > 0xffffffff ||
+      typeof values.fileId !== "string" || !/^[0-9a-f]{32}$/.test(values.fileId) ||
+      typeof values.volumeSerial !== "string" || !/^[0-9a-f]{16}$/.test(values.volumeSerial) ||
+      !isHex64(values.securitySha256) || !isCanonicalWindowsSid(values.owner)) {
+    fail("Windows physical-security identity");
+  }
+  return canonicalJsonHash(values);
 }
 
 function validateBoundedServiceFileFacts(facts, platform, maximumBytes) {

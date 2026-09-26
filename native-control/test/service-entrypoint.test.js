@@ -80,6 +80,17 @@ test('invalid request does not construct the lifecycle facade', async () => {
   assert.equal(constructed, false);
 });
 
+test('invalid win32 request composes the host producer without touching native authority', async () => {
+  const captured = capture();
+  const result = await runServiceEntrypoint({
+    argv: ['install'], input: Buffer.from('{}'), stdout: captured.stream,
+    platform: 'win32', architecture: 'x64',
+  });
+  assert.equal(result.exitCode, EXIT_CODES.usage);
+  assert.equal(result.receipt.status, 'refused');
+  assert.equal(result.receipt.writes, 0);
+});
+
 test('production composition refuses before mutation when authoritative dependencies are unavailable', async () => {
   const captured = capture();
   const result = await runServiceEntrypoint({

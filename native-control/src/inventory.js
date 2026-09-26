@@ -237,7 +237,7 @@ async function createAdapter(loadLowLevel, options, role) {
     await lowLevel.resolve_native_state_root(validated.hostKey, 'inventory'));
   const selfTest = async () => {
     await verifyAcl(lowLevel, inventoryRoot, validated.roles, 'inventory-directory', role);
-    return Object.freeze({ role, contractVersion: 4, writes: 0 });
+    return Object.freeze({ role, contractVersion: 5, writes: 0 });
   };
   await selfTest();
   const publish = createInventoryPublisherTransaction({
@@ -259,7 +259,7 @@ async function createReaderAdapter(lowLevel, validated) {
   };
   const selfTest = async () => {
     await roots();
-    return Object.freeze({ role: 'daemon', contractVersion: 4, writes: 0 });
+    return Object.freeze({ role: 'daemon', contractVersion: 5, writes: 0 });
   };
   const readAccepted = async () => {
     let fence; let body; let bodyExact = false; let outcome;

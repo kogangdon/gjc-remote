@@ -12,7 +12,8 @@ import {
   resolveDispatchRoute,
   WORKSPACE_MAPPING_UNAVAILABLE,
 } from "../src/managed-dispatch.js";
-import { createManagedAuthorityReader, validateManagedProof } from "../src/managed-authority-reader.js";
+import { createManagedAuthorityReader } from "../src/managed-authority-reader.js";
+import { validateManagedProof } from "@gjc-remote/shared/managed-authority-proof";
 import { createTestManagedAuthorityReader } from "./helpers/managed-authority-reader.js";
 import { watchConfigHints } from "../src/config-watcher.js";
 

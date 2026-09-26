@@ -13,58 +13,13 @@ import {
   contractRevision,
   validateBuildManifest,
 } from '../src/index.js';
+import { serviceCapabilities as registeredServiceCapabilities } from '../src/capabilities.js';
 
 const require = createRequire(import.meta.url);
 const addonPath = fileURLToPath(new URL('../build/Release/native_control.node', import.meta.url));
 const manifestPath = fileURLToPath(new URL('../build/Release/native-control.manifest.json', import.meta.url));
 const packagePath = fileURLToPath(new URL('../package.json', import.meta.url));
 const addonSourcePath = fileURLToPath(new URL('../src/addon.cc', import.meta.url));
-
-const serviceCapabilities = [
-  'set_exact_service_acl',
-  'verify_exact_service_acl',
-  'read_file_facts_no_follow',
-  'read_boot_id',
-  'read_process_facts',
-  'enumerate_process_tree',
-  'read_linux_service_cgroup',
-  'terminate_linux_service_cgroup',
-  'open_win32_service',
-  'close_win32_service',
-  'query_win32_service',
-  'create_win32_service_disabled',
-  'protect_win32_service',
-  'set_win32_service_marker',
-  'configure_win32_service_launch',
-  'set_win32_service_start_type',
-  'set_win32_service_failure_actions',
-  'set_win32_service_failure_actions_flag',
-  'start_win32_service',
-  'stop_win32_service',
-  'delete_win32_service',
-  'terminate_win32_service_tree',
-  'open_service_root',
-  'open_service_directory',
-  'acquire_service_lock',
-  'close_service_handle',
-  'read_service_file',
-  'publish_service_file_atomic',
-  'remove_service_object_exact',
-  'list_service_directory',
-  'publish_service_directory_no_replace',
-  'open_linux_service_scope',
-  'read_linux_service_object',
-  'publish_linux_service_object',
-  'remove_linux_service_object',
-  'begin_service_artifact_write',
-  'write_service_artifact_chunk',
-  'finish_service_artifact_write',
-  'open_service_artifact_reader',
-  'read_service_artifact_chunk',
-  'remove_service_artifact_file_exact',
-  'seal_service_directory',
-  'open_service_artifact_source',
-];
 
 const serviceSignatures = {
   set_exact_service_acl: ['path', 'roles', 'profile'],
@@ -78,10 +33,11 @@ const serviceSignatures = {
   open_win32_service: ['name', 'serviceRole', 'roles', 'access'],
   close_win32_service: ['serviceHandle'],
   query_win32_service: ['serviceHandle'],
-  create_win32_service_disabled: ['name', 'serviceRole', 'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory', 'runtimePath', 'runtimeSha256', 'entrypointPath', 'entrypointSha256', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig', 'servicePassword', 'roles'],
+  plan_win32_service_resource: ['name', 'serviceRole', 'launch', 'applicationManifestFingerprint', 'phase', 'roles'],
+  create_win32_service_disabled: ['name', 'serviceRole', 'launch', 'servicePassword', 'roles'],
   protect_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'transitionMarker'],
   set_win32_service_marker: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'transitionMarker'],
-  configure_win32_service_launch: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory', 'runtimePath', 'runtimeSha256', 'entrypointPath', 'entrypointSha256', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig'],
+  configure_win32_service_launch: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'launch'],
   set_win32_service_start_type: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'startType'],
   set_win32_service_failure_actions: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'failurePolicy'],
   set_win32_service_failure_actions_flag: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'enabled'],
@@ -110,58 +66,127 @@ const serviceSignatures = {
   remove_service_artifact_file_exact: ['parentHandle', 'name', 'expectedFacts', 'artifactLockHandle'],
   seal_service_directory: ['directoryHandle', 'expectedIdentity', 'artifactLockHandle'],
   open_service_artifact_source: ['path', 'maxBytes', 'expectedFacts', 'roles'],
+  plan_service_artifact_location: ['rootKind', 'artifactFingerprint', 'relativePath', 'roles'],
+  resolve_service_artifact_location: ['directoryHandle', 'relativePath', 'expectedFileSha256'],
+  open_service_external_root: ['absolutePath', 'profile', 'roles'],
+  read_service_external_object: ['externalRootHandle', 'relativePath', 'mode', 'maxBytes'],
+  open_win32_service_log_observer: ['serviceHandle', 'launch', 'resumeCursor'],
+  read_win32_service_log_observer: ['observerHandle', 'expectedCursorFingerprint', 'maxBytes'],
 };
+const serviceCapabilities = Object.keys(serviceSignatures);
+const win32LaunchFields = [
+  'supervisorPath', 'supervisorSha256', 'workingDirectory', 'homeDirectory',
+  'runtimePath', 'runtimeSha256', 'runtimeVersion', 'runtimeSourceRevision',
+  'entrypointPath', 'entrypointSha256', 'bootstrapPath', 'bootstrapSha256',
+  'bootstrapClosureFingerprint', 'runtimeConfigRoot',
+  'runtimeConfigRootIdentityFingerprint', 'runtimeConfigPath',
+  'runtimeConfigSha256', 'runtimeConfigIdentityFingerprint', 'sdkProfilePath',
+  'scopeFingerprint', 'logDirectory', 'logAs', 'logCmdAs', 'channelsConfig',
+  'effectiveConfigFingerprint', 'configSourceIdentityFingerprint',
+  'runtimePolicyFingerprint',
+];
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 function loadCurrentAddon() {
-  assert.equal(existsSync(addonPath), true, 'revision-4 native_control.node must be built before this gate');
-  assert.equal(existsSync(manifestPath), true, 'revision-4 native-control.manifest.json must be built before this gate');
+  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 1 native_control.node must be built before this gate');
+  assert.equal(existsSync(manifestPath), true, 'ABI 5/revision 1 native-control.manifest.json must be built before this gate');
   const addonBytes = readFileSync(addonPath);
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
   assert.equal(
     validateBuildManifest(manifest, packageJson, addonBytes),
     true,
-    'the present addon must positively validate as the current revision-4 platform tuple',
+    'the present addon must positively validate as the current ABI 5/revision 1 platform tuple',
   );
   return { addon: require(addonPath), addonBytes, manifest, packageJson };
 }
 
-test('revision 4 declares one exact service-native ABI without replacing retained capabilities', () => {
+test('ABI 5 revision 1 declares one exact service-native ABI without replacing retained capabilities', () => {
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
-  assert.equal(contractRevision, 4);
-  assert.equal(packageJson.nativeControlContract.revision, 4);
-  assert.equal(serviceCapabilities.length, 43);
-  assert.deepEqual(capabilities.slice(-serviceCapabilities.length), serviceCapabilities);
+  assert.equal(packageJson.version, '2.0.0');
+  assert.equal(packageJson.nativeControlContract.version, 5);
+  assert.equal(packageJson.nativeControlContract.napi, 8);
+  assert.equal(contractRevision, 1);
+  assert.equal(packageJson.nativeControlContract.revision, contractRevision);
+  assert.deepEqual(registeredServiceCapabilities, serviceCapabilities);
+  const serviceStart = capabilities.indexOf(serviceCapabilities[0]);
+  assert.ok(serviceStart >= 0, 'the registered service capability section must be present');
+  assert.deepEqual(
+    capabilities.slice(serviceStart, serviceStart + registeredServiceCapabilities.length),
+    registeredServiceCapabilities,
+  );
   assert.deepEqual(
     Object.fromEntries(serviceCapabilities.map((name) => [name, capabilitySignatures[name]])),
     serviceSignatures,
   );
+  assert.equal(new Set(serviceCapabilities).size, serviceCapabilities.length);
   assert.equal(new Set(capabilities).size, capabilities.length);
   assert.deepEqual(Object.keys(capabilitySignatures), capabilities);
 });
 
-test('current revision-4 addon and manifest agree exactly and reject revision/table drift', () => {
+test('current ABI 5/revision 1 addon and manifest agree exactly and reject revision/table drift', () => {
   const { addon, addonBytes, manifest, packageJson } = loadCurrentAddon();
   const contract = addon.native_control_contract();
   assert.deepEqual(contract, {
-    contractVersion: 4,
-    contractRevision: 4,
+    contractVersion: 5,
+    contractRevision: 1,
     napi: 8,
     capabilities,
     capabilitySignatures,
   });
-  for (const name of serviceCapabilities) assert.equal(typeof addon[name], 'function', name);
+  for (const name of capabilities) assert.equal(typeof addon[name], 'function', name);
 
-  assert.equal(validateBuildManifest({ ...manifest, contractRevision: 3 }, packageJson, addonBytes), false);
-  assert.equal(validateBuildManifest({ ...manifest, contractRevision: 5 }, packageJson, addonBytes), false);
+  assert.equal(validateBuildManifest({ ...manifest, contractVersion: 4 }, packageJson, addonBytes), false);
+  assert.equal(validateBuildManifest({ ...manifest, contractRevision: contractRevision - 1 }, packageJson, addonBytes), false);
+  assert.equal(validateBuildManifest({ ...manifest, contractRevision: contractRevision + 1 }, packageJson, addonBytes), false);
   const capabilityDrift = structuredClone(manifest);
   capabilityDrift.capabilities.pop();
   assert.equal(validateBuildManifest(capabilityDrift, packageJson, addonBytes), false);
   const signatureDrift = structuredClone(manifest);
-  signatureDrift.capabilitySignatures.start_win32_service = ['serviceHandle'];
+  signatureDrift.capabilitySignatures.plan_win32_service_resource = ['name', 'serviceRole'];
   assert.equal(validateBuildManifest(signatureDrift, packageJson, addonBytes), false);
+});
+
+test('Win32 plan, create, and configure share one exact Launch payload', () => {
+  const source = readFileSync(addonSourcePath, 'utf8');
+  const captureStart = source.indexOf('bool CaptureWin32ServiceLaunch(');
+  const fieldStart = source.indexOf('static const char* const field_names[] = {', captureStart);
+  const fieldEnd = source.indexOf('\n  };', fieldStart);
+  assert.ok(captureStart >= 0 && fieldStart > captureStart && fieldEnd > fieldStart);
+  const actualFields = [...source.slice(fieldStart, fieldEnd).matchAll(/"([A-Za-z][A-Za-z0-9]*)"/g)]
+    .map((match) => match[1]);
+  assert.deepEqual(actualFields, win32LaunchFields);
+  assert.match(source.slice(fieldEnd, fieldEnd + 256), /napi_value captured\[27\]/);
+
+  const planStart = source.indexOf('napi_value PlanWin32ServiceResource(');
+  const createStart = source.indexOf('napi_value CreateWin32ServiceDisabled(', planStart);
+  const protectStart = source.indexOf('napi_value ProtectWin32Service(', createStart);
+  const configureStart = source.indexOf('napi_value ConfigureWin32ServiceLaunch(', protectStart);
+  const startTypeStart = source.indexOf('napi_value SetWin32ServiceStartType(', configureStart);
+  assert.ok(planStart >= 0 && createStart > planStart && protectStart > createStart);
+  assert.ok(configureStart > protectStart && startTypeStart > configureStart);
+
+  const plan = source.slice(planStart, createStart);
+  const create = source.slice(createStart, protectStart);
+  const configure = source.slice(configureStart, startTypeStart);
+  assert.match(plan, /InventoryArgs\(env, info, 6, args\)/);
+  assert.match(plan, /CaptureWin32ServiceLaunch\(env, args\[2\]/);
+  assert.deepEqual(
+    [...plan.matchAll(/(?:napi_set_named_property|ServiceSetString|ServiceSetUint32)\(env, result, "([^"]+)"/g)]
+      .map((match) => match[1]),
+    ['descriptor', 'configFingerprint', 'writes'],
+  );
+  assert.match(plan, /ServiceSetUint32\(env, result, "writes", 0\)/);
+
+  assert.match(create, /InventoryArgs\(env, info, 5, args\)/);
+  assert.match(create, /CaptureWin32ServiceLaunch\(env, args\[2\]/);
+  assert.match(create, /Win32PasswordArg\(env, args\[3\]/);
+  assert.doesNotMatch(create, /args\[5\]/);
+
+  assert.match(configure, /InventoryArgs\(env, info, 4, args\)/);
+  assert.match(configure, /CaptureWin32ServiceLaunch\(env, args\[3\]/);
+  assert.doesNotMatch(configure, /password/i);
 });
 
 test('native read-only service facts bind current file bytes, boot, PID start, executable, owner, and tree', () => {
@@ -342,12 +367,15 @@ test('Windows create derives its service account only from the selected canonica
   assert.match(resolver, /LookupAccountSidW\(/);
   assert.match(resolver, /use == SidTypeUser/);
   assert.match(resolver, /Win32ServiceAccountMatches\(account_utf8, expected_sid\)/);
-  assert.match(create, /InventoryArgs\(env, info, 16, args\)/);
+  assert.match(create, /InventoryArgs\(env, info, 5, args\)/);
+  assert.match(create, /Win32PasswordArg\(env, args\[3\], &password, &password_present\)/);
+  assert.match(create, /CaptureWin32ServiceLaunch\(env, args\[2\]/);
   assert.match(create, /role == "bot" \? roles\.bot : roles\.daemon/);
   assert.match(create, /ResolveWin32ServiceAccountName\(selected_sid, &account\)/);
   assert.match(create, /empty_dependencies, account\.c_str\(\),/);
+  assert.match(create, /password_present \? password\.data\(\) : nullptr/);
   assert.doesNotMatch(create, /accountName/);
-  assert.doesNotMatch(create, /InventoryString\(env, args\[14\], &account\)/);
+  assert.doesNotMatch(create, /args\[14\]|InventoryString\(env, args\[\d+\], &account\)/);
 });
 
 test('Windows canonical role parsing bounds LookupAccountSid sizes before allocation', () => {

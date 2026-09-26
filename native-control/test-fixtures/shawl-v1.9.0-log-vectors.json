@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "shawl": "1.9.0",
+    "flexiLogger": "0.29.3",
+    "naming": "Naming::Timestamps",
+    "cleanup": "Cleanup::KeepLogFiles(retain)",
+    "append": true,
+    "currentInfix": "rCURRENT",
+    "rotatedInfixFormat": "r%Y-%m-%d_%H-%M-%S",
+    "collisionSuffix": ".restart-NNNN"
+  },
+  "baseName": "gjc-remote-bot-wrapper",
+  "names": [
+    { "name": "gjc-remote-bot-wrapper_rCURRENT.log", "kind": "live" },
+    { "name": "gjc-remote-bot-wrapper_r2023-01-27_14-41-08.log", "kind": "rotated" },
+    { "name": "gjc-remote-bot-wrapper_r2023-01-27_14-41-08.restart-0001.log", "kind": "rotated" },
+    { "name": "gjc-remote-bot-wrapper_r2023-01-27_14-41-08.restart-9999.log", "kind": "rotated" },
+    { "name": "gjc-remote-bot-wrapper_rcurrent.log", "kind": "none" },
+    { "name": "gjc-remote-bot-wrapper_rCURRENT.log.bak", "kind": "none" },
+    { "name": "gjc-remote-bot-wrapper_r2023-1-27_14-41-08.log", "kind": "none" },
+    { "name": "gjc-remote-bot-wrapper_r2023-01-27T14-41-08.log", "kind": "none" },
+    { "name": "gjc-remote-bot-wrapper_r2023-01-27_14-41-08.restart-001.log", "kind": "none" },
+    { "name": "gjc-remote-bot-wrapper_r2023-01-27_14-41-08.restart-00a1.log", "kind": "none" },
+    { "name": "gjc-remote-bot-wrapper_r.log", "kind": "none" },
+    { "name": "gjc-remote-bot-wrapper.log", "kind": "none" },
+    { "name": "gjc-remote-bot-child_rCURRENT.log", "kind": "none" },
+    { "name": "xgjc-remote-bot-wrapper_rCURRENT.log", "kind": "none" }
+  ],
+  "rotatedOrder": [
+    "gjc-remote-bot-wrapper_r2023-01-27_14-41-08.log",
+    "gjc-remote-bot-wrapper_r2023-01-27_14-41-08.restart-0001.log",
+    "gjc-remote-bot-wrapper_r2023-01-27_14-41-09.log",
+    "gjc-remote-bot-wrapper_r2023-12-01_00-00-00.log"
+  ]
+}

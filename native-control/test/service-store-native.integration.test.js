@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { capabilitySignatures, contractRevision } from '../src/index.js';
+import { capabilities, capabilitySignatures, contractRevision } from '../src/index.js';
 import { createOfflineDeploymentSource } from '../src/service-offline-source.js';
 
 const require = createRequire(import.meta.url);
@@ -40,8 +40,17 @@ const storeSignatures = {
 };
 
 function addon() {
-  assert.equal(existsSync(addonPath), true, 'revision-4 native addon must be built before this integration gate');
-  return require(addonPath);
+  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 1 native addon must be built before this integration gate');
+  const native = require(addonPath);
+  const contract = native.native_control_contract();
+  assert.deepEqual(contract, {
+    contractVersion: 5,
+    contractRevision,
+    napi: 8,
+    capabilities,
+    capabilitySignatures,
+  });
+  return native;
 }
 
 function sourceReaderRoles(native) {
@@ -85,8 +94,8 @@ function sourceReaderRoles(native) {
   };
 }
 
-test('revision 4 exposes the exact service store and Linux object substrate', () => {
-  assert.equal(contractRevision, 4);
+test('ABI 5 revision 1 exposes the exact service store and Linux object substrate', () => {
+  assert.equal(contractRevision, 1);
   assert.deepEqual(
     Object.fromEntries(Object.keys(storeSignatures).map((name) => [name, capabilitySignatures[name]])),
     storeSignatures,

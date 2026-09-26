@@ -28,6 +28,118 @@ const windowsRoles = Object.freeze({
   system: { kind: 'sid', value: 'S-1-5-18' },
 });
 
+function windowsApplicationManifest({
+  manifestFingerprint = '5'.repeat(64),
+  archiveSha256 = 'a'.repeat(64),
+  entrypoint = 'bot/src/bot.js',
+  treeFingerprint = 'b'.repeat(64),
+  releaseSequence = 1,
+  compatibilityFingerprint = 'c'.repeat(64),
+} = {}) {
+  return Object.freeze({
+    manifestFingerprint,
+    archive: Object.freeze({ sha256: archiveSha256 }),
+    entrypoints: Object.freeze({ bot: entrypoint }),
+    inventory: Object.freeze({ treeFingerprint }),
+    releaseSequence,
+    compatibilityFingerprint,
+  });
+}
+
+function windowsLocationPath(manifest) {
+  return `C:\\ProgramData\\gjc-remote\\releases\\${manifest.archive.sha256}\\${manifest.entrypoints.bot.replaceAll('/', '\\')}`;
+}
+
+function windowsLocationIntent(manifest) {
+  const absoluteRoot = 'C:\\ProgramData\\gjc-remote\\releases';
+  const absolutePath = windowsLocationPath(manifest);
+  const fields = {
+    schemaVersion: 1,
+    rootKind: 'releases',
+    artifactFingerprint: manifest.archive.sha256,
+    relativePath: manifest.entrypoints.bot,
+    absoluteRoot,
+    absolutePath,
+    anchorIdentityFingerprint: 'd'.repeat(64),
+    missingSegments: [manifest.archive.sha256, ...manifest.entrypoints.bot.split('/')],
+    existingDirectoryIdentity: null,
+    writes: 0,
+  };
+  return Object.freeze({ ...fields, intentFingerprint: canonicalJsonHash(fields) });
+}
+
+function windowsApplicationPublication(manifest, {
+  publishedPath = manifest.entrypoints.bot,
+  absolutePath = windowsLocationPath(manifest),
+  artifactFingerprint = manifest.archive.sha256,
+  fileSha256 = 'e'.repeat(64),
+} = {}) {
+  const directoryIdentity = Object.freeze({ profile: 'service-release-directory' });
+  const fileIdentity = Object.freeze({ profile: 'service-release-file' });
+  const binding = Object.freeze({
+    schemaVersion: 1,
+    kind: 'service-artifact-binding',
+    artifactKind: 'application',
+    rootKind: 'releases',
+    artifactFingerprint,
+    manifestFingerprint: manifest.manifestFingerprint,
+    treeFingerprint: manifest.inventory.treeFingerprint,
+    directoryIdentity,
+    directoryIdentityFingerprint: 'f'.repeat(64),
+    bindingFingerprint: '1'.repeat(64),
+  });
+  const location = Object.freeze({
+    binding,
+    schemaVersion: 1,
+    publishedPath,
+    absolutePath,
+    directoryIdentity,
+    fileIdentity,
+    fileSha256,
+    writes: 0,
+  });
+  return Object.freeze({ binding, locations: Object.freeze([location]) });
+}
+
+function windowsShawlManifest({
+  manifestFingerprint = '4'.repeat(64),
+  sha256 = '8'.repeat(64),
+  name = 'shawl.exe',
+} = {}) {
+  return Object.freeze({
+    manifestFingerprint,
+    executable: Object.freeze({ name, sha256 }),
+  });
+}
+
+function windowsShawlPublication(manifest) {
+  const directoryIdentity = Object.freeze({ profile: 'service-release-directory' });
+  const fileIdentity = Object.freeze({ profile: 'service-release-executable' });
+  const binding = Object.freeze({
+    schemaVersion: 1,
+    kind: 'service-artifact-binding',
+    artifactKind: 'shawl',
+    rootKind: 'shawl',
+    artifactFingerprint: manifest.executable.sha256,
+    manifestFingerprint: manifest.manifestFingerprint,
+    treeFingerprint: null,
+    directoryIdentity,
+    directoryIdentityFingerprint: '9'.repeat(64),
+    bindingFingerprint: '1'.repeat(64),
+  });
+  const location = Object.freeze({
+    binding,
+    schemaVersion: 1,
+    publishedPath: manifest.executable.name,
+    absolutePath: `C:\\ProgramData\\gjc-remote\\shawl\\${manifest.executable.sha256}\\${manifest.executable.name}`,
+    directoryIdentity,
+    fileIdentity,
+    fileSha256: manifest.executable.sha256,
+    writes: 0,
+  });
+  return Object.freeze({ binding, locations: Object.freeze([location]) });
+}
+
 function recoveryTransaction(phase, operation = 'install') {
   const old = buildServiceOldProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, 'linux');
   const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint: 'a'.repeat(64), shawlManifestFingerprint: null, releaseSequence: 1, releaseTreeFingerprint: 'b'.repeat(64), compatibilityFingerprint: 'c'.repeat(64) }, 'linux');
@@ -198,6 +310,217 @@ test('unknown operation and extra status fields refuse before opening the store'
   assert.equal(opened, false);
 });
 
+test('Windows rollback retains its authenticated Shawl publication through release planning', async () => {
+  const calls = [];
+  const stoppedAtPlanner = new Error('fixture stops before mutation');
+  const configuration = {
+    runtimePath: 'C:/runtime', workingDirectory: 'C:/work', homeDirectory: 'C:/home',
+    logDirectory: 'C:/log', channelsConfig: 'C:/channels',
+    expectedHostSetFingerprint: '7'.repeat(64), expectedHostCount: 0,
+  };
+  const current = {
+    component: 'bot', serviceKey: 'bot', platform: 'win32', architecture: 'x64',
+    serviceGeneration: 2, manifestFingerprint: '4'.repeat(64), resourceProof: '6'.repeat(64),
+    applicationManifestFingerprint: '8'.repeat(64), shawlManifestFingerprint: '9'.repeat(64),
+    roles: windowsRoles, rolesFingerprint: serviceRolesFingerprint(windowsRoles, 'win32'),
+    configuration,
+    configurationFingerprint: serviceConfigurationFingerprint(configuration, { component: 'bot', platform: 'win32' }),
+  };
+  const application = {
+    manifestFingerprint: '5'.repeat(64), releaseSequence: 1,
+    archive: { sha256: 'a'.repeat(64) },
+    entrypoints: { bot: 'bot/src/bot.js' },
+    inventory: { treeFingerprint: 'b'.repeat(64) },
+    compatibilityFingerprint: 'c'.repeat(64),
+  };
+  const shawl = windowsShawlManifest({ manifestFingerprint: 'e'.repeat(64) });
+  const applicationPublication = windowsApplicationPublication(application);
+  const shawlPublication = windowsShawlPublication(shawl);
+  const shawlBinding = shawlPublication.binding;
+  const publications = {
+    application: applicationPublication,
+    shawl: shawlPublication,
+  };
+  const absent = () => ({ present: false, value: null });
+  const session = {
+    platform: 'win32', architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
+    readManifest: () => ({ present: true, value: current }),
+    readResourceProof: () => ({ present: true, value: {
+      resourceProof: current.resourceProof, platformResourceFingerprint: 'c'.repeat(64),
+      rolesFingerprint: current.rolesFingerprint, configurationFingerprint: current.configurationFingerprint,
+    } }),
+    readReferences: () => ({ present: true, value: {
+      previous: { serviceGeneration: 1, artifacts: [applicationPublication.binding, shawlBinding] },
+    } }),
+    readJournal: () => ({ entries: [], head: absent(), pending: null }),
+    readManualCleanup: absent, readStartupProof: absent,
+    readRetainedDeploymentEnvelope: ({ purpose }) => ({ manifest: purpose === 'application' ? application : shawl }),
+    readPublicationReceipt: ({ slot, artifactKind }) => {
+      assert.equal(slot, 'previous');
+      return publications[artifactKind];
+    },
+    assertApplicationRollback: ({ manifest, publication }) => {
+      assert.equal(manifest, application);
+      assert.equal(publication, publications.application);
+      calls.push('application-verified');
+    },
+    assertShawlRollback: ({ manifest, publication }) => {
+      assert.equal(manifest, shawl);
+      assert.equal(publication, publications.shawl);
+      calls.push('shawl-verified');
+    },
+    acceptProvisionalMetadata: () => assert.fail('fixture stops before metadata writes'),
+    publishCurrentMetadata: () => assert.fail('fixture stops before metadata writes'),
+    close: () => calls.push('close'),
+  };
+  const lifecycle = createServiceLifecycle({
+    platform: 'win32', architecture: 'x64', native: {}, store: { openMutation: () => session },
+    driver: { probe: () => assert.fail('fixture stops before the driver') },
+    observeApplication: () => assert.fail('fixture stops before startup'),
+    planResource: ({ release }) => {
+      assert.equal(release.shawlManifest, shawl);
+      assert.equal(release.entrypointPath, windowsLocationPath(application));
+      assert.equal(release.entrypointSha256, applicationPublication.locations[0].fileSha256);
+      assert.equal(release.supervisorPath, shawlPublication.locations[0].absolutePath);
+      assert.equal(release.supervisorSha256, shawl.executable.sha256);
+      assert.equal(release.publicationReceipts.application.publication, applicationPublication);
+      assert.equal(release.publicationReceipts.application.location, applicationPublication.locations[0]);
+      assert.equal(release.publicationReceipts.shawl.publication, shawlPublication);
+      assert.equal(release.publicationReceipts.shawl.location, shawlPublication.locations[0]);
+      calls.push('plan');
+      throw stoppedAtPlanner;
+    },
+  });
+  await assert.rejects(lifecycle.rollback({
+    schemaVersion: 1, target: { component: 'bot' }, roles: windowsRoles,
+    expected: {
+      serviceGeneration: 2, resourceProof: current.resourceProof,
+      currentManifestFingerprint: current.manifestFingerprint,
+      predecessorManifestFingerprint: application.manifestFingerprint,
+    },
+    acceptServiceDisruption: true,
+  }), (error) => error === stoppedAtPlanner);
+  assert.deepEqual(calls, ['application-verified', 'shawl-verified', 'plan', 'close']);
+  assert.equal(session.writes, 0);
+});
+
+function windowsShawlIntent(manifest) {
+  const relativePath = manifest.executable.name;
+  const fields = {
+    schemaVersion: 1,
+    rootKind: 'shawl',
+    artifactFingerprint: manifest.executable.sha256,
+    relativePath,
+    absoluteRoot: 'C:\\ProgramData\\gjc-remote\\shawl',
+    absolutePath: `C:\\ProgramData\\gjc-remote\\shawl\\${manifest.executable.sha256}\\${relativePath}`,
+    anchorIdentityFingerprint: 'd'.repeat(64),
+    missingSegments: [manifest.executable.sha256, relativePath],
+    existingDirectoryIdentity: null,
+    writes: 0,
+  };
+  return Object.freeze({ ...fields, intentFingerprint: canonicalJsonHash(fields) });
+}
+
+function windowsCandidateFixture(signedEntrypoint) {
+  const calls = [];
+  const stoppedAtPlanner = new Error('stopped at planner');
+  const manifest = windowsApplicationManifest({
+    manifestFingerprint: '2'.repeat(64),
+    archiveSha256: '3'.repeat(64),
+  });
+  const shawl = windowsShawlManifest({ manifestFingerprint: '4'.repeat(64) });
+  const intents = { application: windowsLocationIntent(manifest), shawl: windowsShawlIntent(shawl) };
+  const absent = () => ({ present: false, value: null });
+  const floor = () => ({ floor: { committedSequence: 0 } });
+  const session = {
+    platform: 'win32', architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
+    readManifest: absent,
+    readResourceProof: absent,
+    readReferences: absent,
+    readManualCleanup: absent,
+    readStartupProof: absent,
+    readSiblingReferences: () => [],
+    readJournal: () => ({ entries: [], head: absent(), pending: null }),
+    assertFloorCas: () => ({ application: floor(), shawl: floor() }),
+    planArtifactLocation(input) {
+      assert.equal(this.writes, 0);
+      const expected = input.purpose === 'application'
+        ? [manifest, manifest.entrypoints.bot]
+        : [shawl, shawl.executable.name];
+      assert.equal(input.manifest, expected[0]);
+      assert.equal(input.relativePath, expected[1]);
+      calls.push(`plan-location:${input.purpose}`);
+      return intents[input.purpose];
+    },
+    acceptProvisionalMetadata: () => assert.fail('fixture stops before metadata writes'),
+    publishCurrentMetadata: () => assert.fail('fixture stops before metadata writes'),
+    close: () => calls.push('session-close'),
+  };
+  const acquisition = {
+    readManifests: () => Object.freeze({ application: manifest, shawl, signedEntrypoint }),
+    reserve: () => assert.fail('must not reserve before the prepared transaction'),
+    publish: () => assert.fail('must not publish before the prepared transaction'),
+    close: () => calls.push('acquisition-close'),
+  };
+  const lifecycle = createServiceLifecycle({
+    platform: 'win32', architecture: 'x64', native: {},
+    store: { openMutation: () => session }, acquisition,
+    compatibility: () => assert.fail('must not continue past planning'),
+    observeApplication: () => assert.fail('must not start'),
+    driver: () => assert.fail('must not construct a driver before planning'),
+    planResource: ({ release }) => {
+      assert.equal(session.writes, 0);
+      assert.equal(release.shawlManifest, shawl);
+      assert.equal(release.entrypointPath, intents.application.absolutePath);
+      assert.equal(release.entrypointSha256, signedEntrypoint.sha256);
+      assert.equal(release.supervisorPath, intents.shawl.absolutePath);
+      assert.equal(release.supervisorSha256, shawl.executable.sha256);
+      calls.push('plan');
+      throw stoppedAtPlanner;
+    },
+  });
+  const request = {
+    schemaVersion: 1,
+    target: { component: 'bot' },
+    roles: windowsRoles,
+    configuration: {
+      runtimePath: 'C:/runtime', workingDirectory: 'C:/work', homeDirectory: 'C:/home',
+      logDirectory: 'C:/log', channelsConfig: 'C:/channels',
+      expectedHostSetFingerprint: '7'.repeat(64), expectedHostCount: 0,
+    },
+    source: {
+      kind: 'offline', applicationManifestPath: 'C:/m',
+      applicationSignaturePath: 'C:/s', applicationArchivePath: 'C:/a',
+      shawlManifestPath: 'C:/sm', shawlSignaturePath: 'C:/ss',
+      shawlExecutablePath: 'C:/sa',
+    },
+    expected: { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0, shawlSequenceFloor: 0 },
+  };
+  return { calls, session, lifecycle, request, stoppedAtPlanner };
+}
+
+test('Windows candidate launch plans the signed entrypoint digest over write-free intents', async () => {
+  const fixture = windowsCandidateFixture(Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }));
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === fixture.stoppedAtPlanner);
+  assert.deepEqual(fixture.calls, ['plan-location:application', 'plan-location:shawl', 'plan', 'acquisition-close', 'session-close']);
+  assert.equal(fixture.session.writes, 0);
+});
+
+test('Windows candidate without an authenticated signed entrypoint digest fails closed before planning', async () => {
+  for (const signedEntrypoint of [
+    null,
+    Object.freeze({ path: 'bot/src/other.js', sha256: '6'.repeat(64), size: 42 }),
+    Object.freeze({ path: 'bot/src/bot.js', sha256: 'not-a-hash', size: 42 }),
+    { path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 },
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42, extra: true }),
+  ]) {
+    const fixture = windowsCandidateFixture(signedEntrypoint);
+    await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error.code === 'SERVICE_PENDING' && error.writes === 0);
+    assert.deepEqual(fixture.calls, ['plan-location:application', 'plan-location:shawl', 'acquisition-close', 'session-close']);
+    assert.equal(fixture.session.writes, 0);
+  }
+});
+
 test('all mutation schemas reject unknown fields before acquiring a session', async () => {
   const calls = [];
   const lifecycle = createServiceLifecycle({
@@ -228,6 +551,171 @@ test('mutation dependency gaps refuse before opening the store', async () => {
   };
   await assert.rejects(lifecycle.install(request), (error) => error.code === 'SERVICE_INVALID');
   assert.equal(opened, false);
+});
+
+for (const markerPersists of [true, false]) {
+    test(`linux mutation retains its transaction for manual cleanup (receipt ${markerPersists})`, async () => {
+      const platform = 'linux';
+      const calls = [];
+      const entries = [];
+      let manualRecord;
+      const absent = () => ({ present: false, value: null });
+      const floor = () => ({ floor: { committedSequence: 0 } });
+      const prefix = '';
+      const configuration = {
+        runtimePath: `${prefix}/runtime`, workingDirectory: `${prefix}/work`,
+        homeDirectory: `${prefix}/home`, logDirectory: `${prefix}/log`,
+        channelsConfig: `${prefix}/channels`,
+        expectedHostSetFingerprint: '0'.repeat(64), expectedHostCount: 0,
+      };
+      const session = {
+        platform, architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
+        readManifest: absent, readResourceProof: absent, readReferences: absent,
+        readManualCleanup: absent, readStartupProof: absent,
+        readSiblingReferences: () => [],
+        readJournal: () => ({
+          entries,
+          head: entries.length ? { present: true, value: entries.at(-1) } : absent(),
+          pending: null,
+        }),
+        assertFloorCas: () => ({ application: floor() }),
+        appendJournal(value) { entries.push(value); this.writes += 1; return value; },
+        acceptProvisionalMetadata() {
+          throw Object.assign(new Error('injected metadata drift'), { code: 'SERVICE_STALE', ambiguous: true });
+        },
+        publishCurrentMetadata: () => assert.fail('must not activate a failed mutation'),
+        publishManualCleanup(value) {
+          manualRecord = value;
+          this.writes += 1;
+          return markerPersists ? { present: true, value } : absent();
+        },
+        close: () => calls.push('session-close'),
+      };
+      const acquisition = {
+        readManifests: () => ({
+          application: {
+            manifestFingerprint: 'a'.repeat(64), releaseSequence: 1,
+            releaseTreeFingerprint: 'b'.repeat(64), compatibilityFingerprint: 'c'.repeat(64),
+            archive: { sha256: 'd'.repeat(64) },
+            inventory: { treeFingerprint: 'b'.repeat(64) },
+            entrypoints: { bot: 'bot/src/bot.js' },
+            entrypointPath: `${prefix}/release/bot.js`,
+          },
+        }),
+        reserve: () => assert.fail('must not reserve after metadata failure'),
+        publish: () => assert.fail('must not publish after metadata failure'),
+        close: () => calls.push('acquisition-close'),
+      };
+      const lifecycle = createServiceLifecycle({
+        platform, architecture: 'x64', native: {}, store: { openMutation: () => session },
+        acquisition, compatibility: () => { calls.push('compatibility'); },
+        observeApplication: () => assert.fail('must not start a failed mutation'),
+        driver: { probe: () => ({ platformPhase: 'absent' }) },
+        planResource: () => ({
+          trial: { resourceFingerprint: 'e'.repeat(64), resourceDescriptor: { name: 'gjc-remote-bot' } },
+          final: { resourceFingerprint: 'f'.repeat(64), resourceDescriptor: { name: 'gjc-remote-bot' } },
+        }),
+      });
+      const source = {
+        kind: 'offline', applicationManifestPath: `${prefix}/m`,
+        applicationSignaturePath: `${prefix}/s`, applicationArchivePath: `${prefix}/a`,
+      };
+      await assert.rejects(lifecycle.install({
+        schemaVersion: 1, target: { component: 'bot' },
+        roles, configuration, source,
+        expected: { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0 },
+      }), (error) => {
+        assert.equal(error.code, markerPersists ? 'SERVICE_STALE' : 'SERVICE_MANUAL_CLEANUP');
+        assert.equal(error.ambiguous, true);
+        assert.equal(error.writes, 2);
+        return true;
+      });
+      assert.equal(entries.length, 1);
+      assert.equal(manualRecord.transactionId, entries[0].transactionId);
+      assert.equal(manualRecord.journalFingerprint, entries[0].transactionFingerprint);
+      assert.equal(manualRecord.phase, 'prepared');
+      assert.equal(manualRecord.expectedDisposition, 'absent');
+      assert.equal(manualRecord.observedDisposition, 'torn');
+      assert.equal(manualRecord.observedFingerprint, null);
+      assert.deepEqual(calls, ['compatibility', 'acquisition-close', 'session-close']);
+    });
+}
+
+test('a compatibility refusal precedes the transaction, journal head, provisional metadata and manual marker', async () => {
+  const platform = 'linux';
+  const calls = [];
+  const entries = [];
+  let manualRecord;
+  const absent = () => ({ present: false, value: null });
+  const floor = () => ({ floor: { committedSequence: 0 } });
+  const prefix = '';
+  const configuration = {
+    runtimePath: `${prefix}/runtime`, workingDirectory: `${prefix}/work`,
+    homeDirectory: `${prefix}/home`, logDirectory: `${prefix}/log`,
+    channelsConfig: `${prefix}/channels`,
+    expectedHostSetFingerprint: '0'.repeat(64), expectedHostCount: 0,
+  };
+  const session = {
+    platform, architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
+    readManifest: absent, readResourceProof: absent, readReferences: absent,
+    readManualCleanup: absent, readStartupProof: absent,
+    readSiblingReferences: () => [],
+    readJournal: () => ({
+      entries,
+      head: entries.length ? { present: true, value: entries.at(-1) } : absent(),
+      pending: null,
+    }),
+    assertFloorCas: () => ({ application: floor() }),
+    appendJournal(value) { entries.push(value); this.writes += 1; return value; },
+    acceptProvisionalMetadata() {
+      assert.fail('compatibility refusal must precede provisional metadata');
+    },
+    publishCurrentMetadata: () => assert.fail('must not activate a failed mutation'),
+    publishManualCleanup(value) {
+      manualRecord = value;
+      this.writes += 1;
+      return { present: true, value };
+    },
+    close: () => calls.push('session-close'),
+  };
+  const acquisition = {
+    readManifests: () => ({
+      application: {
+        manifestFingerprint: 'a'.repeat(64), releaseSequence: 1,
+        releaseTreeFingerprint: 'b'.repeat(64), compatibilityFingerprint: 'c'.repeat(64),
+        archive: { sha256: 'd'.repeat(64) },
+        inventory: { treeFingerprint: 'b'.repeat(64) },
+        entrypoints: { bot: 'bot/src/bot.js' },
+        entrypointPath: `${prefix}/release/bot.js`,
+      },
+    }),
+    reserve: () => assert.fail('must not reserve after metadata failure'),
+    publish: () => assert.fail('must not publish after metadata failure'),
+    close: () => calls.push('acquisition-close'),
+  };
+  const lifecycle = createServiceLifecycle({
+    platform, architecture: 'x64', native: {}, store: { openMutation: () => session },
+    acquisition, compatibility: () => { throw Object.assign(new Error('retained envelope drift'), { code: 'SERVICE_STALE', ambiguous: true, writes: 0 }); },
+    observeApplication: () => assert.fail('must not start a failed mutation'),
+    driver: { probe: () => ({ platformPhase: 'absent' }) },
+    planResource: () => ({
+      trial: { resourceFingerprint: 'e'.repeat(64), resourceDescriptor: { name: 'gjc-remote-bot' } },
+      final: { resourceFingerprint: 'f'.repeat(64), resourceDescriptor: { name: 'gjc-remote-bot' } },
+    }),
+  });
+  const source = {
+    kind: 'offline', applicationManifestPath: `${prefix}/m`,
+    applicationSignaturePath: `${prefix}/s`, applicationArchivePath: `${prefix}/a`,
+  };
+  await assert.rejects(lifecycle.install({
+    schemaVersion: 1, target: { component: 'bot' },
+    roles, configuration, source,
+    expected: { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0 },
+  }), { code: 'SERVICE_STALE' });
+  assert.equal(entries.length, 0);
+  assert.equal(manualRecord, undefined);
+  assert.equal(session.writes, 0);
+  assert.deepEqual(calls, ['acquisition-close', 'session-close']);
 });
 
 test('recovery refuses an unknown classifier without replay or synthetic proof', async () => {
@@ -360,18 +848,44 @@ test('windows status authenticates the SCM resource fingerprint, never a Linux b
     manifestFingerprint, resourceProof, applicationManifestFingerprint: 'd'.repeat(64), shawlManifestFingerprint: 'e'.repeat(64),
     roles: windowsRoles, rolesFingerprint: serviceRolesFingerprint(windowsRoles, 'win32'),
   };
+  const retainedApplication = windowsApplicationManifest({
+    manifestFingerprint: manifest.applicationManifestFingerprint,
+    archiveSha256: '7'.repeat(64),
+  });
+  const retainedShawl = windowsShawlManifest({
+    manifestFingerprint: manifest.shawlManifestFingerprint,
+  });
+  const applicationPublication = windowsApplicationPublication(retainedApplication);
+  const shawlPublication = windowsShawlPublication(retainedShawl);
+  const driverLocks = Object.freeze({ kind: 'driver-locks' });
   const session = {
     platform: 'win32', architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
+    handoffDriverLocks: () => driverLocks,
     readManifest: () => ({ present: true, value: manifest }),
     readResourceProof: () => ({ present: true, value: { resourceProof, platformResourceFingerprint, rolesFingerprint: manifest.rolesFingerprint } }),
     readStartupProof: () => ({ present: false, value: null }), readManualCleanup: () => ({ present: false, value: null }),
     readJournal: () => ({ entries: [{ phase: 'committed' }], head: { present: true, value: { phase: 'committed' } }, pending: null }),
-    readRetainedDeploymentEnvelope: () => ({ manifest: { manifestFingerprint: manifest.applicationManifestFingerprint, entrypointPath: 'C:/ProgramData/GJC/releases/current/bot.js' } }),
+    readRetainedDeploymentEnvelope: ({ purpose }) => ({
+      manifest: purpose === 'application' ? retainedApplication : retainedShawl,
+    }),
+    readPublicationReceipt: ({ slot, artifactKind }) => {
+      assert.equal(slot, 'current');
+      return artifactKind === 'application' ? applicationPublication : shawlPublication;
+    },
     close: () => {},
   };
   const lifecycle = createServiceLifecycle({
     platform: 'win32', architecture: 'x64', store: { openReadOnly: () => session },
-    driver: { probe: () => ({ platformPhase: 'final', resourceFingerprint: platformResourceFingerprint, resourceDescriptor: { botUnitSha256: 'f'.repeat(64) }, service: 'stopped', activation: 'enabled', tree: 'empty' }) },
+    driver: ({ release, publicationReceipts, locks }) => {
+      assert.equal(locks, driverLocks);
+      assert.equal(release.entrypointPath, applicationPublication.locations[0].absolutePath);
+      assert.equal(release.entrypointSha256, applicationPublication.locations[0].fileSha256);
+      assert.equal(release.supervisorPath, shawlPublication.locations[0].absolutePath);
+      assert.equal(release.supervisorSha256, shawlPublication.locations[0].fileSha256);
+      assert.equal(publicationReceipts.application.publication, applicationPublication);
+      assert.equal(publicationReceipts.shawl.publication, shawlPublication);
+      return { probe: () => ({ platformPhase: 'final', resourceFingerprint: platformResourceFingerprint, resourceDescriptor: { botUnitSha256: 'f'.repeat(64) }, service: 'stopped', activation: 'enabled', tree: 'empty' }) };
+    },
   });
   const receipt = await lifecycle.status({ schemaVersion: 1, target: { component: 'bot' }, roles: windowsRoles });
   assert.equal(receipt.ownership, 'owned');

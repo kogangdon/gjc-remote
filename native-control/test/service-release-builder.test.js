@@ -18,11 +18,14 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { DEPLOYMENT_FORMAT_REGISTRY } from '@gjc-remote/shared/deployment-format-registry';
 import { canonicalJsonBytes, parseCanonicalJsonBytes } from '@gjc-remote/shared/strict-json';
 import { applicationDeploymentManifestFingerprint } from '@gjc-remote/shared/deployment-envelope';
 import { capabilities, capabilitySignatures, contractRevision } from '../src/capabilities.js';
 import { consumeApplicationArchive, inspectApplicationArchive } from '../src/service-archive.js';
+import { parseBunProductionLock as parseSharedBunProductionLock } from '../src/service-production-closure.js';
 import { createPinnedDeploymentInstallation } from '../test-fixtures/pinned-deployment-installation.mjs';
 
 const require = createRequire(import.meta.url);
@@ -39,7 +42,7 @@ const POSITIVE_ARCHITECTURE = process.platform === 'win32'
 const OTHER_PLATFORM = POSITIVE_PLATFORM === 'win32' ? 'linux' : 'win32';
 const OTHER_ARCHITECTURE = POSITIVE_ARCHITECTURE === 'arm64' ? 'x64' : 'arm64';
 const TARGET_SUFFIX = `${POSITIVE_PLATFORM}-${POSITIVE_ARCHITECTURE}`;
-const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.2-${TARGET_SUFFIX}.tar.gz`;
+const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.3-${TARGET_SUFFIX}.tar.gz`;
 const MANIFEST_NAME = `gjc-remote-service-${TARGET_SUFFIX}.manifest.json`;
 const SDK_INTEGRITY = 'sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==';
 const SDK_SOURCE_CONTRACT_DOMAIN = 'gjc-remote/sdk-external-state-source/v1';
@@ -123,32 +126,38 @@ function packageModels({
 } = {}) {
   const models = {
     bot: {
-      name: '@gjc-remote/bot', version: '0.4.0-rc.2', private: true, type: 'module',
+      name: '@gjc-remote/bot', version: '0.4.0-rc.3', private: true, type: 'module',
       dependencies: {
         '@gjc-remote/native-control': '*',
-        '@gjc-remote/shared': '0.4.0-rc.2',
+        '@gjc-remote/shared': '0.4.0-rc.3',
         'fixture-consumer': '1.0.0',
       },
     },
     daemon: {
-      name: '@gjc-remote/daemon', version: '0.4.0-rc.2', private: true, type: 'module',
+      name: '@gjc-remote/daemon', version: '0.4.0-rc.3', private: true, type: 'module',
       dependencies: {
         '@gajae-code/coding-agent': '0.16.7',
         '@gjc-remote/native-control': '*',
-        '@gjc-remote/shared': '0.4.0-rc.2',
+        '@gjc-remote/shared': '0.4.0-rc.3',
       },
     },
     native: {
-      name: '@gjc-remote/native-control', version: '1.0.0', private: true, type: 'module',
+      name: '@gjc-remote/native-control', version: '2.0.0', private: true, type: 'module',
       nativeControlContract: {
-        version: 4,
-        revision: 4,
+        version: 5,
+        revision: contractRevision,
         napi: 8,
         platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
       },
-      dependencies: { '@gjc-remote/shared': '0.4.0-rc.2', tar: '7.5.22' },
+      dependencies: {
+        '@gjc-remote/shared': '0.4.0-rc.3',
+        dotenv: '16.6.1',
+        'jsonc-parser': '3.3.1',
+        semver: '7.8.5',
+        tar: '7.5.22',
+      },
     },
-    shared: { name: '@gjc-remote/shared', version: '0.4.0-rc.2', private: true, type: 'module' },
+    shared: { name: '@gjc-remote/shared', version: '0.4.0-rc.3', private: true, type: 'module' },
     consumer: {
       name: 'fixture-consumer', version: '1.0.0', type: 'module',
       dependencies: { '@gjc-remote/native-control': '*' },
@@ -175,6 +184,9 @@ function packageModels({
       type: 'module',
     },
     tar: { name: 'tar', version: '7.5.22', type: 'module' },
+    jsoncParser: { name: 'jsonc-parser', version: '3.3.1', type: 'module' },
+    semver: { name: 'semver', version: '7.8.5', type: 'module' },
+    dotenv: { name: 'dotenv', version: '16.6.1', main: 'lib/main.js' },
   };
   if (caseNativeAlias) {
     models.consumer.dependencies['@GJC-REMOTE/native-control'] = '1.0.0';
@@ -218,7 +230,7 @@ function bunLock(models = packageModels(), {
     workspaces: {
       '': {
         name: 'gjc-remote',
-        version: '0.4.0-rc.2',
+        version: '0.4.0-rc.3',
         devDependencies: { 'jsonc-parser': '3.3.1' },
       },
       bot: { name: models.bot.name, version: models.bot.version, dependencies: models.bot.dependencies },
@@ -256,6 +268,9 @@ function bunLock(models = packageModels(), {
         { os: models.target.os[0], cpu: models.target.cpu[0] }, fakeSri(3),
       ],
       tar: ['tar@7.5.22', '', {}, fakeSri(4)],
+      'jsonc-parser': ['jsonc-parser@3.3.1', '', {}, fakeSri(8)],
+      semver: ['semver@7.8.5', '', {}, fakeSri(9)],
+      dotenv: ['dotenv@16.6.1', '', {}, fakeSri(40)],
       ...(models.debug ? {
         'fixture-debug': ['fixture-debug@1.0.0', '', { ...models.debugLock }, fakeSri(7)],
       } : {}),
@@ -305,7 +320,7 @@ function createSourceRepository(root, installation, {
   const source = join(root, 'source');
   mkdirSync(source, { recursive: true });
   writeJson(join(source, 'package.json'), {
-    name: 'gjc-remote', version: '0.4.0-rc.2', private: true, type: 'module',
+    name: 'gjc-remote', version: '0.4.0-rc.3', private: true, type: 'module',
     workspaces: ['bot', 'daemon', 'native-control', 'shared'],
     devDependencies: { 'jsonc-parser': '3.3.1' },
   });
@@ -316,6 +331,13 @@ function createSourceRepository(root, installation, {
   write(join(source, 'daemon/src/daemon.js'), 'export const daemonFixture = true;\n');
   writeJson(join(source, 'native-control/package.json'), models.native);
   write(join(source, 'native-control/src/public.js'), 'export const nativeFixture = true;\n');
+  for (const name of [
+    'capabilities', 'native-provenance', 'service-bootstrap-native',
+    'service-bootstrap-policy', 'service-bootstrap',
+  ]) {
+    write(join(source, `native-control/src/${name}.js`), `export const fixture = ${JSON.stringify(name)};\n`);
+  }
+  write(join(source, 'shared/strict-json.js'), 'export const strictJsonFixture = true;\n');
   write(join(source, 'native-control/release-keys/trusted.json'), nativeTrustBytes);
   write(
     join(source, 'native-control/deployment-keys/application-trusted.json'),
@@ -341,7 +363,7 @@ function createSourceRepository(root, installation, {
     GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
     GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
   });
-  git(source, ['tag', 'v0.4.0-rc.2']);
+  git(source, ['tag', 'v0.4.0-rc.3']);
   if (commitAfterTag) {
     write(join(source, 'shared/later.js'), 'export const later = true;\n');
     git(source, ['add', '--all']);
@@ -365,7 +387,7 @@ function createNativeInputs(root, installation, packageJson, {
   const nativeRoot = join(root, 'native-input');
   mkdirSync(nativeRoot, { recursive: true });
   const manifest = {
-    contractVersion: 4,
+    contractVersion: 5,
     contractRevision,
     package: packageJson.name,
     version: packageJson.version,
@@ -543,6 +565,14 @@ function materializeModeledProduction(cwd, {
     writeJson(join(tar, 'package.json'), models.tar);
     write(join(tar, 'index.js'), 'export const tarFixture = true;\n');
   }
+  for (const model of [models.jsoncParser, models.semver]) {
+    const packageRoot = join(modules, model.name);
+    writeJson(join(packageRoot, 'package.json'), model);
+    write(join(packageRoot, 'index.js'), 'export const runtimeDependencyFixture = true;\n');
+  }
+  const dotenv = join(modules, 'dotenv');
+  writeJson(join(dotenv, 'package.json'), models.dotenv);
+  write(join(dotenv, 'lib/main.js'), 'module.exports = { config() {} };\n');
   if (models.debug) {
     const debug = join(modules, 'fixture-debug');
     writeJson(join(debug, 'package.json'), models.debug);
@@ -686,6 +716,24 @@ async function createFixture(t, options = {}) {
   };
 }
 
+test('code-owned registry loads without a build and refuses serialized overrides', async (t) => {
+  const installation = await createPinnedDeploymentInstallation({
+    keyIds: ['registry-fixture'], includeReleaseBuilder: true,
+  });
+  t.after(() => installation.dispose());
+  const contract = await installation.releaseBuilder.loadServiceReleaseContract();
+  assert.deepEqual(contract.formatRegistry, DEPLOYMENT_FORMAT_REGISTRY);
+  assert.equal(Object.isFrozen(contract.formatRegistry.bot.formats[0].marker), true);
+  const contractPath = fileURLToPath(new URL('../../deploy/native/release-contract.json', installation.releaseBuilderUrl));
+  const raw = JSON.parse(readFileSync(contractPath, 'utf8'));
+  assert.equal(Object.hasOwn(raw, 'formatRegistry'), false);
+  writeFileSync(contractPath, JSON.stringify({ ...raw, formatRegistry: DEPLOYMENT_FORMAT_REGISTRY }));
+  await assert.rejects(
+    installation.releaseBuilder.loadServiceReleaseContract(),
+    (error) => error.code === 'SERVICE_RELEASE_CONTRACT_INVALID',
+  );
+});
+
 test('release contract is closed and Bun JSONC parsing rejects every error and duplicate property', async (t) => {
   const fixture = await createFixture(t);
   try {
@@ -719,13 +767,22 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
         'parseBunProductionLock',
         'runServiceReleaseCli',
         'verifyUnsignedServiceRelease',
+        'windowsServiceBootstrapMetadata',
       ],
     );
     const contract = await fixture.installation.releaseBuilder.loadServiceReleaseContract();
+    const fixtureContractPath = join(
+      dirname(dirname(dirname(fileURLToPath(fixture.installation.releaseBuilderUrl)))),
+      'deploy', 'native', 'release-contract.json',
+    );
+    const rawContractBytes = readFileSync(fixtureContractPath);
+    assert.equal(Object.hasOwn(JSON.parse(rawContractBytes.toString('utf8')), 'formatRegistry'), false);
+    assert.deepEqual(contract.formatRegistry, DEPLOYMENT_FORMAT_REGISTRY);
+    assert.equal(Object.isFrozen(contract.formatRegistry), true);
     assert.equal(fixture.installation.releaseBuilder.buildUnsignedServiceRelease.length, 1);
     assert.equal(contract.repository, 'kogangdon/gjc-remote');
-    assert.equal(contract.releaseVersion, '0.4.0-rc.2');
-    assert.equal(contract.releaseTag, 'v0.4.0-rc.2');
+    assert.equal(contract.releaseVersion, '0.4.0-rc.3');
+    assert.equal(contract.releaseTag, 'v0.4.0-rc.3');
     assert.equal(contract.sdk.packageVersion, '0.16.7');
     assert.equal(contract.sdk.configSchemaVersion, 2);
     assert.equal(contract.sdk.transcriptVersion, 5);
@@ -741,7 +798,7 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
       assert.deepEqual(botFormats.get(`floor:${kind}@1`), {
         formatId: `floor:${kind}@1`,
         marker: { version: 1, kind },
-        source: 'bot/src/managed-authority-reader.js',
+        source: 'shared/managed-authority-proof.js',
       });
     }
     assert.deepEqual(botFormats.get('reader-state:readerVersion/2'), {
@@ -775,6 +832,7 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
 
     const valid = bunLock();
     const parsed = fixture.installation.releaseBuilder.parseBunProductionLock(valid);
+    assert.deepEqual(parseSharedBunProductionLock(valid), parsed);
     assert.equal(parsed.sha256, sha256(valid));
     assert.equal(parsed.names.get('@gajae-code/coding-agent')[0].integrity, SDK_INTEGRITY);
 
@@ -820,6 +878,13 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
         { code: 'SERVICE_RELEASE_LOCK_INVALID', writes: 0 },
       );
     }
+    const suppliedRegistry = JSON.parse(rawContractBytes.toString('utf8'));
+    suppliedRegistry.formatRegistry = structuredClone(DEPLOYMENT_FORMAT_REGISTRY);
+    writeJson(fixtureContractPath, suppliedRegistry);
+    await assert.rejects(
+      fixture.installation.releaseBuilder.loadServiceReleaseContract(),
+      { code: 'SERVICE_RELEASE_CONTRACT_INVALID', writes: 0 },
+    );
     await refuses(
       fixture.installation.releaseBuilder.runServiceReleaseCli(['build']),
       'SERVICE_RELEASE_INPUT_INVALID',
@@ -900,7 +965,7 @@ test('two clean modeled Bun-boundary builds are byte-identical and round-trip th
     assert.equal(first.producerEvidence.integrityAuthority, 'fresh-bun-frozen-lockfile-registry-sri');
     assert.equal(fixture.boundary.evidenceScope, 'modeled-external-bun-process-no-network-or-sri-proof');
     assert.equal(first.source.repository, 'kogangdon/gjc-remote');
-    assert.equal(first.source.tag, 'v0.4.0-rc.2');
+    assert.equal(first.source.tag, 'v0.4.0-rc.3');
     assert.equal(first.source.commit, git(sourceFixture.source, ['rev-parse', 'HEAD^{commit}']));
     assert.equal(first.source.tree, git(sourceFixture.source, ['rev-parse', 'HEAD^{tree}']));
     assert.equal(first.source.commit, git(independentSource.source, ['rev-parse', 'HEAD^{commit}']));
@@ -961,6 +1026,18 @@ test('two clean modeled Bun-boundary builds are byte-identical and round-trip th
     });
     assert.equal(manifest.source.bunLockSha256, sha256(bunLock()));
     assert.equal(manifest.nativeControl.manifestFingerprint, first.nativeManifestFingerprint);
+    assert.equal(Object.hasOwn(manifest, 'windowsServiceBootstrap'), POSITIVE_PLATFORM === 'win32');
+    if (POSITIVE_PLATFORM === 'win32') {
+      assert.equal(
+        manifest.windowsServiceBootstrap.guardPath,
+        'node_modules/@gjc-remote/native-control/src/service-bootstrap.js',
+      );
+      assert.equal(
+        manifest.windowsServiceBootstrap.staticClosure.some(({ relativePath }) =>
+          relativePath === 'node_modules/dotenv/lib/main.js'),
+        true,
+      );
+    }
     assert.equal(
       manifest.compatibility.roles.daemon.sdkExternalStateContractFingerprint,
       first.sdkExternalStateContract.sdkExternalStateContractFingerprint,
@@ -1052,7 +1129,8 @@ test('two clean modeled Bun-boundary builds are byte-identical and round-trip th
       'node_modules/@gjc-remote/native-control/build/Release/native_control.node',
       'node_modules/fixture-consumer/node_modules/@gjc-remote/native-control/build/Release/native_control.node',
     ]) assert.equal(paths.has(path), true, path);
-    assert.equal([...paths].some((path) => path.startsWith('node_modules/jsonc-parser/')), false);
+    assert.equal(paths.has('node_modules/jsonc-parser/package.json'), true);
+    assert.equal(paths.has('node_modules/semver/package.json'), true);
     assert.equal([...paths].some((path) => path.split('/').includes('.bin')), false);
     assert.equal([...paths].some((path) =>
       path.split('/').some((segment) => [

@@ -1,12 +1,143 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { validateServiceRoles } from '@gjc-remote/shared/service-lifecycle-envelope';
-import { capabilitySignatures, serviceCapabilities } from '../src/capabilities.js';
-import { createServiceNativeFactory } from '../src/service-native.js';
+import {
+  capabilities,
+  capabilitySignatures,
+  contractRevision,
+  serviceCapabilities,
+} from '../src/capabilities.js';
+import {
+  validateBuildManifestMetadata,
+  validateNativeAddonContract,
+  validateNativePackageContract,
+} from '../src/native-provenance.js';
+import { createSelfProcessObserverFactory, createServiceNativeFactory } from '../src/service-native.js';
 import * as publicApi from '../src/public.js';
 
 const ROLE_KEYS = ['management', 'bot', 'recovery', 'daemon', 'system'];
+const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
+test('public self observation rejects caller authority before loading native code', () => {
+  assert.equal(typeof publicApi.createSelfProcessObserver, 'function');
+  assert.equal(publicApi.createSelfProcessObserver.length, 0);
+  assert.equal(Object.hasOwn(publicApi, 'observeSelfProcessEpoch'), false);
+  assert.equal(Object.hasOwn(publicApi, 'createSelfProcessObserverFactory'), false);
+  assert.equal(Object.hasOwn(publicApi, 'createServiceBootstrapNative'), false);
+  assert.equal(Object.hasOwn(publicApi, 'readSelfServiceConfig'), false);
+  let accessed = false;
+  const suppliedAuthority = new Proxy({}, {
+    get() { accessed = true; throw new Error('must not inspect supplied authority'); },
+    ownKeys() { accessed = true; throw new Error('must not inspect supplied authority'); },
+  });
+  for (const value of [undefined, null, 123, 'C:/another/process.exe', suppliedAuthority]) {
+    assertServiceInvalid(() => publicApi.createSelfProcessObserver(value), 'create_self_process_observer');
+  }
+  assert.equal(accessed, false);
+});
+
+test('source ABI accepts only native contract v5 revision 1 and N-API 8', () => {
+  assert.equal(packageJson.version, '2.0.0');
+  assert.equal(contractRevision, 1);
+  assert.deepEqual(publicApi.buildManifest, {
+    contractVersion: 5,
+    contractRevision: 1,
+    napi: 8,
+    capabilities,
+    capabilitySignatures,
+  });
+  assert.deepEqual(packageJson.nativeControlContract, {
+    version: 5,
+    revision: 1,
+    napi: 8,
+    platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
+  });
+  assert.equal(validateNativePackageContract(packageJson), true);
+  for (const [version, revision, napi] of [[4, 4, 8], [5, 4, 8], [5, 1, 7]]) {
+    const incompatible = structuredClone(packageJson);
+    incompatible.nativeControlContract = {
+      ...incompatible.nativeControlContract,
+      version,
+      revision,
+      napi,
+    };
+    assert.equal(validateNativePackageContract(incompatible), false);
+  }
+  const staleSourceVersion = structuredClone(packageJson);
+  staleSourceVersion.version = '1.0.0';
+  assert.equal(validateNativePackageContract(staleSourceVersion), false);
+
+  const addonContract = {
+    contractVersion: 5,
+    contractRevision: 1,
+    napi: 8,
+    capabilities,
+    capabilitySignatures,
+  };
+  assert.equal(validateNativeAddonContract(addonContract), true);
+  assert.equal(validateNativeAddonContract({ ...addonContract, contractVersion: 4 }), false);
+  assert.equal(validateNativeAddonContract({ ...addonContract, contractRevision: 4 }), false);
+  const manifest = {
+    contractVersion: 5,
+    contractRevision: 1,
+    package: packageJson.name,
+    version: packageJson.version,
+    napi: 8,
+    platform: 'linux',
+    arch: 'x64',
+    addon: 'native_control.node',
+    sha256: 'a'.repeat(64),
+    capabilities,
+    capabilitySignatures,
+  };
+  assert.equal(validateBuildManifestMetadata(manifest, packageJson, 'linux', 'x64'), true);
+  assert.equal(validateBuildManifestMetadata({ ...manifest, contractVersion: 4 }, packageJson, 'linux', 'x64'), false);
+  assert.equal(validateBuildManifestMetadata({ ...manifest, contractRevision: 4 }, packageJson, 'linux', 'x64'), false);
+  assert.equal(validateBuildManifestMetadata(manifest, staleSourceVersion, 'linux', 'x64'), false);
+});
+
+test('self observer captures only its read-only method and preserves native receipts and errors', () => {
+  let loads = 0;
+  let calls = 0;
+  let failure;
+  const receipt = Object.freeze({ processEpochFingerprint: 'a'.repeat(64), writes: 0 });
+  const backend = {
+    observeSelfProcessEpoch() { calls += 1; if (failure) throw failure; return receipt; },
+    get readSelfServiceConfig() { assert.fail('self observer must not capture config access'); },
+    get createServiceNative() { assert.fail('self observer must not capture management access'); },
+  };
+  const create = createSelfProcessObserverFactory(() => { loads += 1; return backend; });
+  assertServiceInvalid(() => create(undefined), 'create_self_process_observer');
+  assert.equal(loads, 0);
+  const observer = create();
+  assert.equal(loads, 1);
+  assert.equal(Object.isFrozen(observer), true);
+  assert.deepEqual(Reflect.ownKeys(observer), ['observeSelfProcessEpoch']);
+  assert.equal(observer.observeSelfProcessEpoch.length, 0);
+  assertServiceInvalid(() => observer.observeSelfProcessEpoch(123), 'observe_self_process_epoch');
+  assert.equal(calls, 0);
+  backend.observeSelfProcessEpoch = () => assert.fail('must retain the verified function');
+  assert.equal(observer.observeSelfProcessEpoch(), receipt);
+  failure = Object.assign(new Error('native refusal'), { code: 'SERVICE_STALE', writes: 0 });
+  assert.throws(() => observer.observeSelfProcessEpoch(), (error) => error === failure);
+  assert.equal(calls, 2);
+  assert.equal(loads, 1);
+});
+
+test('self observer refuses missing and accessor-backed methods without evaluating them', () => {
+  let accessed = false;
+  for (const backend of [null, {}, { observeSelfProcessEpoch: 1 }, {
+    get observeSelfProcessEpoch() { accessed = true; return () => ({}); },
+  }]) {
+    assertServiceInvalid(
+      () => createSelfProcessObserverFactory(() => backend)(),
+      'create_self_process_observer',
+    );
+  }
+  assert.equal(accessed, false);
+});
 
 function validRoles() {
   if (process.platform === 'win32') {
@@ -283,17 +414,18 @@ test('all signatures remove only roles and inject the immutable snapshot at its 
     assert.notEqual(roleCalls[0][role], inputRoles[role]);
     assert.equal(Object.isFrozen(roleCalls[0][role]), true);
   }
-  assert.equal(facade.create_win32_service_disabled.length, 15);
-  assert.deepEqual(
-    capabilitySignatures.create_win32_service_disabled.filter((name) => name !== 'roles'),
-    [
-      'name', 'serviceRole', 'supervisorPath', 'supervisorSha256',
-      'workingDirectory', 'homeDirectory', 'runtimePath', 'runtimeSha256',
-      'entrypointPath', 'entrypointSha256', 'logDirectory', 'logAs',
-      'logCmdAs', 'channelsConfig', 'servicePassword',
-    ],
-  );
-  assert.equal(facade.configure_win32_service_launch.length, 15);
+  assert.equal(facade.plan_win32_service_resource.length, 5);
+  assert.deepEqual(capabilitySignatures.plan_win32_service_resource, [
+    'name', 'serviceRole', 'launch', 'applicationManifestFingerprint', 'phase', 'roles',
+  ]);
+  assert.equal(facade.create_win32_service_disabled.length, 4);
+  assert.deepEqual(capabilitySignatures.create_win32_service_disabled, [
+    'name', 'serviceRole', 'launch', 'servicePassword', 'roles',
+  ]);
+  assert.equal(facade.configure_win32_service_launch.length, 4);
+  assert.deepEqual(capabilitySignatures.configure_win32_service_launch, [
+    'serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'launch',
+  ]);
 
   const callerRoles = validRoles();
   facade.open_win32_service('GJCRemoteBot', 'bot', callerRoles);

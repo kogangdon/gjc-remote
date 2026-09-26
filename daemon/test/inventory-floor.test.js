@@ -48,7 +48,7 @@ function reader(values) {
   return Object.freeze({
     selfTest: async () => Object.freeze({
       role: "daemon",
-      contractVersion: 4,
+      contractVersion: 5,
       writes: 0,
     }),
     readAccepted: async () => {

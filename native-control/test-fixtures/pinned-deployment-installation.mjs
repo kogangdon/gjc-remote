@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -18,6 +19,9 @@ import { deploymentSignaturePreimage, DEPLOYMENT_SIGNATURE_DOMAINS } from '@gjc-
 
 const require = createRequire(import.meta.url);
 const cleanupFailureCode = 'PINNED_DEPLOYMENT_FIXTURE_CLEANUP_FAILED';
+const nativePackageBytes = readFileSync(
+  fileURLToPath(new URL('../package.json', import.meta.url)),
+);
 
 function cleanupFailure() {
   const error = new Error(cleanupFailureCode);
@@ -145,7 +149,10 @@ export async function createPinnedDeploymentInstallation({
       );
     }
     writeFileSync(join(root, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
-    for (const name of ['package.json', 'strict-json.js', 'identity.js', 'deployment-envelope.js', 'service-lifecycle-envelope.js']) {
+    for (const name of [
+      'package.json', 'strict-json.js', 'identity.js', 'deployment-envelope.js',
+      'deployment-format-registry.js', 'service-lifecycle-envelope.js',
+    ]) {
       copyFileSync(fileURLToPath(new URL(`../../shared/${name}`, import.meta.url)), join(shared, name));
     }
     for (const name of [
@@ -153,6 +160,7 @@ export async function createPinnedDeploymentInstallation({
       ...(includeStore ? ['service-artifacts.js', 'service-store.js'] : []),
       ...(includeTransport ? ['service-transport.js'] : []),
       ...(includeOffline ? ['service-offline-source.js'] : []),
+      ...(includeReleaseBuilder ? ['service-sdk-contract.js', 'service-production-closure.js', 'service-bootstrap-policy.js'] : []),
       ...(includeStore || includeAcquisition || includeReleaseBuilder ? ['service-archive.js'] : []),
       ...(includeAcquisition ? ['service-acquisition.js'] : []),
       ...(includeNativeProvenance
@@ -261,6 +269,9 @@ export async function createPinnedDeploymentInstallation({
       bundledNativeTrustBytes: includeNativeProvenance
         ? Buffer.from(bundledNativeTrustBytes)
         : null,
+      get nativePackageBytes() {
+        return includeNativeProvenance ? Buffer.from(nativePackageBytes) : null;
+      },
       dispose,
       signManifest,
       signNativeManifest,

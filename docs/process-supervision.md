@@ -70,6 +70,12 @@ cannot satisfy ownership, stop, readiness, or evidence gates. This does not roll
 back an application artifact, runtime, mapping authority, or durable state.
 
 ## Windows supervision
+
+The source-level production host composition (SCM -> Shawl -> Node/Bun ->
+application, signed bootstrap guard, startup readiness) is described in
+[Production host composition](deployment/platforms/windows.md#production-host-composition-source-level).
+It carries no compiled-addon, SCM, account, ACL, or reboot evidence.
+
 ### Shawl v1.9.0 (selected primary)
 
 Shawl is the selected primary Windows supervisor. Stage the operator-supplied

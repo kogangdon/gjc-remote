@@ -7,7 +7,7 @@ import { inventoryConfigDiagnostic } from "../src/inventory-config.js";
 
 const stubReader = () =>
   Object.freeze({
-    selfTest: async () => Object.freeze({ role: "daemon", contractVersion: 4, writes: 0 }),
+    selfTest: async () => Object.freeze({ role: "daemon", contractVersion: 5, writes: 0 }),
     readAccepted: async () => {
       throw new Error("must not read");
     },

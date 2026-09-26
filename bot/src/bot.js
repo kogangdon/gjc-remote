@@ -1,4 +1,5 @@
 import "./node-version-guard.js";
+import { consumeServiceBootstrapContext } from "@gjc-remote/native-control/service-bootstrap";
 import "dotenv/config";
 import { existsSync, lstatSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
@@ -60,6 +61,11 @@ import {
 
 import { createShutdown } from "./shutdown.js";
 import { resolveBotSecrets } from "./container-secrets.js";
+import { createBotServiceStartupReporter } from "./service-startup-reporter.js";
+
+// Verified Windows service launch context, or null outside a service launch.
+// The guard module has already evaluated before dotenv and application imports.
+const serviceBootstrapContext = consumeServiceBootstrapContext();
 
 const {
   GJC_BOT_ALLOWED_USERS,
@@ -253,6 +259,14 @@ function handleFatal(event, error) {
 }
 
 let hostWsPort;
+const serviceStartupReporter = serviceBootstrapContext === null
+  ? null
+  : createBotServiceStartupReporter({
+      context: serviceBootstrapContext,
+      tokensByHostId,
+      writable: process.stdout,
+      onFailure: (error) => handleFatal("service_startup_observation_failed", error),
+    });
 try {
   const rawPort = HOST_WS_PORT === undefined ? undefined : `${HOST_WS_PORT}`;
   hostWsPort = rawPort?.trim() === "" || rawPort === undefined ? 7711 : Number(rawPort);
@@ -270,7 +284,9 @@ registry = new HostRegistry({
   workspaceServingEnabled: GJC_NATIVE_WORKSPACE_SERVING === "1",
   ...invokeTimeoutOptions,
   onError: (error) => handleFatal("host_ws_listen_failed", error),
+  onConnectionStateChange: () => serviceStartupReporter?.report(),
 });
+serviceStartupReporter?.attachRegistry(registry);
 registry.setManagedRoutes(
   channelMapping.sourceKind === "managed-v1" ? channelMap : {}
 );
@@ -288,7 +304,14 @@ const client = new Client({
 
 client.once("clientReady", () => {
   console.log(`Logged in as ${client.user.tag}. Channels mapped: ${Object.keys(channelMap).length}`);
+  serviceStartupReporter?.setDiscord("connected");
 });
+if (serviceStartupReporter !== null) {
+  client.on("shardResume", () => serviceStartupReporter.setDiscord("connected"));
+  client.on("shardReady", () => serviceStartupReporter.setDiscord("connected"));
+  client.on("shardDisconnect", () => serviceStartupReporter.setDiscord("disconnected"));
+  client.on("invalidated", () => serviceStartupReporter.setDiscord("disconnected"));
+}
 
 client.on("interactionCreate", async (interaction) => {
   await dispatchAuthorizedInteraction({

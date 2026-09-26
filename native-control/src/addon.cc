@@ -5331,6 +5331,26 @@ void ServiceError(napi_env env, const char* code, const char* operation,
   napi_throw(env, error);
 }
 
+void ServiceObservationError(napi_env env, const char* code,
+                             const char* operation, const char* reason,
+                             bool ambiguous = false) {
+  napi_value error, text, value;
+  const std::string message = std::string(operation) + " failed";
+  napi_create_string_utf8(env, message.c_str(), NAPI_AUTO_LENGTH, &text);
+  napi_create_error(env, nullptr, text, &error);
+  napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &value);
+  napi_set_named_property(env, error, "code", value);
+  napi_create_string_utf8(env, operation, NAPI_AUTO_LENGTH, &value);
+  napi_set_named_property(env, error, "operation", value);
+  napi_create_uint32(env, 0, &value);
+  napi_set_named_property(env, error, "writes", value);
+  napi_get_boolean(env, ambiguous, &value);
+  napi_set_named_property(env, error, "ambiguous", value);
+  napi_create_string_utf8(env, reason, NAPI_AUTO_LENGTH, &value);
+  napi_set_named_property(env, error, "reason", value);
+  napi_throw(env, error);
+}
+
 void ServiceSetString(napi_env env, napi_value object, const char* name,
                       const std::string& text) {
   napi_value value;
@@ -5422,7 +5442,111 @@ enum class ServiceAclProfile {
   DaemonLogDirectory,
   InternalContainerDirectory,
   PreservedContainerDirectory,
+  ExternalAnchorDirectory,
+  BotConfigDirectory,
+  BotConfigFile,
+  DaemonConfigDirectory,
+  DaemonConfigFile,
+  SdkInstallDirectory,
+  SdkInstallFile,
+  BotRetainedDirectory,
+  BotRetainedFile,
+  DaemonRetainedDirectory,
+  DaemonRetainedFile,
 };
+
+enum class ServiceExternalProfile {
+  Config,
+  RetainedState,
+  SdkInstall,
+};
+
+enum class ServiceExternalAclPolicy {
+  Unresolved,
+  Bot,
+  Daemon,
+  SdkInstall,
+};
+
+bool ParseServiceExternalProfile(const std::string& text,
+                                ServiceExternalProfile* profile) {
+  if (text == "config") {
+    *profile = ServiceExternalProfile::Config;
+    return true;
+  }
+  if (text == "retained-state") {
+    *profile = ServiceExternalProfile::RetainedState;
+    return true;
+  }
+  if (text == "sdk-install") {
+    *profile = ServiceExternalProfile::SdkInstall;
+    return true;
+  }
+  return false;
+}
+
+ServiceAclProfile ServiceExternalDirectoryProfile(
+    ServiceExternalProfile profile, ServiceExternalAclPolicy policy) {
+  switch (profile) {
+    case ServiceExternalProfile::Config:
+      if (policy == ServiceExternalAclPolicy::Bot) {
+        return ServiceAclProfile::BotConfigDirectory;
+      }
+      if (policy == ServiceExternalAclPolicy::Daemon) {
+        return ServiceAclProfile::DaemonConfigDirectory;
+      }
+      return ServiceAclProfile::ExternalAnchorDirectory;
+    case ServiceExternalProfile::RetainedState:
+      if (policy == ServiceExternalAclPolicy::Bot) {
+        return ServiceAclProfile::BotRetainedDirectory;
+      }
+      if (policy == ServiceExternalAclPolicy::Daemon) {
+        return ServiceAclProfile::DaemonRetainedDirectory;
+      }
+      return ServiceAclProfile::ExternalAnchorDirectory;
+    case ServiceExternalProfile::SdkInstall:
+      return ServiceAclProfile::SdkInstallDirectory;
+  }
+  return ServiceAclProfile::ExternalAnchorDirectory;
+}
+
+ServiceAclProfile ServiceExternalFileProfile(
+    ServiceExternalProfile profile, ServiceExternalAclPolicy policy) {
+  switch (profile) {
+    case ServiceExternalProfile::Config:
+      if (policy == ServiceExternalAclPolicy::Bot) {
+        return ServiceAclProfile::BotConfigFile;
+      }
+      if (policy == ServiceExternalAclPolicy::Daemon) {
+        return ServiceAclProfile::DaemonConfigFile;
+      }
+      return ServiceAclProfile::ExternalAnchorDirectory;
+    case ServiceExternalProfile::RetainedState:
+      if (policy == ServiceExternalAclPolicy::Bot) {
+        return ServiceAclProfile::BotRetainedFile;
+      }
+      if (policy == ServiceExternalAclPolicy::Daemon) {
+        return ServiceAclProfile::DaemonRetainedFile;
+      }
+      return ServiceAclProfile::ExternalAnchorDirectory;
+    case ServiceExternalProfile::SdkInstall:
+      return ServiceAclProfile::SdkInstallFile;
+  }
+  return ServiceAclProfile::ExternalAnchorDirectory;
+}
+
+bool ServiceExternalPolicyAllowed(
+    ServiceExternalProfile profile,
+    ServiceExternalAclPolicy policy) {
+  return (profile == ServiceExternalProfile::Config &&
+          (policy == ServiceExternalAclPolicy::Bot ||
+           policy == ServiceExternalAclPolicy::Daemon)) ||
+      (profile == ServiceExternalProfile::RetainedState &&
+       (policy == ServiceExternalAclPolicy::Bot ||
+        policy == ServiceExternalAclPolicy::Daemon)) ||
+      (profile == ServiceExternalProfile::SdkInstall &&
+       policy == ServiceExternalAclPolicy::SdkInstall);
+}
 
 bool ParseServiceAclProfile(const std::string& text,
                             ServiceAclProfile* profile) {
@@ -5453,6 +5577,39 @@ bool ParseServiceAclProfile(const std::string& text,
   if (text == "service-daemon-log-directory") {
     *profile = ServiceAclProfile::DaemonLogDirectory; return true;
   }
+  if (text == "service-external-anchor-directory") {
+    *profile = ServiceAclProfile::ExternalAnchorDirectory; return true;
+  }
+  if (text == "service-bot-config-directory") {
+    *profile = ServiceAclProfile::BotConfigDirectory; return true;
+  }
+  if (text == "service-bot-config-file") {
+    *profile = ServiceAclProfile::BotConfigFile; return true;
+  }
+  if (text == "service-daemon-config-directory") {
+    *profile = ServiceAclProfile::DaemonConfigDirectory; return true;
+  }
+  if (text == "service-daemon-config-file") {
+    *profile = ServiceAclProfile::DaemonConfigFile; return true;
+  }
+  if (text == "service-sdk-install-directory") {
+    *profile = ServiceAclProfile::SdkInstallDirectory; return true;
+  }
+  if (text == "service-sdk-install-file") {
+    *profile = ServiceAclProfile::SdkInstallFile; return true;
+  }
+  if (text == "service-bot-retained-directory") {
+    *profile = ServiceAclProfile::BotRetainedDirectory; return true;
+  }
+  if (text == "service-bot-retained-file") {
+    *profile = ServiceAclProfile::BotRetainedFile; return true;
+  }
+  if (text == "service-daemon-retained-directory") {
+    *profile = ServiceAclProfile::DaemonRetainedDirectory; return true;
+  }
+  if (text == "service-daemon-retained-file") {
+    *profile = ServiceAclProfile::DaemonRetainedFile; return true;
+  }
   return false;
 }
 
@@ -5463,12 +5620,29 @@ bool ServiceProfileDirectory(ServiceAclProfile profile) {
       profile == ServiceAclProfile::BotLogDirectory ||
       profile == ServiceAclProfile::DaemonLogDirectory ||
       profile == ServiceAclProfile::InternalContainerDirectory ||
-      profile == ServiceAclProfile::PreservedContainerDirectory;
+      profile == ServiceAclProfile::PreservedContainerDirectory ||
+      profile == ServiceAclProfile::ExternalAnchorDirectory ||
+      profile == ServiceAclProfile::BotConfigDirectory ||
+      profile == ServiceAclProfile::DaemonConfigDirectory ||
+      profile == ServiceAclProfile::SdkInstallDirectory ||
+      profile == ServiceAclProfile::BotRetainedDirectory ||
+      profile == ServiceAclProfile::DaemonRetainedDirectory;
 }
 
 bool ServiceProfileExternal(ServiceAclProfile profile) {
   return profile == ServiceAclProfile::BotLogDirectory ||
-      profile == ServiceAclProfile::DaemonLogDirectory;
+      profile == ServiceAclProfile::DaemonLogDirectory ||
+      profile == ServiceAclProfile::ExternalAnchorDirectory ||
+      profile == ServiceAclProfile::BotConfigDirectory ||
+      profile == ServiceAclProfile::BotConfigFile ||
+      profile == ServiceAclProfile::DaemonConfigDirectory ||
+      profile == ServiceAclProfile::DaemonConfigFile ||
+      profile == ServiceAclProfile::SdkInstallDirectory ||
+      profile == ServiceAclProfile::SdkInstallFile ||
+      profile == ServiceAclProfile::BotRetainedDirectory ||
+      profile == ServiceAclProfile::BotRetainedFile ||
+      profile == ServiceAclProfile::DaemonRetainedDirectory ||
+      profile == ServiceAclProfile::DaemonRetainedFile;
 }
 
 bool ServiceProfileOwned(ServiceAclProfile profile) {
@@ -5477,8 +5651,12 @@ bool ServiceProfileOwned(ServiceAclProfile profile) {
 }
 
 size_t ServiceProfileOwner(ServiceAclProfile profile) {
-  if (profile == ServiceAclProfile::BotLogDirectory) return 1;
-  if (profile == ServiceAclProfile::DaemonLogDirectory) return 3;
+  if (profile == ServiceAclProfile::BotLogDirectory ||
+      profile == ServiceAclProfile::BotRetainedDirectory ||
+      profile == ServiceAclProfile::BotRetainedFile) return 1;
+  if (profile == ServiceAclProfile::DaemonLogDirectory ||
+      profile == ServiceAclProfile::DaemonRetainedDirectory ||
+      profile == ServiceAclProfile::DaemonRetainedFile) return 3;
   return 0;
 }
 
@@ -5499,6 +5677,45 @@ uint8_t ServiceRoleMode(ServiceAclProfile profile, size_t role) {
   }
   if (profile == ServiceAclProfile::PreservedContainerDirectory) {
     return 0;
+  }
+  if (profile == ServiceAclProfile::ExternalAnchorDirectory) {
+    return role == 0 ? 7 :
+        (role == 2 || role == 4 ? 5 : 0);
+  }
+  if (profile == ServiceAclProfile::BotConfigDirectory ||
+      profile == ServiceAclProfile::BotConfigFile ||
+      profile == ServiceAclProfile::DaemonConfigDirectory ||
+      profile == ServiceAclProfile::DaemonConfigFile) {
+    const size_t workload =
+        profile == ServiceAclProfile::BotConfigDirectory ||
+                profile == ServiceAclProfile::BotConfigFile
+            ? 1 : 3;
+    const uint8_t read_mode = static_cast<uint8_t>(directory ? 5 : 4);
+    if (role == 0) return static_cast<uint8_t>(directory ? 7 : 6);
+    if (role == 2 || role == 4 || role == workload) return read_mode;
+    return 0;
+  }
+  if (profile == ServiceAclProfile::SdkInstallDirectory ||
+      profile == ServiceAclProfile::SdkInstallFile) {
+    if (role == 0) return static_cast<uint8_t>(directory ? 7 : 6);
+    if (role == 2 || role == 4) {
+      return static_cast<uint8_t>(directory ? 5 : 4);
+    }
+    return role == 3 ? 5 : 0;
+  }
+  if (profile == ServiceAclProfile::BotRetainedDirectory ||
+      profile == ServiceAclProfile::BotRetainedFile ||
+      profile == ServiceAclProfile::DaemonRetainedDirectory ||
+      profile == ServiceAclProfile::DaemonRetainedFile) {
+    const size_t workload =
+        profile == ServiceAclProfile::BotRetainedDirectory ||
+                profile == ServiceAclProfile::BotRetainedFile
+            ? 1 : 3;
+    if (role == 0 || role == workload) {
+      return static_cast<uint8_t>(directory ? 7 : 6);
+    }
+    return role == 2 || role == 4
+        ? static_cast<uint8_t>(directory ? 5 : 4) : 0;
   }
   if (profile == ServiceAclProfile::ReleaseExecutable) return 5;
   if (profile == ServiceAclProfile::ReleaseFile) return 4;
@@ -6163,6 +6380,33 @@ napi_value ReadFileFactsNoFollow(napi_env env, napi_callback_info info) {
   return result;
 #endif
 }
+
+#ifdef _WIN32
+bool ReadWindowsBootIdentity(std::string* boot_id) {
+  struct SystemTimeOfDayInformation {
+    LARGE_INTEGER boot_time;
+    LARGE_INTEGER current_time;
+    LARGE_INTEGER timezone_bias;
+    ULONG timezone_id;
+    ULONG reserved;
+    ULONGLONG boot_time_bias;
+    ULONGLONG sleep_time_bias;
+  } value{};
+  using NtQuerySystemInformationFunction =
+      LONG (NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+  auto query = reinterpret_cast<NtQuerySystemInformationFunction>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                     "NtQuerySystemInformation"));
+  ULONG returned = 0;
+  if (!query || query(3, &value, sizeof(value), &returned) < 0 ||
+      returned < sizeof(value.boot_time) || value.boot_time.QuadPart <= 0) {
+    return false;
+  }
+  *boot_id = "win32:" + std::to_string(
+      static_cast<uint64_t>(value.boot_time.QuadPart));
+  return true;
+}
+#endif
 
 napi_value ReadBootId(napi_env env, napi_callback_info info) {
   napi_value args[1];
@@ -7276,6 +7520,48 @@ bool BuildWin32ServiceObjectAcl(const InventoryRoles& roles, PACL* acl,
   return SetEntriesInAclW(3, entries, nullptr, acl) == ERROR_SUCCESS;
 }
 
+bool ExpectedWin32ServiceObjectSecurityFingerprint(
+    const InventoryRoles& roles, std::string* fingerprint) {
+  PACL acl = nullptr;
+  std::array<PSID, 3> sids{};
+  if (!BuildWin32ServiceObjectAcl(roles, &acl, &sids)) {
+    if (acl) LocalFree(acl);
+    for (PSID sid : sids) if (sid) LocalFree(sid);
+    return false;
+  }
+  SECURITY_DESCRIPTOR descriptor{};
+  const bool initialized =
+      InitializeSecurityDescriptor(
+          &descriptor, SECURITY_DESCRIPTOR_REVISION) &&
+      SetSecurityDescriptorOwner(&descriptor, sids[0], FALSE) &&
+      SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) &&
+      SetSecurityDescriptorControl(
+          &descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
+  DWORD required = 0;
+  const bool sized = initialized &&
+      !MakeSelfRelativeSD(&descriptor, nullptr, &required) &&
+      GetLastError() == ERROR_INSUFFICIENT_BUFFER && required > 0 &&
+      required <= 1024 * 1024;
+  std::vector<uint8_t> bytes;
+  try {
+    if (sized) bytes.resize(required);
+  } catch (...) {
+    LocalFree(acl);
+    for (PSID sid : sids) if (sid) LocalFree(sid);
+    return false;
+  }
+  const bool serialized = sized && MakeSelfRelativeSD(
+      &descriptor, reinterpret_cast<PSECURITY_DESCRIPTOR>(bytes.data()),
+      &required);
+  Sha256 hash;
+  const bool hashed = serialized && hash.Ready() &&
+      hash.Update(bytes.data(), required);
+  if (hashed) *fingerprint = hash.Finish();
+  LocalFree(acl);
+  for (PSID sid : sids) if (sid) LocalFree(sid);
+  return hashed && ValidServiceFingerprint(*fingerprint);
+}
+
 bool VerifyWin32ServiceObjectAcl(SC_HANDLE service,
                                  const InventoryRoles& roles,
                                  std::string* security_sha256 = nullptr) {
@@ -7948,13 +8234,33 @@ struct Win32ServiceLaunch {
   std::string home_directory;
   std::string runtime_path;
   std::string runtime_sha256;
+  std::string runtime_version;
+  std::string runtime_source_revision;
   std::string entrypoint_path;
   std::string entrypoint_sha256;
+  std::string bootstrap_path;
+  std::string bootstrap_sha256;
+  std::string bootstrap_closure_fingerprint;
+  std::string runtime_config_root;
+  std::string runtime_config_root_identity_fingerprint;
+  std::string runtime_config_path;
+  std::string runtime_config_sha256;
+  std::string runtime_config_identity_fingerprint;
+  std::string sdk_profile_path;
+  std::string scope_fingerprint;
   std::string log_directory;
   std::string log_as;
   std::string log_cmd_as;
   std::string channels_config;
   bool has_channels_config = false;
+  bool has_runtime_config = false;
+  bool has_sdk_profile = false;
+  std::string effective_config_fingerprint;
+  std::string config_source_identity_fingerprint;
+  std::string runtime_policy_fingerprint;
+  std::string launch_fingerprint;
+  std::vector<std::string> child_arguments;
+  std::vector<std::pair<std::string, std::string>> environment;
   std::wstring command_line;
 };
 
@@ -7968,6 +8274,196 @@ bool ValidWin32LogBase(const std::string& value,
       });
 }
 
+bool ValidCanonicalWin32LaunchPath(const std::string& value) {
+  WindowsPathParts parts;
+  return value.size() >= 4 && value[0] >= 'A' && value[0] <= 'Z' &&
+      value.find('/') == std::string::npos && value.back() != '\\' &&
+      ParseWindowsPath(value, &parts) && !parts.components.empty();
+}
+
+bool ValidWin32LaunchText(const std::string& value) {
+  for (size_t index = 0; index < value.size(); ++index) {
+    const uint8_t byte = static_cast<uint8_t>(value[index]);
+    if (byte < 0x20 || (byte >= 0x7f && byte <= 0x9f)) return false;
+    if (index + 2 < value.size() && byte == 0xe2 &&
+        static_cast<uint8_t>(value[index + 1]) == 0x80 &&
+        (static_cast<uint8_t>(value[index + 2]) == 0xa8 ||
+         static_cast<uint8_t>(value[index + 2]) == 0xa9)) return false;
+  }
+  return true;
+}
+
+bool ValidWin32LaunchHash(const std::string& value, size_t length = 64) {
+  return value.size() == length &&
+      value.find_first_not_of("0123456789abcdef") == std::string::npos;
+}
+
+std::string Win32JsonString(const std::string& value) {
+  std::string result = "\"";
+  for (unsigned char character : value) {
+    if (character == '"' || character == '\\') {
+      result.push_back('\\');
+      result.push_back(static_cast<char>(character));
+    } else if (character < 0x20) {
+      static constexpr char hex[] = "0123456789abcdef";
+      result += "\\u00";
+      result.push_back(hex[(character >> 4) & 0x0f]);
+      result.push_back(hex[character & 0x0f]);
+    } else {
+      result.push_back(static_cast<char>(character));
+    }
+  }
+  result.push_back('"');
+  return result;
+}
+
+std::string Win32CanonicalObject(
+    const std::map<std::string, std::string>& fields) {
+  std::string result = "{";
+  bool first = true;
+  for (const auto& field : fields) {
+    if (!first) result.push_back(',');
+    first = false;
+    result += Win32JsonString(field.first);
+    result.push_back(':');
+    result += field.second;
+  }
+  result.push_back('}');
+  return result;
+}
+
+std::map<std::string, std::string> Win32LaunchEnvironment(
+    const Win32ServiceLaunch& launch, const std::string& role,
+    const std::string& service_key, bool policy_template) {
+  std::map<std::string, std::string> values;
+  auto add = [&values](const std::string& key,
+                       const std::string& value) {
+    values.emplace(key, Win32JsonString(value));
+  };
+  add("HOME", launch.home_directory);
+  add("USERPROFILE", launch.home_directory);
+  add("NODE_OPTIONS", "");
+  add("NODE_PATH", "");
+  if (role == "daemon") {
+    add("BUN_OPTIONS", "");
+    add("BUN_INSPECT_PRELOAD", launch.bootstrap_path);
+    add("XDG_CONFIG_HOME", launch.runtime_config_root);
+    add("BUN_INSPECT", "");
+    add("BUN_INSPECT_CONNECT_TO", "");
+    add("GJC_CODING_AGENT_DIR", launch.sdk_profile_path);
+  } else {
+    add("CHANNELS_CONFIG", launch.channels_config);
+  }
+  add("GJC_REMOTE_SERVICE_COMPONENT", role);
+  add("GJC_REMOTE_SERVICE_KEY", service_key);
+  add("GJC_REMOTE_SUPERVISOR_SHA256", launch.supervisor_sha256);
+  add("GJC_REMOTE_RUNTIME_VERSION", launch.runtime_version);
+  add("GJC_REMOTE_RUNTIME_SOURCE_REVISION", launch.runtime_source_revision);
+  add("GJC_REMOTE_RUNTIME_SHA256", launch.runtime_sha256);
+  add("GJC_REMOTE_ENTRYPOINT_SHA256", launch.entrypoint_sha256);
+  add("GJC_REMOTE_BOOTSTRAP_PATH", launch.bootstrap_path);
+  add("GJC_REMOTE_BOOTSTRAP_SHA256", launch.bootstrap_sha256);
+  add("GJC_REMOTE_BOOTSTRAP_CLOSURE_FINGERPRINT",
+      launch.bootstrap_closure_fingerprint);
+  add("GJC_REMOTE_RUNTIME_CONFIG_ROOT_IDENTITY_FINGERPRINT",
+      launch.runtime_config_root_identity_fingerprint);
+  add("GJC_REMOTE_RUNTIME_CONFIG_PATH", launch.runtime_config_path);
+  add("GJC_REMOTE_RUNTIME_CONFIG_SHA256", launch.runtime_config_sha256);
+  add("GJC_REMOTE_RUNTIME_CONFIG_IDENTITY_FINGERPRINT",
+      launch.runtime_config_identity_fingerprint);
+  add("GJC_REMOTE_SDK_PROFILE_PATH", launch.sdk_profile_path);
+  add("GJC_REMOTE_SCOPE_FINGERPRINT", launch.scope_fingerprint);
+  add("GJC_REMOTE_EFFECTIVE_CONFIG_FINGERPRINT",
+      launch.effective_config_fingerprint);
+  add("GJC_REMOTE_CONFIG_SOURCE_IDENTITY_FINGERPRINT",
+      launch.config_source_identity_fingerprint);
+  add("GJC_REMOTE_LAUNCH_FINGERPRINT", launch.launch_fingerprint);
+  add("GJC_REMOTE_RUNTIME_POLICY_FINGERPRINT",
+      policy_template ? "@runtime-policy-fingerprint"
+                      : launch.runtime_policy_fingerprint);
+  return values;
+}
+
+std::vector<std::string> Win32ChildArguments(
+    const Win32ServiceLaunch& launch, const std::string& role) {
+  if (role == "bot") {
+    return {launch.runtime_path, launch.entrypoint_path};
+  }
+  return {launch.runtime_path, "--config", launch.runtime_config_path,
+      "--no-env-file", launch.entrypoint_path};
+}
+
+std::string Win32LaunchFingerprint(
+    const Win32ServiceLaunch& launch, const std::string& role,
+    const std::string& service_key) {
+  std::map<std::string, std::string> values{
+    {"bootstrapClosureFingerprint", Win32JsonString(launch.bootstrap_closure_fingerprint)},
+    {"bootstrapPath", Win32JsonString(launch.bootstrap_path)},
+    {"bootstrapSha256", Win32JsonString(launch.bootstrap_sha256)},
+    {"channelsConfig", launch.has_channels_config ? Win32JsonString(launch.channels_config) : "null"},
+    {"configSourceIdentityFingerprint", Win32JsonString(launch.config_source_identity_fingerprint)},
+    {"effectiveConfigFingerprint", Win32JsonString(launch.effective_config_fingerprint)},
+    {"entrypointPath", Win32JsonString(launch.entrypoint_path)},
+    {"entrypointSha256", Win32JsonString(launch.entrypoint_sha256)},
+    {"homeDirectory", Win32JsonString(launch.home_directory)},
+    {"logAs", Win32JsonString(launch.log_as)},
+    {"logCmdAs", Win32JsonString(launch.log_cmd_as)},
+    {"logDirectory", Win32JsonString(launch.log_directory)},
+    {"runtimeConfigIdentityFingerprint", launch.has_runtime_config ? Win32JsonString(launch.runtime_config_identity_fingerprint) : "null"},
+    {"runtimeConfigPath", launch.has_runtime_config ? Win32JsonString(launch.runtime_config_path) : "null"},
+    {"runtimeConfigRoot", launch.has_runtime_config ? Win32JsonString(launch.runtime_config_root) : "null"},
+    {"runtimeConfigRootIdentityFingerprint", launch.has_runtime_config ? Win32JsonString(launch.runtime_config_root_identity_fingerprint) : "null"},
+    {"runtimeConfigSha256", launch.has_runtime_config ? Win32JsonString(launch.runtime_config_sha256) : "null"},
+    {"runtimePath", Win32JsonString(launch.runtime_path)},
+    {"runtimeSha256", Win32JsonString(launch.runtime_sha256)},
+    {"runtimeSourceRevision", Win32JsonString(launch.runtime_source_revision)},
+    {"runtimeVersion", Win32JsonString(launch.runtime_version)},
+    {"sdkProfilePath", launch.has_sdk_profile ? Win32JsonString(launch.sdk_profile_path) : "null"},
+    {"scopeFingerprint", Win32JsonString(launch.scope_fingerprint)},
+    {"supervisorPath", Win32JsonString(launch.supervisor_path)},
+    {"supervisorSha256", Win32JsonString(launch.supervisor_sha256)},
+    {"workingDirectory", Win32JsonString(launch.working_directory)},
+  };
+  const std::string launch_json = Win32CanonicalObject(values);
+  const std::string canonical = Win32CanonicalObject({
+    {"component", Win32JsonString(role)},
+    {"kind", Win32JsonString("gjc-remote/windows-service-launch/v1")},
+    {"launch", launch_json},
+    {"serviceKey", Win32JsonString(service_key)},
+  });
+  Sha256 hash;
+  if (!hash.Ready() || !hash.Update(canonical)) return {};
+  return hash.Finish();
+}
+
+std::string Win32RuntimePolicyFingerprint(
+    const Win32ServiceLaunch& launch, const std::string& role,
+    const std::string& service_key) {
+  std::string argv = "[";
+  bool first = true;
+  for (const auto& argument : Win32ChildArguments(launch, role)) {
+    if (!first) argv.push_back(',');
+    first = false;
+    argv += Win32JsonString(argument);
+  }
+  argv.push_back(']');
+  const std::string environment = Win32CanonicalObject(
+      Win32LaunchEnvironment(launch, role, service_key, true));
+  const std::string canonical = Win32CanonicalObject({
+    {"argv", argv},
+    {"component", Win32JsonString(role)},
+    {"environment", environment},
+    {"kind", Win32JsonString("gjc-remote/windows-runtime-policy/v1")},
+    {"launchFingerprint", Win32JsonString(launch.launch_fingerprint)},
+    {"runtimeSourceRevision", Win32JsonString(launch.runtime_source_revision)},
+    {"runtimeVersion", Win32JsonString(launch.runtime_version)},
+    {"serviceKey", Win32JsonString(service_key)},
+  });
+  Sha256 hash;
+  if (!hash.Ready() || !hash.Update(canonical)) return {};
+  return hash.Finish();
+}
+
 std::string Win32ServiceLogStem(const std::string& name,
                                 const std::string& role) {
   return role == "bot" ? "gjc-remote-bot" :
@@ -7975,105 +8471,256 @@ std::string Win32ServiceLogStem(const std::string& name,
           name.substr(std::string("GJCRemoteDaemon-").size());
 }
 
-bool CaptureWin32ServiceLaunch(napi_env env, napi_value* args,
-                               size_t offset,
+std::vector<std::pair<std::string, std::string>>
+Win32LaunchEnvironmentEntries(const Win32ServiceLaunch& launch,
+                              const std::string& role,
+                              const std::string& service_key) {
+  std::vector<std::pair<std::string, std::string>> values{
+    {"HOME", launch.home_directory},
+    {"USERPROFILE", launch.home_directory},
+    {"NODE_OPTIONS", ""},
+    {"NODE_PATH", ""},
+  };
+  if (role == "daemon") {
+    values.insert(values.end(), {
+      {"BUN_OPTIONS", ""},
+      {"BUN_INSPECT_PRELOAD", launch.bootstrap_path},
+      {"XDG_CONFIG_HOME", launch.runtime_config_root},
+      {"BUN_INSPECT", ""},
+      {"BUN_INSPECT_CONNECT_TO", ""},
+      {"GJC_CODING_AGENT_DIR", launch.sdk_profile_path},
+    });
+  } else {
+    values.emplace_back("CHANNELS_CONFIG", launch.channels_config);
+  }
+  values.insert(values.end(), {
+    {"GJC_REMOTE_SERVICE_COMPONENT", role},
+    {"GJC_REMOTE_SERVICE_KEY", service_key},
+    {"GJC_REMOTE_SUPERVISOR_SHA256", launch.supervisor_sha256},
+    {"GJC_REMOTE_RUNTIME_VERSION", launch.runtime_version},
+    {"GJC_REMOTE_RUNTIME_SOURCE_REVISION", launch.runtime_source_revision},
+    {"GJC_REMOTE_RUNTIME_SHA256", launch.runtime_sha256},
+    {"GJC_REMOTE_ENTRYPOINT_SHA256", launch.entrypoint_sha256},
+    {"GJC_REMOTE_BOOTSTRAP_PATH", launch.bootstrap_path},
+    {"GJC_REMOTE_BOOTSTRAP_SHA256", launch.bootstrap_sha256},
+    {"GJC_REMOTE_BOOTSTRAP_CLOSURE_FINGERPRINT",
+        launch.bootstrap_closure_fingerprint},
+    {"GJC_REMOTE_RUNTIME_CONFIG_ROOT_IDENTITY_FINGERPRINT",
+        launch.runtime_config_root_identity_fingerprint},
+    {"GJC_REMOTE_RUNTIME_CONFIG_PATH", launch.runtime_config_path},
+    {"GJC_REMOTE_RUNTIME_CONFIG_SHA256", launch.runtime_config_sha256},
+    {"GJC_REMOTE_RUNTIME_CONFIG_IDENTITY_FINGERPRINT",
+        launch.runtime_config_identity_fingerprint},
+    {"GJC_REMOTE_SDK_PROFILE_PATH", launch.sdk_profile_path},
+    {"GJC_REMOTE_SCOPE_FINGERPRINT", launch.scope_fingerprint},
+    {"GJC_REMOTE_EFFECTIVE_CONFIG_FINGERPRINT",
+        launch.effective_config_fingerprint},
+    {"GJC_REMOTE_CONFIG_SOURCE_IDENTITY_FINGERPRINT",
+        launch.config_source_identity_fingerprint},
+    {"GJC_REMOTE_LAUNCH_FINGERPRINT", launch.launch_fingerprint},
+    {"GJC_REMOTE_RUNTIME_POLICY_FINGERPRINT",
+        launch.runtime_policy_fingerprint},
+  });
+  return values;
+}
+
+bool VerifyWin32RuntimeConfigLaunch(const Win32ServiceLaunch& launch,
+                                    const InventoryRoles& roles);
+bool VerifyWin32ConfigSourceLaunch(const Win32ServiceLaunch& launch,
+                                   const InventoryRoles& roles,
+                                   const std::string& role);
+
+bool CaptureWin32ServiceLaunch(napi_env env, napi_value value,
                                const std::string& name,
                                const std::string& role,
                                const InventoryRoles& roles,
                                Win32ServiceLaunch* launch) {
+  static const char* const field_names[] = {
+    "supervisorPath", "supervisorSha256", "workingDirectory",
+    "homeDirectory", "runtimePath", "runtimeSha256", "runtimeVersion",
+    "runtimeSourceRevision", "entrypointPath", "entrypointSha256",
+    "bootstrapPath", "bootstrapSha256", "bootstrapClosureFingerprint",
+    "runtimeConfigRoot", "runtimeConfigRootIdentityFingerprint",
+    "runtimeConfigPath", "runtimeConfigSha256",
+    "runtimeConfigIdentityFingerprint", "sdkProfilePath", "scopeFingerprint",
+    "logDirectory", "logAs", "logCmdAs", "channelsConfig",
+    "effectiveConfigFingerprint", "configSourceIdentityFingerprint",
+    "runtimePolicyFingerprint",
+  };
+  napi_value captured[27];
+  if (!InventoryOrdinaryDataObject(env, value, field_names, 27, captured)) {
+    return false;
+  }
+  auto read = [env, captured](size_t index, std::string* result) {
+    return InventoryString(env, captured[index], result) &&
+        ValidWin32LaunchText(*result);
+  };
+  auto read_nullable = [env, captured](size_t index, std::string* result,
+                                      bool* present) {
+    return Win32NullableString(
+               env, captured[index], result, present) &&
+        (!*present || ValidWin32LaunchText(*result));
+  };
   const std::string log_stem = Win32ServiceLogStem(name, role);
-  if (!InventoryString(env, args[offset], &launch->supervisor_path) ||
-      !InventoryString(env, args[offset + 1],
-                       &launch->supervisor_sha256) ||
-      !InventoryString(env, args[offset + 2],
-                       &launch->working_directory) ||
-      !InventoryString(env, args[offset + 3],
-                       &launch->home_directory) ||
-      !InventoryString(env, args[offset + 4], &launch->runtime_path) ||
-      !InventoryString(env, args[offset + 5],
-                       &launch->runtime_sha256) ||
-      !InventoryString(env, args[offset + 6],
-                       &launch->entrypoint_path) ||
-      !InventoryString(env, args[offset + 7],
-                       &launch->entrypoint_sha256) ||
-      !InventoryString(env, args[offset + 8],
-                       &launch->log_directory) ||
-      !InventoryString(env, args[offset + 9], &launch->log_as) ||
-      !InventoryString(env, args[offset + 10], &launch->log_cmd_as) ||
-      !Win32NullableString(env, args[offset + 11],
-          &launch->channels_config, &launch->has_channels_config) ||
-      !ValidWin32LogBase(launch->log_as, log_stem + "-wrapper") ||
-      !ValidWin32LogBase(launch->log_cmd_as, log_stem + "-child") ||
+  if (!read(0, &launch->supervisor_path) ||
+      !read(1, &launch->supervisor_sha256) ||
+      !read(2, &launch->working_directory) ||
+      !read(3, &launch->home_directory) ||
+      !read(4, &launch->runtime_path) ||
+      !read(5, &launch->runtime_sha256) ||
+      !read(6, &launch->runtime_version) ||
+      !read(7, &launch->runtime_source_revision) ||
+      !read(8, &launch->entrypoint_path) ||
+      !read(9, &launch->entrypoint_sha256) ||
+      !read(10, &launch->bootstrap_path) ||
+      !read(11, &launch->bootstrap_sha256) ||
+      !read(12, &launch->bootstrap_closure_fingerprint) ||
+      !read_nullable(13, &launch->runtime_config_root,
+                     &launch->has_runtime_config) ||
+      !read_nullable(14, &launch->runtime_config_root_identity_fingerprint,
+                     &launch->has_runtime_config) ||
+      !read_nullable(15, &launch->runtime_config_path,
+                     &launch->has_runtime_config) ||
+      !read_nullable(16, &launch->runtime_config_sha256,
+                     &launch->has_runtime_config) ||
+      !read_nullable(17, &launch->runtime_config_identity_fingerprint,
+                     &launch->has_runtime_config) ||
+      !read_nullable(18, &launch->sdk_profile_path,
+                     &launch->has_sdk_profile) ||
+      !read(19, &launch->scope_fingerprint) ||
+      !read(20, &launch->log_directory) ||
+      !read(21, &launch->log_as) ||
+      !read(22, &launch->log_cmd_as) ||
+      !read_nullable(23, &launch->channels_config,
+                     &launch->has_channels_config) ||
+      !read(24, &launch->effective_config_fingerprint) ||
+      !read(25, &launch->config_source_identity_fingerprint) ||
+      !read(26, &launch->runtime_policy_fingerprint)) return false;
+
+  const bool daemon = role == "daemon";
+  const std::string service_key = role == "bot" ? "bot" :
+      name.substr(std::string("GJCRemoteDaemon-").size());
+  const std::string expected_version = daemon ? "1.4.2" : "26.7.0";
+  const std::string expected_revision = daemon
+      ? "744846f844374847c902b5e7fd59b4342a51ef99"
+      : "b4f23d3619c98bed09af93a21192f6080197a8c6";
+  const std::string expected_runtime_config_root =
+      launch->working_directory + "\\runtime-config";
+  const std::string expected_runtime_config_path =
+      expected_runtime_config_root + "\\.bunfig.toml";
+  if (launch->has_runtime_config != daemon ||
+      launch->has_sdk_profile != daemon ||
+      launch->has_channels_config != !daemon ||
+      launch->runtime_version != expected_version ||
+      launch->runtime_source_revision != expected_revision ||
+      !ValidWin32LaunchHash(launch->runtime_source_revision, 40) ||
+      !ValidWin32LaunchHash(launch->supervisor_sha256) ||
+      !ValidWin32LaunchHash(launch->runtime_sha256) ||
+      !ValidWin32LaunchHash(launch->entrypoint_sha256) ||
+      !ValidWin32LaunchHash(launch->bootstrap_sha256) ||
+      !ValidWin32LaunchHash(launch->bootstrap_closure_fingerprint) ||
+      !ValidWin32LaunchHash(launch->scope_fingerprint) ||
+      !ValidWin32LaunchHash(launch->effective_config_fingerprint) ||
+      !ValidWin32LaunchHash(launch->config_source_identity_fingerprint) ||
+      !ValidWin32LaunchHash(launch->runtime_policy_fingerprint) ||
+      !ValidCanonicalWin32LaunchPath(launch->supervisor_path) ||
+      !ValidCanonicalWin32LaunchPath(launch->working_directory) ||
+      !ValidCanonicalWin32LaunchPath(launch->home_directory) ||
+      !ValidCanonicalWin32LaunchPath(launch->runtime_path) ||
+      !ValidCanonicalWin32LaunchPath(launch->entrypoint_path) ||
+      !ValidCanonicalWin32LaunchPath(launch->bootstrap_path) ||
+      !ValidCanonicalWin32LaunchPath(launch->log_directory) ||
       !Win32PathHasLeaf(launch->supervisor_path, "shawl.exe") ||
       !Win32PathHasLeaf(launch->runtime_path,
-          role == "bot" ? "node.exe" : "bun.exe") ||
+          daemon ? "bun.exe" : "node.exe") ||
       !Win32PathHasLeaf(launch->entrypoint_path,
-          role == "bot" ? "bot.js" : "daemon.js") ||
-      !ReadWindowsFileSha256(
-          launch->supervisor_path, launch->supervisor_sha256) ||
-      !ReadWindowsFileSha256(
-          launch->runtime_path, launch->runtime_sha256) ||
-      !ReadWindowsFileSha256(
-          launch->entrypoint_path, launch->entrypoint_sha256) ||
-      !VerifyWindowsPathServiceAcl(
-          launch->supervisor_path, roles,
+          daemon ? "daemon.js" : "bot.js") ||
+      !Win32PathHasLeaf(launch->bootstrap_path,
+          "service-bootstrap.js") ||
+      launch->home_directory.size() > 4096 ||
+      !ValidWin32LogBase(launch->log_as, log_stem + "-wrapper") ||
+      !ValidWin32LogBase(launch->log_cmd_as, log_stem + "-child") ||
+      (daemon &&
+       (!ValidCanonicalWin32LaunchPath(launch->runtime_config_root) ||
+        !ValidWin32LaunchHash(launch->runtime_config_root_identity_fingerprint) ||
+        !ValidCanonicalWin32LaunchPath(launch->runtime_config_path) ||
+        launch->runtime_config_sha256 !=
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ||
+        !ValidWin32LaunchHash(launch->runtime_config_identity_fingerprint) ||
+        !ValidCanonicalWin32LaunchPath(launch->sdk_profile_path) ||
+        launch->runtime_config_root != expected_runtime_config_root ||
+        launch->runtime_config_path != expected_runtime_config_path)) ||
+      (!daemon && (!launch->runtime_config_root.empty() ||
+          !launch->runtime_config_root_identity_fingerprint.empty() ||
+          !launch->runtime_config_path.empty() ||
+          !launch->runtime_config_sha256.empty() ||
+          !launch->runtime_config_identity_fingerprint.empty() ||
+          !launch->sdk_profile_path.empty())) ||
+      (daemon && !launch->channels_config.empty()) ||
+      (!daemon && !ValidCanonicalWin32LaunchPath(launch->channels_config))) {
+    return false;
+  }
+
+  if (!ReadWindowsFileSha256(launch->supervisor_path,
+                             launch->supervisor_sha256) ||
+      !ReadWindowsFileSha256(launch->runtime_path, launch->runtime_sha256) ||
+      !ReadWindowsFileSha256(launch->entrypoint_path,
+                             launch->entrypoint_sha256) ||
+      !ReadWindowsFileSha256(launch->bootstrap_path,
+                             launch->bootstrap_sha256) ||
+      !VerifyWindowsPathServiceAcl(launch->supervisor_path, roles,
           ServiceAclProfile::ReleaseExecutable) ||
-      !VerifyWindowsPathServiceAcl(
-          launch->entrypoint_path, roles,
+      !VerifyWindowsPathServiceAcl(launch->runtime_path, roles,
+          ServiceAclProfile::ReleaseExecutable) ||
+      !VerifyWindowsPathServiceAcl(launch->entrypoint_path, roles,
+          ServiceAclProfile::ReleaseFile) ||
+      !VerifyWindowsPathServiceAcl(launch->bootstrap_path, roles,
           ServiceAclProfile::ReleaseFile) ||
       !VerifyWindowsDirectoryNoFollow(launch->working_directory) ||
-      launch->home_directory.size() > 4096 ||
       !VerifyWindowsDirectoryNoFollow(launch->home_directory) ||
-      !VerifyWindowsDirectoryNoFollow(launch->log_directory)) {
-    return false;
-  }
-  HANDLE log = OpenWindowsPathNoFollow(launch->log_directory,
-      READ_CONTROL | FILE_READ_ATTRIBUTES, VerifiedObjectType::Directory);
-  const ServiceAclProfile log_profile = role == "bot"
-      ? ServiceAclProfile::BotLogDirectory
-      : ServiceAclProfile::DaemonLogDirectory;
-  const bool log_acl = log != INVALID_HANDLE_VALUE &&
-      VerifyWindowsServiceFileAcl(log, roles, log_profile);
-  if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
-  if (!log_acl || launch->has_channels_config != (role == "bot")) {
-    return false;
-  }
-  if (launch->has_channels_config) {
-    WindowsPathParts channels_path;
-    if (!ParseWindowsPath(launch->channels_config, &channels_path)) {
-      return false;
-    }
-    HANDLE channels = OpenWindowsPathNoFollow(launch->channels_config,
-        GENERIC_READ, VerifiedObjectType::File);
-    if (channels == INVALID_HANDLE_VALUE) return false;
-    CloseHandle(channels);
-  }
+      !VerifyWindowsDirectoryNoFollow(launch->log_directory)) return false;
+
+  const ServiceAclProfile log_profile = daemon
+      ? ServiceAclProfile::DaemonLogDirectory
+      : ServiceAclProfile::BotLogDirectory;
+  if (!VerifyWindowsPathServiceAcl(launch->log_directory, roles,
+                                   log_profile) ||
+      !VerifyWin32ConfigSourceLaunch(*launch, roles, role) ||
+      (!daemon && !VerifyWindowsPathServiceAcl(launch->channels_config, roles,
+          ServiceAclProfile::BotConfigFile)) ||
+      (daemon && !VerifyWin32RuntimeConfigLaunch(*launch, roles)) ||
+      (daemon && (!VerifyWindowsPathServiceAcl(launch->sdk_profile_path,
+          roles, ServiceAclProfile::SdkInstallDirectory)))) return false;
+
+  launch->launch_fingerprint = Win32LaunchFingerprint(
+      *launch, role, service_key);
+  const std::string expected_policy = Win32RuntimePolicyFingerprint(
+      *launch, role, service_key);
+  if (!ValidWin32LaunchHash(launch->launch_fingerprint) ||
+      expected_policy != launch->runtime_policy_fingerprint) return false;
+  launch->child_arguments = Win32ChildArguments(*launch, role);
+  launch->environment = Win32LaunchEnvironmentEntries(
+      *launch, role, service_key);
   std::vector<std::string> arguments = {
-    launch->supervisor_path,
-    "run",
-    "--name", name,
-    "--cwd", launch->working_directory,
-    "--env", "HOME=" + launch->home_directory,
-    "--env", "USERPROFILE=" + launch->home_directory,
-    "--kill-process-tree",
-    "--restart-if-not", "0",
-    "--restart-delay", "10000",
-    "--stop-timeout", role == "bot" ? "30000" : "20000",
-    "--log-dir", launch->log_directory,
-    "--log-as", launch->log_as,
-    "--log-cmd-as", launch->log_cmd_as,
-    "--log-rotate", "bytes=2097152",
-    "--log-retain", "2",
+    launch->supervisor_path, "run", "--name", name, "--cwd",
+    launch->working_directory,
   };
-  if (launch->has_channels_config) {
+  for (const auto& entry : launch->environment) {
     arguments.push_back("--env");
-    arguments.push_back(
-        "CHANNELS_CONFIG=" + launch->channels_config);
+    arguments.push_back(entry.first + "=" + entry.second);
   }
-  arguments.push_back("--");
-  arguments.push_back(launch->runtime_path);
-  if (role == "daemon") arguments.push_back("--no-env-file");
-  arguments.push_back(launch->entrypoint_path);
+  const std::string stop_timeout = daemon ? "20000" : "30000";
+  const std::vector<std::string> wrapper_options = {
+    "--kill-process-tree", "--restart-if-not", "0", "--restart-delay",
+    "10000", "--stop-timeout", stop_timeout, "--log-dir",
+    launch->log_directory, "--log-as", launch->log_as, "--log-cmd-as",
+    launch->log_cmd_as, "--log-rotate", "bytes=1048576", "--log-retain",
+    "2", "--",
+  };
+  arguments.insert(arguments.end(), wrapper_options.begin(),
+                   wrapper_options.end());
+  arguments.insert(arguments.end(), launch->child_arguments.begin(),
+                   launch->child_arguments.end());
   launch->command_line.clear();
   for (const auto& argument : arguments) {
     const std::wstring wide = Wide(argument);
@@ -8187,20 +8834,195 @@ napi_value QueryWin32Service(napi_env env, napi_callback_info info) {
 #endif
 }
 
+#ifdef _WIN32
+bool BuildWin32PlannedServiceSnapshot(
+    const std::string& name, const std::string& role,
+    const InventoryRoles& roles, const Win32ServiceLaunch& launch,
+    const std::string& application_fingerprint, const std::string& phase,
+    Win32ServiceSnapshot* snapshot) {
+  if (phase != "trial" && phase != "final-auto" && phase != "final") {
+    return false;
+  }
+  Win32ServiceHandle handle;
+  handle.name = name;
+  handle.service_role = role;
+  handle.roles = roles;
+  snapshot->service_type = SERVICE_WIN32_OWN_PROCESS;
+  snapshot->start_type = phase == "trial"
+      ? SERVICE_DEMAND_START : SERVICE_AUTO_START;
+  snapshot->error_control = SERVICE_ERROR_NORMAL;
+  snapshot->tag_id = 0;
+  snapshot->binary_path = Utf8(launch.command_line);
+  snapshot->load_order_group.clear();
+  snapshot->dependencies.clear();
+  const std::string& sid = role == "bot" ? roles.bot : roles.daemon;
+  std::wstring account;
+  if (!ResolveWin32ServiceAccountName(sid, &account)) return false;
+  snapshot->account_name = Utf8(account);
+  snapshot->display_name = name;
+  snapshot->description = "gjc-remote:v1:" + application_fingerprint;
+  snapshot->delayed_auto_start = false;
+  snapshot->failure_reset_period = phase == "final" ? 600 : 0;
+  snapshot->failure_reboot_message.clear();
+  snapshot->failure_command.clear();
+  snapshot->failure_actions.clear();
+  if (phase == "final") {
+    snapshot->failure_actions = {
+      {SC_ACTION_RESTART, 10000},
+      {SC_ACTION_RESTART, 10000},
+      {SC_ACTION_RESTART, 10000},
+      {SC_ACTION_NONE, 0},
+    };
+  }
+  snapshot->failure_actions_on_non_crash = false;
+  snapshot->service_sid_type = SERVICE_SID_TYPE_NONE;
+  snapshot->required_privileges.clear();
+  snapshot->trigger_count = 0;
+  snapshot->preshutdown_timeout = 180000;
+  snapshot->security_sha256.clear();
+  if (!ExpectedWin32ServiceObjectSecurityFingerprint(
+          roles, &snapshot->security_sha256)) return false;
+  snapshot->acl_matches = true;
+  snapshot->account_matches_role = true;
+  snapshot->config_fingerprint =
+      Win32ServiceConfigFingerprint(handle, *snapshot);
+  return ValidServiceFingerprint(snapshot->config_fingerprint) &&
+      ValidServiceFingerprint(snapshot->security_sha256);
+}
+
+napi_value Win32ServiceResourceDescriptorValue(
+    napi_env env, const std::string& name, const std::string& role,
+    const Win32ServiceSnapshot& snapshot) {
+  napi_value result, dependencies, privileges, actions, null_value;
+  napi_create_object(env, &result);
+  ServiceSetString(env, result, "name", name);
+  ServiceSetString(env, result, "component", role);
+  ServiceSetString(env, result, "serviceKey",
+      role == "bot" ? "bot" :
+          name.substr(std::string("GJCRemoteDaemon-").size()));
+  ServiceSetString(env, result, "serviceRole", role);
+  ServiceSetUint32(env, result, "serviceType", snapshot.service_type);
+  ServiceSetString(env, result, "startType",
+                   Win32StartTypeName(snapshot.start_type));
+  ServiceSetUint32(env, result, "errorControl", snapshot.error_control);
+  ServiceSetUint32(env, result, "tagId", snapshot.tag_id);
+  ServiceSetString(env, result, "binaryPath", snapshot.binary_path);
+  ServiceSetString(env, result, "loadOrderGroup", snapshot.load_order_group);
+  napi_create_array_with_length(env, snapshot.dependencies.size(),
+                                &dependencies);
+  for (uint32_t index = 0; index < snapshot.dependencies.size(); ++index) {
+    napi_value item;
+    napi_create_string_utf8(env, snapshot.dependencies[index].c_str(),
+        snapshot.dependencies[index].size(), &item);
+    napi_set_element(env, dependencies, index, item);
+  }
+  napi_set_named_property(env, result, "dependencies", dependencies);
+  ServiceSetString(env, result, "accountName", snapshot.account_name);
+  ServiceSetString(env, result, "displayName", snapshot.display_name);
+  ServiceSetString(env, result, "description", snapshot.description);
+  ServiceSetBoolean(env, result, "delayedAutoStart",
+                    snapshot.delayed_auto_start);
+  ServiceSetUint32(env, result, "failureResetPeriod",
+                   snapshot.failure_reset_period);
+  ServiceSetString(env, result, "failureRebootMessage",
+                   snapshot.failure_reboot_message);
+  ServiceSetString(env, result, "failureCommand", snapshot.failure_command);
+  napi_create_array_with_length(env, snapshot.failure_actions.size(),
+                                &actions);
+  for (uint32_t index = 0; index < snapshot.failure_actions.size(); ++index) {
+    napi_value action;
+    napi_create_object(env, &action);
+    ServiceSetString(env, action, "type",
+        Win32ActionName(snapshot.failure_actions[index].type));
+    ServiceSetUint32(env, action, "delayMs",
+                     snapshot.failure_actions[index].delay);
+    napi_set_element(env, actions, index, action);
+  }
+  napi_set_named_property(env, result, "failureActions", actions);
+  ServiceSetBoolean(env, result, "failureActionsOnNonCrashFailures",
+                    snapshot.failure_actions_on_non_crash);
+  ServiceSetString(env, result, "failurePolicy",
+                   Win32FailurePolicyName(snapshot));
+  ServiceSetUint32(env, result, "serviceSidType", snapshot.service_sid_type);
+  napi_create_array_with_length(env, snapshot.required_privileges.size(),
+                                &privileges);
+  for (uint32_t index = 0; index < snapshot.required_privileges.size(); ++index) {
+    napi_value item;
+    napi_create_string_utf8(env, snapshot.required_privileges[index].c_str(),
+        snapshot.required_privileges[index].size(), &item);
+    napi_set_element(env, privileges, index, item);
+  }
+  napi_set_named_property(env, result, "requiredPrivileges", privileges);
+  ServiceSetUint32(env, result, "triggerCount", snapshot.trigger_count);
+  ServiceSetUint32(env, result, "preshutdownTimeout",
+                   snapshot.preshutdown_timeout);
+  ServiceSetString(env, result, "securitySha256", snapshot.security_sha256);
+  ServiceSetBoolean(env, result, "aclMatches", snapshot.acl_matches);
+  ServiceSetBoolean(env, result, "accountMatchesRole",
+                    snapshot.account_matches_role);
+  ServiceSetString(env, result, "configFingerprint",
+                   snapshot.config_fingerprint);
+  napi_get_null(env, &null_value);
+  napi_set_named_property(env, result, "runtimeFingerprint", null_value);
+  return result;
+}
+#endif
+
+napi_value PlanWin32ServiceResource(napi_env env,
+                                    napi_callback_info info) {
+#ifdef _WIN32
+  napi_value args[6];
+  std::string name, role, application_fingerprint, phase;
+  InventoryRoles roles{};
+  if (!InventoryArgs(env, info, 6, args) ||
+      !InventoryString(env, args[0], &name) ||
+      !InventoryString(env, args[1], &role) ||
+      !ValidWin32ServiceName(name, role) ||
+      !InventoryString(env, args[3], &application_fingerprint) ||
+      !ValidWin32LaunchHash(application_fingerprint) ||
+      !InventoryString(env, args[4], &phase) ||
+      (phase != "trial" && phase != "final-auto" && phase != "final") ||
+      !InventoryRolesArg(env, args[5], &roles) ||
+      !ServiceActorAuthorized(roles)) {
+    ServiceError(env, "SERVICE_INVALID", "plan_win32_service_resource");
+    return nullptr;
+  }
+  Win32ServiceLaunch launch;
+  Win32ServiceSnapshot snapshot;
+  if (!CaptureWin32ServiceLaunch(env, args[2], name, role, roles, &launch) ||
+      !BuildWin32PlannedServiceSnapshot(name, role, roles, launch,
+          application_fingerprint, phase, &snapshot)) {
+    ServiceError(env, "SERVICE_INVALID", "plan_win32_service_resource");
+    return nullptr;
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  napi_set_named_property(env, result, "descriptor",
+      Win32ServiceResourceDescriptorValue(env, name, role, snapshot));
+  ServiceSetString(env, result, "configFingerprint",
+                   snapshot.config_fingerprint);
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceError(env, "SERVICE_UNSUPPORTED", "plan_win32_service_resource");
+  return nullptr;
+#endif
+}
+
 napi_value CreateWin32ServiceDisabled(napi_env env,
                                       napi_callback_info info) {
 #ifdef _WIN32
-  napi_value args[16];
+  napi_value args[5];
   std::string name, role;
   InventoryRoles roles{};
   std::vector<wchar_t> password;
   bool password_present = false;
-  if (!InventoryArgs(env, info, 16, args) ||
+  if (!InventoryArgs(env, info, 5, args) ||
       !InventoryString(env, args[0], &name) ||
       !InventoryString(env, args[1], &role) ||
       !ValidWin32ServiceName(name, role) ||
-      !Win32PasswordArg(env, args[14], &password, &password_present) ||
-      !InventoryRolesArg(env, args[15], &roles) ||
+      !Win32PasswordArg(env, args[3], &password, &password_present) ||
+      !InventoryRolesArg(env, args[4], &roles) ||
       !ServiceActorAuthorized(roles)) {
     if (!password.empty()) {
       SecureZeroMemory(password.data(),
@@ -8223,7 +9045,7 @@ napi_value CreateWin32ServiceDisabled(napi_env env,
     return nullptr;
   }
   Win32ServiceLaunch launch;
-  if (!CaptureWin32ServiceLaunch(env, args, 2, name, role, roles,
+  if (!CaptureWin32ServiceLaunch(env, args[2], name, role, roles,
                                  &launch)) {
     if (!password.empty()) {
       SecureZeroMemory(password.data(),
@@ -8424,10 +9246,10 @@ napi_value SetWin32ServiceMarker(napi_env env,
 napi_value ConfigureWin32ServiceLaunch(napi_env env,
                                        napi_callback_info info) {
 #ifdef _WIN32
-  napi_value args[15];
+  napi_value args[4];
   Win32ServiceHandle* handle = nullptr;
   std::string expected_config, expected_runtime;
-  if (!InventoryArgs(env, info, 15, args) ||
+  if (!InventoryArgs(env, info, 4, args) ||
       !Win32ServiceHandleArg(env, args[0], &handle) ||
       !InventoryString(env, args[1], &expected_config) ||
       !InventoryString(env, args[2], &expected_runtime) ||
@@ -8447,7 +9269,7 @@ napi_value ConfigureWin32ServiceLaunch(napi_env env,
     return nullptr;
   }
   Win32ServiceLaunch launch;
-  if (!CaptureWin32ServiceLaunch(env, args, 3, handle->name,
+  if (!CaptureWin32ServiceLaunch(env, args[3], handle->name,
           handle->service_role, handle->roles, &launch)) {
     ServiceError(env, "SERVICE_INVALID",
                  "configure_win32_service_launch");
@@ -8953,7 +9775,7 @@ napi_value TerminateWin32ServiceTree(napi_env env,
 // live while binding the exact five-role tuple and physical identities.
 enum class ServiceStoreHandleKind {
   Root, Directory, Lock, LinuxScope,
-  ArtifactWriter, ArtifactReader, ArtifactSourceReader,
+  ArtifactWriter, ArtifactReader, ArtifactSourceReader, ExternalRoot,
 };
 enum class ServiceStoreAccess { Read, Write };
 
@@ -8996,6 +9818,28 @@ const char* ServiceProfileText(ServiceAclProfile profile) {
       return "service-internal-container-directory";
     case ServiceAclProfile::PreservedContainerDirectory:
       return "service-preserved-container-directory";
+    case ServiceAclProfile::ExternalAnchorDirectory:
+      return "service-external-anchor-directory";
+    case ServiceAclProfile::BotConfigDirectory:
+      return "service-bot-config-directory";
+    case ServiceAclProfile::BotConfigFile:
+      return "service-bot-config-file";
+    case ServiceAclProfile::DaemonConfigDirectory:
+      return "service-daemon-config-directory";
+    case ServiceAclProfile::DaemonConfigFile:
+      return "service-daemon-config-file";
+    case ServiceAclProfile::SdkInstallDirectory:
+      return "service-sdk-install-directory";
+    case ServiceAclProfile::SdkInstallFile:
+      return "service-sdk-install-file";
+    case ServiceAclProfile::BotRetainedDirectory:
+      return "service-bot-retained-directory";
+    case ServiceAclProfile::BotRetainedFile:
+      return "service-bot-retained-file";
+    case ServiceAclProfile::DaemonRetainedDirectory:
+      return "service-daemon-retained-directory";
+    case ServiceAclProfile::DaemonRetainedFile:
+      return "service-daemon-retained-file";
   }
   return "";
 }
@@ -9197,6 +10041,14 @@ struct ServiceStoreHandle {
   std::string fixed_parent_path;
   std::string expected_sha256;
   std::string stream_state;
+  std::string external_profile;
+  ServiceExternalAclPolicy external_policy =
+      ServiceExternalAclPolicy::Unresolved;
+  std::string external_absolute_path;
+  bool external_root_absent = false;
+  std::vector<std::string> external_missing_segments;
+  uint64_t external_observed_entries = 0;
+  uint64_t external_observed_name_bytes = 0;
   InventoryRoles roles{};
   ServiceAclProfile profile = ServiceAclProfile::ControlDirectory;
   ServiceStoreIdentity identity{};
@@ -9235,6 +10087,7 @@ thread_local std::vector<ServiceStoreHandle*> gServiceStoreLocks;
 bool VerifyLinuxTrustedSystemdDirectory(int directory);
 #endif
 bool RevalidateServiceArtifactStream(ServiceStoreHandle* handle);
+bool RevalidateServiceExternalRoot(ServiceStoreHandle* handle);
 
 bool ServiceStoreNativeHandleOpen(const ServiceStoreHandle* handle) {
 #ifdef _WIN32
@@ -9370,6 +10223,33 @@ bool ValidServiceStoreComponent(const std::string& name) {
 #else
   return true;
 #endif
+}
+
+bool ValidServiceRelativePath(const std::string& path,
+                              std::vector<std::string>* components) {
+  if (path.empty() || path.size() > 4096 ||
+      path.find('\\') != std::string::npos ||
+      path.front() == '/' || path.back() == '/') return false;
+  components->clear();
+  size_t start = 0;
+  while (start < path.size()) {
+    const size_t end = path.find('/', start);
+    const std::string component = path.substr(
+        start, end == std::string::npos ? std::string::npos : end - start);
+    if (!ValidServiceStoreComponent(component) ||
+        components->size() >= 64) {
+      components->clear();
+      return false;
+    }
+    components->push_back(component);
+    if (end == std::string::npos) break;
+    start = end + 1;
+    if (start == path.size()) {
+      components->clear();
+      return false;
+    }
+  }
+  return !components->empty();
 }
 
 bool ServiceStoreServiceKey(const std::string& value) {
@@ -11506,6 +12386,13 @@ bool RevalidateServiceStoreHandle(ServiceStoreHandle* handle) {
   if (!ServiceStoreNativeHandleOpen(handle) || handle->poisoned) {
     return false;
   }
+  if (handle->kind == ServiceStoreHandleKind::ExternalRoot) {
+#ifdef _WIN32
+    return RevalidateServiceExternalRoot(handle);
+#else
+    return false;
+#endif
+  }
   if (handle->kind == ServiceStoreHandleKind::ArtifactWriter ||
       handle->kind == ServiceStoreHandleKind::ArtifactReader ||
       handle->kind == ServiceStoreHandleKind::ArtifactSourceReader) {
@@ -12662,9 +13549,17 @@ napi_value AcquireServiceLock(napi_env env, napi_callback_info info) {
   return result;
 }
 
+bool CloseWin32LogObserverValue(napi_env env, napi_value value);
+
 napi_value CloseServiceHandle(napi_env env, napi_callback_info info) {
   napi_value args[1];
   ServiceStoreHandle* handle = nullptr;
+  if (InventoryArgs(env, info, 1, args) &&
+      CloseWin32LogObserverValue(env, args[0])) {
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+  }
   if (!InventoryArgs(env, info, 1, args) ||
       !ServiceStoreHandleArg(env, args[0], &handle, false)) {
     ServiceError(env, "SERVICE_INVALID", "close_service_handle");
@@ -13545,6 +14440,155 @@ bool RevalidateExternalArtifactAncestors(
   return valid;
 }
 
+#ifdef _WIN32
+bool CaptureServiceObservationIdentity(
+    HANDLE handle, const InventoryRoles& roles,
+    ServiceAclProfile profile, ServiceStoreIdentity* identity) {
+  if (handle == INVALID_HANDLE_VALUE ||
+      !ServiceProfileExternal(profile) ||
+      !VerifyWindowsServiceFileAcl(handle, roles, profile) ||
+      !InventoryIdentity(handle, &identity->volume_serial,
+                         &identity->file_id, &identity->attributes,
+                         &identity->owner) ||
+      !ServiceSecurityFingerprint(handle,
+                                  &identity->security_sha256)) {
+    return false;
+  }
+  identity->profile = profile;
+  return ValidServiceFingerprint(identity->security_sha256);
+}
+
+bool InferServiceExternalAclPolicy(
+    HANDLE handle, const InventoryRoles& roles,
+    ServiceExternalProfile profile, bool directory,
+    ServiceExternalAclPolicy* policy,
+    ServiceStoreIdentity* identity) {
+  const ServiceExternalAclPolicy candidates[] = {
+    ServiceExternalAclPolicy::Bot,
+    ServiceExternalAclPolicy::Daemon,
+    ServiceExternalAclPolicy::SdkInstall,
+  };
+  size_t matches = 0;
+  for (ServiceExternalAclPolicy candidate : candidates) {
+    if (!ServiceExternalPolicyAllowed(profile, candidate)) continue;
+    const ServiceAclProfile acl_profile = directory
+        ? ServiceExternalDirectoryProfile(profile, candidate)
+        : ServiceExternalFileProfile(profile, candidate);
+    ServiceStoreIdentity observed;
+    if (!CaptureServiceObservationIdentity(
+            handle, roles, acl_profile, &observed)) continue;
+    ++matches;
+    *policy = candidate;
+    *identity = observed;
+  }
+  if (matches != 1) {
+    SetLastError(ERROR_ACCESS_DENIED);
+    return false;
+  }
+  return true;
+}
+
+bool RevalidateServiceExternalRoot(ServiceStoreHandle* handle) {
+  if (!handle || handle->kind != ServiceStoreHandleKind::ExternalRoot ||
+      !ServiceStoreNativeHandleOpen(handle) ||
+      !ServiceActorAuthorized(handle->roles) ||
+      handle->external_ancestors.empty() ||
+      handle->external_ancestor_identities.size() !=
+          handle->external_ancestors.size() ||
+      handle->external_components.size() + 1 !=
+          handle->external_ancestors.size()) {
+    return false;
+  }
+  std::string roles_fingerprint;
+  ServiceExternalProfile external_profile;
+  if (!ServiceStoreRolesFingerprint(handle->roles, &roles_fingerprint) ||
+      roles_fingerprint != handle->roles_fingerprint ||
+      !ParseServiceExternalProfile(
+          handle->external_profile, &external_profile) ||
+      (handle->external_root_absent
+          ? handle->external_policy !=
+              ServiceExternalAclPolicy::Unresolved
+          : !ServiceExternalPolicyAllowed(
+              external_profile, handle->external_policy))) return false;
+
+  HANDLE root = OpenWindowsRoot(
+      Wide(handle->fixed_parent_path),
+      kWindowsTraversalAccess | READ_CONTROL);
+  ServiceStoreIdentity current_identity;
+  bool valid = root != INVALID_HANDLE_VALUE &&
+      CaptureExternalAncestorIdentity(root, &current_identity) &&
+      SameServicePhysicalIdentity(
+          current_identity, handle->external_ancestor_identities[0]);
+  if (root != INVALID_HANDLE_VALUE) CloseHandle(root);
+  for (size_t index = 0; valid &&
+       index < handle->external_components.size(); ++index) {
+    HANDLE named = OpenWindowsRelative(
+        handle->external_ancestors[index],
+        Wide(handle->external_components[index]),
+        kWindowsTraversalAccess | READ_CONTROL, kFileOpen,
+        VerifiedObjectType::Directory);
+    ServiceStoreIdentity held_identity;
+    valid = named != INVALID_HANDLE_VALUE &&
+        CaptureExternalAncestorIdentity(named, &current_identity) &&
+        CaptureExternalAncestorIdentity(
+            handle->external_ancestors[index + 1], &held_identity) &&
+        SameServicePhysicalIdentity(
+            current_identity,
+            handle->external_ancestor_identities[index + 1]) &&
+        SameServicePhysicalIdentity(
+            held_identity,
+            handle->external_ancestor_identities[index + 1]);
+    if (named != INVALID_HANDLE_VALUE) CloseHandle(named);
+  }
+  if (!valid) return false;
+
+  if (handle->external_root_absent) {
+    if (handle->external_missing_segments.empty()) return false;
+    ServiceStoreIdentity held_anchor;
+    if (!CaptureExternalAncestorIdentity(
+            handle->object, &held_anchor) ||
+        !SameServicePhysicalIdentity(
+            held_anchor, handle->binding_parent_identity) ||
+        !SameServicePhysicalIdentity(
+            held_anchor,
+            handle->external_ancestor_identities.back())) return false;
+    HANDLE missing = OpenWindowsRelative(
+        handle->external_ancestors.back(),
+        Wide(handle->external_missing_segments.front()),
+        kWindowsTraversalAccess | READ_CONTROL, kFileOpen,
+        VerifiedObjectType::Directory);
+    const DWORD error = missing == INVALID_HANDLE_VALUE
+        ? GetLastError() : ERROR_SUCCESS;
+    if (missing != INVALID_HANDLE_VALUE) CloseHandle(missing);
+    return missing == INVALID_HANDLE_VALUE &&
+        (error == ERROR_FILE_NOT_FOUND ||
+         error == ERROR_PATH_NOT_FOUND) &&
+        ServiceActorAuthorized(handle->roles);
+  }
+
+  HANDLE named_root = OpenWindowsRelative(
+      handle->external_ancestors.back(), Wide(handle->name),
+      FILE_GENERIC_READ | READ_CONTROL, kFileOpen,
+      VerifiedObjectType::Directory);
+  ServiceStoreIdentity named_identity, held_identity;
+  const bool exact = named_root != INVALID_HANDLE_VALUE &&
+      CaptureServiceObservationIdentity(
+          named_root, handle->roles,
+          ServiceExternalDirectoryProfile(
+              external_profile, handle->external_policy),
+          &named_identity) &&
+      CaptureServiceObservationIdentity(
+          handle->object, handle->roles,
+          ServiceExternalDirectoryProfile(
+              external_profile, handle->external_policy),
+          &held_identity) &&
+      SameServiceStoreIdentity(named_identity, handle->identity) &&
+      SameServiceStoreIdentity(held_identity, handle->identity);
+  if (named_root != INVALID_HANDLE_VALUE) CloseHandle(named_root);
+  return exact && ServiceActorAuthorized(handle->roles);
+}
+#endif
+
 bool RevalidateServiceArtifactStream(ServiceStoreHandle* handle) {
   if (!ServiceStoreNativeHandleOpen(handle)) return false;
   if (handle->kind == ServiceStoreHandleKind::ArtifactSourceReader) {
@@ -14411,6 +15455,2954 @@ napi_value OpenServiceArtifactSource(
       ServiceStoreFileFactsValue(env, facts));
   ServiceSetUint32(env, result, "writes", 0);
   return result;
+}
+
+napi_value ServiceObservationAbsenceValue(
+    napi_env env, const ServiceStoreIdentity& parent_identity,
+    const std::vector<std::string>& missing_segments) {
+  napi_value result, segments, value;
+  napi_create_object(env, &result);
+  napi_set_named_property(
+      env, result, "parentIdentity",
+      ServiceStoreIdentityValue(env, parent_identity));
+  napi_create_array_with_length(env, missing_segments.size(), &segments);
+  for (uint32_t index = 0; index < missing_segments.size(); ++index) {
+    napi_create_string_utf8(
+        env, missing_segments[index].c_str(),
+        missing_segments[index].size(), &value);
+    napi_set_element(env, segments, index, value);
+  }
+  napi_set_named_property(env, result, "missingSegments", segments);
+  return result;
+}
+
+std::string ServiceObservationIdentityFingerprint(
+    const ServiceStoreIdentity& identity, const char* domain) {
+  Sha256 hash;
+  if (!hash.Ready()) return "";
+  HashField(&hash, domain);
+  HashField(&hash, ServiceStoreIdentityText(identity));
+  return hash.Finish();
+}
+
+void ServiceObservationSetNullableIdentity(
+    napi_env env, napi_value result, const char* field,
+    const ServiceStoreIdentity* identity) {
+  napi_value value;
+  if (identity) {
+    value = ServiceStoreIdentityValue(env, *identity);
+  } else {
+    napi_get_null(env, &value);
+  }
+  napi_set_named_property(env, result, field, value);
+}
+
+#ifdef _WIN32
+struct ServiceObservationScopedHandles {
+  std::vector<HANDLE> values;
+  ~ServiceObservationScopedHandles() {
+    for (HANDLE value : values) {
+      if (value != INVALID_HANDLE_VALUE) CloseHandle(value);
+    }
+  }
+  void Add(HANDLE value) { values.push_back(value); }
+};
+
+std::string ServiceWindowsPathText(const WindowsPathParts& parts) {
+  std::wstring path = parts.root;
+  for (const std::wstring& component : parts.components) {
+    if (path.back() != L'\\') path.push_back(L'\\');
+    path += component;
+  }
+  return Utf8(path);
+}
+
+bool ServiceWindowsNotFound(DWORD error) {
+  return error == ERROR_FILE_NOT_FOUND ||
+      error == ERROR_PATH_NOT_FOUND;
+}
+
+bool ServiceSelfUnsupportedTypeError(DWORD error) {
+  return error == ERROR_DIRECTORY || error == ERROR_NOT_SUPPORTED ||
+      error == ERROR_CANT_ACCESS_FILE;
+}
+
+struct ServiceSelfDirectoryChain {
+  std::wstring root;
+  std::vector<HANDLE> handles;
+  std::vector<std::wstring> components;
+  std::vector<ServiceStoreIdentity> identities;
+  ~ServiceSelfDirectoryChain() {
+    for (HANDLE handle : handles) {
+      if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+    }
+  }
+  void Add(HANDLE handle, const ServiceStoreIdentity& identity) {
+    handles.push_back(handle);
+    identities.push_back(identity);
+  }
+};
+
+struct ServiceSelfSecretBuffer {
+  std::vector<uint8_t> bytes;
+  ~ServiceSelfSecretBuffer() {
+    if (!bytes.empty()) SecureZeroMemory(bytes.data(), bytes.size());
+  }
+};
+
+bool ServiceSelfDenyCurrentWriteAccess(HANDLE object, bool directory);
+bool ServiceSelfDenyCurrentAncestorTakeoverAccess(HANDLE object);
+
+bool ServiceSelfLowerHex(const std::string& value, size_t length) {
+  return value.size() == length &&
+      value.find_first_not_of("0123456789abcdef") == std::string::npos;
+}
+
+bool ServiceSelfCanonicalWindowsSid(const std::string& value) {
+  if (value.rfind("S-", 0) != 0 ||
+      value.find_first_not_of("S-0123456789") != std::string::npos) {
+    return false;
+  }
+  PSID sid = nullptr;
+  LPWSTR canonical = nullptr;
+  const bool parsed = ConvertStringSidToSidW(Wide(value).c_str(), &sid) &&
+      sid != nullptr && IsValidSid(sid);
+  const bool serialized = parsed &&
+      ConvertSidToStringSidW(sid, &canonical) && canonical != nullptr &&
+      value == Utf8(canonical);
+  if (canonical) LocalFree(canonical);
+  if (sid) LocalFree(sid);
+  return serialized;
+}
+
+bool ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+    const ServiceStoreIdentity& identity, std::string* fingerprint) {
+  if (!ServiceSelfLowerHex(identity.volume_serial, 16) ||
+      !ServiceSelfLowerHex(identity.file_id, 32) ||
+      !ServiceSelfCanonicalWindowsSid(identity.owner) ||
+      !ValidServiceFingerprint(identity.security_sha256)) return false;
+  const std::string canonical =
+      "{\"attributes\":" + std::to_string(identity.attributes) +
+      ",\"fileId\":\"" + identity.file_id +
+      "\",\"kind\":\"gjc-remote/win32-physical-security-identity/v1\",\"owner\":\"" +
+      identity.owner +
+      "\",\"securitySha256\":\"" + identity.security_sha256 +
+      "\",\"volumeSerial\":\"" + identity.volume_serial + "\"}";
+  Sha256 hash;
+  if (!hash.Ready() || !hash.Update(canonical)) return false;
+  *fingerprint = hash.Finish();
+  return ValidServiceFingerprint(*fingerprint);
+}
+
+bool ServiceSelfWindowsBootFingerprint(
+    const std::string& boot_id, std::string* fingerprint) {
+  if (boot_id.rfind("win32:", 0) != 0 || boot_id.size() <= 6 ||
+      boot_id.substr(6).find_first_not_of("0123456789") !=
+          std::string::npos) return false;
+  const std::string canonical =
+      "{\"bootId\":\"" + boot_id +
+      "\",\"kind\":\"windows-boot/v1\"}";
+  Sha256 hash;
+  if (!hash.Ready() || !hash.Update(canonical)) return false;
+  *fingerprint = hash.Finish();
+  return ValidServiceFingerprint(*fingerprint);
+}
+
+bool VerifyWin32RuntimeConfigLaunch(const Win32ServiceLaunch& launch,
+                                    const InventoryRoles& roles) {
+  HANDLE working = OpenWindowsPathNoFollow(
+      launch.working_directory,
+      FILE_GENERIC_READ | READ_CONTROL,
+      VerifiedObjectType::Directory);
+  if (working == INVALID_HANDLE_VALUE) return false;
+  HANDLE root = OpenWindowsRelative(
+      working, L"runtime-config", FILE_GENERIC_READ | READ_CONTROL,
+      kFileOpen, VerifiedObjectType::Directory);
+  HANDLE named_root = OpenWindowsPathNoFollow(
+      launch.runtime_config_root,
+      FILE_GENERIC_READ | READ_CONTROL,
+      VerifiedObjectType::Directory);
+  HANDLE file = root == INVALID_HANDLE_VALUE ? INVALID_HANDLE_VALUE
+      : OpenWindowsRelative(root, L".bunfig.toml",
+            GENERIC_READ | READ_CONTROL, kFileOpen,
+            VerifiedObjectType::File);
+  HANDLE named_file = OpenWindowsPathNoFollow(
+      launch.runtime_config_path, GENERIC_READ | READ_CONTROL,
+      VerifiedObjectType::File);
+
+  ServiceStoreIdentity working_identity, named_working_identity;
+  ServiceStoreIdentity root_identity, named_root_identity, final_root_identity;
+  ServiceStoreIdentity file_identity, named_file_identity, final_file_identity;
+  std::string root_fingerprint, file_fingerprint;
+  FILE_STANDARD_INFO file_information{};
+  const bool identities_exact =
+      working != INVALID_HANDLE_VALUE && root != INVALID_HANDLE_VALUE &&
+      named_root != INVALID_HANDLE_VALUE && file != INVALID_HANDLE_VALUE &&
+      named_file != INVALID_HANDLE_VALUE &&
+      CaptureExternalAncestorIdentity(working, &working_identity) &&
+      CaptureExternalAncestorIdentity(
+          working, &named_working_identity) &&
+      SameServicePhysicalIdentity(working_identity, named_working_identity) &&
+      CaptureExternalAncestorIdentity(root, &root_identity) &&
+      CaptureExternalAncestorIdentity(named_root, &named_root_identity) &&
+      CaptureExternalAncestorIdentity(root, &final_root_identity) &&
+      SameServicePhysicalIdentity(root_identity, named_root_identity) &&
+      SameServicePhysicalIdentity(root_identity, final_root_identity) &&
+      CaptureExternalServiceFileIdentity(file, &file_identity) &&
+      CaptureExternalServiceFileIdentity(named_file, &named_file_identity) &&
+      CaptureExternalServiceFileIdentity(file, &final_file_identity) &&
+      SameServicePhysicalIdentity(file_identity, named_file_identity) &&
+      SameServicePhysicalIdentity(file_identity, final_file_identity) &&
+      ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+          root_identity, &root_fingerprint) &&
+      ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+          file_identity, &file_fingerprint) &&
+      root_fingerprint == launch.runtime_config_root_identity_fingerprint &&
+      file_fingerprint == launch.runtime_config_identity_fingerprint &&
+      GetFileInformationByHandleEx(
+          file, FileStandardInfo, &file_information,
+          sizeof(file_information)) && file_information.EndOfFile.QuadPart == 0 &&
+      VerifyWindowsServiceFileAcl(
+          root, roles, ServiceAclProfile::DaemonConfigDirectory) &&
+      VerifyWindowsServiceFileAcl(
+          file, roles, ServiceAclProfile::DaemonConfigFile) &&
+      VerifyWindowsServiceFileAcl(
+          named_root, roles, ServiceAclProfile::DaemonConfigDirectory) &&
+      VerifyWindowsServiceFileAcl(
+          named_file, roles, ServiceAclProfile::DaemonConfigFile);
+  const bool content_exact = identities_exact &&
+      ReadWindowsFileSha256(launch.runtime_config_path,
+                            launch.runtime_config_sha256);
+  if (working != INVALID_HANDLE_VALUE) CloseHandle(working);
+  if (root != INVALID_HANDLE_VALUE) CloseHandle(root);
+  if (named_root != INVALID_HANDLE_VALUE) CloseHandle(named_root);
+  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  if (named_file != INVALID_HANDLE_VALUE) CloseHandle(named_file);
+  return content_exact;
+}
+
+bool VerifyWin32ConfigSourceLaunch(const Win32ServiceLaunch& launch,
+                                   const InventoryRoles& roles,
+                                   const std::string& role) {
+  const std::string source_path = launch.working_directory + "\\.env";
+  HANDLE working = OpenWindowsPathNoFollow(
+      launch.working_directory, FILE_GENERIC_READ | READ_CONTROL,
+      VerifiedObjectType::Directory);
+  HANDLE named_working = OpenWindowsPathNoFollow(
+      launch.working_directory, FILE_GENERIC_READ | READ_CONTROL,
+      VerifiedObjectType::Directory);
+  HANDLE source = working == INVALID_HANDLE_VALUE
+      ? INVALID_HANDLE_VALUE
+      : OpenWindowsRelative(working, L".env", GENERIC_READ | READ_CONTROL,
+            kFileOpen, VerifiedObjectType::File);
+  HANDLE named_source = OpenWindowsPathNoFollow(
+      source_path, GENERIC_READ | READ_CONTROL, VerifiedObjectType::File);
+  ServiceStoreIdentity source_identity, named_identity, final_identity;
+  ServiceStoreIdentity working_identity, named_working_identity;
+  std::string source_fingerprint;
+  const ServiceAclProfile profile = role == "bot"
+      ? ServiceAclProfile::BotConfigFile
+      : ServiceAclProfile::DaemonConfigFile;
+  const bool exact = working != INVALID_HANDLE_VALUE &&
+      named_working != INVALID_HANDLE_VALUE &&
+      source != INVALID_HANDLE_VALUE && named_source != INVALID_HANDLE_VALUE &&
+      CaptureExternalAncestorIdentity(working, &working_identity) &&
+      CaptureExternalAncestorIdentity(
+          named_working, &named_working_identity) &&
+      SameServicePhysicalIdentity(working_identity, named_working_identity) &&
+      CaptureExternalServiceFileIdentity(source, &source_identity) &&
+      CaptureExternalServiceFileIdentity(named_source, &named_identity) &&
+      CaptureExternalServiceFileIdentity(source, &final_identity) &&
+      SameServicePhysicalIdentity(source_identity, named_identity) &&
+      SameServicePhysicalIdentity(source_identity, final_identity) &&
+      ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+          source_identity, &source_fingerprint) &&
+      source_fingerprint == launch.config_source_identity_fingerprint &&
+      VerifyWindowsServiceFileAcl(source, roles, profile) &&
+      VerifyWindowsServiceFileAcl(named_source, roles, profile);
+  if (working != INVALID_HANDLE_VALUE) CloseHandle(working);
+  if (named_working != INVALID_HANDLE_VALUE) CloseHandle(named_working);
+  if (source != INVALID_HANDLE_VALUE) CloseHandle(source);
+  if (named_source != INVALID_HANDLE_VALUE) CloseHandle(named_source);
+  return exact;
+}
+
+bool ServiceSelfCurrentDirectory(std::wstring* path) {
+  std::vector<wchar_t> buffer;
+  try {
+    buffer.resize(32768);
+  } catch (...) {
+    return false;
+  }
+  const DWORD written = GetCurrentDirectoryW(
+      static_cast<DWORD>(buffer.size()), buffer.data());
+  if (written == 0 || written >= buffer.size()) return false;
+  path->assign(buffer.data(), written);
+  return true;
+}
+
+bool ServiceSelfOpenDirectoryChain(
+    const std::wstring& path, ServiceSelfDirectoryChain* chain) {
+  WindowsPathParts parts;
+  if (!ParseWindowsPath(Utf8(path), &parts) ||
+      parts.components.size() > 64) return false;
+  try {
+    chain->handles.reserve(parts.components.size() + 1);
+    chain->components.reserve(parts.components.size());
+    chain->identities.reserve(parts.components.size() + 1);
+  } catch (...) {
+    return false;
+  }
+  chain->root = parts.root;
+  HANDLE current = OpenWindowsRoot(
+      parts.root, kWindowsTraversalAccess | READ_CONTROL);
+  ServiceStoreIdentity identity;
+  const bool root_is_working_directory = parts.components.empty();
+  if (current == INVALID_HANDLE_VALUE ||
+      !CaptureExternalAncestorIdentity(current, &identity) ||
+      !(root_is_working_directory
+          ? ServiceSelfDenyCurrentWriteAccess(current, true)
+          : ServiceSelfDenyCurrentAncestorTakeoverAccess(current))) {
+    if (current != INVALID_HANDLE_VALUE) CloseHandle(current);
+    return false;
+  }
+  chain->Add(current, identity);
+  for (size_t index = 0; index < parts.components.size(); ++index) {
+    const std::wstring& component = parts.components[index];
+    HANDLE next = OpenWindowsRelative(
+        current, component, kWindowsTraversalAccess | READ_CONTROL,
+        kFileOpen, VerifiedObjectType::Directory);
+    const bool is_working_directory = index + 1 == parts.components.size();
+    if (next == INVALID_HANDLE_VALUE ||
+        !CaptureExternalAncestorIdentity(next, &identity) ||
+        !(is_working_directory
+            ? ServiceSelfDenyCurrentWriteAccess(next, true)
+            : ServiceSelfDenyCurrentAncestorTakeoverAccess(next))) {
+      if (next != INVALID_HANDLE_VALUE) CloseHandle(next);
+      return false;
+    }
+    chain->components.push_back(component);
+    chain->Add(next, identity);
+    current = next;
+  }
+  return true;
+}
+
+bool ServiceSelfDirectoryChainStable(
+    const ServiceSelfDirectoryChain& chain,
+    const std::wstring& expected_current_directory) {
+  if (chain.handles.empty() ||
+      chain.identities.size() != chain.handles.size() ||
+      chain.components.size() + 1 != chain.handles.size()) return false;
+  HANDLE named_root = OpenWindowsRoot(
+      chain.root, kWindowsTraversalAccess | READ_CONTROL);
+  ServiceStoreIdentity named_identity;
+  const bool root_exact = named_root != INVALID_HANDLE_VALUE &&
+      CaptureExternalAncestorIdentity(named_root, &named_identity) &&
+      SameServicePhysicalIdentity(
+          named_identity, chain.identities.front());
+  if (named_root != INVALID_HANDLE_VALUE) CloseHandle(named_root);
+  if (!root_exact) return false;
+  for (size_t index = 0; index < chain.handles.size(); ++index) {
+    ServiceStoreIdentity held_identity;
+    if (!CaptureExternalAncestorIdentity(
+            chain.handles[index], &held_identity) ||
+        !SameServicePhysicalIdentity(
+            held_identity, chain.identities[index])) return false;
+    if (index == 0) continue;
+    HANDLE named = OpenWindowsRelative(
+        chain.handles[index - 1], chain.components[index - 1],
+        kWindowsTraversalAccess | READ_CONTROL, kFileOpen,
+        VerifiedObjectType::Directory);
+    ServiceStoreIdentity actual;
+    const bool exact = named != INVALID_HANDLE_VALUE &&
+        CaptureExternalAncestorIdentity(named, &actual) &&
+        SameServicePhysicalIdentity(actual, chain.identities[index]);
+    if (named != INVALID_HANDLE_VALUE) CloseHandle(named);
+    if (!exact) return false;
+  }
+  std::wstring current;
+  return ServiceSelfCurrentDirectory(&current) &&
+      current == expected_current_directory;
+}
+
+bool ServiceSelfDenyCurrentAccess(
+    HANDLE object, const ACCESS_MASK* forbidden, size_t forbidden_count) {
+  PACL dacl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (object == INVALID_HANDLE_VALUE ||
+      GetSecurityInfo(
+          object, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+          nullptr, nullptr, &dacl, nullptr, &descriptor) != ERROR_SUCCESS ||
+      descriptor == nullptr) {
+    if (descriptor) LocalFree(descriptor);
+    return false;
+  }
+  BOOL dacl_present = FALSE;
+  BOOL dacl_defaulted = FALSE;
+  const bool usable_dacl =
+      GetSecurityDescriptorDacl(
+          descriptor, &dacl_present, &dacl, &dacl_defaulted) &&
+      dacl_present && dacl != nullptr;
+  if (!usable_dacl) {
+    LocalFree(descriptor);
+    return false;
+  }
+  HANDLE process_token = nullptr;
+  HANDLE impersonation_token = nullptr;
+  const bool token_opened = OpenProcessToken(
+      GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE,
+      &process_token) != FALSE &&
+      DuplicateToken(
+          process_token, SecurityImpersonation,
+          &impersonation_token) != FALSE;
+  if (process_token) CloseHandle(process_token);
+  if (!token_opened) {
+    if (impersonation_token) CloseHandle(impersonation_token);
+    LocalFree(descriptor);
+    return false;
+  }
+  GENERIC_MAPPING mapping{
+      FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+      FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
+  std::vector<uint8_t> privilege_bytes;
+  try {
+    privilege_bytes.resize(4096);
+  } catch (...) {
+    CloseHandle(impersonation_token);
+    LocalFree(descriptor);
+    return false;
+  }
+  bool denied = false;
+  for (size_t index = 0; index < forbidden_count; ++index) {
+    ACCESS_MASK requested = forbidden[index];
+    MapGenericMask(&requested, &mapping);
+    DWORD privilege_bytes_count =
+        static_cast<DWORD>(privilege_bytes.size());
+    DWORD granted = 0;
+    BOOL access_status = FALSE;
+    bool checked = AccessCheck(
+        descriptor, impersonation_token, requested, &mapping,
+        reinterpret_cast<PRIVILEGE_SET*>(privilege_bytes.data()),
+        &privilege_bytes_count, &granted, &access_status) != FALSE;
+    if (!checked && GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
+        privilege_bytes_count > privilege_bytes.size() &&
+        privilege_bytes_count <= 64 * 1024) {
+      try {
+        privilege_bytes.resize(privilege_bytes_count);
+      } catch (...) {
+        checked = false;
+      }
+      if (privilege_bytes.size() == privilege_bytes_count) {
+        privilege_bytes_count =
+            static_cast<DWORD>(privilege_bytes.size());
+        granted = 0;
+        access_status = FALSE;
+        checked = AccessCheck(
+            descriptor, impersonation_token, requested, &mapping,
+            reinterpret_cast<PRIVILEGE_SET*>(privilege_bytes.data()),
+            &privilege_bytes_count, &granted, &access_status) != FALSE;
+      }
+    }
+    if (!checked) {
+      denied = true;
+      break;
+    }
+    if (access_status || (granted & requested) != 0) {
+      denied = true;
+      break;
+    }
+  }
+  CloseHandle(impersonation_token);
+  LocalFree(descriptor);
+  const bool no_write_access = !denied;
+  if (!no_write_access) SetLastError(ERROR_ACCESS_DENIED);
+  return no_write_access;
+}
+
+bool ServiceSelfDenyCurrentWriteAccess(HANDLE object, bool directory) {
+  static constexpr ACCESS_MASK forbidden[] = {
+    FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA,
+    FILE_WRITE_ATTRIBUTES, DELETE, WRITE_DAC, WRITE_OWNER,
+    FILE_DELETE_CHILD,
+  };
+  return ServiceSelfDenyCurrentAccess(
+      object, forbidden,
+      directory ? sizeof(forbidden) / sizeof(forbidden[0])
+                : sizeof(forbidden) / sizeof(forbidden[0]) - 1);
+}
+
+bool ServiceSelfDenyCurrentAncestorTakeoverAccess(HANDLE object) {
+  static constexpr ACCESS_MASK forbidden[] = {
+    FILE_WRITE_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES,
+    DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER,
+  };
+  return ServiceSelfDenyCurrentAccess(
+      object, forbidden, sizeof(forbidden) / sizeof(forbidden[0]));
+}
+
+bool ServiceSelfCaptureFileIdentity(
+    HANDLE file, ServiceStoreIdentity* identity,
+    FILE_BASIC_INFO* basic, FILE_STANDARD_INFO* standard,
+    bool require_read_only = true) {
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  if (file == INVALID_HANDLE_VALUE ||
+      !GetFileInformationByHandleEx(
+          file, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+      !GetFileInformationByHandleEx(
+          file, FileBasicInfo, basic, sizeof(*basic)) ||
+      !GetFileInformationByHandleEx(
+          file, FileStandardInfo, standard, sizeof(*standard)) ||
+      (tag.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT |
+                             FILE_ATTRIBUTE_DEVICE |
+                             FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+      standard->DeletePending || standard->NumberOfLinks != 1 ||
+      standard->EndOfFile.QuadPart < 0 ||
+      (require_read_only &&
+       !ServiceSelfDenyCurrentWriteAccess(file, false)) ||
+      !CaptureExternalServiceFileIdentity(file, identity)) return false;
+  return true;
+}
+
+bool ServiceSelfReadFile(
+    HANDLE parent, const wchar_t* name, uint64_t maximum,
+    bool retain_bytes, std::vector<uint8_t>* bytes,
+    std::string* digest, ServiceStoreIdentity* identity,
+    uint32_t* byte_length,
+    bool* output_limit) {
+  *output_limit = false;
+  const DWORD share_mode = FILE_SHARE_READ;
+  HANDLE file = OpenWindowsRelative(
+      parent, name, GENERIC_READ | READ_CONTROL,
+      kFileOpen, VerifiedObjectType::File, nullptr, share_mode);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  FILE_BASIC_INFO before_basic{}, after_basic{};
+  FILE_STANDARD_INFO before_standard{}, after_standard{};
+  ServiceStoreIdentity before_identity, after_identity;
+  bool valid = ServiceSelfCaptureFileIdentity(
+      file, &before_identity, &before_basic, &before_standard);
+  if (valid && static_cast<uint64_t>(before_standard.EndOfFile.QuadPart) >
+          maximum) {
+    *output_limit = true;
+    CloseHandle(file);
+    return false;
+  }
+  if (valid && retain_bytes) {
+    try {
+      bytes->resize(static_cast<size_t>(before_standard.EndOfFile.QuadPart));
+    } catch (...) {
+      valid = false;
+    }
+  }
+  if (valid && byte_length) {
+    *byte_length = static_cast<uint32_t>(
+        before_standard.EndOfFile.QuadPart);
+  }
+  Sha256 hash;
+  valid = valid && (!digest || hash.Ready());
+  LARGE_INTEGER position{};
+  valid = valid && SetFilePointerEx(
+      file, position, nullptr, FILE_BEGIN) != FALSE;
+  std::array<uint8_t, 64 * 1024> chunk{};
+  uint64_t total = 0;
+  while (valid && total < static_cast<uint64_t>(
+             before_standard.EndOfFile.QuadPart)) {
+    const DWORD requested = static_cast<DWORD>(std::min<uint64_t>(
+        chunk.size(), static_cast<uint64_t>(
+            before_standard.EndOfFile.QuadPart) - total));
+    DWORD count = 0;
+    valid = ReadFile(file, chunk.data(), requested, &count, nullptr) &&
+        count == requested;
+    if (!valid) break;
+    if (digest && !hash.Update(chunk.data(), count)) {
+      valid = false;
+      break;
+    }
+    if (retain_bytes) {
+      std::memcpy(bytes->data() + static_cast<size_t>(total),
+                  chunk.data(), count);
+    }
+    total += count;
+  }
+  valid = valid && total == static_cast<uint64_t>(
+      before_standard.EndOfFile.QuadPart) &&
+      ServiceSelfCaptureFileIdentity(
+          file, &after_identity, &after_basic, &after_standard) &&
+      SameServiceStoreIdentity(before_identity, after_identity) &&
+      before_basic.CreationTime.QuadPart ==
+          after_basic.CreationTime.QuadPart &&
+      before_basic.LastWriteTime.QuadPart ==
+          after_basic.LastWriteTime.QuadPart &&
+      before_basic.ChangeTime.QuadPart ==
+          after_basic.ChangeTime.QuadPart &&
+      before_basic.FileAttributes == after_basic.FileAttributes &&
+      before_standard.EndOfFile.QuadPart ==
+          after_standard.EndOfFile.QuadPart &&
+      before_standard.AllocationSize.QuadPart ==
+          after_standard.AllocationSize.QuadPart;
+  if (valid) {
+    HANDLE named = OpenWindowsRelative(
+        parent, name, GENERIC_READ | READ_CONTROL,
+        kFileOpen, VerifiedObjectType::File, nullptr, share_mode);
+    ServiceStoreIdentity named_identity;
+    FILE_BASIC_INFO named_basic{};
+    FILE_STANDARD_INFO named_standard{};
+    valid = named != INVALID_HANDLE_VALUE &&
+        ServiceSelfCaptureFileIdentity(
+            named, &named_identity, &named_basic, &named_standard) &&
+        SameServiceStoreIdentity(before_identity, named_identity) &&
+        named_basic.CreationTime.QuadPart ==
+            before_basic.CreationTime.QuadPart &&
+        named_basic.LastWriteTime.QuadPart ==
+            before_basic.LastWriteTime.QuadPart &&
+        named_basic.ChangeTime.QuadPart ==
+            before_basic.ChangeTime.QuadPart &&
+        named_standard.EndOfFile.QuadPart ==
+            before_standard.EndOfFile.QuadPart &&
+        named_standard.AllocationSize.QuadPart ==
+            before_standard.AllocationSize.QuadPart;
+    if (named != INVALID_HANDLE_VALUE) CloseHandle(named);
+  }
+  CloseHandle(file);
+  if (!valid) return false;
+  *identity = before_identity;
+  if (digest) {
+    *digest = hash.Finish();
+    if (!ValidServiceFingerprint(*digest)) return false;
+  }
+  return true;
+}
+
+bool ServiceWindowsCaseFold(const std::wstring& value,
+                            std::wstring* folded) {
+  const int count = LCMapStringEx(
+      LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE,
+      value.data(), static_cast<int>(value.size()),
+      nullptr, 0, nullptr, nullptr, 0);
+  if (count <= 0 || count > 32768) return false;
+  folded->resize(static_cast<size_t>(count));
+  return LCMapStringEx(
+      LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE,
+      value.data(), static_cast<int>(value.size()),
+      folded->data(), count, nullptr, nullptr, 0) == count;
+}
+
+bool ServiceObservationNamedChild(
+    HANDLE parent, const std::string& name, bool directory,
+    const InventoryRoles& roles, ServiceAclProfile profile,
+    HANDLE* opened, ServiceStoreIdentity* identity) {
+  *opened = OpenWindowsRelative(
+      parent, Wide(name), FILE_GENERIC_READ | READ_CONTROL,
+      kFileOpen,
+      directory ? VerifiedObjectType::Directory
+                : VerifiedObjectType::File);
+  if (*opened == INVALID_HANDLE_VALUE) return false;
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  FILE_STANDARD_INFO standard{};
+  const bool valid =
+      GetFileInformationByHandleEx(
+          *opened, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+      GetFileInformationByHandleEx(
+          *opened, FileStandardInfo, &standard, sizeof(standard)) &&
+      (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+      (tag.FileAttributes & FILE_ATTRIBUTE_DEVICE) == 0 &&
+      !standard.DeletePending &&
+      (directory
+          ? standard.Directory != FALSE
+          : standard.Directory == FALSE && standard.NumberOfLinks == 1) &&
+      CaptureServiceObservationIdentity(
+          *opened, roles, profile, identity);
+  if (!valid) {
+    CloseHandle(*opened);
+    *opened = INVALID_HANDLE_VALUE;
+    SetLastError(ERROR_ACCESS_DENIED);
+  }
+  return valid;
+}
+
+bool ServiceObservationNamedExternalChild(
+    HANDLE parent, const std::string& name, bool directory,
+    const InventoryRoles& roles, ServiceExternalProfile profile,
+    HANDLE* opened, ServiceStoreIdentity* identity) {
+  *opened = OpenWindowsRelative(
+      parent, Wide(name), FILE_GENERIC_READ | READ_CONTROL,
+      kFileOpen,
+      directory ? VerifiedObjectType::Directory
+                : VerifiedObjectType::File);
+  if (*opened == INVALID_HANDLE_VALUE) return false;
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  FILE_STANDARD_INFO standard{};
+  const bool shape_valid =
+      GetFileInformationByHandleEx(
+          *opened, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+      GetFileInformationByHandleEx(
+          *opened, FileStandardInfo, &standard, sizeof(standard)) &&
+      (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+      (tag.FileAttributes & FILE_ATTRIBUTE_DEVICE) == 0 &&
+      !standard.DeletePending &&
+      (directory
+          ? standard.Directory != FALSE
+          : standard.Directory == FALSE && standard.NumberOfLinks == 1);
+  ServiceExternalAclPolicy policy =
+      ServiceExternalAclPolicy::Unresolved;
+  if (!shape_valid ||
+      !InferServiceExternalAclPolicy(
+          *opened, roles, profile, directory, &policy, identity)) {
+    CloseHandle(*opened);
+    *opened = INVALID_HANDLE_VALUE;
+    SetLastError(ERROR_ACCESS_DENIED);
+    return false;
+  }
+  return true;
+}
+
+struct ServiceObservationDirectoryEntry {
+  std::string name;
+  std::string kind;
+  ServiceStoreIdentity identity;
+};
+
+bool ServiceObservationDirectorySnapshot(
+    HANDLE directory, const InventoryRoles& roles,
+    ServiceExternalProfile external_profile,
+    std::vector<ServiceObservationDirectoryEntry>* entries,
+    bool* output_limit) {
+  entries->clear();
+  *output_limit = false;
+  std::array<uint8_t, 64 * 1024> buffer{};
+  std::set<std::wstring> folded_names;
+  uint64_t name_bytes = 0;
+  bool restart = true;
+  for (;;) {
+    if (!GetFileInformationByHandleEx(
+            directory,
+            restart ? FileIdBothDirectoryRestartInfo
+                    : FileIdBothDirectoryInfo,
+            buffer.data(), static_cast<DWORD>(buffer.size()))) {
+      return GetLastError() == ERROR_NO_MORE_FILES;
+    }
+    restart = false;
+    size_t offset = 0;
+    for (;;) {
+      if (offset + offsetof(FILE_ID_BOTH_DIR_INFO, FileName) >
+          buffer.size()) return false;
+      const auto* record = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(
+          buffer.data() + offset);
+      if (record->FileNameLength == 0 ||
+          record->FileNameLength % sizeof(wchar_t) != 0 ||
+          record->FileNameLength >
+              buffer.size() - offset -
+                  offsetof(FILE_ID_BOTH_DIR_INFO, FileName)) return false;
+      const std::wstring wide_name(
+          record->FileName,
+          record->FileNameLength / sizeof(wchar_t));
+      if (wide_name != L"." && wide_name != L"..") {
+        const std::string name = Utf8(wide_name);
+        const bool is_directory =
+            (record->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (entries->size() >= 10000) {
+          *output_limit = true;
+          return false;
+        }
+        if (name.empty() || !ValidServiceStoreComponent(name) ||
+            Wide(name) != wide_name ||
+            (record->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            (record->FileAttributes & FILE_ATTRIBUTE_DEVICE) != 0) return false;
+        std::wstring folded;
+        if (!ServiceWindowsCaseFold(wide_name, &folded) ||
+            !folded_names.insert(std::move(folded)).second) return false;
+        name_bytes += name.size();
+        if (name_bytes > 64ULL * 1024ULL * 1024ULL) {
+          *output_limit = true;
+          return false;
+        }
+        ServiceObservationDirectoryEntry entry;
+        entry.name = name;
+        entry.kind = is_directory ? "directory" : "file";
+        HANDLE child = INVALID_HANDLE_VALUE;
+        if (!ServiceObservationNamedExternalChild(
+                directory, name, is_directory, roles, external_profile,
+                &child, &entry.identity)) return false;
+        CloseHandle(child);
+        entries->push_back(std::move(entry));
+      }
+      if (record->NextEntryOffset == 0) break;
+      if (record->NextEntryOffset <
+              offsetof(FILE_ID_BOTH_DIR_INFO, FileName) ||
+          record->NextEntryOffset > buffer.size() - offset) return false;
+      offset += record->NextEntryOffset;
+    }
+  }
+  std::sort(entries->begin(), entries->end(),
+      [](const ServiceObservationDirectoryEntry& left,
+         const ServiceObservationDirectoryEntry& right) {
+        return left.name < right.name;
+      });
+  return true;
+}
+
+bool ServiceObservationDirectoryListsEqual(
+    const std::vector<ServiceObservationDirectoryEntry>& left,
+    const std::vector<ServiceObservationDirectoryEntry>& right) {
+  if (left.size() != right.size()) return false;
+  for (size_t index = 0; index < left.size(); ++index) {
+    if (left[index].name != right[index].name ||
+        left[index].kind != right[index].kind ||
+        !SameServiceStoreIdentity(
+            left[index].identity, right[index].identity)) return false;
+  }
+  return true;
+}
+
+bool ServiceObservationRevalidateDirectories(
+    ServiceStoreHandle* root, const std::vector<std::string>& components,
+    const std::vector<ServiceStoreIdentity>& expected) {
+  if (!root || root->external_root_absent ||
+      components.size() != expected.size() ||
+      !RevalidateServiceExternalRoot(root)) return false;
+  HANDLE current = root->object;
+  ServiceObservationScopedHandles opened;
+  for (size_t index = 0; index < components.size(); ++index) {
+    HANDLE next = INVALID_HANDLE_VALUE;
+    ServiceStoreIdentity identity;
+    if (!ServiceObservationNamedChild(
+            current, components[index], true, root->roles,
+            expected[index].profile, &next, &identity) ||
+        !SameServiceStoreIdentity(identity, expected[index])) {
+      if (next != INVALID_HANDLE_VALUE) CloseHandle(next);
+      return false;
+    }
+    opened.Add(next);
+    current = next;
+  }
+  return RevalidateServiceExternalRoot(root);
+}
+
+bool ServiceObservationFixedRootIdentity(
+    const std::string& root_kind, const InventoryRoles& roles,
+    uint32_t* writes, HANDLE* root, std::string* absolute_root,
+    ServiceStoreIdentity* root_identity,
+    ServiceStoreIdentity* anchor_identity,
+    std::vector<std::string>* missing_prefix) {
+  std::string parent_path, name, witness_name;
+  if (!ResolveServiceStoreRoot(
+          root_kind, &parent_path, &name, &witness_name)) return false;
+  *absolute_root = parent_path + "\\" + name;
+  *root = INVALID_HANDLE_VALUE;
+  missing_prefix->clear();
+  ServiceContainerState base_state = ServiceContainerState::IoFailed;
+  ServiceStoreIdentity base_identity;
+  try {
+    base_state = PrepareServiceBaseContainer(
+        root_kind, roles, false, writes, &base_identity);
+  } catch (...) {
+    return false;
+  }
+  if (*writes != 0) return false;
+  if (base_state == ServiceContainerState::Absent) {
+    PWSTR raw = nullptr;
+    if (FAILED(SHGetKnownFolderPath(
+            FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &raw))) {
+      return false;
+    }
+    const std::string program_data = Utf8(raw);
+    CoTaskMemFree(raw);
+    HANDLE anchor = OpenWindowsPathNoFollow(
+        program_data, READ_CONTROL | FILE_READ_ATTRIBUTES,
+        VerifiedObjectType::Directory);
+    if (anchor == INVALID_HANDLE_VALUE) return false;
+    const bool trusted = VerifyBootstrapAnchor(anchor, roles, true) &&
+        CaptureExternalAncestorIdentity(anchor, anchor_identity);
+    CloseHandle(anchor);
+    if (!trusted) return false;
+    missing_prefix->push_back("gjc-remote");
+    if (root_kind == "shawl") missing_prefix->push_back("supervisors");
+    missing_prefix->push_back(name);
+    return true;
+  }
+  if (base_state != ServiceContainerState::Ready) return false;
+
+  ServiceStoreIdentity parent_identity = base_identity;
+  if (root_kind == "shawl") {
+    ServiceStoreIdentity shawl_parent_identity;
+    bool ambiguous = false;
+    const ShawlParentState state = PrepareShawlServiceParent(
+        roles, false, base_identity, writes,
+        &shawl_parent_identity, &ambiguous);
+    if (*writes != 0) return false;
+    if (state == ShawlParentState::Absent) {
+      *anchor_identity = base_identity;
+      missing_prefix->push_back("supervisors");
+      missing_prefix->push_back(name);
+      return true;
+    }
+    if (state != ShawlParentState::Ready) return false;
+    parent_identity = shawl_parent_identity;
+  }
+
+  HANDLE parent = INVALID_HANDLE_VALUE;
+  if (!ServiceStoreOpenFixedParent(parent_path, false, &parent)) return false;
+  ServiceStoreIdentity observed_parent;
+  const bool parent_exact = root_kind == "shawl"
+      ? CaptureServiceStoreIdentity(
+            parent, roles,
+            ServiceAclProfile::InternalContainerDirectory,
+            &observed_parent) &&
+          SameServiceStoreIdentity(observed_parent, parent_identity)
+      : (parent_identity.profile ==
+                ServiceAclProfile::InternalContainerDirectory
+            ? CaptureServiceStoreIdentity(
+                  parent, roles,
+                  ServiceAclProfile::InternalContainerDirectory,
+                  &observed_parent)
+            : VerifyBootstrapAnchor(parent, roles) &&
+                CaptureExternalAncestorIdentity(
+                    parent, &observed_parent)) &&
+          SameServicePhysicalIdentity(
+              observed_parent, parent_identity);
+  if (!parent_exact) {
+    CloseHandle(parent);
+    return false;
+  }
+  *anchor_identity = parent_identity;
+  HANDLE observed_root = INVALID_HANDLE_VALUE;
+  const bool root_present = ServiceStoreOpenRelativeDirectory(
+      parent, name, false, &observed_root);
+  const DWORD root_error = root_present ? ERROR_SUCCESS : GetLastError();
+  HANDLE witness = INVALID_HANDLE_VALUE;
+  const bool witness_present = ServiceStoreOpenRelativeFile(
+      parent, witness_name, false, &witness);
+  const DWORD witness_error = witness_present
+      ? ERROR_SUCCESS : GetLastError();
+  if (!root_present || !witness_present) {
+    if (observed_root != INVALID_HANDLE_VALUE) CloseHandle(observed_root);
+    if (witness != INVALID_HANDLE_VALUE) CloseHandle(witness);
+    const bool absent = !root_present && !witness_present &&
+        ServiceWindowsNotFound(root_error) &&
+        ServiceWindowsNotFound(witness_error);
+    CloseHandle(parent);
+    if (!absent) return false;
+    missing_prefix->push_back(name);
+    return true;
+  }
+  ServiceStoreIdentity observed_root_identity, witness_identity;
+  std::vector<uint8_t> witness_bytes;
+  std::string roles_fingerprint, root_path, root_nonce;
+  const bool exact =
+      CaptureServiceStoreIdentity(
+          observed_root, roles,
+          ServiceStoreRootProfile(root_kind),
+          &observed_root_identity) &&
+      CaptureServiceStoreIdentity(
+          witness, roles, ServiceAclProfile::ControlFile,
+          &witness_identity) &&
+      ServiceStoreReadBytes(witness, 64 * 1024, &witness_bytes) &&
+      CaptureServiceStoreObjectPath(observed_root, &root_path);
+  const bool fingerprint_ready = ServiceStoreRolesFingerprint(
+      roles, &roles_fingerprint);
+  const bool root_binding = exact && fingerprint_ready &&
+      CompareStringOrdinal(
+          Wide(root_path).c_str(), static_cast<int>(Wide(root_path).size()),
+          Wide(*absolute_root).c_str(),
+          static_cast<int>(Wide(*absolute_root).size()), TRUE) == CSTR_EQUAL &&
+      ServiceRootWitnessNonce(
+          std::string(witness_bytes.begin(), witness_bytes.end()),
+          root_kind, root_path, roles_fingerprint, &root_nonce) &&
+      std::string(witness_bytes.begin(), witness_bytes.end()) ==
+          ServiceRootWitnessContent(
+              root_kind, root_path, root_nonce, roles_fingerprint,
+              parent_identity, observed_root_identity, {});
+  CloseHandle(witness);
+  CloseHandle(parent);
+  if (!root_binding) {
+    CloseHandle(observed_root);
+    return false;
+  }
+  *root_identity = observed_root_identity;
+  *root = observed_root;
+  return true;
+}
+#endif
+
+napi_value PlanServiceArtifactLocation(
+    napi_env env, napi_callback_info info) {
+  napi_value args[4];
+  std::string root_kind, artifact_fingerprint, relative_path;
+  InventoryRoles roles{};
+  std::vector<std::string> relative_components;
+  std::vector<std::string> location_components;
+  if (!InventoryArgs(env, info, 4, args) ||
+      !InventoryString(env, args[0], &root_kind) ||
+      (root_kind != "releases" && root_kind != "shawl") ||
+      !InventoryString(env, args[1], &artifact_fingerprint) ||
+      !ValidServiceFingerprint(artifact_fingerprint) ||
+      !InventoryString(env, args[2], &relative_path) ||
+      !ValidServiceRelativePath(relative_path, &relative_components) ||
+      !InventoryRolesArg(env, args[3], &roles)) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "plan_service_artifact_location",
+        "invalid-input");
+    return nullptr;
+  }
+  location_components.reserve(relative_components.size() + 1);
+  location_components.push_back(artifact_fingerprint);
+  location_components.insert(
+      location_components.end(), relative_components.begin(),
+      relative_components.end());
+  if (!ServiceActorAuthorized(roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED", "plan_service_artifact_location",
+        "access-denied");
+    return nullptr;
+  }
+#if defined(_WIN32) && defined(_WIN64)
+  uint32_t writes = 0;
+  HANDLE root = INVALID_HANDLE_VALUE;
+  std::string absolute_root;
+  ServiceStoreIdentity root_identity, anchor_identity;
+  std::vector<std::string> missing_prefix;
+  bool root_observed = false;
+  try {
+    root_observed = ServiceObservationFixedRootIdentity(
+        root_kind, roles, &writes, &root, &absolute_root,
+        &root_identity, &anchor_identity, &missing_prefix);
+  } catch (...) {
+    root_observed = false;
+  }
+  if (!root_observed || writes != 0) {
+    if (root != INVALID_HANDLE_VALUE) CloseHandle(root);
+    const DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED) {
+      ServiceObservationError(
+          env, "SERVICE_ACCESS_DENIED",
+          "plan_service_artifact_location", "access-denied");
+    } else if (ServiceWindowsNotFound(error)) {
+      ServiceObservationError(
+          env, "SERVICE_PENDING", "plan_service_artifact_location",
+          "absence-unproven", true);
+    } else {
+      ServiceObservationError(
+          env, "SERVICE_STALE", "plan_service_artifact_location",
+          "identity-changed", true);
+    }
+    return nullptr;
+  }
+  ServiceObservationScopedHandles opened;
+  if (root != INVALID_HANDLE_VALUE) opened.Add(root);
+  ServiceStoreIdentity existing_directory_identity;
+  ServiceStoreIdentity location_anchor_identity = anchor_identity;
+  bool existing_identity_present = false;
+  std::vector<std::string> missing_segments = missing_prefix;
+  std::string missing_first;
+  std::vector<std::string> observed_relative_directories;
+  std::vector<ServiceStoreIdentity> observed_relative_identities;
+  size_t relative_index = 0;
+  HANDLE current = root;
+  ServiceStoreIdentity current_identity = root_identity;
+  if (root != INVALID_HANDLE_VALUE) {
+    if (!CaptureServiceStoreIdentity(
+            root, roles, ServiceStoreRootProfile(root_kind),
+            &current_identity)) {
+      ServiceObservationError(
+          env, "SERVICE_ACCESS_DENIED",
+          "plan_service_artifact_location", "access-denied");
+      return nullptr;
+    }
+    location_anchor_identity = current_identity;
+    for (; relative_index + 1 < location_components.size();
+         ++relative_index) {
+      HANDLE next = OpenWindowsRelative(
+          current, Wide(location_components[relative_index]),
+          FILE_GENERIC_READ | READ_CONTROL, kFileOpen,
+          VerifiedObjectType::Directory);
+      if (next == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (!ServiceWindowsNotFound(error)) {
+          ServiceObservationError(
+              env, error == ERROR_ACCESS_DENIED
+                  ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+              "plan_service_artifact_location",
+              error == ERROR_ACCESS_DENIED
+                  ? "access-denied" : "identity-changed",
+              error != ERROR_ACCESS_DENIED);
+          return nullptr;
+        }
+        missing_segments.assign(
+            location_components.begin() + relative_index,
+            location_components.end());
+        missing_first = location_components[relative_index];
+        existing_directory_identity = current_identity;
+        existing_identity_present = true;
+        break;
+      }
+      ServiceStoreIdentity next_identity;
+      if (!CaptureServiceStoreIdentity(
+              next, roles, ServiceAclProfile::ReleaseDirectory,
+              &next_identity)) {
+        CloseHandle(next);
+        ServiceObservationError(
+            env, "SERVICE_ACCESS_DENIED",
+            "plan_service_artifact_location", "access-denied");
+        return nullptr;
+      }
+      opened.Add(next);
+      observed_relative_directories.push_back(
+          location_components[relative_index]);
+      observed_relative_identities.push_back(next_identity);
+      current = next;
+      current_identity = next_identity;
+      location_anchor_identity = next_identity;
+    }
+    if (missing_segments.empty()) {
+      HANDLE target = OpenWindowsRelative(
+          current, Wide(location_components.back()),
+          FILE_READ_ATTRIBUTES | READ_CONTROL, kFileOpen,
+          VerifiedObjectType::Any);
+      if (target != INVALID_HANDLE_VALUE) {
+        CloseHandle(target);
+        ServiceObservationError(
+            env, "SERVICE_PENDING", "plan_service_artifact_location",
+            "absence-unproven", true);
+        return nullptr;
+      }
+      const DWORD error = GetLastError();
+      if (!ServiceWindowsNotFound(error)) {
+        ServiceObservationError(
+            env, error == ERROR_ACCESS_DENIED
+                ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+            "plan_service_artifact_location",
+            error == ERROR_ACCESS_DENIED
+                ? "access-denied" : "identity-changed",
+            error != ERROR_ACCESS_DENIED);
+        return nullptr;
+      }
+      missing_segments = {location_components.back()};
+      missing_first = location_components.back();
+      existing_directory_identity = current_identity;
+      existing_identity_present = true;
+      location_anchor_identity = current_identity;
+    }
+  } else {
+    missing_segments.insert(
+        missing_segments.end(), location_components.begin(),
+        location_components.end());
+  }
+
+  if (missing_segments.empty()) {
+    ServiceObservationError(
+        env, "SERVICE_PENDING", "plan_service_artifact_location",
+        "absence-unproven", true);
+    return nullptr;
+  }
+  if (!ServiceActorAuthorized(roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED", "plan_service_artifact_location",
+        "access-denied");
+    return nullptr;
+  }
+  ServiceStoreIdentity verified_root_identity, verified_anchor_identity;
+  HANDLE rechecked_root = INVALID_HANDLE_VALUE;
+  std::string rechecked_absolute_root;
+  std::vector<std::string> rechecked_prefix;
+  bool rechecked = ServiceObservationFixedRootIdentity(
+      root_kind, roles, &writes, &rechecked_root,
+      &rechecked_absolute_root, &verified_root_identity,
+      &verified_anchor_identity, &rechecked_prefix) &&
+      writes == 0 && rechecked_absolute_root == absolute_root &&
+      rechecked_prefix == missing_prefix &&
+      SameServicePhysicalIdentity(
+          anchor_identity, verified_anchor_identity) &&
+      (root == INVALID_HANDLE_VALUE
+          ? rechecked_root == INVALID_HANDLE_VALUE
+          : rechecked_root != INVALID_HANDLE_VALUE &&
+              SameServiceStoreIdentity(
+                  verified_root_identity, root_identity));
+  if (rechecked && rechecked_root != INVALID_HANDLE_VALUE) {
+    HANDLE recheck_parent = rechecked_root;
+    ServiceObservationScopedHandles rechecked_directories;
+    for (size_t index = 0;
+         rechecked && index < observed_relative_directories.size();
+         ++index) {
+      HANDLE named = OpenWindowsRelative(
+          recheck_parent, Wide(observed_relative_directories[index]),
+          FILE_GENERIC_READ | READ_CONTROL, kFileOpen,
+          VerifiedObjectType::Directory);
+      ServiceStoreIdentity named_identity;
+      rechecked = named != INVALID_HANDLE_VALUE &&
+          CaptureServiceStoreIdentity(
+              named, roles, ServiceAclProfile::ReleaseDirectory,
+              &named_identity) &&
+              SameServiceStoreIdentity(
+              named_identity, observed_relative_identities[index]);
+      if (named != INVALID_HANDLE_VALUE) {
+        rechecked_directories.Add(named);
+        recheck_parent = named;
+      }
+    }
+    HANDLE target = INVALID_HANDLE_VALUE;
+    if (rechecked) {
+      target = OpenWindowsRelative(
+          recheck_parent, Wide(missing_first),
+          FILE_READ_ATTRIBUTES | READ_CONTROL, kFileOpen,
+          VerifiedObjectType::Any);
+      const DWORD target_error = target == INVALID_HANDLE_VALUE
+          ? GetLastError() : ERROR_SUCCESS;
+      if (target != INVALID_HANDLE_VALUE) CloseHandle(target);
+      rechecked = target == INVALID_HANDLE_VALUE &&
+          ServiceWindowsNotFound(target_error);
+    }
+  }
+  if (rechecked_root != INVALID_HANDLE_VALUE) CloseHandle(rechecked_root);
+  if (!rechecked) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "plan_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (!ServiceActorAuthorized(roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED", "plan_service_artifact_location",
+        "access-denied");
+    return nullptr;
+  }
+  const std::string slash_path =
+      artifact_fingerprint + "/" + relative_path;
+  std::string absolute_path = absolute_root;
+  if (!absolute_path.empty() && absolute_path.back() != '\\') {
+    absolute_path.push_back('\\');
+  }
+  for (char character : slash_path) {
+    absolute_path.push_back(character == '/' ? '\\' : character);
+  }
+  const std::string anchor_fingerprint =
+      ServiceObservationIdentityFingerprint(
+          location_anchor_identity,
+          "gjc-remote/windows-location-anchor/v1");
+  if (!ValidServiceFingerprint(anchor_fingerprint)) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "plan_service_artifact_location",
+        "io", true);
+    return nullptr;
+  }
+  Sha256 intent_hash;
+  if (!intent_hash.Ready()) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "plan_service_artifact_location",
+        "io");
+    return nullptr;
+  }
+  HashField(&intent_hash, "gjc-remote/windows-location-intent/v1");
+  HashField(&intent_hash, root_kind);
+  HashField(&intent_hash, artifact_fingerprint);
+  HashField(&intent_hash, relative_path);
+  HashField(&intent_hash, absolute_root);
+  HashField(&intent_hash, absolute_path);
+  HashField(&intent_hash, anchor_fingerprint);
+  HashField(&intent_hash, "missing-segments");
+  HashField(&intent_hash, std::to_string(missing_segments.size()));
+  for (const std::string& segment : missing_segments) {
+    HashField(&intent_hash, segment);
+  }
+  if (existing_identity_present) {
+    HashField(&intent_hash,
+              ServiceStoreIdentityText(existing_directory_identity));
+  } else {
+    HashField(&intent_hash, "no-existing-release-directory");
+  }
+  const std::string intent_fingerprint = intent_hash.Finish();
+  if (!ValidServiceFingerprint(intent_fingerprint)) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "plan_service_artifact_location",
+        "io");
+    return nullptr;
+  }
+  napi_value result, value, segments;
+  napi_create_object(env, &result);
+  ServiceSetUint32(env, result, "schemaVersion", 1);
+  ServiceSetString(env, result, "rootKind", root_kind);
+  ServiceSetString(env, result, "artifactFingerprint",
+                   artifact_fingerprint);
+  ServiceSetString(env, result, "relativePath", relative_path);
+  ServiceSetString(env, result, "absoluteRoot", absolute_root);
+  ServiceSetString(env, result, "absolutePath", absolute_path);
+  ServiceSetString(env, result, "anchorIdentityFingerprint",
+                   anchor_fingerprint);
+  napi_create_array_with_length(env, missing_segments.size(), &segments);
+  for (uint32_t index = 0; index < missing_segments.size(); ++index) {
+    napi_create_string_utf8(
+        env, missing_segments[index].c_str(),
+        missing_segments[index].size(), &value);
+    napi_set_element(env, segments, index, value);
+  }
+  napi_set_named_property(env, result, "missingSegments", segments);
+  ServiceObservationSetNullableIdentity(
+      env, result, "existingDirectoryIdentity",
+      existing_identity_present ? &existing_directory_identity : nullptr);
+  ServiceSetString(env, result, "intentFingerprint",
+                   intent_fingerprint);
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceObservationError(
+      env, "SERVICE_UNSUPPORTED", "plan_service_artifact_location",
+      "unsupported");
+  return nullptr;
+#endif
+}
+
+napi_value ResolveServiceArtifactLocation(
+    napi_env env, napi_callback_info info) {
+  napi_value args[3];
+  ServiceStoreHandle* directory = nullptr;
+  std::string relative_path, expected_sha256;
+  std::vector<std::string> components;
+  if (!InventoryArgs(env, info, 3, args) ||
+      !ServiceStoreHandleArg(env, args[0], &directory) ||
+      (directory->kind != ServiceStoreHandleKind::Root &&
+       directory->kind != ServiceStoreHandleKind::Directory) ||
+      (directory->root_kind != "releases" &&
+       directory->root_kind != "shawl") ||
+      directory->profile != ServiceAclProfile::ReleaseDirectory ||
+      !InventoryString(env, args[1], &relative_path) ||
+      !ValidServiceRelativePath(relative_path, &components) ||
+      !InventoryString(env, args[2], &expected_sha256) ||
+      !ValidServiceFingerprint(expected_sha256)) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "resolve_service_artifact_location",
+        "invalid-input");
+    return nullptr;
+  }
+#if defined(_WIN32) && defined(_WIN64)
+  if (!ServiceActorAuthorized(directory->roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED",
+        "resolve_service_artifact_location", "access-denied");
+    return nullptr;
+  }
+  if (!RevalidateServiceStoreHandle(directory)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  std::string directory_path;
+  if (!CaptureServiceStoreObjectPath(directory->object, &directory_path)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  ServiceObservationScopedHandles opened;
+  std::vector<ServiceStoreIdentity> relative_directory_identities;
+  std::vector<std::string> relative_directory_components;
+  HANDLE current = directory->object;
+  for (size_t index = 0; index + 1 < components.size(); ++index) {
+    HANDLE next = OpenWindowsRelative(
+        current, Wide(components[index]),
+        FILE_GENERIC_READ | READ_CONTROL, kFileOpen,
+        VerifiedObjectType::Directory);
+    if (next == INVALID_HANDLE_VALUE) {
+      const DWORD error = GetLastError();
+      ServiceObservationError(
+          env, error == ERROR_ACCESS_DENIED
+              ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+          "resolve_service_artifact_location",
+          error == ERROR_ACCESS_DENIED
+              ? "access-denied" : "identity-changed",
+          error != ERROR_ACCESS_DENIED);
+      return nullptr;
+    }
+    ServiceStoreIdentity identity;
+    if (!CaptureServiceStoreIdentity(
+            next, directory->roles,
+            ServiceAclProfile::ReleaseDirectory, &identity)) {
+      CloseHandle(next);
+      ServiceObservationError(
+          env, "SERVICE_ACCESS_DENIED",
+          "resolve_service_artifact_location", "access-denied");
+      return nullptr;
+    }
+    opened.Add(next);
+    relative_directory_components.push_back(components[index]);
+    relative_directory_identities.push_back(identity);
+    current = next;
+  }
+  const std::string leaf = components.back();
+  HANDLE file = OpenWindowsRelative(
+      current, Wide(leaf), GENERIC_READ | READ_CONTROL,
+      kFileOpen, VerifiedObjectType::File);
+  if (file == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    ServiceObservationError(
+        env, error == ERROR_ACCESS_DENIED
+            ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+        "resolve_service_artifact_location",
+        error == ERROR_ACCESS_DENIED
+            ? "access-denied" : "identity-changed",
+        error != ERROR_ACCESS_DENIED);
+    return nullptr;
+  }
+  opened.Add(file);
+  ServiceStoreIdentity file_identity;
+  if (!CaptureServiceStoreIdentity(
+          file, directory->roles,
+          ServiceAclProfile::ReleaseFile, &file_identity) &&
+      !CaptureServiceStoreIdentity(
+          file, directory->roles,
+          ServiceAclProfile::ReleaseExecutable, &file_identity)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED",
+        "resolve_service_artifact_location", "access-denied");
+    return nullptr;
+  }
+  FILE_STANDARD_INFO before_standard{}, after_standard{};
+  FILE_BASIC_INFO before_basic{}, after_basic{};
+  if (!GetFileInformationByHandleEx(
+          file, FileStandardInfo, &before_standard,
+          sizeof(before_standard)) ||
+      !GetFileInformationByHandleEx(
+          file, FileBasicInfo, &before_basic, sizeof(before_basic)) ||
+      before_standard.Directory || before_standard.DeletePending ||
+      before_standard.NumberOfLinks != 1 ||
+      (before_basic.FileAttributes & FILE_ATTRIBUTE_DEVICE) != 0) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  ServiceStoreFileFacts file_facts;
+  if (!HashRetainedServiceArtifact(
+          file, nullptr, true, kServiceArtifactMaxBytes,
+          &file_facts) ||
+      file_facts.sha256 != expected_sha256 ||
+      !GetFileInformationByHandleEx(
+          file, FileStandardInfo, &after_standard,
+          sizeof(after_standard)) ||
+      !GetFileInformationByHandleEx(
+          file, FileBasicInfo, &after_basic, sizeof(after_basic)) ||
+      before_standard.NumberOfLinks != 1 ||
+      after_standard.NumberOfLinks != 1 ||
+      before_basic.CreationTime.QuadPart !=
+          after_basic.CreationTime.QuadPart ||
+      before_basic.LastWriteTime.QuadPart !=
+          after_basic.LastWriteTime.QuadPart ||
+      before_basic.ChangeTime.QuadPart !=
+          after_basic.ChangeTime.QuadPart ||
+      before_basic.FileAttributes != after_basic.FileAttributes ||
+      before_standard.EndOfFile.QuadPart !=
+          after_standard.EndOfFile.QuadPart ||
+      before_standard.AllocationSize.QuadPart !=
+          after_standard.AllocationSize.QuadPart ||
+      !SameServiceStoreIdentity(
+          file_identity,
+          [&]() {
+            ServiceStoreIdentity after_identity;
+            if (!CaptureServiceStoreIdentity(
+                    file, directory->roles, file_identity.profile,
+                    &after_identity)) return ServiceStoreIdentity{};
+            return after_identity;
+          }())) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  HANDLE named = OpenWindowsRelative(
+      current, Wide(leaf), GENERIC_READ | READ_CONTROL,
+      kFileOpen, VerifiedObjectType::File);
+  ServiceStoreIdentity named_identity;
+  const bool named_exact = named != INVALID_HANDLE_VALUE &&
+      CaptureServiceStoreIdentity(
+          named, directory->roles, file_identity.profile,
+          &named_identity) &&
+      SameServiceStoreIdentity(named_identity, file_identity);
+  if (named != INVALID_HANDLE_VALUE) CloseHandle(named);
+  if (!named_exact) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (!ServiceActorAuthorized(directory->roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED",
+        "resolve_service_artifact_location", "access-denied");
+    return nullptr;
+  }
+  if (!RevalidateServiceStoreHandle(directory)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (!relative_directory_components.empty()) {
+    HANDLE verify_current = directory->object;
+    for (size_t index = 0;
+         index < relative_directory_components.size(); ++index) {
+      HANDLE check = OpenWindowsRelative(
+          verify_current,
+          Wide(relative_directory_components[index]),
+          FILE_GENERIC_READ | READ_CONTROL, kFileOpen,
+          VerifiedObjectType::Directory);
+      ServiceStoreIdentity check_identity;
+      const bool exact = check != INVALID_HANDLE_VALUE &&
+          CaptureServiceStoreIdentity(
+              check, directory->roles,
+              ServiceAclProfile::ReleaseDirectory,
+              &check_identity) &&
+          SameServiceStoreIdentity(
+              check_identity,
+              relative_directory_identities[index]);
+      if (check != INVALID_HANDLE_VALUE) CloseHandle(check);
+      if (!exact) {
+        ServiceObservationError(
+            env, "SERVICE_STALE",
+            "resolve_service_artifact_location",
+            "identity-changed", true);
+        return nullptr;
+      }
+      verify_current = opened.values[index];
+    }
+  }
+  ServiceStoreIdentity containing_directory_identity;
+  const ServiceAclProfile containing_profile =
+      ServiceAclProfile::ReleaseDirectory;
+  if (!CaptureServiceStoreIdentity(
+          current, directory->roles, containing_profile,
+          &containing_directory_identity)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED",
+        "resolve_service_artifact_location", "access-denied");
+    return nullptr;
+  }
+  DWORD path_size = GetFinalPathNameByHandleW(
+      file, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  if (path_size == 0 || path_size > 32768) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "resolve_service_artifact_location",
+        "io", true);
+    return nullptr;
+  }
+  std::vector<wchar_t> path_buffer(path_size + 1);
+  const DWORD path_length = GetFinalPathNameByHandleW(
+      file, path_buffer.data(), static_cast<DWORD>(path_buffer.size()),
+      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  if (path_length == 0 || path_length >= path_buffer.size()) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "resolve_service_artifact_location",
+        "io", true);
+    return nullptr;
+  }
+  std::wstring canonical_file(path_buffer.data(), path_length);
+  if (canonical_file.rfind(L"\\\\?\\", 0) == 0) {
+    canonical_file.erase(0, 4);
+  }
+  const std::string absolute_path = Utf8(canonical_file);
+  WindowsPathParts parsed_file;
+  if (directory_path.empty()) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  const std::string parent_prefix = directory_path +
+      (directory_path.back() == '\\' ? "" : "\\");
+  const std::wstring wide_file = Wide(absolute_path);
+  const std::wstring wide_prefix = Wide(parent_prefix);
+  std::wstring expected_relative = Wide(relative_path);
+  std::replace(expected_relative.begin(), expected_relative.end(), L'/', L'\\');
+  if (!ParseWindowsPath(absolute_path, &parsed_file) ||
+      wide_file.size() <= wide_prefix.size() ||
+      CompareStringOrdinal(
+          wide_file.data(), static_cast<int>(wide_prefix.size()),
+          wide_prefix.data(), static_cast<int>(wide_prefix.size()), TRUE) !=
+          CSTR_EQUAL ||
+      CompareStringOrdinal(
+          wide_file.data() + wide_prefix.size(),
+          static_cast<int>(wide_file.size() - wide_prefix.size()),
+          expected_relative.data(),
+          static_cast<int>(expected_relative.size()), TRUE) != CSTR_EQUAL) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "resolve_service_artifact_location",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (!ServiceActorAuthorized(directory->roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED",
+        "resolve_service_artifact_location", "access-denied");
+    return nullptr;
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  ServiceSetUint32(env, result, "schemaVersion", 1);
+  ServiceSetString(env, result, "publishedPath", relative_path);
+  ServiceSetString(env, result, "absolutePath", absolute_path);
+  napi_set_named_property(
+      env, result, "directoryIdentity",
+      ServiceStoreIdentityValue(env, containing_directory_identity));
+  napi_set_named_property(
+      env, result, "fileIdentity",
+      ServiceStoreIdentityValue(env, file_identity));
+  ServiceSetString(env, result, "fileSha256", file_facts.sha256);
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceObservationError(
+      env, "SERVICE_UNSUPPORTED", "resolve_service_artifact_location",
+      "unsupported");
+  return nullptr;
+#endif
+}
+
+napi_value OpenServiceExternalRoot(
+    napi_env env, napi_callback_info info) {
+  napi_value args[3];
+  std::string absolute_path, profile;
+  InventoryRoles roles{};
+  ServiceExternalProfile external_profile;
+  if (!InventoryArgs(env, info, 3, args) ||
+      !InventoryString(env, args[0], &absolute_path) ||
+      absolute_path.size() > 4096 ||
+      !InventoryString(env, args[1], &profile) ||
+      !ParseServiceExternalProfile(profile, &external_profile) ||
+      !InventoryRolesArg(env, args[2], &roles)) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "open_service_external_root",
+        "invalid-input");
+    return nullptr;
+  }
+  if (!ServiceActorAuthorized(roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED", "open_service_external_root",
+        "access-denied");
+    return nullptr;
+  }
+#if defined(_WIN32) && defined(_WIN64)
+  WindowsPathParts parts;
+  if (!ParseWindowsPath(absolute_path, &parts) ||
+      parts.components.empty() || parts.components.size() > 64) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "open_service_external_root",
+        "invalid-input");
+    return nullptr;
+  }
+  auto* handle = new (std::nothrow) ServiceStoreHandle();
+  if (!handle) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "open_service_external_root", "io");
+    return nullptr;
+  }
+  handle->env = env;
+  handle->kind = ServiceStoreHandleKind::ExternalRoot;
+  handle->access = ServiceStoreAccess::Read;
+  handle->root_kind = "external-observation";
+  handle->external_profile = profile;
+  handle->external_absolute_path = ServiceWindowsPathText(parts);
+  handle->fixed_parent_path = Utf8(parts.root);
+  handle->roles = roles;
+  try {
+    handle->external_ancestors.reserve(parts.components.size());
+    handle->external_ancestor_identities.reserve(parts.components.size());
+    handle->external_components.reserve(parts.components.size());
+    handle->external_missing_segments.reserve(parts.components.size());
+  } catch (...) {
+    delete handle;
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "open_service_external_root", "io");
+    return nullptr;
+  }
+  if (!ServiceStoreRolesFingerprint(
+          roles, &handle->roles_fingerprint)) {
+    delete handle;
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "open_service_external_root", "io");
+    return nullptr;
+  }
+  HANDLE current = OpenWindowsRoot(
+      parts.root, kWindowsTraversalAccess | READ_CONTROL);
+  ServiceStoreIdentity current_identity;
+  if (current == INVALID_HANDLE_VALUE ||
+      !CaptureExternalAncestorIdentity(current, &current_identity)) {
+    if (current != INVALID_HANDLE_VALUE) CloseHandle(current);
+    delete handle;
+    const DWORD error = GetLastError();
+    ServiceObservationError(
+        env, error == ERROR_ACCESS_DENIED
+            ? "SERVICE_ACCESS_DENIED" : "SERVICE_IO_FAILED",
+        "open_service_external_root",
+        error == ERROR_ACCESS_DENIED ? "access-denied" : "io",
+        error != ERROR_ACCESS_DENIED);
+    return nullptr;
+  }
+  handle->external_ancestors.push_back(current);
+  handle->external_ancestor_identities.push_back(current_identity);
+
+  const auto absentFrom = [&](size_t missing_index) -> bool {
+    ServiceStoreIdentity anchor_identity;
+    if (!CaptureExternalAncestorIdentity(current, &anchor_identity)) {
+      return false;
+    }
+    HANDLE retained_anchor = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(
+            GetCurrentProcess(), current, GetCurrentProcess(),
+            &retained_anchor, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      return false;
+    }
+    handle->object = retained_anchor;
+    handle->binding_parent_identity = anchor_identity;
+    handle->external_root_absent = true;
+    handle->external_missing_segments.clear();
+    for (size_t index = missing_index;
+         index < parts.components.size(); ++index) {
+      handle->external_missing_segments.push_back(
+          Utf8(parts.components[index]));
+    }
+    return !handle->external_missing_segments.empty();
+  };
+
+  bool opened_root = false;
+  for (size_t index = 0; index < parts.components.size(); ++index) {
+    const bool final = index + 1 == parts.components.size();
+    HANDLE next = OpenWindowsRelative(
+        current, parts.components[index],
+        final ? FILE_GENERIC_READ | READ_CONTROL
+              : kWindowsTraversalAccess | READ_CONTROL,
+        kFileOpen, VerifiedObjectType::Directory);
+    if (next == INVALID_HANDLE_VALUE) {
+      const DWORD error = GetLastError();
+      if (!ServiceWindowsNotFound(error)) {
+        CloseServiceStoreNative(handle, true);
+        delete handle;
+        ServiceObservationError(
+            env, error == ERROR_ACCESS_DENIED
+                ? "SERVICE_ACCESS_DENIED"
+                : error == ERROR_NOT_SUPPORTED
+                    ? "SERVICE_UNSUPPORTED" : "SERVICE_IO_FAILED",
+            "open_service_external_root",
+            error == ERROR_ACCESS_DENIED ? "access-denied" :
+                error == ERROR_NOT_SUPPORTED ? "unsupported" : "io",
+            error != ERROR_ACCESS_DENIED &&
+                error != ERROR_NOT_SUPPORTED);
+        return nullptr;
+      }
+      if (!absentFrom(index)) {
+        CloseServiceStoreNative(handle, true);
+        delete handle;
+        ServiceObservationError(
+            env, "SERVICE_ACCESS_DENIED",
+            "open_service_external_root", "access-denied");
+        return nullptr;
+      }
+      break;
+    }
+    if (final) {
+      ServiceExternalAclPolicy inferred_policy =
+          ServiceExternalAclPolicy::Unresolved;
+      ServiceStoreIdentity identity;
+      if (!InferServiceExternalAclPolicy(
+              next, roles, external_profile, true,
+              &inferred_policy, &identity)) {
+        CloseHandle(next);
+        CloseServiceStoreNative(handle, true);
+        delete handle;
+        ServiceObservationError(
+            env, "SERVICE_ACCESS_DENIED",
+            "open_service_external_root", "access-denied");
+        return nullptr;
+      }
+      handle->name = Utf8(parts.components[index]);
+      handle->external_policy = inferred_policy;
+      handle->identity = identity;
+      handle->object = next;
+      opened_root = true;
+      break;
+    }
+    if (!CaptureExternalAncestorIdentity(next, &current_identity)) {
+      CloseHandle(next);
+      CloseServiceStoreNative(handle, true);
+      delete handle;
+      ServiceObservationError(
+          env, "SERVICE_STALE", "open_service_external_root",
+          "identity-changed", true);
+      return nullptr;
+    }
+    handle->external_components.push_back(Utf8(parts.components[index]));
+    handle->external_ancestors.push_back(next);
+    handle->external_ancestor_identities.push_back(current_identity);
+    current = next;
+  }
+  if (!opened_root && !handle->external_root_absent) {
+    CloseServiceStoreNative(handle, true);
+    delete handle;
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "open_service_external_root", "io",
+        true);
+    return nullptr;
+  }
+  if (handle->external_root_absent &&
+      !RevalidateServiceExternalRoot(handle)) {
+    CloseServiceStoreNative(handle, true);
+    delete handle;
+    ServiceObservationError(
+        env, "SERVICE_STALE", "open_service_external_root",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (!handle->external_root_absent &&
+      !RevalidateServiceExternalRoot(handle)) {
+    CloseServiceStoreNative(handle, true);
+    delete handle;
+    ServiceObservationError(
+        env, "SERVICE_STALE", "open_service_external_root",
+        "identity-changed", true);
+    return nullptr;
+  }
+  napi_value wrapped = WrapServiceStoreHandle(env, handle);
+  if (!wrapped) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "open_service_external_root", "io");
+    return nullptr;
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  napi_set_named_property(env, result, "handle", wrapped);
+  ServiceSetString(env, result, "profile", profile);
+  ServiceSetString(env, result, "absolutePath",
+                   handle->external_absolute_path);
+  ServiceObservationSetNullableIdentity(
+      env, result, "rootIdentity",
+      handle->external_root_absent ? nullptr : &handle->identity);
+  if (handle->external_root_absent) {
+    napi_set_named_property(
+        env, result, "absence",
+        ServiceObservationAbsenceValue(
+            env, handle->binding_parent_identity,
+            handle->external_missing_segments));
+  } else {
+    napi_value null_value;
+    napi_get_null(env, &null_value);
+    napi_set_named_property(env, result, "absence", null_value);
+  }
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceObservationError(
+      env, "SERVICE_UNSUPPORTED", "open_service_external_root",
+      "unsupported");
+  return nullptr;
+#endif
+}
+
+napi_value ReadServiceExternalObject(
+    napi_env env, napi_callback_info info) {
+  napi_value args[4];
+  ServiceStoreHandle* external_root = nullptr;
+  std::string relative_path, mode;
+  uint64_t maximum = 0;
+  std::vector<std::string> components;
+  const bool shape = InventoryArgs(env, info, 4, args) &&
+      ServiceStoreHandleArg(env, args[0], &external_root) &&
+      external_root->kind == ServiceStoreHandleKind::ExternalRoot &&
+      InventoryString(env, args[1], &relative_path) &&
+      InventoryString(env, args[2], &mode) &&
+      (relative_path.empty()
+          ? mode == "directory"
+          : ValidServiceRelativePath(relative_path, &components)) &&
+      ServiceStoreNumber(env, args[3], 1024ULL * 1024ULL, &maximum);
+  if (!shape) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "read_service_external_object",
+        "invalid-input");
+    return nullptr;
+  }
+#if defined(_WIN32) && defined(_WIN64)
+  ServiceExternalProfile external_profile;
+  if (!ParseServiceExternalProfile(
+          external_root->external_profile, &external_profile)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "read_service_external_object",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (mode != "facts" && mode != "directory" &&
+      mode != "bytes" && mode != "first-line") {
+    ServiceObservationError(
+        env, "SERVICE_UNSUPPORTED", "read_service_external_object",
+        "unsupported");
+    return nullptr;
+  }
+  const bool directory_mode = mode == "directory";
+  const bool facts_mode = mode == "facts";
+  const bool bytes_mode = mode == "bytes";
+  const bool first_line_mode = mode == "first-line";
+  const uint64_t maximum_bytes = bytes_mode
+      ? 1024ULL * 1024ULL : first_line_mode ? 16ULL * 1024ULL : 0;
+  if (((facts_mode || directory_mode) && maximum != 0) ||
+      (bytes_mode && (maximum == 0 || maximum > maximum_bytes)) ||
+      (first_line_mode &&
+       (maximum == 0 || maximum > maximum_bytes))) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "read_service_external_object",
+        "invalid-input");
+    return nullptr;
+  }
+  if (!ServiceActorAuthorized(external_root->roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED", "read_service_external_object",
+        "access-denied");
+    return nullptr;
+  }
+  if (!RevalidateServiceExternalRoot(external_root)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "read_service_external_object",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (external_root->external_components.size() +
+          external_root->external_missing_segments.size() +
+          components.size() > 64) {
+    ServiceObservationError(
+        env, "SERVICE_OUTPUT_LIMIT", "read_service_external_object",
+        "limit");
+    return nullptr;
+  }
+  if (external_root->external_root_absent) {
+    if (!ServiceActorAuthorized(external_root->roles)) {
+      ServiceObservationError(
+          env, "SERVICE_ACCESS_DENIED",
+          "read_service_external_object", "access-denied");
+      return nullptr;
+    }
+    std::vector<std::string> missing =
+        external_root->external_missing_segments;
+    missing.insert(missing.end(), components.begin(), components.end());
+    napi_value result;
+    napi_create_object(env, &result);
+    ServiceSetString(env, result, "kind", "absent");
+    ServiceObservationSetNullableIdentity(
+        env, result, "identity", nullptr);
+    napi_set_named_property(
+        env, result, "absence",
+        ServiceObservationAbsenceValue(
+            env, external_root->binding_parent_identity, missing));
+    napi_value null_value;
+    napi_get_null(env, &null_value);
+    napi_set_named_property(env, result, "bytes", null_value);
+    napi_set_named_property(env, result, "entries", null_value);
+    ServiceSetUint32(env, result, "writes", 0);
+    return result;
+  }
+
+  ServiceObservationScopedHandles opened;
+  std::vector<std::string> parent_components;
+  std::vector<ServiceStoreIdentity> parent_identities;
+  HANDLE current = external_root->object;
+  ServiceStoreIdentity current_identity = external_root->identity;
+  for (size_t index = 0; index + 1 < components.size(); ++index) {
+    HANDLE next = INVALID_HANDLE_VALUE;
+    ServiceStoreIdentity identity;
+    if (!ServiceObservationNamedExternalChild(
+            current, components[index], true, external_root->roles,
+            external_profile, &next, &identity)) {
+      const DWORD error = GetLastError();
+      if (!ServiceWindowsNotFound(error)) {
+        ServiceObservationError(
+            env, error == ERROR_ACCESS_DENIED
+                ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+            "read_service_external_object",
+            error == ERROR_ACCESS_DENIED
+                ? "access-denied" : "identity-changed",
+            error != ERROR_ACCESS_DENIED);
+        return nullptr;
+      }
+      if (!ServiceObservationRevalidateDirectories(
+              external_root, parent_components,
+              parent_identities)) {
+        ServiceObservationError(
+            env, "SERVICE_STALE", "read_service_external_object",
+            "identity-changed", true);
+        return nullptr;
+      }
+      HANDLE recheck = OpenWindowsRelative(
+          current, Wide(components[index]),
+          FILE_READ_ATTRIBUTES | READ_CONTROL, kFileOpen,
+          VerifiedObjectType::Any);
+      const DWORD recheck_error = recheck == INVALID_HANDLE_VALUE
+          ? GetLastError() : ERROR_SUCCESS;
+      if (recheck != INVALID_HANDLE_VALUE) CloseHandle(recheck);
+      if (!ServiceWindowsNotFound(recheck_error)) {
+        ServiceObservationError(
+            env, "SERVICE_STALE", "read_service_external_object",
+            "absence-unproven", true);
+        return nullptr;
+      }
+      if (!ServiceActorAuthorized(external_root->roles)) {
+        ServiceObservationError(
+            env, "SERVICE_ACCESS_DENIED",
+            "read_service_external_object", "access-denied");
+        return nullptr;
+      }
+      std::vector<std::string> missing(
+          components.begin() + index, components.end());
+      napi_value result, null_value;
+      napi_create_object(env, &result);
+      ServiceSetString(env, result, "kind", "absent");
+      ServiceObservationSetNullableIdentity(env, result, "identity", nullptr);
+      napi_set_named_property(
+          env, result, "absence",
+          ServiceObservationAbsenceValue(env, current_identity, missing));
+      napi_get_null(env, &null_value);
+      napi_set_named_property(env, result, "bytes", null_value);
+      napi_set_named_property(env, result, "entries", null_value);
+      ServiceSetUint32(env, result, "writes", 0);
+      return result;
+    }
+    opened.Add(next);
+    parent_components.push_back(components[index]);
+    parent_identities.push_back(identity);
+    current_identity = identity;
+    current = next;
+  }
+
+  const bool observe_external_root = components.empty();
+  const std::string leaf = observe_external_root
+      ? std::string() : components.back();
+  if (directory_mode) {
+    HANDLE directory = observe_external_root
+        ? external_root->object : INVALID_HANDLE_VALUE;
+    ServiceStoreIdentity identity = observe_external_root
+        ? current_identity : ServiceStoreIdentity{};
+    if (!observe_external_root && !ServiceObservationNamedExternalChild(
+            current, leaf, true, external_root->roles, external_profile,
+            &directory, &identity)) {
+      const DWORD error = GetLastError();
+      if (ServiceWindowsNotFound(error)) {
+        if (!ServiceObservationRevalidateDirectories(
+                external_root, parent_components,
+                parent_identities)) {
+          ServiceObservationError(
+              env, "SERVICE_STALE", "read_service_external_object",
+              "identity-changed", true);
+          return nullptr;
+        }
+        if (!ServiceActorAuthorized(external_root->roles)) {
+          ServiceObservationError(
+              env, "SERVICE_ACCESS_DENIED",
+              "read_service_external_object", "access-denied");
+          return nullptr;
+        }
+        HANDLE recheck = OpenWindowsRelative(
+            current, Wide(leaf), FILE_READ_ATTRIBUTES | READ_CONTROL,
+            kFileOpen, VerifiedObjectType::Any);
+        const DWORD recheck_error = recheck == INVALID_HANDLE_VALUE
+            ? GetLastError() : ERROR_SUCCESS;
+        if (recheck != INVALID_HANDLE_VALUE) CloseHandle(recheck);
+        if (!ServiceWindowsNotFound(recheck_error)) {
+          ServiceObservationError(
+              env, "SERVICE_STALE", "read_service_external_object",
+              "absence-unproven", true);
+          return nullptr;
+        }
+        napi_value result, null_value;
+        napi_create_object(env, &result);
+        ServiceSetString(env, result, "kind", "absent");
+        ServiceObservationSetNullableIdentity(env, result, "identity", nullptr);
+        std::vector<std::string> missing{leaf};
+        napi_set_named_property(
+            env, result, "absence",
+            ServiceObservationAbsenceValue(env, current_identity, missing));
+        napi_get_null(env, &null_value);
+        napi_set_named_property(env, result, "bytes", null_value);
+        napi_set_named_property(env, result, "entries", null_value);
+        ServiceSetUint32(env, result, "writes", 0);
+        return result;
+      }
+      ServiceObservationError(
+          env, error == ERROR_ACCESS_DENIED
+              ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+          "read_service_external_object",
+          error == ERROR_ACCESS_DENIED
+              ? "access-denied" : "identity-changed",
+          error != ERROR_ACCESS_DENIED);
+      return nullptr;
+    }
+    ServiceObservationScopedHandles directory_handle;
+    if (!observe_external_root) directory_handle.Add(directory);
+    FILE_BASIC_INFO before_basic{}, after_basic{};
+    FILE_STANDARD_INFO before_standard{}, after_standard{};
+    std::vector<ServiceObservationDirectoryEntry> first, second;
+    bool output_limit = false;
+    const bool before =
+        GetFileInformationByHandleEx(
+            directory, FileBasicInfo, &before_basic,
+            sizeof(before_basic)) &&
+        GetFileInformationByHandleEx(
+            directory, FileStandardInfo, &before_standard,
+            sizeof(before_standard)) &&
+        !before_standard.DeletePending &&
+        ServiceObservationDirectorySnapshot(
+            directory, external_root->roles, external_profile,
+            &first, &output_limit);
+    if (!before && output_limit) {
+      ServiceObservationError(
+          env, "SERVICE_OUTPUT_LIMIT", "read_service_external_object",
+          "limit");
+      return nullptr;
+    }
+    const bool after = before &&
+        ServiceObservationDirectorySnapshot(
+            directory, external_root->roles, external_profile,
+            &second, &output_limit) &&
+        GetFileInformationByHandleEx(
+            directory, FileBasicInfo, &after_basic,
+            sizeof(after_basic)) &&
+        GetFileInformationByHandleEx(
+            directory, FileStandardInfo, &after_standard,
+            sizeof(after_standard));
+    ServiceStoreIdentity final_identity;
+    const bool stable = after &&
+        CaptureServiceObservationIdentity(
+            directory, external_root->roles,
+            identity.profile, &final_identity) &&
+        SameServiceStoreIdentity(identity, final_identity) &&
+        before_basic.CreationTime.QuadPart ==
+            after_basic.CreationTime.QuadPart &&
+        before_basic.LastWriteTime.QuadPart ==
+            after_basic.LastWriteTime.QuadPart &&
+        before_basic.ChangeTime.QuadPart ==
+            after_basic.ChangeTime.QuadPart &&
+        before_basic.FileAttributes == after_basic.FileAttributes &&
+        before_standard.EndOfFile.QuadPart ==
+            after_standard.EndOfFile.QuadPart &&
+        before_standard.AllocationSize.QuadPart ==
+            after_standard.AllocationSize.QuadPart &&
+        before_standard.NumberOfLinks ==
+            after_standard.NumberOfLinks &&
+        ServiceObservationDirectoryListsEqual(first, second) &&
+        [&]() {
+          if (observe_external_root) {
+            return ServiceObservationRevalidateDirectories(
+                external_root, parent_components, parent_identities);
+          }
+          std::vector<std::string> checked_components = parent_components;
+          checked_components.push_back(leaf);
+          std::vector<ServiceStoreIdentity> checked_identities =
+              parent_identities;
+          checked_identities.push_back(identity);
+          return ServiceObservationRevalidateDirectories(
+              external_root, checked_components, checked_identities);
+        }();
+    if (!stable) {
+      if (output_limit) {
+        ServiceObservationError(
+            env, "SERVICE_OUTPUT_LIMIT", "read_service_external_object",
+            "limit");
+      } else {
+        ServiceObservationError(
+            env, "SERVICE_STALE", "read_service_external_object",
+            "identity-changed", true);
+      }
+      return nullptr;
+    }
+    uint64_t marker_bytes = 0;
+    for (const ServiceObservationDirectoryEntry& entry : first) {
+      marker_bytes += entry.name.size();
+    }
+    if (first.size() > 100000ULL -
+            external_root->external_observed_entries ||
+        marker_bytes > 64ULL * 1024ULL * 1024ULL -
+            external_root->external_observed_name_bytes) {
+      ServiceObservationError(
+          env, "SERVICE_OUTPUT_LIMIT", "read_service_external_object",
+          "limit");
+      return nullptr;
+    }
+    external_root->external_observed_entries += first.size();
+    external_root->external_observed_name_bytes += marker_bytes;
+    if (!ServiceActorAuthorized(external_root->roles)) {
+      ServiceObservationError(
+          env, "SERVICE_ACCESS_DENIED",
+          "read_service_external_object", "access-denied");
+      return nullptr;
+    }
+    napi_value result, entries;
+    napi_create_object(env, &result);
+    ServiceSetString(env, result, "kind", "directory");
+    napi_set_named_property(
+        env, result, "identity",
+        ServiceStoreIdentityValue(env, identity));
+    napi_value null_value;
+    napi_get_null(env, &null_value);
+    napi_set_named_property(env, result, "absence", null_value);
+    napi_set_named_property(env, result, "bytes", null_value);
+    napi_create_array_with_length(env, first.size(), &entries);
+    for (uint32_t index = 0; index < first.size(); ++index) {
+      napi_value entry;
+      napi_create_object(env, &entry);
+      ServiceSetString(env, entry, "name", first[index].name);
+      ServiceSetString(env, entry, "kind", first[index].kind);
+      napi_set_named_property(
+          env, entry, "identity",
+          ServiceStoreIdentityValue(env, first[index].identity));
+      napi_set_element(env, entries, index, entry);
+    }
+    napi_set_named_property(env, result, "entries", entries);
+    ServiceSetUint32(env, result, "writes", 0);
+    return result;
+  }
+
+  const std::wstring wide_leaf = Wide(leaf);
+  HANDLE file = INVALID_HANDLE_VALUE;
+  ServiceStoreIdentity identity;
+  if (!ServiceObservationNamedExternalChild(
+          current, leaf, false, external_root->roles, external_profile,
+          &file, &identity)) {
+    const DWORD error = GetLastError();
+    if (ServiceWindowsNotFound(error)) {
+      if (!ServiceObservationRevalidateDirectories(
+              external_root, parent_components,
+              parent_identities)) {
+        ServiceObservationError(
+            env, "SERVICE_STALE", "read_service_external_object",
+            "identity-changed", true);
+        return nullptr;
+      }
+      if (!ServiceActorAuthorized(external_root->roles)) {
+        ServiceObservationError(
+            env, "SERVICE_ACCESS_DENIED",
+            "read_service_external_object", "access-denied");
+        return nullptr;
+      }
+      HANDLE recheck = OpenWindowsRelative(
+          current, wide_leaf, FILE_READ_ATTRIBUTES | READ_CONTROL,
+          kFileOpen, VerifiedObjectType::Any);
+      const DWORD recheck_error = recheck == INVALID_HANDLE_VALUE
+          ? GetLastError() : ERROR_SUCCESS;
+      if (recheck != INVALID_HANDLE_VALUE) CloseHandle(recheck);
+      if (!ServiceWindowsNotFound(recheck_error)) {
+        ServiceObservationError(
+            env, "SERVICE_STALE", "read_service_external_object",
+            "absence-unproven", true);
+        return nullptr;
+      }
+      napi_value result, null_value;
+      napi_create_object(env, &result);
+      ServiceSetString(env, result, "kind", "absent");
+      ServiceObservationSetNullableIdentity(env, result, "identity", nullptr);
+      std::vector<std::string> missing{leaf};
+      napi_set_named_property(
+          env, result, "absence",
+          ServiceObservationAbsenceValue(env, current_identity, missing));
+      napi_get_null(env, &null_value);
+      napi_set_named_property(env, result, "bytes", null_value);
+      napi_set_named_property(env, result, "entries", null_value);
+      ServiceSetUint32(env, result, "writes", 0);
+      return result;
+    }
+    ServiceObservationError(
+        env, error == ERROR_ACCESS_DENIED
+            ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+        "read_service_external_object",
+        error == ERROR_ACCESS_DENIED
+            ? "access-denied" : "identity-changed",
+        error != ERROR_ACCESS_DENIED);
+    return nullptr;
+  }
+  ServiceObservationScopedHandles file_handle;
+  file_handle.Add(file);
+  FILE_BASIC_INFO before_basic{}, after_basic{};
+  FILE_STANDARD_INFO before_standard{}, after_standard{};
+  if (!GetFileInformationByHandleEx(
+          file, FileBasicInfo, &before_basic, sizeof(before_basic)) ||
+      !GetFileInformationByHandleEx(
+          file, FileStandardInfo, &before_standard,
+          sizeof(before_standard)) ||
+      before_standard.Directory || before_standard.DeletePending ||
+      before_standard.NumberOfLinks != 1 ||
+      (before_basic.FileAttributes & FILE_ATTRIBUTE_DEVICE) != 0 ||
+      before_standard.EndOfFile.QuadPart < 0) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "read_service_external_object",
+        "identity-changed", true);
+    return nullptr;
+  }
+  const bool dot_env = CompareStringOrdinal(
+      wide_leaf.data(), static_cast<int>(wide_leaf.size()),
+      L".env", 4, TRUE) == CSTR_EQUAL;
+  if (bytes_mode && maximum > 256ULL * 1024ULL && dot_env) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "read_service_external_object",
+        "invalid-input");
+    return nullptr;
+  }
+  std::vector<uint8_t> content;
+  if (bytes_mode) {
+    const uint64_t size = static_cast<uint64_t>(
+        before_standard.EndOfFile.QuadPart);
+    if (size > maximum) {
+      ServiceObservationError(
+          env, "SERVICE_OUTPUT_LIMIT", "read_service_external_object",
+          "limit");
+      return nullptr;
+    }
+    try {
+      content.resize(static_cast<size_t>(size));
+    } catch (...) {
+      ServiceObservationError(
+          env, "SERVICE_IO_FAILED", "read_service_external_object",
+          "io");
+      return nullptr;
+    }
+    LARGE_INTEGER position{};
+    bool read_exact = SetFilePointerEx(
+        file, position, nullptr, FILE_BEGIN) != FALSE;
+    size_t offset = 0;
+    while (read_exact && offset < content.size()) {
+      DWORD count = 0;
+      const DWORD request = static_cast<DWORD>(std::min<size_t>(
+          content.size() - offset, MAXDWORD));
+      read_exact = ReadFile(
+          file, content.data() + offset, request, &count, nullptr) &&
+          count != 0;
+      offset += count;
+    }
+    if (!read_exact || offset != content.size()) {
+      ServiceObservationError(
+          env, "SERVICE_STALE", "read_service_external_object",
+          "identity-changed", true);
+      return nullptr;
+    }
+  } else if (first_line_mode) {
+    try {
+      content.reserve(static_cast<size_t>(maximum));
+    } catch (...) {
+      ServiceObservationError(
+          env, "SERVICE_IO_FAILED", "read_service_external_object",
+          "io");
+      return nullptr;
+    }
+    LARGE_INTEGER position{};
+    if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN)) {
+      ServiceObservationError(
+          env, "SERVICE_IO_FAILED", "read_service_external_object",
+          "io", true);
+      return nullptr;
+    }
+    bool newline = false;
+    while (content.size() < maximum) {
+      uint8_t byte = 0;
+      DWORD count = 0;
+      if (!ReadFile(file, &byte, 1, &count, nullptr)) {
+        ServiceObservationError(
+            env, "SERVICE_IO_FAILED", "read_service_external_object",
+            "io", true);
+        return nullptr;
+      }
+      if (count == 0) break;
+      content.push_back(byte);
+      if (byte == '\n') {
+        newline = true;
+        break;
+      }
+    }
+    if (!newline && content.size() == maximum &&
+        static_cast<uint64_t>(before_standard.EndOfFile.QuadPart) >
+            content.size()) {
+      ServiceObservationError(
+          env, "SERVICE_OUTPUT_LIMIT", "read_service_external_object",
+          "limit");
+      return nullptr;
+    }
+  }
+  if (!GetFileInformationByHandleEx(
+          file, FileBasicInfo, &after_basic, sizeof(after_basic)) ||
+      !GetFileInformationByHandleEx(
+          file, FileStandardInfo, &after_standard,
+          sizeof(after_standard)) ||
+      before_basic.CreationTime.QuadPart !=
+          after_basic.CreationTime.QuadPart ||
+      before_basic.LastWriteTime.QuadPart !=
+          after_basic.LastWriteTime.QuadPart ||
+      before_basic.ChangeTime.QuadPart !=
+          after_basic.ChangeTime.QuadPart ||
+      before_basic.FileAttributes != after_basic.FileAttributes ||
+      before_standard.EndOfFile.QuadPart !=
+          after_standard.EndOfFile.QuadPart ||
+      before_standard.AllocationSize.QuadPart !=
+          after_standard.AllocationSize.QuadPart ||
+      after_standard.NumberOfLinks != 1 ||
+      !CaptureServiceObservationIdentity(
+          file, external_root->roles,
+          identity.profile,
+          &current_identity) ||
+      !SameServiceStoreIdentity(identity, current_identity)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "read_service_external_object",
+        "identity-changed", true);
+    return nullptr;
+  }
+  HANDLE named = OpenWindowsRelative(
+      current, wide_leaf, GENERIC_READ | READ_CONTROL,
+      kFileOpen, VerifiedObjectType::File);
+  ServiceStoreIdentity named_identity;
+  const bool named_exact = named != INVALID_HANDLE_VALUE &&
+      CaptureServiceObservationIdentity(
+          named, external_root->roles,
+          identity.profile,
+          &named_identity) &&
+      SameServiceStoreIdentity(identity, named_identity);
+  if (named != INVALID_HANDLE_VALUE) CloseHandle(named);
+  if (!named_exact ||
+      !ServiceObservationRevalidateDirectories(
+          external_root, parent_components, parent_identities)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "read_service_external_object",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (!ServiceActorAuthorized(external_root->roles)) {
+    ServiceObservationError(
+        env, "SERVICE_ACCESS_DENIED",
+        "read_service_external_object", "access-denied");
+    return nullptr;
+  }
+  napi_value result, value;
+  napi_create_object(env, &result);
+  ServiceSetString(env, result, "kind", "file");
+  napi_set_named_property(
+      env, result, "identity", ServiceStoreIdentityValue(env, identity));
+  napi_get_null(env, &value);
+  napi_set_named_property(env, result, "absence", value);
+  if (bytes_mode || first_line_mode) {
+    napi_create_buffer_copy(
+        env, content.size(), content.data(), nullptr, &value);
+  } else {
+    napi_get_null(env, &value);
+  }
+  napi_set_named_property(env, result, "bytes", value);
+  napi_get_null(env, &value);
+  napi_set_named_property(env, result, "entries", value);
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceObservationError(
+      env, "SERVICE_UNSUPPORTED", "read_service_external_object",
+      "unsupported");
+  return nullptr;
+#endif
+}
+
+
+
+napi_value ReadWin32BootClock(
+    napi_env env, napi_callback_info info) {
+  napi_value args[1];
+  if (!InventoryArgs(env, info, 0, args)) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "read_win32_boot_clock",
+        "invalid-input");
+    return nullptr;
+  }
+#if defined(_WIN32) && defined(_WIN64)
+  std::string boot_before, boot_after, boot_fingerprint;
+  if (!ReadWindowsBootIdentity(&boot_before)) {
+    ServiceObservationError(
+        env, "SERVICE_PENDING", "read_win32_boot_clock",
+        "clock-unavailable", true);
+    return nullptr;
+  }
+  const ULONGLONG tick = GetTickCount64();
+  if (tick > 9007199254740991ULL ||
+      !ReadWindowsBootIdentity(&boot_after) ||
+      boot_before != boot_after ||
+      !ServiceSelfWindowsBootFingerprint(
+          boot_before, &boot_fingerprint)) {
+    ServiceObservationError(
+        env, "SERVICE_PENDING", "read_win32_boot_clock",
+        "clock-unavailable", true);
+    return nullptr;
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  ServiceSetUint32(env, result, "schemaVersion", 1);
+  ServiceSetString(env, result, "bootFingerprint", boot_fingerprint);
+  ServiceSetDouble(env, result, "tickMs", static_cast<double>(tick));
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceObservationError(
+      env, "SERVICE_UNSUPPORTED", "read_win32_boot_clock",
+      "unsupported");
+  return nullptr;
+#endif
+}
+
+bool ServiceSelfExecutableIdentity(
+    const std::string& executable,
+    ServiceStoreIdentity* identity) {
+#ifdef _WIN32
+  HANDLE file = OpenWindowsPathNoFollow(
+      executable, FILE_READ_ATTRIBUTES | READ_CONTROL,
+      VerifiedObjectType::File, FILE_SHARE_READ | FILE_SHARE_DELETE);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  FILE_BASIC_INFO before_basic{}, after_basic{};
+  FILE_STANDARD_INFO before_standard{}, after_standard{};
+  ServiceStoreIdentity before_identity, after_identity;
+  const bool before = ServiceSelfCaptureFileIdentity(
+      file, &before_identity, &before_basic, &before_standard, false);
+  const bool after = before && ServiceSelfCaptureFileIdentity(
+      file, &after_identity, &after_basic, &after_standard, false);
+  const bool stable = after &&
+      SameServiceStoreIdentity(before_identity, after_identity) &&
+      before_basic.CreationTime.QuadPart ==
+          after_basic.CreationTime.QuadPart &&
+      before_basic.LastWriteTime.QuadPart ==
+          after_basic.LastWriteTime.QuadPart &&
+      before_basic.ChangeTime.QuadPart ==
+          after_basic.ChangeTime.QuadPart &&
+      before_standard.EndOfFile.QuadPart ==
+          after_standard.EndOfFile.QuadPart &&
+      before_standard.AllocationSize.QuadPart ==
+          after_standard.AllocationSize.QuadPart;
+  CloseHandle(file);
+  if (!stable) return false;
+  HANDLE named = OpenWindowsPathNoFollow(
+      executable, FILE_READ_ATTRIBUTES | READ_CONTROL,
+      VerifiedObjectType::File, FILE_SHARE_READ | FILE_SHARE_DELETE);
+  ServiceStoreIdentity named_identity;
+  FILE_BASIC_INFO named_basic{};
+  FILE_STANDARD_INFO named_standard{};
+  const bool named_exact = named != INVALID_HANDLE_VALUE &&
+      ServiceSelfCaptureFileIdentity(
+          named, &named_identity, &named_basic, &named_standard, false) &&
+      SameServiceStoreIdentity(before_identity, named_identity) &&
+      named_basic.CreationTime.QuadPart ==
+          before_basic.CreationTime.QuadPart &&
+      named_basic.LastWriteTime.QuadPart ==
+          before_basic.LastWriteTime.QuadPart &&
+      named_basic.ChangeTime.QuadPart ==
+          before_basic.ChangeTime.QuadPart &&
+      named_standard.EndOfFile.QuadPart ==
+          before_standard.EndOfFile.QuadPart &&
+      named_standard.AllocationSize.QuadPart ==
+          before_standard.AllocationSize.QuadPart;
+  if (named != INVALID_HANDLE_VALUE) CloseHandle(named);
+  if (!named_exact) return false;
+  *identity = named_identity;
+  return true;
+#else
+  (void)executable;
+  (void)identity;
+  return false;
+#endif
+}
+
+#include "service-log-observer.inc"
+
+napi_value ObserveSelfProcessEpoch(
+    napi_env env, napi_callback_info info) {
+  napi_value args[1];
+  if (!InventoryArgs(env, info, 0, args)) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "observe_self_process_epoch",
+        "invalid-input");
+    return nullptr;
+  }
+#if defined(_WIN32) && defined(_WIN64)
+  std::string boot_before, boot_after, executable_fingerprint;
+  ServiceProcessFacts before, after;
+  ServiceStoreIdentity executable_identity, executable_identity_after;
+  const uint32_t pid = GetCurrentProcessId();
+  if (pid == 0 || !ReadWindowsBootIdentity(&boot_before) ||
+      ReadServiceProcessFacts(pid, &before) != ProcessReadResult::Ok ||
+      before.pid != pid || before.start_time == 0 ||
+      !ServiceSelfExecutableIdentity(
+          before.executable, &executable_identity) ||
+      !ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+          executable_identity, &executable_fingerprint) ||
+      ReadServiceProcessFacts(pid, &after) != ProcessReadResult::Ok ||
+      after.pid != before.pid || after.start_time != before.start_time ||
+      after.executable != before.executable ||
+      !ServiceSelfExecutableIdentity(
+          after.executable, &executable_identity_after) ||
+      !SameServiceStoreIdentity(
+          executable_identity, executable_identity_after) ||
+      !ReadWindowsBootIdentity(&boot_after) ||
+      boot_before != boot_after) {
+    ServiceObservationError(
+        env, "SERVICE_PENDING", "observe_self_process_epoch",
+        "process-ambiguous", true);
+    return nullptr;
+  }
+  const std::string canonical =
+      "{\"bootId\":\"" + boot_before +
+      "\",\"creationTime\":\"" +
+      std::to_string(before.start_time) +
+      "\",\"executableIdentityFingerprint\":\"" +
+      executable_fingerprint +
+      "\",\"kind\":\"gjc-remote/windows-self-epoch/v1\",\"pid\":" +
+      std::to_string(pid) + "}";
+  Sha256 hash;
+  if (!hash.Ready() || !hash.Update(canonical)) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "observe_self_process_epoch", "io");
+    return nullptr;
+  }
+  const std::string fingerprint = hash.Finish();
+  if (!ValidServiceFingerprint(fingerprint)) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "observe_self_process_epoch", "io");
+    return nullptr;
+  }
+  napi_value result;
+  napi_create_object(env, &result);
+  ServiceSetString(
+      env, result, "processEpochFingerprint", fingerprint);
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceObservationError(
+      env, "SERVICE_UNSUPPORTED", "observe_self_process_epoch",
+      "unsupported");
+  return nullptr;
+#endif
+}
+
+napi_value ReadSelfServiceConfig(
+    napi_env env, napi_callback_info info) {
+  napi_value args[1];
+  if (!InventoryArgs(env, info, 0, args)) {
+    ServiceObservationError(
+        env, "SERVICE_INVALID", "read_self_service_config",
+        "invalid-input");
+    return nullptr;
+  }
+#if defined(_WIN32) && defined(_WIN64)
+  std::wstring current_directory;
+  if (!ServiceSelfCurrentDirectory(&current_directory)) {
+    ServiceObservationError(
+        env, "SERVICE_IO_FAILED", "read_self_service_config", "io", true);
+    return nullptr;
+  }
+  WindowsPathParts current_parts;
+  if (!ParseWindowsPath(Utf8(current_directory), &current_parts) ||
+      current_parts.components.size() > 64) {
+    ServiceObservationError(
+        env, "SERVICE_UNSUPPORTED", "read_self_service_config",
+        "unsupported");
+    return nullptr;
+  }
+  ServiceSelfDirectoryChain chain;
+  if (!ServiceSelfOpenDirectoryChain(current_directory, &chain)) {
+    const DWORD error = GetLastError();
+    ServiceObservationError(
+        env, error == ERROR_ACCESS_DENIED
+            ? "SERVICE_ACCESS_DENIED" :
+            ServiceSelfUnsupportedTypeError(error)
+                ? "SERVICE_UNSUPPORTED" : "SERVICE_STALE",
+        "read_self_service_config",
+        error == ERROR_ACCESS_DENIED
+            ? "access-denied" :
+            ServiceSelfUnsupportedTypeError(error)
+                ? "unsupported" : "identity-changed",
+        error != ERROR_ACCESS_DENIED &&
+            !ServiceSelfUnsupportedTypeError(error));
+    return nullptr;
+  }
+  HANDLE current = chain.handles.back();
+  const std::wstring runtime_config_name = L"runtime-config";
+  HANDLE runtime_root = OpenWindowsRelative(
+      current, runtime_config_name,
+      kWindowsTraversalAccess | READ_CONTROL, kFileOpen,
+      VerifiedObjectType::Directory);
+  const DWORD runtime_root_error = runtime_root == INVALID_HANDLE_VALUE
+      ? GetLastError() : ERROR_SUCCESS;
+  bool runtime_config_absent = false;
+  std::string runtime_root_fingerprint;
+  std::string runtime_file_fingerprint;
+  std::string runtime_file_sha256;
+  uint32_t runtime_file_bytes = 0;
+  ServiceObservationScopedHandles runtime_root_handle;
+  if (runtime_root == INVALID_HANDLE_VALUE &&
+      ServiceWindowsNotFound(runtime_root_error)) {
+    HANDLE probe = OpenWindowsRelative(
+        current, runtime_config_name,
+        FILE_READ_ATTRIBUTES | READ_CONTROL, kFileOpen,
+        VerifiedObjectType::Any);
+    const DWORD probe_error = probe == INVALID_HANDLE_VALUE
+        ? GetLastError() : ERROR_SUCCESS;
+    if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+    runtime_config_absent = ServiceWindowsNotFound(probe_error) &&
+        ServiceSelfDirectoryChainStable(chain, current_directory);
+    if (!runtime_config_absent) {
+      ServiceObservationError(
+          env, "SERVICE_STALE", "read_self_service_config",
+          "absence-unproven", true);
+      return nullptr;
+    }
+  } else if (runtime_root == INVALID_HANDLE_VALUE) {
+    ServiceObservationError(
+        env, runtime_root_error == ERROR_ACCESS_DENIED
+            ? "SERVICE_ACCESS_DENIED"
+            : ServiceSelfUnsupportedTypeError(runtime_root_error)
+                ? "SERVICE_UNSUPPORTED" : "SERVICE_IO_FAILED",
+        "read_self_service_config",
+        runtime_root_error == ERROR_ACCESS_DENIED ? "access-denied" :
+            ServiceSelfUnsupportedTypeError(runtime_root_error)
+                ? "unsupported" : "io",
+        runtime_root_error != ERROR_ACCESS_DENIED &&
+            !ServiceSelfUnsupportedTypeError(runtime_root_error));
+    return nullptr;
+  } else {
+    try {
+      runtime_root_handle.Add(runtime_root);
+    } catch (...) {
+      CloseHandle(runtime_root);
+      ServiceObservationError(
+          env, "SERVICE_IO_FAILED", "read_self_service_config", "io");
+      return nullptr;
+    }
+    ServiceStoreIdentity runtime_root_identity;
+    if (!CaptureExternalAncestorIdentity(
+            runtime_root, &runtime_root_identity) ||
+        !ServiceSelfDenyCurrentWriteAccess(runtime_root, true) ||
+        !ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+            runtime_root_identity, &runtime_root_fingerprint)) {
+      ServiceObservationError(
+          env, "SERVICE_ACCESS_DENIED", "read_self_service_config",
+          "access-denied");
+      return nullptr;
+    }
+    std::vector<uint8_t> ignored_bytes;
+    ServiceStoreIdentity runtime_file_identity;
+    bool output_limit = false;
+    if (!ServiceSelfReadFile(
+            runtime_root, L".bunfig.toml", 1024ULL * 1024ULL,
+            false, &ignored_bytes, &runtime_file_sha256,
+            &runtime_file_identity, &runtime_file_bytes, &output_limit)) {
+      const DWORD error = GetLastError();
+      if (output_limit) {
+        ServiceObservationError(
+            env, "SERVICE_OUTPUT_LIMIT", "read_self_service_config",
+            "limit");
+      } else if (ServiceWindowsNotFound(error)) {
+        HANDLE probe = OpenWindowsRelative(
+            runtime_root, L".bunfig.toml",
+            FILE_READ_ATTRIBUTES | READ_CONTROL, kFileOpen,
+            VerifiedObjectType::Any);
+        const DWORD probe_error = probe == INVALID_HANDLE_VALUE
+            ? GetLastError() : ERROR_SUCCESS;
+        if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+        if (ServiceWindowsNotFound(probe_error) &&
+            ServiceSelfDirectoryChainStable(chain, current_directory)) {
+          ServiceObservationError(
+              env, "SERVICE_PENDING", "read_self_service_config",
+              "absence-unproven", true);
+        } else {
+          ServiceObservationError(
+              env, "SERVICE_STALE", "read_self_service_config",
+              "identity-changed", true);
+        }
+      } else {
+        ServiceObservationError(
+            env, error == ERROR_ACCESS_DENIED
+                ? "SERVICE_ACCESS_DENIED" :
+                  ServiceSelfUnsupportedTypeError(error)
+                    ? "SERVICE_UNSUPPORTED" : "SERVICE_STALE",
+            "read_self_service_config",
+            error == ERROR_ACCESS_DENIED ? "access-denied" :
+                ServiceSelfUnsupportedTypeError(error)
+                    ? "unsupported" : "identity-changed",
+            error != ERROR_ACCESS_DENIED &&
+                !ServiceSelfUnsupportedTypeError(error));
+      }
+      return nullptr;
+    }
+    const std::string captured_root_fingerprint = runtime_root_fingerprint;
+    const std::string captured_file_fingerprint =
+        ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+            runtime_file_identity, &runtime_file_fingerprint)
+            ? runtime_file_fingerprint : std::string();
+    HANDLE named_root = OpenWindowsRelative(
+        current, runtime_config_name,
+        kWindowsTraversalAccess | READ_CONTROL, kFileOpen,
+        VerifiedObjectType::Directory);
+    ServiceStoreIdentity named_root_identity, held_root_identity;
+    const bool root_exact = named_root != INVALID_HANDLE_VALUE &&
+        CaptureExternalAncestorIdentity(
+            named_root, &named_root_identity) &&
+        CaptureExternalAncestorIdentity(
+            runtime_root, &held_root_identity) &&
+        SameServicePhysicalIdentity(
+            runtime_root_identity, named_root_identity) &&
+        SameServicePhysicalIdentity(
+            runtime_root_identity, held_root_identity) &&
+        ServiceSelfDirectoryChainStable(chain, current_directory);
+    if (named_root != INVALID_HANDLE_VALUE) CloseHandle(named_root);
+    if (!root_exact || captured_root_fingerprint.empty() ||
+        captured_file_fingerprint.empty()) {
+      ServiceObservationError(
+          env, "SERVICE_STALE", "read_self_service_config",
+          "identity-changed", true);
+      return nullptr;
+    }
+  }
+
+  ServiceSelfSecretBuffer env_storage;
+  std::vector<uint8_t>& env_bytes = env_storage.bytes;
+  ServiceStoreIdentity env_identity;
+  uint32_t env_byte_length = 0;
+  bool output_limit = false;
+  if (!ServiceSelfReadFile(
+          current, L".env", 256ULL * 1024ULL, true,
+          &env_bytes, nullptr, &env_identity, &env_byte_length,
+          &output_limit)) {
+    const DWORD error = GetLastError();
+    ServiceObservationError(
+        env, output_limit ? "SERVICE_OUTPUT_LIMIT" :
+            error == ERROR_ACCESS_DENIED ? "SERVICE_ACCESS_DENIED" :
+            ServiceSelfUnsupportedTypeError(error)
+                ? "SERVICE_UNSUPPORTED" :
+            ServiceWindowsNotFound(error) ? "SERVICE_PENDING" :
+                "SERVICE_STALE",
+        "read_self_service_config",
+        output_limit ? "limit" : error == ERROR_ACCESS_DENIED
+            ? "access-denied" :
+            ServiceSelfUnsupportedTypeError(error)
+                ? "unsupported" : ServiceWindowsNotFound(error)
+                    ? "absence-unproven" : "identity-changed",
+        !output_limit && error != ERROR_ACCESS_DENIED &&
+            !ServiceSelfUnsupportedTypeError(error));
+    return nullptr;
+  }
+  std::string source_identity_fingerprint;
+  if (env_byte_length != env_bytes.size() ||
+      !ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+          env_identity, &source_identity_fingerprint) ||
+      !ServiceSelfDirectoryChainStable(chain, current_directory)) {
+    ServiceObservationError(
+        env, "SERVICE_STALE", "read_self_service_config",
+        "identity-changed", true);
+    return nullptr;
+  }
+  if (runtime_config_absent) {
+    HANDLE probe = OpenWindowsRelative(
+        current, runtime_config_name,
+        FILE_READ_ATTRIBUTES | READ_CONTROL, kFileOpen,
+        VerifiedObjectType::Any);
+    const DWORD probe_error = probe == INVALID_HANDLE_VALUE
+        ? GetLastError() : ERROR_SUCCESS;
+    if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+    if (!ServiceWindowsNotFound(probe_error) ||
+        !ServiceSelfDirectoryChainStable(chain, current_directory)) {
+      ServiceObservationError(
+          env, "SERVICE_STALE", "read_self_service_config",
+          "absence-unproven", true);
+      return nullptr;
+    }
+  } else {
+    HANDLE root = runtime_root_handle.values.empty()
+        ? INVALID_HANDLE_VALUE : runtime_root_handle.values.front();
+    ServiceStoreIdentity final_root_identity, final_file_identity;
+    std::string final_root_fingerprint, final_file_fingerprint;
+    std::string final_file_sha256;
+    uint32_t final_file_bytes = 0;
+    bool final_output_limit = false;
+    std::vector<uint8_t> ignored_bytes;
+    const bool final_file_exact = root != INVALID_HANDLE_VALUE &&
+        CaptureExternalAncestorIdentity(root, &final_root_identity) &&
+        ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+            final_root_identity, &final_root_fingerprint) &&
+        ServiceSelfReadFile(
+            root, L".bunfig.toml", 1024ULL * 1024ULL,
+            false, &ignored_bytes, &final_file_sha256,
+            &final_file_identity, &final_file_bytes, &final_output_limit) &&
+        ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+            final_file_identity, &final_file_fingerprint) &&
+        final_root_fingerprint == runtime_root_fingerprint &&
+        final_file_fingerprint == runtime_file_fingerprint &&
+        final_file_sha256 == runtime_file_sha256 &&
+        final_file_bytes == runtime_file_bytes &&
+        ServiceSelfDirectoryChainStable(chain, current_directory);
+    if (!final_file_exact) {
+      ServiceObservationError(
+          env, final_output_limit ? "SERVICE_OUTPUT_LIMIT" :
+              GetLastError() == ERROR_ACCESS_DENIED
+                  ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+          "read_self_service_config",
+          final_output_limit ? "limit" :
+              GetLastError() == ERROR_ACCESS_DENIED
+                  ? "access-denied" : "identity-changed",
+          !final_output_limit &&
+              GetLastError() != ERROR_ACCESS_DENIED);
+      return nullptr;
+    }
+  }
+  ServiceSelfSecretBuffer final_env_storage;
+  std::vector<uint8_t>& final_env_bytes = final_env_storage.bytes;
+  ServiceStoreIdentity final_env_identity;
+  uint32_t final_env_byte_length = 0;
+  bool final_env_output_limit = false;
+  std::string final_source_fingerprint;
+  if (!ServiceSelfReadFile(
+          current, L".env", 256ULL * 1024ULL, true,
+          &final_env_bytes, nullptr, &final_env_identity,
+          &final_env_byte_length, &final_env_output_limit) ||
+      final_env_byte_length != env_byte_length ||
+      final_env_bytes != env_bytes ||
+      !ServiceSelfWin32PhysicalSecurityIdentityFingerprint(
+          final_env_identity, &final_source_fingerprint) ||
+      final_source_fingerprint != source_identity_fingerprint ||
+      !ServiceSelfDirectoryChainStable(chain, current_directory)) {
+    ServiceObservationError(
+        env, final_env_output_limit ? "SERVICE_OUTPUT_LIMIT" :
+            GetLastError() == ERROR_ACCESS_DENIED
+                ? "SERVICE_ACCESS_DENIED" : "SERVICE_STALE",
+        "read_self_service_config",
+        final_env_output_limit ? "limit" :
+            GetLastError() == ERROR_ACCESS_DENIED
+                ? "access-denied" : "identity-changed",
+        !final_env_output_limit &&
+            GetLastError() != ERROR_ACCESS_DENIED);
+    return nullptr;
+  }
+  napi_value result, value;
+  napi_create_object(env, &result);
+  ServiceSetUint32(env, result, "schemaVersion", 1);
+  ServiceSetString(
+      env, result, "sourceIdentityFingerprint",
+      source_identity_fingerprint);
+  napi_create_buffer_copy(
+      env, env_bytes.size(), env_bytes.data(), nullptr, &value);
+  napi_set_named_property(env, result, "bytes", value);
+  if (runtime_config_absent) {
+    napi_get_null(env, &value);
+    napi_set_named_property(env, result, "runtimeConfig", value);
+  } else {
+    napi_value runtime_config;
+    napi_create_object(env, &runtime_config);
+    ServiceSetString(
+        env, runtime_config, "rootIdentityFingerprint",
+        runtime_root_fingerprint);
+    ServiceSetString(
+        env, runtime_config, "fileIdentityFingerprint",
+        runtime_file_fingerprint);
+    ServiceSetString(
+        env, runtime_config, "fileSha256", runtime_file_sha256);
+    ServiceSetUint32(
+        env, runtime_config, "byteLength", runtime_file_bytes);
+    napi_set_named_property(
+        env, result, "runtimeConfig", runtime_config);
+  }
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceObservationError(
+      env, "SERVICE_UNSUPPORTED", "read_self_service_config",
+      "unsupported");
+  return nullptr;
+#endif
 }
 
 napi_value ReadServiceArtifactChunk(
@@ -17388,7 +21380,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
     "enumerate_process_tree", "read_linux_service_cgroup",
     "terminate_linux_service_cgroup", "open_win32_service",
     "close_win32_service", "query_win32_service",
-    "create_win32_service_disabled", "protect_win32_service",
+    "plan_win32_service_resource", "create_win32_service_disabled", "protect_win32_service",
     "set_win32_service_marker", "configure_win32_service_launch",
     "set_win32_service_start_type",
     "set_win32_service_failure_actions",
@@ -17410,11 +21402,20 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
     "remove_service_artifact_file_exact",
     "seal_service_directory",
     "open_service_artifact_source",
+    "plan_service_artifact_location",
+    "resolve_service_artifact_location",
+    "open_service_external_root",
+    "read_service_external_object",
+    "open_win32_service_log_observer",
+    "read_win32_service_log_observer",
+    "read_win32_boot_clock",
+    "observe_self_process_epoch",
+    "read_self_service_config",
   };
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
-  napi_create_uint32(env, 4, &value); napi_set_named_property(env, result, "contractVersion", value);
-  napi_create_uint32(env, 4, &value); napi_set_named_property(env, result, "contractRevision", value);
+  napi_create_uint32(env, 5, &value); napi_set_named_property(env, result, "contractVersion", value);
+  napi_create_uint32(env, 1, &value); napi_set_named_property(env, result, "contractRevision", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
@@ -17472,10 +21473,11 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("open_win32_service", {"name", "serviceRole", "roles", "access"});
   signature("close_win32_service", {"serviceHandle"});
   signature("query_win32_service", {"serviceHandle"});
-  signature("create_win32_service_disabled", {"name", "serviceRole", "supervisorPath", "supervisorSha256", "workingDirectory", "homeDirectory", "runtimePath", "runtimeSha256", "entrypointPath", "entrypointSha256", "logDirectory", "logAs", "logCmdAs", "channelsConfig", "servicePassword", "roles"});
+  signature("plan_win32_service_resource", {"name", "serviceRole", "launch", "applicationManifestFingerprint", "phase", "roles"});
+  signature("create_win32_service_disabled", {"name", "serviceRole", "launch", "servicePassword", "roles"});
   signature("protect_win32_service", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint", "transitionMarker"});
   signature("set_win32_service_marker", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint", "transitionMarker"});
-  signature("configure_win32_service_launch", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint", "supervisorPath", "supervisorSha256", "workingDirectory", "homeDirectory", "runtimePath", "runtimeSha256", "entrypointPath", "entrypointSha256", "logDirectory", "logAs", "logCmdAs", "channelsConfig"});
+  signature("configure_win32_service_launch", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint", "launch"});
   signature("set_win32_service_start_type", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint", "startType"});
   signature("set_win32_service_failure_actions", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint", "failurePolicy"});
   signature("set_win32_service_failure_actions_flag", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint", "enabled"});
@@ -17504,6 +21506,15 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("remove_service_artifact_file_exact", {"parentHandle", "name", "expectedFacts", "artifactLockHandle"});
   signature("seal_service_directory", {"directoryHandle", "expectedIdentity", "artifactLockHandle"});
   signature("open_service_artifact_source", {"path", "maxBytes", "expectedFacts", "roles"});
+  signature("plan_service_artifact_location", {"rootKind", "artifactFingerprint", "relativePath", "roles"});
+  signature("resolve_service_artifact_location", {"directoryHandle", "relativePath", "expectedFileSha256"});
+  signature("open_service_external_root", {"absolutePath", "profile", "roles"});
+  signature("read_service_external_object", {"externalRootHandle", "relativePath", "mode", "maxBytes"});
+  signature("open_win32_service_log_observer", {"serviceHandle", "launch", "resumeCursor"});
+  signature("read_win32_service_log_observer", {"observerHandle", "expectedCursorFingerprint", "maxBytes"});
+  signature("read_win32_boot_clock", {});
+  signature("observe_self_process_epoch", {});
+  signature("read_self_service_config", {});
   napi_set_named_property(env, result, "capabilitySignatures", signatures);
   return result;
 }
@@ -17561,6 +21572,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"open_win32_service", nullptr, OpenWin32Service, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"close_win32_service", nullptr, CloseWin32Service, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"query_win32_service", nullptr, QueryWin32Service, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"plan_win32_service_resource", nullptr, PlanWin32ServiceResource, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"create_win32_service_disabled", nullptr, CreateWin32ServiceDisabled, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"protect_win32_service", nullptr, ProtectWin32Service, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"set_win32_service_marker", nullptr, SetWin32ServiceMarker, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -17592,7 +21604,16 @@ napi_value Init(napi_env env, napi_value exports) {
     {"read_service_artifact_chunk", nullptr, ReadServiceArtifactChunk, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"remove_service_artifact_file_exact", nullptr, RemoveServiceArtifactFileExact, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"seal_service_directory", nullptr, SealServiceDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
-    {"open_service_artifact_source", nullptr, OpenServiceArtifactSource, nullptr, nullptr, nullptr, napi_default, nullptr}
+    {"open_service_artifact_source", nullptr, OpenServiceArtifactSource, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"plan_service_artifact_location", nullptr, PlanServiceArtifactLocation, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"resolve_service_artifact_location", nullptr, ResolveServiceArtifactLocation, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"open_service_external_root", nullptr, OpenServiceExternalRoot, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"read_service_external_object", nullptr, ReadServiceExternalObject, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"open_win32_service_log_observer", nullptr, OpenWin32ServiceLogObserver, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"read_win32_service_log_observer", nullptr, ReadWin32ServiceLogObserver, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"read_win32_boot_clock", nullptr, ReadWin32BootClock, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"observe_self_process_epoch", nullptr, ObserveSelfProcessEpoch, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"read_self_service_config", nullptr, ReadSelfServiceConfig, nullptr, nullptr, nullptr, napi_default, nullptr}
   };
   napi_define_properties(env, exports, sizeof(methods) / sizeof(methods[0]), methods);
   return exports;

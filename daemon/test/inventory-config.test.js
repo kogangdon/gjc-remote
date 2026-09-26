@@ -21,7 +21,7 @@ const verifyEnv = (roles = linuxRoles) => ({
   GJC_NATIVE_INVENTORY_MODE: 'verify', GJC_INVENTORY_ROLE_BINDINGS: rolesJson(roles),
 });
 const reader = () => Object.freeze({
-  selfTest: async () => Object.freeze({ role: 'daemon', contractVersion: 4, writes: 0 }),
+  selfTest: async () => Object.freeze({ role: 'daemon', contractVersion: 5, writes: 0 }),
   readAccepted: async () => { throw new Error('must not read'); },
 });
 
@@ -138,7 +138,7 @@ test('verify gives the factory one frozen exact argument and never reads', async
       Object.assign(receiver, {
         selfTest() {
           assert.equal(this, receiver);
-          return Object.freeze({ role: 'daemon', contractVersion: 4, writes: 0 });
+          return Object.freeze({ role: 'daemon', contractVersion: 5, writes: 0 });
         },
         readAccepted: async () => { reads += 1; },
       });
@@ -153,16 +153,16 @@ test('verify gives the factory one frozen exact argument and never reads', async
 
 test('reader and self-test shapes must be frozen exact data objects', async () => {
   const proxy = new Proxy(Object.freeze({
-    selfTest: async () => Object.freeze({ role: 'daemon', contractVersion: 4, writes: 0 }),
+    selfTest: async () => Object.freeze({ role: 'daemon', contractVersion: 5, writes: 0 }),
     readAccepted() {},
   }), {
     ownKeys() { throw new Error('proxy trap'); },
   });
   const readers = [
     { selfTest: async () => ({}), readAccepted() {} },
-    Object.freeze({ selfTest: async () => ({ role: 'daemon', contractVersion: 4, writes: 0 }), readAccepted() {} }),
+    Object.freeze({ selfTest: async () => ({ role: 'daemon', contractVersion: 5, writes: 0 }), readAccepted() {} }),
     Object.freeze({ get selfTest() { return async () => ({}); }, readAccepted() {} }),
-    Object.freeze({ selfTest: async () => Object.freeze({ role: 'daemon', contractVersion: 3, writes: 0 }), readAccepted() {} }),
+    Object.freeze({ selfTest: async () => Object.freeze({ role: 'daemon', contractVersion: 4, writes: 0 }), readAccepted() {} }),
     proxy,
   ];
   for (const candidate of readers) {

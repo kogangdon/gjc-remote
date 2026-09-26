@@ -11,9 +11,11 @@ import {
   validateServiceTransaction,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import {
+  canonicalJson,
   canonicalJsonBytes,
   canonicalJsonHash,
   parseCanonicalJsonBytes,
+  utf8Compare,
 } from '@gjc-remote/shared/strict-json';
 import {
   consumeApplicationArchive,
@@ -61,6 +63,7 @@ const SESSION_METHODS = Object.freeze([
 const WINDOWS_SESSION_METHODS = Object.freeze([
   'reserveShawlSequence',
   'commitShawlSequence',
+  'planArtifactLocation',
 ]);
 const ERROR_CODES = new Set([
   'DEPLOYMENT_FILE_INVALID',
@@ -212,6 +215,15 @@ function dataProperty(value, key) {
 
 function snapshot(value, limits) {
   return parseCanonicalJsonBytes(canonicalJsonBytes(value, limits), limits);
+}
+
+function sameCanonicalJson(left, right) {
+  try {
+    return canonicalJson(left, TRANSACTION_LIMITS) ===
+      canonicalJson(right, TRANSACTION_LIMITS);
+  } catch {
+    return false;
+  }
 }
 
 function transactionIdentity(transaction) {
@@ -402,6 +414,7 @@ export function createServiceAcquisition(options) {
   let sourceClosed = false;
   let sourceClosing = null;
   let manifests = null;
+  let preInspectedInventoryFingerprint = null;
   let reservedIdentity = null;
   const activeResources = [];
   const createdAt = Date.now();
@@ -721,10 +734,18 @@ export function createServiceAcquisition(options) {
         ? await verifiedBootstrap('shawl', operation)
         : null;
       manifests = Object.freeze({ application, shawl });
+      // Windows launch planning binds the entrypoint file digest before the
+      // prepared transaction. The digest is taken from a read-only inspection
+      // of the signed source archive (inventory verified against the signed
+      // manifest) and is re-proven against the staged bytes at publish.
+      const signedEntrypoint = session.platform === 'win32'
+        ? await preInspectApplication(operation)
+        : null;
       phase = 'manifests-read';
       return Object.freeze({
         application: application.manifest,
         shawl: shawl?.manifest ?? null,
+        signedEntrypoint,
       });
     });
   }
@@ -791,6 +812,217 @@ export function createServiceAcquisition(options) {
     } finally {
       busy = false;
     }
+  }
+
+  function applicationLocationRequests(manifest, inventory, component, operation) {
+    const requests = new Map();
+    const add = (relativePath, signedSha256 = null) => {
+      const record = inventory.payloadEntries.find((candidate) =>
+        candidate.path === relativePath) ?? null;
+      if (typeof relativePath !== 'string' || record === null ||
+          (signedSha256 !== null && record.sha256 !== signedSha256)) {
+        throw acquisitionFailure(
+          'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+          operation,
+          currentWrites(),
+        );
+      }
+      const previous = requests.get(relativePath);
+      if (previous !== undefined && previous !== record.sha256) {
+        throw acquisitionFailure(
+          'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+          operation,
+          currentWrites(),
+        );
+      }
+      requests.set(relativePath, record.sha256);
+    };
+
+    add(manifest.entrypoints[component]);
+    add(manifest.nativeControl.manifestPath);
+    if (Object.hasOwn(manifest, 'windowsServiceBootstrap')) {
+      const bootstrap = exactDataValues(manifest.windowsServiceBootstrap, [
+        'schemaVersion',
+        'guardPath',
+        'staticClosure',
+        'staticClosureFingerprint',
+        'runtimePolicies',
+        'externalBunConfig',
+      ]);
+      if (bootstrap === null || bootstrap.schemaVersion !== 1 ||
+          !Array.isArray(bootstrap.staticClosure)) {
+        throw acquisitionFailure(
+          'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+          operation,
+          currentWrites(),
+        );
+      }
+      let previousPath = null;
+      let guardFound = false;
+      for (const entry of bootstrap.staticClosure) {
+        const closure = exactDataValues(entry, ['relativePath', 'sha256']);
+        if (closure === null || typeof closure.relativePath !== 'string' ||
+            !/^[0-9a-f]{64}$/.test(closure.sha256) ||
+            (previousPath !== null &&
+              utf8Compare(previousPath, closure.relativePath) >= 0)) {
+          throw acquisitionFailure(
+            'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+            operation,
+            currentWrites(),
+          );
+        }
+        previousPath = closure.relativePath;
+        add(closure.relativePath, closure.sha256);
+        if (closure.relativePath === bootstrap.guardPath) guardFound = true;
+      }
+      if (typeof bootstrap.guardPath !== 'string' || !guardFound) {
+        throw acquisitionFailure(
+          'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+          operation,
+          currentWrites(),
+        );
+      }
+      add(bootstrap.guardPath);
+    }
+    return Object.freeze([...requests].map(([relativePath, expectedFileSha256]) =>
+      Object.freeze({ relativePath, expectedFileSha256 })));
+  }
+
+  function shawlLocationRequests(manifest) {
+    return Object.freeze([Object.freeze({
+      relativePath: manifest.executable.name,
+      expectedFileSha256: manifest.executable.sha256,
+    })]);
+  }
+
+  function planLocationIntents(purpose, manifest, requests, operation) {
+    return Object.freeze(requests.map(({ relativePath, expectedFileSha256 }) => {
+      const intent = invokeSession('planArtifactLocation', {
+        purpose,
+        manifest,
+        relativePath,
+      }, operation);
+      const values = exactDataValues(intent, [
+        'schemaVersion',
+        'rootKind',
+        'artifactFingerprint',
+        'relativePath',
+        'absoluteRoot',
+        'absolutePath',
+        'anchorIdentityFingerprint',
+        'missingSegments',
+        'existingDirectoryIdentity',
+        'intentFingerprint',
+        'writes',
+      ]);
+      const rootKind = purpose === 'application' ? 'releases' : 'shawl';
+      const artifactFingerprint = purpose === 'application'
+        ? manifest.archive.sha256
+        : manifest.executable.sha256;
+      if (values === null || values.schemaVersion !== 1 ||
+          values.rootKind !== rootKind ||
+          values.artifactFingerprint !== artifactFingerprint ||
+          values.relativePath !== relativePath ||
+          typeof values.absoluteRoot !== 'string' ||
+          typeof values.absolutePath !== 'string' ||
+          !/^[0-9a-f]{64}$/.test(values.anchorIdentityFingerprint) ||
+          !/^[0-9a-f]{64}$/.test(values.intentFingerprint) ||
+          !Array.isArray(values.missingSegments) || values.missingSegments.length === 0 ||
+          values.writes !== 0 || !/^[0-9a-f]{64}$/.test(expectedFileSha256)) {
+        throw acquisitionFailure(
+          'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+          operation,
+          currentWrites(),
+        );
+      }
+      return intent;
+    }));
+  }
+
+  function assertPublishedLocationAuthorities(
+    publication,
+    purpose,
+    manifest,
+    requests,
+    intents,
+    operation,
+  ) {
+    const receipt = exactDataValues(publication, ['binding', 'locations']);
+    const binding = receipt === null
+      ? null
+      : exactDataValues(receipt.binding, [
+        'schemaVersion',
+        'kind',
+        'artifactKind',
+        'rootKind',
+        'artifactFingerprint',
+        'manifestFingerprint',
+        'treeFingerprint',
+        'directoryIdentity',
+        'directoryIdentityFingerprint',
+        'bindingFingerprint',
+      ]);
+    const expectedFingerprint = purpose === 'application'
+      ? manifest.archive.sha256
+      : manifest.executable.sha256;
+    if (receipt === null || binding === null || !Array.isArray(receipt.locations) ||
+        receipt.locations.length !== requests.length ||
+        binding.schemaVersion !== 1 ||
+        binding.kind !== 'service-artifact-binding' ||
+        binding.artifactKind !== purpose ||
+        binding.rootKind !== (purpose === 'application' ? 'releases' : 'shawl') ||
+        binding.artifactFingerprint !== expectedFingerprint ||
+        binding.manifestFingerprint !== manifest.manifestFingerprint) {
+      throw acquisitionFailure(
+        'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+        operation,
+        currentWrites(),
+      );
+    }
+    for (let index = 0; index < requests.length; index += 1) {
+      const request = requests[index];
+      const intent = exactDataValues(intents[index], [
+        'schemaVersion',
+        'rootKind',
+        'artifactFingerprint',
+        'relativePath',
+        'absoluteRoot',
+        'absolutePath',
+        'anchorIdentityFingerprint',
+        'missingSegments',
+        'existingDirectoryIdentity',
+        'intentFingerprint',
+        'writes',
+      ]);
+      const matches = receipt.locations.filter((location) =>
+        dataProperty(location, 'publishedPath') === request.relativePath);
+      const location = matches.length === 1
+        ? exactDataValues(matches[0], [
+          'binding',
+          'schemaVersion',
+          'publishedPath',
+          'absolutePath',
+          'directoryIdentity',
+          'fileIdentity',
+          'fileSha256',
+          'writes',
+        ])
+        : null;
+      if (intent === null || location === null ||
+          !sameCanonicalJson(location.binding, receipt.binding) ||
+          location.schemaVersion !== 1 ||
+          location.publishedPath !== request.relativePath ||
+          location.absolutePath !== intent.absolutePath ||
+          location.fileSha256 !== request.expectedFileSha256 ||
+          location.writes !== 0) {
+        throw acquisitionFailure(
+          'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+          operation,
+          currentWrites(),
+        );
+      }
+    }
+    return receipt.locations;
   }
 
   function nativeFiles(inspection, operation) {
@@ -987,6 +1219,44 @@ export function createServiceAcquisition(options) {
     checkDeadline(operation);
   }
 
+  function applicationInventory(inspection) {
+    return buildBundleInventory({
+      payloadEntries: inspection.files
+        .filter((record) => record.path !== APPLICATION_BUNDLE_INVENTORY_PATH)
+        .map((record) => ({
+          path: record.path,
+          size: record.size,
+          sha256: record.sha256,
+          executablePolicy: record.executablePolicy,
+        })),
+    }, { platform: session.platform });
+  }
+
+  async function preInspectApplication(operation) {
+    const manifest = manifests.application.manifest;
+    const source = await openSourceAsset('application', operation);
+    const inspection = await inspectApplicationArchive({
+      manifest,
+      chunks: deadlineChunks(source.chunks, operation),
+    });
+    await closeRequired(source.entry, operation);
+    checkDeadline(operation);
+    const inventory = applicationInventory(inspection);
+    const relativePath = manifest.entrypoints?.[session.component];
+    const record = inventory.payloadEntries.find((candidate) =>
+      candidate.path === relativePath) ?? null;
+    if (typeof relativePath !== 'string' || record === null ||
+        !/^[0-9a-f]{64}$/.test(record.sha256) || !Number.isSafeInteger(record.size)) {
+      throw acquisitionFailure(
+        'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+        operation,
+        currentWrites(),
+      );
+    }
+    preInspectedInventoryFingerprint = canonicalJsonHash(inventory);
+    return Object.freeze({ path: record.path, sha256: record.sha256, size: record.size });
+  }
+
   async function publishApplication(transaction, operation) {
     const manifest = manifests.application.manifest;
     const { access, entry: accessEntry } = openAccess('application', transaction, operation);
@@ -1004,16 +1274,15 @@ export function createServiceAcquisition(options) {
     checkDeadline(operation);
 
     const native = nativeFiles(inspection, operation);
-    const inventory = buildBundleInventory({
-      payloadEntries: inspection.files
-        .filter((record) => record.path !== APPLICATION_BUNDLE_INVENTORY_PATH)
-        .map((record) => ({
-          path: record.path,
-          size: record.size,
-          sha256: record.sha256,
-          executablePolicy: record.executablePolicy,
-        })),
-    }, { platform: session.platform });
+    const inventory = applicationInventory(inspection);
+    if (session.platform === 'win32' &&
+        canonicalJsonHash(inventory) !== preInspectedInventoryFingerprint) {
+      throw acquisitionFailure(
+        'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
+        operation,
+        currentWrites(),
+      );
+    }
     const inventoryBytes = canonicalJsonBytes(inventory, INVENTORY_LIMITS);
     checkDeadline(operation);
     access.prepareCandidate(inventoryBytes);
@@ -1093,15 +1362,40 @@ export function createServiceAcquisition(options) {
       );
     }
 
+    const locationRequests = session.platform === 'win32'
+      ? applicationLocationRequests(
+        manifest,
+        inventory,
+        session.component,
+        operation,
+      )
+      : null;
+    const locationIntents = locationRequests === null
+      ? null
+      : planLocationIntents('application', manifest, locationRequests, operation);
     const publication = access.publishCandidate();
     checkDeadline(operation);
+    if (locationRequests !== null) {
+      assertPublishedLocationAuthorities(
+        publication,
+        'application',
+        manifest,
+        locationRequests,
+        locationIntents,
+        operation,
+      );
+    }
     await closeRequired(accessEntry, operation);
     invokeSession('commitApplicationSequence', {
       manifest,
       transaction,
       publication,
     }, operation);
-    return Object.freeze({ manifest, publication, nativeMetadata });
+    return Object.freeze({
+      manifest,
+      publication,
+      nativeMetadata,
+    });
   }
 
   async function publishShawl(transaction, operation) {
@@ -1119,8 +1413,23 @@ export function createServiceAcquisition(options) {
       deadlineChunks(reader.chunks, operation),
     );
     await closeRequired(readerEntry, operation);
+    const locationRequests = shawlLocationRequests(manifest);
+    const locationIntents = planLocationIntents(
+      'shawl',
+      manifest,
+      locationRequests,
+      operation,
+    );
     const publication = access.publishCandidate();
     checkDeadline(operation);
+    assertPublishedLocationAuthorities(
+      publication,
+      'shawl',
+      manifest,
+      locationRequests,
+      locationIntents,
+      operation,
+    );
     await closeRequired(accessEntry, operation);
     invokeSession('commitShawlSequence', {
       manifest,

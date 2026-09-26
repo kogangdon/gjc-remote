@@ -77,7 +77,7 @@ function inventoryRolesForCurrent(current) {
   return null;
 }
 
-test("contract-4 inventory ABI exposes only the frozen seven primitive signatures", () => {
+test("ABI 5 inventory ABI exposes only the frozen seven primitive signatures", () => {
   const inventory = [
     "resolve_native_state_root",
     "read_workspace_root_facts",
@@ -123,8 +123,8 @@ test("public inventory adapters and service facade do not expose low-level helpe
   assert.equal("createInventoryPublisherAdapter" in publicApi, false);
   assert.equal("createInventoryReaderAdapter" in publicApi, false);
   assert.equal("createServiceNativeFactory" in publicApi, false);
-  assert.equal(publicApi.buildManifest.contractVersion, 4);
-  assert.equal(publicApi.buildManifest.contractRevision, 4);
+  assert.equal(publicApi.buildManifest.contractVersion, 5);
+  assert.equal(publicApi.buildManifest.contractRevision, 1);
   assert.deepEqual(publicApi.buildManifest.capabilities, capabilities);
   assert.deepEqual(publicApi.buildManifest.capabilitySignatures, capabilitySignatures);
 });
@@ -297,7 +297,7 @@ test("verified native addon enforces retained-handle, ACL, replacement, durabili
 
   const addon = require(fileURLToPath(addonUrl));
   const contract = addon.native_control_contract();
-  assert.equal(contract.contractVersion, 4);
+  assert.equal(contract.contractVersion, 5);
   assert.equal(contract.contractRevision, contractRevision);
   assert.equal(contract.napi, 8);
   assert.deepEqual(contract.capabilities, capabilities);

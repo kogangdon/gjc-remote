@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ManagementRuntime } from '../src/management-runtime.js';
 import { createManagementNativeForTest } from '../../native-control/test/helpers/management-native.js';
-import { validateManagedProof } from '../src/managed-authority-reader.js';
+import { validateManagedProof } from '@gjc-remote/shared/managed-authority-proof';
 import { createTestManagedAuthorityReader } from './helpers/managed-authority-reader.js';
 import { buildAdmissionAck, buildAdmissionGrant, buildAdmissionRequest } from '../../shared/admission-envelope.js';
 import { canonicalJson, canonicalJsonHash } from '../../shared/strict-json.js';

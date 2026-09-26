@@ -118,7 +118,7 @@ test('publisher factory returns an actor-bound frozen selfTest and publish', asy
     ['acl', `/managed/inventory/${hostKey}`, 'inventory-directory', 'management'],
   ]);
   const result = await publisher.selfTest();
-  assert.deepEqual(result, { role: 'management', contractVersion: 4, writes: 0 });
+  assert.deepEqual(result, { role: 'management', contractVersion: 5, writes: 0 });
   assert.deepEqual(Object.keys(result), ['role', 'contractVersion', 'writes']);
   assert.equal(Object.isFrozen(result), true);
   assert.equal(state.calls.at(-1)[4], 'management');
@@ -138,7 +138,7 @@ test('reader factory and every selfTest bind D while verifying both roots', asyn
     ['acl', `/managed/reader/${hostKey}`, roles, 'reader-directory', 'daemon'],
   ]);
   const result = await reader.selfTest();
-  assert.deepEqual(result, { role: 'daemon', contractVersion: 4, writes: 0 });
+  assert.deepEqual(result, { role: 'daemon', contractVersion: 5, writes: 0 });
   assert.equal(Object.isFrozen(result), true);
   assert.deepEqual(state.calls.slice(-2).map((call) => call[4]), ['daemon', 'daemon']);
 });
@@ -776,7 +776,7 @@ test('Reader retains a verified floor but fails closed on identity or release er
   );
 });
 
-test('public module exposes only management, staged inventory, containment, and service factories', () => {
+test('public module exposes only management, staged inventory, containment, observer, and service factories', () => {
   assert.deepEqual(Object.keys(publicApi).sort(), [
     'buildManifest',
     'createContainmentLowLevel',
@@ -784,9 +784,13 @@ test('public module exposes only management, staged inventory, containment, and 
     'createInventoryReader',
     'createManagementNative',
     'createResidualProcessEnumerator',
+    'createSelfProcessObserver',
     'createServiceNative',
+    'createServiceStartupObserver',
     'validateBuildManifest',
   ]);
+  assert.equal(typeof publicApi.createSelfProcessObserver, 'function');
+  assert.equal(typeof publicApi.createServiceStartupObserver, 'function');
   assert.equal(typeof publicApi.createContainmentLowLevel, 'function');
   assert.equal(typeof publicApi.createResidualProcessEnumerator, 'function');
   assert.equal(typeof publicApi.createInventoryPublisher, 'function');

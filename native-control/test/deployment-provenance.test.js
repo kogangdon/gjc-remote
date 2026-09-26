@@ -103,7 +103,7 @@ test('application signature binds its exact tuple and cannot certify another pla
     inventory: { path: 'bundle-files.json', byteLength: 100, sha256: hash, payloadEntryCount: 3, unpackedPayloadBytes: 100, treeFingerprint: hash },
     entrypoints: { bot: 'bot/src/bot.js', daemon: 'daemon/src/daemon.js' },
     runtimes: { node: { minimumVersion: '26.0.0' }, bun: { minimumVersion: '1.4.0' } },
-    nativeControl: { manifestPath: 'native-control/build/Release/native-control.manifest.json', manifestFingerprint: hash, contractVersion: 4, contractRevision: 4 },
+    nativeControl: { manifestPath: 'native-control/build/Release/native-control.manifest.json', manifestFingerprint: hash, contractVersion: 5, contractRevision: 1 },
     wireCapabilities: ['gate_presentation_v1'],
     compatibility: buildDeploymentCompatibility({
       bot: { domains: [{ domain: 'bot-mapping-reader', readableFormats: ['mapping-v1'], writableFormats: ['mapping-v1'] }] },

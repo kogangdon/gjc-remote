@@ -60,6 +60,17 @@ function writesOf(session, driver) {
 }
 function nonce() { return randomBytes(16).toString('hex'); }
 function validHash(v) { return typeof v === 'string' && HEX.test(v); }
+function validWindowsRelativePath(value) {
+  return typeof value === 'string' && value.length > 0 &&
+    !path.win32.isAbsolute(value) && !value.includes('\\') &&
+    !value.includes('\0') && value.split('/').every((segment) =>
+      segment.length > 0 && segment !== '.' && segment !== '..');
+}
+function sameWindowsPath(left, right) {
+  return typeof left === 'string' && typeof right === 'string' &&
+    left.replaceAll('/', '\\').toLowerCase() ===
+      right.replaceAll('/', '\\').toLowerCase();
+}
 function validAbsoluteEntrypoint(v, platform) {
   return typeof v === 'string' && v.length > 0 &&
     (platform === 'win32' ? /^(?:[A-Za-z]:[\\/]|\\\\)/.test(v) : v.startsWith('/'));
@@ -105,13 +116,20 @@ function releaseFingerprint(value) {
     value?.manifest?.manifestFingerprint ?? null;
 }
 
-/* Deployment manifests carry component-relative entrypoints.  A publication
- * receipt may expose its absolute root under publishedPath; a pre-normalized
- * absolute entrypoint is accepted for retained deployments.  Relative paths
- * without an authenticated publication root are refused before the first
- * store write. */
+/* Windows entrypoints remain signed component-relative names here. Lifecycle
+ * planning resolves only an intent; launch paths come from observed location
+ * receipts. Linux keeps its existing absolute-root normalization. */
 function normalizeEntrypoint(value, component, publication, platform) {
   const manifest = value?.manifest ?? value?.application ?? value?.applicationManifest ?? value;
+  if (platform === 'win32') {
+    const signedPath = manifest?.entrypoints?.[component];
+    if (!validWindowsRelativePath(signedPath) ||
+        (value?.entrypointPath !== undefined && value.entrypointPath !== signedPath) ||
+        (manifest?.entrypointPath !== undefined && manifest.entrypointPath !== signedPath)) {
+      fail('SERVICE_SCOPE_MISMATCH', 'acquire_release');
+    }
+    return signedPath;
+  }
   const configured = value?.entrypointPath ?? manifest?.entrypointPath ??
     manifest?.entrypoints?.[component] ?? manifest?.configuration?.entrypointPath;
   if (typeof configured !== 'string' || configured.length === 0) fail('SERVICE_INVALID', 'acquire_release');
@@ -153,20 +171,265 @@ function normalizeRelease(value, request, platform, publication = null) {
   });
 }
 
-function authenticatedOldRelease(session, manifest, platform, operation) {
-  if (platform !== 'win32' || !manifest?.present) return null;
-  if (typeof session?.readRetainedDeploymentEnvelope !== 'function') fail('SERVICE_PENDING', operation);
-  const retained = required(session, 'readRetainedDeploymentEnvelope', operation, {
-    purpose: 'application', manifestFingerprint: manifest.value.applicationManifestFingerprint,
+const LOCATION_INTENT_KEYS = Object.freeze([
+  'schemaVersion', 'rootKind', 'artifactFingerprint', 'relativePath',
+  'absoluteRoot', 'absolutePath', 'anchorIdentityFingerprint',
+  'missingSegments', 'existingDirectoryIdentity', 'intentFingerprint', 'writes',
+]);
+const LOCATION_BINDING_KEYS = Object.freeze([
+  'schemaVersion', 'kind', 'artifactKind', 'rootKind', 'artifactFingerprint',
+  'manifestFingerprint', 'treeFingerprint', 'directoryIdentity',
+  'directoryIdentityFingerprint', 'bindingFingerprint',
+]);
+const PUBLISHED_LOCATION_KEYS = Object.freeze([
+  'binding', 'schemaVersion', 'publishedPath', 'absolutePath',
+  'directoryIdentity', 'fileIdentity', 'fileSha256', 'writes',
+]);
+
+function exactPlain(value, keys) {
+  return plain(value) && Reflect.ownKeys(value).length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key));
+}
+
+function signedEntrypoint(manifest, component, operation) {
+  const value = manifest?.entrypoints?.[component];
+  if (!validWindowsRelativePath(value)) fail('SERVICE_SCOPE_MISMATCH', operation);
+  return value;
+}
+
+function planApplicationLocation(session, manifest, component, operation) {
+  return planArtifactIntent(session, 'application', manifest,
+    signedEntrypoint(manifest, component, operation), operation);
+}
+
+function planShawlLocation(session, manifest, operation) {
+  const relativePath = manifest?.executable?.name;
+  if (!validWindowsRelativePath(relativePath)) fail('SERVICE_SCOPE_MISMATCH', operation);
+  return planArtifactIntent(session, 'shawl', manifest, relativePath, operation);
+}
+
+function planArtifactIntent(session, purpose, manifest, relativePath, operation) {
+  const artifactFingerprint = purpose === 'application'
+    ? manifest?.archive?.sha256
+    : manifest?.executable?.sha256;
+  const intent = required(session, 'planArtifactLocation', operation, {
+    purpose, manifest, relativePath,
   });
-  const signed = retained?.manifest;
-  const entrypointPath = signed?.entrypointPath ?? signed?.entrypoints?.[manifest.value.component];
-  if (!validHash(manifest.value.applicationManifestFingerprint) ||
-      !validAbsoluteEntrypoint(entrypointPath, platform) ||
-      signed?.manifestFingerprint !== manifest.value.applicationManifestFingerprint) {
+  if (!exactPlain(intent, LOCATION_INTENT_KEYS) ||
+      !Object.isFrozen(intent) ||
+      intent.schemaVersion !== 1 ||
+      intent.rootKind !== (purpose === 'application' ? 'releases' : 'shawl') ||
+      !validHash(artifactFingerprint) ||
+      intent.artifactFingerprint !== artifactFingerprint ||
+      intent.relativePath !== relativePath ||
+      typeof intent.absoluteRoot !== 'string' ||
+      !path.win32.isAbsolute(intent.absoluteRoot) ||
+      typeof intent.absolutePath !== 'string' ||
+      !path.win32.isAbsolute(intent.absolutePath) ||
+      intent.absoluteRoot.length > 32768 || intent.absolutePath.length > 32768 ||
+      intent.absoluteRoot.includes('\0') || intent.absolutePath.includes('\0') ||
+      !validHash(intent.anchorIdentityFingerprint) ||
+      !validHash(intent.intentFingerprint) ||
+      !Array.isArray(intent.missingSegments) || intent.missingSegments.length === 0 ||
+      intent.missingSegments.some((segment) => typeof segment !== 'string' ||
+        segment.length === 0 || segment === '.' || segment === '..' ||
+        /[\\/:\0]/.test(segment)) || intent.writes !== 0) {
     fail('SERVICE_PENDING', operation);
   }
-  return { entrypointPath, applicationManifestFingerprint: manifest.value.applicationManifestFingerprint };
+  const expectedSuffix = `\\${artifactFingerprint}\\${relativePath.replaceAll('/', '\\')}`;
+  if (!intent.absolutePath.toLowerCase().endsWith(expectedSuffix.toLowerCase())) {
+    fail('SERVICE_SCOPE_MISMATCH', operation);
+  }
+  return intent;
+}
+
+function publishedArtifactLocation(
+  publication,
+  manifest,
+  artifactKind,
+  relativePath,
+  operation,
+  intent = null,
+) {
+  const binding = publication?.binding;
+  const rootKind = artifactKind === 'application' ? 'releases' : 'shawl';
+  const artifactFingerprint = artifactKind === 'application'
+    ? manifest?.archive?.sha256
+    : manifest?.executable?.sha256;
+  const treeFingerprint = artifactKind === 'application'
+    ? manifest?.inventory?.treeFingerprint
+    : null;
+  if (!exactPlain(publication, ['binding', 'locations']) ||
+      !Object.isFrozen(publication) || !Object.isFrozen(publication.locations) ||
+      !exactPlain(binding, LOCATION_BINDING_KEYS) ||
+      binding.schemaVersion !== 1 || binding.kind !== 'service-artifact-binding' ||
+      binding.artifactKind !== artifactKind || binding.rootKind !== rootKind ||
+      binding.artifactFingerprint !== artifactFingerprint ||
+      binding.manifestFingerprint !== manifest.manifestFingerprint ||
+      binding.treeFingerprint !== treeFingerprint ||
+      !validHash(binding.directoryIdentityFingerprint) ||
+      !validHash(binding.bindingFingerprint) ||
+      !Array.isArray(publication.locations)) {
+    fail('SERVICE_SCOPE_MISMATCH', operation);
+  }
+  const matches = publication.locations.filter((location) =>
+    location?.publishedPath === relativePath);
+  if (matches.length !== 1) fail('SERVICE_PENDING', operation);
+  const location = matches[0];
+  if (!exactPlain(location, PUBLISHED_LOCATION_KEYS) ||
+      !Object.isFrozen(location) ||
+      !same(location.binding, binding) || location.schemaVersion !== 1 ||
+      location.publishedPath !== relativePath ||
+      typeof location.absolutePath !== 'string' ||
+      !path.win32.isAbsolute(location.absolutePath) ||
+      location.absolutePath.length > 32768 || location.absolutePath.includes('\0') ||
+      !location.absolutePath.toLowerCase().endsWith(
+        `\\${artifactFingerprint}\\${relativePath.replaceAll('/', '\\')}`.toLowerCase(),
+      ) || !validHash(location.fileSha256) || location.writes !== 0 ||
+      !plain(location.directoryIdentity) ||
+      location.directoryIdentity.profile !== 'service-release-directory' ||
+      !same(location.directoryIdentity, binding.directoryIdentity) ||
+      !plain(location.fileIdentity) ||
+      !['service-release-file', 'service-release-executable'].includes(
+        location.fileIdentity.profile,
+      ) || (artifactKind === 'shawl' &&
+        location.fileSha256 !== manifest.executable.sha256)) {
+    fail('SERVICE_PENDING', operation);
+  }
+  if (intent !== null && (!exactPlain(intent, LOCATION_INTENT_KEYS) ||
+      intent.relativePath !== relativePath ||
+      intent.artifactFingerprint !== binding.artifactFingerprint ||
+      intent.rootKind !== binding.rootKind ||
+      !sameWindowsPath(intent.absolutePath, location.absolutePath))) {
+    fail('SERVICE_STALE', operation);
+  }
+  return location;
+}
+
+function publishedApplicationLocation(publication, manifest, component, operation, intent = null) {
+  return publishedArtifactLocation(
+    publication,
+    manifest,
+    'application',
+    signedEntrypoint(manifest, component, operation),
+    operation,
+    intent,
+  );
+}
+
+function publishedShawlLocation(publication, manifest, operation, intent = null) {
+  const relativePath = manifest?.executable?.name;
+  if (!validWindowsRelativePath(relativePath)) fail('SERVICE_SCOPE_MISMATCH', operation);
+  return publishedArtifactLocation(
+    publication,
+    manifest,
+    'shawl',
+    relativePath,
+    operation,
+    intent,
+  );
+}
+
+function releaseFromPublication(release, publication, component, operation, intent = null) {
+  const location = publishedApplicationLocation(
+    publication,
+    release.manifest,
+    component,
+    operation,
+    intent,
+  );
+  return Object.freeze({
+    ...release,
+    entrypointPath: location.absolutePath,
+    entrypointSha256: location.fileSha256,
+    publicationReceipts: Object.freeze({
+      ...(release.publicationReceipts ?? {}),
+      application: Object.freeze({ publication, location }),
+    }),
+  });
+}
+
+function releaseWithShawlPublication(release, manifest, publication, operation, intent = null) {
+  const location = publishedShawlLocation(publication, manifest, operation, intent);
+  return Object.freeze({
+    ...release,
+    shawlManifest: manifest,
+    supervisorPath: location.absolutePath,
+    supervisorSha256: location.fileSha256,
+    publicationReceipts: Object.freeze({
+      ...(release.publicationReceipts ?? {}),
+      shawl: Object.freeze({ publication, location }),
+    }),
+  });
+}
+
+function authenticatedOldRelease(
+  session,
+  manifest,
+  platform,
+  operation,
+  slot = 'current',
+  retainedManifest = null,
+  publication = null,
+) {
+  if (platform !== 'win32' || !manifest?.present) return null;
+  if (retainedManifest === null) {
+    if (typeof session?.readRetainedDeploymentEnvelope !== 'function') fail('SERVICE_PENDING', operation);
+    const retained = required(session, 'readRetainedDeploymentEnvelope', operation, {
+      purpose: 'application', manifestFingerprint: manifest.value.applicationManifestFingerprint,
+    });
+    retainedManifest = retained?.manifest;
+  }
+  if (!validHash(manifest.value.applicationManifestFingerprint) ||
+      retainedManifest?.manifestFingerprint !== manifest.value.applicationManifestFingerprint) {
+    fail('SERVICE_PENDING', operation);
+  }
+  if (publication === null) {
+    try {
+      publication = required(session, 'readPublicationReceipt', operation, {
+        slot, artifactKind: 'application',
+      });
+    } catch (error) {
+      if (error?.code === 'SERVICE_STALE') {
+        fail('SERVICE_PENDING', operation, writesOf(session), error);
+      }
+      throw error;
+    }
+  }
+  const component = manifest.value.component ?? session.component;
+  const release = releaseFromPublication({
+    manifest: retainedManifest,
+    applicationManifestFingerprint: manifest.value.applicationManifestFingerprint,
+  }, publication, component, operation);
+  const shawlFingerprint = manifest.value.shawlManifestFingerprint;
+  if (!validHash(shawlFingerprint) ||
+      typeof session?.readRetainedDeploymentEnvelope !== 'function') {
+    fail('SERVICE_PENDING', operation);
+  }
+  const retainedShawl = required(session, 'readRetainedDeploymentEnvelope', operation, {
+    purpose: 'shawl', manifestFingerprint: shawlFingerprint,
+  });
+  const shawlManifest = retainedShawl?.manifest;
+  if (!plain(shawlManifest) || shawlManifest.manifestFingerprint !== shawlFingerprint) {
+    fail('SERVICE_PENDING', operation);
+  }
+  let shawlPublication;
+  try {
+    shawlPublication = required(session, 'readPublicationReceipt', operation, {
+      slot, artifactKind: 'shawl',
+    });
+  } catch (error) {
+    if (error?.code === 'SERVICE_STALE') {
+      fail('SERVICE_PENDING', operation, writesOf(session), error);
+    }
+    throw error;
+  }
+  return releaseWithShawlPublication(
+    release,
+    shawlManifest,
+    shawlPublication,
+    operation,
+  );
 }
 
 function oldProof(receipt, platform) {
@@ -324,7 +587,10 @@ export class ServiceLifecycle {
   }
   async #driver(session, request, release) {
     if (!this.#options.driver && typeof this.#options.createDriver !== 'function') fail('SERVICE_INVALID', 'create_service_driver');
-    const context = { session, request, release, native: this.#options.native };
+    const context = {
+      session, request, release, native: this.#options.native,
+      publicationReceipts: release?.publicationReceipts ?? null,
+    };
     if (typeof session?.handoffDriverLocks === 'function') {
       context.locks = required(session, 'handoffDriverLocks', 'handoff_driver_locks');
     } else if (typeof this.#options.createDriver === 'function' || typeof this.#options.driver === 'function') {
@@ -392,7 +658,11 @@ export class ServiceLifecycle {
     try {
       const observed = typeof driver?.probe === 'function' ? driver.probe() : null;
       const latest = session.readJournal().entries.at(-1) ?? tx;
-      const record = buildServiceManualCleanup({ component: tx.component, serviceKey: tx.serviceKey, platform: tx.platform, architecture: tx.architecture, serviceGeneration: tx.serviceGeneration, transactionId: tx.transactionId, journalFingerprint: latest.transactionFingerprint, phase: latest.phase, reason, operatorAction: action, expectedDisposition: tx.old.disposition === 'absent' ? 'absent' : 'stable-old', expectedOldProofFingerprint: tx.old.oldFingerprint, observedDisposition: observed?.ownership === 'foreign' ? 'foreign' : observed?.tree === 'ambiguous' ? 'ambiguous' : 'hybrid', observedFingerprint: validHash(observed?.resourceFingerprint) ? observed.resourceFingerprint : null, blockedUntilOperatorAction: true });
+      const observedFingerprint = validHash(observed?.resourceFingerprint) ? observed.resourceFingerprint : null;
+      const observedDisposition = observed?.ownership === 'foreign' ? 'foreign'
+        : observed?.tree === 'ambiguous' ? 'ambiguous'
+          : observedFingerprint === null ? 'torn' : 'hybrid';
+      const record = buildServiceManualCleanup({ component: tx.component, serviceKey: tx.serviceKey, platform: tx.platform, architecture: tx.architecture, serviceGeneration: tx.serviceGeneration, transactionId: tx.transactionId, journalFingerprint: latest.transactionFingerprint, phase: latest.phase, reason, operatorAction: action, expectedDisposition: tx.old.disposition === 'absent' ? 'absent' : 'stable-old', expectedOldProofFingerprint: tx.old.oldFingerprint, observedDisposition, observedFingerprint, blockedUntilOperatorAction: true });
       const expected = required(session, 'readManualCleanup', 'read_manual_cleanup');
       const published = await Promise.resolve(session.publishManualCleanup(record, expected));
       // The native store returns a receipt. Treat an absent, malformed, or
@@ -462,7 +732,7 @@ export class ServiceLifecycle {
       const oldResource = currentResource.present ? currentResource.value : { resourceProof: null, platformResourceFingerprint: null };
       const old = oldProof(current, platform);
       if (operation === 'install' ? (old.disposition !== 'absent' || request.expected.serviceGeneration !== 0 || request.expected.resourceProof !== null) : (old.disposition !== 'stable' || request.expected.serviceGeneration !== old.serviceGeneration || request.expected.resourceProof !== old.resourceProof || (request.expected.currentManifestFingerprint && request.expected.currentManifestFingerprint !== old.manifestFingerprint))) fail('SERVICE_STALE', operation);
-      let release = null; let publicationResult = null; let previousEntry = null;
+      let release = null; let publicationResult = null; let previousEntry = null; let plannedIntents = null;
       if (operation === 'rollback') {
         if (!request.expected.predecessorManifestFingerprint || !references.present || !references.value?.previous) fail('SERVICE_STALE', operation);
         previousEntry = references.value.previous;
@@ -478,9 +748,10 @@ export class ServiceLifecycle {
           fail('SERVICE_PENDING', operation, writesOf(session, driver), error);
         }
         let retainedShawlManifest = null;
+        let previousShawlPublication = null;
         if (platform === 'win32') {
           const shawl = required(session, 'readRetainedDeploymentEnvelope', 'read_retained_deployment_envelope', { purpose: 'shawl', manifestFingerprint: previousEntry.artifacts.find((v) => v.artifactKind === 'shawl')?.manifestFingerprint });
-          const previousShawlPublication = required(session, 'readPublicationReceipt', 'read_publication_receipt', { slot: 'previous', artifactKind: 'shawl' });
+          previousShawlPublication = required(session, 'readPublicationReceipt', 'read_publication_receipt', { slot: 'previous', artifactKind: 'shawl' });
           retainedShawlManifest = shawl.manifest;
           if (typeof session.assertShawlRollback !== 'function') fail('SERVICE_PENDING', operation);
           try {
@@ -490,13 +761,57 @@ export class ServiceLifecycle {
             fail('SERVICE_PENDING', operation, writesOf(session, driver), error);
           }
         }
-        release = normalizeRelease({ manifest: retainedManifest, shawlManifest: retainedShawlManifest, applicationManifestFingerprint: retainedManifest.manifestFingerprint, shawlManifestFingerprint: retainedShawlManifest?.manifestFingerprint ?? (platform === 'win32' ? old.shawlManifestFingerprint : null), releaseSequence: retainedManifest.releaseSequence, releaseTreeFingerprint: retainedManifest.inventory?.treeFingerprint ?? retainedManifest.releaseTreeFingerprint, compatibilityFingerprint: retainedManifest.compatibilityFingerprint ?? hash(retainedManifest.compatibility ?? {}), entrypointPath: retainedManifest.entrypointPath ?? retainedManifest.entrypoints?.[request.target.component] }, request, platform, previousEntry);
+        release = normalizeRelease({ manifest: retainedManifest, shawlManifest: retainedShawlManifest, applicationManifestFingerprint: retainedManifest.manifestFingerprint, shawlManifestFingerprint: retainedShawlManifest?.manifestFingerprint ?? (platform === 'win32' ? old.shawlManifestFingerprint : null), releaseSequence: retainedManifest.releaseSequence, releaseTreeFingerprint: retainedManifest.inventory?.treeFingerprint ?? retainedManifest.releaseTreeFingerprint, compatibilityFingerprint: retainedManifest.compatibilityFingerprint ?? hash(retainedManifest.compatibility ?? {}), entrypointPath: retainedManifest.entrypointPath ?? retainedManifest.entrypoints?.[request.target.component] }, request, platform, platform === 'win32' ? null : previousEntry);
+        if (platform === 'win32') {
+          release = releaseFromPublication(
+            release,
+            previousApplicationPublication,
+            request.target.component,
+            operation,
+          );
+          release = releaseWithShawlPublication(
+            release,
+            retainedShawlManifest,
+            previousShawlPublication,
+            operation,
+          );
+        }
         publicationResult = { application: { publication: previousApplicationPublication } };
         if (platform === 'win32') publicationResult.shawl = { publication: previousShawlPublication };
       } else if (operation !== 'uninstall') {
         acquisition = await this.#acquisition(session, request);
         const manifests = await requiredAsync(acquisition, 'readManifests', 'read_service_acquisition_manifests');
         release = normalizeRelease({ manifest: manifests.application, shawlManifest: manifests.shawl, applicationManifestFingerprint: manifests.application?.manifestFingerprint, shawlManifestFingerprint: manifests.shawl?.manifestFingerprint, releaseSequence: manifests.application?.releaseSequence, releaseTreeFingerprint: manifests.application?.inventory?.treeFingerprint ?? manifests.application?.releaseTreeFingerprint, compatibilityFingerprint: manifests.application?.compatibilityFingerprint ?? (manifests.application?.compatibility ? hash(manifests.application.compatibility) : null), entrypointPath: manifests.application?.entrypointPath ?? manifests.application?.entrypoints?.[request.target.component] }, request, platform, null);
+        if (platform === 'win32') {
+          const applicationIntent = planApplicationLocation(
+            session,
+            release.manifest,
+            request.target.component,
+            operation,
+          );
+          const shawlManifest = manifests.shawl;
+          const shawlIntent = planShawlLocation(session, shawlManifest, operation);
+          // The launch plan binds the future published paths (write-free
+          // intents) and the signed entrypoint digest proven by the
+          // acquisition's read-only archive inspection. Both are re-proven
+          // against the authenticated publication receipts after publish.
+          const entry = manifests.signedEntrypoint;
+          if (!exactPlain(entry, ['path', 'sha256', 'size']) || !Object.isFrozen(entry) ||
+              entry.path !== signedEntrypoint(release.manifest, request.target.component, operation) ||
+              !validHash(entry.sha256) || !Number.isSafeInteger(entry.size) || entry.size < 0 ||
+              !validHash(shawlManifest?.executable?.sha256)) {
+            fail('SERVICE_PENDING', operation);
+          }
+          plannedIntents = { application: applicationIntent, shawl: shawlIntent };
+          release = Object.freeze({
+            ...release,
+            shawlManifest,
+            entrypointPath: applicationIntent.absolutePath,
+            entrypointSha256: entry.sha256,
+            supervisorPath: shawlIntent.absolutePath,
+            supervisorSha256: shawlManifest.executable.sha256,
+          });
+        }
       }
       const beforeResource = operation === 'install' ? null : oldResource.platformResourceFingerprint;
       if (operation !== 'install' && !validHash(beforeResource)) fail('SERVICE_SCOPE_MISMATCH', operation);
@@ -505,6 +820,12 @@ export class ServiceLifecycle {
       if (operation !== 'uninstall' && (!plain(planned) || Object.keys(planned).length !== 2 || !validPlanPart(planned.trial) || !validPlanPart(planned.final))) fail('SERVICE_INVALID', 'plan_resource');
       const trialResource = operation === 'uninstall' ? beforeResource : planned.trial.resourceFingerprint;
       const finalResource = operation === 'uninstall' ? null : planned.final.resourceFingerprint;
+      // Compatibility is read-only and runs before any transaction exists; a
+      // refused crossing leaves no journal head, provisional metadata or
+      // manual-cleanup marker behind.
+      if (operation !== 'uninstall' && operation !== 'rollback') {
+        await this.#options.compatibility({ operation, request, release, old, session });
+      }
       const generation = old.serviceGeneration + 1;
       const candidate = candidateProof(release, platform, operation === 'uninstall');
       const transactionId = request.transactionId ?? `svc-${Date.now()}-${randomBytes(4).toString('hex')}`;
@@ -515,17 +836,12 @@ export class ServiceLifecycle {
       const predictedResource = operation === 'uninstall' ? null : buildServiceResourceProof({ serviceKey: session.serviceKey, component: request.target.component, platform, architecture, operation, serviceGeneration: generation, applicationManifestFingerprint: candidate.applicationManifestFingerprint ?? old.applicationManifestFingerprint, shawlManifestFingerprint: candidate.shawlManifestFingerprint ?? old.shawlManifestFingerprint, configurationFingerprint, rolesFingerprint, transactionId, transactionNonce, predecessorResourceProof: old.resourceProof, platformResourceFingerprint: finalResource, platformState: phaseState(platform, 'final') });
       const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: operation === 'install' ? null : beforeResource, expectedAfterResourceFingerprint: operation === 'uninstall' ? null : finalResource, platformResourceFingerprint: operation === 'uninstall' ? beforeResource : trialResource, platformState: phaseState(platform, 'trial') }, platform);
       const final = buildServiceFinalProof({ disposition: operation === 'uninstall' ? 'absent' : 'stable', manifestFingerprint: operation === 'uninstall' ? null : candidate.applicationManifestFingerprint, resourceProof: operation === 'uninstall' ? null : predictedResource.resourceProof, applicationManifestFingerprint: operation === 'uninstall' ? null : candidate.applicationManifestFingerprint, shawlManifestFingerprint: operation === 'uninstall' ? null : candidate.shawlManifestFingerprint, serviceGeneration: generation, activation: operation === 'uninstall' ? 'disabled-not-startable' : 'enabled' }, platform);
-      const tx = buildServiceTransaction({ transactionId, transactionNonce, operation, component: request.target.component, serviceKey: session.serviceKey, platform, architecture, serviceGeneration: generation, old, candidate, transition, final, phase: 'prepared', substep: 'none', previousJournalFingerprint: journal.head?.present ? journal.head.value.transactionFingerprint : null });
+      tx = buildServiceTransaction({ transactionId, transactionNonce, operation, component: request.target.component, serviceKey: session.serviceKey, platform, architecture, serviceGeneration: generation, old, candidate, transition, final, phase: 'prepared', substep: 'none', previousJournalFingerprint: journal.head?.present ? journal.head.value.transactionFingerprint : null });
       const provisionalManifest = operation === 'uninstall' ? null : buildServiceManifest({ serviceKey: session.serviceKey, component: request.target.component, platform, architecture, serviceGeneration: generation, applicationManifestFingerprint: candidate.applicationManifestFingerprint, shawlManifestFingerprint: candidate.shawlManifestFingerprint, predecessorManifestFingerprint: operation === 'install' ? null : old.manifestFingerprint, configuration, configurationFingerprint, roles: request.roles, rolesFingerprint, resourceProof: predictedResource.resourceProof, platformState: phaseState(platform, 'final') });
-      const driverRelease = release
-        ? { entrypointPath: release.entrypointPath, applicationManifestFingerprint: release.applicationManifestFingerprint }
-        : operation === 'uninstall'
-          ? authenticatedOldRelease(session, current, platform, operation)
-          : null;
+      const driverRelease = release ?? (operation === 'uninstall'
+        ? authenticatedOldRelease(session, current, platform, operation)
+        : null);
       if (platform === 'win32' && (!driverRelease || !validAbsoluteEntrypoint(driverRelease.entrypointPath, platform) || !validHash(driverRelease.applicationManifestFingerprint))) {
-        // Windows SCM mutations must never receive an undefined release.  A
-        // retained/reference binding may be supplied by a future store
-        // accessor; until then refuse before the prepared journal edge.
         fail('SERVICE_PENDING', operation);
       }
       driver = await this.#driver(session, driverRequest, driverRelease);
@@ -554,13 +870,36 @@ export class ServiceLifecycle {
       if (operation !== 'install' && observed.resourceFingerprint !== beforeResource) fail('SERVICE_STALE', operation);
       if (operation === 'install' && observed.platformPhase !== 'absent') fail('SERVICE_STALE', operation);
       if (operation !== 'uninstall' && operation !== 'rollback') {
-        await this.#options.compatibility({ operation, request, release, old, session });
         const appFloor = required(session, 'readApplicationFloor', 'read_application_floor');
         const shawlFloor = platform === 'win32' ? required(session, 'readShawlFloor', 'read_shawl_floor') : null;
         await requiredAsync(acquisition, 'reserve', 'reserve_service_acquisition', { transaction: tx, currentApplicationSequence: appFloor.floor.committedSequence, currentShawlSequence: platform === 'win32' ? shawlFloor.floor.committedSequence : null });
         this.#append(session, tx, 'sequence-reserved', 'observed');
         publicationResult = await requiredAsync(acquisition, 'publish', 'publish_service_acquisition', { transaction: buildServiceTransaction({ ...tx, phase: 'sequence-reserved', substep: 'observed', previousJournalFingerprint: session.readJournal().entries.at(-1).transactionFingerprint }) });
         this.#append(session, tx, 'release-published', 'observed');
+        if (platform === 'win32') {
+          // Published bytes are already committed; any divergence from the
+          // planned launch leaves an owned resource plan that cannot be
+          // trusted automatically.
+          let bound;
+          try {
+            bound = releaseWithShawlPublication(
+              releaseFromPublication(release, publicationResult?.application?.publication, request.target.component, operation, plannedIntents.application),
+              release.shawlManifest,
+              publicationResult?.shawl?.publication,
+              operation,
+              plannedIntents.shawl,
+            );
+          } catch (error) {
+            fail('SERVICE_MANUAL_CLEANUP', operation, writesOf(session, driver), error);
+          }
+          if (bound.entrypointSha256 !== release.entrypointSha256 ||
+              bound.supervisorSha256 !== release.supervisorSha256 ||
+              !sameWindowsPath(bound.entrypointPath, release.entrypointPath) ||
+              !sameWindowsPath(bound.supervisorPath, release.supervisorPath)) {
+            fail('SERVICE_MANUAL_CLEANUP', operation, writesOf(session, driver));
+          }
+          release = bound;
+        }
       }
       if (operation !== 'rollback' && operation !== 'uninstall' && !acquisition) fail('SERVICE_INVALID', operation);
       this.#append(session, tx, 'transition-marker-intent', 'intent');
@@ -744,6 +1083,8 @@ export class ServiceLifecycle {
       // driver here would pass null configuration/release into platform code.
       let candidateRelease = null;
       let retainedManifest = null;
+      let candidatePublication = null;
+      let candidateShawlPublication = null;
       let recoveryConfiguration = manifest.present ? manifest.value.configuration : null;
       if (['prepared', 'sequence-reserved'].includes(head.phase) && transaction === null) fail('SERVICE_PENDING', 'recover');
       const candidateFingerprint = transaction?.candidate?.applicationManifestFingerprint ?? null;
@@ -754,17 +1095,33 @@ export class ServiceLifecycle {
         });
         retainedManifest = retained?.manifest ?? null;
         if (!plain(retainedManifest) || retainedManifest.manifestFingerprint !== candidateFingerprint) fail('SERVICE_PENDING', 'recover');
-        const publication = typeof session.readPublicationReceipt === 'function'
-          ? (() => { try { return session.readPublicationReceipt({ slot: 'provisional', artifactKind: 'application' }); } catch { return null; } })()
-          : null;
+        const candidateSlot = transaction.operation === 'rollback' ? 'previous' : 'provisional';
+        if (typeof session.readPublicationReceipt === 'function') {
+          try {
+            candidatePublication = session.readPublicationReceipt({
+              slot: candidateSlot, artifactKind: 'application',
+            });
+          } catch (error) {
+            if (error?.code !== 'SERVICE_STALE') throw error;
+          }
+        }
         let retainedShawl = null;
         if (transaction.candidate.shawlManifestFingerprint !== null) {
           if (typeof session.readRetainedDeploymentEnvelope !== 'function') fail('SERVICE_PENDING', 'recover');
-          const shawl = required(session, 'readRetainedDeploymentEnvelope', 'read_retained_deployment_envelope', {
+          const retainedShawlEnvelope = required(session, 'readRetainedDeploymentEnvelope', 'read_retained_deployment_envelope', {
             purpose: 'shawl', manifestFingerprint: transaction.candidate.shawlManifestFingerprint,
           });
-          retainedShawl = shawl?.manifest ?? null;
+          retainedShawl = retainedShawlEnvelope?.manifest ?? null;
           if (!plain(retainedShawl) || retainedShawl.manifestFingerprint !== transaction.candidate.shawlManifestFingerprint) fail('SERVICE_PENDING', 'recover');
+          if (platform === 'win32' && typeof session.readPublicationReceipt === 'function') {
+            try {
+              candidateShawlPublication = session.readPublicationReceipt({
+                slot: candidateSlot, artifactKind: 'shawl',
+              });
+            } catch (error) {
+              if (error?.code !== 'SERVICE_STALE') throw error;
+            }
+          }
         }
         candidateRelease = normalizeRelease({
           manifest: retainedManifest,
@@ -775,7 +1132,29 @@ export class ServiceLifecycle {
           releaseTreeFingerprint: transaction.candidate.releaseTreeFingerprint,
           compatibilityFingerprint: transaction.candidate.compatibilityFingerprint,
           entrypointPath: retainedManifest.entrypointPath ?? retainedManifest.entrypoints?.[transaction.component],
-        }, request, platform, publication);
+        }, request, platform, platform === 'win32' ? null : candidatePublication);
+        if (platform === 'win32') {
+          if (candidatePublication === null || candidateShawlPublication === null ||
+              retainedShawl === null) {
+            // A release-published candidate is not necessarily present in a
+            // reference slot yet. Do not substitute current O or an intent
+            // path for candidate C; reopening that publication is a separate
+            // store-authority slice.
+            fail('SERVICE_PENDING', 'recover');
+          }
+          candidateRelease = releaseFromPublication(
+            candidateRelease,
+            candidatePublication,
+            transaction.component,
+            'recover',
+          );
+          candidateRelease = releaseWithShawlPublication(
+            candidateRelease,
+            retainedShawl,
+            candidateShawlPublication,
+            'recover',
+          );
+        }
         recoveryConfiguration ??= retainedManifest.configuration ?? null;
       }
       if (!recoveryConfiguration && typeof session.readProvisionalMetadata === 'function') {
@@ -796,9 +1175,7 @@ export class ServiceLifecycle {
       // Bind a fresh driver to the authenticated candidate release. Passing
       // the persisted predecessor would make SCM/ExecStart probes authenticate
       // the wrong transition state.
-      const driverRelease = candidateRelease
-        ? { entrypointPath: candidateRelease.entrypointPath, applicationManifestFingerprint: candidateRelease.applicationManifestFingerprint }
-        : release;
+      const driverRelease = candidateRelease ?? release;
       if (transaction && transaction.operation !== 'uninstall' && transaction.operation !== 'rollback' &&
           (!candidateRelease || !recoveryConfiguration)) fail('SERVICE_PENDING', 'recover');
       driver = await this.#driver(session, recoveryRequest, driverRelease);
@@ -834,7 +1211,7 @@ export class ServiceLifecycle {
       if (transaction === null) fail('SERVICE_PENDING', 'recover');
 
       const operation = transaction.operation;
-      const releaseForDriver = candidateRelease
+      let releaseForDriver = candidateRelease
         ? { entrypointPath: candidateRelease.entrypointPath, applicationManifestFingerprint: candidateRelease.applicationManifestFingerprint }
         : release;
       if ((head.phase === 'prepared' || head.phase === 'sequence-reserved') &&
@@ -1004,7 +1381,30 @@ export class ServiceLifecycle {
           append('sequence-reserved');
         }
         if (head.phase === 'prepared' || head.phase === 'sequence-reserved') {
-          await requiredAsync(acquisition, 'publish', 'publish_service_acquisition', { transaction: buildServiceTransaction({ ...transaction, phase: 'sequence-reserved', substep: 'observed', previousJournalFingerprint: session.readJournal().entries.at(-1).transactionFingerprint }) });
+          const publicationResult = await requiredAsync(acquisition, 'publish', 'publish_service_acquisition', { transaction: buildServiceTransaction({ ...transaction, phase: 'sequence-reserved', substep: 'observed', previousJournalFingerprint: session.readJournal().entries.at(-1).transactionFingerprint }) });
+          if (platform === 'win32') {
+            if (!same(publicationResult?.application?.manifest, retainedManifest)) {
+              fail('SERVICE_SCOPE_MISMATCH', 'recover');
+            }
+            // candidateRelease was already bound to the authenticated
+            // provisional/previous receipt above (recovery refuses without
+            // one). This replay confirms the acquisition still reports the
+            // exact same publication rather than silently adopting a new one.
+            const replayed = releaseFromPublication(
+              { ...candidateRelease, publicationReceipts: undefined },
+              publicationResult.application.publication,
+              transaction.component,
+              'recover',
+            );
+            if (!sameWindowsPath(replayed.entrypointPath, candidateRelease.entrypointPath) ||
+                replayed.entrypointSha256 !== candidateRelease.entrypointSha256) {
+              fail('SERVICE_STALE', 'recover');
+            }
+            releaseForDriver = {
+              entrypointPath: candidateRelease.entrypointPath,
+              applicationManifestFingerprint: candidateRelease.applicationManifestFingerprint,
+            };
+          }
           append('release-published');
         }
       }

@@ -240,6 +240,7 @@ export class HostRegistry {
    *   monotonicNow?: () => number,
    *   onError?: (error: unknown) => void,
    *   onObservabilityEvent?: (event: object) => void,
+   *   onConnectionStateChange?: () => void,
    * }} opts
    */
   constructor({
@@ -263,6 +264,7 @@ export class HostRegistry {
         : Number(process.hrtime.bigint()) / 1e6,
     onError,
     onObservabilityEvent,
+    onConnectionStateChange,
   }) {
     if (!isPositiveDuration(heartbeatIntervalMs)) {
       throw new Error("heartbeatIntervalMs must be a positive duration");
@@ -363,6 +365,9 @@ export class HostRegistry {
     this.onError = onError;
     this.onObservabilityEvent =
       typeof onObservabilityEvent === "function" ? onObservabilityEvent : undefined;
+    this.onConnectionStateChange =
+      typeof onConnectionStateChange === "function" ? onConnectionStateChange : undefined;
+    this.listening = false;
     /** @type {Map<string, number>} Socket replacements observed per host; stays 0 in off mode. */
     this.reconnectCounts = new Map();
     this.resourceDenials = 0;
@@ -377,6 +382,8 @@ export class HostRegistry {
     this.heartbeatTimer.unref?.();
     this.wss.on("listening", () => {
       console.log(`HostRegistry: WS server listening on :${port}`);
+      this.listening = !this.closed;
+      this.#notifyConnectionStateChange();
     });
   }
 
@@ -553,6 +560,7 @@ export class HostRegistry {
       });
       socket.send(JSON.stringify(registerOk));
       this.#reconcileManagedBindings(hostId);
+      this.#notifyConnectionStateChange();
       console.log(
         `HostRegistry: host '${hostId}' connected (${msg.label ?? "no label"}, ` +
           `protocol v${protocolVersion}, capabilities: ${capabilities.join(", ") || "none"})`
@@ -2350,7 +2358,28 @@ export class HostRegistry {
     this.#clearHeartbeat(socket);
     this.connectionIdentities.delete(socket);
     this.#failPendingForSocket(socket, error);
+    if (wasCurrent) this.#notifyConnectionStateChange();
     return wasCurrent;
+  }
+
+  // Transport facts for service startup observation: the WebSocket listener
+  // state and the exact set of currently registered host ids. Provider and
+  // workspace health are deliberately not part of this snapshot.
+  getServiceStartupSnapshot() {
+    return Object.freeze({
+      listener: this.listening && !this.closed ? "listening" : "closed",
+      connectedHostIds: Object.freeze([...this.connections.keys()].sort()),
+    });
+  }
+
+  #notifyConnectionStateChange() {
+    const sink = this.onConnectionStateChange;
+    if (sink === undefined) return;
+    try {
+      sink();
+    } catch (error) {
+      if (typeof this.onError === "function") this.onError(error);
+    }
   }
 
   #markOfflineReadiness(state) {
@@ -2487,6 +2516,8 @@ export class HostRegistry {
     if (this.closePromise) return this.closePromise;
 
     this.closed = true;
+    this.listening = false;
+    this.#notifyConnectionStateChange();
     this.timers.clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
 
