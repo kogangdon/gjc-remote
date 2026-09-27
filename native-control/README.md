@@ -433,14 +433,18 @@ Output must be a new directory outside the source tree.
 tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
-The current candidate contract is `v0.4.0-rc.4` with native-control 2.0.0
+The current candidate contract is `v0.4.0-rc.5` with native-control 2.0.0
 (contract 5, revision 1). The tag workflow uses the same Bun 1.4.2 producer
-version. Existing rc.1/rc.2/rc.3 releases and artifacts remain historical, immutable
-inputs, not renamed rc.4 candidates; every rc.4 application archive must be built
-from a clean checkout of the exact rc.4 tag. rc.3 native-control 2.0.0 cannot
-qualify Windows services (see CHANGELOG); rc.4 signs a new 2.0.0 addon built
-from the rc.4 tag commit, distinguishable only by the signed manifest's addon
-SHA-256 (recorded in the release notes). Never reuse rc.3 native signing inputs.
+version. Existing rc.1/rc.2/rc.3/rc.4 releases and artifacts remain historical,
+immutable inputs, not renamed rc.5 candidates; every rc.5 application archive
+must be built from a clean checkout of the exact rc.5 tag. The rc.5 native
+addon changes the Windows service-only root to the OS installation drive's
+`\gjc-remote` directory; it does not migrate the old ProgramData service store.
+Fresh native-control 2.0.0 outputs must come from the rc.5 tag commit's main-CI
+promotion inputs. The version string alone does not identify these outputs:
+record each signed manifest's addon SHA-256 in the release notes. Never reuse
+rc.4 or earlier native signing inputs. Signed/live qualification remains
+separate from source-level and unsigned-audit evidence.
 The source must be clean Git state at that tag with canonical `bun.lock` and
 both separate public trust resources tracked. Git hooks/fsmonitor and replacement
 objects cannot supply authority; configured executable filters refuse before
