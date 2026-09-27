@@ -232,8 +232,8 @@ class FakeServiceNative {
       rootKind,
       rootPath: this.platform === 'win32'
         ? rootKind === 'shawl'
-          ? 'C:\\ProgramData\\gjc-remote\\supervisors\\shawl'
-          : `C:\\ProgramData\\gjc-remote\\${rootKind === 'control' ? 'service-control' : rootKind}`
+          ? 'C:\\gjc-remote\\supervisors\\shawl'
+          : `C:\\gjc-remote\\${rootKind === 'control' ? 'service-control' : rootKind}`
         : rootKind === 'control'
           ? '/var/lib/gjc-remote/service-control'
           : `/opt/gjc-remote/${rootKind === 'staging' ? '.staging' : 'releases'}`,
@@ -723,8 +723,8 @@ class FakeServiceNative {
     }
     const root = this.roots.get(rootKind) ?? null;
     const absoluteRoot = root?.binding.rootPath ?? (rootKind === 'shawl'
-      ? 'C:\\ProgramData\\gjc-remote\\supervisors\\shawl'
-      : 'C:\\ProgramData\\gjc-remote\\releases');
+      ? 'C:\\gjc-remote\\supervisors\\shawl'
+      : 'C:\\gjc-remote\\releases');
     let existingDirectoryIdentity = root?.node.identity ?? null;
     let missingSegments = [artifactFingerprint, ...components];
     let current = root?.node ?? null;

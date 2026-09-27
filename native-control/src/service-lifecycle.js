@@ -86,6 +86,12 @@ function safeErrorCode(error) {
 function safeErrorAmbiguous(error) {
   try { return error?.ambiguous === true; } catch { return false; }
 }
+function exactZeroWriteError(error, code, operation) {
+  try {
+    return error?.code === code && error?.operation === operation &&
+      error?.writes === 0 && error?.ambiguous === false;
+  } catch { return false; }
+}
 function safeErrorReason(error) {
   try {
     const reason = error?.reason;
@@ -585,6 +591,29 @@ export class ServiceLifecycle {
     const method = mode === 'read-only' ? 'openReadOnly' : mode === 'recovery' ? 'openRecovery' : 'openMutation';
     return required(source, method, 'open_service_store', request);
   }
+  #openMutation(operation, request, platform) {
+    try { return this.#open('mutation', request); } catch (error) {
+      if (operation !== 'install' ||
+          !exactZeroWriteError(error, 'SERVICE_STORE_ABSENT', 'open_service_store')) {
+        throw error;
+      }
+      if (request.expected.serviceGeneration !== 0 || request.expected.resourceProof !== null ||
+          request.expected.applicationSequenceFloor !== 0 ||
+          (platform === 'win32' && request.expected.shawlSequenceFloor !== 0)) {
+        fail('SERVICE_STALE', operation);
+      }
+      let session;
+      try {
+        session = required(this.#options.store, 'bootstrap', 'bootstrap_service_store');
+      } catch (bootstrapError) {
+        if (!exactZeroWriteError(bootstrapError, 'SERVICE_ALREADY_EXISTS', 'open_service_root')) {
+          throw bootstrapError;
+        }
+        return this.#open('mutation', request);
+      }
+      return session;
+    }
+  }
   async #driver(session, request, release) {
     if (!this.#options.driver && typeof this.#options.createDriver !== 'function') fail('SERVICE_INVALID', 'create_service_driver');
     const context = {
@@ -681,7 +710,7 @@ export class ServiceLifecycle {
     const platform = this.#platform(request); const architecture = this.#architecture(request);
     try { validateServiceLifecycleRequest(operation, request, { platform, architecture }); } catch (error) { fail('SERVICE_INVALID', operation, 0, error); }
     this.#preflight(operation, request);
-    const session = this.#open('mutation', request); let driver = null; let acquisition = null; let tx = null;
+    const session = this.#openMutation(operation, request, platform); let driver = null; let acquisition = null; let tx = null;
     try {
       if (!session || session.component !== request.target.component || session.platform !== platform || session.architecture !== architecture || session.serviceKey !== serviceKeyForTarget(request.target)) fail('SERVICE_SCOPE_MISMATCH', 'open_service_store');
       const current = required(session, 'readManifest', 'read_manifest', 'current');

@@ -268,8 +268,23 @@ binding and exact shared role tuple to equal the protected registration. The
 native root path remains protected registration data and is never returned in a
 public lifecycle/status receipt.
 
+On Windows, the service base is `\gjc-remote` on the OS installation drive
+(for example `C:\gjc-remote`), derived by the native OS API rather than an
+environment variable. Control, staging, releases and Shawl share this base.
+Inventory and native-reader stores retain their separate ProgramData paths.
+There is no alternate-root fallback or automatic adoption of the former
+ProgramData service store. Directory identities, witnesses and role ACLs
+remain mandatory; relocation does not change the NTFS directory-flush
+contract or authorize volume flushing.
+
 Bootstrap is create-exclusive. It initializes registration and zero floors only
 while holding the live handle returned for a genuinely new native control root.
+Only a validated, preflighted install may dispatch bootstrap after an exact
+zero-write, non-ambiguous absent-store refusal. Its expected service generation
+and applicable sequence floors must explicitly be zero, and resource proof must
+be null. Other operations never initialize an absent store. Only an exact
+zero-write, non-ambiguous already-existing root collision may reopen mutation
+and continue through the ordinary fenced stale/CAS checks.
 If that operation becomes partial, a later process does not reinterpret the
 existing root as new or recreate missing registration, locks, witnesses, or
 floors. Missing, replaced, or torn registered metadata is manual cleanup rather

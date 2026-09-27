@@ -76,6 +76,20 @@ fingerprint, and Node 26.7.0 / Bun 1.4.2 runtime policy. The route stays
 SCM → Shawl → Node/Bun → application; there is no extra resident wrapper,
 health endpoint, or `sc.exe` bypass.
 
+The native service store uses `\gjc-remote` on the Windows installation drive,
+normally `C:\gjc-remote`, independently of the CLI's location and the component
+working directory. The native OS-derived location is not configurable through
+environment variables. Service control state, staged and published releases,
+and `supervisors\shawl` belong to this protected base; inventory/native-reader
+state still uses ProgramData. Existing ProgramData service state is not migrated
+or used as a fallback. Preserve it for operator review rather than copying its
+identity-bound records into the new store.
+
+The new root must pass the same ownership, ACL, no-reparse and NTFS directory
+flush checks. A successful directory-flush probe is not evidence of successful
+service installation or power-loss durability. Flush errors remain refusals;
+there is no volume-flush fallback.
+
 The operator must provision the following before the first install. The
 producer never creates, copies, or relaxes them:
 
