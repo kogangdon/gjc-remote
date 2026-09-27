@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.5] - 2026-09-27
+
+### Fixed
+
+- Move Windows service-only storage to `\gjc-remote` on the native OS-derived
+  installation drive. Preserve inventory/native-reader ProgramData paths,
+  Linux paths, exact ACL/identity checks and directory-flush requirements.
+  Existing ProgramData service state is not migrated or used as a fallback.
+- Initialize a genuinely absent service store on validated first install,
+  requiring zero expected generation and sequence floors and null resource
+  proof. Preserve partial-state refusals and fenced CAS for creation races.
+- Normalize drive-root Windows installations and lowercase drive letters
+  before composing fixed service paths.
+
+### Verification limits
+
+- Source/model regression tests, an unsigned Windows native audit build and
+  read-only path planning passed. Signed service installation, startup,
+  shutdown, reboot and power-loss qualification remain separate evidence.
+- Native-control remains 2.0.0 (contract 5 revision 1); rc.5 requires fresh
+  native promotion inputs from its own source commit. Prior signed releases
+  must not be overwritten or reused as rc.5 native inputs.
+
 ## [0.4.0-rc.4] - 2026-09-27
 
 Supersedes the unpublished `v0.4.0-rc.3` draft, whose native addon cannot
