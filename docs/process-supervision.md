@@ -78,9 +78,10 @@ It carries no compiled-addon, SCM, account, ACL, or reboot evidence.
 
 ### Shawl v1.9.0 (selected primary)
 
-Shawl is the selected primary Windows supervisor. Stage the operator-supplied
-binary at `C:\ProgramData\gjc-remote\shawl\shawl.exe`, protect the directory
-from inherited user access, and record the actual executable SHA-256 before
+Shawl is the selected primary Windows supervisor. The native acquisition path
+publishes the verified binary beneath
+`<Windows-drive>:\gjc-remote\supervisors\shawl`, using its content-addressed
+directory and protected role ACLs. Record the actual executable SHA-256 before
 registration. The binary tested locally was v1.9.0, SHA-256
 `0985555b71e7f943b8f3fc639952a9890aa62e66617942a2d0996985fe8e7c6d`, and had
 no Authenticode signature. Do not treat the hash as provenance without recording
@@ -181,7 +182,10 @@ contracts do not establish production deployment, signing, real systemd/SCM
 behavior, or disposable-host evidence. The following boundaries remain
 mandatory before the lifecycle can be used in production.
 
-Use per-service ACL/mode-protected storage (`C:\ProgramData\\gjc-remote\\transactions` or `/var/lib/gjc-remote/transactions`, mode 0700). Before every install/update/remove mutation, it must:
+Use the per-service ACL/mode-protected transaction namespace specified in
+[ADR 0006](adr/0006-native-service-lifecycle.md). On Windows it is beneath
+`<Windows-drive>:\gjc-remote\service-control`; the Linux control root remains
+`/var/lib/gjc-remote/service-control`. Before every install/update/remove mutation, it must:
 
 1. Acquire the per-key lock and generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters). It must never reuse it.
 2. Compute a versioned, canonical SHA-256 `resourceProof` over secret-free transaction/resource fields.

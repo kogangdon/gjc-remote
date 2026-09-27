@@ -186,7 +186,8 @@ test('fixed intermediary bootstrap reserves durable history before exposure and 
   assert.match(source, /spec->anchor_path = "\/var\/lib"/);
   assert.match(source, /spec->anchor_path = "\/opt"/);
   assert.match(source, /spec->name = "gjc-remote"/);
-  assert.match(source, /FOLDERID_ProgramData/);
+  assert.match(source, /bool ResolveServiceSystemDriveRoot\(std::string\* root\)[\s\S]*?GetSystemWindowsDirectoryW\(/);
+  assert.match(source, /spec->identity = "system-drive-gjc-remote"/);
   assert.match(prepare, /ServiceStoreOpenBootstrapAnchor\(\s*spec\.anchor_path, false/);
   assert.match(prepare, /ServiceStoreOpenBootstrapAnchor\(\s*spec\.anchor_path, true/);
   assert.ok(

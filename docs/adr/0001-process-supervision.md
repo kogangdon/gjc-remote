@@ -30,8 +30,9 @@ implementation exists in this repository.
 
 ### Windows: Shawl (selected primary; unsigned-binary evaluation evidence)
 
-The selected Windows primary stages Shawl v1.9.0 at a protected
-`C:\ProgramData\gjc-remote\shawl\shawl.exe` location, records the executable
+The selected Windows primary publishes Shawl v1.9.0 beneath the protected
+`<Windows-drive>:\gjc-remote\supervisors\shawl` content-addressed store
+(the current native layout is specified in ADR 0006), records the executable
 SHA-256, and invokes Bun/Node through absolute paths. Secrets remain in the
 component-local `.env` and never enter Shawl arguments, service metadata, or logs.
 
@@ -130,7 +131,7 @@ implement this contract boundary. They remain contract/fake-driver evidence:
 no production deployment, signing, or disposable-host fault-injection evidence
 is claimed. The following rules remain mandatory before production use.
 
-Install, update, and remove must use an ACL/mode-protected per-service transaction store (`C:\ProgramData\\gjc-remote\\transactions` on Windows; `/var/lib/gjc-remote/transactions` mode 0700 on Linux). Before mutation, it must acquire the per-key lock, generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters), and compute a versioned SHA-256 `resourceProof` over canonical, secret-free transaction/resource fields. It must never reuse a nonce.
+Install, update, and remove must use the ACL/mode-protected per-service transaction namespace from ADR 0006 (`<Windows-drive>:\gjc-remote\service-control` on Windows; `/var/lib/gjc-remote/service-control` on Linux). Before mutation, it must acquire the per-key lock, generate a unique CSPRNG 128-bit `txNonce` (32 lower-case hex characters), and compute a versioned SHA-256 `resourceProof` over canonical, secret-free transaction/resource fields. It must never reuse a nonce.
 
 The journal, staged/owned manifest (or remove tombstone), and service/unit metadata must all carry the transaction envelope: transaction ID, operation, role, owner, configuration fingerprint, nonce, and proof. Resource metadata must contain no host ID, env, credential, prompt, token, or log content. Recovery must mutate a resource only after independently recomputed, exact agreement among all three copies. Name, owner, role, fingerprint, PID, timestamp, or service state alone must not be sufficient.
 

@@ -10355,6 +10355,38 @@ bool SamePhysicalDirectoryIdentity(const ServiceStoreIdentity& left,
 #endif
 }
 
+#ifdef _WIN32
+bool ResolveServiceSystemDriveRoot(std::string* root) {
+  if (!root) return false;
+  root->clear();
+  std::vector<wchar_t> windows_directory(MAX_PATH);
+  UINT length = GetSystemWindowsDirectoryW(
+      windows_directory.data(),
+      static_cast<UINT>(windows_directory.size()));
+  if (length == 0) return false;
+  if (length >= windows_directory.size()) {
+    if (length == std::numeric_limits<UINT>::max()) return false;
+    windows_directory.resize(static_cast<size_t>(length) + 1);
+    length = GetSystemWindowsDirectoryW(
+        windows_directory.data(),
+        static_cast<UINT>(windows_directory.size()));
+    if (length == 0 || length >= windows_directory.size()) return false;
+  }
+  const std::wstring windows_path(windows_directory.data(), length);
+  if (windows_path.size() < 2 ||
+      !((windows_path[0] >= L'A' && windows_path[0] <= L'Z') ||
+        (windows_path[0] >= L'a' && windows_path[0] <= L'z')) ||
+      windows_path[1] != L':' ||
+      (windows_path.size() > 2 && windows_path[2] != L'\\')) {
+    return false;
+  }
+  const wchar_t drive = windows_path[0] >= L'a' && windows_path[0] <= L'z'
+      ? windows_path[0] - L'a' + L'A' : windows_path[0];
+  *root = std::string(1, static_cast<char>(drive)) + ":\\";
+  return true;
+}
+#endif
+
 bool ResolveServiceStoreRoot(const std::string& root_kind,
                              std::string* parent_path,
                              std::string* name,
@@ -10362,18 +10394,14 @@ bool ResolveServiceStoreRoot(const std::string& root_kind,
   if (root_kind != "control" && root_kind != "staging" &&
       root_kind != "releases" && root_kind != "shawl") return false;
 #ifdef _WIN32
-  PWSTR raw = nullptr;
-  if (FAILED(SHGetKnownFolderPath(
-          FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &raw))) {
-    return false;
-  }
-  const std::string program_data = Utf8(raw);
-  CoTaskMemFree(raw);
+  std::string system_drive_root;
+  if (!ResolveServiceSystemDriveRoot(&system_drive_root)) return false;
+  const std::string base_path = system_drive_root + "gjc-remote";
   if (root_kind == "shawl") {
-    *parent_path = program_data + "\\gjc-remote\\supervisors";
+    *parent_path = base_path + "\\supervisors";
     *name = "shawl";
   } else {
-    *parent_path = program_data + "\\gjc-remote";
+    *parent_path = base_path;
     *name = root_kind == "control" ? "service-control" : root_kind;
   }
 #else
@@ -10788,16 +10816,11 @@ struct ServiceContainerSpec {
 bool ResolveServiceBaseContainer(
     const std::string& root_kind, ServiceContainerSpec* spec) {
 #ifdef _WIN32
-  PWSTR raw = nullptr;
-  if (FAILED(SHGetKnownFolderPath(
-          FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &raw))) {
-    return false;
-  }
-  spec->anchor_path = Utf8(raw);
-  CoTaskMemFree(raw);
+  (void)root_kind;
+  if (!ResolveServiceSystemDriveRoot(&spec->anchor_path)) return false;
   spec->name = "gjc-remote";
   spec->witness_name = ".gjc-service-platform-container.v1";
-  spec->identity = "programdata-gjc-remote";
+  spec->identity = "system-drive-gjc-remote";
   return !spec->anchor_path.empty();
 #else
   if (root_kind == "control") {
@@ -10865,13 +10888,11 @@ ShawlParentState PrepareShawlServiceParent(
     ServiceStoreIdentity* parent_identity,
     bool* ambiguous) {
   *ambiguous = false;
-  PWSTR raw = nullptr;
-  if (FAILED(SHGetKnownFolderPath(
-          FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &raw))) {
+  std::string system_drive_root;
+  if (!ResolveServiceSystemDriveRoot(&system_drive_root)) {
     return ShawlParentState::IoFailed;
   }
-  const std::string base_path = Utf8(raw) + "\\gjc-remote";
-  CoTaskMemFree(raw);
+  const std::string base_path = system_drive_root + "gjc-remote";
   HANDLE base = INVALID_HANDLE_VALUE;
   if (!ServiceStoreOpenFixedParent(
           base_path, false, &base)) {
@@ -16309,15 +16330,10 @@ bool ServiceObservationFixedRootIdentity(
   }
   if (*writes != 0) return false;
   if (base_state == ServiceContainerState::Absent) {
-    PWSTR raw = nullptr;
-    if (FAILED(SHGetKnownFolderPath(
-            FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &raw))) {
-      return false;
-    }
-    const std::string program_data = Utf8(raw);
-    CoTaskMemFree(raw);
+    std::string system_drive_root;
+    if (!ResolveServiceSystemDriveRoot(&system_drive_root)) return false;
     HANDLE anchor = OpenWindowsPathNoFollow(
-        program_data, READ_CONTROL | FILE_READ_ATTRIBUTES,
+        system_drive_root, READ_CONTROL | FILE_READ_ATTRIBUTES,
         VerifiedObjectType::Directory);
     if (anchor == INVALID_HANDLE_VALUE) return false;
     const bool trusted = VerifyBootstrapAnchor(anchor, roles, true) &&

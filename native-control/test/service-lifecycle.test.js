@@ -28,6 +28,12 @@ const windowsRoles = Object.freeze({
   system: { kind: 'sid', value: 'S-1-5-18' },
 });
 
+function lifecycleStoreError(code, operation, writes = 0, ambiguous = false) {
+  const error = new Error(`${operation} failed`);
+  Object.assign(error, { name: 'ServiceStoreError', code, operation, writes, ambiguous });
+  return error;
+}
+
 function windowsApplicationManifest({
   manifestFingerprint = '5'.repeat(64),
   archiveSha256 = 'a'.repeat(64),
@@ -47,11 +53,11 @@ function windowsApplicationManifest({
 }
 
 function windowsLocationPath(manifest) {
-  return `C:\\ProgramData\\gjc-remote\\releases\\${manifest.archive.sha256}\\${manifest.entrypoints.bot.replaceAll('/', '\\')}`;
+  return `C:\\gjc-remote\\releases\\${manifest.archive.sha256}\\${manifest.entrypoints.bot.replaceAll('/', '\\')}`;
 }
 
 function windowsLocationIntent(manifest) {
-  const absoluteRoot = 'C:\\ProgramData\\gjc-remote\\releases';
+  const absoluteRoot = 'C:\\gjc-remote\\releases';
   const absolutePath = windowsLocationPath(manifest);
   const fields = {
     schemaVersion: 1,
@@ -131,7 +137,7 @@ function windowsShawlPublication(manifest) {
     binding,
     schemaVersion: 1,
     publishedPath: manifest.executable.name,
-    absolutePath: `C:\\ProgramData\\gjc-remote\\shawl\\${manifest.executable.sha256}\\${manifest.executable.name}`,
+    absolutePath: `C:\\gjc-remote\\supervisors\\shawl\\${manifest.executable.sha256}\\${manifest.executable.name}`,
     directoryIdentity,
     fileIdentity,
     fileSha256: manifest.executable.sha256,
@@ -411,8 +417,8 @@ function windowsShawlIntent(manifest) {
     rootKind: 'shawl',
     artifactFingerprint: manifest.executable.sha256,
     relativePath,
-    absoluteRoot: 'C:\\ProgramData\\gjc-remote\\shawl',
-    absolutePath: `C:\\ProgramData\\gjc-remote\\shawl\\${manifest.executable.sha256}\\${relativePath}`,
+    absoluteRoot: 'C:\\gjc-remote\\supervisors\\shawl',
+    absolutePath: `C:\\gjc-remote\\supervisors\\shawl\\${manifest.executable.sha256}\\${relativePath}`,
     anchorIdentityFingerprint: 'd'.repeat(64),
     missingSegments: [manifest.executable.sha256, relativePath],
     existingDirectoryIdentity: null,
@@ -421,7 +427,7 @@ function windowsShawlIntent(manifest) {
   return Object.freeze({ ...fields, intentFingerprint: canonicalJsonHash(fields) });
 }
 
-function windowsCandidateFixture(signedEntrypoint) {
+function windowsCandidateFixture(signedEntrypoint, store = null) {
   const calls = [];
   const stoppedAtPlanner = new Error('stopped at planner');
   const manifest = windowsApplicationManifest({
@@ -464,7 +470,7 @@ function windowsCandidateFixture(signedEntrypoint) {
   };
   const lifecycle = createServiceLifecycle({
     platform: 'win32', architecture: 'x64', native: {},
-    store: { openMutation: () => session }, acquisition,
+    store: store ?? { openMutation: () => session }, acquisition,
     compatibility: () => assert.fail('must not continue past planning'),
     observeApplication: () => assert.fail('must not start'),
     driver: () => assert.fail('must not construct a driver before planning'),
@@ -506,6 +512,218 @@ test('Windows candidate launch plans the signed entrypoint digest over write-fre
   assert.equal(fixture.session.writes, 0);
 });
 
+test('first install bootstraps only after an exact absent-store result', async () => {
+  const storeCalls = [];
+  let fixture;
+  const store = {
+    openMutation() {
+      storeCalls.push('open-mutation');
+      throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+    },
+    bootstrap() {
+      storeCalls.push('bootstrap');
+      return fixture.session;
+    },
+  };
+  fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    store,
+  );
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === fixture.stoppedAtPlanner);
+  assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap']);
+  assert.deepEqual(fixture.calls, ['plan-location:application', 'plan-location:shawl', 'plan', 'acquisition-close', 'session-close']);
+  assert.equal(fixture.session.writes, 0);
+});
+
+test('stale floor CAS refuses an absent-store install before bootstrap', async () => {
+  const storeCalls = [];
+  let fixture;
+  const store = {
+    openMutation() {
+      storeCalls.push('open-mutation');
+      throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+    },
+    bootstrap() {
+      storeCalls.push('bootstrap');
+      return fixture.session;
+    },
+  };
+  fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    store,
+  );
+  fixture.request.expected.applicationSequenceFloor = 1;
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error.code === 'SERVICE_STALE');
+  assert.deepEqual(storeCalls, ['open-mutation']);
+  assert.deepEqual(fixture.calls, []);
+});
+
+test('nonzero install generation or resource proof is rejected before opening or bootstrapping', async () => {
+  const storeCalls = [];
+  const fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    {
+      openMutation() { storeCalls.push('open-mutation'); },
+      bootstrap() { storeCalls.push('bootstrap'); },
+    },
+  );
+  for (const expected of [
+    { ...fixture.request.expected, serviceGeneration: 1 },
+    { ...fixture.request.expected, resourceProof: '1'.repeat(64) },
+  ]) {
+    fixture.request.expected = expected;
+    await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error.code === 'SERVICE_INVALID');
+  }
+  assert.deepEqual(storeCalls, []);
+  assert.deepEqual(fixture.calls, []);
+});
+
+test('only exact zero-write SERVICE_STORE_ABSENT evidence can enter bootstrap', async () => {
+  for (const openError of [
+    lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_root'),
+    lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store', 1),
+    lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store', 0, true),
+    lifecycleStoreError('SERVICE_ACCESS_DENIED', 'open_service_store'),
+    new Error('unclassified open failure'),
+  ]) {
+    const storeCalls = [];
+    const fixture = windowsCandidateFixture(
+      Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+      {
+        openMutation() {
+          storeCalls.push('open-mutation');
+          throw openError;
+        },
+        bootstrap() { storeCalls.push('bootstrap'); },
+      },
+    );
+    await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === openError);
+    assert.deepEqual(storeCalls, ['open-mutation']);
+    assert.deepEqual(fixture.calls, []);
+  }
+});
+
+test('non-install operations propagate store absence without bootstrapping', async () => {
+  const storeCalls = [];
+  const fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    {
+      openMutation() {
+        storeCalls.push('open-mutation');
+        throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+      },
+      bootstrap() { storeCalls.push('bootstrap'); },
+    },
+  );
+  delete fixture.request.configuration;
+  fixture.request.acceptServiceDisruption = true;
+  fixture.request.expected = {
+    serviceGeneration: 1,
+    resourceProof: '1'.repeat(64),
+    currentManifestFingerprint: '2'.repeat(64),
+    applicationSequenceFloor: 0,
+    shawlSequenceFloor: 0,
+  };
+  await assert.rejects(fixture.lifecycle.update(fixture.request), (error) => error.code === 'SERVICE_STORE_ABSENT');
+  assert.deepEqual(storeCalls, ['open-mutation']);
+  assert.deepEqual(fixture.calls, []);
+});
+
+test('bootstrap failures with writes or manual-cleanup evidence propagate without reopening', async () => {
+  const bootstrapError = lifecycleStoreError('SERVICE_MANUAL_CLEANUP', 'open_service_root', 1, true);
+  const storeCalls = [];
+  let fixture;
+  const store = {
+    openMutation() {
+      storeCalls.push('open-mutation');
+      throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+    },
+    bootstrap() {
+      storeCalls.push('bootstrap');
+      throw bootstrapError;
+    },
+  };
+  fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    store,
+  );
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === bootstrapError);
+  assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap']);
+  assert.deepEqual(fixture.calls, []);
+});
+
+test('bootstrap access-denied failures propagate without reopening mutation', async () => {
+  const bootstrapError = lifecycleStoreError('SERVICE_ACCESS_DENIED', 'open_service_root');
+  const storeCalls = [];
+  const fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    {
+      openMutation() {
+        storeCalls.push('open-mutation');
+        throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+      },
+      bootstrap() {
+        storeCalls.push('bootstrap');
+        throw bootstrapError;
+      },
+    },
+  );
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === bootstrapError);
+  assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap']);
+  assert.deepEqual(fixture.calls, []);
+});
+
+test('bootstrap root collision reopens mutation only for the exact zero-write race contract', async () => {
+  const storeCalls = [];
+  let fixture;
+  const store = {
+    openMutation() {
+      storeCalls.push('open-mutation');
+      if (storeCalls.length === 1) {
+        throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+      }
+      return fixture.session;
+    },
+    bootstrap() {
+      storeCalls.push('bootstrap');
+      throw lifecycleStoreError('SERVICE_ALREADY_EXISTS', 'open_service_root');
+    },
+  };
+  fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    store,
+  );
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === fixture.stoppedAtPlanner);
+  assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap', 'open-mutation']);
+  assert.deepEqual(fixture.calls, ['plan-location:application', 'plan-location:shawl', 'plan', 'acquisition-close', 'session-close']);
+});
+
+test('bootstrap SERVICE_ALREADY_EXISTS without exact zero-write root evidence is not a race', async () => {
+  for (const collision of [
+    lifecycleStoreError('SERVICE_ALREADY_EXISTS', 'open_service_directory'),
+    lifecycleStoreError('SERVICE_ALREADY_EXISTS', 'open_service_root', 1),
+    lifecycleStoreError('SERVICE_ALREADY_EXISTS', 'open_service_root', 0, true),
+  ]) {
+    const storeCalls = [];
+    const fixture = windowsCandidateFixture(
+      Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+      {
+        openMutation() {
+          storeCalls.push('open-mutation');
+          throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+        },
+        bootstrap() {
+          storeCalls.push('bootstrap');
+          throw collision;
+        },
+      },
+    );
+    await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === collision);
+    assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap']);
+    assert.deepEqual(fixture.calls, []);
+  }
+});
+
 test('Windows candidate without an authenticated signed entrypoint digest fails closed before planning', async () => {
   for (const signedEntrypoint of [
     null,
@@ -536,11 +754,14 @@ test('all mutation schemas reject unknown fields before acquiring a session', as
   assert.deepEqual(calls, []);
 });
 
-test('mutation dependency gaps refuse before opening the store', async () => {
-  let opened = false;
+test('mutation dependency gaps refuse before opening or bootstrapping the store', async () => {
+  const calls = [];
   const lifecycle = createServiceLifecycle({
     platform: 'linux', architecture: 'x64',
-    store: { openMutation: () => { opened = true; throw new Error('must not open'); } },
+    store: {
+      openMutation: () => { calls.push('open'); throw new Error('must not open'); },
+      bootstrap: () => { calls.push('bootstrap'); throw new Error('must not bootstrap'); },
+    },
     driver: {},
   });
   const request = {
@@ -550,7 +771,7 @@ test('mutation dependency gaps refuse before opening the store', async () => {
     expected: { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0 },
   };
   await assert.rejects(lifecycle.install(request), (error) => error.code === 'SERVICE_INVALID');
-  assert.equal(opened, false);
+  assert.deepEqual(calls, []);
 });
 
 for (const markerPersists of [true, false]) {

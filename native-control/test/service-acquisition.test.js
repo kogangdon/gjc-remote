@@ -610,7 +610,7 @@ function modeledSession(release, prepared, {
     assert.ok(relativePath.length > 0);
     const rootKind = purpose === 'application' ? 'releases' : 'shawl';
     const artifactFingerprint = purpose === 'application' ? manifest.archive.sha256 : manifest.executable.sha256;
-    const absoluteRoot = `C:\\ProgramData\\gjc-remote\\${rootKind === 'shawl' ? 'supervisors\\shawl' : 'releases'}`;
+    const absoluteRoot = `C:\\gjc-remote\\${rootKind === 'shawl' ? 'supervisors\\shawl' : 'releases'}`;
     const absolutePath = `${absoluteRoot}\\${artifactFingerprint}\\${relativePath.replaceAll('/', '\\')}`;
     const fields = {
       schemaVersion: 1, rootKind, artifactFingerprint, relativePath, absoluteRoot, absolutePath,
