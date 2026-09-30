@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.6] - 2026-09-30
+
+### Fixed
+
+- Match Windows management-auth private ACLs to effective roles (PR #255):
+  require explicit full-access grants only for management and SYSTEM, omitting
+  zero-rights bot and recovery ACEs. Preserve exact owner, mask, protected-DACL,
+  and non-inheritance checks; extra or missing grants remain rejected.
+
+### Verification limits
+
+- This entry prepares a new release candidate; it does not claim publication,
+  installation, or deployment qualification. Signed service startup, shutdown,
+  reboot and power-loss qualification remain separate evidence.
+- Native-control remains 2.0.0 (contract 5 revision 1); rc.6 requires fresh
+  native signing inputs from its own source commit. Released rc.5 and earlier
+  artifacts remain immutable and must not be reused as rc.6 native inputs.
+
 ## [0.4.0-rc.5] - 2026-09-27
 
 ### Fixed
