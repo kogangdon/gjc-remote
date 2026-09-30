@@ -433,20 +433,23 @@ Output must be a new directory outside the source tree.
 tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
-The current candidate contract is `v0.4.0-rc.6` with native-control 2.0.0
+The current candidate contract is `v0.4.0-rc.7` with native-control 2.0.0
 (contract 5, revision 1). The tag workflow uses the same Bun 1.4.2 producer
-version. Existing rc.1/rc.2/rc.3/rc.4/rc.5 releases and artifacts remain historical,
-immutable inputs, not renamed rc.6 candidates; every rc.6 application archive
-must be built from a clean checkout of the exact rc.6 tag. The rc.5 native
+version. Existing rc.1/rc.2/rc.3/rc.4/rc.5/rc.6 releases and artifacts remain historical,
+immutable inputs, not renamed rc.7 candidates; every rc.7 application archive
+must be built from a clean checkout of the exact rc.7 tag. The rc.5 native
 addon changes the Windows service-only root to the OS installation drive's
 `\gjc-remote` directory; it does not migrate the old ProgramData service store.
 The rc.6 native addon fixes Windows management-auth private ACL validation to
 require only the effective management and SYSTEM roles (PR #255), without
 zero-rights bot or recovery ACEs.
-Fresh native-control 2.0.0 outputs must come from the rc.6 tag commit's main-CI
+The rc.7 native addon fixes Windows retained-handle deletion (PR #257) using
+`ReOpenFile` for an independent file instance bound to the retained handle and
+POSIX unlink semantics, without garbage-collection dependence or a fallback.
+Fresh native-control 2.0.0 outputs must come from the rc.7 tag commit's main-CI
 promotion inputs. The version string alone does not identify these outputs:
 record each signed manifest's addon SHA-256 in the release notes. Never reuse
-rc.5 or earlier native signing inputs. This is candidate source preparation,
+rc.6 or earlier native signing inputs. This is candidate source preparation,
 not a publication or installation claim. Signed/live deployment qualification
 remains separate from source-level and unsigned-audit evidence.
 The source must be clean Git state at that tag with canonical `bun.lock` and
