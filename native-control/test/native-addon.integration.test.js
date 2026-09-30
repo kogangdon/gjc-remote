@@ -282,6 +282,98 @@ test("Windows inventory rejects UNC and malformed roots while returning exact lo
   }
 });
 
+test("Windows verified handle removal unlinks immediately with retained aliases and preserves a same-name replacement", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows retained-handle unlink integration only");
+    return;
+  }
+  if (!existsSync(addonUrl)) {
+    t.skip("native addon is not built for this checkout");
+    return;
+  }
+  // Raw loading also permits qualification of an isolated unsigned local build.
+  const addon = require(fileURLToPath(addonUrl));
+  const roles = platformRoles(addon.current_os_principal());
+  if (roles === null || new Set(roles).size !== 4) {
+    t.skip("requires a Windows management user distinct from SYSTEM and the synthetic roles");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "gjc-native-handle-unlink-"));
+  const name = "record.json";
+  const destination = join(root, name);
+  const original = Buffer.from('{"generation":1}');
+  const replacement = Buffer.from('{"generation":2}');
+  let completed = false;
+  try {
+    // Elevated tokens otherwise default the fixture parent owner to Administrators.
+    await execFile("icacls", [root, "/setowner", `*${roles[0]}`], {
+      timeout: 15_000,
+      maxBuffer: 64 * 1024,
+      windowsHide: true,
+    });
+    await addon.set_exact_role_acl(root, ...roles, "management-auth");
+    await addon.create_absent_exclusive(destination, original, ...roles, "management-auth");
+    assert.equal(await addon.verify_exact_role_acl(destination, ...roles, "management-auth"), true);
+    const parent = addon.open_verified_parent_handle(destination);
+    const object = addon.open_verified_object_handle(parent, name);
+    const alias = addon.open_verified_object_handle(parent, name);
+    assert.ok(object);
+    assert.ok(alias);
+    assert.equal(addon.read_handle_identity(parent).owner, roles[0]);
+    assert.deepEqual(addon.read_handle_identity(object), addon.read_handle_identity(alias));
+
+    assert.throws(
+      () => addon.remove_verified_handle(object, replacement),
+      (error) => error?.code === "ERR_NATIVE_CONTROL_REFUSED" &&
+        error?.operation === "remove_verified_handle",
+      "wrong expected bytes must refuse before unlinking",
+    );
+    assert.deepEqual(Buffer.from(addon.read_verified_bytes(destination)), original);
+    assert.equal(addon.path_exists_no_follow(destination), true);
+    assert.deepEqual(await readdir(root), [name]);
+
+    addon.remove_verified_handle(object, original);
+    assert.equal(addon.read_verified_bytes(destination), null,
+      "absence must be observable immediately, without closing or collecting either handle");
+    assert.equal(addon.path_exists_no_follow(destination), false);
+    assert.deepEqual(await readdir(root), [], "independent directory enumeration must see no name");
+    assert.deepEqual(Buffer.from(addon.read_handle_bytes(object)), original);
+    assert.deepEqual(Buffer.from(addon.read_handle_bytes(alias)), original,
+      "the retained alias must still read the unlinked object's original bytes");
+
+    await addon.create_absent_exclusive(destination, replacement, ...roles, "management-auth");
+    const replacementIdentity = addon.read_identity(destination);
+    assert.notDeepEqual(replacementIdentity, addon.read_handle_identity(object),
+      "the recreated name must identify a new object, not the retained unlinked object");
+    try {
+      // An already-unlinked handle may refuse or succeed idempotently; neither
+      // outcome may remove the new object now occupying the same name.
+      addon.remove_verified_handle(object, original);
+    } catch (error) {
+      assert.ok(error?.code === "ERR_NATIVE_CONTROL_REMOVE" ||
+        (error?.code === "ERR_NATIVE_CONTROL_REFUSED" &&
+          error?.operation === "remove_verified_handle"));
+    }
+    assert.equal(addon.path_exists_no_follow(destination), true);
+    assert.deepEqual(Buffer.from(addon.read_verified_bytes(destination)), replacement);
+    assert.deepEqual(addon.read_identity(destination), replacementIdentity);
+    assert.deepEqual(await readdir(root), [name]);
+    assert.equal(await addon.verify_exact_role_acl(destination, ...roles, "management-auth"), true);
+    // Keep every retained handle live through all namespace/replacement checks.
+    assert.deepEqual(Buffer.from(addon.read_handle_bytes(object)), original);
+    assert.deepEqual(Buffer.from(addon.read_handle_bytes(alias)), original);
+    assert.equal(addon.read_handle_identity(parent).owner, roles[0]);
+    completed = true;
+  } finally {
+    try {
+      await rm(root, { recursive: true, force: true });
+    } catch (error) {
+      if (completed) throw error;
+      t.diagnostic(`Owned fixture cleanup failed after test failure (${root}): ${error}`);
+    }
+  }
+});
+
 test("Windows management-auth native ACL creation and replacement retain exactly management and SYSTEM grants", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows DACL integration only");

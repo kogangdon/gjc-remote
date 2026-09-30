@@ -2713,8 +2713,20 @@ napi_value RemoveVerifiedHandle(napi_env env, napi_callback_info info) {
   void* raw; size_t size; napi_get_buffer_info(env, bytes, &raw, &size);
   if (size != expected.size() || std::memcmp(raw, expected.data(), size) != 0) { Refuse(env, "remove_verified_handle", "verified handle bytes do not match"); return nullptr; }
 #ifdef _WIN32
-  FILE_DISPOSITION_INFO disposition{}; disposition.DeleteFile = TRUE;
-  if (!SetFileInformationByHandle(value->handle, FileDispositionInfo, &disposition, sizeof(disposition))) { Throw(env, "ERR_NATIVE_CONTROL_REMOVE", "unable to remove verified handle"); return nullptr; }
+  // Unlink the verified object now, like unlinkat below. Delete-on-close leaves
+  // the name inaccessible but present while retained aliases are still open,
+  // so callers cannot prove absence without depending on garbage collection.
+  FILE_DISPOSITION_INFO_EX disposition{};
+  disposition.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+  // POSIX disposition takes effect when its open instance closes. Reopen the
+  // held object (never its pathname) so independent retained aliases stay valid.
+  HANDLE deletion = ReOpenFile(value->handle, DELETE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+  if (deletion == INVALID_HANDLE_VALUE) { Throw(env, "ERR_NATIVE_CONTROL_REMOVE", "unable to reopen verified handle for unlink"); return nullptr; }
+  const bool removed = SetFileInformationByHandle(deletion, FileDispositionInfoEx,
+      &disposition, sizeof(disposition)) != FALSE;
+  const bool closed = CloseHandle(deletion) != FALSE;
+  if (!removed || !closed) { Throw(env, "ERR_NATIVE_CONTROL_REMOVE", "unable to unlink verified handle"); return nullptr; }
 #else
   struct stat held, named;
   if (fstat(value->fd, &held) != 0 || fstatat(value->parent_fd, value->name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 || held.st_dev != named.st_dev || held.st_ino != named.st_ino || unlinkat(value->parent_fd, value->name.c_str(), 0) != 0) { Refuse(env, "remove_verified_handle", "descriptor-relative exact deletion failed"); return nullptr; }
