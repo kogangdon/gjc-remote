@@ -29,6 +29,14 @@ through protected stdin.
 The command emits only bounded JSON status/error codes; do not redirect it to a
 terminal transcript or log its stdin.
 
+Windows exact DACLs contain one explicit, non-inheritable allow ACE for each
+role with nonzero rights. Authority and bot-state objects require four role
+ACEs; private `management-auth` objects require only management and SYSTEM,
+both with full access. Bot and recovery receive no ACE on private objects,
+not zero-mask ACEs. Verification rejects extra or missing grants, incorrect
+masks or owners, and inherited/inheritable ACEs; the DACL must remain protected.
+Do not repair private records by granting bot or recovery access.
+
 ```bash
 # Placeholders only: protected stdin, no real credentials or token output.
 printf '%s' '{"actorSecret":"REDACTED","hostTokens":"host-a=REDACTED"}' |
