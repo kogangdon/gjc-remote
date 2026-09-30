@@ -309,10 +309,16 @@ test("Windows management-auth native ACL creation and replacement retain exactly
     assert.match(sddl, /D:P/, "the fixture DACL must be protected from inheritance");
     return [...sddl.matchAll(/\(([^()]*)\)/g)].map((match) => match[1].split(";"));
   };
+  const trusteeSid = (ace) => {
+    if (ace[5] === "SY") return "S-1-5-18";
+    // Hosted Windows uses the local RID-500 Administrator, abbreviated as LA.
+    if (ace[5] === "LA" && roles[0].endsWith("-500")) return roles[0];
+    return ace[5];
+  };
   const assertManagementAcl = async (path) => {
     const aces = await readAces(path);
     assert.equal(aces.length, 2, "zero-right bot/recovery ACEs must be omitted entirely");
-    assert.deepEqual(aces.map((ace) => ace[5] === "SY" ? roles[3] : ace[5]).sort(),
+    assert.deepEqual(aces.map(trusteeSid).sort(),
       [roles[0], roles[3]].sort());
     for (const ace of aces) {
       assert.deepEqual(ace.slice(0, 2), ["A", ""], "only explicit, non-inheritable allow ACEs");
@@ -350,7 +356,7 @@ test("Windows management-auth native ACL creation and replacement retain exactly
       await addon.set_exact_role_acl(directory, ...roles, profile);
       const aces = await readAces(directory);
       assert.equal(aces.length, 4, `${profile} must retain all four effective role grants`);
-      assert.deepEqual(aces.map((ace) => ace[5] === "SY" ? roles[3] : ace[5]).sort(), [...roles].sort());
+      assert.deepEqual(aces.map(trusteeSid).sort(), [...roles].sort());
       assert.ok(aces.every((ace) => ace[2] !== "" && ace[2] !== "0x0"));
       assert.equal(await addon.verify_exact_role_acl(directory, ...roles, profile), true);
       assert.equal(await addon.verify_exact_role_acl(directory, ...roles, "management-auth"), false);
