@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.7] - 2026-10-01
+
+### Fixed
+
+- Fix Windows retained-handle deletion (PR #257): use `ReOpenFile` to obtain
+  an independent file instance bound to the retained handle, then apply POSIX
+  unlink semantics. Deletion does not depend on garbage collection or use a
+  fallback path.
+
+### Verification limits
+
+- This entry prepares a new release candidate; it does not claim publication,
+  installation, or deployment qualification. Signed service startup, shutdown,
+  reboot and power-loss qualification remain separate evidence.
+- Native-control remains 2.0.0 (contract 5 revision 1); rc.7 requires fresh
+  native signing inputs from its own source commit. Released rc.6 and earlier
+  artifacts remain immutable and must not be reused as rc.7 native inputs.
+
 ## [0.4.0-rc.6] - 2026-09-30
 
 ### Fixed
