@@ -37,6 +37,15 @@ not zero-mask ACEs. Verification rejects extra or missing grants, incorrect
 masks or owners, and inherited/inheritable ACEs; the DACL must remain protected.
 Do not repair private records by granting bot or recovery access.
 
+Windows retained-handle deletion requires POSIX unlink semantics. The native
+operation reopens the verified object without resolving its pathname, applies
+the POSIX delete disposition, and closes that independent open instance.
+The name must be absent immediately while existing retained handles remain
+readable. Unsupported filesystems or failed unlink operations refuse; there is
+no delete-on-close fallback, garbage-collection dependency, or conversion of
+access-denied reads into absence. This prerequisite is checked by the management
+startup self-test before initialization.
+
 ```bash
 # Placeholders only: protected stdin, no real credentials or token output.
 printf '%s' '{"actorSecret":"REDACTED","hostTokens":"host-a=REDACTED"}' |
