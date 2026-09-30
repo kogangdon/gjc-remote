@@ -282,6 +282,115 @@ test("Windows inventory rejects UNC and malformed roots while returning exact lo
   }
 });
 
+test("Windows management-auth native ACL creation and replacement retain exactly management and SYSTEM grants", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows DACL integration only");
+    return;
+  }
+  if (!existsSync(addonUrl)) {
+    t.skip("native addon is not built for this checkout");
+    return;
+  }
+  // Load the actual addon directly so this regression can also qualify an unsigned local build.
+  const addon = require(fileURLToPath(addonUrl));
+  const roles = platformRoles(addon.current_os_principal());
+  if (roles === null || new Set(roles).size !== 4) {
+    t.skip("requires a Windows management user distinct from SYSTEM and the synthetic roles");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "gjc-native-management-auth-"));
+  const aclTool = (path, ...args) => execFile("icacls", [path, ...args], {
+    timeout: 15_000,
+    maxBuffer: 64 * 1024,
+    windowsHide: true,
+  });
+  const readAces = async (path) => {
+    const sddl = await addon.read_acl(path);
+    assert.match(sddl, /D:P/, "the fixture DACL must be protected from inheritance");
+    return [...sddl.matchAll(/\(([^()]*)\)/g)].map((match) => match[1].split(";"));
+  };
+  const trusteeSid = (ace) => {
+    if (ace[5] === "SY") return "S-1-5-18";
+    // Hosted Windows uses the local RID-500 Administrator, abbreviated as LA.
+    if (ace[5] === "LA" && roles[0].endsWith("-500")) return roles[0];
+    return ace[5];
+  };
+  const assertManagementAcl = async (path) => {
+    const aces = await readAces(path);
+    assert.equal(aces.length, 2, "zero-right bot/recovery ACEs must be omitted entirely");
+    assert.deepEqual(aces.map(trusteeSid).sort(),
+      [roles[0], roles[3]].sort());
+    for (const ace of aces) {
+      assert.deepEqual(ace.slice(0, 2), ["A", ""], "only explicit, non-inheritable allow ACEs");
+      assert.ok(ace[2] === "FA" || ace[2] === "0x1f01ff", "each effective grant is full access");
+      assert.deepEqual(ace.slice(3, 5), ["", ""], "no object-specific ACE qualifiers");
+    }
+    assert.equal((await addon.read_identity(path)).owner, roles[0]);
+    assert.equal(await addon.verify_exact_role_acl(path, ...roles, "management-auth"), true);
+    for (const mode of ["read", "write"]) {
+      assert.equal(await addon.principal_access_check(path, "sid", roles[0], mode, ...roles, "management-auth"), true);
+    }
+    for (const profile of ["authority", "bot-state"]) {
+      assert.equal(await addon.verify_exact_role_acl(path, ...roles, profile), false,
+        "management-only grants must not satisfy a four-role profile");
+    }
+  };
+  try {
+    // Elevated Windows tokens otherwise default the owner to Administrators.
+    await aclTool(root, "/setowner", `*${roles[0]}`);
+    const createdFile = join(root, "created.json");
+    const replacedFile = join(root, "replaced.json");
+    const directory = join(root, "control");
+    const bytes = Buffer.from('{"verifier":"fixture-only"}');
+    await addon.create_absent_exclusive(createdFile, bytes, ...roles, "management-auth");
+    await assertManagementAcl(createdFile);
+    assert.deepEqual(Buffer.from(await addon.read_verified_bytes(createdFile)), bytes);
+    await writeFile(replacedFile, bytes);
+    await mkdir(directory);
+    for (const path of [replacedFile, directory]) {
+      await addon.set_exact_role_acl(path, ...roles, "management-auth");
+      await assertManagementAcl(path);
+    }
+    // Bot-state records require B ownership; use an M-owned directory instead, never a real B token.
+    for (const profile of ["authority", "bot-state"]) {
+      await addon.set_exact_role_acl(directory, ...roles, profile);
+      const aces = await readAces(directory);
+      assert.equal(aces.length, 4, `${profile} must retain all four effective role grants`);
+      assert.deepEqual(aces.map(trusteeSid).sort(), [...roles].sort());
+      assert.ok(aces.every((ace) => ace[2] !== "" && ace[2] !== "0x0"));
+      assert.equal(await addon.verify_exact_role_acl(directory, ...roles, profile), true);
+      assert.equal(await addon.verify_exact_role_acl(directory, ...roles, "management-auth"), false);
+    }
+    await addon.set_exact_role_acl(directory, ...roles, "management-auth");
+    await assertManagementAcl(directory);
+    for (const path of [createdFile, directory]) {
+      for (const mutation of [
+        // icacls resolves trustees; Everyone avoids unmapped synthetic role SIDs.
+        ["/grant", "*S-1-1-0:(R)"],
+        ["/remove:g", `*${roles[3]}`],
+        ["/grant:r", `*${roles[3]}:(R)`],
+      ]) {
+        try {
+          await aclTool(path, ...mutation);
+          const aces = await readAces(path);
+          assert.equal(aces.length, mutation[0] === "/grant" ? 3 : mutation[0] === "/remove:g" ? 1 : 2,
+            "the negative probe must actually change the fixture DACL");
+          assert.equal(await addon.verify_exact_role_acl(path, ...roles, "management-auth"), false,
+            "extra Everyone access or missing/reduced SYSTEM access must fail exact verification");
+          assert.equal(await addon.principal_access_check(path, "sid", roles[0], "read", ...roles, "management-auth"), false,
+            "a management read grant cannot bypass a malformed exact ACL");
+        } finally {
+          await addon.set_exact_role_acl(path, ...roles, "management-auth");
+        }
+        await assertManagementAcl(path);
+      }
+    }
+    t.diagnostic("Synthetic B/R read denial is UNPROVEN: no resolvable account or group expansion is exercised.");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("verified native addon enforces retained-handle, ACL, replacement, durability, and no-follow primitives", async (t) => {
   if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
     t.skip("verified native addon is not built for this checkout");

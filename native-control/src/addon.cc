@@ -765,15 +765,19 @@ bool BuildExactRoleAcl(const std::string& manager, const std::string& bot,
     result->sids.push_back(sid);
   }
   EXPLICIT_ACCESSW entries[4]{};
+  ULONG entry_count = 0;
   for (size_t i = 0; i < 4; ++i) {
-    entries[i].grfAccessPermissions = RoleRights(profile, i, directory);
-    entries[i].grfAccessMode = SET_ACCESS;
-    entries[i].grfInheritance = NO_INHERITANCE;
-    entries[i].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    entries[i].Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
-    entries[i].Trustee.ptstrName = static_cast<LPWSTR>(result->sids[i]);
+    const DWORD rights = RoleRights(profile, i, directory);
+    if (rights == 0) continue;
+    auto& entry = entries[entry_count++];
+    entry.grfAccessPermissions = rights;
+    entry.grfAccessMode = SET_ACCESS;
+    entry.grfInheritance = NO_INHERITANCE;
+    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entry.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    entry.Trustee.ptstrName = static_cast<LPWSTR>(result->sids[i]);
   }
-  return SetEntriesInAclW(4, entries, nullptr, &result->acl) == ERROR_SUCCESS;
+  return SetEntriesInAclW(entry_count, entries, nullptr, &result->acl) == ERROR_SUCCESS;
 }
 
 bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
@@ -793,11 +797,15 @@ bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
   SECURITY_DESCRIPTOR_CONTROL control = 0;
   DWORD revision = 0;
   ACL_SIZE_INFORMATION size{};
+  DWORD expected_ace_count = 0;
+  for (size_t role = 0; role < 4; ++role) {
+    if (RoleRights(profile, role, directory) != 0) ++expected_ace_count;
+  }
   bool valid = owner != nullptr && EqualSid(owner, roles.sids[required_owner_role]) &&
       GetSecurityDescriptorControl(descriptor, &control, &revision) &&
       (control & SE_DACL_PROTECTED) != 0 && applied != nullptr &&
       GetAclInformation(applied, &size, sizeof(size), AclSizeInformation) &&
-      size.AceCount == 4;
+      size.AceCount == expected_ace_count;
   bool seen[4] = {};
   for (DWORD ace_index = 0; valid && ace_index < size.AceCount; ++ace_index) {
     void* raw = nullptr;
@@ -813,7 +821,8 @@ bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
     ACCESS_ALLOWED_ACE* ace = static_cast<ACCESS_ALLOWED_ACE*>(raw);
     bool matched = false;
     for (size_t role = 0; role < 4; ++role) {
-      if (!seen[role] && ace->Mask == RoleRights(profile, role, directory) &&
+      const DWORD rights = RoleRights(profile, role, directory);
+      if (rights != 0 && !seen[role] && ace->Mask == rights &&
           EqualSid(reinterpret_cast<PSID>(&ace->SidStart), roles.sids[role])) {
         seen[role] = true; matched = true; break;
       }
@@ -821,7 +830,10 @@ bool VerifyExactRoleAcl(HANDLE handle, const std::string& manager,
     if (!matched) valid = false;
   }
   LocalFree(descriptor);
-  return valid && seen[0] && seen[1] && seen[2] && seen[3];
+  for (size_t role = 0; role < 4; ++role) {
+    if (seen[role] != (RoleRights(profile, role, directory) != 0)) return false;
+  }
+  return valid;
 }
 
 bool ApplyExactRoleAcl(HANDLE handle, const std::string& manager,
@@ -2496,8 +2508,8 @@ napi_value PrincipalAccessCheck(napi_env env, napi_callback_info info) {
           (mode == "read" || profile == RoleProfile::LegacyRetained)) {
         // Write/mutation denials stay authoritative even with an unexpanded
         // context: VerifyExactRoleAcl already proves the DACL is exactly the
-        // expected 4-ACE role ACL for this profile (owner plus one explicit
-        // per-role allow ACE with the exact expected mask), so no group ACE
+        // expected role ACL for this profile (one explicit allow ACE for
+        // each role with nonzero rights, with the exact mask), so no group ACE
         // could ever grant additional write access here regardless of
         // expansion. Read access, however, can legitimately be granted
         // through a group ACE that an unresolvable principal's unexpanded
