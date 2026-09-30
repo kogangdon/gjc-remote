@@ -1,6 +1,6 @@
 {
   "name": "gjc-remote",
-  "version": "0.4.0-rc.5",
+  "version": "0.4.0-rc.6",
   "private": true,
   "description": "Discord-controlled remote GJC sessions: bot (Discord + WS relay server) + daemon (per-host WebSocket bridge with pooled GJC SDK sessions)",
   "type": "module",
