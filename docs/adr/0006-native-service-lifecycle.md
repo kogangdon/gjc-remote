@@ -271,9 +271,10 @@ public lifecycle/status receipt.
 On Windows, the service base is `\gjc-remote` on the OS installation drive
 (for example `C:\gjc-remote`), derived by the native OS API rather than an
 environment variable. Control, staging, releases and Shawl share this base.
-Inventory and native-reader stores retain their separate ProgramData paths.
+Inventory and native-reader stores use the same OS-derived base with separate
+`native` and `native-reader` subdirectories and their own exact role ACLs.
 There is no alternate-root fallback or automatic adoption of the former
-ProgramData service store. Directory identities, witnesses and role ACLs
+ProgramData service or inventory stores. Directory identities, witnesses and role ACLs
 remain mandatory; relocation does not change the NTFS directory-flush
 contract or authorize volume flushing.
 

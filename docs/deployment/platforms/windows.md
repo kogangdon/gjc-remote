@@ -76,14 +76,23 @@ fingerprint, and Node 26.7.0 / Bun 1.4.2 runtime policy. The route stays
 SCM → Shawl → Node/Bun → application; there is no extra resident wrapper,
 health endpoint, or `sc.exe` bypass.
 
-The native service store uses `\gjc-remote` on the Windows installation drive,
+The native state base is `\gjc-remote` on the Windows installation drive,
 normally `C:\gjc-remote`, independently of the CLI's location and the component
-working directory. The native OS-derived location is not configurable through
-environment variables. Service control state, staged and published releases,
-and `supervisors\shawl` belong to this protected base; inventory/native-reader
-state still uses ProgramData. Existing ProgramData service state is not migrated
-or used as a fallback. Preserve it for operator review rather than copying its
-identity-bound records into the new store.
+working directory. The OS-derived location is not configurable through
+environment variables. Service state uses `service-control`, `staging`,
+`releases`, and `supervisors\shawl`; inventory uses the separate
+`native\<host-key>` and daemon-reader `native-reader\<host-key>` subtrees.
+Before inventory operations, externally provision the base and both inventory
+parent directories. The `native` and `native-reader` parents must have the exact
+role-specific owners and protected ACLs checked by the native capability; it
+does not create or repair these parents. There is no ProgramData fallback or
+migration for inventory state. Existing ProgramData service state is likewise
+not migrated or used as a fallback; preserve it for operator review rather than
+copying its identity-bound records into the new store.
+This inventory layout is an unreleased source correction, not published rc.7
+behavior: rc.7 continues using ProgramData for inventory/native-reader state.
+Use the OS-drive paths only after a newly signed native-control addon and
+corresponding application release are built and deployed.
 
 The new root must pass the same ownership, ACL, no-reparse and NTFS directory
 flush checks. A successful directory-flush probe is not evidence of successful

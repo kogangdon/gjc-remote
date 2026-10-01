@@ -113,8 +113,8 @@ test('observation capabilities expose closed positional signatures through the r
   assert.equal(facade.read_service_external_object.length, 4);
 });
 
-test('Windows service roots use the system drive while inventory roots remain under ProgramData', () => {
-  const systemDriveResolver = nativeFunctionBlock('bool ResolveServiceSystemDriveRoot(');
+test('Windows service and inventory roots share the OS installation drive without ProgramData fallback', () => {
+  const systemDriveResolver = nativeFunctionBlock('bool ResolveWindowsSystemDriveRoot(');
   const serviceRoot = nativeFunctionBlock('bool ResolveServiceStoreRoot(');
   const baseContainer = nativeFunctionBlock('bool ResolveServiceBaseContainer(');
   const shawlParent = nativeFunctionBlock('ShawlParentState PrepareShawlServiceParent(');
@@ -136,7 +136,7 @@ test('Windows service roots use the system drive while inventory roots remain un
     ['PrepareShawlServiceParent', shawlParent],
     ['ServiceObservationFixedRootIdentity', observationRoot],
   ]) {
-    assert.match(block, /ResolveServiceSystemDriveRoot\s*\(/, `${name} uses the system-drive resolver`);
+    assert.match(block, /ResolveWindowsSystemDriveRoot\s*\(/, `${name} uses the system-drive resolver`);
     assert.doesNotMatch(block, /FOLDERID_ProgramData|SHGetKnownFolderPath/, `${name} does not derive its root from ProgramData`);
   }
 
@@ -149,7 +149,7 @@ test('Windows service roots use the system drive while inventory roots remain un
   assert.notEqual(absentStart, -1, 'fixed-root absence branch exists');
   assert.notEqual(absentEnd, -1, 'fixed-root absence branch ends');
   const absentBranch = observationRoot.slice(absentStart, absentEnd);
-  assert.match(absentBranch, /ResolveServiceSystemDriveRoot\s*\(/);
+  assert.match(absentBranch, /ResolveWindowsSystemDriveRoot\s*\(/);
   assert.doesNotMatch(absentBranch, /FOLDERID_ProgramData|SHGetKnownFolderPath/);
 
   assert.match(baseContainer, /spec->name = "gjc-remote"/);
@@ -165,15 +165,19 @@ test('Windows service roots use the system drive while inventory roots remain un
     nativeFunctionBlock('bool VerifyInventoryBaseWindows('),
     nativeFunctionBlock('bool OpenInventoryParentBoundWindows('),
   ];
+  const inventoryBase = nativeFunctionBlock('bool ResolveWindowsInventoryBasePath(');
+  assert.match(inventoryBase, /ResolveWindowsSystemDriveRoot\s*\(/);
+  assert.match(inventoryBase, /system_drive_root \+ "gjc-remote"/);
+  assert.match(inventoryBase, /native-reader/);
+  assert.match(inventoryBase, /\\native/);
   for (const block of inventoryFunctions) {
-    assert.match(block, /FOLDERID_ProgramData/);
-    assert.match(block, /native-reader/);
-    assert.match(block, /\\native/);
+    assert.match(block, /ResolveWindowsInventoryBasePath\s*\(/);
+    assert.doesNotMatch(block, /FOLDERID_ProgramData|SHGetKnownFolderPath/);
   }
   assert.equal(
     [...source.matchAll(/FOLDERID_ProgramData/g)].length,
-    inventoryFunctions.length,
-    'all remaining ProgramData roots belong to inventory/native-reader derivations',
+    0,
+    'no native state root falls back to ProgramData',
   );
 });
 

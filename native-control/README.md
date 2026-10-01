@@ -14,6 +14,21 @@ authority:
 - the management inventory leaf for the host; and
 - the daemon reader leaf for the same host.
 
+On Windows, these leaves are separate OS-drive subtrees:
+`<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
+`<OS-drive>:\gjc-remote\native-reader\<host-key>` for the daemon reader.
+This is an unreleased source correction: published rc.7 continues to use
+ProgramData for inventory/native-reader state. Use these OS-drive paths only
+after a newly signed native-control addon and corresponding application release
+are built and deployed.
+Service state uses different children of `<OS-drive>:\gjc-remote`, including
+`service-control`, `staging`, `releases`, and `supervisors\shawl`. Before
+inventory operations, the base and both inventory parent directories must be
+externally provisioned; `native` and `native-reader` must have the exact
+role-specific owners and protected ACLs validated by the native capability.
+There is no ProgramData fallback or migration. The native capability does not
+create or repair the base or inventory-parent directories.
+
 The publisher creates neither leaf and never creates, replaces, or advances the
 reader floor. UNC workspace inputs are accepted by the schema but are
 deterministically refused by the native capability when no supported
@@ -438,8 +453,12 @@ The current candidate contract is `v0.4.0-rc.7` with native-control 2.0.0
 version. Existing rc.1/rc.2/rc.3/rc.4/rc.5/rc.6 releases and artifacts remain historical,
 immutable inputs, not renamed rc.7 candidates; every rc.7 application archive
 must be built from a clean checkout of the exact rc.7 tag. The rc.5 native
-addon changes the Windows service-only root to the OS installation drive's
+addon moves Windows service state under the OS installation drive's
 `\gjc-remote` directory; it does not migrate the old ProgramData service store.
+The inventory relocation described above is an unreleased source change:
+published rc.7 still resolves inventory/native-reader state under ProgramData.
+A newly signed native-control addon and corresponding application release must
+be built and deployed before the OS-drive inventory paths apply.
 The rc.6 native addon fixes Windows management-auth private ACL validation to
 require only the effective management and SYSTEM roles (PR #255), without
 zero-rights bot or recovery ACEs.
