@@ -147,9 +147,7 @@ test("inventory ACL verification atomically binds the requested actor", (t) => {
     return;
   }
   const hostKey = "0".repeat(64);
-  const root = process.platform === "win32"
-    ? join(process.env.ProgramData, "gjc-remote", "native", hostKey)
-    : `/var/lib/gjc-remote/native/${hostKey}`;
+  const root = addon.resolve_native_state_root(hostKey, "inventory");
   assert.throws(
     () => addon.verify_inventory_acl(root, roles, "inventory-directory", "daemon"),
     (error) => error.code === "INVENTORY_ACCESS_DENIED" &&

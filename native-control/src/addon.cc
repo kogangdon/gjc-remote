@@ -32,7 +32,6 @@
 #include <bcrypt.h>
 #include <aclapi.h>
 #include <authz.h>
-#include <shlobj.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "authz.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -334,6 +333,36 @@ std::string Utf8(const std::wstring& input) {
   std::string output(n, '\0');
   WideCharToMultiByte(CP_UTF8, 0, input.data(), static_cast<int>(input.size()), output.data(), n, nullptr, nullptr);
   return output;
+}
+// Shared OS-installation-drive anchor for service and inventory state.
+bool ResolveWindowsSystemDriveRoot(std::string* root) {
+  if (!root) return false;
+  root->clear();
+  std::vector<wchar_t> windows_directory(MAX_PATH);
+  UINT length = GetSystemWindowsDirectoryW(
+      windows_directory.data(),
+      static_cast<UINT>(windows_directory.size()));
+  if (length == 0) return false;
+  if (length >= windows_directory.size()) {
+    if (length == std::numeric_limits<UINT>::max()) return false;
+    windows_directory.resize(static_cast<size_t>(length) + 1);
+    length = GetSystemWindowsDirectoryW(
+        windows_directory.data(),
+        static_cast<UINT>(windows_directory.size()));
+    if (length == 0 || length >= windows_directory.size()) return false;
+  }
+  const std::wstring windows_path(windows_directory.data(), length);
+  if (windows_path.size() < 2 ||
+      !((windows_path[0] >= L'A' && windows_path[0] <= L'Z') ||
+        (windows_path[0] >= L'a' && windows_path[0] <= L'z')) ||
+      windows_path[1] != L':' ||
+      (windows_path.size() > 2 && windows_path[2] != L'\\')) {
+    return false;
+  }
+  const wchar_t drive = windows_path[0] >= L'a' && windows_path[0] <= L'z'
+      ? windows_path[0] - L'a' + L'A' : windows_path[0];
+  *root = std::string(1, static_cast<char>(drive)) + ":\\";
+  return true;
 }
 enum class VerifiedObjectType { Any, File, Directory };
 // Win32 OPEN_REPARSE_POINT does not protect intermediate components. Resolve each
@@ -2934,6 +2963,18 @@ const char* InventoryParentProfile(const std::string& profile) {
   return profile == "reader-directory" || profile == "inventory-floor" ? "reader-directory" :
       "inventory-directory";
 }
+bool ResolveWindowsInventoryBasePath(const std::string& profile,
+                                     std::string* base_path) {
+  if (!base_path ||
+      (profile != "inventory-directory" && profile != "reader-directory")) {
+    return false;
+  }
+  std::string system_drive_root;
+  if (!ResolveWindowsSystemDriveRoot(&system_drive_root)) return false;
+  *base_path = system_drive_root + "gjc-remote" +
+      (profile == "reader-directory" ? "\\native-reader" : "\\native");
+  return true;
+}
 bool CanonicalUserSid(const std::string& text, bool system) {
   static constexpr DWORD kMaximumAccountUnits = 4096;
   PSID sid = nullptr;
@@ -3018,11 +3059,9 @@ bool CurrentInventoryActor(const InventoryRoles& roles, bool management, bool da
 }
 bool InventoryPath(const std::string& path, const std::string& profile) {
   bool directory; if (!InventoryProfile(profile, &directory)) return false;
-  PWSTR program_data = nullptr;
-  if (FAILED(SHGetKnownFolderPath(FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &program_data))) return false;
-  const std::string root = Utf8(program_data); CoTaskMemFree(program_data);
-  const std::string base = root + (profile == "reader-directory" || profile == "inventory-floor" ?
-      "\\gjc-remote\\native-reader\\" : "\\gjc-remote\\native\\");
+  std::string base;
+  if (!ResolveWindowsInventoryBasePath(InventoryParentProfile(profile), &base)) return false;
+  base += "\\";
   if (path.rfind(base, 0) != 0) return false;
   const std::string rest = path.substr(base.size());
   if (rest.size() < 64 || !InventoryHostKey(rest.substr(0, 64))) return false;
@@ -3163,12 +3202,13 @@ napi_value ResolveInventoryStateRootWindows(napi_env env, napi_callback_info inf
       !InventoryString(env, args[1], &kind) || !InventoryHostKey(host) || (kind != "inventory" && kind != "reader")) {
     InventoryError(env, "INVENTORY_INVALID", "resolve_native_state_root"); return nullptr;
   }
-  PWSTR base = nullptr;
-  if (FAILED(SHGetKnownFolderPath(FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &base))) {
+  std::string base;
+  const std::string profile = kind == "reader" ? "reader-directory" : "inventory-directory";
+  if (!ResolveWindowsInventoryBasePath(profile, &base)) {
     InventoryError(env, "CONTAINMENT_UNSUPPORTED", "resolve_native_state_root"); return nullptr;
   }
-  const std::string path = Utf8(base) + (kind == "inventory" ? "\\gjc-remote\\native\\" : "\\gjc-remote\\native-reader\\") + host;
-  CoTaskMemFree(base); napi_value result; napi_create_string_utf8(env, path.c_str(), NAPI_AUTO_LENGTH, &result); return result;
+  const std::string path = base + "\\" + host;
+  napi_value result; napi_create_string_utf8(env, path.c_str(), NAPI_AUTO_LENGTH, &result); return result;
 }
 bool ValidWindowsVolumeGuid(const std::wstring& value) {
   if (value.size() != 49 || value.rfind(L"\\\\?\\VOLUME{", 0) != 0 ||
@@ -3350,29 +3390,22 @@ bool VerifyInventoryAcl(HANDLE handle, const InventoryRoles& roles, const std::s
   return ok && seen[0] && seen[1] && seen[2] && seen[3];
 }
 bool VerifyInventoryBaseWindows(const InventoryRoles& roles, const std::string& profile) {
-  PWSTR program_data = nullptr;
-  if (FAILED(SHGetKnownFolderPath(FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &program_data))) return false;
-  const std::string base = Utf8(program_data) +
-      (std::string(InventoryParentProfile(profile)) == "reader-directory" ?
-          "\\gjc-remote\\native-reader" : "\\gjc-remote\\native");
-  CoTaskMemFree(program_data);
+  const std::string parent_profile = InventoryParentProfile(profile);
+  std::string base;
+  if (!ResolveWindowsInventoryBasePath(parent_profile, &base)) return false;
   HANDLE handle = OpenWindowsPathNoFollow(base, READ_CONTROL | FILE_READ_ATTRIBUTES,
       VerifiedObjectType::Directory);
   const bool exact = handle != INVALID_HANDLE_VALUE &&
-      VerifyInventoryAcl(handle, roles, InventoryParentProfile(profile));
+      VerifyInventoryAcl(handle, roles, parent_profile);
   if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
   return exact;
 }
 bool OpenInventoryParentBoundWindows(const std::string& path, const InventoryRoles& roles,
                                      const std::string& profile, DWORD access,
                                      HANDLE* parent, std::wstring* name) {
-  PWSTR program_data = nullptr;
-  if (FAILED(SHGetKnownFolderPath(
-          FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &program_data))) return false;
-  const std::string base_path = Utf8(program_data) +
-      (std::string(InventoryParentProfile(profile)) == "reader-directory" ?
-          "\\gjc-remote\\native-reader" : "\\gjc-remote\\native");
-  CoTaskMemFree(program_data);
+  const std::string parent_profile = InventoryParentProfile(profile);
+  std::string base_path;
+  if (!ResolveWindowsInventoryBasePath(parent_profile, &base_path)) return false;
   if (path.rfind(base_path + "\\", 0) != 0) return false;
   const std::string relative = path.substr(base_path.size() + 1);
   const std::wstring host = Wide(relative.substr(0, 64));
@@ -3382,7 +3415,7 @@ bool OpenInventoryParentBoundWindows(const std::string& path, const InventoryRol
           (host_target ? access : 0),
       VerifiedObjectType::Directory);
   if (base == INVALID_HANDLE_VALUE ||
-      !VerifyInventoryAcl(base, roles, InventoryParentProfile(profile))) {
+      !VerifyInventoryAcl(base, roles, parent_profile)) {
     if (base != INVALID_HANDLE_VALUE) CloseHandle(base);
     return false;
   }
@@ -3396,7 +3429,7 @@ bool OpenInventoryParentBoundWindows(const std::string& path, const InventoryRol
       kFileOpen, VerifiedObjectType::Directory);
   CloseHandle(base);
   if (host_root == INVALID_HANDLE_VALUE ||
-      !VerifyInventoryAcl(host_root, roles, InventoryParentProfile(profile))) {
+      !VerifyInventoryAcl(host_root, roles, parent_profile)) {
     if (host_root != INVALID_HANDLE_VALUE) CloseHandle(host_root);
     return false;
   }
@@ -10379,38 +10412,6 @@ bool SamePhysicalDirectoryIdentity(const ServiceStoreIdentity& left,
 #endif
 }
 
-#ifdef _WIN32
-bool ResolveServiceSystemDriveRoot(std::string* root) {
-  if (!root) return false;
-  root->clear();
-  std::vector<wchar_t> windows_directory(MAX_PATH);
-  UINT length = GetSystemWindowsDirectoryW(
-      windows_directory.data(),
-      static_cast<UINT>(windows_directory.size()));
-  if (length == 0) return false;
-  if (length >= windows_directory.size()) {
-    if (length == std::numeric_limits<UINT>::max()) return false;
-    windows_directory.resize(static_cast<size_t>(length) + 1);
-    length = GetSystemWindowsDirectoryW(
-        windows_directory.data(),
-        static_cast<UINT>(windows_directory.size()));
-    if (length == 0 || length >= windows_directory.size()) return false;
-  }
-  const std::wstring windows_path(windows_directory.data(), length);
-  if (windows_path.size() < 2 ||
-      !((windows_path[0] >= L'A' && windows_path[0] <= L'Z') ||
-        (windows_path[0] >= L'a' && windows_path[0] <= L'z')) ||
-      windows_path[1] != L':' ||
-      (windows_path.size() > 2 && windows_path[2] != L'\\')) {
-    return false;
-  }
-  const wchar_t drive = windows_path[0] >= L'a' && windows_path[0] <= L'z'
-      ? windows_path[0] - L'a' + L'A' : windows_path[0];
-  *root = std::string(1, static_cast<char>(drive)) + ":\\";
-  return true;
-}
-#endif
-
 bool ResolveServiceStoreRoot(const std::string& root_kind,
                              std::string* parent_path,
                              std::string* name,
@@ -10419,7 +10420,7 @@ bool ResolveServiceStoreRoot(const std::string& root_kind,
       root_kind != "releases" && root_kind != "shawl") return false;
 #ifdef _WIN32
   std::string system_drive_root;
-  if (!ResolveServiceSystemDriveRoot(&system_drive_root)) return false;
+  if (!ResolveWindowsSystemDriveRoot(&system_drive_root)) return false;
   const std::string base_path = system_drive_root + "gjc-remote";
   if (root_kind == "shawl") {
     *parent_path = base_path + "\\supervisors";
@@ -10841,7 +10842,7 @@ bool ResolveServiceBaseContainer(
     const std::string& root_kind, ServiceContainerSpec* spec) {
 #ifdef _WIN32
   (void)root_kind;
-  if (!ResolveServiceSystemDriveRoot(&spec->anchor_path)) return false;
+  if (!ResolveWindowsSystemDriveRoot(&spec->anchor_path)) return false;
   spec->name = "gjc-remote";
   spec->witness_name = ".gjc-service-platform-container.v1";
   spec->identity = "system-drive-gjc-remote";
@@ -10913,7 +10914,7 @@ ShawlParentState PrepareShawlServiceParent(
     bool* ambiguous) {
   *ambiguous = false;
   std::string system_drive_root;
-  if (!ResolveServiceSystemDriveRoot(&system_drive_root)) {
+  if (!ResolveWindowsSystemDriveRoot(&system_drive_root)) {
     return ShawlParentState::IoFailed;
   }
   const std::string base_path = system_drive_root + "gjc-remote";
@@ -16355,7 +16356,7 @@ bool ServiceObservationFixedRootIdentity(
   if (*writes != 0) return false;
   if (base_state == ServiceContainerState::Absent) {
     std::string system_drive_root;
-    if (!ResolveServiceSystemDriveRoot(&system_drive_root)) return false;
+    if (!ResolveWindowsSystemDriveRoot(&system_drive_root)) return false;
     HANDLE anchor = OpenWindowsPathNoFollow(
         system_drive_root, READ_CONTROL | FILE_READ_ATTRIBUTES,
         VerifiedObjectType::Directory);

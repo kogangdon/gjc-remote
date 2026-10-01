@@ -14,6 +14,10 @@ const nativeBuildVerifier = readFileSync(
   new URL('../scripts/verify-build.mjs', import.meta.url),
   'utf8',
 ).replaceAll('\r\n', '\n');
+const nativeAddon = readFileSync(
+  new URL('../src/addon.cc', import.meta.url),
+  'utf8',
+).replaceAll('\r\n', '\n');
 const nativeProvenance = readFileSync(
   new URL('../src/native-provenance.js', import.meta.url),
   'utf8',
@@ -94,6 +98,21 @@ function blockScalarLines(value) {
   return value.trim().split('\n');
 }
 
+function nativeFunctionBody(signature) {
+  const start = nativeAddon.indexOf(signature);
+  assert.notEqual(start, -1, `native addon must contain ${signature}`);
+  const opening = nativeAddon.indexOf('{', start);
+  assert.notEqual(opening, -1, `${signature} must have a function body`);
+  let depth = 0;
+  for (let index = opening; index < nativeAddon.length; index += 1) {
+    if (nativeAddon[index] === '{') depth += 1;
+    if (nativeAddon[index] === '}' && --depth === 0) {
+      return nativeAddon.slice(start, index + 1);
+    }
+  }
+  assert.fail(`${signature} has an unterminated function body`);
+}
+
 function evaluateConjunctiveWorkflowCondition(condition, context) {
   const wrappedExpression = condition.match(/^\$\{\{\s*(.*?)\s*\}\}$/);
   assert.ok(wrappedExpression, `invalid workflow condition: ${condition}`);
@@ -168,6 +187,38 @@ test('Windows Release build replaces inherited options with deterministic linker
   ]) {
     assert.equal(tool.AdditionalOptions, undefined);
   }
+});
+
+test('Windows inventory paths share the OS-drive base and stay separate from service paths', () => {
+  const inventoryBase = nativeFunctionBody('bool ResolveWindowsInventoryBasePath(');
+  assert.match(inventoryBase, /ResolveWindowsSystemDriveRoot\(&system_drive_root\)/);
+  assert.match(inventoryBase, /system_drive_root \+ "gjc-remote"/);
+  assert.match(inventoryBase, /"\\\\native-reader" : "\\\\native"/);
+
+  assert.match(
+    nativeFunctionBody('bool InventoryPath('),
+    /ResolveWindowsInventoryBasePath\(InventoryParentProfile\(profile\), &base\)/,
+  );
+  const inventoryRoot = nativeFunctionBody('napi_value ResolveInventoryStateRootWindows(');
+  assert.match(inventoryRoot, /ResolveWindowsInventoryBasePath\(profile, &base\)/);
+  assert.match(inventoryRoot, /base \+ "\\\\" \+ host/);
+  assert.match(
+    nativeFunctionBody('bool VerifyInventoryBaseWindows('),
+    /ResolveWindowsInventoryBasePath\(parent_profile, &base\)/,
+  );
+  const parentOpen = nativeFunctionBody('bool OpenInventoryParentBoundWindows(');
+  assert.match(parentOpen, /ResolveWindowsInventoryBasePath\(parent_profile, &base_path\)/);
+  assert.match(parentOpen, /path\.rfind\(base_path \+ "\\\\", 0\)/);
+  assert.match(parentOpen, /OpenWindowsPathNoFollow\(base_path/);
+  assert.match(parentOpen, /OpenWindowsRelative\(base, host/);
+
+  const serviceRoot = nativeFunctionBody('bool ResolveServiceStoreRoot(');
+  assert.match(serviceRoot, /ResolveWindowsSystemDriveRoot\(&system_drive_root\)/);
+  assert.match(serviceRoot, /system_drive_root \+ "gjc-remote"/);
+  assert.match(serviceRoot, /"service-control"/);
+  assert.match(serviceRoot, /"\\\\supervisors"/);
+  assert.match(serviceRoot, /"\/var\/lib\/gjc-remote"/);
+  assert.match(serviceRoot, /"\/opt\/gjc-remote"/);
 });
 
 test('CI promotes target-preserving signing inputs only for successful main pushes', () => {
