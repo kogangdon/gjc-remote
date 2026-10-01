@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.8] - 2026-10-01
+
+### Fixed
+
+- Move Windows inventory and daemon-reader state under the OS-derived
+  `<OS-drive>:\gjc-remote` tree shared with service state (PR #259, source
+  `91fe87f7baa5b8da9e501f1f74f77ee7385bab76`). Preserve role-specific owners,
+  protected ACLs, no-reparse checks, and NTFS directory-flush requirements.
+  There is no ProgramData fallback or migration; Linux paths and behavior are
+  unchanged.
+
+### Verification limits
+
+- This entry prepares a new release candidate; it does not claim publication,
+  installation, or deployment qualification. Signed service startup,
+  shutdown, reboot and power-loss qualification remain separate evidence.
+- Native-control remains 2.0.0 (contract 5 revision 1); rc.8 requires fresh
+  native signing inputs from its exact source commit. Published rc.7 and earlier
+  artifacts remain immutable and must not be reused as rc.8 native inputs.
+
 ## [0.4.0-rc.7] - 2026-10-01
 
 ### Fixed
