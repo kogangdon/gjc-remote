@@ -86,6 +86,12 @@ function safeErrorCode(error) {
 function safeErrorAmbiguous(error) {
   try { return error?.ambiguous === true; } catch { return false; }
 }
+function safeErrorAmbiguity(error) {
+  try {
+    const ambiguous = error?.ambiguous;
+    return typeof ambiguous === 'boolean' ? ambiguous : null;
+  } catch { return null; }
+}
 function exactZeroWriteError(error, code, operation) {
   try {
     return error?.code === code && error?.operation === operation &&
@@ -993,12 +999,14 @@ export class ServiceLifecycle {
       const errorCode = safeErrorCode(error);
       if (tx && (safeErrorAmbiguous(error) || errorCode === 'SERVICE_MANUAL_CLEANUP' || errorCode === 'SERVICE_SCOPE_MISMATCH' || errorCode === 'SERVICE_STALE')) await this.#persistManual(session, tx, operation, error, driver);
       if (error?.name === 'ServiceLifecycleError') throw error;
-      const wrapped = error instanceof Error ? error : new Error(String(error));
-      wrapped.name = 'ServiceLifecycleError'; wrapped.operation = operation; wrapped.writes = writesOf(session, driver);
-      // Preserve only the bounded error context accepted by the public CLI
-      // when a dependency throws a plain object instead of an Error.
-      if (wrapped !== error && errorCode !== null) wrapped.code = errorCode;
-      if (wrapped !== error && safeErrorAmbiguous(error)) wrapped.ambiguous = true;
+      const wrapped = new Error(`${operation} failed`);
+      wrapped.name = 'ServiceLifecycleError';
+      if (errorCode !== null) wrapped.code = errorCode;
+      wrapped.operation = operation;
+      wrapped.writes = writesOf(session, driver);
+      const ambiguous = safeErrorAmbiguity(error);
+      if (ambiguous !== null) wrapped.ambiguous = ambiguous;
+      Object.defineProperty(wrapped, 'cause', { value: error });
       throw wrapped;
     } finally { try { await acquisition?.close?.(); } finally { required(session, 'close', 'close_service_store'); } }
   }

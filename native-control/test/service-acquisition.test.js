@@ -172,6 +172,7 @@ function buildRelease({
   windowsFoldedPrimaryAlias = false,
   aliasMarkerFile = false,
   nodeModulesOnlyShadowAlias = false,
+  additionalPayloadEntries = 0,
   applicationSequence = 7,
   shawlSequence = 3,
 } = {}) {
@@ -286,6 +287,11 @@ function buildRelease({
       bytes: Buffer.from('node_modules-only shadow alias\n'),
       executablePolicy: 'forbidden',
     }] : []),
+    ...Array.from({ length: additionalPayloadEntries }, (_, index) => ({
+      path: `large-inventory/entry-${String(index).padStart(5, '0')}.bin`,
+      bytes: Buffer.alloc(0),
+      executablePolicy: 'forbidden',
+    })),
   ].filter((record) => !omit.includes(record.path));
   const inventory = buildBundleInventory({
     payloadEntries: payload.map((record) => ({
@@ -416,6 +422,7 @@ function buildRelease({
     architecture,
     application,
     shawl,
+    inventory,
     source,
     paths,
     files,
@@ -564,6 +571,7 @@ function deferred() {
 
 function modeledSession(release, prepared, {
   initialWrites = 2,
+  captureApplicationInventoryDigest = false,
   cloneRetainResult = false,
   stageGate = null,
   failAccessClose = false,
@@ -588,6 +596,7 @@ function modeledSession(release, prepared, {
     sessionCloseCalls: 0,
     manifestAuthorities: [],
     afterAccessOpened: null,
+    applicationInventoryDigest: null,
   };
   const expectedManifest = (purpose) => purpose === 'application'
     ? release.application
@@ -743,6 +752,9 @@ function modeledSession(release, prepared, {
         state.log.push(`prepare:${purpose}`);
         if (purpose === 'application') {
           const inventory = parseCanonicalJsonBytes(inventoryBytes, INVENTORY_LIMITS);
+          if (captureApplicationInventoryDigest) {
+            state.applicationInventoryDigest = canonicalJsonHash(inventory, INVENTORY_LIMITS);
+          }
           expected = new Map([[APPLICATION_BUNDLE_INVENTORY_PATH, {
             size: manifest.inventory.byteLength,
             sha256: manifest.inventory.sha256,
@@ -1388,6 +1400,84 @@ test('modeled composition: Windows retains both envelopes before either floor an
   assert.equal(harness.session.controls.state.borrowed, 0);
   assert.equal(harness.offline.handles.size, 0);
   await harness.acquisition.close();
+});
+
+test('Windows acquisition hashes large inventories during preinspection and publish, and rejects archive tampering', async () => {
+  const release = buildRelease({ platform: 'win32', additionalPayloadEntries: 10_000 });
+  assert.ok(release.inventory.payloadEntryCount > 10_000);
+  assert.equal(release.inventory.payloadEntryCount, release.payload.length);
+  assert.throws(() => canonicalJsonHash(release.inventory), {
+    name: 'RangeError',
+    message: 'JSON exceeds its node limit',
+  });
+  const expectedInventoryDigest = canonicalJsonHash(release.inventory, INVENTORY_LIMITS);
+
+  const harness = createHarness(
+    release,
+    { captureApplicationInventoryDigest: true },
+    { chunkBytes: 64 * 1024 },
+  );
+  try {
+    const read = await harness.acquisition.readManifests();
+    const reservation = harness.acquisition.reserve({
+      transaction: harness.prepared,
+      currentApplicationSequence: 1,
+      currentShawlSequence: 1,
+    });
+    assert.equal(reservation.application.purpose, 'application');
+    assert.equal(reservation.shawl.purpose, 'shawl');
+    harness.session.controls.appendSequenceReserved(harness.reserved);
+
+    const published = await harness.acquisition.publish({ transaction: harness.reserved });
+    assert.equal(published.application.manifest, read.application);
+    assert.equal(published.shawl.manifest, read.shawl);
+    assert.equal(
+      harness.session.controls.state.applicationInventoryDigest,
+      expectedInventoryDigest,
+    );
+    assert.equal(harness.session.controls.state.borrowed, 0);
+    assert.equal(harness.offline.handles.size, 0);
+  } finally {
+    await harness.acquisition.close();
+  }
+
+  const tamperedHarness = createHarness(
+    release,
+    { captureApplicationInventoryDigest: true },
+    { chunkBytes: 64 * 1024 },
+  );
+  try {
+    await tamperedHarness.acquisition.readManifests();
+    const reservation = tamperedHarness.acquisition.reserve({
+      transaction: tamperedHarness.prepared,
+      currentApplicationSequence: 1,
+      currentShawlSequence: 1,
+    });
+    assert.equal(reservation.application.purpose, 'application');
+    assert.equal(reservation.shawl.purpose, 'shawl');
+    tamperedHarness.session.controls.appendSequenceReserved(tamperedHarness.reserved);
+
+    const tamperedArchive = Buffer.from(release.files.get(release.paths.applicationArchivePath));
+    tamperedArchive[0] ^= 1;
+    release.files.set(release.paths.applicationArchivePath, tamperedArchive);
+    await assert.rejects(
+      tamperedHarness.acquisition.publish({ transaction: tamperedHarness.reserved }),
+      acquisitionError(
+        'DEPLOYMENT_SOURCE_IDENTITY_MISMATCH',
+        'publish_service_acquisition',
+      ),
+    );
+    assert.equal(tamperedHarness.session.controls.state.applicationInventoryDigest, null);
+    assert.equal(
+      tamperedHarness.session.controls.state.log.includes('stage:application:start'),
+      false,
+    );
+    assert.equal(tamperedHarness.session.controls.state.log.includes('publish:application'), false);
+    assert.equal(tamperedHarness.session.controls.state.borrowed, 0);
+    assert.equal(tamperedHarness.offline.handles.size, 0);
+  } finally {
+    await tamperedHarness.acquisition.close();
+  }
 });
 
 test('Windows acquisition refuses altered path intents and publication evidence before committing', async (t) => {

@@ -89,16 +89,16 @@ does not create or repair these parents. There is no ProgramData fallback or
 migration for inventory state. Existing ProgramData service state is likewise
 not migrated or used as a fallback; preserve it for operator review rather than
 copying its identity-bound records into the new store. PR #259 (source commit
-`91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) moves Windows inventory and
+`91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) moved Windows inventory and
 daemon-reader storage into the same OS-derived `\gjc-remote` tree as service
-state. This is the v0.4.0-rc.8 source candidate; published rc.7 remains
-immutable and continues using ProgramData for inventory/native-reader state.
-This documentation does not claim rc.8 publication, installation, deployment,
-or service qualification. Use the OS-drive inventory paths only after a newly
-signed native-control addon and corresponding application release are built
-from the immutable `v0.4.0-rc.8` tag commit and its successful main-CI
-promotion inputs, then deployed. The PR #259 commit identifies the fix rather
-than the later release/tag commit. Linux paths and behavior are unchanged.
+state. The layout is present in published and deployed rc.8; published rc.7
+remains immutable and continues using ProgramData for inventory/native-reader
+state. This documentation describes the current v0.4.0-rc.9 source candidate
+and makes no rc.9 publication, signing, installation, or deployment claim. Any
+rc.9 application archive and fresh signed native-control addon must use only
+the future immutable `v0.4.0-rc.9` tag commit and its successful main-CI
+promotion inputs. The known fix parent `8bfcb91` and the PR #259 commit identify
+fixes, not the later release/tag source. Linux paths and behavior are unchanged.
 
 The new root must pass the same ownership, ACL, no-reparse and NTFS directory
 flush checks. A successful directory-flush probe is not evidence of successful

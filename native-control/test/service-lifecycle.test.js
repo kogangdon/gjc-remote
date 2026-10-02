@@ -405,7 +405,7 @@ test('Windows rollback retains its authenticated Shawl publication through relea
       predecessorManifestFingerprint: application.manifestFingerprint,
     },
     acceptServiceDisruption: true,
-  }), (error) => error === stoppedAtPlanner);
+  }), (error) => error.name === 'ServiceLifecycleError' && error.cause === stoppedAtPlanner);
   assert.deepEqual(calls, ['application-verified', 'shawl-verified', 'plan', 'close']);
   assert.equal(session.writes, 0);
 });
@@ -427,7 +427,7 @@ function windowsShawlIntent(manifest) {
   return Object.freeze({ ...fields, intentFingerprint: canonicalJsonHash(fields) });
 }
 
-function windowsCandidateFixture(signedEntrypoint, store = null) {
+function windowsCandidateFixture(signedEntrypoint, store = null, acquisitionOverride = null) {
   const calls = [];
   const stoppedAtPlanner = new Error('stopped at planner');
   const manifest = windowsApplicationManifest({
@@ -470,7 +470,7 @@ function windowsCandidateFixture(signedEntrypoint, store = null) {
   };
   const lifecycle = createServiceLifecycle({
     platform: 'win32', architecture: 'x64', native: {},
-    store: store ?? { openMutation: () => session }, acquisition,
+    store: store ?? { openMutation: () => session }, acquisition: acquisitionOverride ?? acquisition,
     compatibility: () => assert.fail('must not continue past planning'),
     observeApplication: () => assert.fail('must not start'),
     driver: () => assert.fail('must not construct a driver before planning'),
@@ -507,7 +507,7 @@ function windowsCandidateFixture(signedEntrypoint, store = null) {
 
 test('Windows candidate launch plans the signed entrypoint digest over write-free intents', async () => {
   const fixture = windowsCandidateFixture(Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }));
-  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === fixture.stoppedAtPlanner);
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error.name === 'ServiceLifecycleError' && error.cause === fixture.stoppedAtPlanner);
   assert.deepEqual(fixture.calls, ['plan-location:application', 'plan-location:shawl', 'plan', 'acquisition-close', 'session-close']);
   assert.equal(fixture.session.writes, 0);
 });
@@ -529,10 +529,90 @@ test('first install bootstraps only after an exact absent-store result', async (
     Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
     store,
   );
-  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === fixture.stoppedAtPlanner);
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error.name === 'ServiceLifecycleError' && error.cause === fixture.stoppedAtPlanner);
   assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap']);
   assert.deepEqual(fixture.calls, ['plan-location:application', 'plan-location:shawl', 'plan', 'acquisition-close', 'session-close']);
   assert.equal(fixture.session.writes, 0);
+});
+
+test('immutable acquisition errors retain safe metadata and bootstrap writes without leaking diagnostics', async () => {
+  class ImmutableServiceAcquisitionError extends Error {
+    constructor() {
+      super('private acquisition diagnostic');
+      Object.defineProperties(this, {
+        name: { value: 'ServiceAcquisitionError' },
+        code: { value: 'SERVICE_ACCESS_DENIED', enumerable: true },
+        operation: { value: 'read_service_acquisition_manifests', enumerable: true },
+        writes: { value: 1, enumerable: true },
+        ambiguous: { value: true, enumerable: true },
+      });
+    }
+  }
+  const acquisitionError = new ImmutableServiceAcquisitionError();
+  const storeCalls = [];
+  let fixture;
+  const store = {
+    openMutation() {
+      storeCalls.push('open-mutation');
+      throw lifecycleStoreError('SERVICE_STORE_ABSENT', 'open_service_store');
+    },
+    bootstrap() {
+      storeCalls.push('bootstrap');
+      fixture.session.writes = 3;
+      return fixture.session;
+    },
+  };
+  const acquisition = {
+    readManifests() { throw acquisitionError; },
+    reserve: () => assert.fail('must not reserve before the prepared transaction'),
+    publish: () => assert.fail('must not publish before the prepared transaction'),
+    close: () => fixture.calls.push('acquisition-close'),
+  };
+  fixture = windowsCandidateFixture(
+    Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
+    store,
+    acquisition,
+  );
+
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => {
+    assert.notEqual(error, acquisitionError);
+    assert.equal(error.name, 'ServiceLifecycleError');
+    assert.equal(error.code, 'SERVICE_ACCESS_DENIED');
+    assert.equal(error.operation, 'install');
+    assert.equal(error.writes, 3);
+    assert.equal(error.ambiguous, true);
+    assert.deepEqual(Object.keys(error), ['name', 'code', 'operation', 'writes', 'ambiguous']);
+    for (const key of ['code', 'operation', 'writes', 'ambiguous']) {
+      const descriptor = Object.getOwnPropertyDescriptor(error, key);
+      assert.equal(descriptor.enumerable, true);
+      assert.equal(descriptor.get, undefined);
+      assert.equal(descriptor.set, undefined);
+    }
+    assert.equal(error.cause, acquisitionError);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause').enumerable, false);
+    assert.equal(error.message, 'install failed');
+    assert.doesNotMatch(error.message, /private acquisition diagnostic/);
+    assert.doesNotMatch(error.stack, /private acquisition diagnostic/);
+    return true;
+  });
+
+  assert.equal(acquisitionError.message, 'private acquisition diagnostic');
+  assert.deepEqual(
+    ['name', 'code', 'operation', 'writes', 'ambiguous'].map((key) => [
+      key, acquisitionError[key], Object.getOwnPropertyDescriptor(acquisitionError, key).writable,
+    ]),
+    [
+      ['name', 'ServiceAcquisitionError', false],
+      ['code', 'SERVICE_ACCESS_DENIED', false],
+      ['operation', 'read_service_acquisition_manifests', false],
+      ['writes', 1, false],
+      ['ambiguous', true, false],
+    ],
+  );
+  assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap']);
+  assert.deepEqual(fixture.session.readJournal().entries, []);
+  assert.equal(fixture.session.writes, 3);
+  assert.deepEqual(fixture.calls, ['acquisition-close', 'session-close']);
 });
 
 test('stale floor CAS refuses an absent-store install before bootstrap', async () => {
@@ -693,7 +773,7 @@ test('bootstrap root collision reopens mutation only for the exact zero-write ra
     Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }),
     store,
   );
-  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error === fixture.stoppedAtPlanner);
+  await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => error.name === 'ServiceLifecycleError' && error.cause === fixture.stoppedAtPlanner);
   assert.deepEqual(storeCalls, ['open-mutation', 'bootstrap', 'open-mutation']);
   assert.deepEqual(fixture.calls, ['plan-location:application', 'plan-location:shawl', 'plan', 'acquisition-close', 'session-close']);
 });
