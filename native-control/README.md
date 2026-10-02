@@ -17,15 +17,16 @@ authority:
 On Windows, these leaves are separate OS-drive subtrees:
 `<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
 `<OS-drive>:\gjc-remote\native-reader\<host-key>` for the daemon reader.
-These are the v0.4.0-rc.8 candidate paths from merged PR #259, source commit
-`91fe87f7baa5b8da9e501f1f74f77ee7385bab76`; they share the OS-derived base
-with service state. Published rc.7 is immutable and continues to use ProgramData
-for inventory/native-reader state. This source-candidate documentation does not
-claim publication, installation, or deployment. Apply the new paths only with
-a corresponding application release and freshly signed native-control addon
-built from the immutable `v0.4.0-rc.8` tag commit and its successful main-CI
-promotion inputs. The PR #259 commit above identifies the fix, not the later
-release/tag commit. Linux paths and behavior are unchanged.
+These remain the v0.4.0-rc.9 candidate paths, sharing the OS-derived base with
+service state. The layout was introduced by merged PR #259 (source commit
+`91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) and is present in published and
+deployed rc.8. Published rc.7 remains immutable and continues to use ProgramData
+for inventory/native-reader state. This documentation makes no rc.9 publication,
+signing, installation, or deployment claim. Any rc.9 application archive and
+fresh signed native-control addon must use only the future immutable
+`v0.4.0-rc.9` tag commit and its successful main-CI promotion inputs; the known
+fix parent `8bfcb91` and PR #259's source commit are not release-source inputs.
+Linux paths and behavior are unchanged.
 
 Service state uses different children of `<OS-drive>:\gjc-remote`, including
 `service-control`, `staging`, `releases`, and `supervisors\shawl`. Before
@@ -457,32 +458,42 @@ Output must be a new directory outside the source tree.
 tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
-The current candidate contract is `v0.4.0-rc.8` with native-control 2.0.0
-(contract 5, revision 1). The tag workflow uses the same Bun 1.4.2 producer
-version. Existing rc.1/rc.2/rc.3/rc.4/rc.5/rc.6/rc.7 releases and artifacts
-remain historical, immutable inputs, not renamed rc.8 candidates; every rc.8
-application archive must be built from a clean checkout of the immutable
-`v0.4.0-rc.8` tag, with that commit recorded in its source manifest.
+The current candidate contract is `v0.4.0-rc.9` with native-control 2.0.0
+(contract 5, revision 1) and unchanged SDK 0.16.7. The tag workflow uses the
+same Bun 1.4.2 producer version. Existing rc.1 through rc.8 releases and
+artifacts remain historical, immutable inputs, not renamed rc.9 candidates;
+every rc.9 application archive must be built from a clean checkout of the
+future immutable `v0.4.0-rc.9` tag, with that commit recorded in its source
+manifest.
 The rc.5 native addon moves
 Windows service state under the OS installation drive's `\gjc-remote`
-directory; it does not migrate the old ProgramData service store. PR #259
-moves Windows inventory and daemon-reader state beneath that same OS-derived
-base. Published rc.7 remains immutable and continues resolving inventory and
-native-reader state under ProgramData; the candidate does not migrate or fall
-back to those paths.
+directory and does not migrate the old ProgramData service store. PR #259
+moved Windows inventory and daemon-reader state beneath that same OS-derived
+base. Published and deployed rc.8 used these paths; published rc.7
+remains immutable and continues resolving inventory and native-reader state
+under ProgramData. The current candidate does not migrate or fall back to those
+paths.
 The rc.6 native addon fixes Windows management-auth private ACL validation to
 require only the effective management and SYSTEM roles (PR #255), without
 zero-rights bot or recovery ACEs.
 The rc.7 native addon fixes Windows retained-handle deletion (PR #257) using
 `ReOpenFile` for an independent file instance bound to the retained handle and
 POSIX unlink semantics, without garbage-collection dependence or a fallback.
-Fresh native-control 2.0.0 outputs must come from the exact rc.8 source
-commit's main-CI promotion inputs. The version string alone does not identify
-these outputs: record each signed manifest's addon SHA-256 in the release
-notes. Never reuse rc.7 or earlier native signing inputs. This is candidate
-source preparation, not a publication or installation claim. Signed/live
-deployment qualification remains separate from source-level and unsigned-audit
-evidence.
+Application inventory hashes use the existing deployment `INVENTORY_LIMITS`
+for both canonical hash operations (32 MiB, depth 16, and 600,032 JSON nodes),
+so full-size signed inventories remain within the established bounds. Lifecycle
+errors are newly owned rather than mutations of immutable dependency errors;
+safe error codes, ambiguity, and accumulated session/driver writes are
+preserved.
+
+Fresh native-control 2.0.0 outputs must come from the exact future rc.9 tag
+commit's successful main-CI promotion inputs. The version string alone does not
+identify these outputs: record each signed manifest's addon SHA-256 in the
+release notes. The known fix parent `8bfcb91` is not a source commit, and rc.7
+or earlier native signing inputs must never be reused. This is candidate source
+preparation only; it does not claim rc.9 publication, signing, installation,
+or deployment. Signed/live deployment qualification remains separate from
+source-level and unsigned-audit evidence.
 The source must be clean Git state at that tag with canonical `bun.lock` and
 both separate public trust resources tracked. Git hooks/fsmonitor and replacement
 objects cannot supply authority; configured executable filters refuse before

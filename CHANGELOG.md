@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.9] - 2026-10-01
+
+### Fixed
+
+- Hash full-size signed application inventories within the existing deployment
+  inventory bounds (32 MiB, depth 16, and 600,032 JSON nodes) for both
+  canonical inventory hash operations.
+- Wrap immutable dependency errors in a lifecycle-owned error instead of
+  mutating them, preserving the safe error code, ambiguity status, and
+  accumulated session/driver write accounting.
+
+### Verification limits
+
+- This is candidate documentation only; it does not claim rc.9 publication,
+  signing, installation, deployment, or service qualification. Application
+  archives and fresh signed native-control outputs must use the future
+  immutable `v0.4.0-rc.9` tag commit and its successful main-CI promotion
+  inputs. The known fix parent `8bfcb91` is not a release source.
+- Native-control remains 2.0.0 (contract 5 revision 1), and SDK 0.16.7 is
+  unchanged. Signed service startup, shutdown, reboot, and power-loss
+  qualification remain separate evidence.
+
 ## [0.4.0-rc.8] - 2026-10-01
 
 ### Fixed
@@ -20,11 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Verification limits
 
-- This entry prepares a new release candidate; it does not claim publication,
-  installation, or deployment qualification. Signed service startup,
-  shutdown, reboot and power-loss qualification remain separate evidence.
-- Native-control remains 2.0.0 (contract 5 revision 1); rc.8 requires fresh
-  native signing inputs from its exact source commit. Published rc.7 and earlier
+- rc.8 was published and deployed. This does not establish Windows service
+  installation or qualification; signed service startup, shutdown, reboot,
+  and power-loss qualification remain separate evidence.
+- Native-control remains 2.0.0 (contract 5 revision 1); rc.8 used fresh native
+  signing inputs from its exact source commit. Published rc.7 and earlier
   artifacts remain immutable and must not be reused as rc.8 native inputs.
 
 ## [0.4.0-rc.7] - 2026-10-01

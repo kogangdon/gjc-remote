@@ -1253,7 +1253,7 @@ export function createServiceAcquisition(options) {
         currentWrites(),
       );
     }
-    preInspectedInventoryFingerprint = canonicalJsonHash(inventory);
+    preInspectedInventoryFingerprint = canonicalJsonHash(inventory, INVENTORY_LIMITS);
     return Object.freeze({ path: record.path, sha256: record.sha256, size: record.size });
   }
 
@@ -1276,7 +1276,7 @@ export function createServiceAcquisition(options) {
     const native = nativeFiles(inspection, operation);
     const inventory = applicationInventory(inspection);
     if (session.platform === 'win32' &&
-        canonicalJsonHash(inventory) !== preInspectedInventoryFingerprint) {
+        canonicalJsonHash(inventory, INVENTORY_LIMITS) !== preInspectedInventoryFingerprint) {
       throw acquisitionFailure(
         'SERVICE_ACQUISITION_NATIVE_METADATA_INVALID',
         operation,
