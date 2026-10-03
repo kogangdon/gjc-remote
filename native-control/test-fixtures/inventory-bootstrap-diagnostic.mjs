@@ -170,6 +170,8 @@ export async function diagnoseInventoryBootstrapRefusal(roles, driveRoot) {
   const owned = await mkdtemp(join(tmpdir(), 'gjc-inventory-bootstrap-diagnostic-'));
   await mkdir(join(owned, 'src'));
   await copyFile(new URL('../src/addon.cc', import.meta.url), join(owned, 'src', 'addon.cc'));
+  await copyFile(new URL('../src/service-log-observer.inc', import.meta.url),
+    join(owned, 'src', 'service-log-observer.inc'));
   await copyFile(new URL('../binding.gyp', import.meta.url), join(owned, 'binding.gyp'));
   await writeFile(join(owned, 'src', 'addon.cc'), source, 'utf8');
   try {
