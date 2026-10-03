@@ -9,6 +9,7 @@ import { buildWorkspaceInventory } from '@gjc-remote/shared/workspace-inventory'
 import {
   createInventoryPublisherAdapter,
   createInventoryReaderAdapter,
+  provisionInventoryBasesAdapter,
 } from '../src/inventory.js';
 import { documentFingerprint } from '../src/inventory-state.js';
 import * as publicApi from '../src/public.js';
@@ -227,6 +228,248 @@ test('factory validation rejects malformed options before addon loading', async 
   await rejectsInvalid(new Proxy({}, { ownKeys() { throw new Error('trap'); } }));
 });
 
+function assertProvisioningError(error, code, writes = 0, ambiguous = false) {
+  assert.equal(error.code, code);
+  assert.equal(error.operation, 'provision_inventory_bases');
+  assert.equal(error.writes, writes);
+  assert.equal(error.ambiguous, ambiguous);
+  return true;
+}
+
+async function rejectsInvalidProvisioningOptions(options) {
+  let loads = 0;
+  await assert.rejects(
+    provisionInventoryBasesAdapter(() => {
+      loads++;
+      return { provision_inventory_bases: async () => assert.fail('invalid input reached native') };
+    }, options),
+    (error) => assertProvisioningError(error, 'INVENTORY_INVALID'),
+  );
+  assert.equal(loads, 0, 'invalid provisioning options and roles must precede native loading');
+}
+
+test('provisioning adapter rejects invalid and accessor options and roles before loading native', async () => {
+  const symbolOptions = { roles };
+  symbolOptions[Symbol('extra')] = true;
+  const nullPrototypeOptions = Object.assign(Object.create(null), { roles });
+  const accessorOptions = {};
+  let optionGetterCalls = 0;
+  Object.defineProperty(accessorOptions, 'roles', {
+    enumerable: true,
+    get() {
+      optionGetterCalls++;
+      return roles;
+    },
+  });
+
+  const malformedPrincipal = {};
+  let principalGetterCalls = 0;
+  Object.defineProperty(malformedPrincipal, 'value', {
+    enumerable: true,
+    get() {
+      principalGetterCalls++;
+      return roles.management.value;
+    },
+  });
+  const accessorRoles = { ...roles, management: malformedPrincipal };
+  let roleGetterCalls = 0;
+  const roleAccessorRoles = { ...roles };
+  Object.defineProperty(roleAccessorRoles, 'management', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      roleGetterCalls++;
+      return roles.management;
+    },
+  });
+  const symbolRoles = { ...roles };
+  symbolRoles[Symbol('extra')] = roles.management;
+  const invalidRoleVariants = [
+    undefined,
+    {},
+    { ...roles, extra: roles.management },
+    Object.assign(Object.create(null), roles),
+    { ...roles, daemon: roles.management },
+    { ...roles, system: { kind: roles.system.kind, value: roles.system.kind === 'sid' ? 'S-1-5-19' : 'uid:1' } },
+    accessorRoles,
+    roleAccessorRoles,
+    symbolRoles,
+  ];
+
+  for (const options of [
+    undefined,
+    null,
+    {},
+    { roles, extra: true },
+    nullPrototypeOptions,
+    symbolOptions,
+    accessorOptions,
+    new Proxy({}, { ownKeys() { throw new Error('trap'); } }),
+    ...invalidRoleVariants.map((invalidRoles) => ({ roles: invalidRoles })),
+  ]) {
+    await rejectsInvalidProvisioningOptions(options);
+  }
+  assert.equal(optionGetterCalls, 0);
+  assert.equal(principalGetterCalls, 0);
+  assert.equal(roleGetterCalls, 0);
+
+  await assert.rejects(
+    publicApi.provisionInventoryBases({ roles, extra: true }),
+    (error) => assertProvisioningError(error, 'INVENTORY_INVALID'),
+  );
+});
+
+test('provisioning adapter calls native once with a frozen role snapshot and returns a closed frozen receipt', async () => {
+  const mutableRoles = Object.fromEntries(
+    Object.entries(roles).map(([name, principal]) => [name, { ...principal }]));
+  const originalRoles = structuredClone(mutableRoles);
+  const nativeReceipt = {
+    inventoryBase: 'C:\\gjc-remote\\native',
+    readerBase: 'C:\\gjc-remote\\native-reader',
+    writes: 4,
+  };
+  const calls = [];
+  let loads = 0;
+  const lowLevel = {
+    provision_inventory_bases: async (suppliedRoles) => {
+      calls.push(suppliedRoles);
+      return nativeReceipt;
+    },
+  };
+
+  const resultPromise = provisionInventoryBasesAdapter(() => {
+    loads++;
+    return lowLevel;
+  }, { roles: mutableRoles });
+  mutableRoles.management.value = mutableRoles.daemon.value;
+  mutableRoles.daemon = mutableRoles.management;
+  const receipt = await resultPromise;
+
+  assert.equal(loads, 1);
+  assert.equal(calls.length, 1, 'one native provisioning call is permitted');
+  assert.notEqual(calls[0], mutableRoles);
+  assert.deepEqual(calls[0], originalRoles);
+  assert.equal(Object.isFrozen(calls[0]), true);
+  for (const principal of Object.values(calls[0])) assert.equal(Object.isFrozen(principal), true);
+  assert.deepEqual(receipt, nativeReceipt);
+  assert.deepEqual(Object.keys(receipt), ['inventoryBase', 'readerBase', 'writes']);
+  assert.equal(Object.isFrozen(receipt), true);
+  assert.equal(Reflect.set(receipt, 'writes', 0), false);
+  assert.equal(Reflect.set(receipt, 'extra', true), false);
+});
+
+test('provisioning adapter refuses missing or accessor native methods without invocation', async () => {
+  for (const lowLevel of [{}, Object.create(null)]) {
+    let loads = 0;
+    await assert.rejects(
+      provisionInventoryBasesAdapter(() => {
+        loads++;
+        return lowLevel;
+      }, { roles }),
+      (error) => assertProvisioningError(error, 'INVENTORY_INVALID'),
+    );
+    assert.equal(loads, 1);
+  }
+
+  let getterCalls = 0;
+  let methodCalls = 0;
+  const accessorMethod = {};
+  Object.defineProperty(accessorMethod, 'provision_inventory_bases', {
+    enumerable: true,
+    get() {
+      getterCalls++;
+      return async () => { methodCalls++; };
+    },
+  });
+  await assert.rejects(
+    provisionInventoryBasesAdapter(() => accessorMethod, { roles }),
+    (error) => assertProvisioningError(error, 'INVENTORY_INVALID'),
+  );
+  assert.equal(getterCalls, 0);
+  assert.equal(methodCalls, 0);
+});
+
+test('provisioning adapter fails closed on malformed paths, extra fields, and write counts', async () => {
+  const validInventoryBase = 'C:\\gjc-remote\\native';
+  const validReaderBase = 'C:\\gjc-remote\\native-reader';
+  const malformedReceipts = [
+    [{ inventoryBase: '/gjc-remote/native', readerBase: validReaderBase, writes: 4 }, 4],
+    [{ inventoryBase: 'c:\\gjc-remote\\native', readerBase: 'c:\\gjc-remote\\native-reader', writes: 4 }, 4],
+    [{ inventoryBase: validInventoryBase, readerBase: 'D:\\gjc-remote\\native-reader', writes: 4 }, 4],
+    [{ inventoryBase: validInventoryBase, readerBase: validReaderBase, writes: 2, extra: true }, 2],
+    [{ inventoryBase: validInventoryBase, readerBase: validReaderBase }, 0],
+    [{ inventoryBase: validInventoryBase, readerBase: validReaderBase, writes: 3 }, 3],
+    [{ inventoryBase: validInventoryBase, readerBase: validReaderBase, writes: -1 }, 0],
+    [{ inventoryBase: validInventoryBase, readerBase: validReaderBase, writes: 4.5 }, 0],
+    [{ inventoryBase: validInventoryBase, readerBase: validReaderBase, writes: Number.MAX_SAFE_INTEGER + 1 }, 0],
+  ];
+
+  for (const [nativeReceipt, reportedWrites] of malformedReceipts) {
+    let calls = 0;
+    await assert.rejects(
+      provisionInventoryBasesAdapter(() => ({
+        provision_inventory_bases: async () => {
+          calls++;
+          return nativeReceipt;
+        },
+      }), { roles }),
+      (error) => assertProvisioningError(error, 'INVENTORY_IO_FAILED', reportedWrites, true),
+    );
+    assert.equal(calls, 1, 'invalid native receipts must not trigger fallback or retry');
+  }
+});
+
+test('provisioning adapter preserves native failure identity, writes, and ambiguity without retry', async () => {
+  const nativeErrors = [
+    Object.assign(new Error('provision failed'), {
+      code: 'INVENTORY_IO_FAILED',
+      operation: 'provision_inventory_bases',
+      writes: 2,
+      ambiguous: true,
+    }),
+    Object.assign(new Error('native refused before mutation'), {
+      code: 'INVENTORY_IO_FAILED',
+      operation: 'provision_inventory_bases',
+      writes: 0,
+      ambiguous: false,
+    }),
+  ];
+  let loads = 0;
+  let calls = 0;
+  for (const nativeError of nativeErrors) {
+    await assert.rejects(
+      provisionInventoryBasesAdapter(() => {
+        loads++;
+        return {
+          provision_inventory_bases: async () => {
+            calls++;
+            throw nativeError;
+          },
+        };
+      }, { roles }),
+      (error) => error === nativeError &&
+        error.writes === nativeError.writes &&
+        error.ambiguous === nativeError.ambiguous,
+    );
+    assert.equal(calls, loads);
+  }
+  assert.equal(loads, 2);
+  assert.equal(calls, 2, 'native failures must not be retried or replaced by a fallback');
+});
+
+test('publisher and reader adapter construction never provisions inventory bases', async () => {
+  let provisionCalls = 0;
+  for (const create of [createInventoryPublisherAdapter, createInventoryReaderAdapter]) {
+    const state = fixture();
+    state.lowLevel.provision_inventory_bases = async () => {
+      provisionCalls++;
+      throw new Error('publisher/reader constructor must not provision bases');
+    };
+    await create(() => state.lowLevel, { hostId, roles });
+  }
+  assert.equal(provisionCalls, 0);
+});
+
 test('role validation rejects malformed, duplicate, mixed-kind, and non-system bindings', async () => {
   const wrongKindRoles = process.platform === 'win32' ? {
     management: { kind: 'uid', value: 'uid:1001' },
@@ -389,12 +632,17 @@ function createReaderModel({
   const readCounts = new Map();
   let factsReads = 0;
   let released = 0;
+  let provisionCalls = 0;
   let currentReleaseError = releaseError;
   let identitySequence = 30;
   const lowLevel = {
     resolve_native_state_root: async (_key, kind) => {
       calls.push(['root', kind]);
       return kind === 'inventory' ? inventoryRoot : readerRoot;
+    },
+    provision_inventory_bases: async () => {
+      provisionCalls++;
+      assert.fail('reader must not provision inventory bases');
     },
     verify_inventory_acl: async (path, _roles, profile, actor) => {
       calls.push(['acl', path, profile, actor]);
@@ -465,6 +713,7 @@ function createReaderModel({
     calls,
     lowLevel,
     released: () => released,
+    provisionCalls: () => provisionCalls,
     setReleaseError: (value) => { currentReleaseError = value; },
     readCounts,
     inventoryRoot,
@@ -506,6 +755,13 @@ test('Reader returns missing only after the locked marker-first state read', asy
     ],
   );
   assert.equal(state.released(), 1);
+});
+
+test('reader construction and reads never provision inventory bases', async () => {
+  const state = createReaderModel();
+  const reader = await createModeledReader(state);
+  assert.equal((await reader.readAccepted()).status, 'present');
+  assert.equal(state.provisionCalls(), 0);
 });
 
 test('Reader rejects missing or replay state that drifts on the final pass', async () => {
@@ -787,6 +1043,7 @@ test('public module exposes only management, staged inventory, containment, obse
     'createSelfProcessObserver',
     'createServiceNative',
     'createServiceStartupObserver',
+    'provisionInventoryBases',
     'validateBuildManifest',
   ]);
   assert.equal(typeof publicApi.createSelfProcessObserver, 'function');
@@ -796,6 +1053,7 @@ test('public module exposes only management, staged inventory, containment, obse
   assert.equal(typeof publicApi.createInventoryPublisher, 'function');
   assert.equal(typeof publicApi.createInventoryReader, 'function');
   assert.equal(typeof publicApi.createServiceNative, 'function');
+  assert.equal(typeof publicApi.provisionInventoryBases, 'function');
   assert.equal('createInventoryPublisherAdapter' in publicApi, false);
   assert.equal('createInventoryReaderAdapter' in publicApi, false);
 });

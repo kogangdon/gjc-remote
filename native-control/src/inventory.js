@@ -8,9 +8,11 @@ import {
 } from './inventory-state.js';
 
 const FACTORY_KEYS = Object.freeze(['hostId', 'roles']);
+const PROVISIONING_KEYS = Object.freeze(['roles']);
 const ROLE_KEYS = Object.freeze(['management', 'bot', 'recovery', 'daemon', 'system']);
 const PRINCIPAL_KEYS = Object.freeze(['kind', 'value']);
 const getOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const getPrototypeOf = Object.getPrototypeOf;
 const ownKeys = Reflect.ownKeys;
 const localErrors = new WeakSet();
@@ -41,8 +43,8 @@ function addWrites(total, amount) {
   return total + amount;
 }
 
-function invalid() {
-  throw localError('INVENTORY_INVALID', 'resolve_native_state_root');
+function invalid(operation = 'resolve_native_state_root') {
+  throw localError('INVENTORY_INVALID', operation);
 }
 
 function exactDataValues(value, keys) {
@@ -94,20 +96,26 @@ function principalSnapshot(value) {
   }
 }
 
-function validateOptions(options) {
-  const values = exactDataValues(options, FACTORY_KEYS);
-  if (!values) invalid();
-  const roleValues = exactDataValues(values.roles, ROLE_KEYS);
-  if (!roleValues) invalid();
+function validateRoles(value, operation = 'resolve_native_state_root') {
+  const roleValues = exactDataValues(value, ROLE_KEYS);
+  if (!roleValues) invalid(operation);
   const principals = ROLE_KEYS.map((key) => principalSnapshot(roleValues[key]));
-  if (principals.some((principal) => principal === null)) invalid();
+  if (principals.some((principal) => principal === null)) invalid(operation);
   const kind = principals[0].kind;
   const requiredKind = process.platform === 'win32' ? 'sid' :
     process.platform === 'linux' ? 'uid' : null;
   if (!principals.every((principal) => principal.kind === kind) ||
       kind !== requiredKind ||
       new Set(principals.map((principal) => principal.value)).size !== principals.length ||
-      (kind === 'sid' ? principals[4].value !== 'S-1-5-18' : principals[4].value !== 'uid:0')) invalid();
+      (kind === 'sid' ? principals[4].value !== 'S-1-5-18' : principals[4].value !== 'uid:0')) invalid(operation);
+  return Object.freeze(
+    Object.fromEntries(ROLE_KEYS.map((key, index) => [key, principals[index]])));
+}
+
+function validateOptions(options) {
+  const values = exactDataValues(options, FACTORY_KEYS);
+  if (!values) invalid();
+  const roles = validateRoles(values.roles);
   let hostKey;
   try {
     hostKey = workspaceInventoryHostKey(values.hostId);
@@ -117,9 +125,14 @@ function validateOptions(options) {
   return Object.freeze({
     hostId: values.hostId,
     hostKey,
-    roles: Object.freeze(
-      Object.fromEntries(ROLE_KEYS.map((key, index) => [key, principals[index]]))),
+    roles,
   });
+}
+
+function validateProvisioningOptions(options) {
+  const values = exactDataValues(options, PROVISIONING_KEYS);
+  if (!values) invalid('provision_inventory_bases');
+  return validateRoles(values.roles, 'provision_inventory_bases');
 }
 
 function requireLowLevel(lowLevel, publisher) {
@@ -157,6 +170,56 @@ function requireLowLevel(lowLevel, publisher) {
   // Capture each verified data property once so later object mutation cannot
   // alter an adapter transaction.
   return Object.freeze(captured);
+}
+
+function requireProvisioningLowLevel(lowLevel) {
+  if (lowLevel === null || typeof lowLevel !== 'object' ||
+      Array.isArray(lowLevel)) invalid('provision_inventory_bases');
+  let descriptors;
+  try {
+    descriptors = getOwnPropertyDescriptors(lowLevel);
+  } catch {
+    invalid('provision_inventory_bases');
+  }
+  const descriptor = descriptors.provision_inventory_bases;
+  if (!descriptor || descriptor.get !== undefined || descriptor.set !== undefined ||
+      !Object.hasOwn(descriptor, 'value') ||
+      typeof descriptor.value !== 'function') {
+    invalid('provision_inventory_bases');
+  }
+  return Object.freeze({ provision_inventory_bases: descriptor.value });
+}
+
+function safeWriteCount(value) {
+  try {
+    if (value === null || typeof value !== 'object') return null;
+    const descriptor = getOwnPropertyDescriptor(value, 'writes');
+    return descriptor && descriptor.get === undefined && descriptor.set === undefined &&
+      Object.hasOwn(descriptor, 'value') && Number.isSafeInteger(descriptor.value) &&
+      descriptor.value >= 0 ? descriptor.value : null;
+  } catch {
+    return null;
+  }
+}
+
+function invalidProvisioningReceipt(value) {
+  throw localError(
+    'INVENTORY_IO_FAILED', 'provision_inventory_bases',
+    safeWriteCount(value) ?? 0, true);
+}
+
+function checkedProvisioningReceipt(value) {
+  const result = exactDataValues(value, ['inventoryBase', 'readerBase', 'writes']);
+  if (!result || result.writes !== 4 ||
+      typeof result.inventoryBase !== 'string' ||
+      typeof result.readerBase !== 'string') return null;
+  const match = /^([A-Z]):\\gjc-remote\\native$/.exec(result.inventoryBase);
+  if (!match || result.readerBase !== `${match[1]}:\\gjc-remote\\native-reader`) return null;
+  return Object.freeze({
+    inventoryBase: result.inventoryBase,
+    readerBase: result.readerBase,
+    writes: 4,
+  });
 }
 
 async function verifyAcl(lowLevel, path, roles, profile, expectedActor) {
@@ -491,4 +554,14 @@ export function createInventoryPublisherAdapter(loadLowLevel, options) {
 
 export function createInventoryReaderAdapter(loadLowLevel, options) {
   return createAdapter(loadLowLevel, options, 'daemon');
+}
+
+export async function provisionInventoryBasesAdapter(loadLowLevel, options) {
+  const roles = validateProvisioningOptions(options);
+  if (typeof loadLowLevel !== 'function') invalid('provision_inventory_bases');
+  const lowLevel = requireProvisioningLowLevel(await loadLowLevel());
+  const nativeReceipt = await lowLevel.provision_inventory_bases(roles);
+  const receipt = checkedProvisioningReceipt(nativeReceipt);
+  if (!receipt) invalidProvisioningReceipt(nativeReceipt);
+  return receipt;
 }

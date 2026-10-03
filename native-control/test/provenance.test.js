@@ -175,16 +175,16 @@ function loadOptions(fixture, extra) {
   };
 }
 
-test('contract revision 1 preserves the fence write-receipt provenance boundary', () => {
+test('contract revision 2 preserves the fence write-receipt provenance boundary', () => {
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
-  assert.equal(packageJson.version, '2.0.0');
+  assert.equal(packageJson.version, '2.1.0');
   assert.equal(packageJson.nativeControlContract.version, 5);
-  assert.equal(contractRevision, 1);
+  assert.equal(contractRevision, 2);
   assert.equal(packageJson.nativeControlContract.revision, contractRevision);
   assert.deepEqual(capabilitySignatures.acquire_inventory_fence, ['path', 'roles']);
 });
 
-test('native contract 5 revision 1 is the only accepted capability contract', () => {
+test('native contract 5 revision 2 is the only accepted capability contract', () => {
   const addonBytes = Buffer.from('current-native-addon');
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
   const manifest = {
@@ -202,7 +202,7 @@ test('native contract 5 revision 1 is the only accepted capability contract', ()
   };
 
   assert.equal(validateBuildManifest(manifest, packageJson, addonBytes, 'linux', 'x64'), true);
-  for (const revision of [contractRevision - 1, contractRevision + 1]) {
+  for (const revision of [1, contractRevision + 1]) {
     assert.equal(
       validateBuildManifest({ ...manifest, contractRevision: revision }, packageJson, addonBytes, 'linux', 'x64'),
       false,
@@ -225,7 +225,7 @@ test('loadVerifiedAddon: package contract revision drift refuses before addon lo
     const addonBytes = Buffer.from('not-a-native-addon');
     const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
     const fixture = writeManifestFixture(dir, { addonBytes, packageJson, copyAddon: true });
-    for (const revision of [contractRevision - 1, contractRevision + 1]) {
+    for (const revision of [1, contractRevision + 1]) {
       const driftedPackageJson = structuredClone(packageJson);
       driftedPackageJson.nativeControlContract.revision = revision;
       writeFileSync(fixture.packageJsonPath, JSON.stringify(driftedPackageJson));

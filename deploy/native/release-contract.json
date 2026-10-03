@@ -91,7 +91,7 @@
     {
       "path": "native-control",
       "packageName": "@gjc-remote/native-control",
-      "packageVersion": "2.0.0",
+      "packageVersion": "2.1.0",
       "productionRoots": [
         "deployment-keys/application-trusted.json",
         "deployment-keys/shawl-trusted.json",
@@ -138,7 +138,7 @@
   },
   "nativeControl": {
     "packageName": "@gjc-remote/native-control",
-    "packageVersion": "2.0.0",
+    "packageVersion": "2.1.0",
     "manifestPath": "native-control/build/Release/native-control.manifest.json",
     "signaturePath": "native-control/build/Release/native-control.manifest.json.sig",
     "addonPath": "native-control/build/Release/native_control.node",
@@ -146,7 +146,7 @@
     "shawlTrustPath": "native-control/deployment-keys/shawl-trusted.json",
     "trustPath": "native-control/release-keys/trusted.json",
     "contractVersion": 5,
-    "contractRevision": 1,
+    "contractRevision": 2,
     "napi": 8,
     "executablePolicy": "required"
   },

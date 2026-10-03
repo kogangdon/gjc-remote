@@ -37,7 +37,7 @@
     },
     "native-control": {
       "name": "@gjc-remote/native-control",
-      "version": "2.0.0",
+      "version": "2.1.0",
       "bin": {
         "gjc-remote-inventory": "./src/inventory-entrypoint.js",
         "gjc-remote-service": "./src/service-entrypoint.js",
