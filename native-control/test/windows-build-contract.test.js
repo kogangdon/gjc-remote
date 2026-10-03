@@ -45,11 +45,11 @@ const trustedPromotionRepository = 'kogangdon/gjc-remote';
 const trustedPromotionEvent = 'push';
 const trustedPromotionRef = 'refs/heads/main';
 
-test('native source package, verifier, and signed metadata use only contract 5 revision 1', () => {
-  assert.equal(nativeControlPackage.version, '2.0.0');
+test('native source package, verifier, and signed metadata use only contract 5 revision 2', () => {
+  assert.equal(nativeControlPackage.version, '2.1.0');
   assert.deepEqual(nativeControlPackage.nativeControlContract, {
     version: 5,
-    revision: 1,
+    revision: 2,
     napi: 8,
     platforms: nativeTargets,
   });
@@ -62,9 +62,9 @@ test('native source package, verifier, and signed metadata use only contract 5 r
   });
 
   assert.match(nativeBuildVerifier, /const nativeContractVersion = 5;/);
-  assert.match(nativeBuildVerifier, /const nativeContractRevision = 1;/);
+  assert.match(nativeBuildVerifier, /const nativeContractRevision = 2;/);
   assert.match(nativeBuildVerifier, /const nativeNapiVersion = 8;/);
-  assert.match(nativeBuildVerifier, /packageJson\.version !== '2\.0\.0'/);
+  assert.match(nativeBuildVerifier, /packageJson\.version !== '2\.1\.0'/);
   assert.match(nativeBuildVerifier, /plan_win32_service_resource: \['name', 'serviceRole', 'launch', 'applicationManifestFingerprint', 'phase', 'roles'\]/);
   assert.match(nativeBuildVerifier, /create_win32_service_disabled: \['name', 'serviceRole', 'launch', 'servicePassword', 'roles'\]/);
   assert.match(nativeBuildVerifier, /configure_win32_service_launch: \['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint', 'launch'\]/);
@@ -80,7 +80,7 @@ test('native source package, verifier, and signed metadata use only contract 5 r
 
   assert.match(nativeProvenance, /const nativeContractVersion = 5;/);
   assert.match(nativeProvenance, /const nativeNapiVersion = 8;/);
-  assert.match(nativeProvenance, /packageJson\.version !== '2\.0\.0'/);
+  assert.match(nativeProvenance, /packageJson\.version !== '2\.1\.0'/);
   assert.match(nativeProvenance, /contractVersion: nativeContractVersion/);
   assert.match(nativeProvenance, /contract\?\.contractVersion === nativeContractVersion/);
   assert.match(nativeProvenance, /verifyPinnedNativeBuildManifest\(input\)/);

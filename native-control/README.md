@@ -8,11 +8,10 @@ authorization, and their persistence.
 
 ## Provisioning and invocation
 
-Before publishing, provision both host leaves through the native management
-authority:
+Before publishing, provision both host leaves under their actual native actors:
 
-- the management inventory leaf for the host; and
-- the daemon reader leaf for the same host.
+- the management inventory leaf under M; and
+- the daemon reader leaf for the same host under D.
 
 On Windows, these leaves are separate OS-drive subtrees:
 `<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
@@ -37,20 +36,39 @@ Read-only Windows launch planning accepts the future signed artifact locations
 before publication. Service creation and launch changes retain mandatory
 materialized artifact byte and ACL verification; runtime, configuration, log,
 and SDK checks remain mandatory even during planning.
-This documentation describes the current rc.10 source candidate,
-which is not yet signed, deployed, or qualified. Any rc.10 application archive
-and fresh signed native-control addon must use only the exact future immutable
-`v0.4.0-rc.10` tag commit and its successful main-CI promotion inputs. The known
-fix parent `8bfcb91` and PR #259's source commit are not release-source inputs.
-Linux paths and behavior are unchanged.
+Published rc.10 is immutable, from tag source
+`56de3e3eb77530fe5380b02870e2ad087412ea6a`. Deployment and foreground bot
+readiness were verified; canonical Windows service installation refused with
+zero writes at the SDK compatibility listing's generic JSON node bound.
+The unreleased source fixes that bound and adds explicit inventory-base
+provisioning. Neither change is present in the signed rc.10 runtime.
 
 Service state uses different children of `<OS-drive>:\gjc-remote`, including
 `service-control`, `staging`, `releases`, and `supervisors\shawl`. Before
-inventory operations, the base and both inventory parent directories must be
-externally provisioned; `native` and `native-reader` must have the exact
-role-specific owners and protected ACLs validated by the native capability.
-There is no ProgramData fallback or migration. The native capability does not
-create or repair the base or inventory-parent directories.
+inventory operations, the platform container must already exist with its
+canonical witness and exact ACL. Unreleased native-control 2.1.0 (contract 5,
+revision 2) adds an explicit management-only operation for its two inventory
+parents:
+
+```text
+gjc-remote-inventory provision-bases
+```
+
+Provide exactly `{}` as EOF-terminated non-terminal standard input and the
+same `GJC_INVENTORY_ROLE_BINDINGS` described below. The public equivalent is
+`await provisionInventoryBases({ roles })`. No path, profile, or host override
+is accepted. Success reports `{inventoryBase,readerBase,writes}` with four
+writes. The fixed `native` parent is owned by M and `native-reader` by D;
+both use their exact protected role ACLs. Provisioning requires management's
+native authority and the privileges needed to establish D ownership.
+
+Both names must be absent. Existing objects refuse without adoption or ACL
+repair. Partial failure cleans up only verified creations from that operation;
+unproven cleanup is an ambiguous manual-cleanup refusal. Preserve its receipt
+and do not retry blindly. This operation does not create the platform container,
+host leaves, inventory documents, or reader floor, and never changes the
+container's witness or ACL. Linux refuses this Windows-only operation.
+There is no ProgramData fallback or migration.
 The OS-derived paths retain the exact ownership and ACL checks, no-reparse
 protection, and NTFS directory-flush requirements; flush errors refuse without
 a volume-flush fallback.
@@ -60,7 +78,7 @@ reader floor. UNC workspace inputs are accepted by the schema but are
 deterministically refused by the native capability when no supported
 containment primitive exists.
 
-The executable accepts exactly one operand:
+Publication accepts exactly one operand:
 
 ```text
 gjc-remote-inventory publish
@@ -478,13 +496,15 @@ candidate verification reject every other sequence.
 tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
-The current candidate contract is `v0.4.0-rc.10` with native-control 2.0.0
-(contract 5, revision 1) and unchanged SDK 0.16.7. The tag workflow uses the
-same Bun 1.4.2 producer version. Existing rc.1 through rc.9 releases and
-artifacts remain historical, immutable inputs, not renamed rc.10 candidates;
-every rc.10 application archive must be built from a clean checkout of the
-exact future immutable `v0.4.0-rc.10` tag, with that commit recorded in its
-source manifest.
+Signed `v0.4.0-rc.10` contains native-control 2.0.0 (contract 5, revision 1).
+Unreleased source uses native-control 2.1.0 (contract 5, revision 2) and unchanged
+SDK 0.16.7. Application version/sequence selection still names rc.10 until a
+separate release-preparation change; do not publish this source as rc.10.
+The tag workflow uses the
+same Bun 1.4.2 producer version. Existing rc.1 through rc.10 releases and
+artifacts remain historical, immutable inputs. A later release must select its
+own version and sequence and build from a clean checkout of its exact immutable
+tag, with that commit recorded in its source manifest.
 The rc.5 native addon moves
 Windows service state under the OS installation drive's `\gjc-remote`
 directory and does not migrate the old ProgramData service store. PR #259
@@ -506,12 +526,12 @@ errors are newly owned rather than mutations of immutable dependency errors;
 safe error codes, ambiguity, and accumulated session/driver writes are
 preserved.
 
-Fresh native-control 2.0.0 outputs must come from the exact future rc.10 tag
+Fresh native-control outputs must come from their exact immutable release tag
 commit's successful main-CI promotion inputs. The version string alone does not
 identify these outputs: record each signed manifest's addon SHA-256 in the
 release notes. The known fix parent `8bfcb91` is not a source commit, and rc.9
-or earlier native signing inputs must never be reused. This is candidate source
-preparation only; it does not claim rc.10 signing, installation, or deployment.
+or earlier native signing inputs must never be reused. The native-control 2.1.0
+changes are source preparation only, not signing, installation, or deployment.
 Signed/live deployment qualification remains separate from source-level and
 unsigned-audit evidence.
 The source must be clean Git state at that tag with canonical `bun.lock` and

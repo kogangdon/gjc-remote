@@ -40,7 +40,7 @@ const storeSignatures = {
 };
 
 function addon() {
-  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 1 native addon must be built before this integration gate');
+  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 2 native addon must be built before this integration gate');
   const native = require(addonPath);
   const contract = native.native_control_contract();
   assert.deepEqual(contract, {
@@ -94,8 +94,8 @@ function sourceReaderRoles(native) {
   };
 }
 
-test('ABI 5 revision 1 exposes the exact service store and Linux object substrate', () => {
-  assert.equal(contractRevision, 1);
+test('ABI 5 revision 2 exposes the exact service store and Linux object substrate', () => {
+  assert.equal(contractRevision, 2);
   assert.deepEqual(
     Object.fromEntries(Object.keys(storeSignatures).map((name) => [name, capabilitySignatures[name]])),
     storeSignatures,
@@ -173,7 +173,7 @@ test('native store source fixes roots, witnesses, profiles, lock ordering, and n
 test('fixed intermediary bootstrap reserves durable history before exposure and keeps status zero-write', () => {
   const source = readFileSync(sourcePath, 'utf8');
   const prepareStart = source.indexOf('ServiceContainerState PrepareServiceBaseContainer');
-  const prepareEnd = source.indexOf('bool ServiceStoreNamedDirectoryExact', prepareStart);
+  const prepareEnd = source.indexOf('\n}\n', prepareStart) + 2;
   const openStart = source.indexOf('napi_value OpenServiceRoot');
   const openEnd = source.indexOf('bool ServiceLockNames', openStart);
   assert.ok(prepareStart >= 0 && prepareEnd > prepareStart);
@@ -325,7 +325,8 @@ test('Windows bootstrap preflights durability rights before any intermediary wri
   const bootstrapStart = source.indexOf('bool ServiceStoreOpenBootstrapAnchor', fixedEnd);
   const bootstrapEnd = source.indexOf('bool ServiceContainerEntryIsLifecycleEvidence', bootstrapStart);
   const prepareStart = source.indexOf('ServiceContainerState PrepareServiceBaseContainer');
-  const prepareEnd = source.indexOf('bool ServiceStoreNamedDirectoryExact', prepareStart);
+  const prepareEnd = source.indexOf('\n}\n', prepareStart) + 2;
+  assert.ok(prepareStart >= 0 && prepareEnd > prepareStart);
   const fixed = source.slice(fixedStart, fixedEnd);
   const bootstrap = source.slice(bootstrapStart, bootstrapEnd);
   const prepare = source.slice(prepareStart, prepareEnd);

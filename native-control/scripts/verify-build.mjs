@@ -21,7 +21,7 @@ const capabilities = [
   'principal_access_check', 'remove_verified_file', 'open_verified_parent_handle',
   'open_verified_object_handle', 'read_handle_identity', 'read_handle_bytes',
   'write_handle_bytes', 'remove_verified_handle', 'verify_role_sid_not_group',
-  'resolve_native_state_root', 'read_workspace_root_facts', 'ensure_inventory_directory',
+  'resolve_native_state_root', 'read_workspace_root_facts', 'ensure_inventory_directory', 'provision_inventory_bases',
   'verify_inventory_acl', 'acquire_inventory_fence', 'read_inventory_object',
   'publish_inventory_object_atomic',
   'enumerate_workspace_process_holders',
@@ -71,6 +71,7 @@ const capabilitySignatures = {
   resolve_native_state_root: ['hostKey', 'rootKind'],
   read_workspace_root_facts: ['path', 'sourcePlatform'],
   ensure_inventory_directory: ['path', 'roles', 'profile'],
+  provision_inventory_bases: ['roles'],
   verify_inventory_acl: ['path', 'roles', 'profile', 'expectedActor'],
   acquire_inventory_fence: ['path', 'roles'],
   read_inventory_object: ['path', 'maxBytes', 'roles', 'profile'],
@@ -132,7 +133,7 @@ const capabilitySignatures = {
 };
 
 const nativeContractVersion = 5;
-const nativeContractRevision = 1;
+const nativeContractRevision = 2;
 const nativeNapiVersion = 8;
 
 function fail(message) {
@@ -311,7 +312,7 @@ const isMainModule = (() => {
 })();
 if (isMainModule) {
 
-if (packageJson.version !== '2.0.0') fail('native-control source package version is invalid');
+if (packageJson.version !== '2.1.0') fail('native-control source package version is invalid');
 if (JSON.stringify(packageJson.nativeControlContract) !== JSON.stringify({
   version: nativeContractVersion,
   revision: nativeContractRevision,

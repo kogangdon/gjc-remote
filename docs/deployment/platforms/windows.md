@@ -82,10 +82,17 @@ working directory. The OS-derived location is not configurable through
 environment variables. Service state uses `service-control`, `staging`,
 `releases`, and `supervisors\shawl`; inventory uses the separate
 `native\<host-key>` and daemon-reader `native-reader\<host-key>` subtrees.
-Before inventory operations, externally provision the base and both inventory
-parent directories. The `native` and `native-reader` parents must have the exact
-role-specific owners and protected ACLs checked by the native capability; it
-does not create or repair these parents. There is no ProgramData fallback or
+Before inventory operations, the canonical witnessed platform container must
+already exist. Unreleased native-control 2.1.0 (contract 5 revision 2) adds
+`gjc-remote-inventory provision-bases`: an explicit management-only operation,
+with exact `{}` standard input and `GJC_INVENTORY_ROLE_BINDINGS`, to create its
+absent `native` and `native-reader` parents. It accepts no path override,
+preserves the container and witness, and establishes exact protected ACLs with
+M and D ownership respectively. Existing objects are never adopted or repaired;
+retain partial-failure receipts instead of retrying blindly. Publisher and
+reader host leaves still require their actual M and D actors, and normal
+publisher/reader construction never provisions the parents. This new command
+is not in signed rc.10. There is no ProgramData fallback or
 migration for inventory state. Existing ProgramData service state is likewise
 not migrated or used as a fallback; preserve it for operator review rather than
 copying its identity-bound records into the new store. PR #259 (source commit
@@ -110,12 +117,13 @@ before publication. Service creation and launch changes still require the
 published bytes and exact ACLs. Runtime, configuration, log, and SDK security
 checks remain mandatory during planning; invalid pre-existing runtime
 permissions are not repaired or relaxed automatically.
-This documentation describes the current v0.4.0-rc.10 source
-candidate, which is not yet signed, deployed, or qualified. Any rc.10
-application archive and fresh signed native-control addon must use only the
-exact future immutable `v0.4.0-rc.10` tag commit and its successful main-CI
-promotion inputs. The known fix parent `8bfcb91` and the PR #259 commit identify
-fixes, not the later release/tag source. Linux paths and behavior are unchanged.
+Published rc.10 came from immutable tag source
+`56de3e3eb77530fe5380b02870e2ad087412ea6a`; deployment and foreground bot
+readiness were verified. Canonical service installation then refused with zero
+writes because SDK compatibility listing hashing exceeded the generic JSON
+node bound. The unreleased source fixes that hashing bound and adds explicit
+inventory-parent provisioning. Those changes require a later signed release;
+neither publication nor bot readiness proves SCM installation or native flush.
 
 The new root must pass the same ownership, ACL, no-reparse and NTFS directory
 flush checks. A successful directory-flush probe is not evidence of successful

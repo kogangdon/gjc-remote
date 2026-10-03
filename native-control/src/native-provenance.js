@@ -202,7 +202,7 @@ export function verifyManifestSignature(manifestBytes, sidecar, trustStore) {
 
 export function validateNativePackageContract(packageJson) {
   if (!plain(packageJson) || packageJson.name !== nativePackageName ||
-      packageJson.version !== '2.0.0') return false;
+      packageJson.version !== '2.1.0') return false;
   try {
     return sameNativeMetadata(packageJson.nativeControlContract, {
       version: nativeContractVersion,

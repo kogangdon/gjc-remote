@@ -69,6 +69,10 @@ export const SERVICE_COMPATIBILITY_LIMITS = Object.freeze({
   jsonBytes: 1024 * 1024,
   sessionHeaderBytes: 16 * 1024,
 });
+const DIRECTORY_LISTING_HASH_LIMITS = Object.freeze({
+  maxDepth: 2,
+  maxNodes: SERVICE_COMPATIBILITY_LIMITS.inventoryEntries * 4 + 1,
+});
 
 export const SERVICE_COMPATIBILITY_ROOT_PROFILES = Object.freeze([
   'config',
@@ -379,7 +383,7 @@ function scanTree(native, handle, rootIdentity, component, profile, roles, budge
   inventory.sort((left, right) => utf8Compare(left.path, right.path));
   const listingFingerprint = canonicalJsonHash(inventory.map(({ path: relative, kind, identityFingerprint }) => ({
     path: relative, kind, identityFingerprint,
-  })));
+  })), DIRECTORY_LISTING_HASH_LIMITS);
   return Object.freeze({
     items: Object.freeze(inventory.map(Object.freeze)),
     listingFingerprint,
@@ -898,7 +902,7 @@ function observeSdkProfileRoot(native, binding, sdk, budget, observations) {
       path: name,
       kind,
       identityFingerprint,
-    })));
+    })), DIRECTORY_LISTING_HASH_LIMITS);
     observations.push(rootObservation(
       'daemon-sdk-profile-root',
       'sdk-install',
@@ -1130,6 +1134,33 @@ function inventoryPackageRoots(inventory) {
   return { roots, rootEntries };
 }
 
+function createSdkPackageRootReader({ packageRoots, rootEntries, treeByPath, readPackageFile }) {
+  const packageMetadata = new Map();
+  return async (root) => {
+    if (!packageRoots.has(root)) return null;
+    const entry = rootEntries.get(root);
+    if (!entry || entry.size === 0 || entry.size > SDK_METADATA_MAX_BYTES) refuse('sdk-package-json-limit');
+    let captured = packageMetadata.get(root);
+    if (!captured) {
+      captured = readPackageFile(root, entry);
+      packageMetadata.set(root, captured);
+    }
+    const rootDirectory = treeByPath.get(root);
+    if (!rootDirectory || rootDirectory.kind !== 'directory') refuse('sdk-package-root-missing');
+    return { realRoot: rootDirectory.identityFingerprint, packageBytes: captured.bytes };
+  };
+}
+
+/** @internal Exercise the package-root callback through the production closure contract. */
+export function createSdkPackageRootReaderForTest(input) {
+  const fields = exactData(input, ['packageRoots', 'rootEntries', 'treeByPath', 'readPackageFile']);
+  if (!fields || !(fields.packageRoots instanceof Set) || Object.getPrototypeOf(fields.packageRoots) !== Set.prototype ||
+      !(fields.rootEntries instanceof Map) || Object.getPrototypeOf(fields.rootEntries) !== Map.prototype ||
+      !(fields.treeByPath instanceof Map) || Object.getPrototypeOf(fields.treeByPath) !== Map.prototype ||
+      typeof fields.readPackageFile !== 'function') refuse('test-adapter');
+  return createSdkPackageRootReader(fields);
+}
+
 async function inspectSdkInstallation(native, binding, sdk, budget, observations) {
   observeSdkProfileRoot(native, binding, sdk, budget, observations);
   const installation = openRoot(native, sdk.installationRoot, 'sdk-install', 'daemon', binding.roles, true);
@@ -1143,9 +1174,9 @@ async function inspectSdkInstallation(native, binding, sdk, budget, observations
     const treeByPath = new Map(tree.items.map((item) => [item.path, item]));
     const observedFacts = new Map();
     const manifestObservation = readSdkFile(native, installation, sdk, manifestPath,
-      SDK_METADATA_MAX_BYTES, null, new Map(), observedFacts);
+      SDK_METADATA_MAX_BYTES, null, treeByPath, observedFacts);
     const signatureObservation = readSdkFile(native, installation, sdk, signaturePath,
-      16 * 1024, null, new Map(), observedFacts);
+      16 * 1024, null, treeByPath, observedFacts);
     const verified = verifyPinnedDeploymentProvenance({
       purpose: 'application',
       manifestBytes: manifestObservation.bytes,
@@ -1197,33 +1228,14 @@ async function inspectSdkInstallation(native, binding, sdk, budget, observations
     ));
     const inventoryByPath = sdkInventoryEntryMap(inventoryValue);
     const { roots: packageRoots, rootEntries } = inventoryPackageRoots(inventoryValue);
-    const packageMetadata = new Map();
     const packageObservedFacts = new Map(observedFacts);
-    const readPackageRoot = async (root) => {
-      if (!packageRoots.has(root)) return null;
-      const entry = rootEntries.get(root);
-      if (!entry || entry.size === 0 || entry.size > SDK_METADATA_MAX_BYTES) refuse('sdk-package-json-limit');
-      const relative = `${root}/package.json`;
-      let captured = packageMetadata.get(root);
-      if (!captured) {
-        captured = readSdkFile(native, installation, sdk, relative, SDK_METADATA_MAX_BYTES,
-          entry, treeByPath, packageObservedFacts);
-        packageMetadata.set(root, captured);
-      }
-      let packageJson;
-      try {
-        packageJson = parseStrictJsonBytes(captured.bytes, {
-          maxBytes: SDK_METADATA_MAX_BYTES,
-          maxDepth: 32,
-          maxNodes: 100_000,
-        });
-      } catch {
-        refuse('sdk-package-json-invalid');
-      }
-      const rootDirectory = treeByPath.get(root);
-      if (!rootDirectory || rootDirectory.kind !== 'directory') refuse('sdk-package-root-missing');
-      return { realRoot: rootDirectory.identityFingerprint, packageBytes: captured.bytes, packageJson };
-    };
+    const readPackageRoot = createSdkPackageRootReader({
+      packageRoots,
+      rootEntries,
+      treeByPath,
+      readPackageFile: (root, entry) => readSdkFile(native, installation, sdk,
+        `${root}/package.json`, SDK_METADATA_MAX_BYTES, entry, treeByPath, packageObservedFacts),
+    });
     const lockEntry = inventoryByPath.get('bun.lock');
     if (!lockEntry || lockEntry.size === 0 || lockEntry.size > SDK_METADATA_MAX_BYTES ||
         lockEntry.sha256 !== verified.source.bunLockSha256) refuse('sdk-lock-inventory-binding');

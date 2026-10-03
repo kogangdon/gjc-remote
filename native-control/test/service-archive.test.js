@@ -215,7 +215,7 @@ function manifestFor({ archive, inventory, inventoryBytes, platform = 'linux' })
       manifestPath: 'native-control/build/Release/native-control.manifest.json',
       manifestFingerprint: 'd'.repeat(64),
       contractVersion: 5,
-      contractRevision: 1,
+      contractRevision: 2,
     },
     wireCapabilities: ['gate_presentation_v1'],
     compatibility: compatibility(),

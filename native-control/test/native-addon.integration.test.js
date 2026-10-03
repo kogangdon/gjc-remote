@@ -77,7 +77,7 @@ function inventoryRolesForCurrent(current) {
   return null;
 }
 
-test("ABI 5 inventory ABI exposes only the frozen seven primitive signatures", () => {
+test("ABI 5 inventory ABI retains its seven primitive signatures and adds management provisioning", () => {
   const inventory = [
     "resolve_native_state_root",
     "read_workspace_root_facts",
@@ -89,8 +89,16 @@ test("ABI 5 inventory ABI exposes only the frozen seven primitive signatures", (
   ];
   const inventoryStart = capabilities.indexOf(inventory[0]);
   assert.ok(inventoryStart >= 0);
-  assert.deepEqual(capabilities.slice(inventoryStart, inventoryStart + inventory.length), inventory);
-  assert.equal(capabilities[inventoryStart + inventory.length], "enumerate_workspace_process_holders");
+  const inventoryPositions = inventory.map((name) => capabilities.indexOf(name));
+  assert.ok(inventoryPositions.every((position) => position >= inventoryStart));
+  assert.deepEqual(inventoryPositions, [...inventoryPositions].sort((left, right) => left - right));
+  for (const name of inventory) {
+    assert.equal(capabilities.filter((capability) => capability === name).length, 1);
+  }
+  assert.ok(capabilities.includes("provision_inventory_bases"));
+  assert.equal(capabilities.filter((name) => name === "provision_inventory_bases").length, 1);
+  assert.deepEqual(capabilitySignatures.provision_inventory_bases, ["roles"]);
+  assert.ok(capabilities.includes("enumerate_workspace_process_holders"));
   assert.deepEqual(capabilitySignatures.enumerate_workspace_process_holders, ["workDir", "sourcePlatform"]);
   assert.deepEqual(Object.fromEntries(inventory.map((name) => [name, capabilitySignatures[name]])), {
     resolve_native_state_root: ["hostKey", "rootKind"],
@@ -114,21 +122,60 @@ test("public inventory adapters and service facade do not expose low-level helpe
     "createSelfProcessObserver",
     "createServiceNative",
     "createServiceStartupObserver",
+    "provisionInventoryBases",
     "validateBuildManifest",
   ]);
   assert.equal(typeof publicApi.createContainmentLowLevel, "function");
   assert.equal(typeof publicApi.createResidualProcessEnumerator, "function");
   assert.equal(typeof publicApi.createInventoryPublisher, "function");
   assert.equal(typeof publicApi.createInventoryReader, "function");
+  assert.equal(typeof publicApi.provisionInventoryBases, "function");
   assert.equal(typeof publicApi.createServiceNative, "function");
   assert.equal(publicApi.createServiceNative, createServiceNative);
   assert.equal("createInventoryPublisherAdapter" in publicApi, false);
   assert.equal("createInventoryReaderAdapter" in publicApi, false);
   assert.equal("createServiceNativeFactory" in publicApi, false);
   assert.equal(publicApi.buildManifest.contractVersion, 5);
-  assert.equal(publicApi.buildManifest.contractRevision, 1);
+  assert.equal(publicApi.buildManifest.contractRevision, 2);
   assert.deepEqual(publicApi.buildManifest.capabilities, capabilities);
   assert.deepEqual(publicApi.buildManifest.capabilitySignatures, capabilitySignatures);
+});
+
+test("native inventory provisioning rejects malformed arguments before fixed-root access", (t) => {
+  if (!existsSync(addonUrl) || !existsSync(manifestUrl)) {
+    t.skip("verified native addon is not built for this checkout");
+    return;
+  }
+  const addonBytes = readFileSync(addonUrl);
+  const manifest = JSON.parse(readFileSync(manifestUrl, "utf8"));
+  const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
+  if (!validateBuildManifest(manifest, packageJson, addonBytes)) {
+    t.skip("native build belongs to a different platform or architecture");
+    return;
+  }
+
+  const addon = require(fileURLToPath(addonUrl));
+  const invalid = (invoke) => assert.throws(invoke, (error) =>
+    error.code === "INVENTORY_INVALID" &&
+    error.operation === "provision_inventory_bases" &&
+    error.writes === 0 && error.ambiguous === false);
+  invalid(() => addon.provision_inventory_bases());
+  invalid(() => addon.provision_inventory_bases(null));
+  invalid(() => addon.provision_inventory_bases({}));
+  invalid(() => addon.provision_inventory_bases({}, "extra"));
+  invalid(() => addon.provision_inventory_bases({ management: {}, extra: true }));
+
+  let getterCalls = 0;
+  const accessorRoles = {};
+  Object.defineProperty(accessorRoles, "management", {
+    enumerable: true,
+    get() {
+      getterCalls++;
+      return {};
+    },
+  });
+  invalid(() => addon.provision_inventory_bases(accessorRoles));
+  assert.equal(getterCalls, 0, "invalid role accessors must be rejected without execution");
 });
 
 test("inventory ACL verification atomically binds the requested actor", (t) => {

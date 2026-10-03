@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback } from 'node:child_process';
 import { createHash, generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -130,8 +130,8 @@ function writeManifestFixture(dir, {
   packageJson,
   copyAddon = false,
   manifestOverrides = {},
+  releaseDir = join(dir, 'release'),
 }) {
-  const releaseDir = join(dir, 'release');
   const releaseKeysDir = join(dir, 'release-keys');
   writeFileSync(join(dir, '.keep'), '');
   // The real .node file stays locked by the OS for as long as this process has required it, so
@@ -175,16 +175,16 @@ function loadOptions(fixture, extra) {
   };
 }
 
-test('contract revision 1 preserves the fence write-receipt provenance boundary', () => {
+test('contract revision 2 preserves the fence write-receipt provenance boundary', () => {
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
-  assert.equal(packageJson.version, '2.0.0');
+  assert.equal(packageJson.version, '2.1.0');
   assert.equal(packageJson.nativeControlContract.version, 5);
-  assert.equal(contractRevision, 1);
+  assert.equal(contractRevision, 2);
   assert.equal(packageJson.nativeControlContract.revision, contractRevision);
   assert.deepEqual(capabilitySignatures.acquire_inventory_fence, ['path', 'roles']);
 });
 
-test('native contract 5 revision 1 is the only accepted capability contract', () => {
+test('native contract 5 revision 2 is the only accepted capability contract', () => {
   const addonBytes = Buffer.from('current-native-addon');
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
   const manifest = {
@@ -202,7 +202,7 @@ test('native contract 5 revision 1 is the only accepted capability contract', ()
   };
 
   assert.equal(validateBuildManifest(manifest, packageJson, addonBytes, 'linux', 'x64'), true);
-  for (const revision of [contractRevision - 1, contractRevision + 1]) {
+  for (const revision of [1, contractRevision + 1]) {
     assert.equal(
       validateBuildManifest({ ...manifest, contractRevision: revision }, packageJson, addonBytes, 'linux', 'x64'),
       false,
@@ -225,7 +225,7 @@ test('loadVerifiedAddon: package contract revision drift refuses before addon lo
     const addonBytes = Buffer.from('not-a-native-addon');
     const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
     const fixture = writeManifestFixture(dir, { addonBytes, packageJson, copyAddon: true });
-    for (const revision of [contractRevision - 1, contractRevision + 1]) {
+    for (const revision of [1, contractRevision + 1]) {
       const driftedPackageJson = structuredClone(packageJson);
       driftedPackageJson.nativeControlContract.revision = revision;
       writeFileSync(fixture.packageJsonPath, JSON.stringify(driftedPackageJson));
@@ -361,23 +361,29 @@ test('loadVerifiedAddon: a pinned trusted key loads without any dev-key warning'
 });
 
 const execFile = promisify(execFileCallback);
-const realManifestPath = join(packageRoot, 'build', 'Release', 'native-control.manifest.json');
-const realSidecarPath = `${realManifestPath}.sig`;
-// Regenerating the manifest (--write-manifest) rewrites native-control.manifest.json and, per the
-// stale-sidecar-deletion contract under test below, deletes native-control.manifest.json.sig. Both
-// files are real, gitignored build outputs signed with a production key held outside this repo, so
-// tests must never leave the workspace with a missing/altered sidecar: capture the exact bytes that
-// were on disk before the case runs and restore them via t.after, which fires even on assertion
-// failure. Restoring bytes (never re-signing) means these tests need no access to the private key.
-function backupRealManifestAndSidecar(t) {
-  const manifestBackup = existsSync(realManifestPath) ? readFileSync(realManifestPath) : null;
-  const sidecarBackup = existsSync(realSidecarPath) ? readFileSync(realSidecarPath) : null;
-  t.after(() => {
-    if (manifestBackup === null) rmSync(realManifestPath, { force: true });
-    else writeFileSync(realManifestPath, manifestBackup, { mode: 0o600 });
-    if (sidecarBackup === null) rmSync(realSidecarPath, { force: true });
-    else writeFileSync(realSidecarPath, sidecarBackup, { mode: 0o600 });
+function writeVerifyBuildFixture(t) {
+  const dir = mkdtempSync(join(tmpdir(), 'native-control-provenance-'));
+  // Only subprocesses load this addon copy. They exit before t.after removes it, so Windows
+  // DLL locks are released without ever rewriting/restoring shared, possibly signed outputs.
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
+  const fixture = writeManifestFixture(dir, {
+    addonBytes: readFileSync(realAddonPath),
+    packageJson,
+    copyAddon: true,
+    releaseDir: join(dir, 'build', 'Release'),
   });
+  mkdirSync(join(dir, 'scripts'));
+  const scriptPath = join(dir, 'scripts', 'verify-build.mjs');
+  cpSync(join(packageRoot, 'scripts', 'verify-build.mjs'), scriptPath);
+  cpSync(join(packageRoot, 'src'), join(dir, 'src'), { recursive: true });
+  // Preserve the genuine index.js import graph and package exports in an owned snapshot.
+  // No workspace release keys, sidecars, or private signing material are copied.
+  const sharedScope = join(dir, 'node_modules', '@gjc-remote');
+  mkdirSync(sharedScope, { recursive: true });
+  cpSync(join(packageRoot, '..', 'shared'), join(sharedScope, 'shared'), { recursive: true });
+  writeFileSync(fixture.trustedKeysPath, JSON.stringify({ version: 1, keys: [] }));
+  return { ...fixture, dir, scriptPath };
 }
 
 // --- Dev keys are honoured only in the trusted.json zero-key bootstrap state ---------------
@@ -583,13 +589,14 @@ test('evaluateRequiredSignature: a signature from a pinned trusted.json key veri
 
 test('verify-build.mjs --write-manifest deletes a stale sidecar so it can never appear valid or linger', async (t) => {
   if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
-  backupRealManifestAndSidecar(t);
-  writeFileSync(realSidecarPath, JSON.stringify({ keyId: 'stale', algorithm: 'ed25519', signature: 'not-a-real-signature' }));
-  assert.ok(existsSync(realSidecarPath), 'fixture setup: stale sidecar must exist before regeneration');
+  const fixture = writeVerifyBuildFixture(t);
+  writeFileSync(fixture.sidecarPath, JSON.stringify({ keyId: 'stale', algorithm: 'ed25519', signature: 'not-a-real-signature' }));
+  assert.ok(existsSync(fixture.sidecarPath), 'fixture setup: stale sidecar must exist before regeneration');
   try {
-    await execFile(process.execPath, [join(packageRoot, 'scripts', 'verify-build.mjs'), '--write-manifest'], { cwd: packageRoot });
+    await execFile(process.execPath, [fixture.scriptPath, '--write-manifest'], { cwd: fixture.dir });
+    assert.deepEqual(readFileSync(fixture.manifestPath), fixture.manifestBytes, 'regeneration must preserve the canonical local metadata');
   } finally {
-    assert.equal(existsSync(realSidecarPath), false, 'manifest regeneration must delete the stale sidecar');
+    assert.equal(existsSync(fixture.sidecarPath), false, 'manifest regeneration must delete the stale sidecar');
   }
 });
 
@@ -597,12 +604,12 @@ test('verify-build.mjs --write-manifest deletes a stale sidecar so it can never 
 
 test('verify-build.mjs invoked through a junctioned/symlinked script path still runs --require-signature and fails closed', async (t) => {
   if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
-  backupRealManifestAndSidecar(t);
+  const fixture = writeVerifyBuildFixture(t);
   const parentDir = mkdtempSync(join(tmpdir(), 'native-control-alias-'));
   const aliasDir = join(parentDir, 'alias');
   try {
     // Directory junctions need no elevated privilege on Windows, unlike file/directory symlinks.
-    symlinkSync(packageRoot, aliasDir, process.platform === 'win32' ? 'junction' : 'dir');
+    symlinkSync(fixture.dir, aliasDir, process.platform === 'win32' ? 'junction' : 'dir');
   } catch (error) {
     if (error?.code === 'EPERM' || error?.code === 'EACCES') {
       t.diagnostic(
@@ -618,7 +625,7 @@ test('verify-build.mjs invoked through a junctioned/symlinked script path still 
   try {
     const aliasedScript = join(aliasDir, 'scripts', 'verify-build.mjs');
     await assert.rejects(
-      execFile(process.execPath, [aliasedScript, '--write-manifest', '--require-signature'], { cwd: packageRoot }),
+      execFile(process.execPath, [aliasedScript, '--write-manifest', '--require-signature'], { cwd: fixture.dir }),
       (error) => {
         assert.notEqual(error.code, 0, 'an aliased invocation must fail closed, never exit 0');
         assert.match(error.stderr, /--require-signature was set but the signature sidecar is missing/);
@@ -633,18 +640,17 @@ test('verify-build.mjs invoked through a junctioned/symlinked script path still 
 
 test('verify-build.mjs treats an unresolvable script entry as ambiguous and runs the checks instead of skipping them', async (t) => {
   if (!realAddonAvailable) { t.skip('real native addon build is not present on this checkout'); return; }
-  backupRealManifestAndSidecar(t);
-  // Regenerate a fresh, matching manifest with no sidecar so this test does not depend on
-  // whatever state the junction test above left behind (including if it was UNPROVEN/skipped).
-  await execFile(process.execPath, [join(packageRoot, 'scripts', 'verify-build.mjs'), '--write-manifest'], { cwd: packageRoot });
-  assert.equal(existsSync(realSidecarPath), false, 'fixture setup: no sidecar must be present before the ambiguous-entry check');
-  const verifyBuildUrl = pathToFileURL(join(packageRoot, 'scripts', 'verify-build.mjs')).href;
+  const fixture = writeVerifyBuildFixture(t);
+  // Exercise genuine regeneration in this test's own tree before the ambiguous-entry check.
+  await execFile(process.execPath, [fixture.scriptPath, '--write-manifest'], { cwd: fixture.dir });
+  assert.equal(existsSync(fixture.sidecarPath), false, 'fixture setup: no sidecar must be present before the ambiguous-entry check');
+  const verifyBuildUrl = pathToFileURL(fixture.scriptPath).href;
   // argv[1] is set to a path that does not exist anywhere on disk, so realpathSync(entry) throws
   // inside verify-build.mjs's isMainModule check: this is the "no resolvable script entry" case,
   // which must fail safe by running the checks, not by silently treating the module as imported.
   const evalCode = `import(${JSON.stringify(verifyBuildUrl)}).catch((e) => { console.error(e); process.exitCode = 3; });`;
   await assert.rejects(
-    execFile(process.execPath, ['-e', evalCode, 'this-entry-path-does-not-resolve.js', '--require-signature'], { cwd: packageRoot }),
+    execFile(process.execPath, ['-e', evalCode, 'this-entry-path-does-not-resolve.js', '--require-signature'], { cwd: fixture.dir }),
     (error) => {
       assert.notEqual(error.code, 0, 'an unresolvable entry must fail closed, never exit 0');
       assert.notEqual(error.code, 3, 'the dynamic import itself must not throw; only the enforced signature check should fail');

@@ -143,7 +143,7 @@ function packageModels({
       },
     },
     native: {
-      name: '@gjc-remote/native-control', version: '2.0.0', private: true, type: 'module',
+      name: '@gjc-remote/native-control', version: '2.1.0', private: true, type: 'module',
       nativeControlContract: {
         version: 5,
         revision: contractRevision,
