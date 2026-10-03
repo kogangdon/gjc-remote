@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { capabilitySignatures, serviceCapabilities } from '../src/capabilities.js';
 import { createServiceNativeFactory } from '../src/service-native.js';
+import { createServiceObservationDirectoryFixture } from '../test-fixtures/service-observation-directory.mjs';
 
 const require = createRequire(import.meta.url);
 const addonPath = fileURLToPath(new URL('../build/Release/native_control.node', import.meta.url));
@@ -62,6 +65,10 @@ function facadeFixture() {
       return Object.freeze({ name });
     },
   ]));
+  addon.read_win32_boot_clock = () => {
+    calls.set('read_win32_boot_clock', []);
+    return Object.freeze({ name: 'read_win32_boot_clock' });
+  };
   const roles = testRoles();
   return {
     calls,
@@ -90,6 +97,7 @@ test('observation capabilities expose closed positional signatures through the r
   facade.resolve_service_artifact_location(directoryHandle, 'bin/worker.exe', 'b'.repeat(64));
   facade.open_service_external_root('C:\\scope\\config', 'config');
   facade.read_service_external_object(externalRootHandle, 'daemon.env', 'bytes', 262144);
+  assert.deepEqual(facade.read_win32_boot_clock(), { name: 'read_win32_boot_clock' });
   const projectedRoles = calls.get('plan_service_artifact_location')[3];
 
   assert.deepEqual(calls.get('plan_service_artifact_location'), [
@@ -104,6 +112,7 @@ test('observation capabilities expose closed positional signatures through the r
   assert.deepEqual(calls.get('read_service_external_object'), [
     externalRootHandle, 'daemon.env', 'bytes', 262144,
   ]);
+  assert.deepEqual(calls.get('read_win32_boot_clock'), []);
   assert.deepEqual(projectedRoles, roles);
   assert.notEqual(projectedRoles, roles);
   assert.equal(calls.get('open_service_external_root')[2], projectedRoles);
@@ -111,7 +120,35 @@ test('observation capabilities expose closed positional signatures through the r
   assert.equal(facade.resolve_service_artifact_location.length, 3);
   assert.equal(facade.open_service_external_root.length, 2);
   assert.equal(facade.read_service_external_object.length, 4);
+  assert.equal(facade.read_win32_boot_clock.length, 0);
 });
+
+function nativeObservationRoles(addon) {
+  const current = addon.current_os_principal();
+  const system = 'S-1-5-18';
+  assert.equal(current?.kind, 'sid');
+  const result = spawnSync('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    'Get-LocalUser | ForEach-Object { $_.SID.Value }',
+  ], { encoding: 'utf8', timeout: 10_000, windowsHide: true });
+  assert.equal(result.error, undefined, 'read-only local user enumeration must run');
+  assert.equal(result.status, 0, 'read-only local user enumeration must succeed');
+  const candidates = [...new Set(result.stdout.split(/\r?\n/).map((value) => value.trim()))]
+    .filter((value) => /^S-1-5-21-(?:[0-9]+-){3}[0-9]+$/.test(value))
+    .filter((value) => value !== current.value && value !== system);
+  assert.ok(
+    candidates.length >= (current.value === system ? 4 : 3),
+    'the temporary native fixture requires three distinct existing user SIDs besides management and SYSTEM',
+  );
+  const management = current.value === system ? candidates.shift() : current.value;
+  return {
+    management: { kind: 'sid', value: management },
+    bot: { kind: 'sid', value: candidates[0] },
+    recovery: { kind: 'sid', value: candidates[1] },
+    daemon: { kind: 'sid', value: candidates[2] },
+    system: { kind: 'sid', value: system },
+  };
+}
 
 test('Windows service and inventory roots share the OS installation drive without ProgramData fallback', () => {
   const systemDriveResolver = nativeFunctionBlock('bool ResolveWindowsSystemDriveRoot(');
@@ -273,6 +310,95 @@ test('native source binds identities, absence, role ACL profiles, and bounded re
   assert.match(ownerPolicy, /DaemonRetainedDirectory[\s\S]*?DaemonRetainedFile\) return 3/);
   assert.match(readObject, /external_observed_entries/);
   assert.match(readObject, /external_observed_name_bytes/);
+});
+
+test('directory snapshots finish enumeration before byte-order sorting and refuse non-EOF errors', () => {
+  const snapshot = nativeFunctionBlock('bool ServiceObservationDirectorySnapshot(');
+  const eof = snapshot.indexOf('if (GetLastError() == ERROR_NO_MORE_FILES) break;');
+  const sort = snapshot.indexOf('std::sort(entries->begin(), entries->end()');
+  assert.notEqual(eof, -1, 'only ERROR_NO_MORE_FILES terminates enumeration successfully');
+  assert.match(snapshot.slice(eof), /^if \(GetLastError\(\) == ERROR_NO_MORE_FILES\) break;\s*return false;/);
+  assert.ok(sort > eof, 'the sorted result is produced only after enumeration completes');
+});
+
+test('native Windows SDK directory snapshots complete mixed-case enumeration, sort names, and fail closed on invalid children', (context) => {
+  if (process.platform !== 'win32') {
+    context.skip('native external directory snapshots require Windows');
+    return;
+  }
+  if (!existsSync(addonPath)) {
+    context.skip('native addon is not built in this source-only check');
+    return;
+  }
+
+  const addon = require(addonPath);
+  const roles = nativeObservationRoles(addon);
+  const fixture = createServiceObservationDirectoryFixture(roles);
+  let handle;
+  try {
+    const opened = addon.open_service_external_root(fixture.root, 'sdk-install', roles);
+    assert.equal(opened.writes, 0);
+    assert.equal(opened.profile, 'sdk-install');
+    handle = opened.handle;
+
+    const snapshot = addon.read_service_external_object(handle, '', 'directory', 0);
+    assert.equal(snapshot.kind, 'directory');
+    assert.equal(snapshot.writes, 0);
+    assert.deepEqual(
+      snapshot.entries.map(({ name, kind }) => [name, kind]),
+      [
+        ['CHANGELOG.md', 'file'],
+        ['LICENSE', 'file'],
+        ['build', 'directory'],
+        ['index.js', 'file'],
+      ],
+    );
+
+    writeFileSync(join(fixture.root, 'invalid-acl.txt'), 'untrusted child\n');
+    assert.throws(
+      () => addon.read_service_external_object(handle, '', 'directory', 0),
+      (error) => error.code === 'SERVICE_STALE' && error.writes === 0,
+      'an invalid child must refuse the entire snapshot rather than expose a partial listing',
+    );
+  } finally {
+    if (handle !== undefined) addon.close_service_handle(handle);
+    fixture.cleanup();
+  }
+});
+
+test('planned Win32 launch mode is confined to planning while mutation callers retain materialized-file checks', () => {
+  const capture = nativeFunctionBlock('bool CaptureWin32ServiceLaunch(');
+  const plan = nativeBlock('PlanWin32ServiceResource');
+  const create = nativeBlock('CreateWin32ServiceDisabled');
+  const configure = nativeBlock('ConfigureWin32ServiceLaunch');
+  assert.match(capture, /Win32ServiceLaunchValidation validation =\s*Win32ServiceLaunchValidation::Materialized/);
+  assert.match(plan, /Win32ServiceLaunchValidation::PlannedArtifacts/);
+
+  const materializedStart = capture.indexOf('const bool materialized_artifacts_valid =');
+  const runtimeStart = capture.indexOf('const bool runtime_valid =');
+  assert.ok(materializedStart > runtimeStart, 'runtime file proof stays outside planned-artifact bypass');
+  const materialized = capture.slice(materializedStart, capture.indexOf('if (!runtime_valid', materializedStart));
+  for (const artifact of ['supervisor_path', 'entrypoint_path', 'bootstrap_path']) {
+    assert.match(materialized, new RegExp(`ReadWindowsFileSha256\\(launch->${artifact}`));
+    assert.match(materialized, new RegExp(`VerifyWindowsPathServiceAcl\\(launch->${artifact}`));
+  }
+  const runtime = capture.slice(runtimeStart, materializedStart);
+  assert.match(runtime, /ReadWindowsFileSha256\(launch->runtime_path/);
+  assert.match(runtime, /VerifyWindowsPathServiceAcl\(launch->runtime_path/);
+  for (const check of [
+    'VerifyWindowsDirectoryNoFollow(launch->working_directory)',
+    'VerifyWindowsDirectoryNoFollow(launch->home_directory)',
+    'VerifyWin32ConfigSourceLaunch',
+    'VerifyWindowsPathServiceAcl(launch->channels_config',
+    'VerifyWin32RuntimeConfigLaunch',
+    'launch->sdk_profile_path',
+  ]) assert.ok(capture.includes(check), `${check} remains enforced in planned mode`);
+
+  for (const [name, body] of [['create', create], ['configure', configure]]) {
+    const call = body.match(/CaptureWin32ServiceLaunch\([\s\S]*?\);/);
+    assert.ok(call, `${name} path captures the launch`);
+    assert.doesNotMatch(call[0], /PlannedArtifacts/, `${name} uses materialized validation`);
+  }
 });
 
 test('native malformed handle/profile tuples fail before observation and report zero writes', (context) => {

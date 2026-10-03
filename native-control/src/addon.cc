@@ -8321,6 +8321,11 @@ struct Win32ServiceLaunch {
   std::wstring command_line;
 };
 
+enum class Win32ServiceLaunchValidation {
+  Materialized,
+  PlannedArtifacts,
+};
+
 bool ValidWin32LogBase(const std::string& value,
                        const std::string& expected) {
   return value == expected && !value.empty() && value.size() <= 255 &&
@@ -8591,7 +8596,9 @@ bool CaptureWin32ServiceLaunch(napi_env env, napi_value value,
                                const std::string& name,
                                const std::string& role,
                                const InventoryRoles& roles,
-                               Win32ServiceLaunch* launch) {
+                               Win32ServiceLaunch* launch,
+                               Win32ServiceLaunchValidation validation =
+                                   Win32ServiceLaunchValidation::Materialized) {
   static const char* const field_names[] = {
     "supervisorPath", "supervisorSha256", "workingDirectory",
     "homeDirectory", "runtimePath", "runtimeSha256", "runtimeVersion",
@@ -8718,21 +8725,26 @@ bool CaptureWin32ServiceLaunch(napi_env env, napi_value value,
     return false;
   }
 
-  if (!ReadWindowsFileSha256(launch->supervisor_path,
-                             launch->supervisor_sha256) ||
-      !ReadWindowsFileSha256(launch->runtime_path, launch->runtime_sha256) ||
-      !ReadWindowsFileSha256(launch->entrypoint_path,
-                             launch->entrypoint_sha256) ||
-      !ReadWindowsFileSha256(launch->bootstrap_path,
-                             launch->bootstrap_sha256) ||
-      !VerifyWindowsPathServiceAcl(launch->supervisor_path, roles,
-          ServiceAclProfile::ReleaseExecutable) ||
-      !VerifyWindowsPathServiceAcl(launch->runtime_path, roles,
-          ServiceAclProfile::ReleaseExecutable) ||
-      !VerifyWindowsPathServiceAcl(launch->entrypoint_path, roles,
-          ServiceAclProfile::ReleaseFile) ||
-      !VerifyWindowsPathServiceAcl(launch->bootstrap_path, roles,
-          ServiceAclProfile::ReleaseFile) ||
+  const bool runtime_valid =
+      ReadWindowsFileSha256(launch->runtime_path, launch->runtime_sha256) &&
+      VerifyWindowsPathServiceAcl(launch->runtime_path, roles,
+          ServiceAclProfile::ReleaseExecutable);
+  const bool materialized_artifacts_valid =
+      validation == Win32ServiceLaunchValidation::PlannedArtifacts ||
+      (validation == Win32ServiceLaunchValidation::Materialized &&
+       ReadWindowsFileSha256(launch->supervisor_path,
+                             launch->supervisor_sha256) &&
+       ReadWindowsFileSha256(launch->entrypoint_path,
+                             launch->entrypoint_sha256) &&
+       ReadWindowsFileSha256(launch->bootstrap_path,
+                             launch->bootstrap_sha256) &&
+       VerifyWindowsPathServiceAcl(launch->supervisor_path, roles,
+           ServiceAclProfile::ReleaseExecutable) &&
+       VerifyWindowsPathServiceAcl(launch->entrypoint_path, roles,
+           ServiceAclProfile::ReleaseFile) &&
+       VerifyWindowsPathServiceAcl(launch->bootstrap_path, roles,
+           ServiceAclProfile::ReleaseFile));
+  if (!runtime_valid || !materialized_artifacts_valid ||
       !VerifyWindowsDirectoryNoFollow(launch->working_directory) ||
       !VerifyWindowsDirectoryNoFollow(launch->home_directory) ||
       !VerifyWindowsDirectoryNoFollow(launch->log_directory)) return false;
@@ -9046,7 +9058,8 @@ napi_value PlanWin32ServiceResource(napi_env env,
   }
   Win32ServiceLaunch launch;
   Win32ServiceSnapshot snapshot;
-  if (!CaptureWin32ServiceLaunch(env, args[2], name, role, roles, &launch) ||
+  if (!CaptureWin32ServiceLaunch(env, args[2], name, role, roles, &launch,
+          Win32ServiceLaunchValidation::PlannedArtifacts) ||
       !BuildWin32PlannedServiceSnapshot(name, role, roles, launch,
           application_fingerprint, phase, &snapshot)) {
     ServiceError(env, "SERVICE_INVALID", "plan_win32_service_resource");
@@ -16234,7 +16247,8 @@ bool ServiceObservationDirectorySnapshot(
             restart ? FileIdBothDirectoryRestartInfo
                     : FileIdBothDirectoryInfo,
             buffer.data(), static_cast<DWORD>(buffer.size()))) {
-      return GetLastError() == ERROR_NO_MORE_FILES;
+      if (GetLastError() == ERROR_NO_MORE_FILES) break;
+      return false;
     }
     restart = false;
     size_t offset = 0;

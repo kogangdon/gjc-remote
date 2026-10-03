@@ -471,6 +471,7 @@ function validateContractShape(contract, platform, architecture) {
     'repository',
     'releaseVersion',
     'releaseTag',
+    'releaseSequence',
     'producer',
     'targets',
     'sourceWorkspaces',
@@ -485,6 +486,7 @@ function validateContractShape(contract, platform, architecture) {
       contract.kind !== 'gjc-remote-application-release-contract' ||
       contract.repository !== 'kogangdon/gjc-remote' ||
       contract.releaseTag !== `v${contract.releaseVersion}` ||
+      contract.releaseSequence !== 10 ||
       contract.producer?.bunVersion !== '1.4.2' ||
       !Array.isArray(contract.sourceWorkspaces) ||
       contract.sourceWorkspaces.length !== workspaces.size ||
@@ -1166,7 +1168,7 @@ async function verifyBuild({
       build.source.bunLockSha256 !== lockSha256 ||
       manifest.releaseVersion !== contract.releaseVersion ||
       manifest.releaseId !== contract.releaseTag ||
-      manifest.releaseSequence !== 1 ||
+      manifest.releaseSequence !== contract.releaseSequence ||
       !sameJson(manifest.target, target) ||
       manifest.source.commit !== syntheticGit.commit ||
       manifest.source.tree !== syntheticGit.tree ||
@@ -1760,7 +1762,7 @@ export async function runServiceReleaseRealBunEvidence(argv) {
         outputDirectory,
         platform: target.platform,
         architecture: target.architecture,
-        releaseSequence: 1,
+        releaseSequence: contract.releaseSequence,
         signingKeyId: FIXTURE_SIGNING_KEY_ID,
         nativeAddonPath,
         nativeManifestPath,

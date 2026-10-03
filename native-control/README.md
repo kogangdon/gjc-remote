@@ -17,14 +17,30 @@ authority:
 On Windows, these leaves are separate OS-drive subtrees:
 `<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
 `<OS-drive>:\gjc-remote\native-reader\<host-key>` for the daemon reader.
-These remain the v0.4.0-rc.9 candidate paths, sharing the OS-derived base with
+These remain the v0.4.0-rc.10 candidate paths, sharing the OS-derived base with
 service state. The layout was introduced by merged PR #259 (source commit
 `91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) and is present in published and
 deployed rc.8. Published rc.7 remains immutable and continues to use ProgramData
-for inventory/native-reader state. This documentation makes no rc.9 publication,
-signing, installation, or deployment claim. Any rc.9 application archive and
-fresh signed native-control addon must use only the future immutable
-`v0.4.0-rc.9` tag commit and its successful main-CI promotion inputs; the known
+for inventory/native-reader state. rc.9 was deployed; its CLI and SDK archive
+contents matched the signed release, application signatures were verified, and
+protected ACLs were verified. The canonical Windows SCM install was refused
+before journal creation with `SERVICE_INVALID` and zero writes because the JS
+driver rejected valid opaque native lock handles. No SCM mutation occurred, and
+no service was installed or qualified. The rc.10 candidate removes the
+unnecessary JS driver lock-handle input and shape check;
+authority validation and lock lifetime remain at the existing native/session
+boundary. It also projects the already-exported `read_win32_boot_clock`
+capability through the `serviceNative` role facade without adding a native ABI
+capability, and fixes native observation-directory EOF handling so complete
+enumeration reaches canonical ordering for ordinary mixed-case SDK directories.
+Read-only Windows launch planning accepts the future signed artifact locations
+before publication. Service creation and launch changes retain mandatory
+materialized artifact byte and ACL verification; runtime, configuration, log,
+and SDK checks remain mandatory even during planning.
+This documentation describes the current rc.10 source candidate,
+which is not yet signed, deployed, or qualified. Any rc.10 application archive
+and fresh signed native-control addon must use only the exact future immutable
+`v0.4.0-rc.10` tag commit and its successful main-CI promotion inputs. The known
 fix parent `8bfcb91` and PR #259's source commit are not release-source inputs.
 Linux paths and behavior are unchanged.
 
@@ -143,17 +159,19 @@ open_service_artifact_source
 
 Each public method has the corresponding native capability signature with its
 single `roles` parameter removed. The captured tuple is inserted only at that
-declared position. Thus the seven authority-bearing public signatures are
+declared position. Authority-bearing public examples include
 `set_exact_service_acl(path, profile)`,
 `verify_exact_service_acl(path, profile)`,
 `open_win32_service(name, serviceRole, access)`,
-`create_win32_service_disabled(name, serviceRole, supervisorPath,
-supervisorSha256, workingDirectory, homeDirectory, runtimePath, runtimeSha256,
-entrypointPath, entrypointSha256, logDirectory, logAs, logCmdAs,
-channelsConfig, servicePassword)`, `open_service_root(rootKind, access)`,
+`plan_win32_service_resource(name, serviceRole, launch,
+applicationManifestFingerprint, phase)`,
+`create_win32_service_disabled(name, serviceRole, launch, servicePassword)`,
+`open_service_root(rootKind, access)`,
 `open_linux_service_scope(serviceKey, access)`, and
 `open_service_artifact_source(path, maxBytes, expectedFacts)`. All other signatures are
-unchanged. Every wrapper rejects missing or extra arguments and otherwise
+unchanged. The facade also projects the existing zero-argument
+`read_win32_boot_clock()` without exposing the other self-observation
+capabilities. Every wrapper rejects missing or extra arguments and otherwise
 passes values, opaque handles, byte buffers, receipts, and native errors
 unchanged. It exposes no raw addon, management, inventory, workspace-serving,
 generic dispatch, filesystem fallback, or role-substitution surface.
@@ -453,18 +471,20 @@ release. Build takes exactly `--source`, `--output`, `--platform`,
 `--architecture`, `--release-sequence`, `--signing-key-id`, `--native-addon`,
 `--native-manifest`, and `--native-signature`. Verify takes only `--candidate`.
 Output must be a new directory outside the source tree.
+For rc.10, `--release-sequence 10` must match the pinned contract; build and
+candidate verification reject every other sequence.
 
 `deploy/native/release-contract.json` fixes the repository, release tag, supported
 tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
-The current candidate contract is `v0.4.0-rc.9` with native-control 2.0.0
+The current candidate contract is `v0.4.0-rc.10` with native-control 2.0.0
 (contract 5, revision 1) and unchanged SDK 0.16.7. The tag workflow uses the
-same Bun 1.4.2 producer version. Existing rc.1 through rc.8 releases and
-artifacts remain historical, immutable inputs, not renamed rc.9 candidates;
-every rc.9 application archive must be built from a clean checkout of the
-future immutable `v0.4.0-rc.9` tag, with that commit recorded in its source
-manifest.
+same Bun 1.4.2 producer version. Existing rc.1 through rc.9 releases and
+artifacts remain historical, immutable inputs, not renamed rc.10 candidates;
+every rc.10 application archive must be built from a clean checkout of the
+exact future immutable `v0.4.0-rc.10` tag, with that commit recorded in its
+source manifest.
 The rc.5 native addon moves
 Windows service state under the OS installation drive's `\gjc-remote`
 directory and does not migrate the old ProgramData service store. PR #259
@@ -486,14 +506,14 @@ errors are newly owned rather than mutations of immutable dependency errors;
 safe error codes, ambiguity, and accumulated session/driver writes are
 preserved.
 
-Fresh native-control 2.0.0 outputs must come from the exact future rc.9 tag
+Fresh native-control 2.0.0 outputs must come from the exact future rc.10 tag
 commit's successful main-CI promotion inputs. The version string alone does not
 identify these outputs: record each signed manifest's addon SHA-256 in the
-release notes. The known fix parent `8bfcb91` is not a source commit, and rc.7
+release notes. The known fix parent `8bfcb91` is not a source commit, and rc.9
 or earlier native signing inputs must never be reused. This is candidate source
-preparation only; it does not claim rc.9 publication, signing, installation,
-or deployment. Signed/live deployment qualification remains separate from
-source-level and unsigned-audit evidence.
+preparation only; it does not claim rc.10 signing, installation, or deployment.
+Signed/live deployment qualification remains separate from source-level and
+unsigned-audit evidence.
 The source must be clean Git state at that tag with canonical `bun.lock` and
 both separate public trust resources tracked. Git hooks/fsmonitor and replacement
 objects cannot supply authority; configured executable filters refuse before

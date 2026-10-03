@@ -6,6 +6,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   unlinkSync,
   writeFileSync,
@@ -187,7 +188,10 @@ function populateExactSyntheticSource(root) {
   return join(fixtureDirectory, 'service-release-real-bun.mjs');
 }
 
-function installNoProcessBoundary(t, sourceRoot) {
+function installNoProcessBoundary(t, sourceRoot, {
+  injectMembershipChange = true,
+  refuseKeyGeneration = false,
+} = {}) {
   const ownedRoots = [];
   let spawnCalls = 0;
   let keyGenerationCalls = 0;
@@ -202,6 +206,9 @@ function installNoProcessBoundary(t, sourceRoot) {
   });
   const keyMock = t.mock.method(crypto, 'generateKeyPairSync', (...args) => {
     keyGenerationCalls += 1;
+    if (refuseKeyGeneration) {
+      throw new Error('MODELED_KEY_BOUNDARY_REFUSED');
+    }
     return Reflect.apply(originalGenerateKeyPairSync, crypto, args);
   });
   const realpathMock = t.mock.method(fsPromises, 'realpath', async (...args) => {
@@ -219,7 +226,7 @@ function installNoProcessBoundary(t, sourceRoot) {
   const mkdirMock = t.mock.method(fsPromises, 'mkdir', async (...args) => {
     mkdirCalls += 1;
     const [path, options] = args;
-    if (!injected && typeof path === 'string' &&
+    if (!injected && injectMembershipChange && typeof path === 'string' &&
         basename(path) === 'source' && options?.recursive === false &&
         dirname(path).includes('gjc-real-bun-release-fixture-')) {
       injected = true;
@@ -274,7 +281,7 @@ function errorCode(expected) {
   };
 }
 
-test('real-Bun evidence harness refuses no acknowledgement and detects newly eligible selected source membership', async (t) => {
+test('real-Bun evidence harness rejects invalid release sequences before side effects and preserves the source membership fence', async (t) => {
   assert.equal(
     ['win32:x64', 'linux:x64', 'linux:arm64'].includes(
       `${process.platform}:${process.arch}`,
@@ -290,7 +297,6 @@ test('real-Bun evidence harness refuses no acknowledgement and detects newly eli
   try {
     const root = fixtureRootFor(installation);
     const harnessPath = populateExactSyntheticSource(root);
-    boundary = installNoProcessBoundary(t, root);
     const harness = await import(
       `${pathToFileURL(harnessPath).href}?source-membership=${Date.now()}`
     );
@@ -299,6 +305,17 @@ test('real-Bun evidence harness refuses no acknowledgement and detects newly eli
       'function',
     );
 
+    const contractPath = join(root, 'deploy', 'native', 'release-contract.json');
+    const originalContractBytes = readFileSync(contractPath);
+    assert.equal(
+      JSON.parse(originalContractBytes.toString('utf8')).releaseSequence,
+      10,
+      'the source fixture carries the current production release sequence',
+    );
+    boundary = installNoProcessBoundary(t, root, {
+      injectMembershipChange: false,
+      refuseKeyGeneration: true,
+    });
     const beforeAcknowledgement = boundary.snapshot();
     await assert.rejects(
       harness.runServiceReleaseRealBunEvidence(),
@@ -308,6 +325,35 @@ test('real-Bun evidence harness refuses no acknowledgement and detects newly eli
     );
     assert.deepEqual(boundary.snapshot(), beforeAcknowledgement);
 
+    const invalidSequenceContracts = [
+      ['malformed string', (contract) => { contract.releaseSequence = '10'; }],
+      ['malformed fraction', (contract) => { contract.releaseSequence = 10.5; }],
+      ['missing', (contract) => { delete contract.releaseSequence; }],
+      ['stale', (contract) => { contract.releaseSequence = 9; }],
+      ['future', (contract) => { contract.releaseSequence = 11; }],
+    ];
+    for (const [description, mutate] of invalidSequenceContracts) {
+      const contract = JSON.parse(originalContractBytes.toString('utf8'));
+      mutate(contract);
+      writeFileSync(contractPath, JSON.stringify(contract), { mode: 0o644 });
+      await assert.rejects(
+        harness.runServiceReleaseRealBunEvidence([ACKNOWLEDGEMENT_FLAG]),
+        errorCode('SERVICE_RELEASE_REAL_BUN_FIXTURE_CONTRACT_INVALID'),
+        `reject ${description} releaseSequence`,
+      );
+      const snapshot = boundary.snapshot();
+      assert.equal(snapshot.spawnCalls, 0, `${description}: no process operation`);
+      assert.equal(snapshot.keyGenerationCalls, 0, `${description}: no key operation`);
+      assert.equal(snapshot.mkdtempCalls, 0, `${description}: no fixture setup`);
+      assert.equal(snapshot.ownedRootCount, 0, `${description}: no fixture root`);
+    }
+
+    assert.equal(boundary.injected, false);
+    boundary.restore();
+    boundary = null;
+    writeFileSync(contractPath, originalContractBytes);
+
+    boundary = installNoProcessBoundary(t, root);
     await assert.rejects(
       harness.runServiceReleaseRealBunEvidence([ACKNOWLEDGEMENT_FLAG]),
       errorCode('SERVICE_RELEASE_REAL_BUN_FIXTURE_SOURCE_CHANGED'),

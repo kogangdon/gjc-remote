@@ -6,6 +6,7 @@ import { createServiceBootstrapNative } from './service-bootstrap-native.js';
 const FACTORY_KEYS = Object.freeze(['roles']);
 const ROLE_KEYS = Object.freeze(['management', 'bot', 'recovery', 'daemon', 'system']);
 const PRINCIPAL_KEYS = Object.freeze(['kind', 'value']);
+const WINDOWS_BOOT_CLOCK_CAPABILITY = 'read_win32_boot_clock';
 const getOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
 const getPrototypeOf = Object.getPrototypeOf;
 const ownKeys = Reflect.ownKeys;
@@ -109,7 +110,7 @@ function roleSnapshot(options) {
   return roles;
 }
 
-const projection = Object.freeze(serviceCapabilities.map((name) => {
+const projection = Object.freeze([...serviceCapabilities, WINDOWS_BOOT_CLOCK_CAPABILITY].map((name) => {
   const signature = capabilitySignatures[name];
   if (!Array.isArray(signature)) {
     throw new Error(`missing service capability signature: ${name}`);

@@ -449,15 +449,17 @@ function parseContract(bytes) {
     fail(CODES.contract);
   }
   const keys = [
-    'schemaVersion', 'kind', 'limits', 'repository', 'releaseVersion', 'releaseTag', 'producer',
+    'schemaVersion', 'kind', 'limits', 'repository', 'releaseVersion', 'releaseTag',
+    'releaseSequence', 'producer',
     'targets', 'sourceWorkspaces', 'sourceRootFiles', 'excludedSegments',
     'entrypoints', 'runtimes', 'nativeControl',
     'wireCapabilities', 'sdk',
   ];
   if (!exact(contract, keys) || contract.schemaVersion !== 1 ||
       contract.kind !== 'gjc-remote-application-release-contract' ||
-      contract.repository !== 'kogangdon/gjc-remote' || contract.releaseVersion !== '0.4.0-rc.9' ||
-      contract.releaseTag !== 'v0.4.0-rc.9' || !exact(contract.entrypoints, ['bot', 'daemon']) ||
+      contract.repository !== 'kogangdon/gjc-remote' || contract.releaseVersion !== '0.4.0-rc.10' ||
+      contract.releaseTag !== 'v0.4.0-rc.10' || contract.releaseSequence !== 10 ||
+      !exact(contract.entrypoints, ['bot', 'daemon']) ||
       contract.entrypoints.bot !== 'bot/src/bot.js' || contract.entrypoints.daemon !== 'daemon/src/daemon.js' ||
       !exact(contract.runtimes, ['node', 'bun']) || contract.runtimes.node?.minimumVersion !== '26.0.0' ||
       contract.runtimes.bun?.minimumVersion !== '1.4.0') fail(CODES.contract);
@@ -512,14 +514,14 @@ function parseContract(bytes) {
         'path', 'packageName', 'packageVersion', 'productionRoots',
       ]) || workspace.path !== SOURCE_WORKSPACES[index] || !Array.isArray(workspace.productionRoots))) fail(CODES.contract);
   const expectedWorkspace = [
-    ['bot', '@gjc-remote/bot', '0.4.0-rc.9', ['package.json', 'src']],
-    ['daemon', '@gjc-remote/daemon', '0.4.0-rc.9', ['package.json', 'src']],
+    ['bot', '@gjc-remote/bot', '0.4.0-rc.10', ['package.json', 'src']],
+    ['daemon', '@gjc-remote/daemon', '0.4.0-rc.10', ['package.json', 'src']],
     ['native-control', '@gjc-remote/native-control', '2.0.0', [
       'deployment-keys/application-trusted.json',
       'deployment-keys/shawl-trusted.json', 'package.json',
       'release-keys/trusted.json', 'src',
     ]],
-    ['shared', '@gjc-remote/shared', '0.4.0-rc.9', ['package.json', '*.js']],
+    ['shared', '@gjc-remote/shared', '0.4.0-rc.10', ['package.json', '*.js']],
   ];
   if (contract.sourceWorkspaces.some((workspace, index) =>
     workspace.path !== expectedWorkspace[index][0] || workspace.packageName !== expectedWorkspace[index][1] ||
@@ -1013,7 +1015,7 @@ async function materializeWithBun({ materialRoot, scratch, platform, architectur
   });
 }
 
-function validateBuildInput(input) {
+function validateBuildInput(input, contract) {
   const keys = [
     'sourceRoot', 'outputDirectory', 'platform', 'architecture', 'releaseSequence', 'signingKeyId',
     'nativeAddonPath', 'nativeManifestPath', 'nativeSignaturePath',
@@ -1028,6 +1030,7 @@ function validateBuildInput(input) {
       value.nativeManifestPath, value.nativeSignaturePath].every(exactAbsolutePath) ||
         !TARGETS.has(`${value.platform}:${value.architecture}`) ||
         !Number.isSafeInteger(value.releaseSequence) || value.releaseSequence < 1 ||
+        value.releaseSequence !== contract.releaseSequence ||
         typeof value.signingKeyId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.signingKeyId) ||
         sameOrInside(value.sourceRoot, value.outputDirectory) ||
         sameOrInside(value.outputDirectory, value.sourceRoot)) fail(CODES.input);
@@ -1504,6 +1507,7 @@ export async function verifyUnsignedServiceRelease(input = {}) {
     throw bounded(error, CODES.candidate);
   }
   if (manifest.releaseVersion !== contract.releaseVersion || manifest.releaseId !== contract.releaseTag ||
+      manifest.releaseSequence !== contract.releaseSequence ||
       manifest.source.repository !== contract.repository || !TARGETS.has(`${manifest.target.platform}:${manifest.target.architecture}`) ||
       canonicalJsonHash(manifest.entrypoints) !== canonicalJsonHash(contract.entrypoints) ||
       canonicalJsonHash(manifest.runtimes) !== canonicalJsonHash(contract.runtimes) ||
@@ -1580,7 +1584,8 @@ export async function verifyUnsignedServiceRelease(input = {}) {
 }
 
 export async function buildUnsignedServiceRelease(input) {
-  input = validateBuildInput(input);
+  const contract = await loadServiceReleaseContract();
+  input = validateBuildInput(input, contract);
   // NTFS/Bun materialization does not retain authoritative POSIX mode bits for
   // non-bin package helpers. Refuse before creating scratch/output state or
   // invoking Git/Bun rather than emitting host-dependent Linux policy.
@@ -1599,7 +1604,6 @@ export async function buildUnsignedServiceRelease(input) {
   } catch (error) {
     throw bounded(error, CODES.path);
   }
-  const contract = await loadServiceReleaseContract();
   let scratchCreated;
   let scratch;
   try {

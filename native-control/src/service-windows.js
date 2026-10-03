@@ -424,16 +424,16 @@ function validateResourceDescriptor(value, component, serviceKey, op) {
 
 export function createWindowsServiceDriver(options) {
   const op = 'create_windows_service_driver';
-  const optionKeys = ['native', 'session', 'locks', 'roles', 'configuration', 'launch', 'shawl', 'clock', 'sleep'];
+  const optionKeys = ['native', 'session', 'roles', 'configuration', 'launch', 'shawl', 'clock', 'sleep'];
   const optionalKeys = ['servicePassword', 'servicePasswordRequired'];
   if (!plain(options) || Reflect.ownKeys(options).some((key) => !optionKeys.includes(key) && !optionalKeys.includes(key)) || optionKeys.some((key) => !Object.hasOwn(options, key))) fail('SERVICE_INVALID', op);
-  const { native, session, locks, roles, configuration, launch: launchInput, shawl } = options;
+  const { native, session, roles, configuration, launch: launchInput, shawl } = options;
   const servicePassword = options.servicePassword;
   const servicePasswordRequired = options.servicePasswordRequired === true;
   const nowMs = options.clock ?? (() => Date.now());
   const sleepMs = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   if (typeof nowMs !== 'function' || typeof sleepMs !== 'function') fail('SERVICE_INVALID', op);
-  if ((native === null || (typeof native !== 'object' && typeof native !== 'function')) || !plain(session) || !plain(locks) || !plain(shawl)) fail('SERVICE_INVALID', op);
+  if ((native === null || (typeof native !== 'object' && typeof native !== 'function')) || !plain(session) || !plain(shawl)) fail('SERVICE_INVALID', op);
   for (const method of SESSION_METHODS) if (typeof session[method] !== 'function') fail('SERVICE_INVALID', op);
   if (session.platform !== 'win32' || session.architecture !== 'x64' || (session.component !== 'bot' && session.component !== 'daemon')) fail('SERVICE_INVALID', op);
   const component = session.component; const serviceKey = session.serviceKey;
@@ -454,7 +454,6 @@ export function createWindowsServiceDriver(options) {
   } catch {
     fail('SERVICE_INVALID', op);
   }
-  if (!exact(locks, ['artifact', 'sharedTemplate', 'serviceKey']) || Object.values(locks).some((v) => v === null || typeof v !== 'object' || Reflect.ownKeys(v).length === 0)) fail('SERVICE_INVALID', op);
   if (servicePassword !== undefined && (typeof servicePassword !== 'string' || servicePassword.length === 0 || Buffer.byteLength(servicePassword, 'utf8') > SERVICE_LIFECYCLE_LIMITS.servicePasswordBytes || servicePassword.includes('\0'))) fail('SERVICE_INVALID', op);
   if (servicePasswordRequired && servicePassword === undefined) fail('SERVICE_INVALID', op, 0, false, 'service-password-required');
   const descriptors = Object.getOwnPropertyDescriptors(native); const calls = Object.create(null);

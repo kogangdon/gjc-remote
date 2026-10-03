@@ -162,7 +162,6 @@ function releaseFor(component) {
 function session(serviceKey, configuration = null) {
   return {
     serviceKey,
-    handoffDriverLocks: () => ({ locks: true }),
     readManifest: () => configuration === null ? { present: false, value: null } : { present: true, value: { configuration } },
   };
 }
@@ -199,7 +198,7 @@ test('bot install composes one Launch-bound driver and plans trial and final res
   const planned = options.planResource({ session: s, request: h.request, release });
   assert.equal(planned.trial.resourceFingerprint, hex('1'));
   assert.equal(planned.final.resourceDescriptor.phase, 'final');
-  const driver = options.createWindowsDriver({ session: s, request: h.request, release, locks: { locks: true } });
+  const driver = options.createWindowsDriver({ session: s, request: h.request, release });
   assert.equal(h.drivers.length, 1, 'planning and execution share one driver');
   assert.ok(driver);
   const { launch, shawl } = h.drivers[0];
@@ -220,6 +219,31 @@ test('bot install composes one Launch-bound driver and plans trial and final res
   assert.deepEqual(h.calls, [['install', { expectedScopeFingerprint: hex('4') }]]);
 });
 
+test('opaque handoff handles remain session-owned and are not forwarded as Windows driver authority', async () => {
+  const h = harness();
+  const operation = h.create();
+  await operation.effectiveConfigPreflight(context(h));
+  const options = operation.lifecycleOptions(context(h));
+  const release = releaseFor('bot');
+  const opaqueLocks = Object.freeze({
+    artifact: Object.freeze({}),
+    sharedTemplate: Object.freeze({}),
+    serviceKey: Object.freeze({}),
+  });
+  assert.ok(Object.values(opaqueLocks).every((handle) => typeof handle === 'object' && Reflect.ownKeys(handle).length === 0));
+  const s = session('bot');
+  let handoffCalls = 0;
+  s.handoffDriverLocks = () => { handoffCalls += 1; return opaqueLocks; };
+  const planned = options.planResource({ session: s, request: h.request, release });
+  assert.equal(planned.trial.resourceDescriptor.phase, 'trial');
+  assert.equal(planned.final.resourceDescriptor.phase, 'final');
+  const driver = options.createWindowsDriver({ session: s, request: h.request, release, locks: opaqueLocks });
+  assert.ok(driver);
+  assert.equal(handoffCalls, 0, 'the Windows host never re-authenticates or manufactures session lock authority');
+  assert.equal(Object.hasOwn(h.drivers[0], 'locks'), false, 'the unused lock API is not forwarded into the driver');
+  assert.equal(h.fake.openHandles(), 0);
+});
+
 test('daemon Launch binds runtime config identities, SDK profile and exact target fingerprint', async () => {
   const h = harness({ component: 'daemon', env: 'HOST_ID=host-a\nBOT_WS_URL=wss://bot.example/ws\nHOST_TOKEN=t\n' });
   const operation = h.create();
@@ -229,7 +253,7 @@ test('daemon Launch binds runtime config identities, SDK profile and exact targe
     [['read', 'C:\\GJC\\daemon\\runtime-config\\.bunfig.toml', 'bytes', 1]],
   );
   const options = operation.lifecycleOptions(context(h));
-  options.createWindowsDriver({ session: session(daemonKey), request: h.request, release: releaseFor('daemon'), locks: {} });
+  options.createWindowsDriver({ session: session(daemonKey), request: h.request, release: releaseFor('daemon') });
   const { launch } = h.drivers[0];
   assert.equal(launch.runtimeConfigRoot, 'C:\\GJC\\daemon\\runtime-config');
   assert.equal(launch.runtimeConfigIdentityFingerprint, physical('d'.repeat(32)));
@@ -304,7 +328,7 @@ test('update checks the candidate against the authenticated current release and 
     'SERVICE_PENDING', 'current-release-unavailable');
   await refusal(options.compatibility({ operation: 'rollback', request: h.request, release, old: oldProof, session: s }),
     'SERVICE_INVALID', 'compatibility-operation');
-  await refusal((async () => options.createWindowsDriver({ session: session('other'), request: h.request, release, locks: {} }))(),
+  await refusal((async () => options.createWindowsDriver({ session: session('other'), request: h.request, release }))(),
     'SERVICE_INVALID', 'service-key');
 });
 
@@ -315,13 +339,13 @@ test('retained operations derive configuration from the current service manifest
   const ctx = { operation: 'uninstall', request: uninstallRequest, platform: 'win32', architecture: 'x64' };
   await operation.effectiveConfigPreflight(ctx);
   const options = operation.lifecycleOptions(ctx);
-  await refusal((async () => options.createWindowsDriver({ session: session('bot'), request: uninstallRequest, release: releaseFor('bot'), locks: {} }))(),
+  await refusal((async () => options.createWindowsDriver({ session: session('bot'), request: uninstallRequest, release: releaseFor('bot') }))(),
     'SERVICE_PENDING', 'configuration-unavailable');
   const s = session('bot', botConfiguration);
-  options.createWindowsDriver({ session: s, request: uninstallRequest, release: releaseFor('bot'), locks: {} });
+  options.createWindowsDriver({ session: s, request: uninstallRequest, release: releaseFor('bot') });
   assert.equal(h.drivers[0].configuration, botConfiguration);
   const moved = { ...releaseFor('bot'), entrypointSha256: hex('5') };
-  await refusal((async () => options.createWindowsDriver({ session: s, request: uninstallRequest, release: moved, locks: {} }))(),
+  await refusal((async () => options.createWindowsDriver({ session: s, request: uninstallRequest, release: moved }))(),
     'SERVICE_STALE', 'launch-drift');
 });
 
@@ -333,7 +357,7 @@ test('recovery compatibility uses the configuration bound by the recovery driver
   const options = operation.lifecycleOptions(ctx);
   const s = session('bot');
   const release = releaseFor('bot');
-  options.createWindowsDriver({ session: s, request: { ...recoverRequest, configuration: botConfiguration }, release, locks: {} });
+  options.createWindowsDriver({ session: s, request: { ...recoverRequest, configuration: botConfiguration }, release });
   await options.compatibility({ operation: 'install', request: recoverRequest, release, session: s });
   assert.equal(h.compatibility[0].workingDirectory, botConfiguration.workingDirectory);
   assert.equal(typeof options.observeApplication({}), 'function');
