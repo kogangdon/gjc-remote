@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 
 import { validateBuildManifest } from '../src/index.js';
+import { diagnoseInventoryBootstrapRefusal } from '../test-fixtures/inventory-bootstrap-diagnostic.mjs';
 
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
@@ -249,6 +250,8 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
   assert.deepEqual(current, { kind: 'sid', value: windowsIdentity.currentSid },
     'native current_os_principal must match the actual Windows process identity');
   const roles = localRoleIdentities(windowsIdentity.users, current.value);
+  for (const role of Object.values(roles)) Object.freeze(role);
+  Object.freeze(roles);
   assert.equal(new Set([
     roles.management.value, roles.bot.value, roles.recovery.value, roles.daemon.value,
   ]).size, 4, 'M/B/R/D must be distinct real local user SIDs');
@@ -258,17 +261,35 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
   const controlRootPath = `${containerPath}\\service-control`;
   const inventoryBase = `${containerPath}\\native`;
   const readerBase = `${containerPath}\\native-reader`;
-  const platformWitnessPath = `${containerPath}\\.gjc-service-platform-container.v1`;
+  const platformWitnessPath = `${driveRoot}.gjc-service-platform-container.v1`;
+  const platformPendingPath = `${driveRoot}.gjc-service-system-drive-gjc-remote.pending`;
   const controlWitnessPath = `${containerPath}\\.gjc-service-control-root.v1`;
 
   // Never adopt, inspect as fixture state, or clean up a live canonical root.
   // The root is checked before the only mutating operation below.
   await assertPathAbsent(containerPath);
+  await assertPathAbsent(platformWitnessPath);
+  await assertPathAbsent(platformPendingPath);
 
   // This is the existing low-level creator. Its callback contract is
   // { handle, rootBinding, writes }; the opaque handle stays open until all
   // filesystem and witness observations have completed.
-  const opened = native.open_service_root('control', roles, 'create-new');
+  let opened;
+  try {
+    opened = native.open_service_root('control', roles, 'create-new');
+  } catch (error) {
+    if (error?.code === 'SERVICE_ACCESS_DENIED' &&
+        error?.operation === 'open_service_root' && error?.writes === 0 &&
+        error?.ambiguous === false) {
+      try {
+        const diagnostic = await diagnoseInventoryBootstrapRefusal(roles, driveRoot);
+        t.diagnostic(JSON.stringify(diagnostic));
+      } catch {
+        t.diagnostic('INVENTORY_BOOTSTRAP_DIAGNOSTIC_FAILED');
+      }
+    }
+    throw error;
+  }
   const controlHandle = opened?.handle;
   try {
     assert.deepEqual(Object.keys(opened ?? {}).sort(), ['handle', 'rootBinding', 'writes']);
