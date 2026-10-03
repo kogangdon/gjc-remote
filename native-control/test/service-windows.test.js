@@ -351,16 +351,43 @@ function fixture(options = {}) {
   const session = sessionFixture(transaction, options.references);
   let now = 1_000_000;
   const launch = launchFor(component, serviceKey, configuration, options.entrypointPath ?? (component === 'bot' ? release().entrypointPath : 'C:\\ProgramData\\GJC\\releases\\current\\daemon.js'));
-  const driver = createWindowsServiceDriver({ native: native.facade, session, locks: { artifact: { token: 'artifact' }, sharedTemplate: { token: 'shared' }, serviceKey: { token: 'service' } }, roles, configuration, launch, shawl, servicePassword: options.servicePassword, servicePasswordRequired: options.servicePasswordRequired, clock: () => now, sleep: async (ms) => { now += ms; } });
+  const driver = createWindowsServiceDriver({ native: native.facade, session, roles, configuration, launch, shawl, servicePassword: options.servicePassword, servicePasswordRequired: options.servicePasswordRequired, clock: () => now, sleep: async (ms) => { now += ms; } });
   return { driver, native, session, transaction, advance: (ms) => { now += ms; } };
 }
 
 function freshDriver(f, { component = f.session.component, serviceKey = f.session.serviceKey, configuration = component === 'bot' ? botConfiguration : daemonConfiguration, applicationManifestFingerprint = hex('d'), entrypointPath = 'C:\\ProgramData\\GJC\\releases\\current\\bot.js' } = {}) {
   const launch = launchFor(component, serviceKey, configuration, entrypointPath);
-  return createWindowsServiceDriver({ native: f.native.facade, session: f.session, locks: { artifact: { token: 'artifact' }, sharedTemplate: { token: 'shared' }, serviceKey: { token: 'service' } }, roles, configuration, launch, shawl, clock: () => 1_000_000, sleep: async () => {} });
+  return createWindowsServiceDriver({ native: f.native.facade, session: f.session, roles, configuration, launch, shawl, clock: () => 1_000_000, sleep: async () => {} });
 }
 
 // All tests below use only the injected fake facade. No SCM, services, files, or native platform state are touched.
+test('opaque store locks are not driver authority and lock-free resource planning is write-free', () => {
+  const f = fixture();
+  const opaqueLocks = Object.freeze({
+    artifact: Object.freeze({}),
+    sharedTemplate: Object.freeze({}),
+    serviceKey: Object.freeze({}),
+  });
+  assert.ok(Object.values(opaqueLocks).every((handle) => typeof handle === 'object' && Reflect.ownKeys(handle).length === 0));
+  const launch = launchFor('bot', 'bot', botConfiguration, release().entrypointPath);
+  const options = {
+    native: f.native.facade, session: f.session, roles, configuration: botConfiguration, launch, shawl,
+    clock: () => 1_000_000, sleep: async () => {},
+  };
+  const callsBeforeRejectedLockInput = f.native.calls.length;
+  for (const locks of [{}, opaqueLocks]) {
+    assert.throws(() => createWindowsServiceDriver({ ...options, locks }), (error) =>
+      error.code === 'SERVICE_INVALID' && error.operation === 'create_windows_service_driver' && error.writes === 0);
+  }
+  assert.equal(f.native.calls.length, callsBeforeRejectedLockInput, 'neither arbitrary bags nor opaque handles bypass session authority');
+  const driver = createWindowsServiceDriver(options);
+  const plan = driver.planResource({ phase: 'trial', applicationManifestFingerprint: hex('d') });
+  assert.equal(plan.resourceDescriptor.startType, 'demand');
+  assert.equal(plan.resourceDescriptor.failurePolicy, 'none');
+  assert.equal(driver.writes, 0);
+  assert.deepEqual(f.native.calls.filter(([name]) => name === 'plan_win32_service_resource').map(([name]) => name), ['plan_win32_service_resource']);
+});
+
 test('projected Windows facade uses public arities and injects roles exactly once', () => {
   const f = fixture();
   assert.equal(f.native.facade.open_win32_service.length, 3);

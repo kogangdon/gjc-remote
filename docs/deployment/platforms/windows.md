@@ -93,10 +93,27 @@ copying its identity-bound records into the new store. PR #259 (source commit
 daemon-reader storage into the same OS-derived `\gjc-remote` tree as service
 state. The layout is present in published and deployed rc.8; published rc.7
 remains immutable and continues using ProgramData for inventory/native-reader
-state. This documentation describes the current v0.4.0-rc.9 source candidate
-and makes no rc.9 publication, signing, installation, or deployment claim. Any
-rc.9 application archive and fresh signed native-control addon must use only
-the future immutable `v0.4.0-rc.9` tag commit and its successful main-CI
+state. rc.9 was deployed; its CLI and SDK archive contents matched the signed
+release, application signatures were verified, and protected ACLs were
+verified. The canonical Windows SCM install was refused before journal
+creation with `SERVICE_INVALID` and zero writes because the JS driver rejected
+valid opaque native lock handles. No SCM mutation occurred, and no service was
+installed or qualified. The rc.10 candidate removes the
+unnecessary JS driver lock-handle input and shape check;
+authority validation and lock lifetime remain at the existing native/session
+boundary. It also projects the already-exported `read_win32_boot_clock`
+capability through the `serviceNative` role facade without adding a native ABI
+capability, and fixes native observation-directory EOF handling so complete
+enumeration reaches canonical ordering for ordinary mixed-case SDK directories.
+Read-only Windows launch planning accepts the future signed artifact locations
+before publication. Service creation and launch changes still require the
+published bytes and exact ACLs. Runtime, configuration, log, and SDK security
+checks remain mandatory during planning; invalid pre-existing runtime
+permissions are not repaired or relaxed automatically.
+This documentation describes the current v0.4.0-rc.10 source
+candidate, which is not yet signed, deployed, or qualified. Any rc.10
+application archive and fresh signed native-control addon must use only the
+exact future immutable `v0.4.0-rc.10` tag commit and its successful main-CI
 promotion inputs. The known fix parent `8bfcb91` and the PR #259 commit identify
 fixes, not the later release/tag source. Linux paths and behavior are unchanged.
 

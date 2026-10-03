@@ -362,7 +362,7 @@ export function createWindowsHostOperationFactory(dependencyValues) {
       if (!current?.present || !plain(current.value?.configuration)) refuse('SERVICE_PENDING', bound.operation, 'configuration-unavailable');
       return current.value.configuration;
     };
-    const driverFor = ({ session, request, release, locks }) => {
+    const driverFor = ({ session, request, release }) => {
       const serviceKey = serviceKeyOf(session);
       const configuration = retainedConfiguration(session, request);
       const captured = authorityFor(configuration, serviceKey);
@@ -374,7 +374,7 @@ export function createWindowsHostOperationFactory(dependencyValues) {
         return driver.value;
       }
       const options = {
-        native: nativeFor(bound.roles), session, locks: locks ?? session.handoffDriverLocks(), roles: bound.roles,
+        native: nativeFor(bound.roles), session, roles: bound.roles,
         configuration, launch,
         shawl: {
           path: release.supervisorPath, sha256: release.supervisorSha256,
@@ -405,7 +405,7 @@ export function createWindowsHostOperationFactory(dependencyValues) {
       }
       state = 'composed';
       const planResource = ({ session, request, release }) => {
-        const planner = driverFor({ session, request, release, locks: undefined });
+        const planner = driverFor({ session, request, release });
         const trial = planner.planResource({ phase: 'trial', applicationManifestFingerprint: release.applicationManifestFingerprint });
         const final = planner.planResource({ phase: 'final', applicationManifestFingerprint: release.applicationManifestFingerprint });
         return { trial: { ...trial }, final: { ...final } };

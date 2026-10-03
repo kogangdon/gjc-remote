@@ -18,6 +18,7 @@ import { createSelfProcessObserverFactory, createServiceNativeFactory } from '..
 import * as publicApi from '../src/public.js';
 
 const ROLE_KEYS = ['management', 'bot', 'recovery', 'daemon', 'system'];
+const FACADE_CAPABILITIES = Object.freeze([...serviceCapabilities, 'read_win32_boot_clock']);
 const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 test('public self observation rejects caller authority before loading native code', () => {
@@ -165,7 +166,7 @@ function cloneRoles(roles = validRoles()) {
 function fakeAddon(overrides = {}) {
   const calls = [];
   const addon = {};
-  for (const name of serviceCapabilities) {
+  for (const name of FACADE_CAPABILITIES) {
     addon[name] = (...args) => {
       const result = Object.freeze({ capability: name, sequence: calls.length });
       calls.push({ name, args, result });
@@ -345,7 +346,7 @@ test('applies the native Win32 SID bounds after canonical shared role validation
   assert.equal(loads, 0);
 });
 
-test('projects exactly the declared frozen service-capability surface', () => {
+test('projects only frozen service and Win32 boot-clock capabilities', () => {
   const { addon } = fakeAddon();
   const loaderArguments = [];
   const createServiceNative = createServiceNativeFactory((...args) => {
@@ -354,15 +355,20 @@ test('projects exactly the declared frozen service-capability surface', () => {
   });
   const facade = createServiceNative({ roles: validRoles() });
 
-  assert.deepEqual(Object.keys(facade), serviceCapabilities);
-  assert.deepEqual(Reflect.ownKeys(facade), serviceCapabilities);
+  assert.deepEqual(Object.keys(facade), FACADE_CAPABILITIES);
+  assert.deepEqual(Reflect.ownKeys(facade), FACADE_CAPABILITIES);
   assert.equal(Object.isFrozen(facade), true);
   assert.deepEqual(loaderArguments, [[]]);
-  for (const name of serviceCapabilities) assert.equal(typeof facade[name], 'function');
+  for (const name of FACADE_CAPABILITIES) {
+    assert.equal(typeof facade[name], 'function');
+    assert.equal(Object.isFrozen(facade[name]), true, `${name} wrapper is frozen`);
+  }
   for (const withheld of [
     'open_verified_parent',
     'publish_inventory_object_atomic',
     'enumerate_workspace_process_holders',
+    'observe_self_process_epoch',
+    'read_self_service_config',
     'native_control_contract',
     'addon',
     'dispatch',
@@ -383,7 +389,7 @@ test('all signatures remove only roles and inject the immutable snapshot at its 
     .filter((name) => capabilitySignatures[name].includes('roles'));
   assert.ok(roleCapabilities.length > 0);
 
-  for (const name of serviceCapabilities) {
+  for (const name of FACADE_CAPABILITIES) {
     const signature = capabilitySignatures[name];
     const args = publicArguments(name);
     assert.equal(facade[name].length, args.length, `${name} reflected arity`);
@@ -461,7 +467,7 @@ test('every method rejects missing and extra positional arguments before native 
   const { addon, calls } = fakeAddon();
   const facade = createServiceNativeFactory(() => addon)({ roles: validRoles() });
 
-  for (const name of serviceCapabilities) {
+  for (const name of FACADE_CAPABILITIES) {
     const args = publicArguments(name);
     const before = calls.length;
     if (args.length > 0) {
@@ -474,7 +480,7 @@ test('every method rejects missing and extra positional arguments before native 
 });
 
 test('fails closed for every missing capability and for non-functions without evaluating accessors', () => {
-  for (const missing of serviceCapabilities) {
+  for (const missing of FACADE_CAPABILITIES) {
     const { addon } = fakeAddon();
     delete addon[missing];
     assertFactoryRefusal(
@@ -484,15 +490,15 @@ test('fails closed for every missing capability and for non-functions without ev
   }
 
   const nonFunction = fakeAddon().addon;
-  nonFunction.query_win32_service = Object.freeze({ callable: false });
+  nonFunction.read_win32_boot_clock = Object.freeze({ callable: false });
   assertFactoryRefusal(
     () => createServiceNativeFactory(() => nonFunction)({ roles: validRoles() }),
-    'query_win32_service',
+    'read_win32_boot_clock',
   );
 
   let getterCalls = 0;
   const accessor = fakeAddon().addon;
-  Object.defineProperty(accessor, 'read_boot_id', {
+  Object.defineProperty(accessor, 'read_win32_boot_clock', {
     enumerable: true,
     configurable: true,
     get() {
@@ -502,7 +508,7 @@ test('fails closed for every missing capability and for non-functions without ev
   });
   assertFactoryRefusal(
     () => createServiceNativeFactory(() => accessor)({ roles: validRoles() }),
-    'read_boot_id',
+    'read_win32_boot_clock',
   );
   assert.equal(getterCalls, 0);
 });
@@ -511,19 +517,32 @@ test('captures native function references once', () => {
   const { addon } = fakeAddon();
   let originalCalls = 0;
   let replacementCalls = 0;
+  let originalClockCalls = 0;
+  let replacementClockCalls = 0;
   addon.read_boot_id = () => {
     originalCalls += 1;
     return 'original';
+  };
+  addon.read_win32_boot_clock = () => {
+    originalClockCalls += 1;
+    return 'original clock';
   };
   const facade = createServiceNativeFactory(() => addon)({ roles: validRoles() });
   addon.read_boot_id = () => {
     replacementCalls += 1;
     return 'replacement';
   };
+  addon.read_win32_boot_clock = () => {
+    replacementClockCalls += 1;
+    return 'replacement clock';
+  };
 
   assert.equal(facade.read_boot_id(), 'original');
   assert.equal(originalCalls, 1);
   assert.equal(replacementCalls, 0);
+  assert.equal(facade.read_win32_boot_clock(), 'original clock');
+  assert.equal(originalClockCalls, 1);
+  assert.equal(replacementClockCalls, 0);
 });
 
 test('preserves opaque handles, bytes, receipts, native errors, and write accounting by identity', () => {

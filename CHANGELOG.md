@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.10] - 2026-10-02
+
+### Fixed
+
+- Correct Windows service-driver pre-journal handling so valid opaque native
+  lock handles are not rejected because of their JavaScript-visible shape.
+  Remove the unnecessary JS driver lock-handle input and shape check; authority
+  validation and lock lifetime remain at the existing native/session boundary.
+- Project the already-exported `read_win32_boot_clock` through the
+  `serviceNative` role facade without adding a native ABI capability, and fix
+  native observation-directory EOF handling so complete enumeration reaches
+  canonical ordering for ordinary mixed-case SDK directories.
+- Separate read-only Windows launch planning from materialized artifact
+  validation. Planning accepts future signed publication paths; service creation
+  and launch changes still require the published bytes and exact ACLs. Runtime,
+  configuration, log, and SDK security checks remain mandatory during planning.
+
+### Verification limits
+
+- rc.10 is a candidate only; it has not been signed, deployed, or qualified.
+  Application archives and fresh signed native-control outputs must come only
+  from the exact future immutable `v0.4.0-rc.10` tag commit and its successful
+  main-CI promotion inputs.
+- Native-control remains 2.0.0 (contract 5 revision 1), and SDK 0.16.7 is
+  unchanged. Signed service startup, shutdown, reboot, and power-loss
+  qualification remain separate evidence.
+
 ## [0.4.0-rc.9] - 2026-10-01
 
 ### Fixed
@@ -20,11 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Verification limits
 
-- This is candidate documentation only; it does not claim rc.9 publication,
-  signing, installation, deployment, or service qualification. Application
-  archives and fresh signed native-control outputs must use the future
-  immutable `v0.4.0-rc.9` tag commit and its successful main-CI promotion
-  inputs. The known fix parent `8bfcb91` is not a release source.
+- Published rc.9 application archives and fresh signed native-control outputs
+  came from the exact immutable `v0.4.0-rc.9` tag commit and its successful
+  main-CI promotion inputs; the known fix parent `8bfcb91` was not a release
+  source.
+- rc.9 was deployed; its CLI and SDK archive contents matched the signed
+  release, application signatures were verified, and protected ACLs were
+  verified. The canonical Windows SCM install was still refused before journal
+  creation with `SERVICE_INVALID` and zero writes: the JS driver rejected valid
+  opaque native lock handles. No SCM mutation, service installation, or service
+  qualification occurred.
 - Native-control remains 2.0.0 (contract 5 revision 1), and SDK 0.16.7 is
   unchanged. Signed service startup, shutdown, reboot, and power-loss
   qualification remain separate evidence.
