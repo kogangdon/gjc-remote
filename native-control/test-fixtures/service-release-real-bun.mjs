@@ -486,7 +486,7 @@ function validateContractShape(contract, platform, architecture) {
       contract.kind !== 'gjc-remote-application-release-contract' ||
       contract.repository !== 'kogangdon/gjc-remote' ||
       contract.releaseTag !== `v${contract.releaseVersion}` ||
-      contract.releaseSequence !== 10 ||
+      contract.releaseSequence !== 11 ||
       contract.producer?.bunVersion !== '1.4.2' ||
       !Array.isArray(contract.sourceWorkspaces) ||
       contract.sourceWorkspaces.length !== workspaces.size ||

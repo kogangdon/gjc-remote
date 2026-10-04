@@ -16,7 +16,7 @@ Before publishing, provision both host leaves under their actual native actors:
 On Windows, these leaves are separate OS-drive subtrees:
 `<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
 `<OS-drive>:\gjc-remote\native-reader\<host-key>` for the daemon reader.
-These remain the v0.4.0-rc.10 candidate paths, sharing the OS-derived base with
+These remain the v0.4.0-rc.11 source candidate paths, sharing the OS-derived base with
 service state. The layout was introduced by merged PR #259 (source commit
 `91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) and is present in published and
 deployed rc.8. Published rc.7 remains immutable and continues to use ProgramData
@@ -25,7 +25,7 @@ contents matched the signed release, application signatures were verified, and
 protected ACLs were verified. The canonical Windows SCM install was refused
 before journal creation with `SERVICE_INVALID` and zero writes because the JS
 driver rejected valid opaque native lock handles. No SCM mutation occurred, and
-no service was installed or qualified. The rc.10 candidate removes the
+no service was installed or qualified. Published rc.10 removes the
 unnecessary JS driver lock-handle input and shape check;
 authority validation and lock lifetime remain at the existing native/session
 boundary. It also projects the already-exported `read_win32_boot_clock`
@@ -40,8 +40,13 @@ Published rc.10 is immutable, from tag source
 `56de3e3eb77530fe5380b02870e2ad087412ea6a`. Deployment and foreground bot
 readiness were verified; canonical Windows service installation refused with
 zero writes at the SDK compatibility listing's generic JSON node bound.
-The unreleased source fixes that bound and adds explicit inventory-base
-provisioning. Neither change is present in the signed rc.10 runtime.
+Signed rc.10 contains native-control 2.0.0 (contract 5 revision 1) and SDK
+0.16.7. The rc.11 source candidate includes PR #263 (merge `c4a2ebe5`): it
+fixes that hashing bound, validates SDK sidecars against observed package facts,
+and adds explicit inventory-base provisioning. These changes are not present
+in the signed rc.10 runtime. The current preparation is not publication,
+signing, or deployment and does not replace any immutable rc.1 through rc.10
+asset.
 
 Service state uses different children of `<OS-drive>:\gjc-remote`, including
 `service-control`, `staging`, `releases`, and `supervisors\shawl`. Before
@@ -72,6 +77,17 @@ There is no ProgramData fallback or migration.
 The OS-derived paths retain the exact ownership and ACL checks, no-reparse
 protection, and NTFS directory-flush requirements; flush errors refuse without
 a volume-flush fallback.
+
+Isolated CI run [37167043415](https://github.com/kogangdon/gjc-remote/actions/runs/37167043415)
+and main CI run [37167663638](https://github.com/kogangdon/gjc-remote/actions/runs/37167663638)
+qualified this source operation on disposable GitHub-hosted Windows VMs:
+four writes, exactly four explicit ACEs per parent with M/D ownership, native
+directory flush, unchanged container/witness, and duplicate refusal with zero
+writes. The three standard CI users for bot, recovery, and daemon are authorized
+only on those disposable VMs; this is not a local E2E opt-in or authorization
+to create production accounts. This evidence does not qualify production M/D
+flush, deployment, SCM installation/startup, mapping authority, reboot,
+power-loss durability, or provider health.
 
 The publisher creates neither leaf and never creates, replaces, or advances the
 reader floor. UNC workspace inputs are accepted by the schema but are
@@ -489,7 +505,7 @@ release. Build takes exactly `--source`, `--output`, `--platform`,
 `--architecture`, `--release-sequence`, `--signing-key-id`, `--native-addon`,
 `--native-manifest`, and `--native-signature`. Verify takes only `--candidate`.
 Output must be a new directory outside the source tree.
-For rc.10, `--release-sequence 10` must match the pinned contract; build and
+For the rc.11 source candidate, `--release-sequence 11` must match the pinned contract; build and
 candidate verification reject every other sequence.
 
 `deploy/native/release-contract.json` fixes the repository, release tag, supported
@@ -497,9 +513,11 @@ tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
 Signed `v0.4.0-rc.10` contains native-control 2.0.0 (contract 5, revision 1).
-Unreleased source uses native-control 2.1.0 (contract 5, revision 2) and unchanged
-SDK 0.16.7. Application version/sequence selection still names rc.10 until a
-separate release-preparation change; do not publish this source as rc.10.
+Current source metadata selects application `0.4.0-rc.11`, release tag
+`v0.4.0-rc.11`, and sequence 11, with native-control 2.1.0 (contract 5,
+revision 2), N-API 8, and unchanged SDK 0.16.7. This is source candidate
+preparation only, not an existing signed tag or published release; do not
+publish this source as rc.10.
 The tag workflow uses the
 same Bun 1.4.2 producer version. Existing rc.1 through rc.10 releases and
 artifacts remain historical, immutable inputs. A later release must select its

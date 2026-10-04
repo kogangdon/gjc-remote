@@ -39,6 +39,7 @@ const originalMkdtemp = fsPromises.mkdtemp;
 const originalRealpath = fsPromises.realpath;
 const productRoot = fileURLToPath(new URL('../..', import.meta.url));
 const ACKNOWLEDGEMENT_FLAG = '--acknowledge-real-bun-fixture-build';
+const RELEASE_SEQUENCE = 11;
 
 function copyRegular(source, destination, mode = undefined) {
   const stat = lstatSync(source);
@@ -309,8 +310,8 @@ test('real-Bun evidence harness rejects invalid release sequences before side ef
     const originalContractBytes = readFileSync(contractPath);
     assert.equal(
       JSON.parse(originalContractBytes.toString('utf8')).releaseSequence,
-      10,
-      'the source fixture carries the current production release sequence',
+      RELEASE_SEQUENCE,
+      'the source fixture carries the current candidate release sequence',
     );
     boundary = installNoProcessBoundary(t, root, {
       injectMembershipChange: false,
@@ -326,16 +327,36 @@ test('real-Bun evidence harness rejects invalid release sequences before side ef
     assert.deepEqual(boundary.snapshot(), beforeAcknowledgement);
 
     const invalidSequenceContracts = [
-      ['malformed string', (contract) => { contract.releaseSequence = '10'; }],
-      ['malformed fraction', (contract) => { contract.releaseSequence = 10.5; }],
+      ['malformed string', (contract) => { contract.releaseSequence = '11'; }],
+      ['malformed fraction', (contract) => { contract.releaseSequence = 11.5; }],
       ['missing', (contract) => { delete contract.releaseSequence; }],
-      ['stale', (contract) => { contract.releaseSequence = 9; }],
-      ['future', (contract) => { contract.releaseSequence = 11; }],
+      ['stale', (contract) => { contract.releaseSequence = 10; }],
+      ['future', (contract) => { contract.releaseSequence = 12; }],
     ];
+    const buildInput = {
+      sourceRoot: root,
+      outputDirectory: `${root}-unsigned-candidate`,
+      platform: process.platform,
+      architecture: process.arch,
+      releaseSequence: RELEASE_SEQUENCE,
+      signingKeyId: 'deployment-test',
+      nativeAddonPath: join(root, 'native-control', 'build', 'Release', 'native_control.node'),
+      nativeManifestPath: join(root, 'native-control', 'build', 'Release', 'native-control.manifest.json'),
+      nativeSignaturePath: join(root, 'native-control', 'build', 'Release', 'native-control.manifest.json.sig'),
+    };
+    assert.equal(existsSync(buildInput.outputDirectory), false);
     for (const [description, mutate] of invalidSequenceContracts) {
       const contract = JSON.parse(originalContractBytes.toString('utf8'));
       mutate(contract);
       writeFileSync(contractPath, JSON.stringify(contract), { mode: 0o644 });
+      const beforeBuilder = boundary.snapshot();
+      await assert.rejects(
+        installation.releaseBuilder.buildUnsignedServiceRelease(buildInput),
+        { code: 'SERVICE_RELEASE_CONTRACT_INVALID', writes: 0 },
+        `builder rejects ${description} contract releaseSequence`,
+      );
+      assert.deepEqual(boundary.snapshot(), beforeBuilder, `${description}: builder has no side effects`);
+      assert.equal(existsSync(buildInput.outputDirectory), false);
       await assert.rejects(
         harness.runServiceReleaseRealBunEvidence([ACKNOWLEDGEMENT_FLAG]),
         errorCode('SERVICE_RELEASE_REAL_BUN_FIXTURE_CONTRACT_INVALID'),
@@ -346,6 +367,24 @@ test('real-Bun evidence harness rejects invalid release sequences before side ef
       assert.equal(snapshot.keyGenerationCalls, 0, `${description}: no key operation`);
       assert.equal(snapshot.mkdtempCalls, 0, `${description}: no fixture setup`);
       assert.equal(snapshot.ownedRootCount, 0, `${description}: no fixture root`);
+    }
+
+    writeFileSync(contractPath, originalContractBytes);
+    const admittedContract = await installation.releaseBuilder.loadServiceReleaseContract();
+    assert.equal(admittedContract.releaseVersion, '0.4.0-rc.11');
+    assert.equal(admittedContract.releaseTag, 'v0.4.0-rc.11');
+    assert.equal(admittedContract.releaseSequence, RELEASE_SEQUENCE);
+    for (const [description, mutate] of invalidSequenceContracts) {
+      const invalidInput = { ...buildInput };
+      mutate(invalidInput);
+      const beforeBuilder = boundary.snapshot();
+      await assert.rejects(
+        installation.releaseBuilder.buildUnsignedServiceRelease(invalidInput),
+        { code: 'SERVICE_RELEASE_INPUT_INVALID', writes: 0 },
+        `builder rejects ${description} input releaseSequence`,
+      );
+      assert.deepEqual(boundary.snapshot(), beforeBuilder, `${description}: builder has no side effects`);
+      assert.equal(existsSync(buildInput.outputDirectory), false);
     }
 
     assert.equal(boundary.injected, false);
