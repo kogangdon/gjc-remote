@@ -55,6 +55,7 @@ $password = $null
 $random = $null
 $bytes = $null
 $result = $null
+$phase = 'guards'
 try {
   if ($env:OS -ne 'Windows_NT' -or $env:GITHUB_ACTIONS -ne 'true' -or
       $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
@@ -67,6 +68,7 @@ try {
   )
   # Enumerate once with terminating query errors: no missing-user error is
   # mistaken for absence. Every fixed name must be absent before any creation.
+  $phase = 'account-preflight'
   $existing = @(Get-LocalUser -ErrorAction Stop)
   foreach ($spec in $specs) {
     if (@($existing | Where-Object { $_.Name -eq $spec.name }).Count -ne 0) {
@@ -74,27 +76,35 @@ try {
     }
   }
   $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $phase = 'management-query'
   $management = Get-LocalUser -SID ([System.Security.Principal.SecurityIdentifier]::new($currentSid)) -ErrorAction Stop
   if ($null -eq $management -or $management.SID.Value -ne $currentSid) { throw 'Current local user not found' }
   $usersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+  $phase = 'users-group-query'
   $usersGroup = Get-LocalGroup -SID $usersSid -ErrorAction Stop
   if ($null -eq $usersGroup -or $usersGroup.SID.Value -ne $usersSid.Value) { throw 'Users group not found' }
   $bindings = [ordered]@{ management = [string]$management.SID.Value }
+  $phase = 'random-initialization'
   $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
   foreach ($spec in $specs) {
     try {
+      $phase = 'password-generation'
       $bytes = New-Object byte[] 48
       $random.GetBytes($bytes)
       # Random material never leaves this process or becomes a fixture secret.
       $password = ConvertTo-SecureString -String ('Aa1!' + [Convert]::ToBase64String($bytes)) -AsPlainText -Force
       [Array]::Clear($bytes, 0, $bytes.Length)
       $bytes = $null
+      $phase = 'account-create'
       New-LocalUser -Name $spec.name -Password $password -ErrorAction Stop | Out-Null
       $created++
+      $phase = 'account-query'
       $user = Get-LocalUser -Name $spec.name -ErrorAction Stop
       if ($null -eq $user -or -not $user.Enabled) { throw 'CI account not enabled' }
+      $phase = 'users-group-join'
       Add-LocalGroupMember -SID $usersSid -Member $user -ErrorAction Stop | Out-Null
       $joined++
+      $phase = 'membership-query'
       $members = @(Get-LocalGroupMember -SID $usersSid -ErrorAction Stop)
       if (@($members | Where-Object { $_.SID.Value -eq $user.SID.Value }).Count -ne 1) {
         throw 'CI account Users membership not verified'
@@ -111,7 +121,7 @@ try {
 } catch {
   # Do not render PowerShell error records, credentials, or account objects.
   # Partial ownership is retained on this disposable runner, never retried.
-  $result = [ordered]@{ success = $false; created = $created; joined = $joined; verified = $verified; retained = $true }
+  $result = [ordered]@{ success = $false; created = $created; joined = $joined; verified = $verified; retained = $true; phase = $phase; errorCategory = [int]$_.CategoryInfo.Category; hresult = [int]$_.Exception.HResult }
 } finally {
   if ($null -ne $password) { $password.Dispose(); $password = $null }
   if ($null -ne $bytes) { [Array]::Clear($bytes, 0, $bytes.Length); $bytes = $null }
@@ -325,6 +335,11 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
       joined: accountSetup.joined,
       verified: accountSetup.verified,
       retained: accountSetup.retained,
+      ...(accountSetup.success === false ? {
+        phase: accountSetup.phase,
+        errorCategory: accountSetup.errorCategory,
+        hresult: accountSetup.hresult,
+      } : {}),
     },
   }));
   assert.equal(accountSetup.success, true, 'CI account setup must succeed without retry or adoption');
