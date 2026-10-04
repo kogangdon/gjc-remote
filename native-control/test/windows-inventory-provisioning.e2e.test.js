@@ -84,6 +84,8 @@ try {
   $usersGroup = Get-LocalGroup -SID $usersSid -ErrorAction Stop
   if ($null -eq $usersGroup -or $usersGroup.SID.Value -ne $usersSid.Value) { throw 'Users group not found' }
   $bindings = [ordered]@{ management = [string]$management.SID.Value }
+  $phase = 'security-module'
+  Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
   $phase = 'random-initialization'
   $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
   foreach ($spec in $specs) {
