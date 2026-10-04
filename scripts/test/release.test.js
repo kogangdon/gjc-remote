@@ -37,6 +37,19 @@ test("tag workflow uses the canonical candidate producer Bun version", async () 
   assert.deepEqual(versions, [contract.producer.bunVersion]);
 });
 
+test("the actual candidate changelog retains the next release promotion boundary", async () => {
+  const source = (await readFile(new URL("../../CHANGELOG.md", import.meta.url), "utf8"))
+    .replaceAll("\r\n", "\n");
+  const heading = "## [Unreleased]";
+  assert.equal(source.match(/^## \[Unreleased\]$/gm)?.length, 1);
+  const retainedHistory = source.slice(source.indexOf(heading) + heading.length).trimStart();
+  const withNextNotes = source.replace(heading, `${heading}\n\n- Test-only next release note.`);
+  const promoted = promoteChangelog(withNextNotes, "99.0.0-fixture", "2000-01-01");
+  assert.equal(promoted.error, undefined);
+  assert.ok(promoted.text.includes("## [99.0.0-fixture] - 2000-01-01"));
+  assert.ok(promoted.text.endsWith(retainedHistory), "candidate and historical release entries must remain intact");
+});
+
 // --- --no-verify / --push exclusivity ---------------------------------------
 
 test("checkFlagExclusivity rejects --no-verify combined with --push", () => {
