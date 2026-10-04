@@ -135,6 +135,7 @@ try {
 const ACL_SNAPSHOT_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
   [System.Security.AccessControl.AccessControlSections]::Group -bor
   [System.Security.AccessControl.AccessControlSections]::Access
