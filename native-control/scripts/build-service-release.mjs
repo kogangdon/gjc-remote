@@ -516,7 +516,7 @@ function parseContract(bytes) {
   const expectedWorkspace = [
     ['bot', '@gjc-remote/bot', '0.4.0-rc.10', ['package.json', 'src']],
     ['daemon', '@gjc-remote/daemon', '0.4.0-rc.10', ['package.json', 'src']],
-    ['native-control', '@gjc-remote/native-control', '2.0.0', [
+    ['native-control', '@gjc-remote/native-control', '2.1.0', [
       'deployment-keys/application-trusted.json',
       'deployment-keys/shawl-trusted.json', 'package.json',
       'release-keys/trusted.json', 'src',
@@ -535,14 +535,14 @@ function parseContract(bytes) {
     'contractVersion', 'contractRevision', 'napi', 'executablePolicy',
   ];
   if (!exact(contract.nativeControl, nativeKeys) || contract.nativeControl.packageName !== '@gjc-remote/native-control' ||
-      contract.nativeControl.packageVersion !== '2.0.0' ||
+      contract.nativeControl.packageVersion !== '2.1.0' ||
       contract.nativeControl.manifestPath !== 'native-control/build/Release/native-control.manifest.json' ||
       contract.nativeControl.signaturePath !== 'native-control/build/Release/native-control.manifest.json.sig' ||
       contract.nativeControl.addonPath !== 'native-control/build/Release/native_control.node' ||
       contract.nativeControl.applicationTrustPath !== 'native-control/deployment-keys/application-trusted.json' ||
       contract.nativeControl.shawlTrustPath !== 'native-control/deployment-keys/shawl-trusted.json' ||
       contract.nativeControl.trustPath !== 'native-control/release-keys/trusted.json' ||
-      contract.nativeControl.contractVersion !== 5 || contract.nativeControl.contractRevision !== 1 ||
+      contract.nativeControl.contractVersion !== 5 || contract.nativeControl.contractRevision !== 2 ||
       contract.nativeControl.napi !== 8 || contract.nativeControl.executablePolicy !== 'required') fail(CODES.contract);
   if (!Array.isArray(contract.wireCapabilities) || contract.wireCapabilities.length === 0 ||
       contract.wireCapabilities.some((value, index) => typeof value !== 'string' ||

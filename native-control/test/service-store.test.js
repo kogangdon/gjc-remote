@@ -1059,7 +1059,7 @@ function applicationManifest({
     inventory: { path: 'bundle-files.json', byteLength: inventoryBytes.length, sha256: sha256(inventoryBytes), payloadEntryCount: files.payloadEntryCount, unpackedPayloadBytes: files.unpackedPayloadBytes, treeFingerprint: files.treeFingerprint },
     entrypoints: { bot: 'bot/src/bot.js', daemon: 'daemon/src/daemon.js' },
     runtimes: { node: { minimumVersion: '26.0.0' }, bun: { minimumVersion: '1.4.0' } },
-    nativeControl: { manifestPath: 'native-control/build/Release/native-control.manifest.json', manifestFingerprint: hash('5'), contractVersion: 5, contractRevision: 1 },
+    nativeControl: { manifestPath: 'native-control/build/Release/native-control.manifest.json', manifestFingerprint: hash('5'), contractVersion: 5, contractRevision: 2 },
     wireCapabilities: ['gate_presentation_v1'],
     compatibility: compatibility(),
   }));
@@ -1162,7 +1162,7 @@ function realArchiveApplication({
         manifestPath: 'native-control/build/Release/native-control.manifest.json',
         manifestFingerprint: hash('5'),
         contractVersion: 5,
-        contractRevision: 1,
+        contractRevision: 2,
       },
       wireCapabilities: ['gate_presentation_v1'],
       compatibility: compatibility(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createInventoryPublisher } from './public.js';
+import { createInventoryPublisher, provisionInventoryBases } from './public.js';
 import { isPrincipal } from '@gjc-remote/shared/identity';
 import {
   STRICT_JSON_LIMITS, assertStrictText, canonicalJson, parseStrictJsonBytes,
@@ -137,16 +137,25 @@ function errorReceipt(caught) {
 }
 
 async function main() {
-  if (process.argv.length !== 3 || process.argv[2] !== 'publish') throw failure();
+  if (process.argv.length !== 3 ||
+      !['publish', 'provision-bases'].includes(process.argv[2])) throw failure();
+  const mode = process.argv[2];
   const input = await readStdin();
   let request;
   try {
-    request = validateRequest(parseStrictJsonBytes(input, { ...STRICT_JSON_LIMITS, maxBytes: INPUT_LIMIT }));
+    const parsed = parseStrictJsonBytes(input, { ...STRICT_JSON_LIMITS, maxBytes: INPUT_LIMIT });
+    if (mode === 'publish') request = validateRequest(parsed);
+    else if (!exact(parsed, [])) throw failure('INVENTORY_INVALID', 'provision_inventory_bases');
   } catch (caught) {
     if (caught?.code) throw caught;
-    throw failure('INVENTORY_INVALID', 'publish_inventory');
+    throw failure('INVENTORY_INVALID', mode === 'publish' ? 'publish_inventory' : 'provision_inventory_bases');
   }
   const roles = readRoles();
+  if (mode === 'provision-bases') {
+    const receipt = await provisionInventoryBases({ roles });
+    process.stdout.write(`${canonicalJson(receipt)}\n`);
+    return;
+  }
   const publisher = await createInventoryPublisher({ hostId: request.hostId, roles });
   const receipt = await publisher.publish({
     expectedInventoryGeneration: request.expectedInventoryGeneration,

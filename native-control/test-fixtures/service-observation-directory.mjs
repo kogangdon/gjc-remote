@@ -7,11 +7,12 @@ const FILE_GENERIC_READ = 0x00120089;
 const FILE_GENERIC_WRITE = 0x00120116;
 const FILE_GENERIC_EXECUTE = 0x001200a0;
 const FILE_DELETE_CHILD = 0x00000040;
+const FIXTURE_PROCESS_TIMEOUT_MS = 60_000;
 
 function checkedSpawn(command, args) {
   const result = spawnSync(command, args, {
     encoding: 'utf8',
-    timeout: 10_000,
+    timeout: FIXTURE_PROCESS_TIMEOUT_MS,
     windowsHide: true,
   });
   if (result.error) throw result.error;
@@ -60,7 +61,7 @@ function applySdkInstallAcl(path, roles, directory) {
 function resetAndRemove(root) {
   const reset = spawnSync('icacls.exe', [root, '/reset', '/T', '/C'], {
     encoding: 'utf8',
-    timeout: 10_000,
+    timeout: FIXTURE_PROCESS_TIMEOUT_MS,
     windowsHide: true,
   });
   try {

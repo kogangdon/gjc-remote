@@ -33,7 +33,7 @@ export const SHAWL_UPSTREAM = Object.freeze({
   commit: "dbc4014c6d67027dc75a565d79fe9f493e897eb2",
 });
 export const APPLICATION_BUNDLE_INVENTORY_PATH = "bundle-files.json";
-export const REQUIRED_NATIVE_CONTROL_CONTRACT = Object.freeze({ version: 5, revision: 1 });
+export const REQUIRED_NATIVE_CONTROL_CONTRACT = Object.freeze({ version: 5, revision: 2 });
 
 const INVENTORY_CANONICAL_LIMITS = Object.freeze({
   maxBytes: DEPLOYMENT_ENVELOPE_LIMITS.inventoryBytes,

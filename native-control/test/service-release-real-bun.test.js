@@ -166,7 +166,7 @@ function populateExactSyntheticSource(root) {
     contractVersion: 5,
     contractRevision,
     package: '@gjc-remote/native-control',
-    version: '2.0.0',
+    version: '2.1.0',
     napi: 8,
     platform: process.platform,
     arch: process.arch,

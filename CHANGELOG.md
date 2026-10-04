@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Explicit Windows management-only inventory-base provisioning through
+  `provisionInventoryBases({ roles })` and `gjc-remote-inventory provision-bases`.
+  The operation requires the existing witnessed platform container and creates
+  only its fixed `native` and `native-reader` children. Existing objects are not
+  adopted or repaired; ordinary publishers and readers never provision them.
+- Native-control source version 2.1.0, contract 5 revision 2, adds the
+  `provision_inventory_bases(roles)` capability. N-API 8 and SDK 0.16.7 are unchanged.
+
+### Fixed
+
+- Hash compatibility directory listings within limits derived from the
+  already-bounded inventory size, rather than the smaller generic JSON node
+  limit. Preserve canonical digests, inventory limits, and exact ACL checks.
+- Validate SDK provenance sidecars against the observed installation tree and
+  pass the exact package-facts record required by production dependency
+  validation. Preserve signature, physical-identity, and package-byte checks.
+
+### Verification limits
+
+- These are unreleased source changes, not a replacement for signed rc.10.
+  Publication, deployment, actual-account provisioning, service startup, reboot,
+  and power-loss qualification require separate evidence.
+
 ## [0.4.0-rc.10] - 2026-10-03
 
 ### Fixed
@@ -26,10 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Verification limits
 
-- rc.10 is a candidate only; it has not been signed, deployed, or qualified.
-  Application archives and fresh signed native-control outputs must come only
-  from the exact future immutable `v0.4.0-rc.10` tag commit and its successful
-  main-CI promotion inputs.
+- rc.10 was signed, published, and deployed from immutable tag source
+  `56de3e3eb77530fe5380b02870e2ad087412ea6a`. Installed payload and preserved
+  state verification passed, and the foreground bot connected to Discord.
+  Canonical Windows service installation subsequently refused with zero writes:
+  SDK compatibility listing hashing exceeded the generic JSON node limit.
 - Native-control remains 2.0.0 (contract 5 revision 1), and SDK 0.16.7 is
   unchanged. Signed service startup, shutdown, reboot, and power-loss
   qualification remain separate evidence.

@@ -171,7 +171,7 @@ function applicationManifest({
         manifestPath: "native-control/build/Release/native-control.manifest.json",
         manifestFingerprint: hex("5"),
         contractVersion: 5,
-        contractRevision: 1,
+        contractRevision: 2,
       },
       wireCapabilities: ["gate_presentation_v1", "terminal_disposition_v1"],
       compatibility: deploymentCompatibility,
@@ -324,6 +324,26 @@ test("application manifest binds canonical inventory, tuple, runtime, native, an
   assert.throws(() => validateApplicationDeploymentManifest(manifest, missingEntrypoint));
   assert.equal(applicationManifest({ archiveByteLength: DEPLOYMENT_ENVELOPE_LIMITS.archiveBytes }).manifest.archive.byteLength, DEPLOYMENT_ENVELOPE_LIMITS.archiveBytes);
   assert.throws(() => applicationManifest({ archiveByteLength: DEPLOYMENT_ENVELOPE_LIMITS.archiveBytes + 1 }));
+});
+
+test("application manifest rejects stale and future native contract revisions without fallback", () => {
+  const { manifest, inventory: files } = applicationManifest();
+  for (const contractRevision of [1, 3]) {
+    const refused = {
+      ...manifest,
+      nativeControl: { ...manifest.nativeControl, contractRevision },
+    };
+    refused.manifestFingerprint = applicationDeploymentManifestFingerprint(refused);
+    assert.throws(() => validateApplicationDeploymentManifest(refused, files), {
+      name: "TypeError",
+      message: "DEPLOYMENT_ENVELOPE_INVALID: native-control contract",
+    });
+    const { schemaVersion, kind, manifestFingerprint, ...fields } = refused;
+    assert.throws(() => buildApplicationDeploymentManifest(fields), {
+      name: "TypeError",
+      message: "DEPLOYMENT_ENVELOPE_INVALID: native-control contract",
+    });
+  }
 });
 
 test("Shawl manifest stays pinned to v1.9.0 and truthfully records unsigned upstream provenance", () => {

@@ -30,11 +30,13 @@ test('production package surface excludes the low-level test adapter', () => {
       'createSelfProcessObserver',
       'createServiceNative',
       'createServiceStartupObserver',
+      'provisionInventoryBases',
       'validateBuildManifest',
     ],
   );
   assert.equal(publicApi.createInventoryPublisherAdapter, undefined);
   assert.equal(publicApi.createInventoryReaderAdapter, undefined);
+  assert.equal(publicApi.provisionInventoryBasesAdapter, undefined);
 });
 
 test('management adapter validates its explicit native dependency subset', () => {
@@ -1006,12 +1008,12 @@ test('accepts Linux POSIX UID roles and normalizes exact decimal inputs', async 
     () => createManagementNativeForTest({ lowLevel, configPath: '/state/channels.json', roles: { ...roles, recoverySid: 'uid:100' }, platform: 'linux' }),
     /root UID role configuration/,
   );
-  assert.equal(validateBuildManifest({ ...buildManifest, package: '@gjc-remote/native-control', version: '2.0.0', platform: 'linux', arch: 'x64', addon: 'native_control.node', sha256: sha(Buffer.from('native-addon')) }, nativePackageJson, Buffer.from('native-addon'), 'linux', 'x64'), true);
+  assert.equal(validateBuildManifest({ ...buildManifest, package: '@gjc-remote/native-control', version: nativePackageJson.version, platform: 'linux', arch: 'x64', addon: 'native_control.node', sha256: sha(Buffer.from('native-addon')) }, nativePackageJson, Buffer.from('native-addon'), 'linux', 'x64'), true);
 });
 test('refuses manifest package, N-API, platform, hash, capability, and signature drift', () => {
   const addonBytes = Buffer.from('native-addon');
   const manifest = {
-    ...buildManifest, package: '@gjc-remote/native-control', version: '2.0.0',
+    ...buildManifest, package: '@gjc-remote/native-control', version: nativePackageJson.version,
     platform: 'linux', arch: 'x64', addon: 'native_control.node', sha256: sha(addonBytes),
   };
   assert.equal(validateBuildManifest(manifest, nativePackageJson, addonBytes, 'linux', 'x64'), true);

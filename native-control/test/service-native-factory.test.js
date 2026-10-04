@@ -39,24 +39,24 @@ test('public self observation rejects caller authority before loading native cod
   assert.equal(accessed, false);
 });
 
-test('source ABI accepts only native contract v5 revision 1 and N-API 8', () => {
-  assert.equal(packageJson.version, '2.0.0');
-  assert.equal(contractRevision, 1);
+test('source ABI accepts only native contract v5 revision 2 and N-API 8', () => {
+  assert.equal(packageJson.version, '2.1.0');
+  assert.equal(contractRevision, 2);
   assert.deepEqual(publicApi.buildManifest, {
     contractVersion: 5,
-    contractRevision: 1,
+    contractRevision,
     napi: 8,
     capabilities,
     capabilitySignatures,
   });
   assert.deepEqual(packageJson.nativeControlContract, {
     version: 5,
-    revision: 1,
+    revision: contractRevision,
     napi: 8,
     platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
   });
   assert.equal(validateNativePackageContract(packageJson), true);
-  for (const [version, revision, napi] of [[4, 4, 8], [5, 4, 8], [5, 1, 7]]) {
+  for (const [version, revision, napi] of [[4, 4, 8], [5, 1, 8], [5, 4, 8], [5, 2, 7]]) {
     const incompatible = structuredClone(packageJson);
     incompatible.nativeControlContract = {
       ...incompatible.nativeControlContract,
@@ -72,17 +72,18 @@ test('source ABI accepts only native contract v5 revision 1 and N-API 8', () => 
 
   const addonContract = {
     contractVersion: 5,
-    contractRevision: 1,
+    contractRevision,
     napi: 8,
     capabilities,
     capabilitySignatures,
   };
   assert.equal(validateNativeAddonContract(addonContract), true);
   assert.equal(validateNativeAddonContract({ ...addonContract, contractVersion: 4 }), false);
+  assert.equal(validateNativeAddonContract({ ...addonContract, contractRevision: 1 }), false);
   assert.equal(validateNativeAddonContract({ ...addonContract, contractRevision: 4 }), false);
   const manifest = {
     contractVersion: 5,
-    contractRevision: 1,
+    contractRevision,
     package: packageJson.name,
     version: packageJson.version,
     napi: 8,
@@ -95,6 +96,7 @@ test('source ABI accepts only native contract v5 revision 1 and N-API 8', () => 
   };
   assert.equal(validateBuildManifestMetadata(manifest, packageJson, 'linux', 'x64'), true);
   assert.equal(validateBuildManifestMetadata({ ...manifest, contractVersion: 4 }, packageJson, 'linux', 'x64'), false);
+  assert.equal(validateBuildManifestMetadata({ ...manifest, contractRevision: 1 }, packageJson, 'linux', 'x64'), false);
   assert.equal(validateBuildManifestMetadata({ ...manifest, contractRevision: 4 }, packageJson, 'linux', 'x64'), false);
   assert.equal(validateBuildManifestMetadata(manifest, staleSourceVersion, 'linux', 'x64'), false);
 });

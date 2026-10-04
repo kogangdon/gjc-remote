@@ -462,6 +462,7 @@ constexpr ULONG kFileOpen = 1;
 constexpr ULONG kFileCreate = 2;
 constexpr ULONG kFileOpenReparsePoint = 0x00200000;
 constexpr ULONG kFileSynchronousIoNonalert = 0x00000020;
+constexpr ULONG kFileOpenForBackupIntent = 0x00004000;
 constexpr ULONG kFileDirectoryFile = 0x00000001;
 constexpr ULONG kFileNonDirectoryFile = 0x00000040;
 constexpr ULONG kObjCaseInsensitive = 0x00000040;
@@ -494,7 +495,8 @@ HANDLE OpenWindowsRelative(HANDLE parent, const std::wstring& name, DWORD access
                            ULONG disposition, VerifiedObjectType expected_type,
                            PSECURITY_DESCRIPTOR security = nullptr,
                            DWORD share_mode =
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) {
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           ULONG additional_options = 0) {
   NtCreateFileFunction create = NtCreateFileApi();
   if (create == nullptr || parent == INVALID_HANDLE_VALUE || !SafeWideName(name) ||
       name.size() > std::numeric_limits<USHORT>::max() / sizeof(wchar_t)) {
@@ -509,6 +511,7 @@ HANDLE OpenWindowsRelative(HANDLE parent, const std::wstring& name, DWORD access
       sizeof(attributes), parent, &unicode, kObjCaseInsensitive, security, nullptr};
   NativeIoStatusBlock status{};
   ULONG options = kFileOpenReparsePoint | kFileSynchronousIoNonalert;
+  options |= additional_options;
   if (expected_type == VerifiedObjectType::Directory) options |= kFileDirectoryFile;
   if (expected_type == VerifiedObjectType::File) options |= kFileNonDirectoryFile;
   HANDLE handle = INVALID_HANDLE_VALUE;
@@ -3289,7 +3292,10 @@ napi_value ReadWorkspaceRootFactsWindows(napi_env env, napi_callback_info info) 
   napi_create_string_utf8(env, fssystem.c_str(), NAPI_AUTO_LENGTH, &value); napi_set_named_property(env, storage, "fileSystem", value);
   napi_set_named_property(env, result, "rootIdentity", root); napi_set_named_property(env, result, "storageIdentity", storage); return result;
 }
-bool InventoryAcl(HANDLE handle, const InventoryRoles& roles, const std::string& profile) {
+bool InventoryAcl(HANDLE handle, const InventoryRoles& roles,
+                  const std::string& profile,
+                  bool* attempted_write = nullptr) {
+  if (attempted_write) *attempted_write = false;
   const bool directory = profile == "inventory-directory" || profile == "reader-directory";
   const bool daemon_owner = profile == "reader-directory" || profile == "inventory-floor";
   const std::string owner_text = daemon_owner ? roles.daemon : roles.management;
@@ -3304,6 +3310,8 @@ bool InventoryAcl(HANDLE handle, const InventoryRoles& roles, const std::string&
     entries[i].Trustee.ptstrName = static_cast<LPWSTR>(sids[i]);
   }
   if (SetEntriesInAclW(4, entries, nullptr, &acl) != ERROR_SUCCESS) goto done;
+  // A failing SetSecurityInfo can still have applied one part of the update.
+  if (attempted_write) *attempted_write = true;
   if (SetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
       sids[0], nullptr, acl, nullptr) != ERROR_SUCCESS) goto done;
   for (PSID sid : sids) LocalFree(sid); LocalFree(acl); return true;
@@ -12243,6 +12251,722 @@ ServiceContainerState PrepareServiceBaseContainer(
   if (!observed_exact) return ServiceContainerState::ManualCleanup;
   *container_identity = created_identity;
   return ServiceContainerState::Ready;
+}
+
+#ifdef _WIN32
+bool InventoryTokenPrivilegeAttributes(HANDLE token, const LUID& privilege,
+                                       DWORD* attributes) {
+  DWORD bytes = 0;
+  SetLastError(ERROR_SUCCESS);
+  if (GetTokenInformation(token, TokenPrivileges, nullptr, 0, &bytes) ||
+      GetLastError() != ERROR_INSUFFICIENT_BUFFER ||
+      bytes < offsetof(TOKEN_PRIVILEGES, Privileges)) return false;
+  std::vector<uint8_t> buffer;
+  try {
+    buffer.resize(bytes);
+  } catch (...) {
+    return false;
+  }
+  if (!GetTokenInformation(token, TokenPrivileges, buffer.data(), bytes,
+                           &bytes) ||
+      bytes < offsetof(TOKEN_PRIVILEGES, Privileges)) return false;
+  const auto* privileges =
+      reinterpret_cast<const TOKEN_PRIVILEGES*>(buffer.data());
+  const size_t available =
+      (bytes - offsetof(TOKEN_PRIVILEGES, Privileges)) /
+      sizeof(LUID_AND_ATTRIBUTES);
+  if (privileges->PrivilegeCount > available) return false;
+  for (DWORD index = 0; index < privileges->PrivilegeCount; ++index) {
+    const LUID_AND_ATTRIBUTES& item = privileges->Privileges[index];
+    if (item.Luid.LowPart == privilege.LowPart &&
+        item.Luid.HighPart == privilege.HighPart) {
+      *attributes = item.Attributes;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool InventoryTokenUserIs(HANDLE token, const std::string& expected_sid) {
+  DWORD bytes = 0;
+  if (GetTokenInformation(token, TokenUser, nullptr, 0, &bytes) ||
+      GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0) return false;
+  std::vector<uint8_t> buffer;
+  try {
+    buffer.resize(bytes);
+  } catch (...) {
+    return false;
+  }
+  if (!GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes))
+    return false;
+  LPWSTR sid = nullptr;
+  const bool converted = ConvertSidToStringSidW(
+      reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &sid) != FALSE;
+  const bool matches = converted && expected_sid == Utf8(sid);
+  if (sid) LocalFree(sid);
+  return matches;
+}
+
+bool CurrentInventoryThreadIsManagement(const std::string& management_sid) {
+  HANDLE token = nullptr;
+  if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token))
+    return GetLastError() == ERROR_NO_TOKEN;
+  const bool matches = InventoryTokenUserIs(token, management_sid);
+  CloseHandle(token);
+  return matches;
+}
+
+// SeRestorePrivilege is needed to provision the daemon-owned reader base.
+// Enable it only on a duplicate of the current effective token, then restore
+// that token's original privilege state and thread impersonation context.
+class ScopedInventoryRestorePrivilege {
+ public:
+  ScopedInventoryRestorePrivilege() = default;
+  ScopedInventoryRestorePrivilege(const ScopedInventoryRestorePrivilege&) =
+      delete;
+  ScopedInventoryRestorePrivilege& operator=(
+      const ScopedInventoryRestorePrivilege&) = delete;
+
+  ~ScopedInventoryRestorePrivilege() {
+    if (scoped_token_ != nullptr || previous_thread_token_ != nullptr ||
+        installed_) Restore();
+  }
+
+  bool Enable(const std::string& management_sid) {
+    HANDLE source = nullptr;
+    if (OpenThreadToken(
+            GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE |
+                TOKEN_IMPERSONATE,
+            TRUE, &previous_thread_token_)) {
+      source = previous_thread_token_;
+    } else if (GetLastError() == ERROR_NO_TOKEN) {
+      if (!OpenProcessToken(
+              GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE,
+              &source)) return false;
+    } else {
+      return false;
+    }
+
+    const bool duplicated = DuplicateTokenEx(
+        source, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE,
+        nullptr, SecurityImpersonation, TokenImpersonation,
+        &scoped_token_) != FALSE;
+    if (source != previous_thread_token_) CloseHandle(source);
+    if (!duplicated) {
+      CloseHandles();
+      return false;
+    }
+
+    if (!LookupPrivilegeValueW(nullptr, L"SeRestorePrivilege", &restore_privilege_) ||
+        !InventoryTokenPrivilegeAttributes(
+            scoped_token_, restore_privilege_, &previous_attributes_)) {
+      CloseHandles();
+      return false;
+    }
+    previous_privilege_.PrivilegeCount = 1;
+    previous_privilege_.Privileges[0].Luid = restore_privilege_;
+    previous_privilege_.Privileges[0].Attributes = previous_attributes_;
+    previous_privilege_valid_ = true;
+
+    TOKEN_PRIVILEGES enabled{};
+    enabled.PrivilegeCount = 1;
+    enabled.Privileges[0].Luid = restore_privilege_;
+    enabled.Privileges[0].Attributes = previous_attributes_ | SE_PRIVILEGE_ENABLED;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL adjusted = AdjustTokenPrivileges(
+        scoped_token_, FALSE, &enabled, 0, nullptr, nullptr);
+    const DWORD adjust_error = GetLastError();
+    DWORD current_attributes = 0;
+    if (!adjusted || adjust_error == ERROR_NOT_ALL_ASSIGNED ||
+        !InventoryTokenPrivilegeAttributes(
+            scoped_token_, restore_privilege_, &current_attributes) ||
+        (current_attributes & SE_PRIVILEGE_ENABLED) == 0) {
+      Restore();
+      return false;
+    }
+
+    if (!SetThreadToken(nullptr, scoped_token_)) {
+      Restore();
+      return false;
+    }
+    installed_ = true;
+    HANDLE effective = nullptr;
+    DWORD effective_attributes = 0;
+    const bool enabled_on_thread =
+        OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &effective) &&
+        InventoryTokenUserIs(effective, management_sid) &&
+        InventoryTokenPrivilegeAttributes(
+            effective, restore_privilege_, &effective_attributes) &&
+        (effective_attributes & SE_PRIVILEGE_ENABLED) != 0;
+    if (effective) CloseHandle(effective);
+    if (!enabled_on_thread) {
+      Restore();
+      return false;
+    }
+    return true;
+  }
+
+  bool Restore() {
+    bool privilege_restored = true;
+    if (scoped_token_ != nullptr && previous_privilege_valid_) {
+      SetLastError(ERROR_SUCCESS);
+      const BOOL adjusted = AdjustTokenPrivileges(
+          scoped_token_, FALSE, &previous_privilege_, 0, nullptr, nullptr);
+      const DWORD adjust_error = GetLastError();
+      DWORD actual_attributes = 0;
+      privilege_restored = adjusted &&
+          adjust_error != ERROR_NOT_ALL_ASSIGNED &&
+          InventoryTokenPrivilegeAttributes(
+              scoped_token_, restore_privilege_, &actual_attributes) &&
+          actual_attributes == previous_attributes_;
+    }
+    bool identity_restored = true;
+    if (installed_) {
+      identity_restored = previous_thread_token_ != nullptr
+          ? SetThreadToken(nullptr, previous_thread_token_) != FALSE
+          : RevertToSelf() != FALSE;
+      if (identity_restored) installed_ = false;
+    }
+    if (!installed_) CloseHandles();
+    if (!privilege_restored || !identity_restored) restore_failed_ = true;
+    return !restore_failed_;
+  }
+
+ private:
+  void CloseHandles() {
+    if (scoped_token_ != nullptr) CloseHandle(scoped_token_);
+    if (previous_thread_token_ != nullptr) CloseHandle(previous_thread_token_);
+    scoped_token_ = nullptr;
+    previous_thread_token_ = nullptr;
+    previous_privilege_valid_ = false;
+  }
+
+  HANDLE scoped_token_ = nullptr;
+  HANDLE previous_thread_token_ = nullptr;
+  LUID restore_privilege_{};
+  DWORD previous_attributes_ = 0;
+  TOKEN_PRIVILEGES previous_privilege_{};
+  bool previous_privilege_valid_ = false;
+  bool installed_ = false;
+  bool restore_failed_ = false;
+};
+
+bool InventoryProvisionContainerIdentity(
+    HANDLE handle, const InventoryRoles& roles,
+    const ServiceStoreIdentity& expected, ServiceStoreIdentity* actual) {
+  if (expected.profile == ServiceAclProfile::InternalContainerDirectory) {
+    return CaptureServiceStoreIdentity(
+        handle, roles, expected.profile, actual);
+  }
+  return expected.profile ==
+          ServiceAclProfile::PreservedContainerDirectory &&
+      VerifyBootstrapAnchor(handle, roles) &&
+      CaptureExternalAncestorIdentity(handle, actual);
+}
+
+bool InventoryProvisionDirectoryEmpty(HANDLE directory) {
+  std::array<uint8_t, 64 * 1024> buffer{};
+  bool restart = true;
+  for (;;) {
+    if (!GetFileInformationByHandleEx(
+            directory,
+            restart ? FileIdBothDirectoryRestartInfo
+                    : FileIdBothDirectoryInfo,
+            buffer.data(), static_cast<DWORD>(buffer.size()))) {
+      return GetLastError() == ERROR_NO_MORE_FILES;
+    }
+    restart = false;
+    size_t offset = 0;
+    for (;;) {
+      if (offset + offsetof(FILE_ID_BOTH_DIR_INFO, FileName) >
+          buffer.size()) return false;
+      const auto* record = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(
+          buffer.data() + offset);
+      if (record->FileNameLength == 0 ||
+          record->FileNameLength % sizeof(wchar_t) != 0 ||
+          record->FileNameLength > buffer.size() - offset -
+              offsetof(FILE_ID_BOTH_DIR_INFO, FileName)) return false;
+      const std::wstring name(
+          record->FileName,
+          record->FileNameLength / sizeof(wchar_t));
+      if (name != L"." && name != L"..") return false;
+      if (record->NextEntryOffset == 0) break;
+      if (record->NextEntryOffset <
+              offsetof(FILE_ID_BOTH_DIR_INFO, FileName) ||
+          record->NextEntryOffset > buffer.size() - offset) return false;
+      offset += record->NextEntryOffset;
+    }
+  }
+}
+
+struct InventoryProvisionBase {
+  const char* profile = nullptr;
+  std::wstring name;
+  HANDLE created = INVALID_HANDLE_VALUE;
+  FILE_ID_INFO identity{};
+  bool created_by_call = false;
+  bool identity_known = false;
+};
+
+enum class InventoryProvisionPresence { Absent, Exact, Foreign, Ambiguous };
+
+InventoryProvisionPresence InventoryProvisionCheckBase(
+    HANDLE parent, const InventoryRoles& roles,
+    const InventoryProvisionBase& base) {
+  HANDLE object = OpenWindowsRelative(
+      parent, base.name, READ_CONTROL | FILE_READ_ATTRIBUTES,
+      kFileOpen, VerifiedObjectType::Any);
+  if (object == INVALID_HANDLE_VALUE) {
+    return GetLastError() == ERROR_FILE_NOT_FOUND
+        ? InventoryProvisionPresence::Absent
+        : InventoryProvisionPresence::Ambiguous;
+  }
+  BY_HANDLE_FILE_INFORMATION info{};
+  const bool directory = GetFileInformationByHandle(object, &info) &&
+      (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  const bool exact = directory &&
+      VerifyInventoryAcl(object, roles, base.profile);
+  CloseHandle(object);
+  return exact ? InventoryProvisionPresence::Exact
+               : InventoryProvisionPresence::Foreign;
+}
+
+bool InventoryProvisionParentUnchanged(
+    HANDLE parent, const std::string& parent_path,
+    const FILE_ID_INFO& parent_id, const std::wstring& canonical_parent,
+    const InventoryRoles& roles,
+    const ServiceStoreIdentity& expected_identity) {
+  auto exact = [&](HANDLE candidate) {
+    ServiceStoreIdentity actual;
+    return InventoryProvisionContainerIdentity(
+               candidate, roles, expected_identity, &actual) &&
+        SameServicePhysicalIdentity(actual, expected_identity);
+  };
+  if (!InventoryParentStable(parent, parent_id, canonical_parent) ||
+      !exact(parent)) return false;
+  HANDLE reopened = OpenWindowsPathNoFollow(
+      parent_path, READ_CONTROL | FILE_READ_ATTRIBUTES,
+      VerifiedObjectType::Directory);
+  if (reopened == INVALID_HANDLE_VALUE) return false;
+  FILE_ID_INFO reopened_id{};
+  const bool stable =
+      GetFileInformationByHandleEx(
+          reopened, FileIdInfo, &reopened_id, sizeof(reopened_id)) &&
+      SameWindowsFileId(parent_id, reopened_id) && exact(reopened);
+  CloseHandle(reopened);
+  return stable;
+}
+
+bool InventoryProvisionCleanupBase(
+    HANDLE parent, const std::string& parent_path,
+    const FILE_ID_INFO& parent_id, const std::wstring& canonical_parent,
+    const InventoryRoles& roles,
+    const ServiceStoreIdentity& parent_identity,
+    InventoryProvisionBase* base, uint32_t* writes) {
+  if (!base->created_by_call) return true;
+  if (!base->identity_known ||
+      !InventoryProvisionParentUnchanged(
+          parent, parent_path, parent_id, canonical_parent, roles,
+          parent_identity)) return false;
+  HANDLE cleanup = OpenWindowsRelative(
+      parent, base->name,
+      READ_CONTROL | FILE_LIST_DIRECTORY | DELETE,
+      kFileOpen, VerifiedObjectType::Directory, nullptr,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      kFileOpenForBackupIntent);
+  if (cleanup == INVALID_HANDLE_VALUE) return false;
+  FILE_ID_INFO cleanup_identity{};
+  const bool same_empty_object =
+      GetFileInformationByHandleEx(
+          cleanup, FileIdInfo, &cleanup_identity, sizeof(cleanup_identity)) &&
+      SameWindowsFileId(base->identity, cleanup_identity) &&
+      InventoryProvisionDirectoryEmpty(cleanup);
+  if (!same_empty_object ||
+      !InventoryProvisionParentUnchanged(
+          parent, parent_path, parent_id, canonical_parent, roles,
+          parent_identity)) {
+    CloseHandle(cleanup);
+    return false;
+  }
+  FILE_DISPOSITION_INFO disposition{TRUE};
+  const bool removed = SetFileInformationByHandle(
+      cleanup, FileDispositionInfo, &disposition, sizeof(disposition)) != FALSE;
+  if (removed) ++*writes;
+  CloseHandle(cleanup);
+  if (base->created != INVALID_HANDLE_VALUE) {
+    CloseHandle(base->created);
+    base->created = INVALID_HANDLE_VALUE;
+  }
+  if (!removed || !FlushInventoryParent(parent, parent_id, canonical_parent) ||
+      !InventoryProvisionParentUnchanged(
+          parent, parent_path, parent_id, canonical_parent, roles,
+          parent_identity)) return false;
+  HANDLE probe = OpenWindowsRelative(
+      parent, base->name, FILE_READ_ATTRIBUTES,
+      kFileOpen, VerifiedObjectType::Any);
+  const DWORD probe_error = probe == INVALID_HANDLE_VALUE
+      ? GetLastError() : ERROR_SUCCESS;
+  if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+  return probe == INVALID_HANDLE_VALUE &&
+      probe_error == ERROR_FILE_NOT_FOUND;
+}
+#endif
+
+napi_value ProvisionInventoryBases(napi_env env, napi_callback_info info) {
+  napi_value args[1];
+  InventoryRoles roles{};
+  if (!InventoryArgs(env, info, 1, args) ||
+      !InventoryRolesArg(env, args[0], &roles)) {
+    InventoryError(env, "INVENTORY_INVALID", "provision_inventory_bases");
+    return nullptr;
+  }
+#ifdef _WIN32
+  if (!CurrentInventoryActor(roles, true, false) ||
+      !CurrentInventoryThreadIsManagement(roles.management)) {
+    InventoryError(env, "INVENTORY_INVALID", "provision_inventory_bases");
+    return nullptr;
+  }
+
+  ServiceContainerSpec container_spec;
+  std::string inventory_path, reader_path;
+  if (!ResolveServiceBaseContainer("control", &container_spec) ||
+      !ResolveWindowsInventoryBasePath("inventory-directory", &inventory_path) ||
+      !ResolveWindowsInventoryBasePath("reader-directory", &reader_path)) {
+    InventoryError(env, "CONTAINMENT_UNSUPPORTED",
+        "provision_inventory_bases");
+    return nullptr;
+  }
+  uint32_t parent_writes = 0;
+  ServiceStoreIdentity prepared_identity;
+  const ServiceContainerState container_state = PrepareServiceBaseContainer(
+      "control", roles, false, &parent_writes, &prepared_identity);
+  if (container_state != ServiceContainerState::Ready || parent_writes != 0) {
+    const bool ambiguous = parent_writes != 0 ||
+        container_state == ServiceContainerState::ManualCleanup;
+    const char* code = ambiguous ? "INVENTORY_MANUAL_CLEANUP" :
+        container_state == ServiceContainerState::AccessDenied
+            ? "INVENTORY_ACCESS_DENIED" :
+        container_state == ServiceContainerState::IoFailed
+            ? "INVENTORY_IO_FAILED" : "INVENTORY_ACCESS_DENIED";
+    InventoryError(env, code, "provision_inventory_bases",
+        parent_writes, ambiguous);
+    return nullptr;
+  }
+
+  const std::string parent_path = container_spec.anchor_path +
+      (container_spec.anchor_path.empty() ||
+               container_spec.anchor_path.back() == '\\'
+           ? "" : "\\") + container_spec.name;
+  const std::string parent_prefix = parent_path + "\\";
+  if (inventory_path != parent_prefix + "native" ||
+      reader_path != parent_prefix + "native-reader") {
+    InventoryError(env, "CONTAINMENT_UNSUPPORTED",
+        "provision_inventory_bases");
+    return nullptr;
+  }
+  HANDLE parent = OpenWindowsPathNoFollow(
+      parent_path, kWindowsChildMutationParentAccess | FILE_LIST_DIRECTORY,
+      VerifiedObjectType::Directory);
+  if (parent == INVALID_HANDLE_VALUE) {
+    InventoryError(env, GetLastError() == ERROR_ACCESS_DENIED
+            ? "INVENTORY_ACCESS_DENIED" : "INVENTORY_IO_FAILED",
+        "provision_inventory_bases");
+    return nullptr;
+  }
+  FILE_ID_INFO parent_id{};
+  std::wstring canonical_parent;
+  ServiceStoreIdentity parent_identity;
+  std::wstring expected_parent = Wide(parent_path);
+  const std::wstring extended_prefix = L"\\\\?\\";
+  if (expected_parent.rfind(extended_prefix, 0) == 0)
+    expected_parent.erase(0, extended_prefix.size());
+  const bool canonical = CanonicalInventoryParent(
+          parent, &parent_id, &canonical_parent) &&
+      InventoryProvisionContainerIdentity(
+          parent, roles, prepared_identity, &parent_identity) &&
+      SameServicePhysicalIdentity(parent_identity, prepared_identity);
+  std::wstring comparable_parent = canonical_parent;
+  if (comparable_parent.rfind(extended_prefix, 0) == 0)
+    comparable_parent.erase(0, extended_prefix.size());
+  const bool canonical_path = canonical &&
+      CompareStringOrdinal(
+          comparable_parent.c_str(),
+          static_cast<int>(comparable_parent.size()),
+          expected_parent.c_str(),
+          static_cast<int>(expected_parent.size()), TRUE) == CSTR_EQUAL;
+  if (!canonical_path ||
+      !InventoryProvisionParentUnchanged(
+          parent, parent_path, parent_id, canonical_parent, roles,
+          parent_identity)) {
+    CloseHandle(parent);
+    InventoryError(env, "INVENTORY_ACCESS_DENIED",
+        "provision_inventory_bases");
+    return nullptr;
+  }
+
+  InventoryProvisionBase bases[2];
+  bases[0].profile = "inventory-directory";
+  bases[0].name = L"native";
+  bases[1].profile = "reader-directory";
+  bases[1].name = L"native-reader";
+  InventoryProvisionPresence presence[2];
+  for (size_t index = 0; index != 2; ++index) {
+    presence[index] = InventoryProvisionCheckBase(parent, roles, bases[index]);
+  }
+  bool ambiguous_presence = false;
+  bool foreign_presence = false;
+  bool exact_presence = false;
+  for (InventoryProvisionPresence item : presence) {
+    ambiguous_presence = ambiguous_presence ||
+        item == InventoryProvisionPresence::Ambiguous;
+    foreign_presence = foreign_presence ||
+        item == InventoryProvisionPresence::Foreign;
+    exact_presence = exact_presence ||
+        item == InventoryProvisionPresence::Exact;
+  }
+  if (ambiguous_presence || foreign_presence || exact_presence) {
+    CloseHandle(parent);
+    const char* code = ambiguous_presence
+        ? "INVENTORY_MANUAL_CLEANUP"
+        : foreign_presence ? "INVENTORY_ACCESS_DENIED"
+                           : "INVENTORY_BASE_EXISTS";
+    InventoryError(env, code, "provision_inventory_bases", 0,
+        ambiguous_presence);
+    return nullptr;
+  }
+  if (!InventoryProvisionParentUnchanged(
+          parent, parent_path, parent_id, canonical_parent, roles,
+          parent_identity)) {
+    CloseHandle(parent);
+    InventoryError(env, "INVENTORY_ACCESS_DENIED",
+        "provision_inventory_bases");
+    return nullptr;
+  }
+
+  ScopedInventoryRestorePrivilege restore_privilege;
+  if (!restore_privilege.Enable(roles.management)) {
+    const bool restored = restore_privilege.Restore();
+    CloseHandle(parent);
+    InventoryError(env, restored ? "INVENTORY_ACCESS_DENIED"
+                                 : "INVENTORY_MANUAL_CLEANUP",
+        "provision_inventory_bases", 0, !restored);
+    return nullptr;
+  }
+
+  uint32_t writes = 0;
+  const char* failure_code = nullptr;
+  bool failure_ambiguous = false;
+  auto fail = [&](const char* code, bool ambiguous = false) {
+    if (failure_code == nullptr) {
+      failure_code = code;
+      failure_ambiguous = ambiguous;
+    }
+  };
+  auto classify_collision = [&](const InventoryProvisionBase& base) {
+    const InventoryProvisionPresence existing =
+        InventoryProvisionCheckBase(parent, roles, base);
+    if (existing == InventoryProvisionPresence::Exact) {
+      fail("INVENTORY_BASE_EXISTS");
+    } else if (existing == InventoryProvisionPresence::Foreign) {
+      fail("INVENTORY_ACCESS_DENIED");
+    } else if (existing == InventoryProvisionPresence::Ambiguous) {
+      fail("INVENTORY_MANUAL_CLEANUP", true);
+    } else {
+      fail("INVENTORY_IO_FAILED");
+    }
+  };
+
+  for (size_t index = 0; index != 2 && failure_code == nullptr; ++index) {
+    if (!InventoryProvisionParentUnchanged(
+            parent, parent_path, parent_id, canonical_parent, roles,
+            parent_identity)) {
+      fail("INVENTORY_ACCESS_DENIED", true);
+      break;
+    }
+    PSECURITY_DESCRIPTOR descriptor =
+        InventorySecurityDescriptor(roles, bases[index].profile);
+    if (descriptor == nullptr) {
+      fail("INVENTORY_IO_FAILED");
+      break;
+    }
+    HANDLE created = OpenWindowsRelative(
+        parent, bases[index].name,
+        READ_CONTROL | FILE_LIST_DIRECTORY,
+        kFileCreate, VerifiedObjectType::Directory, descriptor);
+    const DWORD create_error = created == INVALID_HANDLE_VALUE
+        ? GetLastError() : ERROR_SUCCESS;
+    LocalFree(descriptor);
+    if (created == INVALID_HANDLE_VALUE) {
+      if (create_error == ERROR_ALREADY_EXISTS ||
+          create_error == ERROR_FILE_EXISTS) {
+        classify_collision(bases[index]);
+      } else {
+        const InventoryProvisionPresence after_failure =
+            InventoryProvisionCheckBase(parent, roles, bases[index]);
+        if (after_failure != InventoryProvisionPresence::Absent) {
+          fail("INVENTORY_MANUAL_CLEANUP", true);
+        } else {
+          fail(create_error == ERROR_ACCESS_DENIED
+                  ? "INVENTORY_ACCESS_DENIED" : "INVENTORY_IO_FAILED");
+        }
+      }
+      break;
+    }
+    ++writes;
+    bases[index].created = created;
+    bases[index].created_by_call = true;
+    if (!GetFileInformationByHandleEx(
+            created, FileIdInfo, &bases[index].identity,
+            sizeof(bases[index].identity))) {
+      fail("INVENTORY_IO_FAILED", true);
+      break;
+    }
+    bases[index].identity_known = true;
+
+    // The management SID receives RX on the reader base; use the scoped
+    // restore privilege for ACL application, not a temporary broader DACL.
+    HANDLE control = OpenWindowsRelative(
+        parent, bases[index].name,
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_LIST_DIRECTORY | DELETE,
+        kFileOpen, VerifiedObjectType::Directory, nullptr,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        kFileOpenForBackupIntent);
+    FILE_ID_INFO control_identity{};
+    const bool control_exact = control != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandleEx(
+            control, FileIdInfo, &control_identity,
+            sizeof(control_identity)) &&
+        SameWindowsFileId(bases[index].identity, control_identity);
+    if (!control_exact) {
+      const DWORD control_error = control == INVALID_HANDLE_VALUE
+          ? GetLastError() : ERROR_SUCCESS;
+      if (control != INVALID_HANDLE_VALUE) CloseHandle(control);
+      fail(control_error == ERROR_ACCESS_DENIED
+              ? "INVENTORY_ACCESS_DENIED" : "INVENTORY_IO_FAILED");
+      break;
+    }
+    bool acl_attempted = false;
+    const bool acl_written = InventoryAcl(
+        control, roles, bases[index].profile, &acl_attempted);
+    if (acl_attempted) ++writes;
+    const bool acl_exact = acl_written &&
+        VerifyInventoryAcl(control, roles, bases[index].profile) &&
+        GetFileInformationByHandleEx(
+            control, FileIdInfo, &control_identity,
+            sizeof(control_identity)) &&
+        SameWindowsFileId(bases[index].identity, control_identity);
+    CloseHandle(control);
+    if (!acl_exact) {
+      fail("INVENTORY_ACCESS_DENIED");
+      break;
+    }
+  }
+
+  if (failure_code == nullptr &&
+      (!FlushInventoryParent(parent, parent_id, canonical_parent) ||
+       !InventoryProvisionParentUnchanged(
+           parent, parent_path, parent_id, canonical_parent, roles,
+           parent_identity))) {
+    fail("INVENTORY_IO_FAILED");
+  }
+  for (size_t index = 0; index != 2 && failure_code == nullptr; ++index) {
+    HANDLE reopened = OpenWindowsRelative(
+        parent, bases[index].name,
+        READ_CONTROL | FILE_LIST_DIRECTORY,
+        kFileOpen, VerifiedObjectType::Directory);
+    FILE_ID_INFO reopened_identity{};
+    const bool exact = reopened != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandleEx(
+            reopened, FileIdInfo, &reopened_identity,
+            sizeof(reopened_identity)) &&
+        SameWindowsFileId(bases[index].identity, reopened_identity) &&
+        VerifyInventoryAcl(reopened, roles, bases[index].profile);
+    if (reopened != INVALID_HANDLE_VALUE) CloseHandle(reopened);
+    if (!exact || !InventoryProvisionParentUnchanged(
+            parent, parent_path, parent_id, canonical_parent, roles,
+            parent_identity)) {
+      fail("INVENTORY_ACCESS_DENIED", true);
+    }
+  }
+  if (failure_code == nullptr && writes != 4)
+    fail("INVENTORY_IO_FAILED", true);
+  if (failure_code == nullptr && !InventoryProvisionParentUnchanged(
+          parent, parent_path, parent_id, canonical_parent, roles,
+          parent_identity)) {
+    fail("INVENTORY_ACCESS_DENIED", true);
+  }
+
+  bool cleanup_proven = true;
+  if (failure_code != nullptr) {
+    for (size_t index = 2; index != 0; --index) {
+      if (!InventoryProvisionCleanupBase(
+              parent, parent_path, parent_id, canonical_parent, roles,
+              parent_identity, &bases[index - 1], &writes)) {
+        cleanup_proven = false;
+      }
+    }
+  }
+  const bool privilege_restored = restore_privilege.Restore();
+  if (!privilege_restored && failure_code == nullptr) {
+    fail("INVENTORY_IO_FAILED", true);
+    for (size_t index = 2; index != 0; --index) {
+      if (!InventoryProvisionCleanupBase(
+              parent, parent_path, parent_id, canonical_parent, roles,
+              parent_identity, &bases[index - 1], &writes)) {
+        cleanup_proven = false;
+      }
+    }
+  }
+  for (InventoryProvisionBase& base : bases) {
+    if (base.created != INVALID_HANDLE_VALUE) {
+      CloseHandle(base.created);
+      base.created = INVALID_HANDLE_VALUE;
+    }
+  }
+  const bool parent_preserved = InventoryProvisionParentUnchanged(
+      parent, parent_path, parent_id, canonical_parent, roles,
+      parent_identity);
+  CloseHandle(parent);
+  if (!privilege_restored) {
+    InventoryError(env, "INVENTORY_MANUAL_CLEANUP",
+        "provision_inventory_bases", writes, true);
+    return nullptr;
+  }
+  if (failure_code != nullptr) {
+    if (!cleanup_proven || !parent_preserved) {
+      InventoryError(env, "INVENTORY_MANUAL_CLEANUP",
+          "provision_inventory_bases", writes, true);
+    } else {
+      InventoryError(env, failure_code, "provision_inventory_bases",
+          writes, failure_ambiguous &&
+              std::strcmp(failure_code, "INVENTORY_MANUAL_CLEANUP") == 0);
+    }
+    return nullptr;
+  }
+  if (!parent_preserved || writes != 4) {
+    InventoryError(env, "INVENTORY_MANUAL_CLEANUP",
+        "provision_inventory_bases", writes, true);
+    return nullptr;
+  }
+
+  napi_value result, value;
+  napi_create_object(env, &result);
+  napi_create_string_utf8(
+      env, inventory_path.c_str(), NAPI_AUTO_LENGTH, &value);
+  napi_set_named_property(env, result, "inventoryBase", value);
+  napi_create_string_utf8(env, reader_path.c_str(), NAPI_AUTO_LENGTH, &value);
+  napi_set_named_property(env, result, "readerBase", value);
+  napi_create_uint32(env, writes, &value);
+  napi_set_named_property(env, result, "writes", value);
+  return result;
+#else
+  if (geteuid() != roles.management) {
+    InventoryError(env, "INVENTORY_INVALID", "provision_inventory_bases");
+    return nullptr;
+  }
+  InventoryError(env, "INVENTORY_UNSUPPORTED", "provision_inventory_bases");
+  return nullptr;
+#endif
 }
 
 bool ServiceStoreNamedDirectoryExact(
@@ -21436,6 +22160,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
     "open_verified_parent_handle", "open_verified_object_handle", "read_handle_identity",
     "read_handle_bytes", "write_handle_bytes", "remove_verified_handle", "verify_role_sid_not_group",
     "resolve_native_state_root", "read_workspace_root_facts", "ensure_inventory_directory",
+    "provision_inventory_bases",
     "verify_inventory_acl", "acquire_inventory_fence", "read_inventory_object",
     "publish_inventory_object_atomic",
     "enumerate_workspace_process_holders",
@@ -21479,7 +22204,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
   napi_create_uint32(env, 5, &value); napi_set_named_property(env, result, "contractVersion", value);
-  napi_create_uint32(env, 1, &value); napi_set_named_property(env, result, "contractRevision", value);
+  napi_create_uint32(env, 2, &value); napi_set_named_property(env, result, "contractRevision", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
@@ -21521,6 +22246,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("resolve_native_state_root", {"hostKey", "rootKind"});
   signature("read_workspace_root_facts", {"path", "sourcePlatform"});
   signature("ensure_inventory_directory", {"path", "roles", "profile"});
+  signature("provision_inventory_bases", {"roles"});
   signature("verify_inventory_acl", {"path", "roles", "profile", "expectedActor"});
   signature("acquire_inventory_fence", {"path", "roles"});
   signature("read_inventory_object", {"path", "maxBytes", "roles", "profile"});
@@ -21620,6 +22346,7 @@ napi_value Init(napi_env env, napi_value exports) {
     {"resolve_native_state_root", nullptr, ResolveInventoryStateRoot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"read_workspace_root_facts", nullptr, ReadWorkspaceRootFacts, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"ensure_inventory_directory", nullptr, EnsureInventoryDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"provision_inventory_bases", nullptr, ProvisionInventoryBases, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"verify_inventory_acl", nullptr, VerifyInventoryAcl, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"acquire_inventory_fence", nullptr, AcquireInventoryFence, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"read_inventory_object", nullptr, ReadInventoryObject, nullptr, nullptr, nullptr, napi_default, nullptr},

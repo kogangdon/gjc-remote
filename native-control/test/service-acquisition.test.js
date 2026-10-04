@@ -118,7 +118,7 @@ function portableGzip(bytes) {
 function nativePackageBytes() {
   return canonicalJsonBytes({
     name: '@gjc-remote/native-control',
-    version: '2.0.0',
+    version: '2.1.0',
     nativeControlContract: {
       version: 5,
       revision: contractRevision,
@@ -133,7 +133,7 @@ function nativeManifestBytes(addonBytes, platform, architecture, claimedAddon = 
     contractVersion: 5,
     contractRevision,
     package: '@gjc-remote/native-control',
-    version: '2.0.0',
+    version: '2.1.0',
     napi: 8,
     platform,
     arch: architecture,

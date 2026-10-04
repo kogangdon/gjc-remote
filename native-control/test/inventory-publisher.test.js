@@ -12,7 +12,7 @@ const rootIdentity = Object.freeze({ kind: 'posix-root-v1', device: '2', inode: 
 const storageIdentity = Object.freeze({ kind: 'posix-storage-v1', device: '2' });
 
 function model({ fenceWrites = 0, checkpoint, mutateFacts, publishFailure, releaseFailure, publishIdentityMismatch } = {}) {
-  const objects = new Map(); const calls = []; let sequence = 0; let released = 0;
+  const objects = new Map(); const calls = []; let sequence = 0; let released = 0; let provisionCalls = 0;
   const identity = () => ({ device: '1', inode: String(++sequence), mode: 33152, owner: 'uid:1001' });
   const lowLevel = {
     verify_inventory_acl: async (...args) => { calls.push(['acl', ...args]); return true; },
@@ -22,6 +22,10 @@ function model({ fenceWrites = 0, checkpoint, mutateFacts, publishFailure, relea
     read_workspace_root_facts: async (workDir, sourcePlatform) => {
       calls.push(['facts', workDir, sourcePlatform]);
       return mutateFacts?.(calls.filter(([kind]) => kind === 'facts').length, workDir, sourcePlatform) ?? { sourcePlatform, workDir: `/canonical${workDir}`, rootIdentity, storageIdentity };
+    },
+    provision_inventory_bases: async () => {
+      provisionCalls++;
+      assert.fail('publisher must not provision inventory bases');
     },
     publish_inventory_object_atomic: async (path, prefix, bytes, expectedIdentity, ...args) => {
       calls.push(['publish', path, prefix, expectedIdentity, ...args]);
@@ -36,7 +40,7 @@ function model({ fenceWrites = 0, checkpoint, mutateFacts, publishFailure, relea
     },
   };
   const publisher = createInventoryPublisherTransaction({ hostId, roles, inventoryRoot: '/inventory', lowLevel, checkpoint });
-  return { publisher, calls, objects, released: () => released, lowLevel };
+  return { publisher, calls, objects, released: () => released, provisionCalls: () => provisionCalls, lowLevel };
 }
 function input(workspaces = [{ workspaceId: 'one', sourcePlatform: 'posix', workDir: '/work' }], generation = 0) { return { expectedInventoryGeneration: generation, workspaces }; }
 function paths(state) { return [...state.objects.keys()]; }
@@ -111,6 +115,7 @@ test('orders marker, inventory, commit, floor reads and publishes genesis with e
   ]);
   assert.deepEqual(state.calls.filter(([kind]) => kind === 'publish').map(([, path]) => basename(path)), ['workspace-inventory.v2.json', 'inventory-commit.v1.json']);
   assert.equal(state.released(), 1);
+  assert.equal(state.provisionCalls(), 0);
 });
 
 test('a present marker short-circuits later reads and writes', async () => {
@@ -550,4 +555,72 @@ test('CLI rejects malformed input and redacts malformed role bindings', () => {
     assert.equal(result.stdout, '');
     assert.equal(JSON.parse(result.stderr).code, 'INVENTORY_INVALID');
   }
+});
+
+test('CLI refuses unknown and extra arguments without reaching inventory APIs', () => {
+  const entrypoint = fileURLToPath(new URL('../src/inventory-entrypoint.js', import.meta.url));
+  const secret = 'invalid-role-binding-must-not-be-rendered';
+  const commands = [[], ['unknown'], ['provision-bases', 'extra'], ['publish', 'extra']];
+  for (const args of commands) {
+    const result = spawnSync(process.execPath, [entrypoint, ...args], {
+      input: '{}',
+      encoding: 'utf8',
+      env: { ...process.env, GJC_INVENTORY_ROLE_BINDINGS: secret },
+    });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr.includes(secret), false);
+    assert.deepEqual(JSON.parse(result.stderr), {
+      status: 'error',
+      code: 'INVENTORY_INVALID',
+      operation: 'inventory_entrypoint',
+      writes: 0,
+      ambiguous: false,
+    });
+  }
+});
+
+test('CLI validates exact provisioning and publish request keys before reading roles or loading native', () => {
+  const entrypoint = fileURLToPath(new URL('../src/inventory-entrypoint.js', import.meta.url));
+  const secret = 'invalid-role-binding-must-not-be-rendered';
+  const malformedRequests = [
+    ['provision-bases', '{"extra":true}', 'provision_inventory_bases'],
+    ['provision-bases', '{"roles":{}}', 'provision_inventory_bases'],
+    ['publish', JSON.stringify({ hostId, expectedInventoryGeneration: 0, workspaces: [], extra: true }), 'publish_inventory'],
+  ];
+  for (const [command, request, operation] of malformedRequests) {
+    const result = spawnSync(process.execPath, [entrypoint, command], {
+      input: request,
+      encoding: 'utf8',
+      env: { ...process.env, GJC_INVENTORY_ROLE_BINDINGS: secret },
+    });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr.includes(secret), false);
+    assert.deepEqual(JSON.parse(result.stderr), {
+      status: 'error',
+      code: 'INVENTORY_INVALID',
+      operation,
+      writes: 0,
+      ambiguous: false,
+    });
+  }
+
+  // A non-TTY EOF request containing exactly {} passes request validation; bad
+  // role configuration then stops before public API/native loading.
+  const exactEmptyRequest = spawnSync(process.execPath, [entrypoint, 'provision-bases'], {
+    input: '{}',
+    encoding: 'utf8',
+    env: { ...process.env, GJC_INVENTORY_ROLE_BINDINGS: secret },
+  });
+  assert.notEqual(exactEmptyRequest.status, 0);
+  assert.equal(exactEmptyRequest.stdout, '');
+  assert.equal(exactEmptyRequest.stderr.includes(secret), false);
+  assert.deepEqual(JSON.parse(exactEmptyRequest.stderr), {
+    status: 'error',
+    code: 'INVENTORY_INVALID',
+    operation: 'inventory_entrypoint',
+    writes: 0,
+    ambiguous: false,
+  });
 });
