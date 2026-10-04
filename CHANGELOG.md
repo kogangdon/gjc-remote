@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.11] - Unreleased source candidate
+
+Application `0.4.0-rc.11` / tag selection `v0.4.0-rc.11` / release sequence 11
+is preparation only, not a published, signed, or deployed release. This candidate
+includes the fixes merged in PR #263 at `c4a2ebe5`.
+
 ### Added
 
 - Explicit Windows management-only inventory-base provisioning through
@@ -28,9 +34,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Verification limits
 
-- These are unreleased source changes, not a replacement for signed rc.10.
-  Publication, deployment, actual-account provisioning, service startup, reboot,
-  and power-loss qualification require separate evidence.
+- Isolated CI run [37167043415](https://github.com/kogangdon/gjc-remote/actions/runs/37167043415)
+  and main CI run [37167663638](https://github.com/kogangdon/gjc-remote/actions/runs/37167663638)
+  qualified the source Windows inventory-base operation: four writes, exactly
+  four explicit ACEs per parent with M/D ownership, native directory flush,
+  unchanged container/witness, and duplicate refusal with zero writes.
+- The three standard CI role users (bot, recovery, daemon) are authorized only
+  on disposable GitHub-hosted Windows VMs, not on local or production hosts.
+  This is source-CI evidence, not production M/D flush or account qualification.
+- Native-control is 2.1.0 (contract 5 revision 2); SDK 0.16.7, N-API 8, and
+  Bun 1.4.2 are unchanged. Signed/live rc.10 remains immutable at source
+  `56de3e3eb77530fe5380b02870e2ad087412ea6a`, with native-control 2.0.0
+  (contract 5 revision 1) and SDK 0.16.7. Existing rc.1 through rc.10 assets
+  are not replaced by this candidate.
+- This preparation does not establish publication, signing, deployment, SCM
+  installation or startup, production account provisioning or M/D flush,
+  mapping authority, reboot, power-loss durability, or provider health.
 
 ## [0.4.0-rc.10] - 2026-10-03
 

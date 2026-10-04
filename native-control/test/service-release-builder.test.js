@@ -42,9 +42,9 @@ const POSITIVE_ARCHITECTURE = process.platform === 'win32'
 const OTHER_PLATFORM = POSITIVE_PLATFORM === 'win32' ? 'linux' : 'win32';
 const OTHER_ARCHITECTURE = POSITIVE_ARCHITECTURE === 'arm64' ? 'x64' : 'arm64';
 const TARGET_SUFFIX = `${POSITIVE_PLATFORM}-${POSITIVE_ARCHITECTURE}`;
-const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.10-${TARGET_SUFFIX}.tar.gz`;
+const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.11-${TARGET_SUFFIX}.tar.gz`;
 const MANIFEST_NAME = `gjc-remote-service-${TARGET_SUFFIX}.manifest.json`;
-const RELEASE_SEQUENCE = 10;
+const RELEASE_SEQUENCE = 11;
 const SDK_INTEGRITY = 'sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==';
 const SDK_SOURCE_CONTRACT_DOMAIN = 'gjc-remote/sdk-external-state-source/v1';
 const SDK_ROOT_IDENTITY = '@gajae-code/coding-agent@0.16.7';
@@ -127,19 +127,19 @@ function packageModels({
 } = {}) {
   const models = {
     bot: {
-      name: '@gjc-remote/bot', version: '0.4.0-rc.10', private: true, type: 'module',
+      name: '@gjc-remote/bot', version: '0.4.0-rc.11', private: true, type: 'module',
       dependencies: {
         '@gjc-remote/native-control': '*',
-        '@gjc-remote/shared': '0.4.0-rc.10',
+        '@gjc-remote/shared': '0.4.0-rc.11',
         'fixture-consumer': '1.0.0',
       },
     },
     daemon: {
-      name: '@gjc-remote/daemon', version: '0.4.0-rc.10', private: true, type: 'module',
+      name: '@gjc-remote/daemon', version: '0.4.0-rc.11', private: true, type: 'module',
       dependencies: {
         '@gajae-code/coding-agent': '0.16.7',
         '@gjc-remote/native-control': '*',
-        '@gjc-remote/shared': '0.4.0-rc.10',
+        '@gjc-remote/shared': '0.4.0-rc.11',
       },
     },
     native: {
@@ -151,14 +151,14 @@ function packageModels({
         platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
       },
       dependencies: {
-        '@gjc-remote/shared': '0.4.0-rc.10',
+        '@gjc-remote/shared': '0.4.0-rc.11',
         dotenv: '16.6.1',
         'jsonc-parser': '3.3.1',
         semver: '7.8.5',
         tar: '7.5.22',
       },
     },
-    shared: { name: '@gjc-remote/shared', version: '0.4.0-rc.10', private: true, type: 'module' },
+    shared: { name: '@gjc-remote/shared', version: '0.4.0-rc.11', private: true, type: 'module' },
     consumer: {
       name: 'fixture-consumer', version: '1.0.0', type: 'module',
       dependencies: { '@gjc-remote/native-control': '*' },
@@ -231,7 +231,7 @@ function bunLock(models = packageModels(), {
     workspaces: {
       '': {
         name: 'gjc-remote',
-        version: '0.4.0-rc.10',
+        version: '0.4.0-rc.11',
         devDependencies: { 'jsonc-parser': '3.3.1' },
       },
       bot: { name: models.bot.name, version: models.bot.version, dependencies: models.bot.dependencies },
@@ -321,7 +321,7 @@ function createSourceRepository(root, installation, {
   const source = join(root, 'source');
   mkdirSync(source, { recursive: true });
   writeJson(join(source, 'package.json'), {
-    name: 'gjc-remote', version: '0.4.0-rc.10', private: true, type: 'module',
+    name: 'gjc-remote', version: '0.4.0-rc.11', private: true, type: 'module',
     workspaces: ['bot', 'daemon', 'native-control', 'shared'],
     devDependencies: { 'jsonc-parser': '3.3.1' },
   });
@@ -364,7 +364,7 @@ function createSourceRepository(root, installation, {
     GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
     GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
   });
-  git(source, ['tag', 'v0.4.0-rc.10']);
+  git(source, ['tag', 'v0.4.0-rc.11']);
   if (commitAfterTag) {
     write(join(source, 'shared/later.js'), 'export const later = true;\n');
     git(source, ['add', '--all']);
@@ -783,8 +783,8 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
     assert.equal(Object.isFrozen(contract.formatRegistry), true);
     assert.equal(fixture.installation.releaseBuilder.buildUnsignedServiceRelease.length, 1);
     assert.equal(contract.repository, 'kogangdon/gjc-remote');
-    assert.equal(contract.releaseVersion, '0.4.0-rc.10');
-    assert.equal(contract.releaseTag, 'v0.4.0-rc.10');
+    assert.equal(contract.releaseVersion, '0.4.0-rc.11');
+    assert.equal(contract.releaseTag, 'v0.4.0-rc.11');
     assert.equal(contract.releaseSequence, RELEASE_SEQUENCE);
     assert.equal(contract.sdk.packageVersion, '0.16.7');
     assert.equal(contract.sdk.configSchemaVersion, 2);
@@ -837,8 +837,12 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
     delete contractWithoutSequence.releaseSequence;
     for (const invalidContract of [
       contractWithoutSequence,
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: '11' },
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: 11.5 },
       { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: RELEASE_SEQUENCE - 1 },
       { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: RELEASE_SEQUENCE + 1 },
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseVersion: '0.4.0-rc.10' },
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseTag: 'v0.4.0-rc.10' },
     ]) {
       writeJson(fixtureContractPath, invalidContract);
       await assert.rejects(
@@ -949,9 +953,14 @@ test('build input release sequence must match the release contract', async (t) =
     const native = createNativeInputs(root, fixture.installation, source.models.native);
     for (const [name, releaseSequence] of [
       ['candidate-invalid-sequence', 0],
+      ['candidate-string-sequence', '11'],
+      ['candidate-fractional-sequence', 11.5],
+      ['candidate-missing-sequence', undefined],
+      ['candidate-stale-sequence', RELEASE_SEQUENCE - 1],
       ['candidate-mismatched-sequence', RELEASE_SEQUENCE + 1],
     ]) {
       const input = await inputFor(root, source.source, native, name, { releaseSequence });
+      if (releaseSequence === undefined) delete input.releaseSequence;
       await refuses(
         fixture.installation.releaseBuilder.buildUnsignedServiceRelease(input),
         'SERVICE_RELEASE_INPUT_INVALID',
@@ -1009,7 +1018,7 @@ test('two clean modeled Bun-boundary builds are byte-identical and round-trip th
     assert.equal(first.producerEvidence.integrityAuthority, 'fresh-bun-frozen-lockfile-registry-sri');
     assert.equal(fixture.boundary.evidenceScope, 'modeled-external-bun-process-no-network-or-sri-proof');
     assert.equal(first.source.repository, 'kogangdon/gjc-remote');
-    assert.equal(first.source.tag, 'v0.4.0-rc.10');
+    assert.equal(first.source.tag, 'v0.4.0-rc.11');
     assert.equal(first.source.commit, git(sourceFixture.source, ['rev-parse', 'HEAD^{commit}']));
     assert.equal(first.source.tree, git(sourceFixture.source, ['rev-parse', 'HEAD^{tree}']));
     assert.equal(first.source.commit, git(independentSource.source, ['rev-parse', 'HEAD^{commit}']));

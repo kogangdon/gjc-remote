@@ -105,7 +105,7 @@ release, application signatures were verified, and protected ACLs were
 verified. The canonical Windows SCM install was refused before journal
 creation with `SERVICE_INVALID` and zero writes because the JS driver rejected
 valid opaque native lock handles. No SCM mutation occurred, and no service was
-installed or qualified. The rc.10 candidate removes the
+installed or qualified. Published rc.10 removes the
 unnecessary JS driver lock-handle input and shape check;
 authority validation and lock lifetime remain at the existing native/session
 boundary. It also projects the already-exported `read_win32_boot_clock`
@@ -121,9 +121,26 @@ Published rc.10 came from immutable tag source
 `56de3e3eb77530fe5380b02870e2ad087412ea6a`; deployment and foreground bot
 readiness were verified. Canonical service installation then refused with zero
 writes because SDK compatibility listing hashing exceeded the generic JSON
-node bound. The unreleased source fixes that hashing bound and adds explicit
-inventory-parent provisioning. Those changes require a later signed release;
-neither publication nor bot readiness proves SCM installation or native flush.
+node bound. Signed/live rc.10 remains immutable with native-control 2.0.0
+(contract 5 revision 1) and SDK 0.16.7, as do all existing rc.1 through rc.10
+assets. The current source candidate selects application `0.4.0-rc.11`, tag
+`v0.4.0-rc.11`, and release sequence 11, with native-control 2.1.0 (contract 5
+revision 2), unchanged N-API 8, SDK 0.16.7, and Bun 1.4.2. It includes PR #263
+(merge `c4a2ebe5`): the hashing-bound fix, SDK sidecar validation against observed
+package facts, and explicit inventory-parent provisioning. This preparation is
+not a published, signed, or deployed release.
+
+Isolated CI run [37167043415](https://github.com/kogangdon/gjc-remote/actions/runs/37167043415)
+and main CI run [37167663638](https://github.com/kogangdon/gjc-remote/actions/runs/37167663638)
+qualified the source inventory-base operation on disposable GitHub-hosted
+Windows VMs: four writes, exactly four explicit ACEs per parent with M/D
+ownership, native directory flush, unchanged container/witness, and duplicate
+refusal with zero writes. The three standard CI users for bot, recovery, and
+daemon are authorized only on those disposable VMs, not for local E2E opt-in or
+production account creation. This does not establish production M/D flush,
+deployment, SCM installation/startup, mapping authority, reboot, power-loss
+durability, or provider health. Publication and foreground bot readiness are
+also not SCM or native-flush qualification.
 
 The new root must pass the same ownership, ACL, no-reparse and NTFS directory
 flush checks. A successful directory-flush probe is not evidence of successful
