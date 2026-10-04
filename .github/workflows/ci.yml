@@ -61,11 +61,14 @@ jobs:
 
       # This is intentionally after the ordinary tests and opts in only on the
       # disposable hosted Windows lane. The fixture refuses any existing
-      # canonical root and leaves its owned root for the runner to discard.
+      # canonical root before creating exactly three ordinary temporary role
+      # users. Owned users and root are retained for the runner to discard;
+      # production account changes are never authorized by these opt-ins.
       - name: Verify canonical Windows inventory provisioning
         if: runner.os == 'Windows' && matrix.target == 'win32-x64'
         env:
           GJC_REMOTE_INVENTORY_BASES_E2E: '1'
+          GJC_REMOTE_INVENTORY_CI_ACCOUNTS: '1'
         run: node --test native-control/test/windows-inventory-provisioning.e2e.test.js
 
       # Guards released CHANGELOG.md history against silent deletion. Runs

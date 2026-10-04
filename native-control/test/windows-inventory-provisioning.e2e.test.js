@@ -35,22 +35,89 @@ if ($length -eq 0 -or $length -ge $buffer.Capacity) { throw 'GetSystemWindowsDir
 $systemDirectory = $buffer.ToString()
 $driveRoot = [System.IO.Path]::GetPathRoot($systemDirectory)
 $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$users = @(
-  Get-LocalUser | ForEach-Object {
-    [pscustomobject]@{
-      name = [string]$_.Name
-      sid = [string]$_.SID.Value
-      enabled = [bool]$_.Enabled
-    }
-  }
-)
+$management = Get-LocalUser -SID ([System.Security.Principal.SecurityIdentifier]::new($currentSid)) -ErrorAction Stop
+if ($null -eq $management -or $management.SID.Value -ne $currentSid) { throw 'Current local user not found' }
 $result = [ordered]@{
   systemDirectory = $systemDirectory
   driveRoot = $driveRoot
   currentSid = $currentSid
-  users = [object[]]$users
 }
 [Console]::Out.WriteLine((ConvertTo-Json -InputObject $result -Depth 6 -Compress))
+`;
+
+const CI_ACCOUNTS_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$created = 0
+$joined = 0
+$verified = 0
+$password = $null
+$random = $null
+$bytes = $null
+$result = $null
+try {
+  if ($env:OS -ne 'Windows_NT' -or $env:GITHUB_ACTIONS -ne 'true' -or
+      $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
+      $env:GJC_REMOTE_INVENTORY_BASES_E2E -ne '1' -or
+      $env:GJC_REMOTE_INVENTORY_CI_ACCOUNTS -ne '1') { throw 'CI account setup guard refused' }
+  $specs = @(
+    [pscustomobject]@{ role = 'bot'; name = 'gjc-ci-inv-bot' }
+    [pscustomobject]@{ role = 'recovery'; name = 'gjc-ci-inv-recovery' }
+    [pscustomobject]@{ role = 'daemon'; name = 'gjc-ci-inv-daemon' }
+  )
+  # Enumerate once with terminating query errors: no missing-user error is
+  # mistaken for absence. Every fixed name must be absent before any creation.
+  $existing = @(Get-LocalUser -ErrorAction Stop)
+  foreach ($spec in $specs) {
+    if (@($existing | Where-Object { $_.Name -eq $spec.name }).Count -ne 0) {
+      throw 'CI account name already exists'
+    }
+  }
+  $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $management = Get-LocalUser -SID ([System.Security.Principal.SecurityIdentifier]::new($currentSid)) -ErrorAction Stop
+  if ($null -eq $management -or $management.SID.Value -ne $currentSid) { throw 'Current local user not found' }
+  $usersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+  $usersGroup = Get-LocalGroup -SID $usersSid -ErrorAction Stop
+  if ($null -eq $usersGroup -or $usersGroup.SID.Value -ne $usersSid.Value) { throw 'Users group not found' }
+  $bindings = [ordered]@{ management = [string]$management.SID.Value }
+  $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  foreach ($spec in $specs) {
+    try {
+      $bytes = New-Object byte[] 48
+      $random.GetBytes($bytes)
+      # Random material never leaves this process or becomes a fixture secret.
+      $password = ConvertTo-SecureString -String ('Aa1!' + [Convert]::ToBase64String($bytes)) -AsPlainText -Force
+      [Array]::Clear($bytes, 0, $bytes.Length)
+      $bytes = $null
+      New-LocalUser -Name $spec.name -Password $password -ErrorAction Stop | Out-Null
+      $created++
+      $user = Get-LocalUser -Name $spec.name -ErrorAction Stop
+      if ($null -eq $user -or -not $user.Enabled) { throw 'CI account not enabled' }
+      Add-LocalGroupMember -SID $usersSid -Member $user -ErrorAction Stop | Out-Null
+      $joined++
+      $members = @(Get-LocalGroupMember -SID $usersSid -ErrorAction Stop)
+      if (@($members | Where-Object { $_.SID.Value -eq $user.SID.Value }).Count -ne 1) {
+        throw 'CI account Users membership not verified'
+      }
+      $verified++
+      $bindings[$spec.role] = [string]$user.SID.Value
+    } finally {
+      if ($null -ne $password) { $password.Dispose(); $password = $null }
+      if ($null -ne $bytes) { [Array]::Clear($bytes, 0, $bytes.Length); $bytes = $null }
+    }
+  }
+  if (@($bindings.Values | Select-Object -Unique).Count -ne 4) { throw 'CI role SIDs not distinct' }
+  $result = [ordered]@{ success = $true; created = $created; joined = $joined; verified = $verified; retained = $true; bindings = $bindings }
+} catch {
+  # Do not render PowerShell error records, credentials, or account objects.
+  # Partial ownership is retained on this disposable runner, never retried.
+  $result = [ordered]@{ success = $false; created = $created; joined = $joined; verified = $verified; retained = $true }
+} finally {
+  if ($null -ne $password) { $password.Dispose(); $password = $null }
+  if ($null -ne $bytes) { [Array]::Clear($bytes, 0, $bytes.Length); $bytes = $null }
+  if ($null -ne $random) { $random.Dispose(); $random = $null }
+}
+[Console]::Out.WriteLine((ConvertTo-Json -InputObject $result -Depth 4 -Compress))
 `;
 
 const ACL_SNAPSHOT_SCRIPT = String.raw`
@@ -118,39 +185,22 @@ async function powershellJson(script, extraEnv = {}) {
   return JSON.parse(stdout.trim());
 }
 
-function localRoleIdentities(users, currentSid) {
-  assert.ok(Array.isArray(users), 'Get-LocalUser must return local account SID records');
-  const bySid = new Map();
-  for (const user of users) {
-    assert.equal(typeof user?.name, 'string');
-    assert.match(user.sid, /^S-1-5-21-(?:[0-9]+-){3}[0-9]+$/,
+function localRoleIdentities(bindings, currentSid) {
+  assert.deepEqual(Object.keys(bindings ?? {}).sort(), ['bot', 'daemon', 'management', 'recovery']);
+  assert.equal(bindings.management, currentSid, 'setup must capture the actual existing management user');
+  const roles = {};
+  for (const [name, sid] of Object.entries(bindings)) {
+    assert.match(sid, /^S-1-5-21-(?:[0-9]+-){3}[0-9]+$/,
       'every role account must be an actual machine-local user SID');
-    assert.equal(bySid.has(user.sid), false, 'Get-LocalUser must not return duplicate SIDs');
-    bySid.set(user.sid, user);
+    if (name !== 'management') {
+      assert.ok(Number(sid.slice(sid.lastIndexOf('-') + 1)) >= 1000,
+        'new CI role accounts must not be built-in users');
+    }
+    roles[name] = Object.freeze({ kind: 'sid', value: sid });
   }
-  assert.ok(bySid.has(currentSid), 'the actual current principal must resolve to a Get-LocalUser account');
-
-  const preferredRids = [500, 501, 503];
-  const preferredRank = new Map(preferredRids.map((rid, index) => [String(rid), index]));
-  const candidates = [...bySid.values()]
-    .filter((user) => user.sid !== currentSid)
-    .sort((left, right) => {
-      const leftRid = left.sid.slice(left.sid.lastIndexOf('-') + 1);
-      const rightRid = right.sid.slice(right.sid.lastIndexOf('-') + 1);
-      const leftRank = preferredRank.get(leftRid) ?? preferredRids.length;
-      const rightRank = preferredRank.get(rightRid) ?? preferredRids.length;
-      return leftRank - rightRank || left.sid.localeCompare(right.sid, 'en');
-    });
-  assert.ok(candidates.length >= 3,
-    'three distinct existing local user SIDs besides the management principal are required');
-
-  return {
-    management: { kind: 'sid', value: currentSid },
-    bot: { kind: 'sid', value: candidates[0].sid },
-    recovery: { kind: 'sid', value: candidates[1].sid },
-    daemon: { kind: 'sid', value: candidates[2].sid },
-    system: { kind: 'sid', value: 'S-1-5-18' },
-  };
+  assert.equal(new Set(Object.values(bindings)).size, 4, 'M/B/R/D must be distinct real local users');
+  roles.system = Object.freeze({ kind: 'sid', value: 'S-1-5-18' });
+  return Object.freeze(roles);
 }
 
 async function assertPathAbsent(path) {
@@ -216,6 +266,8 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
   assert.equal(process.platform, 'win32', 'the opt-in fixture is Windows-only');
   assert.equal(process.env.GITHUB_ACTIONS, 'true', 'the opt-in fixture requires GitHub Actions');
   assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted', 'the opt-in fixture requires a hosted runner');
+  assert.equal(process.env.GJC_REMOTE_INVENTORY_CI_ACCOUNTS, '1',
+    'temporary account setup requires its separate explicit CI opt-in');
   assert.equal(existsSync(addonUrl), true, 'the verified Windows native addon must be built');
   assert.equal(existsSync(manifestUrl), true, 'the native addon build manifest must exist');
 
@@ -249,12 +301,6 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
   const current = native.current_os_principal();
   assert.deepEqual(current, { kind: 'sid', value: windowsIdentity.currentSid },
     'native current_os_principal must match the actual Windows process identity');
-  const roles = localRoleIdentities(windowsIdentity.users, current.value);
-  for (const role of Object.values(roles)) Object.freeze(role);
-  Object.freeze(roles);
-  assert.equal(new Set([
-    roles.management.value, roles.bot.value, roles.recovery.value, roles.daemon.value,
-  ]).size, 4, 'M/B/R/D must be distinct real local user SIDs');
 
   const driveRoot = windowsIdentity.driveRoot.toUpperCase();
   const containerPath = `${driveRoot}gjc-remote`;
@@ -266,10 +312,28 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
   const controlWitnessPath = `${containerPath}\\.gjc-service-control-root.v1`;
 
   // Never adopt, inspect as fixture state, or clean up a live canonical root.
-  // The root is checked before the only mutating operation below.
+  // All three paths are absent before account setup or native bootstrap.
   await assertPathAbsent(containerPath);
   await assertPathAbsent(platformWitnessPath);
   await assertPathAbsent(platformPendingPath);
+
+  const accountSetup = await powershellJson(CI_ACCOUNTS_SCRIPT);
+  t.diagnostic(JSON.stringify({
+    ciAccounts: {
+      success: accountSetup.success,
+      created: accountSetup.created,
+      joined: accountSetup.joined,
+      verified: accountSetup.verified,
+      retained: accountSetup.retained,
+    },
+  }));
+  assert.equal(accountSetup.success, true, 'CI account setup must succeed without retry or adoption');
+  assert.deepEqual(Object.keys(accountSetup).sort(), ['bindings', 'created', 'joined', 'retained', 'success', 'verified']);
+  assert.equal(accountSetup.created, 3, 'exactly three ordinary CI role users must be created');
+  assert.equal(accountSetup.joined, 3, 'all three CI role users must join only BUILTIN Users');
+  assert.equal(accountSetup.verified, 3, 'all three enabled standard roles must have verified Users membership');
+  assert.equal(accountSetup.retained, true, 'owned CI users remain until the disposable runner is destroyed');
+  const roles = localRoleIdentities(accountSetup.bindings, current.value);
 
   // This is the existing low-level creator. Its callback contract is
   // { handle, rootBinding, writes }; the opaque handle stays open until all
