@@ -1403,6 +1403,7 @@ test('rc12 accepts the tagged final merge commit and refuses a tag retained on t
       const scenarioRoot = join(root, tagFinalMerge ? 'final-merge-tag' : 'premerge-tag');
       const sourceFixture = createSourceRepository(scenarioRoot, fixture.installation);
       const source = sourceFixture.source;
+      git(source, ['config', '--local', 'core.autocrlf', 'false']);
       const premergeHead = git(source, ['rev-parse', 'HEAD']);
       if (tagFinalMerge) git(source, ['tag', '--delete', 'v0.4.0-rc.12']);
       git(source, ['checkout', '-b', 'fixture-release-change']);
