@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Distinct local reinstall release preparation
+
+- Select application `0.4.0-rc.12`, local tag `v0.4.0-rc.12` and sequence 12
+  coherently across the closed producer/verifier contract, application
+  workspaces, lock metadata and managed image defaults. Keep native-control
+  2.1.0 (contract 5 revision 2), official SDK 0.18.12 and trust roots unchanged.
+- Preserve immutable rc.11/rc.10 identities and assets. The new local release
+  tag follows independently reviewed, exact-head-CI-gated source landing and
+  identifies the final main merge. This source change does not publish a release
+  or admit signing, protected installation, recovery or credential use.
+- Cover previous-release rejection and final-merge versus premerge-tag source
+  binding without weakening clean-tree, signature, sequence or archive checks.
+
 ### SDK 0.18.12 source upgrade
 
 - Pin official unpatched `@gajae-code/coding-agent`, `agent-core`, and `ai`
