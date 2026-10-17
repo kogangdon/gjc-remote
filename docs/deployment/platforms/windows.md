@@ -123,12 +123,24 @@ readiness were verified. Canonical service installation then refused with zero
 writes because SDK compatibility listing hashing exceeded the generic JSON
 node bound. Signed/live rc.10 remains immutable with native-control 2.0.0
 (contract 5 revision 1) and SDK 0.16.7, as do all existing rc.1 through rc.10
-assets. The current source candidate selects application `0.4.0-rc.11`, tag
-`v0.4.0-rc.11`, and release sequence 11, with native-control 2.1.0 (contract 5
+assets. The current source candidate selects application `0.4.0-rc.12`, tag
+`v0.4.0-rc.12`, and release sequence 12, with native-control 2.1.0 (contract 5
 revision 2), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It includes PR #263
 (merge `c4a2ebe5`): the hashing-bound fix, SDK sidecar validation against observed
 package facts, and explicit inventory-parent provisioning. This preparation is
 not a published, signed, or deployed release.
+
+Published rc.11 remains immutable at `116b60caf0ce6361eb3f17d1b9cf3a17e22e92cb`.
+The distinct rc.12 local tag must follow independent source review, required
+exact-head CI and the verified main merge; never move rc.11 or push a release
+tag as part of local reinstall preparation. Signed native compatibility,
+application signing custody, preservation and fresh per-operation floor/CAS/UAC
+admission remain separate gates. A read-only lock refusal is not evidence of a
+pending transaction and never authorizes recovery or uninstall. Genuinely
+absent services use fresh install without an artificial uninstall; an owned or
+tombstoned service needs a proven supported fresh-install and failure route
+before any removal. Neither an unsigned build nor local fixture smoke proves
+canonical installation or provider/remote E2E.
 
 Post-admission parent-run main-based SDK-only verification records Windows focused **333/333
 passed**, zero skips, and bounded workspace **2704 tests: 2700 passed, 0 failed,

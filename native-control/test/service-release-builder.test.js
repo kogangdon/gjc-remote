@@ -42,9 +42,9 @@ const POSITIVE_ARCHITECTURE = process.platform === 'win32'
 const OTHER_PLATFORM = POSITIVE_PLATFORM === 'win32' ? 'linux' : 'win32';
 const OTHER_ARCHITECTURE = POSITIVE_ARCHITECTURE === 'arm64' ? 'x64' : 'arm64';
 const TARGET_SUFFIX = `${POSITIVE_PLATFORM}-${POSITIVE_ARCHITECTURE}`;
-const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.11-${TARGET_SUFFIX}.tar.gz`;
+const ARCHIVE_NAME = `gjc-remote-service-0.4.0-rc.12-${TARGET_SUFFIX}.tar.gz`;
 const MANIFEST_NAME = `gjc-remote-service-${TARGET_SUFFIX}.manifest.json`;
-const RELEASE_SEQUENCE = 11;
+const RELEASE_SEQUENCE = 12;
 const SDK_INTEGRITY = 'sha512-ls1SkP0FmXhHGxi3oft+1M9HbWwfaAjq6ubWGekFHptegxZEIP/tO8Soha6+xxTSFWvBhdPOuZLtP86Qzcs7vQ==';
 const SDK_SOURCE_CONTRACT_DOMAIN = 'gjc-remote/sdk-external-state-source/v1';
 const SDK_ROOT_IDENTITY = '@gajae-code/coding-agent@0.18.12';
@@ -127,19 +127,19 @@ function packageModels({
 } = {}) {
   const models = {
     bot: {
-      name: '@gjc-remote/bot', version: '0.4.0-rc.11', private: true, type: 'module',
+      name: '@gjc-remote/bot', version: '0.4.0-rc.12', private: true, type: 'module',
       dependencies: {
         '@gjc-remote/native-control': '*',
-        '@gjc-remote/shared': '0.4.0-rc.11',
+        '@gjc-remote/shared': '0.4.0-rc.12',
         'fixture-consumer': '1.0.0',
       },
     },
     daemon: {
-      name: '@gjc-remote/daemon', version: '0.4.0-rc.11', private: true, type: 'module',
+      name: '@gjc-remote/daemon', version: '0.4.0-rc.12', private: true, type: 'module',
       dependencies: {
         '@gajae-code/coding-agent': '0.18.12',
         '@gjc-remote/native-control': '*',
-        '@gjc-remote/shared': '0.4.0-rc.11',
+        '@gjc-remote/shared': '0.4.0-rc.12',
       },
     },
     native: {
@@ -151,14 +151,14 @@ function packageModels({
         platforms: ['linux-x64', 'linux-arm64', 'win32-x64'],
       },
       dependencies: {
-        '@gjc-remote/shared': '0.4.0-rc.11',
+        '@gjc-remote/shared': '0.4.0-rc.12',
         dotenv: '16.6.1',
         'jsonc-parser': '3.3.1',
         semver: '7.8.5',
         tar: '7.5.22',
       },
     },
-    shared: { name: '@gjc-remote/shared', version: '0.4.0-rc.11', private: true, type: 'module' },
+    shared: { name: '@gjc-remote/shared', version: '0.4.0-rc.12', private: true, type: 'module' },
     consumer: {
       name: 'fixture-consumer', version: '1.0.0', type: 'module',
       dependencies: { '@gjc-remote/native-control': '*' },
@@ -231,7 +231,7 @@ function bunLock(models = packageModels(), {
     workspaces: {
       '': {
         name: 'gjc-remote',
-        version: '0.4.0-rc.11',
+        version: '0.4.0-rc.12',
         devDependencies: { 'jsonc-parser': '3.3.1' },
       },
       bot: { name: models.bot.name, version: models.bot.version, dependencies: models.bot.dependencies },
@@ -321,7 +321,7 @@ function createSourceRepository(root, installation, {
   const source = join(root, 'source');
   mkdirSync(source, { recursive: true });
   writeJson(join(source, 'package.json'), {
-    name: 'gjc-remote', version: '0.4.0-rc.11', private: true, type: 'module',
+    name: 'gjc-remote', version: '0.4.0-rc.12', private: true, type: 'module',
     workspaces: ['bot', 'daemon', 'native-control', 'shared'],
     devDependencies: { 'jsonc-parser': '3.3.1' },
   });
@@ -364,7 +364,7 @@ function createSourceRepository(root, installation, {
     GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
     GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
   });
-  git(source, ['tag', 'v0.4.0-rc.11']);
+  git(source, ['tag', 'v0.4.0-rc.12']);
   if (commitAfterTag) {
     write(join(source, 'shared/later.js'), 'export const later = true;\n');
     git(source, ['add', '--all']);
@@ -783,9 +783,9 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
     assert.equal(Object.isFrozen(contract.formatRegistry), true);
     assert.equal(fixture.installation.releaseBuilder.buildUnsignedServiceRelease.length, 1);
     assert.equal(contract.repository, 'kogangdon/gjc-remote');
-    assert.equal(contract.releaseVersion, '0.4.0-rc.11');
-    assert.equal(contract.releaseTag, 'v0.4.0-rc.11');
-    assert.equal(contract.releaseSequence, RELEASE_SEQUENCE);
+    assert.equal(contract.releaseVersion, '0.4.0-rc.12');
+    assert.equal(contract.releaseTag, 'v0.4.0-rc.12');
+    assert.equal(contract.releaseSequence, 12);
     assert.equal(contract.sdk.packageVersion, '0.18.12');
     assert.equal(contract.sdk.configSchemaVersion, 2);
     assert.equal(contract.sdk.transcriptVersion, 5);
@@ -837,10 +837,27 @@ test('release contract is closed and Bun JSONC parsing rejects every error and d
     delete contractWithoutSequence.releaseSequence;
     for (const invalidContract of [
       contractWithoutSequence,
-      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: '11' },
-      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: 11.5 },
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: '12' },
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: 12.5 },
       { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: RELEASE_SEQUENCE - 1 },
       { ...JSON.parse(rawContractBytes.toString('utf8')), releaseSequence: RELEASE_SEQUENCE + 1 },
+      {
+        ...JSON.parse(rawContractBytes.toString('utf8')),
+        releaseVersion: '0.4.0-rc.11', releaseTag: 'v0.4.0-rc.11', releaseSequence: 11,
+        sourceWorkspaces: contract.sourceWorkspaces.map((workspace) => ({
+          ...workspace,
+          packageVersion: workspace.path === 'native-control' ? '2.1.0' : '0.4.0-rc.11',
+        })),
+      },
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseVersion: '0.4.0-rc.11' },
+      { ...JSON.parse(rawContractBytes.toString('utf8')), releaseTag: 'v0.4.0-rc.11' },
+      ...['bot', 'daemon', 'shared', 'native-control'].map((path) => ({
+        ...JSON.parse(rawContractBytes.toString('utf8')),
+        sourceWorkspaces: contract.sourceWorkspaces.map((workspace) => ({
+          ...workspace,
+          packageVersion: workspace.path === path ? '0.4.0-rc.11' : workspace.packageVersion,
+        })),
+      })),
       { ...JSON.parse(rawContractBytes.toString('utf8')), releaseVersion: '0.4.0-rc.10' },
       { ...JSON.parse(rawContractBytes.toString('utf8')), releaseTag: 'v0.4.0-rc.10' },
     ]) {
@@ -953,8 +970,9 @@ test('build input release sequence must match the release contract', async (t) =
     const native = createNativeInputs(root, fixture.installation, source.models.native);
     for (const [name, releaseSequence] of [
       ['candidate-invalid-sequence', 0],
-      ['candidate-string-sequence', '11'],
-      ['candidate-fractional-sequence', 11.5],
+      ['candidate-string-sequence', '12'],
+      ['candidate-fractional-sequence', 12.5],
+      ['candidate-historical-sequence', 10],
       ['candidate-missing-sequence', undefined],
       ['candidate-stale-sequence', RELEASE_SEQUENCE - 1],
       ['candidate-mismatched-sequence', RELEASE_SEQUENCE + 1],
@@ -1018,7 +1036,7 @@ test('two clean modeled Bun-boundary builds are byte-identical and round-trip th
     assert.equal(first.producerEvidence.integrityAuthority, 'fresh-bun-frozen-lockfile-registry-sri');
     assert.equal(fixture.boundary.evidenceScope, 'modeled-external-bun-process-no-network-or-sri-proof');
     assert.equal(first.source.repository, 'kogangdon/gjc-remote');
-    assert.equal(first.source.tag, 'v0.4.0-rc.11');
+    assert.equal(first.source.tag, 'v0.4.0-rc.12');
     assert.equal(first.source.commit, git(sourceFixture.source, ['rev-parse', 'HEAD^{commit}']));
     assert.equal(first.source.tree, git(sourceFixture.source, ['rev-parse', 'HEAD^{tree}']));
     assert.equal(first.source.commit, git(independentSource.source, ['rev-parse', 'HEAD^{commit}']));
@@ -1371,6 +1389,55 @@ test('lock-synthesized peer metadata is authoritative and cross-checked', async 
       'SERVICE_RELEASE_LOCK_INVALID',
     );
     assert.equal(existsSync(join(inconsistentRoot, 'candidate-c')), false);
+  } finally {
+    fixture.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rc12 accepts the tagged final merge commit and refuses a tag retained on the premerge head', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'gjc-release-merge-tag-'));
+  const fixture = await createFixture(t);
+  try {
+    for (const tagFinalMerge of [false, true]) {
+      const scenarioRoot = join(root, tagFinalMerge ? 'final-merge-tag' : 'premerge-tag');
+      const sourceFixture = createSourceRepository(scenarioRoot, fixture.installation);
+      const source = sourceFixture.source;
+      const premergeHead = git(source, ['rev-parse', 'HEAD']);
+      if (tagFinalMerge) git(source, ['tag', '--delete', 'v0.4.0-rc.12']);
+      git(source, ['checkout', '-b', 'fixture-release-change']);
+      write(join(source, 'shared/merged.js'), 'export const merged = true;\n');
+      git(source, ['add', '--all']);
+      git(source, ['commit', '--no-gpg-sign', '-m', 'fixture release change']);
+      git(source, ['checkout', 'main']);
+      git(source, ['merge', '--no-ff', '--no-gpg-sign', '-m', 'fixture final merge', 'fixture-release-change']);
+      const mergedHead = git(source, ['rev-parse', 'HEAD']);
+      assert.notEqual(mergedHead, premergeHead);
+      assert.equal(git(source, ['rev-list', '--parents', '-n', '1', 'HEAD']).split(' ').length, 3);
+      if (tagFinalMerge) git(source, ['tag', 'v0.4.0-rc.12']);
+      assert.equal(
+        git(source, ['rev-parse', 'v0.4.0-rc.12^{commit}']),
+        tagFinalMerge ? mergedHead : premergeHead,
+      );
+      assert.equal(git(source, ['status', '--porcelain=v1', '--untracked-files=all']), '');
+      const native = createNativeInputs(scenarioRoot, fixture.installation, sourceFixture.models.native);
+      const input = await inputFor(scenarioRoot, source, native);
+      if (tagFinalMerge) {
+        const built = await fixture.installation.releaseBuilder.buildUnsignedServiceRelease(input);
+        assert.equal(built.source.tag, 'v0.4.0-rc.12');
+        assert.equal(built.source.commit, mergedHead);
+        assert.equal(built.source.tree, git(source, ['rev-parse', 'HEAD^{tree}']));
+        assert.equal(existsSync(join(input.outputDirectory, ARCHIVE_NAME)), true);
+      } else {
+        const callsBefore = fixture.boundary.calls.length;
+        await refuses(
+          fixture.installation.releaseBuilder.buildUnsignedServiceRelease(input),
+          'SERVICE_RELEASE_SOURCE_INVALID',
+        );
+        assert.equal(fixture.boundary.calls.length, callsBefore);
+        assert.equal(existsSync(input.outputDirectory), false);
+      }
+    }
   } finally {
     fixture.dispose();
     rmSync(root, { recursive: true, force: true });

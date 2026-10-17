@@ -39,7 +39,7 @@ const originalMkdtemp = fsPromises.mkdtemp;
 const originalRealpath = fsPromises.realpath;
 const productRoot = fileURLToPath(new URL('../..', import.meta.url));
 const ACKNOWLEDGEMENT_FLAG = '--acknowledge-real-bun-fixture-build';
-const RELEASE_SEQUENCE = 11;
+const RELEASE_SEQUENCE = 12;
 
 function copyRegular(source, destination, mode = undefined) {
   const stat = lstatSync(source);
@@ -282,7 +282,7 @@ function errorCode(expected) {
   };
 }
 
-test('real-Bun evidence harness rejects invalid release sequences before side effects and preserves the source membership fence', async (t) => {
+test('real-Bun evidence harness rejects invalid release identities before side effects and preserves the source membership fence', async (t) => {
   assert.equal(
     ['win32:x64', 'linux:x64', 'linux:arm64'].includes(
       `${process.platform}:${process.arch}`,
@@ -327,11 +327,32 @@ test('real-Bun evidence harness rejects invalid release sequences before side ef
     assert.deepEqual(boundary.snapshot(), beforeAcknowledgement);
 
     const invalidSequenceContracts = [
-      ['malformed string', (contract) => { contract.releaseSequence = '11'; }],
-      ['malformed fraction', (contract) => { contract.releaseSequence = 11.5; }],
+      ['malformed string', (contract) => { contract.releaseSequence = '12'; }],
+      ['malformed fraction', (contract) => { contract.releaseSequence = 12.5; }],
       ['missing', (contract) => { delete contract.releaseSequence; }],
-      ['stale', (contract) => { contract.releaseSequence = 10; }],
-      ['future', (contract) => { contract.releaseSequence = 12; }],
+      ['historical', (contract) => { contract.releaseSequence = 10; }],
+      ['stale', (contract) => { contract.releaseSequence = 11; }],
+      ['future', (contract) => { contract.releaseSequence = 13; }],
+    ];
+    const invalidIdentityContracts = [
+      ['coherent previous rc11 tuple', (contract) => {
+        contract.releaseVersion = '0.4.0-rc.11';
+        contract.releaseTag = 'v0.4.0-rc.11';
+        contract.releaseSequence = 11;
+        for (const workspace of contract.sourceWorkspaces) {
+          if (workspace.path !== 'native-control') workspace.packageVersion = '0.4.0-rc.11';
+        }
+      }],
+      ['previous version', (contract) => { contract.releaseVersion = '0.4.0-rc.11'; }],
+      ['previous tag', (contract) => { contract.releaseTag = 'v0.4.0-rc.11'; }],
+      ['historical version', (contract) => { contract.releaseVersion = '0.4.0-rc.10'; }],
+      ['historical tag', (contract) => { contract.releaseTag = 'v0.4.0-rc.10'; }],
+      ...['bot', 'daemon', 'shared', 'native-control'].map((path) => [
+        `wrong ${path} workspace version`,
+        (contract) => {
+          contract.sourceWorkspaces.find((workspace) => workspace.path === path).packageVersion = '0.4.0-rc.11';
+        },
+      ]),
     ];
     const buildInput = {
       sourceRoot: root,
@@ -345,7 +366,7 @@ test('real-Bun evidence harness rejects invalid release sequences before side ef
       nativeSignaturePath: join(root, 'native-control', 'build', 'Release', 'native-control.manifest.json.sig'),
     };
     assert.equal(existsSync(buildInput.outputDirectory), false);
-    for (const [description, mutate] of invalidSequenceContracts) {
+    for (const [description, mutate] of [...invalidSequenceContracts, ...invalidIdentityContracts]) {
       const contract = JSON.parse(originalContractBytes.toString('utf8'));
       mutate(contract);
       writeFileSync(contractPath, JSON.stringify(contract), { mode: 0o644 });
@@ -353,14 +374,14 @@ test('real-Bun evidence harness rejects invalid release sequences before side ef
       await assert.rejects(
         installation.releaseBuilder.buildUnsignedServiceRelease(buildInput),
         { code: 'SERVICE_RELEASE_CONTRACT_INVALID', writes: 0 },
-        `builder rejects ${description} contract releaseSequence`,
+        `builder rejects ${description} contract identity`,
       );
       assert.deepEqual(boundary.snapshot(), beforeBuilder, `${description}: builder has no side effects`);
       assert.equal(existsSync(buildInput.outputDirectory), false);
       await assert.rejects(
         harness.runServiceReleaseRealBunEvidence([ACKNOWLEDGEMENT_FLAG]),
         errorCode('SERVICE_RELEASE_REAL_BUN_FIXTURE_CONTRACT_INVALID'),
-        `reject ${description} releaseSequence`,
+        `reject ${description} contract identity`,
       );
       const snapshot = boundary.snapshot();
       assert.equal(snapshot.spawnCalls, 0, `${description}: no process operation`);
@@ -371,8 +392,8 @@ test('real-Bun evidence harness rejects invalid release sequences before side ef
 
     writeFileSync(contractPath, originalContractBytes);
     const admittedContract = await installation.releaseBuilder.loadServiceReleaseContract();
-    assert.equal(admittedContract.releaseVersion, '0.4.0-rc.11');
-    assert.equal(admittedContract.releaseTag, 'v0.4.0-rc.11');
+    assert.equal(admittedContract.releaseVersion, '0.4.0-rc.12');
+    assert.equal(admittedContract.releaseTag, 'v0.4.0-rc.12');
     assert.equal(admittedContract.releaseSequence, RELEASE_SEQUENCE);
     for (const [description, mutate] of invalidSequenceContracts) {
       const invalidInput = { ...buildInput };
