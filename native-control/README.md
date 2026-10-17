@@ -48,6 +48,32 @@ in the signed rc.10 runtime. The current preparation is not publication,
 signing, or deployment and does not replace any immutable rc.1 through rc.10
 asset.
 
+The current SDK-only main-based source pin is official unpatched 0.18.12.
+Only SDK contract version/integrity defaults and their expectations change in
+native-control; native lifetime/ACL/publication/construction/fixture repairs
+remain excluded and deferred. Main native code was freshly built unchanged.
+Parent-run SDK-only receipts record Windows focused **318/318 passed**, zero
+skips, bounded workspace **2689 tests: 2685 passed, 0 failed, 4 skipped**, and
+actual isolated credentialless Linux **233/233 passed** without provider calls.
+The workspace retains the [nine explicit historical authority exclusions](../docs/deployment/README.md#current-sdk-only-evidence);
+four reported skips do not represent those exclusions and are not passes.
+
+One separately authorized native Windows provider smoke **passed**, using the
+existing `codex-eco` runtime-only child override: three exact A-B-A `SMOKE_OK`
+responses, heartbeat, three successful invoke terminals, exit 0, and ephemeral
+relay port free. No optional model query, wrapper retry, or wrapper persistent
+profile write occurred. Same-profile basic continuity is not isolation or a
+proven #247 disconnect fix. Active daemon controls remain fail-closed and
+active cancellation remains nonterminal `cancellation_pending`; aggregate
+oracle success does not establish standalone SDK abort support. Workflow guard
+issues #6578/#6700 remain unresolved; #6763's approval binding is not that repair.
+
+No private native fixture or combined-worktree result qualifies this tree.
+Local receipts are unshipped, not promotion authority. Independent review,
+PR, and merge remain pending; refreshed docs have not been rerun through tests.
+Native/service/security/fault/OOM/noDump, signing, signed deployment,
+installation, release, support, and production qualification remain excluded.
+
 Service state uses different children of `<OS-drive>:\gjc-remote`, including
 `service-control`, `staging`, `releases`, and `supervisors\shawl`. Before
 inventory operations, the platform container must already exist with its
@@ -515,7 +541,7 @@ injected by the builder; the serialized contract must not carry it.
 Signed `v0.4.0-rc.10` contains native-control 2.0.0 (contract 5, revision 1).
 Current source metadata selects application `0.4.0-rc.11`, release tag
 `v0.4.0-rc.11`, and sequence 11, with native-control 2.1.0 (contract 5,
-revision 2), N-API 8, and unchanged SDK 0.16.7. This is source candidate
+revision 2), unchanged N-API 8, and official unpatched SDK 0.18.12. This is source candidate
 preparation only, not an existing signed tag or published release; do not
 publish this source as rc.10.
 The tag workflow uses the

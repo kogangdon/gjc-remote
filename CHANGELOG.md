@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SDK 0.18.12 source upgrade
+
+- Pin official unpatched `@gajae-code/coding-agent`, `agent-core`, and `ai`
+  to 0.18.12 through the daemon dependency and lock graph. Align Docker and
+  native SDK contract defaults/integrity; published and signed assets remain
+  unchanged. No local upstream source or `node_modules` patch is included.
+- Adapt public router/lifecycle imports and add credentialless SDK regressions
+  for genuine exact-once cancelled terminal/no continuation, public resource
+  close, workflow ownership/fail-closed gates, and child-session scratch versus
+  process-lifetime native-loader cache cleanup. Active live controls remain
+  fail-closed; active cancellation remains nonterminal `cancellation_pending`.
+- This is the SDK-only main-based implementation. Separate native lifetime,
+  ACL, publication, construction, and fixture repairs are excluded and deferred.
+  Parent Windows focused tests passed 318/318 (zero skips); bounded workspace
+  verification recorded 2689 tests, 2685 pass, zero fail, and four skips under
+  nine explicit historical authority exclusion patterns. Skips are not passes;
+  the exclusions are not represented by just those four skips. Actual isolated
+  Linux credentialless tests passed 233/233 without provider calls.
+- One separately authorized native Windows provider smoke passed using the
+  existing `codex-eco` profile via child-only override: three exact `SMOKE_OK`
+  responses in A-B-A order, heartbeat and three invoke-terminal assertions,
+  exit 0, and the ephemeral relay port free afterward. No optional model query
+  or wrapper retry ran. Main native code was freshly built unchanged; this is
+  same-profile continuity, not a fix for #247 or profile/tenant isolation.
+- The four local, unshipped receipts are `artifacts/sdk-first-0.18.12-focused.json`,
+  `artifacts/sdk-first-0.18.12-workspace.json`,
+  `artifacts/sdk-first-0.18.12-wsl-final.json`, and
+  `artifacts/sdk-first-0.18.12-provider-smoke.json`; see the current SDK-only
+  section of [the verification matrix](docs/daemon-workspace-verification.md)
+  for exclusions and evidence limits. They predate this documentation refresh,
+  are not authority or promotion grants, and do not test these refreshed docs.
+  Earlier combined-worktree results and private native fixture results do not
+  qualify this tree. Independent review, PR, and merge remain pending.
+  Upstream workflow guard issues #6578/#6700 remain unresolved; #6763's approval
+  binding is not that repair. No standalone abort support is inferred. Existing
+  phase gates remain open: no Docker/image, release, security, native/service,
+  fault/OOM/noDump, installation, deployment, or isolation qualification.
+
 ## [0.4.0-rc.11] - Unreleased source candidate
 
 Application `0.4.0-rc.11` / tag selection `v0.4.0-rc.11` / release sequence 11

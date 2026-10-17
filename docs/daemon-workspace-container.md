@@ -156,5 +156,20 @@ in-flight invokes, resource denials, lock/fence owner, graph verification, backu
 and restart count. Every release packet runs path/secret/control sentinel scans.
 The five documents carry an assumptions ledger: #44 route/envelope and mapping persistence,
 receiver TTL/skew/probe bounds, Git refs/allowlist/dirty policy, lease/resource budgets, provider
-key recovery, #42/#45 evidence schedules, and SDK/package/lock reconciliation at 0.16.7. Each item
+key recovery, #42/#45 evidence schedules, and SDK/package/lock reconciliation at official unpatched
+0.18.12. Parent SDK-only evidence records Windows focused 318/318 (zero skips),
+bounded workspace 2689 tests/2685 pass/zero fail/four skips under nine explicit historical
+authority exclusion patterns, and actual isolated Linux credentialless 233/233 without provider
+calls. Skips are not passes, and four skips do not represent all nine exclusions.
+One separately authorized native Windows `codex-eco` smoke used a child-only profile override
+and passed three exact A-B-A `SMOKE_OK` responses, heartbeat/three invoke-terminal assertions,
+exit 0, and ephemeral relay-port cleanup, without optional model query or wrapper retry.
+Main native code was freshly built unchanged; separate native repairs and private native fixture
+claims are excluded. This same-profile continuity does not establish a fix for #247 or isolation.
+The [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-01812-evidence)
+lists the four local unshipped receipts and exact exclusions. Those receipts predate this doc refresh,
+do not test refreshed docs, and grant no authority or promotion. Independent review/PR/merge
+remain pending. Active controls remain fail-closed, with no inferred standalone abort support;
+#6578/#6700 remain unresolved. Docker/image/release/security/native/service/fault/OOM/noDump/
+installation/deployment and isolation gates remain unqualified and open. Each item
 has an owner, closure gate, and fail-closed behavior; illustrative values are not final approvals.

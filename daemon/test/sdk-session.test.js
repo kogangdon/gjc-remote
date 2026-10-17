@@ -49,7 +49,7 @@ function assistantMessage(text = "done", overrides = {}) {
   };
 }
 
-// AgentEvent.agent_end in @gajae-code/agent-core 0.16.7 always carries the
+// AgentEvent.agent_end in @gajae-code/agent-core 0.18.12 always carries the
 // run's messages. Tests use this source-shaped boundary instead of fabricating
 // a bare terminal that the installed SDK cannot emit.
 function terminalEvent({ text = "done", messages, ...overrides } = {}) {
@@ -82,8 +82,8 @@ function schemaHash(schema) {
   return createHash("sha256").update(canonicalJson(schema)).digest("hex");
 }
 
-// Exact output shape of SDK 0.16.7 buildAskGateAnswerSchema() and
-// buildAskGateStageState(); see workflow-gate-types.ts:206-293. Keeping the
+// Exact output shape of SDK 0.18.12 buildAskGateAnswerSchema() and
+// buildAskGateStageState() in workflow-gate-types.ts. Keeping the
 // generated schema on every fake gate makes scalar-answer regressions visible.
 function sdkAskGate({
   gate_id,
@@ -215,7 +215,7 @@ function sdkAskGate({
   return gate;
 }
 
-// Exact schemas/options from SDK 0.16.7 approval-gate.ts:54-94.
+// Exact schemas/options from SDK 0.18.12 approval-gate.ts.
 function sdkDecisionGate({ gate_id, kind, context = {} }) {
   const approval = kind === "approval";
   const decisions = approval
@@ -354,7 +354,7 @@ class FakeAgentSession {
   }
 }
 
-// #35: a fake BrokerWorkflowGateEmitter. emitGate() fires the registered
+// #35: a fake public WorkflowGateEmitter. emitGate() fires the registered
 // listeners (as the real emitter does when the `ask` tool opens a gate) and
 // returns a promise that resolves only when resolveGate() is called with the
 // matching gate_id — mirroring how emitGate suspends the agent loop until an
@@ -372,6 +372,9 @@ class FakeGateEmitter {
     this.completed = new Map();
     this.acceptedIncompleteKeys = new Set();
     this.beforeReceipt = undefined;
+    this.recoveryCalls = 0;
+    this.recoverAccepted = undefined;
+    this.lookupCalls = [];
   }
   supportsRemoteGateAnswers() {
     return true;
@@ -429,6 +432,7 @@ class FakeGateEmitter {
     return resolution;
   }
   lookupCompletedResolution(response) {
+    this.lookupCalls.push(response);
     const completed = this.completed.get(response.idempotency_key);
     if (!completed) return { kind: "none" };
     if (
@@ -443,7 +447,8 @@ class FakeGateEmitter {
     throw new Error("idempotency_conflict");
   }
   async recoverAcceptedGates() {
-    return [];
+    this.recoveryCalls += 1;
+    return this.recoverAccepted ? this.recoverAccepted() : [];
   }
   quarantineGate(gateId) {
     this.quarantineCalls.push(gateId);
@@ -559,7 +564,7 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(
     Object.hasOwn(calls[1][1], "settings"),
     false,
-    "SDK 0.16.7 must own and close its Settings.loadForScope instance"
+    "SDK 0.18.12 must own and close its Settings.loadForScope instance"
   );
   assert.deepEqual(agent.profileCalls, ["copilot-claude"]);
   await session.dispose();
@@ -771,6 +776,79 @@ test("a prompt rejection after agent_end still fails the invocation", async () =
   assert.equal(JSON.stringify(events).includes("credential-bearing"), false);
   assert.deepEqual(events, []);
   await session.dispose();
+});
+
+test("scoped diagnostics bind only to the exact terminal and never outrun the prompt promise", async (t) => {
+  const current = attemptScope(2, "main-attempt");
+  const cases = [
+    { name: "matching main attempt", scope: current, code: "provider_down", expected: "provider_down" },
+    { name: "stale generation", scope: attemptScope(1, current.attemptId), code: "stale_failure" },
+    { name: "different attempt", scope: attemptScope(2, "other-attempt"), code: "other_failure" },
+    { name: "different lineage", scope: { ...current, lineage: "child" }, code: "child_failure" },
+    { name: "missing generation", scope: { attemptId: current.attemptId, lineage: "main" }, code: "invalid_scope" },
+    { name: "unsafe generation", scope: { ...current, generation: Number.MAX_SAFE_INTEGER + 1 }, code: "invalid_scope" },
+    { name: "non-record scope", scope: [current], code: "invalid_scope" },
+    { name: "null scope", scope: null, code: "invalid_scope" },
+    { name: "maximum safe diagnostic length", scope: current, code: "x".repeat(64), expected: "x".repeat(64) },
+    { name: "later stale diagnostic cannot override matching failure", scope: current, code: "matching_failure", laterStale: true, expected: "matching_failure" },
+    { name: "unsafe diagnostic code", scope: current, code: "credential-bearing secret", expected: "prompt_failed" },
+    { name: "oversized diagnostic code", scope: current, code: "x".repeat(65), expected: "prompt_failed" },
+    { name: "prompt rejection after successful scoped terminal", scope: attemptScope(1, current.attemptId), code: "stale_failure", promptCode: "submission_failed", expected: "submission_failed" },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const agent = new FakeAgentSession();
+      let releasePrompt;
+      const promptBarrier = new Promise((resolve) => { releasePrompt = resolve; });
+      agent.prompt = async () => {
+        agent.emit({ type: "agent_start", scope: current });
+        await promptBarrier;
+        if (scenario.promptCode) {
+          throw Object.assign(new Error("credential-bearing prompt secret"), { code: scenario.promptCode });
+        }
+      };
+      const session = new SdkSession(agent);
+      const events = [];
+      let settled = false;
+      const observed = session.send(
+        { type: "prompt", message: "scoped" },
+        (event) => events.push(event)
+      ).then(
+        (value) => { settled = true; return { value }; },
+        (error) => { settled = true; return { error }; }
+      );
+      await waitForImmediate(() => agent.listeners.size === 1);
+      agent.emit({
+        type: "agent_failed",
+        scope: scenario.scope,
+        error: { code: scenario.code, message: "credential-bearing diagnostic secret" },
+      });
+      if (scenario.laterStale) {
+        agent.emit({
+          type: "agent_failed",
+          scope: attemptScope(1, current.attemptId),
+          error: { code: "stale_failure", message: "credential-bearing stale secret" },
+        });
+      }
+      agent.emit(terminalEvent({ scope: current }));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "terminal readiness cannot settle a pending prompt promise");
+      releasePrompt();
+      const outcome = await observed;
+      if (scenario.expected) {
+        assert.equal(outcome.error?.code, scenario.expected);
+        assert.equal(outcome.error?.terminalDisposition, "failed");
+        assert.doesNotMatch(outcome.error.message, /credential-bearing|secret/);
+      } else {
+        assert.deepEqual(outcome, { value: { disposition: "completed" } });
+      }
+      assert.deepEqual(events, [{ type: "agent_start", scope: current }]);
+      assert.doesNotMatch(JSON.stringify(events), /credential-bearing|secret|agent_failed|agent_end/);
+      assert.equal(agent.listeners.size, 0);
+      await session.dispose();
+      assert.equal(agent.disposeCalls, 1);
+    });
+  }
 });
 
 test("a provider-error terminal is readiness evidence but not success", async () => {
@@ -2254,7 +2332,7 @@ test("a proven successor gate is admitted while predecessor receipt is pending",
   await session.dispose();
 });
 
-test("an accepted-incomplete predecessor retains ownership until completed proof", async () => {
+test("recovery completes the same immutable accepted-incomplete answer before admitting its successor", async () => {
   const agent = new GatingAgentSession([
     sdkAskGate({
       gate_id: "g-incomplete-1",
@@ -2269,12 +2347,21 @@ test("an accepted-incomplete predecessor retains ownership until completed proof
   ]);
   const key = "gjc-remote:g-incomplete-1";
   agent.gateEmitter.acceptedIncompleteKeys.add(key);
-  let releaseReceipt;
-  const receiptBarrier = new Promise((resolve) => {
-    releaseReceipt = resolve;
+  let releaseRecovery;
+  const recoveryBarrier = new Promise((resolve) => {
+    releaseRecovery = resolve;
   });
-  agent.gateEmitter.beforeReceipt = async (response) => {
-    if (response.gate_id === "g-incomplete-1") await receiptBarrier;
+  agent.gateEmitter.beforeReceipt = (response) => {
+    if (response.gate_id === "g-incomplete-1") {
+      Object.freeze(response.answer.selected);
+      Object.freeze(response.answer);
+      Object.freeze(response);
+    }
+  };
+  agent.gateEmitter.recoverAccepted = async () => {
+    await recoveryBarrier;
+    agent.gateEmitter.acceptedIncompleteKeys.delete(key);
+    return [agent.gateEmitter.completed.get(key).resolution];
   };
   const events = [];
   const session = new SdkSession(agent, {
@@ -2290,8 +2377,13 @@ test("an accepted-incomplete predecessor retains ownership until completed proof
 
   const firstAnswer = answerGate(session, "g-incomplete-1", "Continue");
   await waitForImmediate(
-    () => session.deferredGateCandidate?.gate?.gate_id === "g-incomplete-2"
+    () => session.deferredGateCandidate?.gate?.gate_id === "g-incomplete-2" &&
+      agent.gateEmitter.recoveryCalls === 1
   );
+  const immutableResponse = agent.gateEmitter.resolveCalls[0];
+  const originalResponse = JSON.stringify(immutableResponse);
+  assert.equal(Object.isFrozen(immutableResponse), true);
+  assert.equal(Object.isFrozen(immutableResponse.answer), true);
   assert.strictEqual(
     session.pendingGates.get("g-incomplete-1").response,
     agent.gateEmitter.resolveCalls[0]
@@ -2307,9 +2399,16 @@ test("an accepted-incomplete predecessor retains ownership until completed proof
   );
   assert.deepEqual(agent.gateEmitter.quarantineCalls, []);
 
-  agent.gateEmitter.acceptedIncompleteKeys.delete(key);
-  releaseReceipt();
-  assert.equal((await firstAnswer).ok, true);
+  releaseRecovery();
+  assert.deepEqual(await firstAnswer, {
+    ok: true,
+    resolution: agent.gateEmitter.completed.get(key).resolution,
+  });
+  assert.equal(agent.gateEmitter.recoveryCalls, 1);
+  assert.equal(agent.gateEmitter.resolveCalls.length, 1);
+  assert.equal(JSON.stringify(immutableResponse), originalResponse);
+  assert.ok(agent.gateEmitter.lookupCalls.every((response) => response === immutableResponse));
+  assert.deepEqual(agent.answers, [immutableResponse.answer]);
   await waitForImmediate(() => session.pendingGates.has("g-incomplete-2"));
   assert.equal(session.pendingGates.has("g-incomplete-1"), false);
   assert.equal(
@@ -2326,6 +2425,337 @@ test("an accepted-incomplete predecessor retains ownership until completed proof
   );
   await done;
   await session.dispose();
+});
+
+test("recovery no-op, throw and answer conflict never publish an unproven successor", async (t) => {
+  for (const mode of ["no-op", "throw", "answer-conflict", "lookup-no-op", "lookup-throw"]) {
+    await t.test(mode, async () => {
+      const firstId = `g-recovery-${mode}-1`;
+      const secondId = `g-recovery-${mode}-2`;
+      const key = `gjc-remote:${firstId}`;
+      const agent = new GatingAgentSession([
+        sdkAskGate({ gate_id: firstId, options: [{ label: "Continue" }] }),
+        sdkAskGate({ gate_id: secondId, options: [{ label: "Finish" }] }),
+      ]);
+      const emitter = agent.gateEmitter;
+      emitter.acceptedIncompleteKeys.add(key);
+      emitter.beforeReceipt = (response) => {
+        Object.freeze(response.answer.selected);
+        Object.freeze(response.answer);
+        Object.freeze(response);
+      };
+      let releaseRecovery;
+      const recoveryBarrier = new Promise((resolve) => { releaseRecovery = resolve; });
+      emitter.recoverAccepted = async () => {
+        await recoveryBarrier;
+        if (mode === "throw") throw new Error("credential-bearing recovery detail");
+        if (mode === "answer-conflict") {
+          const accepted = emitter.completed.get(key);
+          emitter.completed.set(key, {
+            ...accepted,
+            response: { ...accepted.response, answer: { selected: ["Different"] } },
+          });
+        }
+        if (mode === "lookup-no-op" || mode === "lookup-throw") {
+          emitter.lookupCompletedResolution = (response) => {
+            emitter.lookupCalls.push(response);
+            if (mode === "lookup-throw") throw new Error("credential-bearing lookup detail");
+            return { kind: "none" };
+          };
+        }
+        return [];
+      };
+      const session = new SdkSession(agent);
+      const events = [];
+      const done = session.send({ type: "prompt", message: "recover" }, (event) => events.push(event));
+      const doneResult = Promise.allSettled([done]);
+      await waitForImmediate(() => session.pendingGates.has(firstId));
+      const entry = session.pendingGates.get(firstId);
+      const answer = answerGate(session, firstId, "Continue");
+      await waitForImmediate(() => emitter.recoveryCalls === 1 && session.deferredGateCandidate?.gate.gate_id === secondId);
+      const response = emitter.resolveCalls[0];
+      const originalResponse = JSON.stringify(response);
+      assert.strictEqual(entry.response, response);
+      assert.equal(emitter.lookupCompletedResolution(response).kind, "accepted_incomplete");
+      releaseRecovery();
+      const result = await answer;
+      assert.equal(result.ok, false);
+      assert.equal(result.error, mode === "throw" ? "workflow gate answer failed" : "workflow gate resolution is incomplete");
+      assert.doesNotMatch(JSON.stringify(result), /credential-bearing|recovery detail/);
+      assert.equal(emitter.recoveryCalls, mode === "throw" ? 2 : 1);
+      assert.equal(emitter.resolveCalls.length, 1);
+      assert.equal(JSON.stringify(response), originalResponse);
+      assert.deepEqual(agent.answers, [response.answer]);
+      if (mode === "answer-conflict") {
+        assert.throws(() => emitter.lookupCompletedResolution(response), /idempotency_conflict/);
+      } else if (mode !== "lookup-no-op" && mode !== "lookup-throw") {
+        assert.equal(emitter.lookupCompletedResolution(response).kind, "accepted_incomplete");
+      }
+      assert.equal(session.pendingGates.has(secondId), false);
+      assert.equal(events.some((event) => event.type === "gate_request" && event.gateId === secondId), false);
+      if (mode !== "lookup-no-op" && mode !== "lookup-throw") {
+        assert.throws(
+          () => emitter.lookupCompletedResolution({ ...response, answer: { selected: ["Replay conflict"] } }),
+          /idempotency_conflict/
+        );
+      }
+      try {
+        assert.strictEqual(session.pendingGates.get(firstId), entry);
+        assert.strictEqual(entry.response, response);
+        for (const replayAnswer of ["Continue", "Different", null, '{"selected":42}']) {
+          const replay = await session.answerGate(entry.ownerId, firstId, entry.presentationId, replayAnswer);
+          assert.deepEqual(replay, { ok: false, error: "workflow gate is no longer answerable" });
+          assert.equal(emitter.resolveCalls.length, 1);
+          assert.strictEqual(entry.response, response);
+          if (mode === "answer-conflict") {
+            assert.throws(() => emitter.lookupCompletedResolution(entry.response), /idempotency_conflict/);
+          } else if (mode !== "lookup-no-op" && mode !== "lookup-throw") {
+            assert.equal(emitter.lookupCompletedResolution(entry.response).kind, "accepted_incomplete");
+          }
+        }
+        assert.equal(emitter.prepareCalls.length, 1);
+        assert.deepEqual(emitter.clearPreparedCalls, []);
+        assert.deepEqual(emitter.quarantineCalls, []);
+        assert.equal(session.deferredGateCandidate?.gate.gate_id, secondId);
+      } finally {
+        await session.dispose();
+      }
+      assert.strictEqual(entry.response, response);
+      await session.dispose();
+      const [promptResult] = await doneResult;
+      assert.equal(promptResult.status, "rejected");
+      assert.equal(session.pendingGates.size, 0);
+      assert.equal(session.deferredGateCandidate, undefined);
+      assert.equal(emitter.listeners.size, 0);
+      assert.equal(agent.disposeCalls, 1);
+    });
+  }
+});
+
+test("successor-observed acceptance survives a lost receipt and later lookup none", async (t) => {
+  for (const finish of ["dispose", "exact-completion"]) {
+    await t.test(finish, async () => {
+      const firstId = `g-observed-accepted-${finish}-1`;
+      const secondId = `g-observed-accepted-${finish}-2`;
+      const key = `gjc-remote:${firstId}`;
+      const agent = new GatingAgentSession([
+        sdkAskGate({ gate_id: firstId, options: [{ label: "Continue" }] }),
+        sdkAskGate({ gate_id: secondId, options: [{ label: "Finish" }] }),
+      ]);
+      const emitter = agent.gateEmitter;
+      emitter.acceptedIncompleteKeys.add(key);
+      let releaseReceipt;
+      const receiptBarrier = new Promise((resolve) => { releaseReceipt = resolve; });
+      emitter.beforeReceipt = async (response) => {
+        if (response.gate_id !== firstId) return;
+        Object.freeze(response.answer.selected);
+        Object.freeze(response.answer);
+        Object.freeze(response);
+        await receiptBarrier;
+        throw new Error("resolve receipt lost");
+      };
+      const lookup = emitter.lookupCompletedResolution.bind(emitter);
+      let lookupUnavailable = false;
+      emitter.lookupCompletedResolution = (response) => {
+        if (!lookupUnavailable) return lookup(response);
+        emitter.lookupCalls.push(response);
+        return { kind: "none" };
+      };
+      const events = [];
+      const session = new SdkSession(agent);
+      const doneResult = Promise.allSettled([
+        session.send({ type: "prompt", message: "observe acceptance" }, (event) => events.push(event)),
+      ]);
+      await waitForImmediate(() => session.pendingGates.has(firstId));
+      const entry = session.pendingGates.get(firstId);
+      const answer = answerGate(session, firstId, "Continue");
+      await waitForImmediate(() => session.deferredGateCandidate?.gate.gate_id === secondId);
+      const response = emitter.resolveCalls[0];
+      const candidate = session.deferredGateCandidate;
+      assert.equal(entry.accepted, true, "successor lookup records acceptance before the receipt arrives");
+      assert.strictEqual(entry.response, response);
+      lookupUnavailable = true;
+      releaseReceipt();
+      assert.deepEqual(await answer, { ok: false, error: "workflow gate answer failed" });
+      assert.strictEqual(session.pendingGates.get(firstId), entry);
+      assert.strictEqual(entry.response, response);
+      assert.strictEqual(session.deferredGateCandidate, candidate);
+      assert.equal(entry.accepted, true);
+      assert.equal(emitter.listPendingGates().some((gate) => gate.gate_id === firstId), false);
+      for (const replayAnswer of ["Continue", "Different", null]) {
+        assert.deepEqual(await session.answerGate(entry.ownerId, firstId, entry.presentationId, replayAnswer), {
+          ok: false, error: "workflow gate is no longer answerable",
+        });
+        assert.strictEqual(entry.response, response);
+        assert.strictEqual(session.deferredGateCandidate, candidate);
+      }
+      assert.equal(emitter.resolveCalls.length, 1);
+      assert.equal(emitter.prepareCalls.length, 1);
+      assert.equal(emitter.recoveryCalls, 0);
+      assert.deepEqual(emitter.clearPreparedCalls, []);
+      assert.deepEqual(emitter.quarantineCalls, []);
+      assert.deepEqual(agent.answers, [response.answer]);
+      assert.ok(emitter.lookupCalls.every((lookupResponse) => lookupResponse === response));
+      assert.equal(events.some((event) => event.type === "gate_request" && event.gateId === secondId), false);
+      if (finish === "exact-completion") {
+        lookupUnavailable = false;
+        emitter.acceptedIncompleteKeys.delete(key);
+        assert.deepEqual(await session.answerGate(entry.ownerId, firstId, entry.presentationId, null), {
+          ok: true, resolution: emitter.completed.get(key).resolution,
+        });
+        assert.equal(events.filter((event) => event.type === "gate_request" && event.gateId === secondId).length, 1);
+        assert.equal((await answerGate(session, secondId, "Finish")).ok, true);
+        assert.equal((await doneResult)[0].status, "fulfilled");
+        assert.equal(emitter.resolveCalls.length, 2);
+        assert.deepEqual(agent.answers, [response.answer, emitter.resolveCalls[1].answer]);
+      }
+      await session.dispose();
+      assert.strictEqual(entry.response, response);
+      assert.equal(session.pendingGates.size, 0);
+      assert.equal(session.deferredGateCandidate, undefined);
+      if (finish === "dispose") assert.equal((await doneResult)[0].status, "rejected");
+    });
+  }
+});
+
+test("an unknown resolution with pending proof retains its response until disposal", async () => {
+  const gateId = "g-unknown-pending";
+  const agent = new GatingAgentSession(sdkAskGate({
+    gate_id: gateId, options: [{ label: "Continue" }],
+  }));
+  const emitter = agent.gateEmitter;
+  emitter.resolveGate = async (response) => {
+    emitter.resolveCalls.push(response);
+    throw new Error("resolution receipt unavailable");
+  };
+  emitter.lookupCompletedResolution = (response) => {
+    emitter.lookupCalls.push(response);
+    throw new Error("lookup unavailable");
+  };
+  const session = new SdkSession(agent);
+  const doneResult = Promise.allSettled([
+    session.send({ type: "prompt", message: "unknown resolution" }, () => {}),
+  ]);
+  await waitForImmediate(() => session.pendingGates.has(gateId));
+  const entry = session.pendingGates.get(gateId);
+  assert.deepEqual(await answerGate(session, gateId, "Continue"), {
+    ok: false, error: "workflow gate answer failed",
+  });
+  const response = emitter.resolveCalls[0];
+  assert.equal(emitter.listPendingGates().length, 1);
+  for (const replayAnswer of ["Continue", "Different", null]) {
+    assert.deepEqual(await session.answerGate(entry.ownerId, gateId, entry.presentationId, replayAnswer), {
+      ok: false, error: "workflow gate is no longer answerable",
+    });
+    assert.strictEqual(entry.response, response);
+  }
+  assert.equal(emitter.resolveCalls.length, 1);
+  assert.equal(emitter.prepareCalls.length, 1);
+  assert.deepEqual(emitter.clearPreparedCalls, []);
+  assert.deepEqual(emitter.quarantineCalls, []);
+  assert.deepEqual(agent.answers, []);
+  await session.dispose();
+  assert.strictEqual(entry.response, response);
+  assert.equal((await doneResult)[0].status, "rejected");
+});
+
+test("a completed retained binding admits its successor once without resolving a replay", async () => {
+  const firstId = "g-completed-replay-1";
+  const secondId = "g-completed-replay-2";
+  const key = `gjc-remote:${firstId}`;
+  const agent = new GatingAgentSession([
+    sdkAskGate({ gate_id: firstId, options: [{ label: "Continue" }] }),
+    sdkAskGate({ gate_id: secondId, options: [{ label: "Finish" }] }),
+  ]);
+  const emitter = agent.gateEmitter;
+  emitter.acceptedIncompleteKeys.add(key);
+  const events = [];
+  const session = new SdkSession(agent);
+  const done = session.send({ type: "prompt", message: "completed replay" }, (event) => events.push(event));
+  await waitForImmediate(() => session.pendingGates.has(firstId));
+  const entry = session.pendingGates.get(firstId);
+  assert.equal((await answerGate(session, firstId, "Continue")).ok, false);
+  await waitForImmediate(() => session.deferredGateCandidate?.gate.gate_id === secondId);
+  const response = emitter.resolveCalls[0];
+  assert.strictEqual(entry.response, response);
+  emitter.acceptedIncompleteKeys.delete(key);
+  const replay = await session.answerGate(entry.ownerId, firstId, entry.presentationId, null);
+  assert.deepEqual(replay, { ok: true, resolution: emitter.completed.get(key).resolution });
+  assert.strictEqual(entry.response, response);
+  assert.equal(emitter.resolveCalls.length, 1);
+  assert.equal(emitter.prepareCalls.length, 1);
+  assert.deepEqual(emitter.clearPreparedCalls, []);
+  assert.ok(emitter.lookupCalls.every((lookupResponse) => lookupResponse === response));
+  assert.deepEqual(agent.answers, [response.answer]);
+  assert.equal(session.pendingGates.has(firstId), false);
+  assert.equal(session.pendingGates.has(secondId), true);
+  assert.equal(events.filter((event) => event.type === "gate_request" && event.gateId === secondId).length, 1);
+  assert.deepEqual(await session.answerGate(entry.ownerId, firstId, entry.presentationId, "Different"), {
+    ok: false, error: "no pending gate for id",
+  });
+  assert.equal((await answerGate(session, secondId, "Finish")).ok, true);
+  await done;
+  assert.equal(emitter.resolveCalls.length, 2);
+  assert.equal(agent.answers.length, 2);
+  assert.deepEqual(emitter.quarantineCalls, []);
+  await session.dispose();
+});
+
+test("dispose settles a recovery waiter and fences its late completion", async () => {
+  const firstId = "g-dispose-recovery-1";
+  const secondId = "g-dispose-recovery-2";
+  const key = `gjc-remote:${firstId}`;
+  const agent = new GatingAgentSession([
+    sdkAskGate({ gate_id: firstId, options: [{ label: "Continue" }] }),
+    sdkAskGate({ gate_id: secondId, options: [{ label: "Finish" }] }),
+  ]);
+  const emitter = agent.gateEmitter;
+  emitter.acceptedIncompleteKeys.add(key);
+  let releaseRecovery;
+  const recoveryBarrier = new Promise((resolve) => { releaseRecovery = resolve; });
+  let recovered = false;
+  emitter.recoverAccepted = async () => {
+    await recoveryBarrier;
+    emitter.acceptedIncompleteKeys.delete(key);
+    recovered = true;
+    return [emitter.completed.get(key).resolution];
+  };
+  const events = [];
+  const session = new SdkSession(agent);
+  const doneResult = Promise.allSettled([
+    session.send({ type: "prompt", message: "dispose recovery" }, (event) => events.push(event)),
+  ]);
+  await waitForImmediate(() => session.pendingGates.has(firstId));
+  const entry = session.pendingGates.get(firstId);
+  const answer = answerGate(session, firstId, "Continue");
+  await waitForImmediate(() => emitter.recoveryCalls === 1 && session.deferredGateCandidate?.gate.gate_id === secondId);
+  const response = emitter.resolveCalls[0];
+  assert.strictEqual(entry.response, response);
+  assert.deepEqual(await session.answerGate(entry.ownerId, firstId, entry.presentationId, null), {
+    ok: false, error: "gate answer is already being resolved",
+  });
+  assert.strictEqual(entry.response, response);
+  await session.dispose();
+  assert.strictEqual(entry.response, response);
+  assert.equal(recovered, false, "adapter disposal does not wait on the underlying recovery promise");
+  assert.deepEqual(await answer, { ok: false, error: "session is closed" });
+  assert.equal((await doneResult)[0].status, "rejected");
+  releaseRecovery();
+  await waitForImmediate(() => recovered);
+  assert.strictEqual(entry.response, response);
+  assert.equal(emitter.lookupCompletedResolution(emitter.resolveCalls[0]).kind, "completed");
+  assert.deepEqual(await session.answerGate(entry.ownerId, firstId, entry.presentationId, "Continue"), {
+    ok: false, error: "session is closed",
+  });
+  assert.equal(events.some((event) => event.type === "gate_request" && event.gateId === secondId), false);
+  assert.equal(session.pendingGates.size, 0);
+  assert.equal(session.deferredGateCandidate, undefined);
+  assert.equal(emitter.listeners.size, 0);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(emitter.resolveCalls.length, 1);
+  assert.equal(emitter.recoveryCalls, 1);
+  await session.dispose();
+  assert.equal(agent.disposeCalls, 1);
 });
 
 test("a deferred accepted-incomplete candidate is bounded by the gate window", async () => {

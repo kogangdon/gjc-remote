@@ -125,10 +125,35 @@ node bound. Signed/live rc.10 remains immutable with native-control 2.0.0
 (contract 5 revision 1) and SDK 0.16.7, as do all existing rc.1 through rc.10
 assets. The current source candidate selects application `0.4.0-rc.11`, tag
 `v0.4.0-rc.11`, and release sequence 11, with native-control 2.1.0 (contract 5
-revision 2), unchanged N-API 8, SDK 0.16.7, and Bun 1.4.2. It includes PR #263
+revision 2), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It includes PR #263
 (merge `c4a2ebe5`): the hashing-bound fix, SDK sidecar validation against observed
 package facts, and explicit inventory-parent provisioning. This preparation is
 not a published, signed, or deployed release.
+
+Parent-run main-based SDK-only verification records Windows focused **318/318
+passed**, zero skips, and bounded workspace **2689 tests: 2685 passed, 0 failed,
+4 skipped**, under the [nine explicit historical authority exclusions](../README.md#current-sdk-only-evidence).
+Those exclusions are not represented by just four skips; skips are not passes.
+Actual isolated credentialless Linux verification passed **233/233** without
+provider calls. One separately authorized native Windows provider smoke
+**passed**, using the existing `codex-eco` runtime-only child override: three
+exact A-B-A `SMOKE_OK` responses, heartbeat, three successful invoke terminals,
+exit 0, and ephemeral relay port free. No optional model query, wrapper retry,
+or wrapper persistent profile write occurred. This is same-profile basic
+continuity, not isolation or a proven #247 disconnect fix.
+
+Main native code was freshly built unchanged. Separate native lifetime, ACL,
+publication, construction, and fixture repairs remain deferred; no private
+native fixture or combined-worktree result qualifies this tree. No service,
+account, ACL, mapping, installed asset, or signed release was changed. Local
+receipts are unshipped, not promotion authority; independent review/PR/merge
+remain pending, and refreshed docs have not been rerun through tests.
+Native/service/security/fault/OOM/noDump, signed deployment, installation,
+production, release, and support qualification remain excluded. Active live
+controls remain fail-closed and active cancellation remains nonterminal
+`cancellation_pending`; aggregate oracle success does not establish standalone
+SDK abort support. Upstream workflow guard issues #6578/#6700 remain unresolved;
+#6763's approval binding is not that repair.
 
 Isolated CI run [37167043415](https://github.com/kogangdon/gjc-remote/actions/runs/37167043415)
 and main CI run [37167663638](https://github.com/kogangdon/gjc-remote/actions/runs/37167663638)

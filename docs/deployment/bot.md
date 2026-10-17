@@ -140,8 +140,8 @@ hard-cap/receipt horizon.
 A queued cancellation is revoked before SDK, provider, or tool execution. It
 receives `cancelled_before_start`, followed by the authoritative terminal
 `cancelled` frame. Active work can only receive nonterminal
-`cancellation_pending`: SDK 0.16.7 has no supported active-interruption
-control, and the natural terminal remains authoritative. A cancellation receipt
+`cancellation_pending`: the daemon has no qualified active-interruption
+integration, and the natural terminal remains authoritative. A cancellation receipt
 does not prove a terminal outcome or host quiescence.
 
 The daemon's authoritative final response is an `event` containing
@@ -166,6 +166,36 @@ should use it for a known owned request, wait for its terminal outcome, and
 inspect the host before retrying. Bot idle/hard-cap expiry, presentation
 failure, and shutdown/disconnect ownership changes use the same revocation
 path. This does not restore active `steer`/`follow_up` or unblock #231.
+
+Official unpatched SDK 0.18.12 includes the late-follow-up continuation fix and
+public tracked `submitUserMessage` ownership API. API existence is not qualified
+daemon integration: active controls remain fail-closed, and active cancellation
+remains nonterminal `cancellation_pending`. Aggregate oracle success does not
+establish standalone SDK abort support.
+
+Parent-run SDK-only receipts record Windows focused **318/318 passed** (zero
+skips), bounded workspace **2689 tests: 2685 passed, 0 failed, 4 skipped**, and
+actual isolated credentialless Linux **233/233 passed** without provider calls.
+The workspace retains the [nine explicit historical authority exclusions](README.md#current-sdk-only-evidence);
+four reported skips do not represent those exclusions and are not passes.
+One separately authorized native Windows provider smoke **passed** with the
+existing `codex-eco` runtime-only child override: three exact A-B-A `SMOKE_OK`
+responses, heartbeat, three successful invoke terminals, exit 0, and ephemeral
+relay port free. No optional model query, wrapper retry, or wrapper persistent
+profile write occurred. Same-profile basic continuity is not isolation or a
+proven #247 disconnect fix.
+
+Main native code was freshly built unchanged. Native lifetime, ACL, publication,
+construction, and fixture repairs remain deferred; no private native fixture or
+combined-worktree result is claimed. Local receipts are unshipped, not promotion
+authority. Independent review/PR/merge remain pending, and these refreshed docs
+have not been rerun through tests. Native/service/security/fault/OOM/noDump,
+signed deployment, production, release, support, and installation qualification
+remain excluded. See [current SDK status](../../README.md#local-quick-start).
+
+Upstream #6578 and direct repair #6700 remain open/unmerged and can affect
+SDK-exposed Ultragoal/Ralplan workflow gates. Merged #6763's transcript-content
+approval binding does not repair that guard deadlock; do not bypass containment.
 
 Alert separately for bot exit, listener failure, Discord disconnects, unknown
 or rejected host registrations, absent expected daemons, gate presentation/

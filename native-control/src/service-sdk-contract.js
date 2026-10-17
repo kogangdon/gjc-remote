@@ -7,8 +7,8 @@ import { assertStrictText, canonicalJsonBytes, utf8Compare } from '@gjc-remote/s
 
 export const SDK_EXTERNAL_STATE_REQUIREMENTS = Object.freeze({
   packageName: '@gajae-code/coding-agent',
-  packageVersion: '0.16.7',
-  lockIntegrity: 'sha512-rqhs7FELytNw0zfumqroc5EaVrtEUccGGp4YNpFbycF89o+Q+dzWWof1uRVnZvS+GLzCKR9psWZiDEacJzXY7A==',
+  packageVersion: '0.18.12',
+  lockIntegrity: 'sha512-ls1SkP0FmXhHGxi3oft+1M9HbWwfaAjq6ubWGekFHptegxZEIP/tO8Soha6+xxTSFWvBhdPOuZLtP86Qzcs7vQ==',
   configSchemaVersion: 2,
   transcriptVersion: 5,
   sourceRoots: Object.freeze({

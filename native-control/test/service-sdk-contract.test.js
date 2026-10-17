@@ -217,7 +217,7 @@ test('derives and exactly matches a bounded pinned SDK installation closure', ()
   const result = derive(installation);
 
   assert.equal(result.sdkContract.packageName, '@gajae-code/coding-agent');
-  assert.equal(result.sdkContract.packageVersion, '0.16.7');
+  assert.equal(result.sdkContract.packageVersion, '0.18.12');
   assert.equal(result.sdkContract.lockIntegrity, SDK_EXTERNAL_STATE_REQUIREMENTS.lockIntegrity);
   assert.equal(result.sdkContract.configSchemaVersion, 2);
   assert.equal(result.packageCount, 2);
@@ -256,7 +256,7 @@ test('missing declared source roots and mismatched version-source bytes fail clo
 
 test('SDK package, integrity, schema, and transcript version changes are rejected', () => {
   invalid(() => derive(syntheticInstallation({
-    rootIdentity: '@gajae-code/coding-agent@0.16.8',
+    rootIdentity: '@gajae-code/coding-agent@0.16.7',
   })));
   invalid(() => derive(syntheticInstallation({
     rootIntegrity: `sha512-${Buffer.alloc(64, 0x34).toString('base64')}`,
