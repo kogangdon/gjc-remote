@@ -250,24 +250,32 @@ Every verification-matrix evidence layer and non-negotiable gate must close befo
 
 Any missing or failed gate is a hard no-promotion result; interim feature flags are rejected.
 
-SDK 0.18.12 has parent SDK-only source evidence: Windows focused 318/318 with
-zero skips; bounded workspace 2689 tests, 2685 pass, zero fail, four skips under
+SDK 0.18.12 has post-admission parent SDK-only source evidence: Windows focused 333/333 with
+zero skips; bounded workspace 2704 tests, 2700 pass, zero fail, four skips under
 nine explicit historical authority exclusion patterns; and actual isolated Linux
-credentialless 233/233 without provider calls. Skips are not passes; four skips
+credentialless 248/248 without provider calls. Skips are not passes; four skips
 do not represent all nine exclusions. One separately authorized native Windows
 `codex-eco` provider smoke used a child-only profile override and passed three
 exact A-B-A `SMOKE_OK` responses, heartbeat/three invoke-terminal assertions,
 exit 0, and ephemeral relay-port cleanup. No optional model query or wrapper
-retry ran. Main native code was freshly built unchanged; separate native repairs
+retry ran. The smoke was not repeated after fixture/test-only changes; production SDK
+runtime/package/lock are unchanged. Main native code was freshly built unchanged; separate native repairs
 and private native fixture claims are excluded. Same-profile continuity is not
 a fix for #247 or proof of profile/tenant isolation. Active controls remain
 fail-closed; standalone abort support is not inferred, and #6578/#6700 persist.
 
 The [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-01812-evidence)
-lists exact exclusions and four local unshipped receipts. They predate this doc
-refresh, do not test refreshed docs, and are not authority or promotion grants.
-Historical or combined SDK/native receipts do not qualify this tree. Independent
-review/PR/merge remain pending. These source tests and basic provider smoke do
+lists exact exclusions; current local unshipped runtime receipts are
+`artifacts/sdk-first-0.18.12-admission2-focused.json`,
+`artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
+`artifacts/sdk-first-0.18.12-admission2-wsl-final.json`. Each run
+qualifies only its exact pins; local receipts alone do not approve landing.
+Historical or combined SDK/native receipts do not qualify this tree. Both original P2s and
+owner-admission are verified and independently cleared in
+`artifacts/sdk-first-0.18.12-final-review.json`: static agent review APPROVE, zero P0/P1/P2,
+not independent runtime or CI/merge/deployment approval. Exact-head CI/landing is tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is not yet
+committed/pushed, and CI/merge completion is not claimed. These source tests and basic provider smoke do
 not close existing phase gates or qualify Docker/images/releases/security,
 native/service, fault/OOM/noDump, installation/deployment, or isolation.
 

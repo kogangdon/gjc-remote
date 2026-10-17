@@ -2,15 +2,19 @@
 
 Discord-controlled remote GJC sessions.
 
-> **Official unpatched SDK 0.18.12 candidate: bounded parent evidence recorded.**
+> **Official unpatched SDK 0.18.12: bounded source evidence.**
 > Published types expose `QueuedInputSubmission` / `submitUserMessage` ownership;
 > API existence is not qualified daemon integration. Active `steer` and
 > `follow_up` remain fail-closed; idle controls remain prompt-equivalent FIFO
-> work. This SDK-only, main-based tree has Windows focused 318/318, bounded
-> workspace 2689 tests / 2685 pass / 0 fail / 4 skips, isolated Linux 233/233,
+> work. Post-admission SDK-only, main-based evidence is Windows focused 333/333, bounded
+> workspace 2704 tests / 2700 pass / 0 fail / 4 skips, isolated Linux 248/248,
 > and one separately authorized Windows provider smoke PASS. Nine historical
 > authority exclusions bound the workspace run; skips are not passes.
-> Independent review/PR/merge remain pending. No production, release, support,
+> Independent static agent review is APPROVE, with zero P0/P1/P2; it is not
+> independent runtime or CI/merge/deployment approval. Exact-head CI/landing is tracked in
+> [PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
+> not yet committed/pushed, and CI/merge completion is not claimed. Local receipts alone
+> do not approve landing. No production, release, support,
 > installation, or deployment qualification is claimed. See the bounded
 > [evidence record](docs/verification/issue62-evidence.md#current-parent-observations).
 
@@ -305,10 +309,10 @@ SDK 0.18.12 retains the bundled catalog change introduced in 0.16.4: the retired
 Registration is an explicit operator action; upgrading dependencies alone does
 not change Discord's stored commands.
 
-> **SDK update status:** the implementation targets official unpatched
+> **SDK source evidence:** the implementation uses official unpatched
 > `@gajae-code/coding-agent` **0.18.12**, requiring **Bun 1.4.0 or newer**.
-> Parent evidence: Windows focused **318/318**, bounded workspace **2689 tests,
-> 2685 pass, 0 fail, 4 skips**, and isolated Linux **233/233** (no provider calls).
+> Post-admission parent evidence: Windows focused **333/333**, bounded workspace **2704 tests,
+> 2700 pass, 0 fail, 4 skips**, and isolated Linux **248/248** (no provider calls).
 > This is not unrestricted `npm test`: its nine historical authority exclusion
 > patterns are recorded in the [current evidence](docs/verification/issue62-evidence.md#current-parent-observations), separately from the four skips.
 > Canonical imports are exercised by real SDK probes, not independently
@@ -316,15 +320,28 @@ not change Discord's stored commands.
 > passed with three exact `SMOKE_OK` responses in A-B-A order, the existing
 > `codex-eco` child-only override, heartbeat/three successful invoke terminals,
 > exit 0 and ephemeral relay port free; no optional model query or wrapper retry.
+> That single smoke was not repeated after fixture/test-only changes; production SDK
+> runtime/package/lock are unchanged. Current run receipts are
+> `artifacts/sdk-first-0.18.12-admission2-focused.json`,
+> `artifacts/sdk-first-0.18.12-admission2-workspace.json` and
+> `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; the smoke remains
+> `artifacts/sdk-first-0.18.12-provider-smoke.json`.
+> Both original P2s and owner-admission are verified and independently cleared in
+> `artifacts/sdk-first-0.18.12-final-review.json` (static agent review APPROVE,
+> zero P0/P1/P2, not independent runtime or CI/merge/deployment approval).
+> The separate Windows FIFO 100 ms wall-clock flake remains recorded as
+> `artifacts/sdk-first-0.18.12-admission-focused.json` (333 tests / 332 pass / 1 fail).
+> Only that deterministic gated FIFO ordering test uses Node mock `setTimeout`;
+> actual timeout tests are unchanged. Subsequent admission2 focused and Linux runs passed.
 > Same-profile continuity is not isolation or a fix for #247.
 > Combined-worktree results are not evidence for this tree. Native lifetime,
 > ACL, publication, construction, and fixture repairs are excluded/deferred.
 > No local SOURCEPATCH modifications or admission recovery are included.
 > Main native code was freshly built unchanged; no native repair or private
 > native fixture pass is claimed. Native/service/security/fault/OOM/noDump and
-> release qualification remain unavailable. Independent review/PR/merge remain
-> pending. Local unshipped receipts and historical results grant no authority.
-> These refreshed documentation bytes postdate the receipts and were not tested.
+> release qualification remain unavailable. Independent review and exact-head
+> CI/landing status are tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265).
+> Local receipts alone do not approve landing; each run qualifies only its exact pins.
 >
 > **Historical 0.16.4 blocker evidence:** the real-SDK oracle observed
 > `waitForIdle()` resolving with the exact executable late follow-up still

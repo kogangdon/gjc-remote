@@ -130,24 +130,35 @@ revision 2), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. I
 package facts, and explicit inventory-parent provisioning. This preparation is
 not a published, signed, or deployed release.
 
-Parent-run main-based SDK-only verification records Windows focused **318/318
-passed**, zero skips, and bounded workspace **2689 tests: 2685 passed, 0 failed,
+Post-admission parent-run main-based SDK-only verification records Windows focused **333/333
+passed**, zero skips, and bounded workspace **2704 tests: 2700 passed, 0 failed,
 4 skipped**, under the [nine explicit historical authority exclusions](../README.md#current-sdk-only-evidence).
 Those exclusions are not represented by just four skips; skips are not passes.
-Actual isolated credentialless Linux verification passed **233/233** without
+Actual isolated credentialless Linux verification passed **248/248** without
 provider calls. One separately authorized native Windows provider smoke
 **passed**, using the existing `codex-eco` runtime-only child override: three
 exact A-B-A `SMOKE_OK` responses, heartbeat, three successful invoke terminals,
 exit 0, and ephemeral relay port free. No optional model query, wrapper retry,
 or wrapper persistent profile write occurred. This is same-profile basic
 continuity, not isolation or a proven #247 disconnect fix.
+The smoke was not repeated after fixture/test-only changes; production SDK runtime/
+package/lock are unchanged. Current local runtime receipts are
+`artifacts/sdk-first-0.18.12-admission2-focused.json`,
+`artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
+`artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; see the
+[SDK-only evidence record](../README.md#current-sdk-only-evidence).
 
 Main native code was freshly built unchanged. Separate native lifetime, ACL,
 publication, construction, and fixture repairs remain deferred; no private
 native fixture or combined-worktree result qualifies this tree. No service,
 account, ACL, mapping, installed asset, or signed release was changed. Local
-receipts are unshipped, not promotion authority; independent review/PR/merge
-remain pending, and refreshed docs have not been rerun through tests.
+receipts alone do not approve landing. Independent review and exact-head
+CI/landing are separate: `artifacts/sdk-first-0.18.12-final-review.json` records
+static agent review APPROVE, zero P0/P1/P2, clearing both original P2s and
+owner-admission, not independent runtime or CI/merge/deployment approval.
+Exact-head CI/landing is tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
+the final follow-up is not yet committed/pushed, and CI/merge completion is not claimed;
+each run qualifies only its exact pins.
 Native/service/security/fault/OOM/noDump, signed deployment, installation,
 production, release, and support qualification remain excluded. Active live
 controls remain fail-closed and active cancellation remains nonterminal

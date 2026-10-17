@@ -1,7 +1,7 @@
 # Native daemon foreground deployment
 
 Run one daemon on each host that owns mapped work directories. It embeds the
-pinned official unpatched `@gajae-code/coding-agent` SDK **0.18.12** candidate
+pinned official unpatched `@gajae-code/coding-agent` SDK **0.18.12**
 and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
@@ -15,8 +15,8 @@ SDK 0.18.12 includes the late-follow-up continuation fix for
 not qualified daemon integration; active controls remain fail-closed. See the
 [containment record](../../CHANGELOG.md#sdk-0166-containment).
 
-Actual parent SDK-only evidence: Windows focused 318/318; bounded workspace
-2689 tests, 2685 pass, 0 fail, 4 skips; isolated Linux 233/233 without provider
+Actual post-admission parent SDK-only evidence: Windows focused 333/333; bounded workspace
+2704 tests, 2700 pass, 0 fail, 4 skips; isolated Linux 248/248 without provider
 calls. The workspace command used nine historical authority exclusion patterns,
 not unrestricted `npm test`; skips are not passes or the complete exclusions.
 See the [exact evidence boundary](../verification/issue62-evidence.md#current-parent-observations).
@@ -25,15 +25,24 @@ all-platform qualification. A single separately authorized native Windows smoke
 passed with three exact `SMOKE_OK` responses in A-B-A order, existing
 `codex-eco` child-only override, heartbeat/three successful invoke terminals,
 exit 0 and ephemeral relay port free; no optional model query or wrapper retry.
+The smoke was not repeated after fixture/test-only changes; production SDK runtime/
+package/lock are unchanged. Current local runtime receipts are
+`artifacts/sdk-first-0.18.12-admission2-focused.json`,
+`artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
+`artifacts/sdk-first-0.18.12-admission2-wsl-final.json`.
 Same-profile continuity is not isolation or a fix for #247.
 Combined-worktree and historical results do not qualify this tree. Main native
 code was freshly built unchanged; native lifetime, ACL, publication,
 construction, and fixture repairs remain deferred. No private native fixture
 pass, SOURCEPATCH change, admission recovery, native/service/security/fault/
 OOM/noDump, production, release, support, installation, or deployment
-qualification is claimed. Independent review/PR/merge remain pending. Refreshed
-docs postdate the receipts and were not tested; local artifacts are unshipped
-evidence only, never authority or promotion grants.
+qualification is claimed. Both original P2s and owner-admission are verified and
+independently cleared in `artifacts/sdk-first-0.18.12-final-review.json`:
+static agent review APPROVE, zero P0/P1/P2, not independent runtime or
+CI/merge/deployment approval. Exact-head CI/landing is tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
+not yet committed/pushed, and CI/merge completion is not claimed. Local
+receipts alone do not approve landing; each run qualifies only its exact pins.
 See [current SDK status](../../README.md#local-quick-start).
 
 Upstream #6578 and direct repair #6700 remain open/unmerged and can affect

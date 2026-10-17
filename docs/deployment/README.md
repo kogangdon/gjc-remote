@@ -29,9 +29,9 @@ binding is not that repair. See the [current SDK boundary](daemon.md).
 
 ### Current SDK-only evidence
 
-Parent-run local receipts for this main-based SDK-only tree record Windows
-focused **318/318 passed**, zero skips, and bounded Windows workspace **2689
-tests: 2685 passed, 0 failed, 4 skipped**. Skips are not passes. The workspace
+Post-admission parent-run local receipts for this main-based SDK-only tree record Windows
+focused **333/333 passed**, zero skips, and bounded Windows workspace **2704
+tests: 2700 passed, 0 failed, 4 skipped**. Skips are not passes. The workspace
 used `--test-concurrency=4` and the explicit `--test-skip-pattern` below; its
 nine historical authority exclusions are not represented by just four skips:
 
@@ -39,7 +39,7 @@ nine historical authority exclusions are not represented by just four skips:
 inventory ACL verification atomically|Windows verified handle removal unlinks|Windows management-auth native ACL creation|verified native addon enforces retained-handle|POSIX principal access rejects|POSIX named ACL groups match|Win32 legacy no-replace creation|current management or system caller can reapply|opted-in Windows hosted runner provisions
 ```
 
-Actual isolated, credentialless Linux verification passed **233/233**, without
+Actual isolated, credentialless Linux verification passed **248/248**, without
 provider calls. One separately authorized native Windows provider smoke
 **passed**, using the existing `codex-eco` profile via a runtime-only child
 environment override: three exact `SMOKE_OK` responses in A-B-A order,
@@ -48,13 +48,23 @@ relay port free after exit. There was no optional model query, wrapper retry,
 or wrapper persistent profile write. This proves only same-profile basic
 continuity, not profile/tenant isolation or a proven #247 disconnect fix.
 Aggregate oracle success does not establish standalone SDK abort support.
+The single smoke was not repeated after fixture/test-only changes; production SDK
+runtime/package/lock are unchanged. Current receipts are
+`artifacts/sdk-first-0.18.12-admission2-focused.json`,
+`artifacts/sdk-first-0.18.12-admission2-workspace.json` and
+`artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; the smoke remains
+`artifacts/sdk-first-0.18.12-provider-smoke.json`.
 
 Main native code was freshly built unchanged; separate native lifetime, ACL,
 publication, construction, and fixture repairs remain deferred. No private
 native fixture or combined SDK/native result qualifies this tree. These local
-receipts are unshipped and grant no promotion authority. Independent review,
-PR, and merge remain pending; this documentation refresh has not been rerun
-through tests. Native/service/security/fault/OOM/noDump, signed deployment,
+receipts are unshipped and alone do not approve landing. Both original P2s and
+owner-admission are verified and independently cleared in
+`artifacts/sdk-first-0.18.12-final-review.json`: static agent review APPROVE,
+zero P0/P1/P2, not independent runtime or CI/merge/deployment approval.
+Exact-head CI/landing is tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
+the final follow-up is not yet committed/pushed, and CI/merge completion is not claimed;
+each run qualifies only its exact pins. Native/service/security/fault/OOM/noDump, signed deployment,
 installation, production, release, and support qualification remain excluded.
 
 No guide in this directory claims a completed live deployment. The repository

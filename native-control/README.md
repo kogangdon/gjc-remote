@@ -52,9 +52,9 @@ The current SDK-only main-based source pin is official unpatched 0.18.12.
 Only SDK contract version/integrity defaults and their expectations change in
 native-control; native lifetime/ACL/publication/construction/fixture repairs
 remain excluded and deferred. Main native code was freshly built unchanged.
-Parent-run SDK-only receipts record Windows focused **318/318 passed**, zero
-skips, bounded workspace **2689 tests: 2685 passed, 0 failed, 4 skipped**, and
-actual isolated credentialless Linux **233/233 passed** without provider calls.
+Post-admission parent-run SDK-only receipts record Windows focused **333/333 passed**, zero
+skips, bounded workspace **2704 tests: 2700 passed, 0 failed, 4 skipped**, and
+actual isolated credentialless Linux **248/248 passed** without provider calls.
 The workspace retains the [nine explicit historical authority exclusions](../docs/deployment/README.md#current-sdk-only-evidence);
 four reported skips do not represent those exclusions and are not passes.
 
@@ -67,10 +67,21 @@ proven #247 disconnect fix. Active daemon controls remain fail-closed and
 active cancellation remains nonterminal `cancellation_pending`; aggregate
 oracle success does not establish standalone SDK abort support. Workflow guard
 issues #6578/#6700 remain unresolved; #6763's approval binding is not that repair.
+The smoke was not repeated after fixture/test-only changes; production SDK runtime/
+package/lock are unchanged. Current local runtime receipts are
+`artifacts/sdk-first-0.18.12-admission2-focused.json`,
+`artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
+`artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; see the
+[SDK-only evidence record](../docs/deployment/README.md#current-sdk-only-evidence).
 
 No private native fixture or combined-worktree result qualifies this tree.
-Local receipts are unshipped, not promotion authority. Independent review,
-PR, and merge remain pending; refreshed docs have not been rerun through tests.
+Local receipts are unshipped and alone do not approve landing. Both original P2s and
+owner-admission are verified and independently cleared in
+`artifacts/sdk-first-0.18.12-final-review.json`: static agent review APPROVE,
+zero P0/P1/P2, not independent runtime or CI/merge/deployment approval.
+Exact-head CI/landing is tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
+the final follow-up is not yet committed/pushed, and CI/merge completion is not claimed;
+each run qualifies only its exact pins.
 Native/service/security/fault/OOM/noDump, signing, signed deployment,
 installation, release, support, and production qualification remain excluded.
 

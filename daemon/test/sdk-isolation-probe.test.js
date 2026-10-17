@@ -265,7 +265,7 @@ async function runGuardLifecycleProbe(scenario) {
           finally {
             guard.beginTeardown();
             disposals += 1;
-            try { await sdk.dispose(); }
+            try { await guard.trackTeardown("mock-dispose", () => sdk.dispose()); }
             catch (error) {
               if (!primary) primary = error;
               else primary.details = { cleanupErrors: [{ operation: "mock-dispose", code: error.code }] };
@@ -310,39 +310,152 @@ async function runPooledFailureProbe(scenario) {
       import { SessionPool } from ${JSON.stringify(pathToFileURL(join(daemonDir, "src/session-pool.js")).href)};
       const scenario = ${JSON.stringify(scenario)};
       const root = ${JSON.stringify(root)};
+      const retainedScenario = scenario.startsWith("retained-");
+      const creationScenario = scenario.startsWith("creation-");
+      const afterObservation = scenario === "creation-after-observation-withheld";
+      const pendingCleanupRejects = scenario.endsWith("pending-cleanup-rejected");
+      const fixtureTimeout = retainedScenario && scenario.includes("timeout");
+      const publicOwner = creationScenario || (retainedScenario && !scenario.includes("raw-timeout"));
+      const withhold = (retainedScenario || creationScenario) && scenario.endsWith("withheld");
+      const poolFailure = scenario.includes("pool-public");
       let restorationCount = 0, managerCloses = 0, disposals = 0, factories = 0, guardedCloses = 0;
+      let escapedCalls = 0, completionJoins = 0, completionSettled = false, restoredBeforeSettlement = false;
+      let adapterConstructions = 0, adapterDisposals = 0, startupCompleted = false, observationSettled = false;
+      let pendingCleanupStatus = "pending", beforeRetainedRelease, observationBeforeStartup;
+      const blockedAttempts = [], deadlineTimeouts = [], guardDeadlineSchedules = [];
+      const releaseFactory = Promise.withResolvers();
+      const factoryStarted = Promise.withResolvers();
+      const pendingCleanupObserved = Promise.withResolvers();
+      const releaseTeardown = Promise.withResolvers();
+      const disposalStarted = Promise.withResolvers();
+      const cleanupReached = Promise.withResolvers();
+      const completionJoined = Promise.withResolvers();
+      let retainedOwner;
+      const pendingTimers = [];
+      let timerScheduled = Promise.withResolvers();
+      const schedule = (callback, timeoutMs, source) => {
+        const timer = { callback, timeoutMs, source, active: true };
+        pendingTimers.push(timer);
+        timerScheduled.resolve();
+        timerScheduled = Promise.withResolvers();
+        return timer;
+      };
+      const timers = {
+        setTimeout(callback, timeoutMs) {
+          guardDeadlineSchedules.push(timeoutMs);
+          return schedule(callback, timeoutMs, "guard");
+        },
+        clearTimeout(timer) { timer.active = false; },
+      };
+      const waitForDeadline = async (timeoutMs, source, active = true) => {
+        for (;;) {
+          const timer = pendingTimers.find(timer => (!active || timer.active) &&
+            (timeoutMs === undefined || timer.timeoutMs === timeoutMs) &&
+            (source === undefined || timer.source === source));
+          if (timer) return timer;
+          await timerScheduled.promise;
+        }
+      };
+      const expireDeadline = timer => {
+        if (!timer.active) throw new Error("deadline was cleared before its owner settled");
+        timer.active = false;
+        deadlineTimeouts.push(timer.timeoutMs);
+        timer.callback();
+      };
+      const expireNextDeadline = async (timeoutMs, source) => expireDeadline(await waitForDeadline(timeoutMs, source));
+      const originalSetTimeout = globalThis.setTimeout, originalClearTimeout = globalThis.clearTimeout;
+      if (creationScenario) {
+        // Exercise the actual pool's deadlines without elapsed-time waits.
+        globalThis.setTimeout = (callback, timeoutMs, ...args) => schedule(() => callback(...args), timeoutMs, "pool");
+        globalThis.clearTimeout = timer => { timer.active = false; };
+      }
       const managerCloseCounts = [];
-      const original = () => { throw new Error("transport escaped"); };
+      const original = () => { escapedCalls += 1; throw new Error("transport escaped"); };
       original.preconnect = original;
       let installed = original;
       Object.defineProperty(globalThis, "fetch", { configurable: true, get: () => installed,
-        set: value => { installed = value; if (value === original) restorationCount += 1; } });
+        set: value => { installed = value; if (value === original) {
+          restorationCount += 1;
+          if ((retainedScenario || creationScenario) && !completionSettled) restoredBeforeSettlement = true;
+        } } });
+      const attemptTransport = phase => {
+        for (const kind of ["fetch", "preconnect"]) {
+          try {
+            if (kind === "fetch") globalThis.fetch("https://guard.invalid/API_KEY=q7M4vN9xC2pL8rK");
+            else globalThis.fetch.preconnect("https://guard.invalid/API_KEY=q7M4vN9xC2pL8rK");
+          } catch (error) { blockedAttempts.push({ ...(phase ? { phase } : {}), kind, code: error.code }); }
+        }
+      };
       const models = ["a", "b"].map(letter => ({ provider: "issue62-provider-" + letter, id: "issue62-model-" + letter }));
       const disposalMessage = scenario === "nested-pool-long-secret"
         ? 'distinctive disposal API_KEY="longQuotedPrefixZ9 ' + "x".repeat(2_100) + ' longQuotedSuffixY8" ' + root
         : "distinctive disposal API_KEY=q7M4vN9xC2pL8rK " + root;
       const distinctive = () => Object.assign(new Error(disposalMessage),
         { code: "DISTINCTIVE_DISPOSAL", cause: Object.assign(new Error("distinctive cause"), { code: "INNER_CAUSE" }) });
+      const factoryFailure = () => {
+        const primary = Object.assign(new Error("factory primary"), { code: "FACTORY_PRIMARY" });
+        if (!scenario.startsWith("factory-diagnostic-")) return primary;
+        primary.cause = Object.assign(new Error("factory cause API_KEY=q7M4vN9xC2pL8rK " + root), { code: "FACTORY_CAUSE" });
+        const startupCleanup = Object.assign(new AggregateError([distinctive()], "startup cleanup " + root),
+          { code: "STARTUP_CLEANUP_AGGREGATE" });
+        Object.defineProperty(primary, "cleanupDiagnostic", { enumerable: false, value: {
+          code: "MCP_MANAGER_CLEANUP_FAILED", cause: distinctive(),
+        } });
+        // Match the SDK's frozen-error AggregateError fallback, including the
+        // shared primary/cleanup references in cause, errors and attached fields.
+        const failure = scenario.endsWith("aggregate")
+          ? new AggregateError([Object.freeze(primary), startupCleanup], primary.message, { cause: primary })
+          : primary;
+        Object.defineProperty(failure, "startupCleanupDiagnostic", { enumerable: false, value: {
+          code: "STARTUP_RESOURCE_CLEANUP_FAILED", cause: startupCleanup,
+        } });
+        if (Object.keys(failure).includes("startupCleanupDiagnostic") || Object.keys(primary).includes("cleanupDiagnostic"))
+          throw new Error("diagnostic fields must be non-enumerable");
+        return failure;
+      };
       const dependencies = {
-        SessionPool,
-        SdkSession: class { constructor(raw) { this.raw = raw; } dispose() { return this.raw.dispose(); } },
+        SessionPool: creationScenario ? class extends SessionPool {
+          async ensureSession(workDir) {
+            try {
+              return await super.ensureSession(workDir,
+                pendingCleanupRejects ? { managedIdentity: "issue62-admission-root" } : undefined);
+            } catch (error) {
+              if (error.pendingCleanup) void error.pendingCleanup.then(
+                () => { pendingCleanupStatus = "fulfilled"; pendingCleanupObserved.resolve(); },
+                () => { pendingCleanupStatus = "rejected"; pendingCleanupObserved.resolve(); },
+              );
+              throw error;
+            }
+          }
+        } : SessionPool,
+        SdkSession: class {
+          constructor(raw) { adapterConstructions += 1; this.raw = raw; }
+          dispose() { adapterDisposals += 1; return this.raw.dispose(); }
+        },
         SessionManager: { create() { const index = managerCloseCounts.push(0) - 1; return { async close() {
           await Promise.resolve(); managerCloses += 1; guardedCloses += Number(installed !== original);
           managerCloseCounts[index] += 1;
           if (scenario === "manager-rejection") throw distinctive();
         } }; } },
         Settings: { get instance() { throw new Error("Settings not initialized"); } },
-        getAllProvidersInfo: () => [], getCapabilityInfo: () => ({}), closeModelCache: () => true,
+        getAllProvidersInfo: () => [], getCapabilityInfo: () => ({}),
+        closeModelCache: () => { cleanupReached.resolve(); return true; },
         async createAgentSession(options) {
           factories += 1;
-          if (scenario === "early" || scenario === "manager-rejection" || factories === 2)
-            throw Object.assign(new Error("factory primary"), { code: "FACTORY_PRIMARY" });
+          if (scenario === "early" || scenario === "manager-rejection" || scenario.startsWith("factory-diagnostic-") || factories === 2)
+            throw factoryFailure();
+          if (creationScenario) {
+            factoryStarted.resolve();
+            await releaseFactory.promise;
+            attemptTransport("startup");
+            startupCompleted = true;
+          }
           const order = models.map(model => model.provider);
           const values = { disabledProviders: [], enabledModels: models.map(model => model.provider + "/" + model.id),
             modelRoles: { default: "issue62-provider-a/issue62-model-a" },
             "task.agentModelOverrides": { planner: "issue62-provider-a/issue62-model-a" },
             modelProviderOrder: order, "startup.networkPrewarm": false };
-          const settings = { getCwd: () => scenario === "validation" ? "wrong-scope" : options.cwd,
+          const settings = { getCwd: () => scenario === "validation" || (retainedScenario && !poolFailure) ? "wrong-scope" : options.cwd,
             getAgentDir: () => options.agentDir, get: key => values[key], getGlobal: key => values[key],
             getModelRole: () => values.modelRoles.default, getStorage: () => null };
           const registry = { authStorage: { getAll: () => ({}) }, getAll: () => models,
@@ -353,19 +466,89 @@ async function runPooledFailureProbe(scenario) {
           const raw = { settings, modelRegistry: registry, model: models[0], isDisposed: false,
             async dispose() {
               raw.isDisposed = true; disposals += 1;
+              if (retainedScenario || creationScenario) {
+                retainedOwner = releaseTeardown.promise.then(async () => {
+                  attemptTransport(creationScenario ? "disposal" : undefined);
+                  await options.sessionManager.close();
+                  completionSettled = true;
+                  if (scenario.endsWith("completion-rejected")) throw distinctive();
+                });
+                void retainedOwner.catch(() => {});
+                disposalStarted.resolve();
+                if (fixtureTimeout) return retainedOwner;
+                throw Object.assign(new Error("Session disposal exceeded its bounded caller deadline."),
+                  { name: "SessionDisposalIncompleteError" });
+              }
               await options.sessionManager.close();
               throw new AggregateError([new AggregateError([distinctive()], "nested SDK cleanup")], "SDK cleanup");
             } };
+          if (publicOwner) raw.awaitDisposeCompletion = () => {
+            completionJoins += 1; completionJoined.resolve(); return retainedOwner;
+          };
           return { session: raw };
         },
       };
       let failure;
-      try { await observePooledFailureLifecycle(dependencies, {
+      const observation = observePooledFailureLifecycle(dependencies, {
         root, agentDir: root, modelsPath: root + "/models.json",
         workDirs: { A: root + "/A", B: root + "/B", C: root + "/C" },
-      }); } catch (error) { failure = { code: error.code, message: error.message, details: error.details }; }
+      }, retainedScenario || creationScenario ? timers : undefined).catch(error => {
+        failure = { code: error.code, message: error.message, details: error.details };
+      }).finally(() => { observationSettled = true; });
+      if (creationScenario) {
+        await factoryStarted.promise;
+        await expireNextDeadline(30_000, "pool");
+        await cleanupReached.promise;
+        const finalTimer = await waitForDeadline(5_000, "guard", false);
+        if (afterObservation) {
+          expireDeadline(finalTimer);
+          await observation;
+          observationBeforeStartup = { startupCompleted, adapterConstructions, managerCloses,
+            restorationCount, restored: installed === original };
+        }
+        releaseFactory.resolve();
+        await disposalStarted.promise;
+        await completionJoined.promise;
+        await pendingCleanupObserved.promise;
+        // Flush admitted promise reactions, not an elapsed cleanup delay.
+        await new Promise(resolve => setImmediate(resolve));
+        beforeRetainedRelease = { observationSettled, completionSettled, restorationCount,
+          finalTimerActive: finalTimer.active, pendingCleanupStatus,
+          guardDeadlineSchedules: [...guardDeadlineSchedules] };
+        if (withhold && !afterObservation) {
+          expireDeadline(finalTimer);
+          await observation;
+        }
+        releaseTeardown.resolve();
+        await retainedOwner.catch(() => {});
+        await observation;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      if (retainedScenario) {
+        await disposalStarted.promise;
+        if (fixtureTimeout) await expireNextDeadline();
+        else await completionJoined.promise;
+        await cleanupReached.promise;
+        if (withhold) {
+          await expireNextDeadline();
+          await observation;
+          // Attempt transport only AFTER the bounded observer has failed.
+          // A stage flag or rejected public promise cannot release the guard.
+          releaseTeardown.resolve();
+        } else releaseTeardown.resolve();
+        await retainedOwner.catch(() => {});
+        if (publicOwner) await completionJoined.promise;
+      }
+      await observation;
+      if (creationScenario) {
+        globalThis.setTimeout = originalSetTimeout;
+        globalThis.clearTimeout = originalClearTimeout;
+      }
       console.log(JSON.stringify({ schema: "issue62-sdk-isolation-probe-v1", failure,
-        managerCloses, managerCloseCounts, guardedCloses, disposals, factories, restorationCount, restored: installed === original }));
+        managerCloses, managerCloseCounts, guardedCloses, disposals, factories, restorationCount, restored: installed === original,
+        escapedCalls, completionJoins, completionSettled, restoredBeforeSettlement, blockedAttempts, deadlineTimeouts,
+        adapterConstructions, adapterDisposals, startupCompleted, beforeRetainedRelease, observationBeforeStartup,
+        pendingCleanupStatus, guardDeadlineSchedules }));
     `);
     // Distinct canonical directories are required by the actual factory router.
     for (const label of ["A", "B", "C"]) await mkdir(join(root, label));
@@ -374,7 +557,10 @@ async function runPooledFailureProbe(scenario) {
     assertNoDistinctiveSentinels(result.stdout, ["q7M4vN9xC2pL8rK", "longQuotedPrefixZ9", "longQuotedSuffixY8"]);
     const rawOutput = JSON.parse(result.stdout.trim());
     assertNoRawPaths(rawOutput.failure.details.cleanupErrors, envInfo.roots);
+    if (rawOutput.failure.details.originalDiagnostic) assertNoRawPaths(rawOutput.failure.details.originalDiagnostic, envInfo.roots);
+    if (scenario.startsWith("factory-diagnostic-")) assertNoRawPaths(rawOutput.failure, envInfo.roots);
     const output = sanitize(parseReceipt(result.stdout, envInfo.roots), envInfo.roots);
+    if (scenario.startsWith("retained-") || scenario.startsWith("creation-")) return output;
     assert.equal(output.restorationCount, 1);
     assert.equal(output.restored, true);
     const nestedPool = scenario === "nested-pool" || scenario === "nested-pool-long-secret";
@@ -382,7 +568,7 @@ async function runPooledFailureProbe(scenario) {
     assert.deepEqual(output.managerCloseCounts, nestedPool ? [1, 1] : [1]);
     assert.equal(output.factories, nestedPool ? 2 : 1);
     assert.equal(output.guardedCloses, output.managerCloses);
-    assert.equal(output.disposals, scenario === "early" || scenario === "manager-rejection" ? 0 : 1);
+    assert.equal(output.disposals, scenario === "early" || scenario === "manager-rejection" || scenario.startsWith("factory-diagnostic-") ? 0 : 1);
     assert.equal(output.failure.details.preconnectGuard.attempts, 0);
     assert.equal(output.failure.details.preconnectGuard.checkedAfterTrackedTeardown, true);
     return output.failure;
@@ -438,6 +624,194 @@ test("issue #62 deep pooled cleanup redacts complete long quoted secrets before 
   assert.ok(original.error.length <= 512);
   assert.equal(failure.details.cleanup.sessionDisposals[0].closed, false);
 });
+
+for (const scenario of [
+  "retained-public-rejection-settled",
+  "retained-pool-public-rejection-settled",
+  "retained-public-rejection-completion-rejected",
+  "retained-public-timeout-settled",
+  "retained-raw-timeout-settled",
+  "retained-public-rejection-withheld",
+  "retained-public-timeout-withheld",
+  "retained-raw-timeout-withheld",
+]) {
+  test(`issue #62 ${scenario} keeps late teardown transport intercepted`, async () => {
+    const output = await runPooledFailureProbe(scenario);
+    const withheld = scenario.endsWith("withheld");
+    const timeout = scenario.includes("timeout");
+    const poolFailure = scenario.includes("pool-public");
+    const publicOwner = !scenario.includes("raw-timeout");
+    const failure = output.failure;
+    assert.equal(failure.code, poolFailure ? "FACTORY_PRIMARY" : "API_CONTRACT_MISMATCH");
+    assert.equal(output.disposals, 1, "no disposal retry after rejection or deadline");
+    assert.equal(output.managerCloses, poolFailure ? 2 : 1);
+    assert.equal(output.guardedCloses, output.managerCloses);
+    assert.equal(output.escapedCalls, 0, "neither late fetch nor preconnect reaches original transport");
+    assert.deepEqual(output.blockedAttempts, [
+      { kind: "fetch", code: "ENVIRONMENT_BLOCKED" },
+      { kind: "preconnect", code: "ENVIRONMENT_BLOCKED" },
+    ]);
+    assert.equal(output.completionSettled, true, "test releases the real retained owner deterministically");
+    assert.equal(output.completionJoins, publicOwner ? 1 : 0);
+    assert.equal(output.restoredBeforeSettlement, false);
+    assert.equal(output.restorationCount, withheld ? 0 : 1);
+    assert.equal(output.restored, !withheld);
+    assert.deepEqual(output.deadlineTimeouts, Array(Number(timeout) + Number(withheld)).fill(5_000));
+    const guard = failure.details.preconnectGuard;
+    assert.equal(guard.completionConfirmed, !withheld);
+    assert.equal(guard.checkedAfterTrackedTeardown, !withheld, "a teardown stage alone cannot certify completion");
+    assert.equal(guard.restored, !withheld);
+    assert.equal(guard.restorationBoundary, withheld ? "withheld-until-child-termination" : "after-owner-settlement");
+    assert.equal(guard.attempts, withheld ? 0 : 2, "withheld case attempts transport after the failure receipt");
+    if (!withheld) assert.deepEqual(guard.events.map(({ kind, stage }) => ({ kind, stage })), [
+      { kind: "fetch", stage: "sdk-teardown" },
+      { kind: "preconnect", stage: "sdk-teardown" },
+    ]);
+    const owner = guard.teardownOwners.find(owner => owner.label === (poolFailure ? "pool-A" : "create-A"));
+    assert.equal(owner.retainedCompletion, publicOwner);
+    assert.equal(owner.publicStatus, timeout ? (withheld ? "pending" : "fulfilled") : "rejected");
+    assert.equal(owner.completionStatus, withheld ? "pending" : scenario.endsWith("completion-rejected") ? "rejected" : "fulfilled");
+    const disposalFailure = failure.details.cleanupErrors.find(error =>
+      error.operation === (poolFailure ? "pool-shutdown" : "create-A-dispose"));
+    assert.ok(disposalFailure, "original disposal failure survives the later settlement");
+    if (timeout) {
+      assert.equal(disposalFailure.code, "SESSION_LIFECYCLE_FAILURE");
+      assert.match(disposalFailure.error, /raw session disposal timed out/);
+      assert.equal(disposalFailure.details.timeoutMs, 5_000);
+    } else {
+      assert.match(JSON.stringify(disposalFailure), /"name":"SessionDisposalIncompleteError"/);
+      assert.match(JSON.stringify(disposalFailure), /Session disposal exceeded its bounded caller deadline\./);
+    }
+    if (scenario.endsWith("completion-rejected")) {
+      const retainedFailure = failure.details.cleanupErrors.find(error => error.operation === "create-A-retained-completion");
+      assert.equal(retainedFailure.code, "DISTINCTIVE_DISPOSAL");
+      assert.equal(retainedFailure.cause.code, "INNER_CAUSE");
+    }
+    assert.equal(failure.details.cleanup.sessionDisposals[0].closed, false,
+      "late completion cannot rewrite a failed public close into success");
+    assert.equal(failure.details.cleanup.sdkOwnedResourcesClosed, false);
+  });
+}
+
+for (const scenario of [
+  "creation-after-observation-withheld",
+  "creation-during-join-fulfilled",
+  "creation-during-join-completion-rejected",
+  "creation-during-join-withheld",
+  "creation-during-join-pending-cleanup-rejected",
+]) {
+  test(`issue #62 ${scenario} retains factory-driven teardown admission`, async () => {
+    const output = await runPooledFailureProbe(scenario);
+    const afterObservation = scenario === "creation-after-observation-withheld";
+    const withheld = scenario.endsWith("withheld");
+    const pendingCleanupRejects = scenario.endsWith("pending-cleanup-rejected");
+    const completionRejects = scenario.endsWith("completion-rejected");
+    const failure = output.failure;
+    assert.equal(failure.code, "SESSION_CREATE_TIMEOUT");
+    assert.equal(failure.message, "SESSION_CREATE_TIMEOUT: GJC SDK session creation timed out");
+    assert.equal(failure.details.originalDiagnostic.code, "SESSION_CREATE_TIMEOUT");
+    assert.equal(output.factories, 1);
+    assert.equal(output.adapterConstructions, 1, "late factory retains its injected adapter binding");
+    assert.equal(output.adapterDisposals, 1);
+    assert.equal(output.disposals, 1);
+    assert.equal(output.managerCloses, 1);
+    assert.deepEqual(output.managerCloseCounts, [1]);
+    assert.equal(output.guardedCloses, 1);
+    assert.equal(output.completionJoins, 1);
+    assert.equal(output.startupCompleted, true);
+    assert.equal(output.completionSettled, true);
+    assert.equal(output.escapedCalls, 0, "startup and disposal never reach original transport");
+    assert.deepEqual(output.blockedAttempts, ["startup", "disposal"].flatMap(phase =>
+      ["fetch", "preconnect"].map(kind => ({ phase, kind, code: "ENVIRONMENT_BLOCKED" }))));
+    assert.equal(output.restoredBeforeSettlement, false);
+    assert.equal(output.restorationCount, withheld ? 0 : 1, "withholding cannot be undone by late settlement");
+    assert.equal(output.restored, !withheld);
+    assert.deepEqual(output.deadlineTimeouts, withheld ? [30_000, 5_000] : [30_000]);
+    assert.deepEqual(output.guardDeadlineSchedules, [5_000], "one final budget, never restarted for another owner batch");
+    assert.deepEqual(output.beforeRetainedRelease, {
+      observationSettled: afterObservation,
+      completionSettled: false,
+      restorationCount: 0,
+      finalTimerActive: !afterObservation,
+      pendingCleanupStatus: pendingCleanupRejects ? "rejected" : "fulfilled",
+      guardDeadlineSchedules: [5_000],
+    }, "public pendingCleanup settlement cannot close admission ahead of retained raw teardown");
+    if (afterObservation) assert.deepEqual(output.observationBeforeStartup, {
+      startupCompleted: false, adapterConstructions: 0, managerCloses: 0,
+      restorationCount: 0, restored: false,
+    });
+    const guard = failure.details.preconnectGuard;
+    assert.equal(guard.completionConfirmed, !withheld);
+    assert.equal(guard.checkedAfterTrackedTeardown, !withheld);
+    assert.equal(guard.restored, !withheld);
+    assert.equal(guard.restorationBoundary, withheld ? "withheld-until-child-termination" : "after-owner-settlement");
+    assert.equal(guard.attempts, afterObservation ? 0 : withheld ? 2 : 4);
+    const root = guard.teardownOwners.find(owner => owner.label === "factory-pending-cleanup");
+    assert.ok(root, "retained factory/pendingCleanup root is registered before finalization");
+    assert.equal(root.retainedCompletion, false);
+    assert.equal(root.publicStatus, afterObservation ? "pending" : pendingCleanupRejects ? "rejected" : "fulfilled");
+    assert.equal(root.completionStatus, root.publicStatus);
+    const late = guard.teardownOwners.find(owner => owner.label === "pool-A");
+    if (afterObservation) assert.equal(late, undefined, "late disposal is admitted only after failure capture");
+    else {
+      assert.ok(late, "dynamic final drain includes the late adapter/raw owner");
+      assert.equal(late.publicStatus, "rejected");
+      assert.equal(late.retainedCompletion, true);
+      assert.equal(late.completionStatus, withheld ? "pending" : completionRejects ? "rejected" : "fulfilled");
+      const publicFailure = failure.details.cleanupErrors.find(error => error.operation === "pool-A-public-dispose");
+      assert.equal(publicFailure.name, "SessionDisposalIncompleteError");
+      assert.equal(publicFailure.error, "Session disposal exceeded its bounded caller deadline.");
+    }
+    if (completionRejects) {
+      const retainedFailure = failure.details.cleanupErrors.find(error => error.operation === "pool-A-retained-completion");
+      assert.equal(retainedFailure.code, "DISTINCTIVE_DISPOSAL");
+      assert.equal(retainedFailure.cause.code, "INNER_CAUSE");
+    }
+    if (pendingCleanupRejects) {
+      const cleanupFailure = failure.details.cleanupErrors.find(error => error.operation === "factory-pending-cleanup");
+      assert.equal(cleanupFailure.code, "SESSION_RETIREMENT_FAILED");
+    }
+    assert.equal(failure.details.cleanup.sdkOwnedResourcesClosed, false,
+      "late owner settlement does not rewrite the failed observation into successful cleanup");
+  });
+}
+
+for (const form of ["attached", "aggregate"]) {
+  test(`issue #62 factory ${form} diagnostics preserve non-enumerable SDK cleanup failures`, async () => {
+    const failure = await runPooledFailureProbe(`factory-diagnostic-${form}`);
+    assert.equal(failure.code, form === "attached" ? "FACTORY_PRIMARY" : "PROBE_FAILURE");
+    assert.equal(failure.message, `${failure.code}: factory primary`);
+    const original = failure.details.originalDiagnostic;
+    assert.equal(original.stage, "create-A");
+    const startup = original.startupCleanupDiagnostic;
+    assert.equal(startup.code, "STARTUP_RESOURCE_CLEANUP_FAILED");
+    assert.equal(startup.cause.name, "AggregateError");
+    assert.equal(startup.cause.code, "STARTUP_CLEANUP_AGGREGATE");
+    assert.equal(startup.cause.errors[0].code, "DISTINCTIVE_DISPOSAL");
+    assert.equal(startup.cause.errors[0].cause.code, "INNER_CAUSE");
+    const primary = form === "aggregate" ? original.cause : original;
+    assert.equal(primary.code, "FACTORY_PRIMARY");
+    assert.equal(primary.error, "factory primary");
+    assert.equal(primary.cause.code, "FACTORY_CAUSE");
+    assert.equal(primary.cleanupDiagnostic.code, "MCP_MANAGER_CLEANUP_FAILED");
+    assert.equal(primary.cleanupDiagnostic.cause.code, "DISTINCTIVE_DISPOSAL");
+    assert.equal(primary.cleanupDiagnostic.cause.cause.code, "INNER_CAUSE");
+    if (form === "aggregate") {
+      assert.equal(original.name, "AggregateError");
+      assert.equal(original.errors[0].code, "FACTORY_PRIMARY");
+      assert.equal(original.errors[1].code, "STARTUP_CLEANUP_AGGREGATE");
+      assert.equal(original.errors[1].errors[0].code, "DISTINCTIVE_DISPOSAL");
+      assert.equal(original.errors[0].cleanupDiagnostic.code, "MCP_MANAGER_CLEANUP_FAILED");
+    }
+    const serialized = JSON.stringify(original);
+    assert.ok(serialized.length < 12_000, "diagnostic remains bounded");
+    assertNoDistinctiveSentinels(serialized, ["q7M4vN9xC2pL8rK"]);
+    assertNoRawPaths(original);
+    assert.match(serialized, /<secret-redacted>/);
+    assert.match(serialized, /<(?:wrapper-root|fixture-root|path-redacted)>/);
+    assert.deepEqual(failure.details.cleanupErrors, []);
+  });
+}
 
 async function withImmediateRemovalProbe(run) {
   const { observeImmediateFixtureRemoval } = await import(pathToFileURL(fixture).href);
@@ -821,6 +1195,11 @@ async function validateReceipt(receipt, order, roots = []) {
   assert.equal(receipt.preconnectGuard.observed, false);
   assert.equal(receipt.preconnectGuard.checkedAfterTrackedTeardown, true);
   assert.equal(receipt.preconnectGuard.restored, true);
+  assert.equal(receipt.preconnectGuard.completionConfirmed, true);
+  assert.equal(receipt.preconnectGuard.restorationBoundary, "after-owner-settlement");
+  assert.deepEqual(receipt.preconnectGuard.teardownOwners.map(owner => owner.label).sort(), ["pool-A", "pool-B"]);
+  assert.ok(receipt.preconnectGuard.teardownOwners.every(owner =>
+    owner.publicStatus === "fulfilled" && owner.completionStatus === "fulfilled" && owner.retainedCompletion === true));
   assert.match(receipt.preconnectGuard.scope, /guarded SDK\/daemon imports through tracked resource teardown/);
   assert.match(receipt.preconnectGuard.scope, /excludes other network APIs, calls after restoration/);
   assert.equal(receipt.networkPrewarm.global, false);

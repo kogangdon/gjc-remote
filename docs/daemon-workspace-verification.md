@@ -75,15 +75,16 @@ approvals until their owners close the corresponding gates. TTL alone never auth
 
 ## Current SDK-only 0.18.12 evidence
 
-The parent verified the SDK-only source tree before this documentation refresh.
-The following local artifacts are unshipped evidence references, not authority
-or promotion grants, and do not establish that these refreshed docs were tested:
+The parent verified the SDK-only source tree after the fixture ownership,
+startup-cleanup diagnostic, source-redaction and owner-admission repairs, plus
+the FIFO-only mock-clock correction. Each run qualifies only
+its exact pins; the following local unshipped receipts alone do not approve landing:
 
 | Local receipt | Actual observed scope and result |
 | --- | --- |
-| `artifacts/sdk-first-0.18.12-focused.json` | Windows Node v26.7.0 focused tests: 318 tests, 318 pass, zero fail, zero skips, exit 0 |
-| `artifacts/sdk-first-0.18.12-workspace.json` | Bounded Windows Node v26.7.0 workspace run: 2689 tests, 2685 pass, zero fail, four skips, exit 0, under the nine explicit exclusions below |
-| `artifacts/sdk-first-0.18.12-wsl-final.json` | Actual isolated Linux credentialless run, Node v26.7.0/Bun 1.4.2: 233 tests, 233 pass, zero fail/skips, exit 0; no provider calls or native repair changes |
+| `artifacts/sdk-first-0.18.12-admission2-focused.json` | Windows Node v26.7.0 focused tests: 333 tests, 333 pass, zero fail, zero skips, exit 0 |
+| `artifacts/sdk-first-0.18.12-admission2-workspace.json` | Bounded Windows Node v26.7.0 workspace run: 2704 tests, 2700 pass, zero fail, four skips, exit 0, under the unchanged nine explicit exclusions below |
+| `artifacts/sdk-first-0.18.12-admission2-wsl-final.json` | Actual isolated Linux credentialless run, Node v26.7.0/Bun 1.4.2: 248 tests, 248 pass, zero fail/skips, exit 0; no provider calls or native repair changes |
 | `artifacts/sdk-first-0.18.12-provider-smoke.json` | One separately authorized native Windows provider smoke: PASS, existing `codex-eco` child-environment-only profile override, three exact `SMOKE_OK` responses in A-B-A order, heartbeat and three invoke-terminal assertions, exit 0, ephemeral relay port free afterward |
 
 The bounded workspace command used `--test-concurrency=4` and this explicit
@@ -101,19 +102,42 @@ deferred. No private native fixture counts or combined SDK/native results
 qualify this SDK-only tree.
 
 The single smoke ran no optional model query or wrapper retry and made no
-wrapper persistent-profile writes. It proves basic native Windows same-profile
+wrapper persistent-profile writes. It was not repeated after fixture/test-only
+changes; production SDK runtime/package/lock are unchanged. It proves basic native Windows same-profile
 A-B-A continuity only, not a fix for #247, generic disconnect recovery, or
 profile/tenant isolation. Active live controls remain fail-closed; active
 cancellation remains nonterminal `cancellation_pending`. Standalone abort
 support is not inferred. Upstream workflow guard issues #6578/#6700 remain
 unresolved; #6763 approval binding does not repair them.
 
-Independent review, PR, and merge remain pending. Existing phase promotion
+Historical passing pre-admission receipts retain their original counts:
+`artifacts/sdk-first-0.18.12-review-fix2-focused.json` (328/328),
+`artifacts/sdk-first-0.18.12-review-fix2-workspace.json` (2699 tests, 2695 pass,
+zero fail, four skips), and `artifacts/sdk-first-0.18.12-review-fix2-wsl-final.json`
+(243/243). They are not results for the later owner-admission/FIFO bytes.
+The first repair attempt's five sentinel failures remain in
+`artifacts/sdk-first-0.18.12-review-fix-focused.json` (328 tests, 323 pass, 5 fail)
+and `artifacts/sdk-first-0.18.12-review-fix-wsl-focused.stdout.log` (243 tests,
+238 pass, 5 fail). The source event-target
+redaction fix resolved them without weakening assertions; see the
+[repair boundaries and history](verification/issue62-evidence.md#repaired-failure-boundaries).
+The separate Windows 100 ms FIFO wall-clock flake remains in
+`artifacts/sdk-first-0.18.12-admission-focused.json` (333 tests, 332 pass, 1 fail).
+Only that deterministic gated ordering test uses Node mock `setTimeout`; actual
+timeout tests are unchanged. Subsequent admission2 focused 333/333 and actual
+Linux 248/248 passed. Both original P2s and owner-admission are verified and
+independently cleared in `artifacts/sdk-first-0.18.12-final-review.json`:
+static agent review APPROVE, zero P0/P1/P2, not independent runtime or
+CI/merge/deployment approval. That review did not observe the concurrent workspace
+result; the completed 2704/2700/0/4 result above comes from its own parent receipt.
+Exact-head CI/landing is tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is not
+yet committed/pushed, and CI/merge completion is not claimed. Existing phase promotion
 gates remain open: source tests and this basic provider smoke do not qualify
 Docker/images, release/provenance/security, native/service, fault/OOM/noDump,
-installation/deployment, or isolation. These receipts describe their own
-pre-refresh source snapshot; no implementation-only receipt digest is equated
-with the parent's verification digest or with refreshed documentation.
+installation/deployment, or isolation. These receipts describe their exact
+recorded pins; no implementation-only receipt digest is equated with the
+parent's verification digest or a future snapshot.
 
 ## Native inventory verification evidence (as-built)
 

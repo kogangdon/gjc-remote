@@ -1358,7 +1358,9 @@ test("idle controls serialize behind an in-flight model switch", async () => {
   await session.dispose();
 });
 
-test("multiple idle controls remain FIFO prompt runs", async () => {
+test("multiple idle controls remain FIFO prompt runs", async (t) => {
+  // FIFO is driven by explicit gates, not a 100 ms wall-clock scheduling race.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const agent = new FakeAgentSession();
   let releaseFirst;
   const firstGate = new Promise((resolve) => {

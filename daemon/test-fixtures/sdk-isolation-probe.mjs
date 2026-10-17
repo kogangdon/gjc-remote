@@ -800,7 +800,7 @@ function registerCapabilityFixture() {
   capabilityRegistered = true;
 }
 
-function armNetworkGuard() {
+function armNetworkGuard(timers) {
   const originalFetch = globalThis.fetch;
   const originalPreconnect = originalFetch?.preconnect;
   requireCondition(typeof originalFetch === "function" && typeof originalPreconnect === "function", "PRECONNECT_GUARD_UNAVAILABLE", "Bun fetch.preconnect is unavailable");
@@ -809,7 +809,7 @@ function armNetworkGuard() {
   const record = (kind, args) => {
     attempts += 1;
     if (events.length < 32) events.push({ kind, stage: currentStage,
-      target: typeof args[0] === "string" ? args[0] : "request" });
+      target: typeof args[0] === "string" ? redactedText(args[0], { root: "" }) : "request" });
   };
   const guardedFetch = (...args) => {
     record("fetch", args);
@@ -821,12 +821,91 @@ function armNetworkGuard() {
   };
   guardedFetch.preconnect = guardedPreconnect;
   globalThis.fetch = guardedFetch;
+  const owners = [];
+  let factoryCleanupRetained = false;
+  let completionConfirmed = false;
+  const waitBounded = async operation => {
+    let timer;
+    const timeout = new Promise(resolve => {
+      timer = timers.setTimeout(() => resolve({ status: "timed_out" }), RAW_SESSION_DISPOSE_TIMEOUT_MS);
+    });
+    try { return await Promise.race([operation, timeout]); }
+    finally { timers.clearTimeout(timer); }
+  };
   return {
     beginTeardown: () => { currentStage = "sdk-teardown"; },
+    waitBounded,
+    trackTeardown: (label, close, resource) => {
+      const owner = { label, publicStatus: "pending", completionStatus: "pending",
+        retainedCompletion: typeof resource?.awaitDisposeCompletion === "function" };
+      owners.push(owner);
+      // Keep the raw operation, not its deadline race. A rejected SDK public
+      // deadline is distinct from the retained awaitDisposeCompletion owner.
+      const operation = Promise.resolve().then(close);
+      owner.settlement = operation.then(
+        () => { owner.publicStatus = "fulfilled"; },
+        error => { owner.publicStatus = "rejected"; owner.publicError = error; },
+      ).then(async () => {
+        if (owner.retainedCompletion) {
+          try {
+            await resource.awaitDisposeCompletion();
+            owner.completionStatus = "fulfilled";
+          } catch (error) {
+            owner.completionStatus = "rejected";
+            owner.completionError = error;
+          }
+        } else {
+          owner.completionStatus = owner.publicStatus;
+        }
+      });
+      return operation;
+    },
+    retainFactoryCleanup: pendingCleanup => {
+      factoryCleanupRetained = true;
+      const owner = { label: "factory-pending-cleanup", publicStatus: "pending",
+        completionStatus: "pending", retainedCompletion: false };
+      owners.push(owner);
+      owner.settlement = Promise.resolve(pendingCleanup).then(
+        () => { owner.publicStatus = owner.completionStatus = "fulfilled"; },
+        error => {
+          owner.publicStatus = owner.completionStatus = "rejected";
+          owner.completionError = error;
+        },
+      );
+    },
+    settleTeardown: async () => {
+      // A retained factory root can admit late adapter/raw disposal owners.
+      // Drain those batches under ONE deadline, not a fresh budget per batch.
+      const drain = async () => {
+        let joined = 0;
+        while (joined < owners.length) {
+          const batch = owners.slice(joined);
+          joined += batch.length;
+          await Promise.all(batch.map(owner => owner.settlement));
+        }
+        return { status: "settled" };
+      };
+      const result = await waitBounded(drain());
+      completionConfirmed = result.status === "settled";
+      return owners.flatMap(owner => [
+        // Unmanaged late retirement can swallow its public disposal rejection.
+        ...(factoryCleanupRetained && Object.hasOwn(owner, "publicError") ? [{
+          operation: `${owner.label}-public-dispose`, ...cleanupDiagnostic(owner.publicError, { root: "" }),
+        }] : []),
+        ...(Object.hasOwn(owner, "completionError") ? [{
+          operation: owner.retainedCompletion ? `${owner.label}-retained-completion` : owner.label,
+          ...cleanupDiagnostic(owner.completionError, { root: "" }),
+        }] : []),
+      ]);
+    },
     evidence: () => ({
       available: true, events: [...events], attempts, observed: attempts > 0,
-      scope: "Intercepted Bun fetch/preconnect calls from guarded SDK/daemon imports through tracked resource teardown only; excludes other network APIs, calls after restoration and production startup.",
-      checkedAfterTrackedTeardown: currentStage === "sdk-teardown",
+      scope: "Intercepted Bun fetch/preconnect calls from guarded SDK/daemon imports through tracked resource teardown only; retained until actual owner settlement or child termination when unconfirmed; excludes other network APIs, calls after restoration and production startup.",
+      checkedAfterTrackedTeardown: currentStage === "sdk-teardown" && completionConfirmed,
+      completionConfirmed,
+      teardownOwners: owners.map(({ label, publicStatus, completionStatus, retainedCompletion }) =>
+        ({ label, publicStatus, completionStatus, retainedCompletion })),
+      restorationBoundary: completionConfirmed ? "after-owner-settlement" : "withheld-until-child-termination",
     }),
     verify: () => {
       requireCondition(globalThis.fetch === guardedFetch &&
@@ -836,7 +915,10 @@ function armNetworkGuard() {
       requireCondition(attempts === 0, "ENVIRONMENT_BLOCKED",
         "network or preconnect guard observed an unexpected call", { events, attempts });
     },
-    restore: () => { globalThis.fetch = originalFetch; },
+    restore: () => {
+      requireCondition(completionConfirmed, "SESSION_LIFECYCLE_FAILURE", "teardown completion is unconfirmed; interception must remain until child termination");
+      globalThis.fetch = originalFetch;
+    },
   };
 }
 
@@ -844,8 +926,8 @@ let currentStage = "preflight";
 
 // Fixture-only injection seam: tests load temporary modules and dispose mock
 // resources through the same owner used by main, without invoking a provider.
-export async function observeGuardedSdkLifecycle(loadSdk, runSessions) {
-  const guard = armNetworkGuard();
+export async function observeGuardedSdkLifecycle(loadSdk, runSessions, timers = { setTimeout, clearTimeout }) {
+  const guard = armNetworkGuard(timers);
   let receipt;
   let primary;
   let evidence;
@@ -857,12 +939,22 @@ export async function observeGuardedSdkLifecycle(loadSdk, runSessions) {
   } catch (error) {
     primary = error instanceof ProbeFailure ? error : new ProbeFailure(
       error?.code ?? "PROBE_FAILURE", error?.message ?? String(error),
-      { ...error?.details, originalName: error?.name ?? null });
+      { ...error?.details, originalName: error?.name ?? null,
+        originalDiagnostic: { stage: currentStage, ...cleanupDiagnostic(error, { root: "" }) } });
   } finally {
     try {
+      const completionErrors = await guard.settleTeardown();
+      if (completionErrors.length > 0) {
+        if (!primary) primary = new ProbeFailure("SESSION_LIFECYCLE_FAILURE", "retained teardown rejected");
+        primary.details = { ...primary.details,
+          cleanupErrors: [...(primary.details?.cleanupErrors ?? []), ...completionErrors] };
+      }
       // runSessions owns its finally cleanup. Even swallowed cleanup/import
       // attempts remain in the guard and must prevent a successful receipt.
       guard.verify();
+      requireCondition(guard.evidence().completionConfirmed, "SESSION_LIFECYCLE_FAILURE",
+        "tracked teardown completion exceeded its bounded wait; interception retained until child termination",
+        { timeoutMs: RAW_SESSION_DISPOSE_TIMEOUT_MS });
       if (!primary) requireCondition(currentStage === "sdk-teardown",
         "SESSION_LIFECYCLE_FAILURE", "guarded observation returned before tracked teardown");
     } catch (error) {
@@ -874,9 +966,12 @@ export async function observeGuardedSdkLifecycle(loadSdk, runSessions) {
       };
     } finally {
       evidence = guard.evidence();
+      evidence.restored = false;
       try {
-        guard.restore();
-        evidence.restored = true;
+        if (evidence.completionConfirmed) {
+          guard.restore();
+          evidence.restored = true;
+        }
       } catch (error) {
         evidence.restored = false;
         if (!primary) primary = error;
@@ -1021,37 +1116,40 @@ async function observeUnregisteredCwdCapability(fixture, order) {
 }
 function cleanupDiagnostic(error, fixture, depth = 0, seen = new Set(), budget = { remaining: 48 }) {
   if (depth >= 5 || budget.remaining-- <= 0 || seen.has(error)) return { truncated: true };
+  // Detect ancestor cycles without dropping shared SDK causes that also
+  // appear in AggregateError.errors or an attached cleanup diagnostic.
+  seen = new Set(seen);
   if (error && typeof error === "object") seen.add(error);
   const text = value => redactedText(String(value), fixture, fixture.root);
-  const diagnostic = { code: text(error?.code ?? "UNKNOWN"), error: text(error?.message ?? error) };
-  const detail = (value, level) => {
-    if (value instanceof Error) return cleanupDiagnostic(value, fixture, level, seen, budget);
-    if (level >= 5 || budget.remaining-- <= 0 || seen.has(value)) return { truncated: true };
+  const diagnostic = { code: text(error?.code ?? "UNKNOWN"), error: text(error?.message ?? error),
+    name: text(error?.name ?? "Error") };
+  const detail = (value, level, ancestors = seen) => {
+    if (value instanceof Error) return cleanupDiagnostic(value, fixture, level, ancestors, budget);
+    if (level >= 5 || budget.remaining-- <= 0 || ancestors.has(value)) return { truncated: true };
     if (typeof value === "string") return text(value);
     if (!value || typeof value !== "object") return value;
-    seen.add(value);
-    if (Array.isArray(value)) return value.slice(0, 8).map(item => detail(item, level + 1));
+    const next = new Set(ancestors).add(value);
+    if (Array.isArray(value)) return value.slice(0, 8).map(item => detail(item, level + 1, next));
     return Object.fromEntries(Object.entries(value).slice(0, 8)
       .filter(([key]) => !/(?:stack|api.?key|token|password|authorization|cookie|credential|secret|oauth|broker)/i.test(key))
-      .map(([key, item]) => [text(key), detail(item, level + 1)]));
+      .map(([key, item]) => [text(key), detail(item, level + 1, next)]));
   };
+  // The public factory attaches these with enumerable:false. Read them
+  // explicitly, before optional details consume the bounded diagnostic budget.
+  for (const field of ["startupCleanupDiagnostic", "cleanupDiagnostic"]) {
+    if (error?.[field] !== undefined) diagnostic[field] = cleanupDiagnostic(error[field], fixture, depth + 1, seen, budget);
+  }
   if (error?.cause !== undefined) diagnostic.cause = cleanupDiagnostic(error.cause, fixture, depth + 1, seen, budget);
   if (Array.isArray(error?.errors)) diagnostic.errors = error.errors.slice(0, 8).map(item => cleanupDiagnostic(item, fixture, depth + 1, seen, budget));
   if (error?.details !== undefined) diagnostic.details = detail(error.details, depth);
   return diagnostic;
 }
 
-async function disposeRawSessionBounded(rawSession, label, close = () => rawSession.dispose()) {
+async function disposeRawSessionBounded(rawSession, label, guard, close = () => rawSession.dispose()) {
   requireCondition(rawSession, "SESSION_LIFECYCLE_FAILURE", `${label} resource is missing`);
-  let timer;
-  const timeout = new Promise(resolve => {
-    timer = setTimeout(() => resolve({ status: "timed_out" }), RAW_SESSION_DISPOSE_TIMEOUT_MS);
-  });
-  const settled = Promise.resolve()
-    .then(close)
+  const settled = guard.trackTeardown(label, close, rawSession)
     .then(value => ({ status: "fulfilled", value }), reason => ({ status: "rejected", reason }));
-  const result = await Promise.race([settled, timeout]);
-  clearTimeout(timer);
+  const result = await guard.waitBounded(settled);
   if (result.status === "timed_out") {
     throw new ProbeFailure("SESSION_LIFECYCLE_FAILURE", `${label} raw session disposal timed out`, { timeoutMs: RAW_SESSION_DISPOSE_TIMEOUT_MS });
   }
@@ -1060,7 +1158,8 @@ async function disposeRawSessionBounded(rawSession, label, close = () => rawSess
   }
 }
 
-async function createPooledSession(fixture, workDir, label, registries, cAttempts) {
+async function createPooledSession(fixture, workDir, label, registries, cAttempts, guard, dependencies) {
+  const { SessionManager, createAgentSession, SdkSession } = dependencies;
   const record = {
     label,
     workDir,
@@ -1109,6 +1208,10 @@ async function createPooledSession(fixture, workDir, label, registries, cAttempt
     record.rawSession = created.session;
     record.managerOwnership = "AgentSession";
     record.sdkSession = new SdkSession(record.rawSession);
+    // SessionPool bounds the adapter's public dispose promise too. Retain
+    // both that in-flight call and the SDK's actual teardown completion owner.
+    const dispose = record.sdkSession.dispose.bind(record.sdkSession);
+    record.sdkSession.dispose = () => guard.trackTeardown(`pool-${label}`, dispose, record.rawSession);
     record.settings = record.rawSession.settings;
     record.modelRegistry = record.rawSession.modelRegistry;
     record.authEntryProviderCount = Object.keys(record.modelRegistry.authStorage.getAll()).length;
@@ -1139,7 +1242,7 @@ async function createPooledSession(fixture, workDir, label, registries, cAttempt
     if (record.rawSession) {
       record.rawDisposalAttempted = true;
       try {
-        await disposeRawSessionBounded(record.rawSession, `create-${label}`);
+        await disposeRawSessionBounded(record.rawSession, `create-${label}`, guard);
         record.rawDisposalCompleted = true;
       } catch (cleanupError) {
         error.details = { ...error.details,
@@ -1149,7 +1252,7 @@ async function createPooledSession(fixture, workDir, label, registries, cAttempt
       }
     } else if (record.sessionManager && record.managerOwnership === "caller") {
       try {
-        await disposeRawSessionBounded(record.sessionManager, `create-${label}-manager`, () => record.sessionManager.close());
+        await disposeRawSessionBounded(record.sessionManager, `create-${label}-manager`, guard, () => record.sessionManager.close());
         record.managerOwnership = "closed";
       } catch (cleanupError) {
         error.details = { ...error.details, cleanupErrors: [...(error.details?.cleanupErrors ?? []),
@@ -1181,14 +1284,14 @@ async function readSession(record, fixture) {
 
 // Hermetic fixture seam: exercise the actual factory and runOrder failure
 // paths without importing the SDK, configuring a host, or invoking providers.
-export async function observePooledFailureLifecycle(dependencies, fixture) {
+export async function observePooledFailureLifecycle(dependencies, fixture, timers) {
   const previous = { SessionPool, SdkSession, SessionManager, createAgentSession,
     Settings, closeModelCache, getAllProvidersInfo, getCapabilityInfo };
   try {
     ({ SessionPool, SdkSession, SessionManager, createAgentSession,
       Settings, closeModelCache, getAllProvidersInfo, getCapabilityInfo } = dependencies);
     return await observeGuardedSdkLifecycle(async () => {},
-      guard => runOrder(["A", "B"], fixture, {}, guard));
+      guard => runOrder(["A", "B"], fixture, {}, guard), timers);
   } finally {
     ({ SessionPool, SdkSession, SessionManager, createAgentSession,
       Settings, closeModelCache, getAllProvidersInfo, getCapabilityInfo } = previous);
@@ -1196,6 +1299,8 @@ export async function observePooledFailureLifecycle(dependencies, fixture) {
 }
 
 async function runOrder(order, fixture, provenance, guard) {
+  // A timed-out factory can resume after the injection seam restores globals.
+  const factoryDependencies = { SessionManager, createAgentSession, SdkSession };
   const cAttempts = { sessionConstructionAttempts: 0, promptAttempts: 0 };
   const registries = {};
   const canonicalFixtureWorkDirs = {
@@ -1240,7 +1345,7 @@ async function runOrder(order, fixture, provenance, guard) {
           },
         },
       );
-      return createPooledSession(fixture, workDir, label, registries, cAttempts);
+      return createPooledSession(fixture, workDir, label, registries, cAttempts, guard, factoryDependencies);
     },
     sessionCreateTimeoutMs: 30_000,
     sessionDisposeTimeoutMs: 5_000,
@@ -1252,6 +1357,7 @@ async function runOrder(order, fixture, provenance, guard) {
   registries.C = cResources;
   let receipt;
   let runError;
+  let runErrorStage;
   try {
     fixture.globalSettingsSingletonSeed = globalSettingsSingletonSnapshot();
     fixture.globalIntrospectionSeed = capabilityIntrospectionSnapshot();
@@ -1536,6 +1642,8 @@ async function runOrder(order, fixture, provenance, guard) {
     };
   } catch (error) {
     runError = error;
+    runErrorStage = currentStage;
+    if (error?.pendingCleanup) guard.retainFactoryCleanup(error.pendingCleanup);
   } finally {
     guard.beginTeardown();
     const cleanup = {
@@ -1577,7 +1685,7 @@ async function runOrder(order, fixture, provenance, guard) {
       if (!closed && !record.rawDisposalAttempted && !record.rawSession.isDisposed) {
         record.rawDisposalAttempted = true;
         try {
-          await disposeRawSessionBounded(record.rawSession, `cleanup-${label}`);
+          await disposeRawSessionBounded(record.rawSession, `cleanup-${label}`, guard);
           record.rawDisposalCompleted = true;
         } catch (error) {
           cleanupErrors.push({
@@ -1688,6 +1796,7 @@ async function runOrder(order, fixture, provenance, guard) {
         runError?.code ?? "PROBE_FAILURE",
         runError?.message ?? String(runError),
         { ...runError?.details, originalName: runError?.name ?? null, cleanup,
+          originalDiagnostic: { stage: runErrorStage, ...cleanupDiagnostic(runError, fixture) },
           cleanupErrors: [...(runError?.details?.cleanupErrors ?? []), ...cleanupErrors] },
       );
     } else if (cleanupErrors.length > 0 || !cleanup.poolShutdown || !cleanup.storesClosed || cleanup.leaks.length > 0) {

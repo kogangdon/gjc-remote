@@ -11,11 +11,11 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (official SDK 0.18.12; bounded parent evidence)
+## Architecture (official SDK 0.18.12; bounded source evidence)
 
 The daemon dependency and lockfile target official unpatched 0.18.12. Actual
-parent SDK-only evidence is Windows focused 318/318, bounded workspace 2689
-tests / 2685 pass / 0 fail / 4 skips, and isolated Linux 233/233 with no provider
+post-admission parent SDK-only evidence is Windows focused 333/333, bounded workspace 2704
+tests / 2700 pass / 0 fail / 4 skips, and isolated Linux 248/248 with no provider
 calls. The workspace run used nine explicit historical authority exclusion
 patterns, not unrestricted `npm test`; the four skips are not passes or a
 complete account of the exclusions. Exact patterns and local unshipped receipt
@@ -24,15 +24,31 @@ Canonical imports are covered by real SDK probes, not independent all-platform
 qualification. One separately authorized native Windows smoke passed: three
 exact `SMOKE_OK` responses A-B-A, existing `codex-eco` child-only override,
 heartbeat/three successful invoke terminals, exit 0, ephemeral relay port free,
-no optional model query or wrapper retry. Same-profile continuity is not
+no optional model query or wrapper retry. It was not repeated after fixture/test-only
+changes; production SDK runtime/package/lock are unchanged. Same-profile continuity is not
 isolation or a fix for #247. Combined-worktree and historical results do not
 qualify this tree. Main native code was freshly built unchanged; native
 lifetime, ACL, publication, construction, and fixture repairs are deferred.
 No private native fixture passes, SOURCEPATCH changes, admission recovery,
 native/service/security/fault/OOM/noDump, production, release, support,
-installation, or deployment qualification is claimed. Independent review,
-PR and merge remain pending. Refreshed docs postdate these receipts and were
-not tested; local artifacts confer no authority or promotion grant.
+installation, or deployment qualification is claimed. Independent static agent review
+`artifacts/sdk-first-0.18.12-final-review.json` is **APPROVE**, with zero P0/P1/P2,
+clearing both original P2s and owner-admission; it is not independent runtime or
+CI/merge/deployment approval. Exact-head CI/landing is tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
+not yet committed/pushed, and CI/merge completion is not claimed;
+local receipts alone do not approve landing. Each run qualifies only its exact pins.
+Current receipts are `artifacts/sdk-first-0.18.12-admission2-focused.json`,
+`artifacts/sdk-first-0.18.12-admission2-workspace.json` and
+`artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; the single smoke remains
+`artifacts/sdk-first-0.18.12-provider-smoke.json`. The fixture retains actual
+teardown/admission owners and official non-enumerable startup-cleanup diagnostics. The
+initial five sentinel failures remain recorded; source event-target redaction
+resolved them without weakening assertions, not by changing production code.
+The separate Windows FIFO 100 ms wall-clock flake remains in
+`artifacts/sdk-first-0.18.12-admission-focused.json` (333 tests / 332 pass / 1 fail).
+Only the gated FIFO ordering test uses Node mock `setTimeout`; actual timeout
+tests are unchanged. Subsequent admission2 focused 333/333 and Linux 248/248 passed.
 
 Published types expose `QueuedInputSubmission`, and
 `AgentSession.submitUserMessage()` provides tracked submission ownership.
@@ -515,7 +531,7 @@ Use these rules for Telegram delivery:
    `GJC_REMOTE_REQUIRE_ALLOWLIST=1`; local unrestricted mode remains available
    only for backward-compatible development and emits a startup warning.
 4. **Historical Linux provider run retained; current Linux credentialless
-   checks passed 233/233, not provider/deployment qualification. The macOS
+   checks passed 248/248, not provider/deployment qualification. The macOS
    daemon path remains unverified.** Built on native Windows (this repo's origin
    host). On 2026-07-25, a real local smoke passed on WSL2 Ubuntu 24.04 using
    the then-current Bun 1.3.14 (repo cloned to native ext4 `~/gjc-remote`,
