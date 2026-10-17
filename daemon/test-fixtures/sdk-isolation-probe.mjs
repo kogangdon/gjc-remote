@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
 /* Issue #62: real SDK/session-pool isolation probe. Bun-only; stdout is not an artifact. */
-import { chmod, lstat, readFile, readdir, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { SessionPool } from "../src/session-pool.js";
-import { SdkSession } from "../src/sdk-session.js";
 
+let SessionPool;
+let SdkSession;
 let closeModelCache;
 let createAgentSession;
 let Settings;
@@ -25,7 +25,7 @@ let registerProvider;
 
 const ISSUE = 62;
 const BASE_COMMIT = "a5bb530bd5a063b6571a7ba963e938bb6f97616f";
-const EXPECTED_SDK = "0.16.7";
+const EXPECTED_SDK = "0.18.12";
 const MIN_BUN = [1, 4, 0];
 const PROVIDER_A = "issue62-provider-a";
 const PROVIDER_B = "issue62-provider-b";
@@ -59,11 +59,8 @@ const UNKNOWN_CAPABILITY_MESSAGE = `Unknown capability: "${UNKNOWN_CAPABILITY_ID
 const RAW_SESSION_DISPOSE_TIMEOUT_MS = 5_000;
 const WORK_DIR_REALPATH_TIMEOUT_MS = 5_000;
 const FIXTURE_ROOT_PREFIX = "gjc-issue62-sdk-";
-const FIXTURE_REMOVAL_ATTEMPTS = 20;
-const FIXTURE_REMOVAL_RETRY_MS = 100;
+const WRAPPER_ROOT_PREFIX = "issue62-wrapper-";
 const FIXTURE_INVENTORY_LIMIT = 32;
-const FIXTURE_REMOVAL_RETRY_CODES = new Set(["EACCES", "EBUSY", "ENOTEMPTY", "EPERM"]);
-const initialProcessCwd = process.cwd();
 const childOwnedFixtureRoots = new Set();
 
 class ProbeFailure extends Error {
@@ -83,18 +80,27 @@ function requireCondition(value, code, message, details) {
   if (!value) fail(code, message, details);
 }
 
-async function loadProbeSdk() {
+async function loadProbeSdk(fixture) {
   process.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = "1";
-  const [ai, sdk, sessionManager, authStorage, modelRegistry, modelResolver, capability] = await Promise.all([
-    import("@gajae-code/ai/core"),
-    import("@gajae-code/coding-agent/sdk"),
-    import("@gajae-code/coding-agent/session/session-manager"),
-    import("@gajae-code/coding-agent/session/auth-storage"),
-    import("@gajae-code/coding-agent/config/model-registry"),
-    import("@gajae-code/coding-agent/config/model-resolver"),
-    import("@gajae-code/coding-agent/capability"),
-  ]);
-  closeModelCache = ai.closeModelCache;
+  // Settle each import before the next: an early rejection must not leave
+  // sibling import promises running after the owning guard is restored.
+  ({ closeModelCache } = await import("@gajae-code/ai/core"));
+  const { getAgentDbPath, getModelDbPath } = await import("@gajae-code/utils");
+  for (const agentDir of [undefined, fixture.agentDir]) {
+    requireCondition(
+      comparableWorkDir(getAgentDbPath(agentDir)) === comparableWorkDir(join(fixture.agentDir, "agent.db")) &&
+        comparableWorkDir(getModelDbPath(agentDir)) === comparableWorkDir(join(fixture.agentDir, "models.db")),
+      "CLEANUP_SCOPE_VIOLATION", "SDK auth/settings/model-cache paths must stay inside session scratch",
+    );
+  }
+  ({ SessionPool } = await import("../src/session-pool.js"));
+  ({ SdkSession } = await import("../src/sdk-session.js"));
+  const sdk = await import("@gajae-code/coding-agent/sdk");
+  const sessionManager = await import("@gajae-code/coding-agent/session/session-manager");
+  const authStorage = await import("@gajae-code/coding-agent/session/auth-storage");
+  const modelRegistry = await import("@gajae-code/coding-agent/config/model-registry");
+  const modelResolver = await import("@gajae-code/coding-agent/config/model-resolver");
+  const capability = await import("@gajae-code/coding-agent/capability");
   createAgentSession = sdk.createAgentSession;
   Settings = sdk.Settings;
   SessionManager = sessionManager.SessionManager;
@@ -381,6 +387,18 @@ async function assertSdkProvenance(sourceCommit, changeSetDigest) {
   const bunVersion = Bun.version;
   requireCondition(daemonPackage.dependencies?.["@gajae-code/coding-agent"] === EXPECTED_SDK, "SDK_VERSION_MISMATCH", `daemon dependency is not pinned to ${EXPECTED_SDK}`, { daemon: daemonPackage.dependencies?.["@gajae-code/coding-agent"] });
   requireCondition(installedPackage.version === EXPECTED_SDK && lockEvidence === EXPECTED_SDK, "SDK_VERSION_MISMATCH", `installed package or lockfile is not ${EXPECTED_SDK}`, { installed: installedPackage.version, lock: lockEvidence });
+  const sdkDependencyProvenance = [];
+  for (const name of ["agent-core", "ai"]) {
+    const packageName = `@gajae-code/${name}`;
+    const installed = JSON.parse(await readFile(join(repoRoot, "node_modules", "@gajae-code", name, "package.json"), "utf8"));
+    const lockedVersion = lock.match(new RegExp(`"@gajae-code/${name}": \\["@gajae-code/${name}@([^"\\s]+)"`))?.[1];
+    const declaredVersion = installedPackage.dependencies?.[packageName];
+    requireCondition(installed.version === EXPECTED_SDK && lockedVersion === EXPECTED_SDK &&
+      declaredVersion === EXPECTED_SDK, "SDK_VERSION_MISMATCH",
+    `${packageName} installed, declared and locked versions must match ${EXPECTED_SDK}`,
+    { installed: installed.version, lockedVersion, declaredVersion });
+    sdkDependencyProvenance.push({ packageName, installedVersion: installed.version, lockedVersion, declaredVersion });
+  }
   requireCondition(versionAtLeast(bunVersion, MIN_BUN), "SDK_VERSION_MISMATCH", "Bun is older than 1.4.0", { bunVersion });
   return {
     sdkPackage: "@gajae-code/coding-agent",
@@ -388,6 +406,7 @@ async function assertSdkProvenance(sourceCommit, changeSetDigest) {
     sdkVersionObserved: installedPackage.version,
     daemonDependencyVersion: daemonPackage.dependencies["@gajae-code/coding-agent"],
     lockfileVersionEvidence: lockEvidence,
+    sdkDependencyProvenance,
     bunVersion,
     nodeVersion: process.version,
     platform: { platform: process.platform, arch: process.arch },
@@ -411,11 +430,8 @@ function rejectHostEnvironment() {
 }
 
 async function prepareFixtureRoot(explicitRoot) {
-  if (explicitRoot === undefined) {
-    const root = resolve(await mkdtemp(join(tmpdir(), FIXTURE_ROOT_PREFIX)));
-    childOwnedFixtureRoots.add(root);
-    return { root, invocationRoot: root, cleanupOwner: "child" };
-  }
+  requireCondition(typeof explicitRoot === "string" && isAbsolute(explicitRoot),
+    "CLEANUP_SCOPE_VIOLATION", "an absolute wrapper-owned fixture root is required");
   const [canonicalRoot, canonicalTemp] = await Promise.all([
     realpath(explicitRoot),
     realpath(tmpdir()),
@@ -434,12 +450,94 @@ async function prepareFixtureRoot(explicitRoot) {
     "wrapper-owned fixture root must be empty before child setup",
     { entryCount: entries.length },
   );
-  return { root: canonicalRoot, invocationRoot: explicitRoot, cleanupOwner: "parent-wrapper" };
+  childOwnedFixtureRoots.add(canonicalRoot);
+  return { root: canonicalRoot, invocationRoot: explicitRoot };
 }
 
 function isPathWithin(root, candidate) {
   const relation = relative(resolve(root), resolve(candidate));
   return relation === "" || (!relation.startsWith(`..${sep}`) && relation !== ".." && !isAbsolute(relation));
+}
+
+// Read-only fixture seam, also used before any SDK import. XDG_DATA_HOME is
+// supported by the official natives loader only when its gjc child exists.
+export async function validateLauncherCacheRoot(fixtureRoot, env = process.env) {
+  for (const name of ["HOME", "USERPROFILE", "TEMP", "TMP", "XDG_DATA_HOME"]) {
+    requireCondition(typeof env[name] === "string" && isAbsolute(env[name]),
+      "CLEANUP_SCOPE_VIOLATION", `wrapper ${name} must be an absolute owned path`);
+  }
+  requireCondition(typeof fixtureRoot === "string" && isAbsolute(fixtureRoot),
+    "CLEANUP_SCOPE_VIOLATION", "session scratch must be an absolute wrapper-owned path");
+  const wrapperRoot = await realpath(env.HOME);
+  requireCondition(basename(wrapperRoot).startsWith(WRAPPER_ROOT_PREFIX),
+    "CLEANUP_SCOPE_VIOLATION", "native cache requires a disposable wrapper root");
+  const temp = join(wrapperRoot, "tmp");
+  const launcherRoot = join(wrapperRoot, "launcher");
+  const dataHome = join(launcherRoot, "data");
+  const nativesDir = join(dataHome, "gjc", "natives");
+  for (const [candidate, expected] of [
+    [env.HOME, wrapperRoot],
+    [env.USERPROFILE, wrapperRoot],
+    [env.TEMP, temp],
+    [env.TMP, temp],
+    [env.XDG_DATA_HOME, dataHome],
+  ]) {
+    requireCondition(comparableWorkDir(resolve(candidate)) === comparableWorkDir(expected),
+      "CLEANUP_SCOPE_VIOLATION", "wrapper environment escapes its exact owned layout");
+  }
+  for (const directory of [wrapperRoot, temp, launcherRoot, dataHome, join(dataHome, "gjc"), nativesDir]) {
+    const metadata = await lstat(directory);
+    requireCondition(metadata.isDirectory() && !metadata.isSymbolicLink() &&
+      comparableWorkDir(await realpath(directory)) === comparableWorkDir(directory),
+    "CLEANUP_SCOPE_VIOLATION", "launcher cache layout must contain only canonical owned directories");
+  }
+  const sessionRoot = await realpath(fixtureRoot);
+  const sessionMetadata = await lstat(fixtureRoot);
+  requireCondition(sessionMetadata.isDirectory() && !sessionMetadata.isSymbolicLink() &&
+    comparableWorkDir(resolve(fixtureRoot)) === comparableWorkDir(sessionRoot) &&
+    comparableWorkDir(dirname(sessionRoot)) === comparableWorkDir(temp) &&
+    basename(sessionRoot).startsWith(FIXTURE_ROOT_PREFIX) &&
+    !isPathWithin(sessionRoot, launcherRoot) && !isPathWithin(launcherRoot, sessionRoot),
+  "CLEANUP_SCOPE_VIOLATION", "session scratch and launcher cache must be separate wrapper-owned roots");
+  const cache = { wrapperRoot, launcherRoot, dataHome, nativesDir };
+  await validateLauncherCacheContents(cache);
+  return cache;
+}
+
+async function validateLauncherCacheContents({ launcherRoot, dataHome }) {
+  for (const [directory, onlyChild] of [
+    [launcherRoot, "data"],
+    [dataHome, "gjc"],
+    [join(dataHome, "gjc"), "natives"],
+  ]) {
+    const entries = await readdir(directory);
+    requireCondition(entries.length === 1 && entries[0] === onlyChild,
+      "CLEANUP_SCOPE_VIOLATION", "session resources must not escape into the launcher cache");
+  }
+}
+
+async function observeNativeCacheLifetime(fixture) {
+  const { nativesDir } = fixture.nativeCache;
+  await validateLauncherCacheContents(fixture.nativeCache);
+  const versionedDir = join(nativesDir, EXPECTED_SDK);
+  const stagedEntries = existsSync(versionedDir) ? await readdir(versionedDir) : [];
+  const stagedAddonPresent = stagedEntries.some(entry => entry.endsWith(".node"));
+  requireCondition(process.platform !== "win32" || stagedAddonPresent,
+    "SESSION_LIFECYCLE_FAILURE", "Windows native staging did not use the owned launcher cache");
+  return {
+    owner: "wrapper",
+    scope: "launcher-cache-only",
+    lifetime: "child-process",
+    configuration: "XDG_DATA_HOME/gjc/natives",
+    configuredBeforeSdkImport: true,
+    insideWrapperRoot: true,
+    outsideSessionScratch: true,
+    presentAfterSessionRemoval: existsSync(nativesDir),
+    stagedAddonPresent,
+    childRemovalAttempted: false,
+    cleanupBoundary: "parent-after-child-exit",
+    immediateSessionCloseProof: false,
+  };
 }
 
 function activeResourceSnapshot() {
@@ -517,62 +615,20 @@ async function fixtureTreeSnapshot(root) {
   return snapshot;
 }
 
-async function makeFixtureTreeWritable(root) {
-  const outcome = { attempted: true, changed: 0, symlinksSkipped: 0, errors: [] };
-  const visit = async current => {
-    if (!isPathWithin(root, current)) {
-      outcome.errors.push({ entry: "<outside-fixture>", code: "CLEANUP_SCOPE_VIOLATION" });
-      return;
-    }
-    let metadata;
-    try {
-      metadata = await lstat(current);
-    } catch (error) {
-      if (error?.code !== "ENOENT" && outcome.errors.length < FIXTURE_INVENTORY_LIMIT) {
-        outcome.errors.push({ entry: relative(root, current) || ".", code: error?.code ?? "UNKNOWN" });
-      }
-      return;
-    }
-    if (metadata.isSymbolicLink()) {
-      outcome.symlinksSkipped += 1;
-      return;
-    }
-    const entry = relative(root, current) || ".";
-    try {
-      await chmod(current, metadata.isDirectory() ? 0o700 : 0o600);
-      outcome.changed += 1;
-    } catch (error) {
-      if (outcome.errors.length < FIXTURE_INVENTORY_LIMIT) {
-        outcome.errors.push({ entry, code: error?.code ?? "UNKNOWN" });
-      }
-    }
-    if (!metadata.isDirectory()) return;
-    let children;
-    try {
-      children = await readdir(current);
-    } catch (error) {
-      if (outcome.errors.length < FIXTURE_INVENTORY_LIMIT) {
-        outcome.errors.push({ entry, code: error?.code ?? "UNKNOWN" });
-      }
-      return;
-    }
-    for (const child of children) await visit(join(current, child));
-  };
-  await visit(root);
-  return outcome;
-}
-
 async function createHermeticFixture(explicitRoot) {
-  const { root, invocationRoot, cleanupOwner } = await prepareFixtureRoot(explicitRoot);
+  const nativeCache = await validateLauncherCacheRoot(explicitRoot);
+  const { root, invocationRoot } = await prepareFixtureRoot(explicitRoot);
   setupRoot = root;
-  setupCleanupOwner = cleanupOwner;
   const home = join(root, "home");
-  const agentDir = join(home, ".gjc", "agent");
+  // A non-default agentDir prevents the SDK's POSIX XDG data lane from
+  // relocating session SQLite stores into the process-lifetime native cache.
+  const agentDir = join(root, "agent");
   const workDirs = { A: join(root, "work-A"), B: join(root, "work-B"), C: join(root, "work-C") };
   const markerA = join(root, "marker-A.txt");
   const markerB = join(root, "marker-B.txt");
   const markerC = join(root, "marker-C.txt");
   await mkdir(agentDir, { recursive: true });
+  await mkdir(home, { recursive: true });
   await mkdir(join(root, "tmp"), { recursive: true });
   await Promise.all(Object.values(workDirs).map(dir => mkdir(join(dir, ".gjc"), { recursive: true })));
   await writeFile(markerA, "issue62 capability marker A\n");
@@ -582,6 +638,9 @@ async function createHermeticFixture(explicitRoot) {
   process.env.USERPROFILE = home;
   process.env.TEMP = join(root, "tmp");
   process.env.TMP = join(root, "tmp");
+  process.env.LOCALAPPDATA = join(home, "AppData", "Local");
+  process.env.APPDATA = join(home, "AppData", "Roaming");
+  process.env.GJC_CODING_AGENT_DIR = agentDir;
   const globalConfig = `configSchemaVersion: 2\nstartup:\n  networkPrewarm: false\ndisabledProviders:\n${BACKGROUND_DISCOVERY_PROVIDERS.map(item => `  - ${item}`).join("\n")}\nenabledModels:\n  - ${MODEL_A}\n  - ${MODEL_B}\nmodelRoles:\n  default: ${MODEL_A}\ntask:\n  agentModelOverrides:\n    planner: ${MODEL_A}\nmodelProviderOrder:\n  - ${PROVIDER_A}\n  - ${PROVIDER_B}\n`;
   await writeFile(join(agentDir, "config.yml"), globalConfig);
   const policies = {
@@ -613,11 +672,10 @@ async function createHermeticFixture(explicitRoot) {
   const modelsConfig = `providers:\n  ${PROVIDER_A}:\n    baseUrl: http://127.0.0.1:1/issue62-a\n    api: anthropic-messages\n    auth: none\n    models:\n      - id: issue62-model-a\n        name: Issue62 fixture model A\n        contextWindow: 4096\n        maxTokens: 512\n        input: [text]\n        output: [text]\n        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}\n  ${PROVIDER_B}:\n    baseUrl: http://127.0.0.1:1/issue62-b\n    api: anthropic-messages\n    auth: none\n    models:\n      - id: issue62-model-b\n        name: Issue62 fixture model B\n        contextWindow: 4096\n        maxTokens: 512\n        input: [text]\n        output: [text]\n        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}\nequivalence:\n  overrides:\n    ${MODEL_A}: ${CANONICAL}\n    ${MODEL_B}: ${CANONICAL}\n`;
   await writeFile(modelsPath, modelsConfig);
   setupRoot = undefined;
-  setupCleanupOwner = undefined;
   return {
     root,
     invocationRoot,
-    cleanupOwner,
+    nativeCache,
     home,
     agentDir,
     workDirs,
@@ -629,12 +687,12 @@ async function createHermeticFixture(explicitRoot) {
     authDir: join(root, "auth"),
   };
 }
-async function removeFixtureRoot(root) {
+async function removeFixtureRoot(root, remove = rm) {
   root = resolve(root);
   requireCondition(
     childOwnedFixtureRoots.has(root),
     "CLEANUP_SCOPE_VIOLATION",
-    "child refused to remove a root it did not create",
+    "child refused to remove a root it did not create or validate for wrapper-authorized cleanup",
   );
   const cwdBefore = process.cwd();
   const fixtureRemoval = {
@@ -643,117 +701,59 @@ async function removeFixtureRoot(root) {
     attempted: true,
     removed: false,
     attempts: 0,
+    immediateAfterPublicClose: true,
+    beforeChildExit: true,
     cwd: {
       insideFixtureBefore: isPathWithin(root, cwdBefore),
-      restoredToLaunchDirectory: false,
     },
     activeResourcesBefore: activeResourceSnapshot(),
     firstFailure: null,
-    writableRepair: null,
     finalInventory: null,
   };
   if (fixtureRemoval.cwd.insideFixtureBefore) {
-    requireCondition(
-      !isPathWithin(root, initialProcessCwd) && existsSync(initialProcessCwd),
+    fail(
       "SESSION_LIFECYCLE_FAILURE",
-      "process cwd remained inside the fixture and the launch directory was unavailable",
+      "SDK lifecycle left process cwd inside the fixture root",
       { fixtureRemoval },
     );
-    try {
-      process.chdir(initialProcessCwd);
-      fixtureRemoval.cwd.restoredToLaunchDirectory = true;
-    } catch (error) {
-      fixtureRemoval.cwd.restoreError = {
-        code: error?.code ?? "UNKNOWN",
-        syscall: error?.syscall ?? null,
-      };
-      throw new ProbeFailure(
-        "SESSION_LIFECYCLE_FAILURE",
-        "process cwd remained inside the fixture and could not be restored",
-        { fixtureRemoval },
-      );
-    }
   }
-  let lastError;
-  for (let attempt = 1; attempt <= FIXTURE_REMOVAL_ATTEMPTS; attempt += 1) {
-    fixtureRemoval.attempts = attempt;
-    try {
-      await rm(root, { recursive: true, force: true });
-      fixtureRemoval.removed = !existsSync(root);
-      requireCondition(
-        fixtureRemoval.removed,
-        "SESSION_LIFECYCLE_FAILURE",
-        "fixture root still existed after rm resolved",
-        { fixtureRemoval },
-      );
-      fixtureRemoval.classification = fixtureRemoval.cwd.insideFixtureBefore
-        ? "process-cwd-restored"
-        : fixtureRemoval.firstFailure?.inventory?.nonWritableEntries > 0
-          ? "readonly-remediated"
-          : fixtureRemoval.firstFailure
-            ? "transient-unattributed-removal-block"
-            : "removed-first-attempt";
-      fixtureRemoval.activeResourcesAfter = activeResourceSnapshot();
-      childOwnedFixtureRoots.delete(root);
-      return fixtureRemoval;
-    } catch (error) {
-      lastError = error;
-      if (fixtureRemoval.firstFailure === null) {
-        fixtureRemoval.firstFailure = {
-          attempt,
-          code: error?.code ?? "UNKNOWN",
-          syscall: error?.syscall ?? null,
-          inventory: await fixtureTreeSnapshot(root),
-        };
-        fixtureRemoval.writableRepair = await makeFixtureTreeWritable(root);
-      }
-      if (!FIXTURE_REMOVAL_RETRY_CODES.has(error?.code)) {
-        fixtureRemoval.finalInventory = await fixtureTreeSnapshot(root);
-        fixtureRemoval.classification = fixtureRemoval.cwd.insideFixtureBefore
-          ? "process-cwd-observed"
-          : fixtureRemoval.firstFailure?.inventory?.nonWritableEntries > 0
-            ? "readonly-remediation-insufficient"
-            : "unattributed-no-cwd-or-mode-cause";
-        throw new ProbeFailure(
-          "SESSION_LIFECYCLE_FAILURE",
-          "fixture root removal failed",
-          {
-            fixtureRemoval,
-            removalError: {
-              code: error?.code ?? "UNKNOWN",
-              syscall: error?.syscall ?? null,
-            },
-          },
-        );
-      }
-      await Bun.sleep(FIXTURE_REMOVAL_RETRY_MS);
-    }
+  try {
+    fixtureRemoval.attempts = 1;
+    await remove(root, { recursive: true, force: false, maxRetries: 0 });
+    fixtureRemoval.removed = !existsSync(root);
+    requireCondition(fixtureRemoval.removed, "SESSION_LIFECYCLE_FAILURE",
+      "fixture root still existed after rm resolved", { fixtureRemoval });
+    fixtureRemoval.classification = "removed-first-attempt";
+    fixtureRemoval.activeResourcesAfter = activeResourceSnapshot();
+    childOwnedFixtureRoots.delete(root);
+    return fixtureRemoval;
+  } catch (error) {
+    fixtureRemoval.firstFailure = {
+      attempt: 1,
+      code: error?.code ?? "UNKNOWN",
+      syscall: error?.syscall ?? null,
+      ...cleanupDiagnostic(error, { root }),
+      inventory: await fixtureTreeSnapshot(root),
+    };
+    fixtureRemoval.finalInventory = fixtureRemoval.firstFailure.inventory;
+    fixtureRemoval.classification = "immediate-removal-failed";
+    fixtureRemoval.activeResourcesAfter = activeResourceSnapshot();
+    throw new ProbeFailure("SESSION_LIFECYCLE_FAILURE",
+      "fixture root was not removable immediately after public close", { fixtureRemoval });
   }
-  fixtureRemoval.finalInventory = await fixtureTreeSnapshot(root);
-  fixtureRemoval.classification = fixtureRemoval.cwd.insideFixtureBefore
-    ? "process-cwd-observed"
-    : fixtureRemoval.firstFailure?.inventory?.nonWritableEntries > 0
-      ? "readonly-remediation-insufficient"
-      : "unattributed-no-cwd-or-mode-cause";
-  fixtureRemoval.activeResourcesAfter = activeResourceSnapshot();
-  throw new ProbeFailure(
-    "SESSION_LIFECYCLE_FAILURE",
-    "fixture root remained after bounded removal",
-    {
-      fixtureRemoval,
-      removalError: {
-        code: lastError?.code ?? "UNKNOWN",
-        syscall: lastError?.syscall ?? null,
-      },
-    },
-  );
+}
+
+// Exercise the same ownership validation and immediate-removal path without SDK imports.
+export async function observeImmediateFixtureRemoval(root, closeResources, remove = rm) {
+  const owned = await prepareFixtureRoot(root);
+  await closeResources(owned.root);
+  return removeFixtureRoot(owned.root, remove);
 }
 
 const counters = { [CAP_A]: 0, [CAP_B]: 0, [CAP_THROW]: 0 };
 const capabilityInvocations = [];
 let capabilityFixture;
 let setupRoot;
-let setupCleanupOwner;
 let capabilityRegistered = false;
 
 function registerCapabilityFixture() {
@@ -800,24 +800,199 @@ function registerCapabilityFixture() {
   capabilityRegistered = true;
 }
 
-function armNetworkGuard() {
+function armNetworkGuard(timers) {
   const originalFetch = globalThis.fetch;
   const originalPreconnect = originalFetch?.preconnect;
   requireCondition(typeof originalFetch === "function" && typeof originalPreconnect === "function", "PRECONNECT_GUARD_UNAVAILABLE", "Bun fetch.preconnect is unavailable");
   const events = [];
+  let attempts = 0;
+  const record = (kind, args) => {
+    attempts += 1;
+    if (events.length < 32) events.push({ kind, stage: currentStage,
+      target: typeof args[0] === "string" ? redactedText(args[0], { root: "" }) : "request" });
+  };
   const guardedFetch = (...args) => {
-    events.push({ kind: "fetch", stage: currentStage, target: typeof args[0] === "string" ? args[0] : "request" });
+    record("fetch", args);
     throw new ProbeFailure("ENVIRONMENT_BLOCKED", "unexpected network fetch");
   };
-  guardedFetch.preconnect = (...args) => {
-    events.push({ kind: "preconnect", stage: currentStage, target: typeof args[0] === "string" ? args[0] : "request" });
+  const guardedPreconnect = (...args) => {
+    record("preconnect", args);
     throw new ProbeFailure("ENVIRONMENT_BLOCKED", "unexpected fetch.preconnect");
   };
+  guardedFetch.preconnect = guardedPreconnect;
   globalThis.fetch = guardedFetch;
-  return { originalFetch, originalPreconnect, events, restore: () => { globalThis.fetch = originalFetch; } };
+  const owners = [];
+  let factoryCleanupRetained = false;
+  let completionConfirmed = false;
+  const waitBounded = async operation => {
+    let timer;
+    const timeout = new Promise(resolve => {
+      timer = timers.setTimeout(() => resolve({ status: "timed_out" }), RAW_SESSION_DISPOSE_TIMEOUT_MS);
+    });
+    try { return await Promise.race([operation, timeout]); }
+    finally { timers.clearTimeout(timer); }
+  };
+  return {
+    beginTeardown: () => { currentStage = "sdk-teardown"; },
+    waitBounded,
+    trackTeardown: (label, close, resource) => {
+      const owner = { label, publicStatus: "pending", completionStatus: "pending",
+        retainedCompletion: typeof resource?.awaitDisposeCompletion === "function" };
+      owners.push(owner);
+      // Keep the raw operation, not its deadline race. A rejected SDK public
+      // deadline is distinct from the retained awaitDisposeCompletion owner.
+      const operation = Promise.resolve().then(close);
+      owner.settlement = operation.then(
+        () => { owner.publicStatus = "fulfilled"; },
+        error => { owner.publicStatus = "rejected"; owner.publicError = error; },
+      ).then(async () => {
+        if (owner.retainedCompletion) {
+          try {
+            await resource.awaitDisposeCompletion();
+            owner.completionStatus = "fulfilled";
+          } catch (error) {
+            owner.completionStatus = "rejected";
+            owner.completionError = error;
+          }
+        } else {
+          owner.completionStatus = owner.publicStatus;
+        }
+      });
+      return operation;
+    },
+    retainFactoryCleanup: pendingCleanup => {
+      factoryCleanupRetained = true;
+      const owner = { label: "factory-pending-cleanup", publicStatus: "pending",
+        completionStatus: "pending", retainedCompletion: false };
+      owners.push(owner);
+      owner.settlement = Promise.resolve(pendingCleanup).then(
+        () => { owner.publicStatus = owner.completionStatus = "fulfilled"; },
+        error => {
+          owner.publicStatus = owner.completionStatus = "rejected";
+          owner.completionError = error;
+        },
+      );
+    },
+    settleTeardown: async () => {
+      // A retained factory root can admit late adapter/raw disposal owners.
+      // Drain those batches under ONE deadline, not a fresh budget per batch.
+      const drain = async () => {
+        let joined = 0;
+        while (joined < owners.length) {
+          const batch = owners.slice(joined);
+          joined += batch.length;
+          await Promise.all(batch.map(owner => owner.settlement));
+        }
+        return { status: "settled" };
+      };
+      const result = await waitBounded(drain());
+      completionConfirmed = result.status === "settled";
+      return owners.flatMap(owner => [
+        // Unmanaged late retirement can swallow its public disposal rejection.
+        ...(factoryCleanupRetained && Object.hasOwn(owner, "publicError") ? [{
+          operation: `${owner.label}-public-dispose`, ...cleanupDiagnostic(owner.publicError, { root: "" }),
+        }] : []),
+        ...(Object.hasOwn(owner, "completionError") ? [{
+          operation: owner.retainedCompletion ? `${owner.label}-retained-completion` : owner.label,
+          ...cleanupDiagnostic(owner.completionError, { root: "" }),
+        }] : []),
+      ]);
+    },
+    evidence: () => ({
+      available: true, events: [...events], attempts, observed: attempts > 0,
+      scope: "Intercepted Bun fetch/preconnect calls from guarded SDK/daemon imports through tracked resource teardown only; retained until actual owner settlement or child termination when unconfirmed; excludes other network APIs, calls after restoration and production startup.",
+      checkedAfterTrackedTeardown: currentStage === "sdk-teardown" && completionConfirmed,
+      completionConfirmed,
+      teardownOwners: owners.map(({ label, publicStatus, completionStatus, retainedCompletion }) =>
+        ({ label, publicStatus, completionStatus, retainedCompletion })),
+      restorationBoundary: completionConfirmed ? "after-owner-settlement" : "withheld-until-child-termination",
+    }),
+    verify: () => {
+      requireCondition(globalThis.fetch === guardedFetch &&
+        guardedFetch.preconnect === guardedPreconnect &&
+        originalFetch.preconnect === originalPreconnect,
+      "ENVIRONMENT_BLOCKED", "network guard was replaced during observation");
+      requireCondition(attempts === 0, "ENVIRONMENT_BLOCKED",
+        "network or preconnect guard observed an unexpected call", { events, attempts });
+    },
+    restore: () => {
+      requireCondition(completionConfirmed, "SESSION_LIFECYCLE_FAILURE", "teardown completion is unconfirmed; interception must remain until child termination");
+      globalThis.fetch = originalFetch;
+    },
+  };
 }
 
 let currentStage = "preflight";
+
+// Fixture-only injection seam: tests load temporary modules and dispose mock
+// resources through the same owner used by main, without invoking a provider.
+export async function observeGuardedSdkLifecycle(loadSdk, runSessions, timers = { setTimeout, clearTimeout }) {
+  const guard = armNetworkGuard(timers);
+  let receipt;
+  let primary;
+  let evidence;
+  try {
+    currentStage = "sdk-import";
+    await loadSdk(guard);
+    currentStage = "session-observation";
+    receipt = await runSessions(guard);
+  } catch (error) {
+    primary = error instanceof ProbeFailure ? error : new ProbeFailure(
+      error?.code ?? "PROBE_FAILURE", error?.message ?? String(error),
+      { ...error?.details, originalName: error?.name ?? null,
+        originalDiagnostic: { stage: currentStage, ...cleanupDiagnostic(error, { root: "" }) } });
+  } finally {
+    try {
+      const completionErrors = await guard.settleTeardown();
+      if (completionErrors.length > 0) {
+        if (!primary) primary = new ProbeFailure("SESSION_LIFECYCLE_FAILURE", "retained teardown rejected");
+        primary.details = { ...primary.details,
+          cleanupErrors: [...(primary.details?.cleanupErrors ?? []), ...completionErrors] };
+      }
+      // runSessions owns its finally cleanup. Even swallowed cleanup/import
+      // attempts remain in the guard and must prevent a successful receipt.
+      guard.verify();
+      requireCondition(guard.evidence().completionConfirmed, "SESSION_LIFECYCLE_FAILURE",
+        "tracked teardown completion exceeded its bounded wait; interception retained until child termination",
+        { timeoutMs: RAW_SESSION_DISPOSE_TIMEOUT_MS });
+      if (!primary) requireCondition(currentStage === "sdk-teardown",
+        "SESSION_LIFECYCLE_FAILURE", "guarded observation returned before tracked teardown");
+    } catch (error) {
+      if (!primary) primary = error;
+      else primary.details = {
+        ...primary.details,
+        cleanupErrors: [...(primary.details?.cleanupErrors ?? []),
+          { operation: "network-guard-verification", code: error.code, error: error.message }],
+      };
+    } finally {
+      evidence = guard.evidence();
+      evidence.restored = false;
+      try {
+        if (evidence.completionConfirmed) {
+          guard.restore();
+          evidence.restored = true;
+        }
+      } catch (error) {
+        evidence.restored = false;
+        if (!primary) primary = error;
+        else primary.details = {
+          ...primary.details,
+          cleanupErrors: [...(primary.details?.cleanupErrors ?? []),
+            { operation: "network-guard-restore", error: error?.message ?? String(error) }],
+        };
+      }
+    }
+  }
+  if (primary) {
+    if (!(primary instanceof ProbeFailure)) primary = new ProbeFailure(
+      primary?.code ?? "PROBE_FAILURE", primary?.message ?? String(primary),
+      { ...primary?.details, originalName: primary?.name ?? null });
+    primary.details = { ...primary.details, preconnectGuard: evidence };
+    throw primary;
+  }
+  receipt.preconnectGuard = evidence;
+  return receipt;
+}
 
 function registrySnapshot(registry, settings, phase) {
   const all = registry.getAll().filter(model => model.provider === PROVIDER_A || model.provider === PROVIDER_B);
@@ -939,32 +1114,62 @@ async function observeUnregisteredCwdCapability(fixture, order) {
     warnings: result.warnings.slice(0, 4),
   };
 }
-async function disposeRawSessionBounded(rawSession, label) {
-  if (!rawSession || typeof rawSession.dispose !== "function") return;
-  let timer;
-  const timeout = new Promise(resolve => {
-    timer = setTimeout(() => resolve({ status: "timed_out" }), RAW_SESSION_DISPOSE_TIMEOUT_MS);
-  });
-  const settled = Promise.resolve()
-    .then(() => rawSession.dispose())
+function cleanupDiagnostic(error, fixture, depth = 0, seen = new Set(), budget = { remaining: 48 }) {
+  if (depth >= 5 || budget.remaining-- <= 0 || seen.has(error)) return { truncated: true };
+  // Detect ancestor cycles without dropping shared SDK causes that also
+  // appear in AggregateError.errors or an attached cleanup diagnostic.
+  seen = new Set(seen);
+  if (error && typeof error === "object") seen.add(error);
+  const text = value => redactedText(String(value), fixture, fixture.root);
+  const diagnostic = { code: text(error?.code ?? "UNKNOWN"), error: text(error?.message ?? error),
+    name: text(error?.name ?? "Error") };
+  const detail = (value, level, ancestors = seen) => {
+    if (value instanceof Error) return cleanupDiagnostic(value, fixture, level, ancestors, budget);
+    if (level >= 5 || budget.remaining-- <= 0 || ancestors.has(value)) return { truncated: true };
+    if (typeof value === "string") return text(value);
+    if (!value || typeof value !== "object") return value;
+    const next = new Set(ancestors).add(value);
+    if (Array.isArray(value)) return value.slice(0, 8).map(item => detail(item, level + 1, next));
+    return Object.fromEntries(Object.entries(value).slice(0, 8)
+      .filter(([key]) => !/(?:stack|api.?key|token|password|authorization|cookie|credential|secret|oauth|broker)/i.test(key))
+      .map(([key, item]) => [text(key), detail(item, level + 1, next)]));
+  };
+  // The public factory attaches these with enumerable:false. Read them
+  // explicitly, before optional details consume the bounded diagnostic budget.
+  for (const field of ["startupCleanupDiagnostic", "cleanupDiagnostic"]) {
+    if (error?.[field] !== undefined) diagnostic[field] = cleanupDiagnostic(error[field], fixture, depth + 1, seen, budget);
+  }
+  if (error?.cause !== undefined) diagnostic.cause = cleanupDiagnostic(error.cause, fixture, depth + 1, seen, budget);
+  if (Array.isArray(error?.errors)) diagnostic.errors = error.errors.slice(0, 8).map(item => cleanupDiagnostic(item, fixture, depth + 1, seen, budget));
+  if (error?.details !== undefined) diagnostic.details = detail(error.details, depth);
+  return diagnostic;
+}
+
+async function disposeRawSessionBounded(rawSession, label, guard, close = () => rawSession.dispose()) {
+  requireCondition(rawSession, "SESSION_LIFECYCLE_FAILURE", `${label} resource is missing`);
+  const settled = guard.trackTeardown(label, close, rawSession)
     .then(value => ({ status: "fulfilled", value }), reason => ({ status: "rejected", reason }));
-  const result = await Promise.race([settled, timeout]);
-  clearTimeout(timer);
+  const result = await guard.waitBounded(settled);
   if (result.status === "timed_out") {
     throw new ProbeFailure("SESSION_LIFECYCLE_FAILURE", `${label} raw session disposal timed out`, { timeoutMs: RAW_SESSION_DISPOSE_TIMEOUT_MS });
   }
   if (result.status === "rejected") {
-    throw new ProbeFailure("SESSION_LIFECYCLE_FAILURE", `${label} raw session disposal rejected`, { error: result.reason?.message ?? String(result.reason) });
+    throw new ProbeFailure("SESSION_LIFECYCLE_FAILURE", `${label} raw session disposal rejected`, { error: result.reason });
   }
 }
 
-async function createPooledSession(fixture, workDir, label, registries, cAttempts) {
+async function createPooledSession(fixture, workDir, label, registries, cAttempts, guard, dependencies) {
+  const { SessionManager, createAgentSession, SdkSession } = dependencies;
   const record = {
     label,
     workDir,
     settings: null,
     modelRegistry: null,
     rawSession: null,
+    sessionManager: null,
+    managerOwnership: "caller",
+    rawDisposalAttempted: false,
+    rawDisposalCompleted: false,
     sdkSession: null,
     policy: null,
     globalPolicy: null,
@@ -980,6 +1185,7 @@ async function createPooledSession(fixture, workDir, label, registries, cAttempt
     }
     currentStage = `create-${label}`;
     const manager = SessionManager.create(workDir, join(workDir, ".gjc-remote-session"));
+    record.sessionManager = manager;
     const created = await createAgentSession({
       cwd: workDir,
       agentDir: fixture.agentDir,
@@ -1000,7 +1206,12 @@ async function createPooledSession(fixture, workDir, label, registries, cAttempt
       agentDisplayName: `issue62-${label}`,
     });
     record.rawSession = created.session;
+    record.managerOwnership = "AgentSession";
     record.sdkSession = new SdkSession(record.rawSession);
+    // SessionPool bounds the adapter's public dispose promise too. Retain
+    // both that in-flight call and the SDK's actual teardown completion owner.
+    const dispose = record.sdkSession.dispose.bind(record.sdkSession);
+    record.sdkSession.dispose = () => guard.trackTeardown(`pool-${label}`, dispose, record.rawSession);
     record.settings = record.rawSession.settings;
     record.modelRegistry = record.rawSession.modelRegistry;
     record.authEntryProviderCount = Object.keys(record.modelRegistry.authStorage.getAll()).length;
@@ -1028,7 +1239,26 @@ async function createPooledSession(fixture, workDir, label, registries, cAttempt
     record.beforeSiblingRegistry = registrySnapshot(record.modelRegistry, record.settings, `after-${label}`);
     return record.sdkSession;
   } catch (error) {
-    if (record.rawSession) await disposeRawSessionBounded(record.rawSession, `create-${label}`);
+    if (record.rawSession) {
+      record.rawDisposalAttempted = true;
+      try {
+        await disposeRawSessionBounded(record.rawSession, `create-${label}`, guard);
+        record.rawDisposalCompleted = true;
+      } catch (cleanupError) {
+        error.details = { ...error.details,
+          cleanupErrors: [...(error.details?.cleanupErrors ?? []),
+            { operation: `create-${label}-dispose`, ...cleanupDiagnostic(cleanupError, fixture) }],
+        };
+      }
+    } else if (record.sessionManager && record.managerOwnership === "caller") {
+      try {
+        await disposeRawSessionBounded(record.sessionManager, `create-${label}-manager`, guard, () => record.sessionManager.close());
+        record.managerOwnership = "closed";
+      } catch (cleanupError) {
+        error.details = { ...error.details, cleanupErrors: [...(error.details?.cleanupErrors ?? []),
+          { operation: `create-${label}-manager-close`, ...cleanupDiagnostic(cleanupError, fixture) }] };
+      }
+    }
     throw error;
   }
 }
@@ -1052,8 +1282,25 @@ async function readSession(record, fixture) {
   };
 }
 
-async function runOrder(order, fixture, provenance) {
-  const guard = armNetworkGuard();
+// Hermetic fixture seam: exercise the actual factory and runOrder failure
+// paths without importing the SDK, configuring a host, or invoking providers.
+export async function observePooledFailureLifecycle(dependencies, fixture, timers) {
+  const previous = { SessionPool, SdkSession, SessionManager, createAgentSession,
+    Settings, closeModelCache, getAllProvidersInfo, getCapabilityInfo };
+  try {
+    ({ SessionPool, SdkSession, SessionManager, createAgentSession,
+      Settings, closeModelCache, getAllProvidersInfo, getCapabilityInfo } = dependencies);
+    return await observeGuardedSdkLifecycle(async () => {},
+      guard => runOrder(["A", "B"], fixture, {}, guard), timers);
+  } finally {
+    ({ SessionPool, SdkSession, SessionManager, createAgentSession,
+      Settings, closeModelCache, getAllProvidersInfo, getCapabilityInfo } = previous);
+  }
+}
+
+async function runOrder(order, fixture, provenance, guard) {
+  // A timed-out factory can resume after the injection seam restores globals.
+  const factoryDependencies = { SessionManager, createAgentSession, SdkSession };
   const cAttempts = { sessionConstructionAttempts: 0, promptAttempts: 0 };
   const registries = {};
   const canonicalFixtureWorkDirs = {
@@ -1098,7 +1345,7 @@ async function runOrder(order, fixture, provenance) {
           },
         },
       );
-      return createPooledSession(fixture, workDir, label, registries, cAttempts);
+      return createPooledSession(fixture, workDir, label, registries, cAttempts, guard, factoryDependencies);
     },
     sessionCreateTimeoutMs: 30_000,
     sessionDisposeTimeoutMs: 5_000,
@@ -1110,6 +1357,7 @@ async function runOrder(order, fixture, provenance) {
   registries.C = cResources;
   let receipt;
   let runError;
+  let runErrorStage;
   try {
     fixture.globalSettingsSingletonSeed = globalSettingsSingletonSnapshot();
     fixture.globalIntrospectionSeed = capabilityIntrospectionSnapshot();
@@ -1239,7 +1487,6 @@ async function runOrder(order, fixture, provenance) {
       order,
       capabilityProviderForLabel,
     );
-    requireCondition(guard.events.length === 0, "ENVIRONMENT_BLOCKED", "network or preconnect guard observed an unexpected call", { events: guard.events });
     const readByLabel = Object.fromEntries(reads.map(item => [item.label, item]));
     const registryClassification = {
       availableResolvedProvider: {
@@ -1380,7 +1627,6 @@ async function runOrder(order, fixture, provenance) {
         staticFixtureProviderApi: "anthropic-messages",
         scope: "Fixture-only startup control; this probe does not claim production startup is network-free.",
       },
-      preconnectGuard: { available: true, events: guard.events, observed: false },
       failureCodes: [],
       startedAt,
       finishedAt: new Date().toISOString(),
@@ -1396,7 +1642,10 @@ async function runOrder(order, fixture, provenance) {
     };
   } catch (error) {
     runError = error;
+    runErrorStage = currentStage;
+    if (error?.pendingCleanup) guard.retainFactoryCleanup(error.pendingCleanup);
   } finally {
+    guard.beginTeardown();
     const cleanup = {
       poolShutdown: false,
       storesClosed: false,
@@ -1406,6 +1655,7 @@ async function runOrder(order, fixture, provenance) {
       storeOutcomes: [],
       sdkOwnedResourceOutcomes: [],
       sessionDisposals: [],
+      callerManagerOutcomes: [],
       leakScope: "Tracked SessionPool, AgentSession, Settings, auth, registry, session-manager, and model-cache resources; filesystem removal is reported separately.",
       sdkLifecycleSourceContract: {
         scopedSettings: "createAgentSession calls Settings.loadForScope when settings is omitted",
@@ -1420,26 +1670,34 @@ async function runOrder(order, fixture, provenance) {
       await pool.shutdown();
       poolShutdownResolved = true;
     } catch (error) {
-      cleanupErrors.push({ operation: "pool-shutdown", error: error?.message ?? String(error) });
+      cleanupErrors.push({ operation: "pool-shutdown", ...cleanupDiagnostic(error, fixture) });
     }
+    const poolDisposalsSettled = poolShutdownResolved && pool.getPendingShutdownOperations().length === 0;
     for (const [label, record] of Object.entries(registries)) {
+      if (record?.sessionManager && record.managerOwnership !== "AgentSession") {
+        cleanup.callerManagerOutcomes.push({ label, closed: record.managerOwnership === "closed" });
+      }
       if (!record?.rawSession) continue;
-      let closed = record.rawSession.isDisposed === true;
-      if (!closed) {
+      // isDisposed signals start, not awaited completion. Pool rejection
+      // cannot certify already-started disposal as completed.
+      let closed = record.rawDisposalCompleted ||
+        (poolDisposalsSettled && !record.rawDisposalAttempted && record.rawSession.isDisposed === true);
+      if (!closed && !record.rawDisposalAttempted && !record.rawSession.isDisposed) {
+        record.rawDisposalAttempted = true;
         try {
-          await disposeRawSessionBounded(record.rawSession, `cleanup-${label}`);
+          await disposeRawSessionBounded(record.rawSession, `cleanup-${label}`, guard);
+          record.rawDisposalCompleted = true;
         } catch (error) {
           cleanupErrors.push({
             operation: `raw-session-${label}`,
-            error: error?.message ?? String(error),
-            details: error?.details,
+            ...cleanupDiagnostic(error, fixture),
           });
         }
-        closed = record.rawSession.isDisposed === true;
+        closed = record.rawDisposalCompleted;
       }
       cleanup.sessionDisposals.push({ label, closed });
       if (!closed) {
-        cleanupErrors.push({ operation: `raw-session-${label}`, error: "session did not reach disposed state after pool shutdown" });
+        cleanupErrors.push({ operation: `raw-session-${label}`, error: "session disposal completion was not confirmed after pool shutdown" });
       }
       const settingsStorageClosed = record.settings?.getStorage?.() === null;
       cleanup.sdkOwnedResourceOutcomes.push({
@@ -1458,7 +1716,7 @@ async function runOrder(order, fixture, provenance) {
     }
     cleanup.poolShutdown = poolShutdownResolved &&
       cleanup.sessionDisposals.every(outcome => outcome.closed);
-    cleanup.sdkOwnedResourcesClosed =
+    cleanup.sdkOwnedResourcesClosed = cleanup.sessionDisposals.every(outcome => outcome.closed) &&
       cleanup.sdkOwnedResourceOutcomes.length === 2 &&
       cleanup.sdkOwnedResourceOutcomes.every(outcome => outcome.settingsStorageClosed);
     const stores = [
@@ -1506,17 +1764,14 @@ async function runOrder(order, fixture, provenance) {
         cleanup.storeOutcomes.push({ name, closed: true });
       } catch (error) {
         cleanup.storeOutcomes.push({ name, closed: false, error: error?.message ?? String(error) });
-        cleanupErrors.push({ operation: `close-${name}`, error: error?.message ?? String(error) });
+        cleanupErrors.push({ operation: `close-${name}`, ...cleanupDiagnostic(error, fixture) });
       }
-    }
-    await Bun.sleep(250);
-    try {
-      guard.restore();
-    } catch (error) {
-      cleanupErrors.push({ operation: "network-guard-restore", error: error?.message ?? String(error) });
     }
     const pending = pool.getPendingShutdownOperations();
     const leaks = [];
+    for (const outcome of cleanup.callerManagerOutcomes) {
+      if (!outcome.closed) leaks.push({ kind: "caller-session-manager", label: outcome.label });
+    }
     if (pool.sessions.size !== 0) leaks.push({ kind: "pool-sessions", count: pool.sessions.size });
     for (const operation of pending) leaks.push({ kind: "pending-operation", operation: operation.operation });
     for (const outcome of cleanup.sessionDisposals) if (!outcome.closed) leaks.push({ kind: "raw-session", label: outcome.label });
@@ -1534,12 +1789,15 @@ async function runOrder(order, fixture, provenance) {
       receipt.finishedAt = new Date().toISOString();
     }
     if (runError instanceof ProbeFailure) {
-      runError.details = { ...runError.details, cleanup, cleanupErrors };
+      runError.details = { ...runError.details, cleanup,
+        cleanupErrors: [...(runError.details?.cleanupErrors ?? []), ...cleanupErrors] };
     } else if (runError) {
       runError = new ProbeFailure(
         runError?.code ?? "PROBE_FAILURE",
         runError?.message ?? String(runError),
-        { originalName: runError?.name ?? null, cleanup, cleanupErrors },
+        { ...runError?.details, originalName: runError?.name ?? null, cleanup,
+          originalDiagnostic: { stage: runErrorStage, ...cleanupDiagnostic(runError, fixture) },
+          cleanupErrors: [...(runError?.details?.cleanupErrors ?? []), ...cleanupErrors] },
       );
     } else if (cleanupErrors.length > 0 || !cleanup.poolShutdown || !cleanup.storesClosed || cleanup.leaks.length > 0) {
       runError = new ProbeFailure(
@@ -1570,79 +1828,53 @@ async function main() {
     provenance.sourceIdentity = sourceIdentity(provenance.sourceCommit, provenance.changeSet.digest);
     rejectHostEnvironment();
     fixture = await createHermeticFixture(explicitFixtureRoot);
-    await loadProbeSdk();
-    provenance = {
-      ...provenance,
-      ...await assertSdkProvenance(provenance.sourceCommit, provenance.changeSet.digest),
-    };
-    capabilityFixture = fixture;
-    receipt = await runOrder(order, fixture, provenance);
-    if (fixture.cleanupOwner === "parent-wrapper") {
-      receipt.cleanup.fixtureRemoved = false;
-      receipt.cleanup.fixtureRemoval = {
-        owner: "parent-wrapper",
-        scope: "fixture-root-only",
-        child: {
-          attempted: false,
-          removed: false,
-          observedPresentAtReceipt: existsSync(fixture.root),
-          cwdInsideFixtureAtReceipt: isPathWithin(fixture.root, process.cwd()),
-          activeResourcesAtReceipt: activeResourceSnapshot(),
-          reason: "Process-owned SDK resources may release only when the child exits.",
-        },
-        parent: {
-          pending: true,
-          mustRunAfterChildExit: true,
-        },
-      };
-      requireCondition(
-        !receipt.cleanup.fixtureRemoval.child.cwdInsideFixtureAtReceipt,
-        "SESSION_LIFECYCLE_FAILURE",
-        "SDK lifecycle left process cwd inside the wrapper-owned fixture root",
-        { cleanup: receipt.cleanup },
-      );
-    } else {
-      let fixtureRemoval;
+    receipt = await observeGuardedSdkLifecycle(async guard => {
       try {
-        fixtureRemoval = await removeFixtureRoot(fixture.root);
-      } catch (error) {
-        receipt.cleanup.fixtureRemoved = false;
-        receipt.cleanup.fixtureRemoval = error?.details?.fixtureRemoval ?? {
-          owner: "child",
-          scope: "fixture-root-only",
-          attempted: true,
-          removed: false,
+        await loadProbeSdk(fixture);
+        provenance = {
+          ...provenance,
+          ...await assertSdkProvenance(provenance.sourceCommit, provenance.changeSet.digest),
         };
-        if (error instanceof ProbeFailure) {
-          error.details = {
-            ...error.details,
-            cleanup: receipt.cleanup,
-          };
-          throw error;
+        capabilityFixture = fixture;
+      } catch (error) {
+        guard.beginTeardown();
+        // No sessions/stores are constructed before runOrder. A partially
+        // imported SDK can still own the exact hermetic model-cache path.
+        if (closeModelCache) {
+          try {
+            closeModelCache(join(dirname(fixture.modelsPath), "models.db"));
+          } catch (cleanupError) {
+            error.details = { ...error.details,
+              cleanupErrors: [...(error.details?.cleanupErrors ?? []),
+                { operation: "partial-import-model-cache", error: cleanupError?.message ?? String(cleanupError) }],
+            };
+          }
         }
-        throw new ProbeFailure(
-          error?.code ?? "SESSION_LIFECYCLE_FAILURE",
-          error?.message ?? "fixture root removal failed",
-          {
-            ...error?.details,
-            cleanup: receipt.cleanup,
-          },
-        );
+        throw error;
       }
-      receipt.cleanup.fixtureRemoved = fixtureRemoval.removed;
-      receipt.cleanup.fixtureRemoval = fixtureRemoval;
-      requireCondition(
-        !fixtureRemoval.cwd.insideFixtureBefore,
-        "SESSION_LIFECYCLE_FAILURE",
-        "SDK lifecycle left process cwd inside the fixture root",
-        { cleanup: receipt.cleanup },
-      );
-    }
+    }, async guard => {
+      const result = await runOrder(order, fixture, provenance, guard);
+      try {
+        result.cleanup.fixtureRemoval = await removeFixtureRoot(fixture.root);
+        result.cleanup.fixtureRemoved = true;
+      } catch (error) {
+        result.cleanup.fixtureRemoved = false;
+        result.cleanup.fixtureRemoval = error?.details?.fixtureRemoval;
+        error.details = { ...error.details, cleanup: result.cleanup };
+        throw error;
+      }
+      try {
+        result.cleanup.nativeCache = await observeNativeCacheLifetime(fixture);
+      } catch (error) {
+        error.details = { ...error.details, cleanup: result.cleanup };
+        throw error;
+      }
+      return result;
+    });
     receipt = redactValue(receipt, fixture);
     process.stdout.write(`${JSON.stringify(receipt)}\n`);
   } catch (error) {
     const cleanupRoot = fixture?.root ?? setupRoot;
-    const cleanupOwner = fixture?.cleanupOwner ?? setupCleanupOwner;
     const cleanup = {
       poolShutdown: false,
       storesClosed: false,
@@ -1656,24 +1888,10 @@ async function main() {
     };
     const cleanupErrors = [...(error?.details?.cleanupErrors ?? [])];
     let removalFailure;
-    if (cleanupRoot && cleanupOwner === "parent-wrapper") {
-      cleanup.fixtureRemoved = false;
-      cleanup.fixtureRemoval = {
-        owner: "parent-wrapper",
-        scope: "fixture-root-only",
-        child: {
-          attempted: false,
-          removed: false,
-          observedPresentAtReceipt: existsSync(cleanupRoot),
-          cwdInsideFixtureAtReceipt: isPathWithin(cleanupRoot, process.cwd()),
-          activeResourcesAtReceipt: activeResourceSnapshot(),
-          reason: "Process-owned SDK resources may release only when the child exits.",
-        },
-        parent: {
-          pending: true,
-          mustRunAfterChildExit: true,
-        },
-      };
+    if (cleanup.fixtureRemoval?.attempted) {
+      // Preserve the first removal verdict. Parent-owned salvage after exit is
+      // never a second qualification attempt or a successful lifecycle verdict.
+      removalFailure = cleanup.fixtureRemoval.removed ? undefined : error;
     } else if (cleanupRoot && existsSync(cleanupRoot)) {
       try {
         const fixtureRemoval = await removeFixtureRoot(cleanupRoot);
@@ -1699,7 +1917,6 @@ async function main() {
       cleanup.fixtureRemoved = true;
     }
     setupRoot = undefined;
-    setupCleanupOwner = undefined;
     const primaryCode = error?.code ?? "PROBE_FAILURE";
     const failureCodes = [...new Set([
       primaryCode,

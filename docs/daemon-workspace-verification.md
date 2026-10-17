@@ -65,13 +65,79 @@ key version, and restart count. Release evidence includes path/secret/control se
 | Git refs, remote allowlist, dirty policy, cadence, and storage budget | #43/#44 | Complete-graph and destructive-operation fixtures | `GIT_GRAPH_INCOMPLETE` and preserve prior generation |
 | Lease TTL, fence recovery, resource budgets, backup RPO/RTO | #43/#33 | Numeric boundary and crash/recovery fixtures | `LEASE_CONFLICT`/`RESOURCE_EXHAUSTED` or manual cleanup |
 | Provider backup key ownership, escrow, rotation, and restore | #42/#43 | Independent key recovery and restore rehearsal | Preserve data and require manual cleanup |
-| SDK/package/lock reconciliation at 0.16.7 and evidence schedule | #42/#45 | Source/lock/version/provenance packet | Stop image/release work |
+| SDK/package/lock reconciliation at official unpatched 0.18.12 and evidence schedule | #42/#45 | Source/lock/version/provenance packet; bounded SDK-only source evidence below, promotion gates still open | Stop image/release work |
 | Docker production target and Windows-host primitive support | #42/#43 | Linux-engine matrix and Windows/UNC containment fixtures | Unsupported target refuses startup |
 | Singleton legacy fallback fence | #43/#44 | Live remap/invalidation and re-registration fixture | Invalidate socket; never silently remap |
 | Protocol v0/v1 retirement | #43/#44/#55 | [ADR 0005](adr/0005-managed-protocol-floor.md): managed v3 floor now; remove local parsers by v0.4.0 RC or 2026-10-01 | Reject managed lower peers with `PROTOCOL_INCOMPATIBLE`; no inferred mapping or downgrade |
 
 Illustrative values such as 60-second readiness maximum and 8/8/64/4 admission are not final
 approvals until their owners close the corresponding gates. TTL alone never authorizes takeover.
+
+## Current SDK-only 0.18.12 evidence
+
+The parent verified the SDK-only source tree after the fixture ownership,
+startup-cleanup diagnostic, source-redaction and owner-admission repairs, plus
+the FIFO-only mock-clock correction. Each run qualifies only
+its exact pins; the following local unshipped receipts alone do not approve landing:
+
+| Local receipt | Actual observed scope and result |
+| --- | --- |
+| `artifacts/sdk-first-0.18.12-admission2-focused.json` | Windows Node v26.7.0 focused tests: 333 tests, 333 pass, zero fail, zero skips, exit 0 |
+| `artifacts/sdk-first-0.18.12-admission2-workspace.json` | Bounded Windows Node v26.7.0 workspace run: 2704 tests, 2700 pass, zero fail, four skips, exit 0, under the unchanged nine explicit exclusions below |
+| `artifacts/sdk-first-0.18.12-admission2-wsl-final.json` | Actual isolated Linux credentialless run, Node v26.7.0/Bun 1.4.2: 248 tests, 248 pass, zero fail/skips, exit 0; no provider calls or native repair changes |
+| `artifacts/sdk-first-0.18.12-provider-smoke.json` | One separately authorized native Windows provider smoke: PASS, existing `codex-eco` child-environment-only profile override, three exact `SMOKE_OK` responses in A-B-A order, heartbeat and three invoke-terminal assertions, exit 0, ephemeral relay port free afterward |
+
+The bounded workspace command used `--test-concurrency=4` and this explicit
+`--test-skip-pattern` (alternatives separated by `|`):
+
+```text
+inventory ACL verification atomically|Windows verified handle removal unlinks|Windows management-auth native ACL creation|verified native addon enforces retained-handle|POSIX principal access rejects|POSIX named ACL groups match|Win32 legacy no-replace creation|current management or system caller can reapply|opted-in Windows hosted runner provisions
+```
+
+These are nine historical authority exclusion patterns, not a full unexcluded
+workspace qualification. Four reported skips are not passes and do not represent
+the entire excluded scope. Main native code was freshly built unchanged;
+separate native lifetime/ACL/publication/construction/fixture repairs remain
+deferred. No private native fixture counts or combined SDK/native results
+qualify this SDK-only tree.
+
+The single smoke ran no optional model query or wrapper retry and made no
+wrapper persistent-profile writes. It was not repeated after fixture/test-only
+changes; production SDK runtime/package/lock are unchanged. It proves basic native Windows same-profile
+A-B-A continuity only, not a fix for #247, generic disconnect recovery, or
+profile/tenant isolation. Active live controls remain fail-closed; active
+cancellation remains nonterminal `cancellation_pending`. Standalone abort
+support is not inferred. Upstream workflow guard issues #6578/#6700 remain
+unresolved; #6763 approval binding does not repair them.
+
+Historical passing pre-admission receipts retain their original counts:
+`artifacts/sdk-first-0.18.12-review-fix2-focused.json` (328/328),
+`artifacts/sdk-first-0.18.12-review-fix2-workspace.json` (2699 tests, 2695 pass,
+zero fail, four skips), and `artifacts/sdk-first-0.18.12-review-fix2-wsl-final.json`
+(243/243). They are not results for the later owner-admission/FIFO bytes.
+The first repair attempt's five sentinel failures remain in
+`artifacts/sdk-first-0.18.12-review-fix-focused.json` (328 tests, 323 pass, 5 fail)
+and `artifacts/sdk-first-0.18.12-review-fix-wsl-focused.stdout.log` (243 tests,
+238 pass, 5 fail). The source event-target
+redaction fix resolved them without weakening assertions; see the
+[repair boundaries and history](verification/issue62-evidence.md#repaired-failure-boundaries).
+The separate Windows 100 ms FIFO wall-clock flake remains in
+`artifacts/sdk-first-0.18.12-admission-focused.json` (333 tests, 332 pass, 1 fail).
+Only that deterministic gated ordering test uses Node mock `setTimeout`; actual
+timeout tests are unchanged. Subsequent admission2 focused 333/333 and actual
+Linux 248/248 passed. Both original P2s and owner-admission are verified and
+independently cleared in `artifacts/sdk-first-0.18.12-final-review.json`:
+static agent review APPROVE, zero P0/P1/P2, not independent runtime or
+CI/merge/deployment approval. That review did not observe the concurrent workspace
+result; the completed 2704/2700/0/4 result above comes from its own parent receipt.
+Exact-head CI/landing is tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is not
+yet committed/pushed, and CI/merge completion is not claimed. Existing phase promotion
+gates remain open: source tests and this basic provider smoke do not qualify
+Docker/images, release/provenance/security, native/service, fault/OOM/noDump,
+installation/deployment, or isolation. These receipts describe their exact
+recorded pins; no implementation-only receipt digest is equated with the
+parent's verification digest or a future snapshot.
 
 ## Native inventory verification evidence (as-built)
 

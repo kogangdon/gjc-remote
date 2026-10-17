@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, mkdir, mkdtemp, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { readFile, mkdir, mkdtemp, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 const testFile = fileURLToPath(import.meta.url);
@@ -20,13 +20,12 @@ const CHANGE_FILES = [
 ];
 const artifactsDir = join(repoRoot, "artifacts");
 const BASE_COMMIT = "a5bb530bd5a063b6571a7ba963e938bb6f97616f";
-const SDK_VERSION = "0.16.7";
+const SDK_VERSION = "0.18.12";
 const MIN_BUN_VERSION = [1, 4, 0];
 const FIXTURE_ROOT_PREFIX = "gjc-issue62-sdk-";
 const MAX_RECEIPT_BYTES = 100_000;
 const MAX_TIMEOUT_MS = 90_000;
 const wrapperOwnedRoots = new Set();
-const ROOT_REMOVAL_RETRY_CODES = new Set(["EACCES", "EBUSY", "ENOTEMPTY", "EPERM"]);
 const secretKey = /(?:api.?key|access.?token|refresh.?token|password|authorization|cookie|credential|broker|secret|oauth|token)/i;
 const WINDOWS_ABSOLUTE_PATH = /(^|[\s"'([{=:])([A-Za-z]:[\\/](?:[^\\/\s"'<>]+[\\/])*[^\\/\s"'<>]+)/;
 const UNC_PATH = /(^|[\s"'([{=:])((?:\\\\|\/\/)[^\\/\s"'<>]+(?:[\\/][^\\/\s"'<>]+)+)/;
@@ -86,14 +85,19 @@ async function stableEnv(order) {
   ]);
   const env = {};
   for (const [key, value] of Object.entries(process.env)) if (allowed.has(key) && value) env[key] = value;
-  const root = resolve(await mkdtemp(join(tmpdir(), `issue62-wrapper-${process.pid}-${order.replace(",", "-")}-`)));
+  const root = await realpath(await mkdtemp(join(tmpdir(), `issue62-wrapper-${process.pid}-${order.replace(",", "-")}-`)));
   wrapperOwnedRoots.add(root);
   env.HOME = root;
   env.USERPROFILE = root;
   env.TEMP = join(root, "tmp");
   env.TMP = join(root, "tmp");
+  env.LOCALAPPDATA = join(root, "local-appdata");
+  env.APPDATA = join(root, "appdata");
+  const launcherRoot = join(root, "launcher");
+  env.XDG_DATA_HOME = join(launcherRoot, "data");
   await mkdir(env.TMP, { recursive: true });
-  return { env, roots: [root, join(root, "tmp")] };
+  await mkdir(join(env.XDG_DATA_HOME, "gjc", "natives"), { recursive: true });
+  return { env, roots: [root, join(root, "tmp")], launcherRoot };
 }
 async function orderedChangeDigest() {
   const digest = createHash("sha256");
@@ -160,13 +164,13 @@ function parseReceipt(stdout, roots = []) {
   assert.fail(`Bun fixture emitted no structured receipt: ${diagnostic}`);
 }
 
-async function spawnBun(args, envInfo) {
+async function spawnBun(args, envInfo, entry = fixture) {
   const { env } = envInfo;
   await mkdir(env.HOME, { recursive: true });
   await mkdir(env.TMP, { recursive: true });
   return new Promise((resolveResult, reject) => {
     const bun = process.env.BUN_BIN || "bun";
-    const child = spawn(bun, [fixture, ...args], {
+    const child = spawn(bun, [entry, ...args], {
       cwd: repoRoot,
       env,
       windowsHide: true,
@@ -175,6 +179,7 @@ async function spawnBun(args, envInfo) {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let childError;
     const timer = setTimeout(() => {
       if (settled) return;
       child.kill("SIGTERM");
@@ -185,14 +190,16 @@ async function spawnBun(args, envInfo) {
     child.stdout.on("data", chunk => { stdout += chunk; if (stdout.length > MAX_RECEIPT_BYTES * 2) stdout = stdout.slice(-MAX_RECEIPT_BYTES * 2); });
     child.stderr.on("data", chunk => { stderr += chunk; if (stderr.length > 20_000) stderr = stderr.slice(-20_000); });
     child.on("error", error => {
-      clearTimeout(timer);
-      if (!settled) { settled = true; reject(error); }
+      // An error is not an exit boundary (for example, a failed kill).
+      // Retain it, but never let finally remove a live child's loader cache.
+      childError ??= error;
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       if (settled) return;
       settled = true;
-      resolveResult({ code, signal, stdout, stderr });
+      if (childError) { reject(childError); return; }
+      resolveResult({ code, signal, stdout, stderr, childExited: true });
     });
   });
 }
@@ -210,6 +217,860 @@ async function spawnRedactionProbe() {
   }
 }
 
+async function runGuardLifecycleProbe(scenario) {
+  const envInfo = await stableEnv("guard-lifecycle");
+  try {
+    const modulePath = join(envInfo.roots[0], "mock-sdk.mjs");
+    const runnerPath = join(envInfo.roots[0], "guard-runner.mjs");
+    await writeFile(modulePath, `
+      const scenario = ${JSON.stringify(scenario)};
+      const attempt = () => {
+        const invoke = () => scenario.kind === "fetch"
+          ? globalThis.fetch("https://guard.invalid/API_KEY=q7M4vN9xC2pL8rK")
+          : globalThis.fetch.preconnect("https://guard.invalid/API_KEY=q7M4vN9xC2pL8rK");
+        if (scenario.swallowed) {
+          try { invoke(); } catch { /* Deliberately model an SDK-swallowed attempt. */ }
+        } else invoke();
+      };
+      if (scenario.phase === "sdk-import") attempt();
+      if (scenario.failure === "import") throw Object.assign(new Error("import primary"), { code: "MOCK_IMPORT_FAILED" });
+      export async function dispose() {
+        // A queued attempt during tracked disposal must remain guarded too.
+        await Promise.resolve();
+        if (scenario.phase === "sdk-teardown") attempt();
+      }
+    `);
+    await writeFile(runnerPath, `
+      import { observeGuardedSdkLifecycle } from ${JSON.stringify(pathToFileURL(fixture).href)};
+      const scenario = ${JSON.stringify(scenario)};
+      let escapedCalls = 0, restorationCount = 0, runStarted = false, disposals = 0;
+      let sdk, receipt, failure;
+      const originalFetch = () => { escapedCalls += 1; throw new Error("guard bypassed"); };
+      originalFetch.preconnect = originalFetch;
+      let installedFetch = originalFetch;
+      Object.defineProperty(globalThis, "fetch", { configurable: true,
+        get: () => installedFetch,
+        set: value => { installedFetch = value; if (value === originalFetch) restorationCount += 1; },
+      });
+      try {
+        receipt = await observeGuardedSdkLifecycle(async () => {
+          sdk = await import(${JSON.stringify(pathToFileURL(modulePath).href)});
+          if (scenario.failure === "setup") throw Object.assign(new Error("setup primary"), { code: "MOCK_SETUP_FAILED" });
+        }, async guard => {
+          runStarted = true;
+          let primary;
+          try {
+            if (scenario.failure === "session") throw Object.assign(new Error("session primary"), { code: "MOCK_SESSION_FAILED" });
+          } catch (error) { primary = error; }
+          finally {
+            guard.beginTeardown();
+            disposals += 1;
+            try { await guard.trackTeardown("mock-dispose", () => sdk.dispose()); }
+            catch (error) {
+              if (!primary) primary = error;
+              else primary.details = { cleanupErrors: [{ operation: "mock-dispose", code: error.code }] };
+            }
+          }
+          if (primary) throw primary;
+          return { cleanup: { mockDisposed: true } };
+        });
+      } catch (error) {
+        failure = { code: error.code, message: error.message, details: error.details };
+      }
+      // Identity and setter counts independently observe restoration, including
+      // import/setup errors. The original stub cannot make a real connection.
+      const output = { schema: "issue62-sdk-isolation-probe-v1", receipt, failure,
+        escapedCalls, restorationCount, runStarted, disposals,
+        restoredIdentity: globalThis.fetch === originalFetch && globalThis.fetch.preconnect === originalFetch,
+        inheritedSensitiveNames: Object.keys(process.env).filter(key => /(?:API_KEY|TOKEN|SECRET|AUTHORIZATION|CREDENTIAL)/i.test(key)) };
+      console.log(JSON.stringify(output));
+    `);
+    const result = await spawnBun([], envInfo, runnerPath);
+    assert.equal(result.code, 0, `guard child failed: ${sanitize(result.stderr, envInfo.roots)}`);
+    const receipt = sanitize(parseReceipt(result.stdout, envInfo.roots), envInfo.roots);
+    assertNoRawPaths(receipt, envInfo.roots);
+    assertNoDistinctiveSentinels(JSON.stringify(receipt), ["q7M4vN9xC2pL8rK"]);
+    assert.equal(receipt.escapedCalls, 0, "no intercepted call reaches an original transport");
+    assert.equal(receipt.restorationCount, 1, "original fetch restored exactly once");
+    assert.equal(receipt.restoredIdentity, true, "original fetch/preconnect identity restored");
+    assert.deepEqual(receipt.inheritedSensitiveNames, [], "child inherits no provider credentials");
+    return receipt;
+  } finally {
+    await removeOwnedRoot(envInfo.roots[0]);
+  }
+}
+
+async function runPooledFailureProbe(scenario) {
+  const envInfo = await stableEnv("pooled-failure");
+  try {
+    const root = envInfo.roots[0];
+    const runnerPath = join(root, "pooled-failure-runner.mjs");
+    await writeFile(runnerPath, `
+      import { observePooledFailureLifecycle } from ${JSON.stringify(pathToFileURL(fixture).href)};
+      import { SessionPool } from ${JSON.stringify(pathToFileURL(join(daemonDir, "src/session-pool.js")).href)};
+      const scenario = ${JSON.stringify(scenario)};
+      const root = ${JSON.stringify(root)};
+      const retainedScenario = scenario.startsWith("retained-");
+      const creationScenario = scenario.startsWith("creation-");
+      const afterObservation = scenario === "creation-after-observation-withheld";
+      const pendingCleanupRejects = scenario.endsWith("pending-cleanup-rejected");
+      const fixtureTimeout = retainedScenario && scenario.includes("timeout");
+      const publicOwner = creationScenario || (retainedScenario && !scenario.includes("raw-timeout"));
+      const withhold = (retainedScenario || creationScenario) && scenario.endsWith("withheld");
+      const poolFailure = scenario.includes("pool-public");
+      let restorationCount = 0, managerCloses = 0, disposals = 0, factories = 0, guardedCloses = 0;
+      let escapedCalls = 0, completionJoins = 0, completionSettled = false, restoredBeforeSettlement = false;
+      let adapterConstructions = 0, adapterDisposals = 0, startupCompleted = false, observationSettled = false;
+      let pendingCleanupStatus = "pending", beforeRetainedRelease, observationBeforeStartup;
+      const blockedAttempts = [], deadlineTimeouts = [], guardDeadlineSchedules = [];
+      const releaseFactory = Promise.withResolvers();
+      const factoryStarted = Promise.withResolvers();
+      const pendingCleanupObserved = Promise.withResolvers();
+      const releaseTeardown = Promise.withResolvers();
+      const disposalStarted = Promise.withResolvers();
+      const cleanupReached = Promise.withResolvers();
+      const completionJoined = Promise.withResolvers();
+      let retainedOwner;
+      const pendingTimers = [];
+      let timerScheduled = Promise.withResolvers();
+      const schedule = (callback, timeoutMs, source) => {
+        const timer = { callback, timeoutMs, source, active: true };
+        pendingTimers.push(timer);
+        timerScheduled.resolve();
+        timerScheduled = Promise.withResolvers();
+        return timer;
+      };
+      const timers = {
+        setTimeout(callback, timeoutMs) {
+          guardDeadlineSchedules.push(timeoutMs);
+          return schedule(callback, timeoutMs, "guard");
+        },
+        clearTimeout(timer) { timer.active = false; },
+      };
+      const waitForDeadline = async (timeoutMs, source, active = true) => {
+        for (;;) {
+          const timer = pendingTimers.find(timer => (!active || timer.active) &&
+            (timeoutMs === undefined || timer.timeoutMs === timeoutMs) &&
+            (source === undefined || timer.source === source));
+          if (timer) return timer;
+          await timerScheduled.promise;
+        }
+      };
+      const expireDeadline = timer => {
+        if (!timer.active) throw new Error("deadline was cleared before its owner settled");
+        timer.active = false;
+        deadlineTimeouts.push(timer.timeoutMs);
+        timer.callback();
+      };
+      const expireNextDeadline = async (timeoutMs, source) => expireDeadline(await waitForDeadline(timeoutMs, source));
+      const originalSetTimeout = globalThis.setTimeout, originalClearTimeout = globalThis.clearTimeout;
+      if (creationScenario) {
+        // Exercise the actual pool's deadlines without elapsed-time waits.
+        globalThis.setTimeout = (callback, timeoutMs, ...args) => schedule(() => callback(...args), timeoutMs, "pool");
+        globalThis.clearTimeout = timer => { timer.active = false; };
+      }
+      const managerCloseCounts = [];
+      const original = () => { escapedCalls += 1; throw new Error("transport escaped"); };
+      original.preconnect = original;
+      let installed = original;
+      Object.defineProperty(globalThis, "fetch", { configurable: true, get: () => installed,
+        set: value => { installed = value; if (value === original) {
+          restorationCount += 1;
+          if ((retainedScenario || creationScenario) && !completionSettled) restoredBeforeSettlement = true;
+        } } });
+      const attemptTransport = phase => {
+        for (const kind of ["fetch", "preconnect"]) {
+          try {
+            if (kind === "fetch") globalThis.fetch("https://guard.invalid/API_KEY=q7M4vN9xC2pL8rK");
+            else globalThis.fetch.preconnect("https://guard.invalid/API_KEY=q7M4vN9xC2pL8rK");
+          } catch (error) { blockedAttempts.push({ ...(phase ? { phase } : {}), kind, code: error.code }); }
+        }
+      };
+      const models = ["a", "b"].map(letter => ({ provider: "issue62-provider-" + letter, id: "issue62-model-" + letter }));
+      const disposalMessage = scenario === "nested-pool-long-secret"
+        ? 'distinctive disposal API_KEY="longQuotedPrefixZ9 ' + "x".repeat(2_100) + ' longQuotedSuffixY8" ' + root
+        : "distinctive disposal API_KEY=q7M4vN9xC2pL8rK " + root;
+      const distinctive = () => Object.assign(new Error(disposalMessage),
+        { code: "DISTINCTIVE_DISPOSAL", cause: Object.assign(new Error("distinctive cause"), { code: "INNER_CAUSE" }) });
+      const factoryFailure = () => {
+        const primary = Object.assign(new Error("factory primary"), { code: "FACTORY_PRIMARY" });
+        if (!scenario.startsWith("factory-diagnostic-")) return primary;
+        primary.cause = Object.assign(new Error("factory cause API_KEY=q7M4vN9xC2pL8rK " + root), { code: "FACTORY_CAUSE" });
+        const startupCleanup = Object.assign(new AggregateError([distinctive()], "startup cleanup " + root),
+          { code: "STARTUP_CLEANUP_AGGREGATE" });
+        Object.defineProperty(primary, "cleanupDiagnostic", { enumerable: false, value: {
+          code: "MCP_MANAGER_CLEANUP_FAILED", cause: distinctive(),
+        } });
+        // Match the SDK's frozen-error AggregateError fallback, including the
+        // shared primary/cleanup references in cause, errors and attached fields.
+        const failure = scenario.endsWith("aggregate")
+          ? new AggregateError([Object.freeze(primary), startupCleanup], primary.message, { cause: primary })
+          : primary;
+        Object.defineProperty(failure, "startupCleanupDiagnostic", { enumerable: false, value: {
+          code: "STARTUP_RESOURCE_CLEANUP_FAILED", cause: startupCleanup,
+        } });
+        if (Object.keys(failure).includes("startupCleanupDiagnostic") || Object.keys(primary).includes("cleanupDiagnostic"))
+          throw new Error("diagnostic fields must be non-enumerable");
+        return failure;
+      };
+      const dependencies = {
+        SessionPool: creationScenario ? class extends SessionPool {
+          async ensureSession(workDir) {
+            try {
+              return await super.ensureSession(workDir,
+                pendingCleanupRejects ? { managedIdentity: "issue62-admission-root" } : undefined);
+            } catch (error) {
+              if (error.pendingCleanup) void error.pendingCleanup.then(
+                () => { pendingCleanupStatus = "fulfilled"; pendingCleanupObserved.resolve(); },
+                () => { pendingCleanupStatus = "rejected"; pendingCleanupObserved.resolve(); },
+              );
+              throw error;
+            }
+          }
+        } : SessionPool,
+        SdkSession: class {
+          constructor(raw) { adapterConstructions += 1; this.raw = raw; }
+          dispose() { adapterDisposals += 1; return this.raw.dispose(); }
+        },
+        SessionManager: { create() { const index = managerCloseCounts.push(0) - 1; return { async close() {
+          await Promise.resolve(); managerCloses += 1; guardedCloses += Number(installed !== original);
+          managerCloseCounts[index] += 1;
+          if (scenario === "manager-rejection") throw distinctive();
+        } }; } },
+        Settings: { get instance() { throw new Error("Settings not initialized"); } },
+        getAllProvidersInfo: () => [], getCapabilityInfo: () => ({}),
+        closeModelCache: () => { cleanupReached.resolve(); return true; },
+        async createAgentSession(options) {
+          factories += 1;
+          if (scenario === "early" || scenario === "manager-rejection" || scenario.startsWith("factory-diagnostic-") || factories === 2)
+            throw factoryFailure();
+          if (creationScenario) {
+            factoryStarted.resolve();
+            await releaseFactory.promise;
+            attemptTransport("startup");
+            startupCompleted = true;
+          }
+          const order = models.map(model => model.provider);
+          const values = { disabledProviders: [], enabledModels: models.map(model => model.provider + "/" + model.id),
+            modelRoles: { default: "issue62-provider-a/issue62-model-a" },
+            "task.agentModelOverrides": { planner: "issue62-provider-a/issue62-model-a" },
+            modelProviderOrder: order, "startup.networkPrewarm": false };
+          const settings = { getCwd: () => scenario === "validation" || (retainedScenario && !poolFailure) ? "wrong-scope" : options.cwd,
+            getAgentDir: () => options.agentDir, get: key => values[key], getGlobal: key => values[key],
+            getModelRole: () => values.modelRoles.default, getStorage: () => null };
+          const registry = { authStorage: { getAll: () => ({}) }, getAll: () => models,
+            getAvailable: () => models, getCanonicalId: () => "issue62-canonical-model",
+            getCanonicalVariants: () => models.map(model => ({ model })),
+            getCanonicalModels: () => [{ id: "issue62-canonical-model", variants: models.map(model => ({ model })) }],
+            resolveCanonicalModel: () => models[0] };
+          const raw = { settings, modelRegistry: registry, model: models[0], isDisposed: false,
+            async dispose() {
+              raw.isDisposed = true; disposals += 1;
+              if (retainedScenario || creationScenario) {
+                retainedOwner = releaseTeardown.promise.then(async () => {
+                  attemptTransport(creationScenario ? "disposal" : undefined);
+                  await options.sessionManager.close();
+                  completionSettled = true;
+                  if (scenario.endsWith("completion-rejected")) throw distinctive();
+                });
+                void retainedOwner.catch(() => {});
+                disposalStarted.resolve();
+                if (fixtureTimeout) return retainedOwner;
+                throw Object.assign(new Error("Session disposal exceeded its bounded caller deadline."),
+                  { name: "SessionDisposalIncompleteError" });
+              }
+              await options.sessionManager.close();
+              throw new AggregateError([new AggregateError([distinctive()], "nested SDK cleanup")], "SDK cleanup");
+            } };
+          if (publicOwner) raw.awaitDisposeCompletion = () => {
+            completionJoins += 1; completionJoined.resolve(); return retainedOwner;
+          };
+          return { session: raw };
+        },
+      };
+      let failure;
+      const observation = observePooledFailureLifecycle(dependencies, {
+        root, agentDir: root, modelsPath: root + "/models.json",
+        workDirs: { A: root + "/A", B: root + "/B", C: root + "/C" },
+      }, retainedScenario || creationScenario ? timers : undefined).catch(error => {
+        failure = { code: error.code, message: error.message, details: error.details };
+      }).finally(() => { observationSettled = true; });
+      if (creationScenario) {
+        await factoryStarted.promise;
+        await expireNextDeadline(30_000, "pool");
+        await cleanupReached.promise;
+        const finalTimer = await waitForDeadline(5_000, "guard", false);
+        if (afterObservation) {
+          expireDeadline(finalTimer);
+          await observation;
+          observationBeforeStartup = { startupCompleted, adapterConstructions, managerCloses,
+            restorationCount, restored: installed === original };
+        }
+        releaseFactory.resolve();
+        await disposalStarted.promise;
+        await completionJoined.promise;
+        await pendingCleanupObserved.promise;
+        // Flush admitted promise reactions, not an elapsed cleanup delay.
+        await new Promise(resolve => setImmediate(resolve));
+        beforeRetainedRelease = { observationSettled, completionSettled, restorationCount,
+          finalTimerActive: finalTimer.active, pendingCleanupStatus,
+          guardDeadlineSchedules: [...guardDeadlineSchedules] };
+        if (withhold && !afterObservation) {
+          expireDeadline(finalTimer);
+          await observation;
+        }
+        releaseTeardown.resolve();
+        await retainedOwner.catch(() => {});
+        await observation;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      if (retainedScenario) {
+        await disposalStarted.promise;
+        if (fixtureTimeout) await expireNextDeadline();
+        else await completionJoined.promise;
+        await cleanupReached.promise;
+        if (withhold) {
+          await expireNextDeadline();
+          await observation;
+          // Attempt transport only AFTER the bounded observer has failed.
+          // A stage flag or rejected public promise cannot release the guard.
+          releaseTeardown.resolve();
+        } else releaseTeardown.resolve();
+        await retainedOwner.catch(() => {});
+        if (publicOwner) await completionJoined.promise;
+      }
+      await observation;
+      if (creationScenario) {
+        globalThis.setTimeout = originalSetTimeout;
+        globalThis.clearTimeout = originalClearTimeout;
+      }
+      console.log(JSON.stringify({ schema: "issue62-sdk-isolation-probe-v1", failure,
+        managerCloses, managerCloseCounts, guardedCloses, disposals, factories, restorationCount, restored: installed === original,
+        escapedCalls, completionJoins, completionSettled, restoredBeforeSettlement, blockedAttempts, deadlineTimeouts,
+        adapterConstructions, adapterDisposals, startupCompleted, beforeRetainedRelease, observationBeforeStartup,
+        pendingCleanupStatus, guardDeadlineSchedules }));
+    `);
+    // Distinct canonical directories are required by the actual factory router.
+    for (const label of ["A", "B", "C"]) await mkdir(join(root, label));
+    const result = await spawnBun([], envInfo, runnerPath);
+    assert.equal(result.code, 0, sanitize(result.stderr, envInfo.roots));
+    assertNoDistinctiveSentinels(result.stdout, ["q7M4vN9xC2pL8rK", "longQuotedPrefixZ9", "longQuotedSuffixY8"]);
+    const rawOutput = JSON.parse(result.stdout.trim());
+    assertNoRawPaths(rawOutput.failure.details.cleanupErrors, envInfo.roots);
+    if (rawOutput.failure.details.originalDiagnostic) assertNoRawPaths(rawOutput.failure.details.originalDiagnostic, envInfo.roots);
+    if (scenario.startsWith("factory-diagnostic-")) assertNoRawPaths(rawOutput.failure, envInfo.roots);
+    const output = sanitize(parseReceipt(result.stdout, envInfo.roots), envInfo.roots);
+    if (scenario.startsWith("retained-") || scenario.startsWith("creation-")) return output;
+    assert.equal(output.restorationCount, 1);
+    assert.equal(output.restored, true);
+    const nestedPool = scenario === "nested-pool" || scenario === "nested-pool-long-secret";
+    assert.equal(output.managerCloses, nestedPool ? 2 : 1);
+    assert.deepEqual(output.managerCloseCounts, nestedPool ? [1, 1] : [1]);
+    assert.equal(output.factories, nestedPool ? 2 : 1);
+    assert.equal(output.guardedCloses, output.managerCloses);
+    assert.equal(output.disposals, scenario === "early" || scenario === "manager-rejection" || scenario.startsWith("factory-diagnostic-") ? 0 : 1);
+    assert.equal(output.failure.details.preconnectGuard.attempts, 0);
+    assert.equal(output.failure.details.preconnectGuard.checkedAfterTrackedTeardown, true);
+    return output.failure;
+  } finally {
+    await removeOwnedRoot(envInfo.roots[0]);
+  }
+}
+
+test("issue #62 actual factory failure closes caller manager once under guard", async () => {
+  const failure = await runPooledFailureProbe("early");
+  assert.equal(failure.code, "FACTORY_PRIMARY");
+  assert.equal(failure.message, "FACTORY_PRIMARY: factory primary");
+  assert.deepEqual(failure.details.cleanupErrors, []);
+});
+
+test("issue #62 manager rejection retains factory primary and redacted original cause", async () => {
+  const failure = await runPooledFailureProbe("manager-rejection");
+  assert.equal(failure.code, "FACTORY_PRIMARY");
+  const diagnostic = failure.details.cleanupErrors.find(item => item.operation === "create-A-manager-close");
+  assert.equal(diagnostic.details.error.code, "DISTINCTIVE_DISPOSAL");
+  assert.equal(diagnostic.details.error.cause.code, "INNER_CAUSE");
+  assert.equal(failure.details.cleanup.callerManagerOutcomes[0].closed, false);
+  assert.ok(failure.details.cleanup.leaks.some(item => item.kind === "caller-session-manager"));
+});
+
+test("issue #62 actual validation failure retains nested disposal rejection without double close", async () => {
+  const failure = await runPooledFailureProbe("validation");
+  assert.equal(failure.code, "API_CONTRACT_MISMATCH");
+  const diagnostic = failure.details.cleanupErrors.find(item => item.operation === "create-A-dispose");
+  assert.equal(diagnostic.details.error.errors[0].errors[0].code, "DISTINCTIVE_DISPOSAL");
+  assert.equal(failure.details.cleanup.sessionDisposals[0].closed, false);
+  assert.equal(failure.details.cleanup.sdkOwnedResourcesClosed, false);
+});
+
+test("issue #62 actual pool shutdown preserves nested SDK errors beside factory primary", async () => {
+  const failure = await runPooledFailureProbe("nested-pool");
+  assert.equal(failure.code, "FACTORY_PRIMARY");
+  const diagnostic = failure.details.cleanupErrors.find(item => item.operation === "pool-shutdown");
+  assert.equal(diagnostic.errors[0].errors[0].errors[0].code, "DISTINCTIVE_DISPOSAL");
+  assert.equal(diagnostic.errors[0].errors[0].errors[0].cause.code, "INNER_CAUSE");
+  assert.equal(failure.details.cleanup.sessionDisposals[0].closed, false);
+  assert.equal(failure.details.cleanup.poolShutdown, false);
+});
+
+test("issue #62 deep pooled cleanup redacts complete long quoted secrets before truncation", async () => {
+  const failure = await runPooledFailureProbe("nested-pool-long-secret");
+  assert.equal(failure.code, "FACTORY_PRIMARY");
+  const diagnostic = failure.details.cleanupErrors.find(item => item.operation === "pool-shutdown");
+  const original = diagnostic.errors[0].errors[0].errors[0];
+  assert.equal(original.code, "DISTINCTIVE_DISPOSAL");
+  assert.equal(original.cause.code, "INNER_CAUSE");
+  assert.match(original.error, /distinctive disposal <secret-redacted>/);
+  assert.ok(original.error.length <= 512);
+  assert.equal(failure.details.cleanup.sessionDisposals[0].closed, false);
+});
+
+for (const scenario of [
+  "retained-public-rejection-settled",
+  "retained-pool-public-rejection-settled",
+  "retained-public-rejection-completion-rejected",
+  "retained-public-timeout-settled",
+  "retained-raw-timeout-settled",
+  "retained-public-rejection-withheld",
+  "retained-public-timeout-withheld",
+  "retained-raw-timeout-withheld",
+]) {
+  test(`issue #62 ${scenario} keeps late teardown transport intercepted`, async () => {
+    const output = await runPooledFailureProbe(scenario);
+    const withheld = scenario.endsWith("withheld");
+    const timeout = scenario.includes("timeout");
+    const poolFailure = scenario.includes("pool-public");
+    const publicOwner = !scenario.includes("raw-timeout");
+    const failure = output.failure;
+    assert.equal(failure.code, poolFailure ? "FACTORY_PRIMARY" : "API_CONTRACT_MISMATCH");
+    assert.equal(output.disposals, 1, "no disposal retry after rejection or deadline");
+    assert.equal(output.managerCloses, poolFailure ? 2 : 1);
+    assert.equal(output.guardedCloses, output.managerCloses);
+    assert.equal(output.escapedCalls, 0, "neither late fetch nor preconnect reaches original transport");
+    assert.deepEqual(output.blockedAttempts, [
+      { kind: "fetch", code: "ENVIRONMENT_BLOCKED" },
+      { kind: "preconnect", code: "ENVIRONMENT_BLOCKED" },
+    ]);
+    assert.equal(output.completionSettled, true, "test releases the real retained owner deterministically");
+    assert.equal(output.completionJoins, publicOwner ? 1 : 0);
+    assert.equal(output.restoredBeforeSettlement, false);
+    assert.equal(output.restorationCount, withheld ? 0 : 1);
+    assert.equal(output.restored, !withheld);
+    assert.deepEqual(output.deadlineTimeouts, Array(Number(timeout) + Number(withheld)).fill(5_000));
+    const guard = failure.details.preconnectGuard;
+    assert.equal(guard.completionConfirmed, !withheld);
+    assert.equal(guard.checkedAfterTrackedTeardown, !withheld, "a teardown stage alone cannot certify completion");
+    assert.equal(guard.restored, !withheld);
+    assert.equal(guard.restorationBoundary, withheld ? "withheld-until-child-termination" : "after-owner-settlement");
+    assert.equal(guard.attempts, withheld ? 0 : 2, "withheld case attempts transport after the failure receipt");
+    if (!withheld) assert.deepEqual(guard.events.map(({ kind, stage }) => ({ kind, stage })), [
+      { kind: "fetch", stage: "sdk-teardown" },
+      { kind: "preconnect", stage: "sdk-teardown" },
+    ]);
+    const owner = guard.teardownOwners.find(owner => owner.label === (poolFailure ? "pool-A" : "create-A"));
+    assert.equal(owner.retainedCompletion, publicOwner);
+    assert.equal(owner.publicStatus, timeout ? (withheld ? "pending" : "fulfilled") : "rejected");
+    assert.equal(owner.completionStatus, withheld ? "pending" : scenario.endsWith("completion-rejected") ? "rejected" : "fulfilled");
+    const disposalFailure = failure.details.cleanupErrors.find(error =>
+      error.operation === (poolFailure ? "pool-shutdown" : "create-A-dispose"));
+    assert.ok(disposalFailure, "original disposal failure survives the later settlement");
+    if (timeout) {
+      assert.equal(disposalFailure.code, "SESSION_LIFECYCLE_FAILURE");
+      assert.match(disposalFailure.error, /raw session disposal timed out/);
+      assert.equal(disposalFailure.details.timeoutMs, 5_000);
+    } else {
+      assert.match(JSON.stringify(disposalFailure), /"name":"SessionDisposalIncompleteError"/);
+      assert.match(JSON.stringify(disposalFailure), /Session disposal exceeded its bounded caller deadline\./);
+    }
+    if (scenario.endsWith("completion-rejected")) {
+      const retainedFailure = failure.details.cleanupErrors.find(error => error.operation === "create-A-retained-completion");
+      assert.equal(retainedFailure.code, "DISTINCTIVE_DISPOSAL");
+      assert.equal(retainedFailure.cause.code, "INNER_CAUSE");
+    }
+    assert.equal(failure.details.cleanup.sessionDisposals[0].closed, false,
+      "late completion cannot rewrite a failed public close into success");
+    assert.equal(failure.details.cleanup.sdkOwnedResourcesClosed, false);
+  });
+}
+
+for (const scenario of [
+  "creation-after-observation-withheld",
+  "creation-during-join-fulfilled",
+  "creation-during-join-completion-rejected",
+  "creation-during-join-withheld",
+  "creation-during-join-pending-cleanup-rejected",
+]) {
+  test(`issue #62 ${scenario} retains factory-driven teardown admission`, async () => {
+    const output = await runPooledFailureProbe(scenario);
+    const afterObservation = scenario === "creation-after-observation-withheld";
+    const withheld = scenario.endsWith("withheld");
+    const pendingCleanupRejects = scenario.endsWith("pending-cleanup-rejected");
+    const completionRejects = scenario.endsWith("completion-rejected");
+    const failure = output.failure;
+    assert.equal(failure.code, "SESSION_CREATE_TIMEOUT");
+    assert.equal(failure.message, "SESSION_CREATE_TIMEOUT: GJC SDK session creation timed out");
+    assert.equal(failure.details.originalDiagnostic.code, "SESSION_CREATE_TIMEOUT");
+    assert.equal(output.factories, 1);
+    assert.equal(output.adapterConstructions, 1, "late factory retains its injected adapter binding");
+    assert.equal(output.adapterDisposals, 1);
+    assert.equal(output.disposals, 1);
+    assert.equal(output.managerCloses, 1);
+    assert.deepEqual(output.managerCloseCounts, [1]);
+    assert.equal(output.guardedCloses, 1);
+    assert.equal(output.completionJoins, 1);
+    assert.equal(output.startupCompleted, true);
+    assert.equal(output.completionSettled, true);
+    assert.equal(output.escapedCalls, 0, "startup and disposal never reach original transport");
+    assert.deepEqual(output.blockedAttempts, ["startup", "disposal"].flatMap(phase =>
+      ["fetch", "preconnect"].map(kind => ({ phase, kind, code: "ENVIRONMENT_BLOCKED" }))));
+    assert.equal(output.restoredBeforeSettlement, false);
+    assert.equal(output.restorationCount, withheld ? 0 : 1, "withholding cannot be undone by late settlement");
+    assert.equal(output.restored, !withheld);
+    assert.deepEqual(output.deadlineTimeouts, withheld ? [30_000, 5_000] : [30_000]);
+    assert.deepEqual(output.guardDeadlineSchedules, [5_000], "one final budget, never restarted for another owner batch");
+    assert.deepEqual(output.beforeRetainedRelease, {
+      observationSettled: afterObservation,
+      completionSettled: false,
+      restorationCount: 0,
+      finalTimerActive: !afterObservation,
+      pendingCleanupStatus: pendingCleanupRejects ? "rejected" : "fulfilled",
+      guardDeadlineSchedules: [5_000],
+    }, "public pendingCleanup settlement cannot close admission ahead of retained raw teardown");
+    if (afterObservation) assert.deepEqual(output.observationBeforeStartup, {
+      startupCompleted: false, adapterConstructions: 0, managerCloses: 0,
+      restorationCount: 0, restored: false,
+    });
+    const guard = failure.details.preconnectGuard;
+    assert.equal(guard.completionConfirmed, !withheld);
+    assert.equal(guard.checkedAfterTrackedTeardown, !withheld);
+    assert.equal(guard.restored, !withheld);
+    assert.equal(guard.restorationBoundary, withheld ? "withheld-until-child-termination" : "after-owner-settlement");
+    assert.equal(guard.attempts, afterObservation ? 0 : withheld ? 2 : 4);
+    const root = guard.teardownOwners.find(owner => owner.label === "factory-pending-cleanup");
+    assert.ok(root, "retained factory/pendingCleanup root is registered before finalization");
+    assert.equal(root.retainedCompletion, false);
+    assert.equal(root.publicStatus, afterObservation ? "pending" : pendingCleanupRejects ? "rejected" : "fulfilled");
+    assert.equal(root.completionStatus, root.publicStatus);
+    const late = guard.teardownOwners.find(owner => owner.label === "pool-A");
+    if (afterObservation) assert.equal(late, undefined, "late disposal is admitted only after failure capture");
+    else {
+      assert.ok(late, "dynamic final drain includes the late adapter/raw owner");
+      assert.equal(late.publicStatus, "rejected");
+      assert.equal(late.retainedCompletion, true);
+      assert.equal(late.completionStatus, withheld ? "pending" : completionRejects ? "rejected" : "fulfilled");
+      const publicFailure = failure.details.cleanupErrors.find(error => error.operation === "pool-A-public-dispose");
+      assert.equal(publicFailure.name, "SessionDisposalIncompleteError");
+      assert.equal(publicFailure.error, "Session disposal exceeded its bounded caller deadline.");
+    }
+    if (completionRejects) {
+      const retainedFailure = failure.details.cleanupErrors.find(error => error.operation === "pool-A-retained-completion");
+      assert.equal(retainedFailure.code, "DISTINCTIVE_DISPOSAL");
+      assert.equal(retainedFailure.cause.code, "INNER_CAUSE");
+    }
+    if (pendingCleanupRejects) {
+      const cleanupFailure = failure.details.cleanupErrors.find(error => error.operation === "factory-pending-cleanup");
+      assert.equal(cleanupFailure.code, "SESSION_RETIREMENT_FAILED");
+    }
+    assert.equal(failure.details.cleanup.sdkOwnedResourcesClosed, false,
+      "late owner settlement does not rewrite the failed observation into successful cleanup");
+  });
+}
+
+for (const form of ["attached", "aggregate"]) {
+  test(`issue #62 factory ${form} diagnostics preserve non-enumerable SDK cleanup failures`, async () => {
+    const failure = await runPooledFailureProbe(`factory-diagnostic-${form}`);
+    assert.equal(failure.code, form === "attached" ? "FACTORY_PRIMARY" : "PROBE_FAILURE");
+    assert.equal(failure.message, `${failure.code}: factory primary`);
+    const original = failure.details.originalDiagnostic;
+    assert.equal(original.stage, "create-A");
+    const startup = original.startupCleanupDiagnostic;
+    assert.equal(startup.code, "STARTUP_RESOURCE_CLEANUP_FAILED");
+    assert.equal(startup.cause.name, "AggregateError");
+    assert.equal(startup.cause.code, "STARTUP_CLEANUP_AGGREGATE");
+    assert.equal(startup.cause.errors[0].code, "DISTINCTIVE_DISPOSAL");
+    assert.equal(startup.cause.errors[0].cause.code, "INNER_CAUSE");
+    const primary = form === "aggregate" ? original.cause : original;
+    assert.equal(primary.code, "FACTORY_PRIMARY");
+    assert.equal(primary.error, "factory primary");
+    assert.equal(primary.cause.code, "FACTORY_CAUSE");
+    assert.equal(primary.cleanupDiagnostic.code, "MCP_MANAGER_CLEANUP_FAILED");
+    assert.equal(primary.cleanupDiagnostic.cause.code, "DISTINCTIVE_DISPOSAL");
+    assert.equal(primary.cleanupDiagnostic.cause.cause.code, "INNER_CAUSE");
+    if (form === "aggregate") {
+      assert.equal(original.name, "AggregateError");
+      assert.equal(original.errors[0].code, "FACTORY_PRIMARY");
+      assert.equal(original.errors[1].code, "STARTUP_CLEANUP_AGGREGATE");
+      assert.equal(original.errors[1].errors[0].code, "DISTINCTIVE_DISPOSAL");
+      assert.equal(original.errors[0].cleanupDiagnostic.code, "MCP_MANAGER_CLEANUP_FAILED");
+    }
+    const serialized = JSON.stringify(original);
+    assert.ok(serialized.length < 12_000, "diagnostic remains bounded");
+    assertNoDistinctiveSentinels(serialized, ["q7M4vN9xC2pL8rK"]);
+    assertNoRawPaths(original);
+    assert.match(serialized, /<secret-redacted>/);
+    assert.match(serialized, /<(?:wrapper-root|fixture-root|path-redacted)>/);
+    assert.deepEqual(failure.details.cleanupErrors, []);
+  });
+}
+
+async function withImmediateRemovalProbe(run) {
+  const { observeImmediateFixtureRemoval } = await import(pathToFileURL(fixture).href);
+  const root = resolve(await mkdtemp(join(tmpdir(), FIXTURE_ROOT_PREFIX)));
+  wrapperOwnedRoots.add(root);
+  try {
+    await run(root, observeImmediateFixtureRemoval);
+  } finally {
+    await removeOwnedRoot(root);
+  }
+}
+
+async function withLauncherCacheProbe(run) {
+  const { validateLauncherCacheRoot } = await import(pathToFileURL(fixture).href);
+  const envInfo = await stableEnv("native-cache");
+  const root = await realpath(await mkdtemp(join(envInfo.env.TMP, FIXTURE_ROOT_PREFIX)));
+  wrapperOwnedRoots.add(root);
+  try {
+    await run(root, envInfo, validateLauncherCacheRoot);
+  } finally {
+    if (wrapperOwnedRoots.has(root)) await removeOwnedRoot(root);
+    if (wrapperOwnedRoots.has(envInfo.roots[0])) await removeOwnedRoot(envInfo.roots[0]);
+  }
+}
+
+test("issue #62 native cache is a separate launcher-owned root within the disposable wrapper", async () => {
+  await withLauncherCacheProbe(async (root, envInfo, validate) => {
+    const cache = await validate(root, envInfo.env);
+    assert.equal(cache.wrapperRoot, envInfo.roots[0]);
+    assert.equal(cache.launcherRoot, join(cache.wrapperRoot, "launcher"));
+    assert.equal(cache.dataHome, envInfo.env.XDG_DATA_HOME);
+    assert.equal(cache.nativesDir, join(cache.launcherRoot, "data", "gjc", "natives"));
+    assert.equal(dirname(root), join(cache.wrapperRoot, "tmp"));
+    assert.notEqual(dirname(root), cache.launcherRoot);
+    assert.equal(existsSync(join(cache.dataHome, "gjc")), true, "official loader requires a pre-existing gjc directory");
+  });
+});
+
+test("issue #62 cache scope refuses missing, relative, session-nested and external environment roots", async () => {
+  await withLauncherCacheProbe(async (root, envInfo, validate) => {
+    for (const overrides of [
+      { XDG_DATA_HOME: undefined },
+      { XDG_DATA_HOME: "relative-native-cache" },
+      { XDG_DATA_HOME: root },
+      { XDG_DATA_HOME: join(root, "data") },
+      { XDG_DATA_HOME: repoRoot },
+      { HOME: repoRoot },
+      { USERPROFILE: repoRoot },
+      { TEMP: repoRoot },
+      { TMP: root },
+    ]) {
+      await assert.rejects(validate(root, { ...envInfo.env, ...overrides }), { code: "CLEANUP_SCOPE_VIOLATION" });
+    }
+    for (const candidate of [envInfo.launcherRoot, envInfo.roots[0], envInfo.env.TMP, repoRoot]) {
+      await assert.rejects(validate(candidate, envInfo.env), { code: "CLEANUP_SCOPE_VIOLATION" });
+    }
+    assert.equal(existsSync(root), true, "scope rejection does not remove session scratch");
+  });
+});
+
+for (const redirected of ["session", "natives"]) {
+  test(`issue #62 cache scope refuses a redirected ${redirected} directory`, async () => {
+    await withLauncherCacheProbe(async (root, envInfo, validate) => {
+      const cache = await validate(root, envInfo.env);
+      const target = join(envInfo.roots[0], "outside-cache");
+      await mkdir(target);
+      await writeFile(join(target, "preserved"), "do not remove through link");
+      const link = redirected === "session" ? root : cache.nativesDir;
+      await rm(link, { recursive: true, force: false, maxRetries: 0 });
+      await symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+      await assert.rejects(validate(root, envInfo.env), { code: "CLEANUP_SCOPE_VIOLATION" });
+      assert.equal(await readFile(join(target, "preserved"), "utf8"), "do not remove through link");
+    });
+  });
+}
+
+test("issue #62 cache scope refuses session data in launcher storage and missing loader prerequisites", async () => {
+  await withLauncherCacheProbe(async (root, envInfo, validate) => {
+    const dataRoot = join(envInfo.env.XDG_DATA_HOME, "gjc");
+    await writeFile(join(dataRoot, "agent.db"), "not a native cache resource");
+    await assert.rejects(validate(root, envInfo.env), { code: "CLEANUP_SCOPE_VIOLATION" });
+    assert.equal(await readFile(join(dataRoot, "agent.db"), "utf8"), "not a native cache resource");
+    await rm(dataRoot, { recursive: true, force: false, maxRetries: 0 });
+    await assert.rejects(validate(root, envInfo.env), { code: "ENOENT" });
+    assert.equal(existsSync(dataRoot), false, "validation never repairs the missing XDG prerequisite or falls back to home");
+  });
+});
+
+test("issue #62 parent cache cleanup refuses pre-exit, external and redirected roots", async () => {
+  await withLauncherCacheProbe(async (root, envInfo) => {
+    await assert.rejects(removeLauncherCache(envInfo, { childExited: false }), /observed child exit/);
+    await assert.rejects(removeLauncherCache({ ...envInfo, launcherRoot: root }, { childExited: true }), /exact launcher root/);
+    await assert.rejects(removeLauncherCache({ ...envInfo, roots: [repoRoot] }, { childExited: true }), /belong to this wrapper/);
+    const displaced = join(envInfo.roots[0], "displaced-launcher");
+    await rename(envInfo.launcherRoot, displaced);
+    await symlink(displaced, envInfo.launcherRoot, process.platform === "win32" ? "junction" : "dir");
+    await assert.rejects(removeLauncherCache(envInfo, { childExited: true }), /redirected launcher cache/);
+    assert.equal(existsSync(join(displaced, "data", "gjc", "natives")), true);
+    assert.equal(existsSync(root), true);
+  });
+});
+
+test("issue #62 modeled native cache outlives immediate session removal and is removed only after child exit", async () => {
+  await withLauncherCacheProbe(async (root, envInfo, validate) => {
+    const cache = await validate(root, envInfo.env);
+    // This marker models ownership lifetime, not a DLL unload or SDK pass.
+    const marker = join(cache.nativesDir, "modeled-process-lifetime.node");
+    await writeFile(marker, "modeled cache bytes");
+    const runner = join(envInfo.roots[0], "cache-lifetime-runner.mjs");
+    await writeFile(runner, `
+      import { existsSync } from "node:fs";
+      import { mkdir, writeFile } from "node:fs/promises";
+      import { join } from "node:path";
+      import { observeImmediateFixtureRemoval, validateLauncherCacheRoot } from ${JSON.stringify(pathToFileURL(fixture).href)};
+      const root = ${JSON.stringify(root)};
+      const cache = await validateLauncherCacheRoot(root);
+      const events = [];
+      const removal = await observeImmediateFixtureRemoval(root, async owned => {
+        for (const name of ["auth", "model-cache", "settings", "workdir"]) {
+          await mkdir(join(owned, name));
+          await writeFile(join(owned, name, "owned-marker"), "session-owned");
+          events.push(name + "-close");
+        }
+      });
+      events.push("session-removed");
+      console.log(JSON.stringify({ schema: "issue62-sdk-isolation-probe-v1", modeledCacheLifetime: true,
+        removal, events, scratchAbsentBeforeChildExit: !existsSync(root),
+        cachePresentBeforeChildExit: existsSync(join(cache.nativesDir, "modeled-process-lifetime.node")) }));
+    `);
+    await assert.rejects(removeLauncherCache(envInfo), /observed child exit/);
+    const result = await spawnBun([], envInfo, runner);
+    assert.equal(result.code, 0, `cache lifetime child failed: ${sanitize(result.stderr, envInfo.roots)}`);
+    const receipt = parseReceipt(result.stdout, envInfo.roots);
+    assert.equal(receipt.modeledCacheLifetime, true);
+    assert.equal(receipt.scratchAbsentBeforeChildExit, true);
+    assert.equal(receipt.cachePresentBeforeChildExit, true);
+    assert.equal(receipt.removal.attempts, 1);
+    assert.equal(receipt.removal.removed, true);
+    assert.equal(receipt.removal.immediateAfterPublicClose, true);
+    assert.equal(receipt.removal.beforeChildExit, true);
+    assert.deepEqual(receipt.events, ["auth-close", "model-cache-close", "settings-close", "workdir-close", "session-removed"]);
+    assert.equal(existsSync(root), false);
+    assert.equal(await readFile(marker, "utf8"), "modeled cache bytes");
+    const cleanup = await removeLauncherCache(envInfo, result);
+    assert.equal(cleanup.removed, true);
+    assert.equal(cleanup.attempts, 1);
+    assert.equal(cleanup.scope, "launcher-cache-only");
+    assert.equal(cleanup.afterChildExit, true);
+    assert.equal(cleanup.immediateAfterPublicClose, false);
+    assert.equal(cleanup.immediateSessionCloseProof, false);
+    assert.equal(existsSync(cache.launcherRoot), false);
+  });
+});
+
+test("issue #62 fixture lifecycle closes before immediate owned scratch removal", async () => {
+  await withImmediateRemovalProbe(async (root, observe) => {
+    const events = [];
+    const outcome = await observe(root, async owned => {
+      await writeFile(join(owned, "owned-marker"), "fixture only");
+      events.push("auth-close", "model-cache-close");
+    }, async (owned, options) => {
+      events.push("remove");
+      assert.equal(owned, await realpath(root));
+      assert.deepEqual(options, { recursive: true, force: false, maxRetries: 0 });
+      await rm(owned, options);
+    });
+    assert.deepEqual(events, ["auth-close", "model-cache-close", "remove"]);
+    assert.equal(existsSync(root), false);
+    assert.equal(outcome.removed, true);
+    assert.equal(outcome.attempts, 1);
+    assert.equal(outcome.immediateAfterPublicClose, true);
+    assert.equal(outcome.beforeChildExit, true);
+    assert.equal(outcome.firstFailure, null);
+  });
+});
+
+for (const code of ["EACCES", "EBUSY", "ENOTEMPTY", "EPERM", "EIO"]) {
+  test(`issue #62 immediate ${code} removal failure is retained without retry or repair`, async () => {
+    await withImmediateRemovalProbe(async (root, observe) => {
+      let removals = 0;
+      await assert.rejects(observe(root, async owned => {
+        await writeFile(join(owned, "owned-marker"), "fixture only");
+      }, async () => {
+        removals += 1;
+        throw Object.assign(new Error("distinctive removal failure"), { code, syscall: "rmdir" });
+      }), error => {
+        assert.equal(error.code, "SESSION_LIFECYCLE_FAILURE");
+        assert.equal(error.details.fixtureRemoval.attempts, 1);
+        assert.equal(error.details.fixtureRemoval.removed, false);
+        assert.equal(error.details.fixtureRemoval.firstFailure.code, code);
+        assert.equal(error.details.fixtureRemoval.firstFailure.syscall, "rmdir");
+        assert.equal(error.details.fixtureRemoval.classification, "immediate-removal-failed");
+        return true;
+      });
+      assert.equal(removals, 1);
+      assert.equal(await readFile(join(root, "owned-marker"), "utf8"), "fixture only");
+    });
+  });
+}
+
+test("issue #62 resolved removal without absence cannot pass", async () => {
+  await withImmediateRemovalProbe(async (root, observe) => {
+    let removals = 0;
+    await assert.rejects(observe(root, async () => {}, async () => { removals += 1; }), error => {
+      assert.equal(error.code, "SESSION_LIFECYCLE_FAILURE");
+      assert.equal(error.details.fixtureRemoval.removed, false);
+      return true;
+    });
+    assert.equal(removals, 1);
+    assert.equal(existsSync(root), true);
+  });
+});
+
+test("issue #62 public close rejection is not hidden by scratch removal", async () => {
+  await withImmediateRemovalProbe(async (root, observe) => {
+    const failure = new Error("public close failed");
+    let removals = 0;
+    await assert.rejects(observe(root, async () => { throw failure; }, async () => { removals += 1; }),
+      error => error === failure);
+    assert.equal(removals, 0);
+    assert.equal(existsSync(root), true);
+  });
+});
+
+test("issue #62 immediate cleanup fails rather than repairing process cwd", async () => {
+  await withImmediateRemovalProbe(async (root, observe) => {
+    const cwd = process.cwd();
+    let removals = 0;
+    try {
+      await assert.rejects(observe(root, async owned => { process.chdir(owned); },
+        async () => { removals += 1; }), error => {
+        assert.equal(error.code, "SESSION_LIFECYCLE_FAILURE");
+        assert.equal(error.details.fixtureRemoval.cwd.insideFixtureBefore, true);
+        assert.equal(error.details.fixtureRemoval.attempts, 0);
+        return true;
+      });
+      assert.equal(removals, 0);
+      assert.equal(await realpath(process.cwd()), await realpath(root));
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+});
+
+test("issue #62 immediate cleanup refuses nonempty or non-prefixed wrapper roots", async () => {
+  await withImmediateRemovalProbe(async (root, observe) => {
+    let closes = 0;
+    let removals = 0;
+    const close = async () => { closes += 1; };
+    const remove = async () => { removals += 1; };
+    await writeFile(join(root, "preexisting"), "do not touch");
+    await assert.rejects(observe(root, close, remove), { code: "CLEANUP_SCOPE_VIOLATION" });
+    await assert.rejects(observe(dirname(root), close, remove), { code: "CLEANUP_SCOPE_VIOLATION" });
+    assert.equal(closes, 0);
+    assert.equal(removals, 0);
+    assert.equal(await readFile(join(root, "preexisting"), "utf8"), "do not touch");
+  });
+});
+
 async function removeOwnedRoot(root) {
   root = resolve(root);
   assert.equal(wrapperOwnedRoots.has(root), true, "refusing to remove a root not created by this wrapper");
@@ -224,51 +1085,58 @@ async function removeOwnedRoot(root) {
       attempts: 0,
     };
   }
-  let lastError;
-  let firstFailureCode = null;
-  for (let attempt = 1; attempt <= 20; attempt += 1) {
-    try {
-      await rm(root, { recursive: true, force: true });
-      const removed = !existsSync(root);
-      assert.equal(removed, true, "wrapper-owned root still existed after rm resolved");
-      wrapperOwnedRoots.delete(root);
-      return {
-        scope: "wrapper-owned-root-only",
-        attempted: true,
-        existedBefore,
-        removed,
-        attempts: attempt,
-        firstFailureCode,
-      };
-    } catch (error) {
-      lastError = error;
-      firstFailureCode ??= error?.code ?? "UNKNOWN";
-      if (!ROOT_REMOVAL_RETRY_CODES.has(error?.code)) {
-        const failure = new Error("wrapper-owned root removal failed");
-        failure.cleanup = {
-          scope: "wrapper-owned-root-only",
-          attempted: true,
-          existedBefore,
-          removed: !existsSync(root),
-          attempts: attempt,
-          errorCode: error?.code ?? "UNKNOWN",
-          syscall: error?.syscall ?? null,
-        };
-        throw failure;
-      }
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
+  try {
+    await rm(root, { recursive: true, force: false, maxRetries: 0 });
+    assert.equal(existsSync(root), false, "wrapper-owned root still existed after rm resolved");
+    wrapperOwnedRoots.delete(root);
+    return { scope: "wrapper-owned-root-only", attempted: true, existedBefore, removed: true, attempts: 1 };
+  } catch (error) {
+    // Do not retry the failed root again from the wrapper's outer finally.
+    wrapperOwnedRoots.delete(root);
+    const failure = new Error("wrapper-owned root removal failed", { cause: error });
+    failure.cleanup = {
+      scope: "wrapper-owned-root-only",
+      attempted: true,
+      existedBefore,
+      removed: !existsSync(root),
+      attempts: 1,
+      errorCode: error?.code ?? "UNKNOWN",
+      syscall: error?.syscall ?? null,
+    };
+    throw failure;
   }
-  const failure = new Error("wrapper-owned root remained after bounded removal");
-  failure.cleanup = {
-    scope: "wrapper-owned-root-only",
-    attempted: true,
-    existedBefore,
-    removed: !existsSync(root),
-    attempts: 20,
-    errorCode: lastError?.code ?? "UNKNOWN",
-  };
-  throw failure;
+}
+
+async function removeLauncherCache(envInfo, childResult) {
+  assert.equal(childResult?.childExited, true, "launcher cache removal requires observed child exit");
+  const wrapperRoot = envInfo.roots[0];
+  assert.equal(wrapperOwnedRoots.has(wrapperRoot), true, "launcher cache must belong to this wrapper");
+  const root = envInfo.launcherRoot;
+  assert.equal(root, join(wrapperRoot, "launcher"), "refusing a cache outside the exact launcher root");
+  assert.equal(await realpath(root), root, "refusing a redirected launcher cache root");
+  wrapperOwnedRoots.add(root);
+  try {
+    return {
+      ...await removeOwnedRoot(root),
+      owner: "wrapper",
+      scope: "launcher-cache-only",
+      afterChildExit: true,
+      immediateAfterPublicClose: false,
+      immediateSessionCloseProof: false,
+    };
+  } catch (error) {
+    // Removing an ancestor in finally would retry this failed cache cleanup.
+    wrapperOwnedRoots.delete(wrapperRoot);
+    error.cleanup = {
+      ...error.cleanup,
+      owner: "wrapper",
+      scope: "launcher-cache-only",
+      afterChildExit: true,
+      immediateAfterPublicClose: false,
+      immediateSessionCloseProof: false,
+    };
+    throw error;
+  }
 }
 
 async function validateReceipt(receipt, order, roots = []) {
@@ -279,6 +1147,12 @@ async function validateReceipt(receipt, order, roots = []) {
   assert.equal(receipt.sdkVersionObserved, SDK_VERSION);
   assert.equal(receipt.daemonDependencyVersion, SDK_VERSION);
   assert.equal(receipt.lockfileVersionEvidence, SDK_VERSION);
+  assert.deepEqual(receipt.sdkDependencyProvenance, ["agent-core", "ai"].map(name => ({
+    packageName: `@gajae-code/${name}`,
+    installedVersion: SDK_VERSION,
+    lockedVersion: SDK_VERSION,
+    declaredVersion: SDK_VERSION,
+  })));
   assert.equal(versionAtLeast(receipt.bunVersion, MIN_BUN_VERSION), true);
   assert.deepEqual(receipt.order, order.split(","));
   assert.deepEqual(receipt.changeSet.files, CHANGE_FILES);
@@ -317,7 +1191,17 @@ async function validateReceipt(receipt, order, roots = []) {
   assert.deepEqual(receipt.failureCodes, []);
   assert.equal(receipt.preconnectGuard.available, true);
   assert.deepEqual(receipt.preconnectGuard.events, []);
+  assert.equal(receipt.preconnectGuard.attempts, 0);
   assert.equal(receipt.preconnectGuard.observed, false);
+  assert.equal(receipt.preconnectGuard.checkedAfterTrackedTeardown, true);
+  assert.equal(receipt.preconnectGuard.restored, true);
+  assert.equal(receipt.preconnectGuard.completionConfirmed, true);
+  assert.equal(receipt.preconnectGuard.restorationBoundary, "after-owner-settlement");
+  assert.deepEqual(receipt.preconnectGuard.teardownOwners.map(owner => owner.label).sort(), ["pool-A", "pool-B"]);
+  assert.ok(receipt.preconnectGuard.teardownOwners.every(owner =>
+    owner.publicStatus === "fulfilled" && owner.completionStatus === "fulfilled" && owner.retainedCompletion === true));
+  assert.match(receipt.preconnectGuard.scope, /guarded SDK\/daemon imports through tracked resource teardown/);
+  assert.match(receipt.preconnectGuard.scope, /excludes other network APIs, calls after restoration/);
   assert.equal(receipt.networkPrewarm.global, false);
   assert.equal(receipt.networkPrewarm.A, false);
   assert.equal(receipt.networkPrewarm.B, false);
@@ -463,38 +1347,52 @@ async function validateReceipt(receipt, order, roots = []) {
   assert.match(receipt.cleanup.sdkLifecycleSourceContract.sharedModelCache, /exact fixture models\.db/);
   assert.match(receipt.cleanup.sdkLifecycleSourceContract.processGlobalDrain, /No aggregate process-global drain/);
   assert.equal(receipt.cleanup.fixtureRemoved, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.owner, "parent-wrapper");
+  assert.equal(receipt.cleanup.fixtureRemoval.owner, "child");
   assert.equal(receipt.cleanup.fixtureRemoval.scope, "fixture-root-only");
-  assert.equal(receipt.cleanup.fixtureRemoval.child.attempted, false);
-  assert.equal(receipt.cleanup.fixtureRemoval.child.removed, false);
-  assert.equal(receipt.cleanup.fixtureRemoval.child.observedPresentAtReceipt, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.child.cwdInsideFixtureAtReceipt, false);
-  assert.equal(receipt.cleanup.fixtureRemoval.child.activeResourcesAtReceipt.available, true);
-  assert.equal(typeof receipt.cleanup.fixtureRemoval.child.activeResourcesAtReceipt.counts, "object");
-  assert.equal(
-    receipt.cleanup.fixtureRemoval.child.reason,
-    "Process-owned SDK resources may release only when the child exits.",
-  );
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.pending, false);
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.pendingAtChildReceipt, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.mustRunAfterChildExit, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.ranAfterChildExit, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.existedAfterChildExit, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.fixtureEvidencePresentAfterChildExit, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.attempted, true);
-  assert.equal(receipt.cleanup.fixtureRemoval.parent.removed, true);
-  assert.ok(receipt.cleanup.fixtureRemoval.parent.attempts >= 1);
-  assert.ok(
-    receipt.cleanup.fixtureRemoval.parent.firstFailureCode === null ||
-    typeof receipt.cleanup.fixtureRemoval.parent.firstFailureCode === "string",
-  );
-  assert.match(receipt.cleanup.fixtureRemoval.parent.completedAt, /^\d{4}-\d{2}-\d{2}T/);
-  assert.equal(receipt.cleanup.fixtureRemoval.removedBy, "parent-wrapper-after-child-exit");
-  assert.match(receipt.cleanup.fixtureRemoval.semantics, /neither reproduces nor attributes.*specific SDK store or handle/);
+  assert.equal(receipt.cleanup.fixtureRemoval.attempted, true);
+  assert.equal(receipt.cleanup.fixtureRemoval.removed, true);
+  assert.equal(receipt.cleanup.fixtureRemoval.attempts, 1);
+  assert.equal(receipt.cleanup.fixtureRemoval.immediateAfterPublicClose, true);
+  assert.equal(receipt.cleanup.fixtureRemoval.beforeChildExit, true);
+  assert.equal(receipt.cleanup.fixtureRemoval.cwd.insideFixtureBefore, false);
+  assert.equal(receipt.cleanup.fixtureRemoval.firstFailure, null);
+  assert.equal(receipt.cleanup.fixtureRemoval.classification, "removed-first-attempt");
+  assert.equal(receipt.cleanup.fixtureRemoval.activeResourcesBefore.available, true);
+  assert.equal(typeof receipt.cleanup.fixtureRemoval.activeResourcesBefore.counts, "object");
+  assert.equal(receipt.cleanup.parentSalvage.existedBefore, false);
+  assert.equal(receipt.cleanup.parentSalvage.attempted, false);
+  assert.equal(receipt.cleanup.parentSalvage.attempts, 0);
+  assert.deepEqual(receipt.cleanup.nativeCache, {
+    owner: "wrapper",
+    scope: "launcher-cache-only",
+    lifetime: "child-process",
+    configuration: "XDG_DATA_HOME/gjc/natives",
+    configuredBeforeSdkImport: true,
+    insideWrapperRoot: true,
+    outsideSessionScratch: true,
+    presentAfterSessionRemoval: true,
+    stagedAddonPresent: receipt.platform.platform === "win32",
+    childRemovalAttempted: false,
+    cleanupBoundary: "parent-after-child-exit",
+    immediateSessionCloseProof: false,
+  });
+  assert.deepEqual(receipt.cleanup.parentCacheRemoval, {
+    owner: "wrapper",
+    scope: "launcher-cache-only",
+    attempted: true,
+    existedBefore: true,
+    removed: true,
+    attempts: 1,
+    afterChildExit: true,
+    immediateAfterPublicClose: false,
+    immediateSessionCloseProof: false,
+  });
   assert.deepEqual(receipt.cleanup.leaks, []);
   assert.match(receipt.cleanup.leakScope, /filesystem removal is reported separately/);
   assert.equal(receipt.cleanup.storeOutcomes.length, 4);
   assert.ok(receipt.cleanup.storeOutcomes.every(outcome => outcome.closed));
+  assert.deepEqual(receipt.cleanup.storeOutcomes.map(outcome => outcome.name),
+    ["model-registry-C", "auth-C", "settings-C", "model-cache"]);
   assert.equal(receipt.artifactName, null);
   assert.match(receipt.customFactoryBoundary, /Profile activation and live provider transport are not covered\./);
   assert.equal(receipt.coverage.auth, "SDK-owned empty fixture auth for A/B; fixture-owned empty auth for C");
@@ -532,12 +1430,6 @@ async function runOrder(order) {
     wrapperOwnedRoots.add(fixtureRoot);
     const result = await spawnFixture(order, envInfo, fixtureRoot);
     const existedAfterChildExit = existsSync(fixtureRoot);
-    const fixtureEvidencePresentAfterChildExit = [
-      "marker-A.txt",
-      "marker-B.txt",
-      "marker-C.txt",
-      join("home", ".gjc", "agent", "config.yml"),
-    ].every(entry => existsSync(join(fixtureRoot, entry)));
     let parentRemoval;
     let parentRemovalError;
     try {
@@ -553,30 +1445,31 @@ async function runOrder(order) {
         errorCode: error?.code ?? "UNKNOWN",
       };
     }
+    let parentCacheRemoval;
+    let parentCacheRemovalError;
+    try {
+      parentCacheRemoval = await removeLauncherCache(envInfo, result);
+    } catch (error) {
+      parentCacheRemovalError = error;
+      parentCacheRemoval = error?.cleanup ?? {
+        owner: "wrapper",
+        scope: "launcher-cache-only",
+        attempted: false,
+        removed: false,
+        afterChildExit: true,
+        immediateAfterPublicClose: false,
+        immediateSessionCloseProof: false,
+        errorCode: error?.code ?? "UNKNOWN",
+      };
+    }
+    if (parentRemovalError) wrapperOwnedRoots.delete(envInfo.roots[0]);
     const receipt = parseReceipt(result.stdout, envInfo.roots);
-    const childRemoval = receipt.cleanup?.fixtureRemoval;
     receipt.cleanup = {
       ...receipt.cleanup,
-      fixtureRemoved: parentRemoval.removed,
-      fixtureRemoval: {
-        ...childRemoval,
-        parent: {
-          pendingAtChildReceipt: childRemoval?.parent?.pending === true,
-          pending: false,
-          mustRunAfterChildExit: true,
-          ranAfterChildExit: true,
-          existedAfterChildExit,
-          fixtureEvidencePresentAfterChildExit,
-          attempted: parentRemoval.attempted,
-          removed: parentRemoval.removed,
-          attempts: parentRemoval.attempts,
-          firstFailureCode: parentRemoval.firstFailureCode ?? null,
-          completedAt: new Date().toISOString(),
-          ...(parentRemoval.errorCode ? { errorCode: parentRemoval.errorCode } : {}),
-        },
-        removedBy: parentRemoval.removed ? "parent-wrapper-after-child-exit" : null,
-        semantics: "Parent removal proves the fixture was removable after child exit; it neither reproduces nor attributes the prior child EPERM to a specific SDK store or handle.",
-      },
+      // Parent salvage cannot replace the child's immediate-removal verdict.
+      parentSalvage: parentRemoval,
+      // Loaded native code belongs to the launcher, not to the session stores.
+      parentCacheRemoval,
     };
     const failureReceipt = sanitize({
       error: receipt.error ?? null,
@@ -591,14 +1484,15 @@ async function runOrder(order) {
       0,
       `${order} fixture failed (${result.signal}): ${sanitizedStderr}\n` +
         `Sanitized receipt diagnostics: ${JSON.stringify(failureReceipt)}\n` +
-        `Parent cleanup diagnostics: ${JSON.stringify(sanitize(parentRemoval, envInfo.roots))}`,
+        `Parent cleanup diagnostics: ${JSON.stringify(sanitize({ parentRemoval, parentCacheRemoval }, envInfo.roots))}`,
     );
-    if (parentRemovalError) {
+    if (parentRemovalError || parentCacheRemovalError) {
       assert.fail(
-        `parent cleanup failed after child exit: ${JSON.stringify(sanitize(parentRemoval, envInfo.roots))}\n` +
+        `parent cleanup failed after child exit: ${JSON.stringify(sanitize({ parentRemoval, parentCacheRemoval }, envInfo.roots))}\n` +
           `Completed child cleanup receipt: ${JSON.stringify(failureReceipt.cleanup)}`,
       );
     }
+    assert.equal(existedAfterChildExit, false, "child must remove its owned fixture before exit");
     await validateReceipt(receipt, order, envInfo.roots);
     await writeReceiptArtifact(name, { ...receipt, nodeWrapperVersion: process.version }, envInfo.roots);
     return receipt;
@@ -606,7 +1500,7 @@ async function runOrder(order) {
     if (fixtureRoot && wrapperOwnedRoots.has(fixtureRoot)) {
       await removeOwnedRoot(fixtureRoot);
     }
-    await removeOwnedRoot(envInfo.roots[0]);
+    if (wrapperOwnedRoots.has(envInfo.roots[0])) await removeOwnedRoot(envInfo.roots[0]);
   }
 }
 
@@ -684,6 +1578,58 @@ test("issue #62 Bun redaction probe consumes opaque values and fragments", async
     secretMarker: true,
   });
 });
+for (const phase of ["sdk-import", "sdk-teardown"]) {
+  for (const kind of ["fetch", "preconnect"]) {
+    for (const swallowed of [false, true]) {
+      test(`issue #62 guard rejects ${swallowed ? "swallowed" : "propagated"} ${kind} during ${phase}`, async () => {
+        const result = await runGuardLifecycleProbe({ phase, kind, swallowed });
+        assert.equal(result.failure.code, "ENVIRONMENT_BLOCKED");
+        assert.equal(result.receipt, undefined, "attempt cannot produce a successful receipt");
+        const guard = result.failure.details.preconnectGuard;
+        assert.equal(guard.attempts, 1);
+        assert.deepEqual(guard.events.map(event => ({ kind: event.kind, stage: event.stage })), [{ kind, stage: phase }]);
+        assert.equal(guard.observed, true);
+        assert.equal(guard.restored, true);
+        assert.equal(result.runStarted, phase === "sdk-teardown" || swallowed);
+        assert.equal(result.disposals, result.runStarted ? 1 : 0);
+      });
+    }
+  }
+}
+
+for (const failure of ["import", "setup", "session"]) {
+  test(`issue #62 guard restores fetch after ${failure} failure without masking primary error`, async () => {
+    const result = await runGuardLifecycleProbe({ failure });
+    assert.equal(result.failure.code, `MOCK_${failure.toUpperCase()}_FAILED`);
+    assert.equal(result.receipt, undefined);
+    assert.equal(result.failure.details.preconnectGuard.attempts, 0);
+    assert.equal(result.failure.details.preconnectGuard.restored, true);
+    assert.equal(result.runStarted, failure === "session");
+    assert.equal(result.disposals, failure === "session" ? 1 : 0);
+  });
+}
+
+test("issue #62 guard retains primary and cleanup errors plus swallowed background events", async () => {
+  for (const swallowed of [false, true]) {
+    const result = await runGuardLifecycleProbe({ failure: "session", phase: "sdk-teardown", kind: "fetch", swallowed });
+    assert.equal(result.failure.code, "MOCK_SESSION_FAILED");
+    assert.equal(result.failure.details.preconnectGuard.attempts, 1);
+    assert.ok(result.failure.details.cleanupErrors.some(error => error.operation === "network-guard-verification"));
+    assert.equal(result.failure.details.cleanupErrors.some(error => error.operation === "mock-dispose"), !swallowed);
+    assert.equal(result.disposals, 1);
+  }
+});
+
+test("issue #62 guard restores fetch after successful tracked teardown", async () => {
+  const result = await runGuardLifecycleProbe({});
+  assert.equal(result.failure, undefined);
+  assert.equal(result.receipt.cleanup.mockDisposed, true);
+  assert.equal(result.receipt.preconnectGuard.attempts, 0);
+  assert.equal(result.receipt.preconnectGuard.checkedAfterTrackedTeardown, true);
+  assert.equal(result.runStarted, true);
+  assert.equal(result.disposals, 1);
+});
+
 test("issue #62 real SDK divergent-session probe", async () => {
   assert.ok(existsSync(fixture), `missing Bun fixture ${fixture}`);
   const nodeMajor = Number(process.versions.node.split(".")[0]);

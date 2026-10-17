@@ -1,21 +1,53 @@
 # Native daemon foreground deployment
 
 Run one daemon on each host that owns mapped work directories. It embeds the
-pinned `@gajae-code/coding-agent` SDK **0.16.7** and requires **Bun 1.4.0 or
+pinned official unpatched `@gajae-code/coding-agent` SDK **0.18.12**
+and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
 
 The daemon adapter rejects `steer` and `follow_up` while a prompt is active,
 before SDK queue admission. Idle controls remain prompt-equivalent FIFO work.
-Upstream issue
-[#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is fixed on the
-development branch by
-[#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that fix is
-absent from both the `v0.16.7` tag and the actual published 0.16.7 npm tarball.
-A supported public ownership lifecycle is requested in
-[#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429); live controls
-remain fail-closed until it ships. See the
+SDK 0.18.12 includes the late-follow-up continuation fix for
+[#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) and public tracked
+`submitUserMessage` ownership associated with
+[#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429). API existence is
+not qualified daemon integration; active controls remain fail-closed. See the
 [containment record](../../CHANGELOG.md#sdk-0166-containment).
+
+Actual post-admission parent SDK-only evidence: Windows focused 333/333; bounded workspace
+2704 tests, 2700 pass, 0 fail, 4 skips; isolated Linux 248/248 without provider
+calls. The workspace command used nine historical authority exclusion patterns,
+not unrestricted `npm test`; skips are not passes or the complete exclusions.
+See the [exact evidence boundary](../verification/issue62-evidence.md#current-parent-observations).
+Canonical imports are exercised by real SDK probes, not independent
+all-platform qualification. A single separately authorized native Windows smoke
+passed with three exact `SMOKE_OK` responses in A-B-A order, existing
+`codex-eco` child-only override, heartbeat/three successful invoke terminals,
+exit 0 and ephemeral relay port free; no optional model query or wrapper retry.
+The smoke was not repeated after fixture/test-only changes; production SDK runtime/
+package/lock are unchanged. Current local runtime receipts are
+`artifacts/sdk-first-0.18.12-admission2-focused.json`,
+`artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
+`artifacts/sdk-first-0.18.12-admission2-wsl-final.json`.
+Same-profile continuity is not isolation or a fix for #247.
+Combined-worktree and historical results do not qualify this tree. Main native
+code was freshly built unchanged; native lifetime, ACL, publication,
+construction, and fixture repairs remain deferred. No private native fixture
+pass, SOURCEPATCH change, admission recovery, native/service/security/fault/
+OOM/noDump, production, release, support, installation, or deployment
+qualification is claimed. Both original P2s and owner-admission are verified and
+independently cleared in `artifacts/sdk-first-0.18.12-final-review.json`:
+static agent review APPROVE, zero P0/P1/P2, not independent runtime or
+CI/merge/deployment approval. Exact-head CI/landing is tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
+not yet committed/pushed, and CI/merge completion is not claimed. Local
+receipts alone do not approve landing; each run qualifies only its exact pins.
+See [current SDK status](../../README.md#local-quick-start).
+
+Upstream #6578 and direct repair #6700 remain open/unmerged and can affect
+SDK-exposed Ultragoal/Ralplan workflow gates. Merged #6763's transcript-content
+approval binding does not repair that guard deadlock. Do not bypass containment.
 
 The bot and daemon must negotiate `gate_presentation_v1`,
 `terminal_disposition_v1`, and `invoke_cancellation_v1` before serving a
@@ -47,8 +79,8 @@ tombstones are bounded and retained through the hard-cap/receipt horizon.
 
 A queued request is revoked before SDK, provider, or tool execution, receives
 `cancelled_before_start`, and then terminal `cancelled`. An active request
-receives only nonterminal `cancellation_pending`: SDK 0.16.7 has no supported
-active-interruption control, and its eventual natural terminal remains
+receives only nonterminal `cancellation_pending`: the daemon has no qualified
+active-interruption integration, and its eventual natural terminal remains
 authoritative. A cancellation receipt is not terminal or quiescence proof.
 
 Its authoritative final frame is an `event` with an
@@ -76,9 +108,9 @@ not evidence of a completed live deployment.
 The integration boundary is unchanged by the SDK bump. `gjc-remote` owns host
 authentication, route/workDir selection, and workspace admission/lifecycle
 policy. The embedded SDK runtime owns provider/model catalogs, provider
-authentication, and agent-turn semantics. Broker/Router surfaces are reserved
-for a separate future external-session evaluation; no adapter or migration is
-implemented.
+authentication, and agent-turn semantics. Public SDK `router` and `lifecycle`
+namespaces are reserved for separate future external-session evaluation; no
+adapter or migration is implemented. `sdk/broker` is not a public entrypoint.
 
 ## Prerequisites and provider identity
 
@@ -98,9 +130,13 @@ The provider credential and model configuration are retained in that account's
 `~/.gjc`; every SDK session created by the daemon reuses them. Do not copy this
 directory, a provider token, or another user's home directory into a service
 account. The daemon's normal model profile comes from `~/.gjc/agent/config.yml`
-(`modelProfile.default`); `GJC_MODEL_PROFILE` can select a configured profile.
-A missing or unusable provider/profile fails session creation rather than
-silently selecting another identity.
+(`modelProfile.default`), with project overrides resolved through SDK-owned
+scope-local settings. A nonblank `GJC_MODEL_PROFILE` overrides that name without
+persisting a new default. Failure to activate a selected named profile fails
+session creation. If no usable name remains, the adapter warns and retains the
+SDK default model, which may be unauthenticated and return empty responses.
+Explicitly select a usable, authenticated profile for each workDir; this is an
+operator requirement, not a new daemon preflight.
 
 ## Configure and start
 

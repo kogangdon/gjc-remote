@@ -2,19 +2,21 @@
 
 Discord-controlled remote GJC sessions.
 
-> **SDK 0.16.7 upgrade candidate: live controls fail closed.** The published SDK
-> can leave a late follow-up queued without a successor run after
-> `waitForIdle()` settles.
-> Upstream [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) is
-> fixed on the development branch by
-> [#5371](https://github.com/Yeachan-Heo/gajae-code/pull/5371), but that
-> lifecycle wakeup fix is absent from both the `v0.16.7` tag and the actual
-> published `@gajae-code/coding-agent@0.16.7` npm tarball. The daemon therefore
-> rejects `steer` and `follow_up` while a prompt is active instead of entering
-> the unsupported queue path. Idle controls remain prompt-equivalent FIFO work.
-> A supported ownership API is tracked upstream in
-> [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429). See
-> [CHANGELOG.md](CHANGELOG.md#sdk-0167-upgrade).
+> **Official unpatched SDK 0.18.12: bounded source evidence.**
+> Published types expose `QueuedInputSubmission` / `submitUserMessage` ownership;
+> API existence is not qualified daemon integration. Active `steer` and
+> `follow_up` remain fail-closed; idle controls remain prompt-equivalent FIFO
+> work. Post-admission SDK-only, main-based evidence is Windows focused 333/333, bounded
+> workspace 2704 tests / 2700 pass / 0 fail / 4 skips, isolated Linux 248/248,
+> and one separately authorized Windows provider smoke PASS. Nine historical
+> authority exclusions bound the workspace run; skips are not passes.
+> Independent static agent review is APPROVE, with zero P0/P1/P2; it is not
+> independent runtime or CI/merge/deployment approval. Exact-head CI/landing is tracked in
+> [PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
+> not yet committed/pushed, and CI/merge completion is not claimed. Local receipts alone
+> do not approve landing. No production, release, support,
+> installation, or deployment qualification is claimed. See the bounded
+> [evidence record](docs/verification/issue62-evidence.md#current-parent-observations).
 
 > **⚠️ Security: this grants remote code execution.** A mapped Discord channel
 > runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
@@ -60,9 +62,9 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    the SDK queue. This prevents an unowned request from hanging or being matched
    to an unrelated terminal. SDK failure outcomes reject the invocation. Each
    prompt receives its event stream. Idle sessions (no requests for 1 hour) are
-   disposed automatically. Live controls can be restored once upstream
-   [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429) provides a
-   supported submission-ownership lifecycle.
+   disposed automatically. SDK 0.18.12 exposes the submission-ownership lifecycle,
+   but active controls remain disabled until the daemon integrates and qualifies
+   it; upgrading the dependency does not restore them automatically.
    Workflow gates require negotiated `gate_presentation_v1` in addition to
    `terminal_disposition_v1` and `invoke_cancellation_v1`; mixed bot/daemon
    peers refuse a gate-capable invoke before execution, so deploy them
@@ -91,8 +93,8 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    `already_terminal`, or `not_owned`. Duplicate cancel IDs replay the exact
    original receipt. A queued request is revoked before SDK, provider, or tool
    execution, receives `cancelled_before_start`, then receives terminal
-   `cancelled`. Active work receives only `cancellation_pending`: SDK 0.16.7
-   exposes no supported active-interruption control, and its natural terminal
+   `cancelled`. Active work receives only nonterminal `cancellation_pending`:
+   the daemon has no qualified active-interruption integration, and its natural terminal
    remains authoritative. A receipt is neither a terminal result nor proof of
    quiescence. Request/cancel tombstones are bounded and survive the
    hard-cap/receipt horizon.
@@ -275,7 +277,7 @@ bun run --filter '@gjc-remote/daemon' start
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
 daemon runs on Bun (>=1.4.0) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.16.7**
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.18.12**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
@@ -291,38 +293,81 @@ The integration boundary remains narrow. `gjc-remote` owns host authentication,
 Discord routing, workDir canonicalization, and workspace admission/lifecycle
 policy. The embedded SDK runtime owns provider/model catalogs, authentication,
 and agent-turn semantics; the bridge resolves remote selectors and relays
-controls without replacing those runtime semantics. The SDK's Broker/Router
-surfaces are reserved for separate evaluation as a possible future
+controls without replacing those runtime semantics. Public SDK `router` and
+`lifecycle` namespaces are reserved for separate evaluation as a possible future
 external-session path. Neither is wired into this repository, and this upgrade
 implements no Broker/Router or product-policy migration.
 
-SDK 0.16.7 retains the bundled catalog change introduced in 0.16.4: the retired
+Use canonical `@gajae-code/coding-agent/sdk` exports, including the `host`,
+`router`, `lifecycle`, `bus`, and `mcp` namespaces. Old `sdk/broker`, `sdk/client`,
+and `sdk/models` import subpaths are blocked in 0.18.12; source-file presence
+does not make them public entrypoints.
+
+SDK 0.18.12 retains the bundled catalog change introduced in 0.16.4: the retired
 `team` command is replaced by `autoresearch`. After deploying this upgrade, run
 `npm run register` from `bot/` to replace the guild slash-command catalog.
 Registration is an explicit operator action; upgrading dependencies alone does
 not change Discord's stored commands.
 
-> **SDK update status:** `@gajae-code/coding-agent` is pinned to **0.16.7** and
-> the daemon requires **Bun 1.4.0 or newer**. The
-> [scoped isolation evidence rerun on 0.16.7](docs/verification/issue62-evidence.md)
-> distinguishes per-workDir policy from unscoped SDK state. Adapter regressions,
-> the real-SDK contract oracle, canonical imports, and local smoke are separate
-> candidate checks; they do not establish tenant isolation or Broker/Router
-> compatibility. Historical release attestations and oracle receipts do not
-> transfer to this pin.
+> **SDK source evidence:** the implementation uses official unpatched
+> `@gajae-code/coding-agent` **0.18.12**, requiring **Bun 1.4.0 or newer**.
+> Post-admission parent evidence: Windows focused **333/333**, bounded workspace **2704 tests,
+> 2700 pass, 0 fail, 4 skips**, and isolated Linux **248/248** (no provider calls).
+> This is not unrestricted `npm test`: its nine historical authority exclusion
+> patterns are recorded in the [current evidence](docs/verification/issue62-evidence.md#current-parent-observations), separately from the four skips.
+> Canonical imports are exercised by real SDK probes, not independently
+> qualified on all platforms. One separately authorized native Windows smoke
+> passed with three exact `SMOKE_OK` responses in A-B-A order, the existing
+> `codex-eco` child-only override, heartbeat/three successful invoke terminals,
+> exit 0 and ephemeral relay port free; no optional model query or wrapper retry.
+> That single smoke was not repeated after fixture/test-only changes; production SDK
+> runtime/package/lock are unchanged. Current run receipts are
+> `artifacts/sdk-first-0.18.12-admission2-focused.json`,
+> `artifacts/sdk-first-0.18.12-admission2-workspace.json` and
+> `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; the smoke remains
+> `artifacts/sdk-first-0.18.12-provider-smoke.json`.
+> Both original P2s and owner-admission are verified and independently cleared in
+> `artifacts/sdk-first-0.18.12-final-review.json` (static agent review APPROVE,
+> zero P0/P1/P2, not independent runtime or CI/merge/deployment approval).
+> The separate Windows FIFO 100 ms wall-clock flake remains recorded as
+> `artifacts/sdk-first-0.18.12-admission-focused.json` (333 tests / 332 pass / 1 fail).
+> Only that deterministic gated FIFO ordering test uses Node mock `setTimeout`;
+> actual timeout tests are unchanged. Subsequent admission2 focused and Linux runs passed.
+> Same-profile continuity is not isolation or a fix for #247.
+> Combined-worktree results are not evidence for this tree. Native lifetime,
+> ACL, publication, construction, and fixture repairs are excluded/deferred.
+> No local SOURCEPATCH modifications or admission recovery are included.
+> Main native code was freshly built unchanged; no native repair or private
+> native fixture pass is claimed. Native/service/security/fault/OOM/noDump and
+> release qualification remain unavailable. Independent review and exact-head
+> CI/landing status are tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265).
+> Local receipts alone do not approve landing; each run qualifies only its exact pins.
 >
 > **Historical 0.16.4 blocker evidence:** the real-SDK oracle observed
 > `waitForIdle()` resolving with the exact executable late follow-up still
 > queued and no successor run. Its receipt recorded `BLOCK`
 > (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). That is retained as
-> old-run evidence, not a current 0.16.7 oracle result.
+> old-run evidence, not a current 0.18.12 oracle result.
 >
 > **Historical 0.12.21 verification:** that pin superseded 0.12.7, and its
 > 2026-08-09 verification covered package/lock reconciliation, canonical SDK
 > imports, root/workspace regression suites, local smoke (`SMOKE_OK`), and
 > manual bot/daemon runtime execution. Provider/model switch coverage was
 > environment-dependent. This is retained as old-run evidence, not evidence for
-> 0.16.7.
+> 0.18.12.
+
+SDK 0.18.12 includes the late-follow-up continuation fix for
+[#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) and the public
+tracked ownership API associated with
+[#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429); neither restores
+active controls in this adapter. Release inclusion is not local verification:
+[#6600](https://github.com/Yeachan-Heo/gajae-code/issues/6600) is addressed by
+#6693 and follow-up #6715, and #6604 by #6696. Upstream
+[#6578](https://github.com/Yeachan-Heo/gajae-code/issues/6578) and direct repair
+[#6700](https://github.com/Yeachan-Heo/gajae-code/pull/6700) remain open/unmerged;
+the guard deadlock can affect SDK-exposed Ultragoal/Ralplan workflow gates.
+Merged #6763 binds approvals to transcript content, not a guard-deadlock repair.
+Do not bypass gate/admission containment.
 
 **Optional environment variables** — beyond the required keys above:
 
@@ -386,13 +431,14 @@ ambiguous requests fail with a bounded candidate list instead of selecting a
 provider implicitly. A successful switch reports the selected display name,
 provider, and model ID. It does not change the daemon's startup default.
 
-Each new session activates the host's configured model profile
-(`~/.gjc/agent/config.yml` `modelProfile.default`) through GJC's own resolver, so
-the daemon starts on the same model your interactive GJC uses instead of the
-SDK's first-available fallback. Set `GJC_MODEL_PROFILE` to override the profile
-name. A profile that cannot be activated (for example, missing provider
-credentials) fails session creation loudly rather than silently returning empty
-responses.
+Each new session resolves its configured model profile through SDK-owned
+scope-local settings (`~/.gjc/agent/config.yml` `modelProfile.default`, with
+project overrides). A nonblank `GJC_MODEL_PROFILE` overrides that name without
+persisting a new default. Failure to activate a selected named profile fails
+session creation. If no usable name remains, the adapter warns and leaves the
+SDK default model unchanged; that model may be unauthenticated and return empty
+responses. Explicitly select a usable, authenticated profile for each workDir;
+this is an operator requirement, not a new daemon preflight.
 
 ## Output & tool logs
 
@@ -494,7 +540,7 @@ users or local administrators. Cross-account read/write isolation for unrelated 
 users is therefore outside the dedicated-host release gate, while service-account
 separation and protected secret/profile storage remain required for supervised deployment.
 
-**Platform evidence is pending.** These links describe the current contract and
+**Supervised deployment platform evidence is pending.** These links describe the current contract and
 evaluation results; they do not claim that a signed Windows primary wrapper,
 production Windows account/ACL behavior, Linux boot/readiness, relay behavior,
 or transaction fault-injection has been verified.
