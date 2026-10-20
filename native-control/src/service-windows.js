@@ -1089,6 +1089,9 @@ export function createWindowsServiceDriver(options) {
       if (headBeforeCreate.phase !== 'transition-marker-intent' || substepOrder[headBeforeCreate.substep] < substepOrder.action) append('transition-marker-intent', 'action');
       const created = nativeCall('create_win32_service_disabled', name, component, launch, servicePassword ?? null);
       if (!created) fail('SERVICE_IO_FAILED', operation, driverWrites, true);
+      // This capability returns an opaque handle, not a writes receipt.
+      // Its successful CreateServiceW effect precedes every following probe.
+      driverWrites += 1;
       try {
         const initial = query(created, operation);
         append('transition-marker-intent', 'observed');
