@@ -46,7 +46,7 @@ const daemonConfiguration = Object.freeze({
 });
 const shawl = Object.freeze({
   path: 'C:\\ProgramData\\GJC\\shawl\\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\shawl.exe',
-  sha256: hex('a'), runtimeSha256: hex('b'), entrypointSha256: hex('c'),
+  sha256: hex('a'), manifestFingerprint: hex('7'), runtimeSha256: hex('b'), entrypointSha256: hex('c'),
 });
 const release = (applicationManifestFingerprint = hex('d'), entrypointPath = 'C:\\ProgramData\\GJC\\releases\\current\\bot.js') => ({ entrypointPath, applicationManifestFingerprint });
 const daemonKey = `daemon-host-${'1'.repeat(64)}`;
@@ -318,23 +318,25 @@ const expectedStateFor = (component) => component === 'bot' ? { expectedHostSetF
 // startup observer to the driver's protected trial observation.
 const observeWith = (component = 'bot') => (trialObservation) => createServiceStartupObserver({ trialObservation, expectedState: expectedStateFor(component) }).observeApplication;
 
-function transactionFixture({ component = 'bot', serviceKey = 'bot', applicationManifestFingerprint = hex('d'), expectedAfterResourceFingerprint = undefined } = {}) {
+function transactionFixture({ component = 'bot', serviceKey = 'bot', applicationManifestFingerprint = hex('d'), expectedAfterResourceFingerprint = undefined, shawlManifestFingerprint = shawl.manifestFingerprint } = {}) {
   const old = buildServiceOldProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, 'win32');
-  const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint, shawlManifestFingerprint: shawl.sha256, releaseSequence: 1, releaseTreeFingerprint: hex('e'), compatibilityFingerprint: hex('f') }, 'win32');
+  const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint, shawlManifestFingerprint, releaseSequence: 1, releaseTreeFingerprint: hex('e'), compatibilityFingerprint: hex('f') }, 'win32');
   const configuration = component === 'bot' ? botConfiguration : daemonConfiguration;
   const launch = launchFor(component, serviceKey, configuration,
     component === 'bot' ? release(applicationManifestFingerprint).entrypointPath : `C:\\ProgramData\\GJC\\releases\\current\\daemon.js`);
   const resource = windowsServiceResourceFingerprint(serviceResourceDescriptor(
     component, serviceKey, launch, applicationManifestFingerprint, 'trial', configuration));
-  const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: null, expectedAfterResourceFingerprint: expectedAfterResourceFingerprint === undefined ? resource : expectedAfterResourceFingerprint, platformResourceFingerprint: resource, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
-  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: resource, applicationManifestFingerprint, shawlManifestFingerprint: shawl.sha256, serviceGeneration: 1, activation: 'enabled' }, 'win32');
+  const finalResource = windowsServiceResourceFingerprint(serviceResourceDescriptor(
+    component, serviceKey, launch, applicationManifestFingerprint, 'final', configuration));
+  const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: null, expectedAfterResourceFingerprint: expectedAfterResourceFingerprint === undefined ? finalResource : expectedAfterResourceFingerprint, platformResourceFingerprint: resource, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
+  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: finalResource, applicationManifestFingerprint, shawlManifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
   const fields = { transactionId: `tx-${serviceKey.slice(0, 8)}`, transactionNonce: '1'.repeat(32), operation: 'install', component, serviceKey, platform: 'win32', architecture: 'x64', serviceGeneration: 1, old, candidate, transition, final };
   const prepared = buildServiceTransaction({ ...fields, phase: 'prepared', substep: 'none', previousJournalFingerprint: null });
   return buildServiceTransaction({ ...fields, phase: 'transition-marker-intent', substep: 'observed', previousJournalFingerprint: prepared.transactionFingerprint });
 }
 
 function detachedUninstallTransaction(resourceFingerprint) {
-  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: resourceFingerprint, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.sha256, serviceGeneration: 1, activation: 'enabled' }, 'win32');
+  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: resourceFingerprint, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
   const candidate = buildServiceCandidateProof({ disposition: 'none', applicationManifestFingerprint: null, shawlManifestFingerprint: null, releaseSequence: 0, releaseTreeFingerprint: null, compatibilityFingerprint: null }, 'win32');
   const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: resourceFingerprint, expectedAfterResourceFingerprint: null, platformResourceFingerprint: resourceFingerprint, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
   const final = buildServiceFinalProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, 'win32');
@@ -361,6 +363,84 @@ function freshDriver(f, { component = f.session.component, serviceKey = f.sessio
 }
 
 // All tests below use only the injected fake facade. No SCM, services, files, or native platform state are touched.
+test('C1 suppressed publication accepts distinct planner trial and final resource identities', () => {
+  const f = fixture();
+  const trial = f.driver.planResource({ phase: 'trial', applicationManifestFingerprint: hex('d') });
+  const final = f.driver.planResource({ phase: 'final', applicationManifestFingerprint: hex('d') });
+  assert.notEqual(trial.resourceFingerprint, final.resourceFingerprint);
+  assert.equal(trial.resourceDescriptor.startType, 'demand');
+  assert.equal(final.resourceDescriptor.startType, 'auto');
+  const transaction = transactionFixture({ expectedAfterResourceFingerprint: final.resourceFingerprint });
+  assert.equal(transaction.transition.platformResourceFingerprint, trial.resourceFingerprint);
+  f.session.state.entries = [transaction];
+  const published = f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  assert.equal(published.resourceFingerprint, trial.resourceFingerprint);
+  assert.equal(published.platformPhase, 'trial');
+  assert.equal(f.native.service.startType, 'demand');
+  assert.equal(f.native.service.failurePolicy, 'none');
+});
+
+test('C1 distinct final identity does not bypass wrong trial identity or absent-resource CAS', () => {
+  for (const wrongTrial of [true, false]) {
+    const f = fixture();
+    const final = f.driver.planResource({ phase: 'final', applicationManifestFingerprint: hex('d') });
+    const transaction = transactionFixture({ expectedAfterResourceFingerprint: final.resourceFingerprint });
+    const transition = buildServiceTransitionProof({ oldFingerprint: transaction.old.oldFingerprint, candidateFingerprint: transaction.candidate.candidateFingerprint,
+      expectedBeforeResourceFingerprint: null, expectedAfterResourceFingerprint: final.resourceFingerprint,
+      platformResourceFingerprint: wrongTrial ? hex('0') : transaction.transition.platformResourceFingerprint,
+      platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
+    f.session.state.entries = [buildServiceTransaction({ ...transaction, transition })];
+    assert.throws(() => f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: wrongTrial ? null : hex('1') }),
+      (error) => error.code === (wrongTrial ? 'SERVICE_STALE' : 'SERVICE_MANUAL_CLEANUP') && error.reason === (wrongTrial ? 'resource-drift' : 'recreated-resource'));
+    assert.equal(f.driver.writes, 0);
+    assert.equal(f.native.service, null);
+  }
+});
+
+test('C1 suppressed publication refuses a wrong final identity despite a valid trial identity', () => {
+  const f = fixture({ transaction: transactionFixture({ expectedAfterResourceFingerprint: hex('0') }) });
+  const trial = f.driver.planResource({ phase: 'trial', applicationManifestFingerprint: hex('d') });
+  assert.equal(trial.resourceFingerprint, f.transaction.transition.platformResourceFingerprint);
+  assert.throws(() => f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null }),
+    (error) => error.code === 'SERVICE_STALE' && error.reason === 'resource-drift');
+  assert.equal(f.driver.writes, 0);
+  assert.equal(f.native.service, null);
+});
+
+test('C2 publication separates authenticated Shawl manifest identity from executable digest', () => {
+  const manifestFingerprint = hex('7');
+  const f = fixture({ transaction: transactionFixture({ shawlManifestFingerprint: manifestFingerprint }) });
+  const launch = launchFor();
+  assert.notEqual(manifestFingerprint, launch.supervisorSha256);
+  const driver = createWindowsServiceDriver({ native: f.native.facade, session: f.session, roles, configuration: botConfiguration, launch,
+    shawl: { ...shawl, manifestFingerprint }, clock: () => 1_000_000, sleep: async () => {} });
+  const published = driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  assert.equal(published.platformPhase, 'trial');
+  assert.equal(f.native.service.binaryPath, serializeWindowsCommandLine(buildWindowsShawlArgv({ component: 'bot', serviceKey: 'bot', launch })));
+});
+
+test('C2 publication rejects wrong Shawl manifest even when executable digest matches', () => {
+  const f = fixture({ transaction: transactionFixture({ shawlManifestFingerprint: hex('7') }) });
+  const driver = createWindowsServiceDriver({ native: f.native.facade, session: f.session, roles, configuration: botConfiguration, launch: launchFor(),
+    shawl: { ...shawl, manifestFingerprint: hex('8') }, clock: () => 1_000_000, sleep: async () => {} });
+  assert.throws(() => driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null }),
+    (error) => error.code === 'SERVICE_STALE' && error.reason === 'resource-drift');
+  assert.equal(driver.writes, 0);
+  assert.equal(f.native.service, null);
+});
+
+test('C2 executable-only authority is rejected at construction before native effects', () => {
+  const f = fixture({ transaction: transactionFixture({ shawlManifestFingerprint: hex('7') }) });
+  const { manifestFingerprint, ...executableOnly } = shawl;
+  assert.equal(manifestFingerprint, hex('7'));
+  const before = f.native.calls.length;
+  assert.throws(() => createWindowsServiceDriver({ native: f.native.facade, session: f.session, roles, configuration: botConfiguration, launch: launchFor(),
+    shawl: executableOnly, clock: () => 1_000_000, sleep: async () => {} }),
+    (error) => error.code === 'SERVICE_INVALID' && error.operation === 'create_windows_service_driver' && error.writes === 0);
+  assert.equal(f.native.calls.length, before);
+  assert.equal(f.driver.writes, 0);
+});
+
 test('opaque store locks are not driver authority and lock-free resource planning is write-free', () => {
   const f = fixture();
   const opaqueLocks = Object.freeze({
@@ -539,6 +619,94 @@ test('fault injection preserves closed error codes and cumulative native writes'
   assert.throws(() => f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null }), (e) => e.code === 'SERVICE_IO_FAILED' && e.writes === 3 && e.ambiguous === true);
   const before = f.driver.writes; assert.equal(before, 3);
   assert.throws(() => f.driver.publishSuppressedResource({ phase: 'bad', release: release(), expectedCurrentSha256: null }), (e) => e.code === 'SERVICE_INVALID' && e.writes === before);
+});
+
+test('C4 callable recovery carries the durable journal phase rather than the platform phase', async () => {
+  const f = fixture();
+  f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  await f.driver.startTrial({});
+  const recovery = freshDriver(f).recoverTrialState();
+  assert.equal(recovery.recovery, 'resume');
+  assert.ok(recovery.trial, 'resume must carry an actually reconstructed callable trial');
+  assert.equal(recovery.platformPhase, 'trial');
+  const head = f.session.state.entries.at(-1);
+  assert.equal(head.phase, 'trial-start-observed');
+  assert.equal(recovery.phase, head.phase);
+});
+
+test('C4 action recovery reports its classified input phase after promoting the journal head', async () => {
+  const f = fixture();
+  f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  await f.driver.startTrial({});
+  const previous = f.session.state.entries.at(-1);
+  const action = buildServiceTransaction({ ...previous, phase: 'trial-start-intent', substep: 'action', previousJournalFingerprint: previous.transactionFingerprint });
+  f.session.state.entries.push(action);
+  const recovery = freshDriver(f).recoverTrialState();
+  assert.equal(recovery.recovery, 'resume');
+  assert.ok(recovery.trial);
+  assert.equal(f.session.state.entries.at(-1).phase, 'trial-start-observed');
+  assert.equal(recovery.phase, action.phase);
+  assert.notEqual(recovery.phase, f.session.state.entries.at(-1).phase);
+});
+
+test('C4 manual-cleanup recovery carries the durable journal phase without authorizing replay', () => {
+  const f = fixture();
+  f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  f.native.service.startType = 'disabled';
+  const fresh = freshDriver(f);
+  const before = fresh.writes;
+  const recovery = fresh.recoverTrialState();
+  assert.equal(recovery.recovery, 'manual-cleanup');
+  assert.equal(recovery.trial, undefined);
+  assert.equal(fresh.writes, before);
+  assert.equal(recovery.phase, f.session.state.entries.at(-1).phase);
+});
+
+test('C4 final-looking recovery remains pending with its durable phase and never claims resume', async () => {
+  const f = fixture();
+  f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  const trial = await f.driver.startTrial({});
+  await f.driver.runStartupGate({ trial, observeApplication: observeWith() });
+  f.driver.armFinalRestart();
+  f.driver.enableFinal();
+  const fresh = freshDriver(f);
+  const before = fresh.writes;
+  const recovery = fresh.recoverTrialState();
+  assert.equal(recovery.platformPhase, 'final');
+  assert.equal(recovery.recovery, 'pending');
+  assert.equal(recovery.reason, 'log-cursor-invalid');
+  assert.equal(recovery.trial, undefined);
+  assert.equal(fresh.writes, before);
+  assert.equal(recovery.phase, f.session.state.entries.at(-1).phase);
+});
+
+test('C1 final resource binding prefers its observed identity over the same release projected trial', async () => {
+  const f = fixture();
+  f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  const trial = await f.driver.startTrial({});
+  await f.driver.runStartupGate({ trial, observeApplication: observeWith() });
+  f.driver.armFinalRestart();
+  f.driver.enableFinal();
+  const observed = freshDriver(f).probe();
+  assert.equal(observed.platformPhase, 'final');
+  assert.equal(observed.resourceFingerprint, f.transaction.transition.expectedAfterResourceFingerprint);
+  assert.equal(observed.releaseBinding.applicationManifestFingerprint, hex('d'));
+});
+
+test('C1 final resource binding refuses when observed and projected identities are both undeclared', async () => {
+  const f = fixture();
+  f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  const trial = await f.driver.startTrial({});
+  await f.driver.runStartupGate({ trial, observeApplication: observeWith() });
+  f.driver.armFinalRestart();
+  f.driver.enableFinal();
+  f.native.service.configFingerprint = hex('0');
+  const fresh = freshDriver(f);
+  const before = f.native.calls.length;
+  assert.throws(() => fresh.probe(),
+    (error) => error.code === 'SERVICE_MANUAL_CLEANUP' && error.reason === 'resource-drift');
+  assert.equal(fresh.writes, 0);
+  assert.deepEqual(f.native.calls.slice(before).filter(([name]) => !['open_win32_service', 'query_win32_service', 'close_win32_service'].includes(name)), []);
 });
 
 test('controller loss, reboot, and changed process epochs classify as retrial', async () => {
@@ -814,10 +982,11 @@ test('recovery binds the old entrypoint when old and candidate entrypoints diffe
   const candidateResource = windowsServiceResourceFingerprint(asDescriptor(candidateSnapshot));
   const oldSnapshot = { ...candidateSnapshot, binaryPath: serializeWindowsCommandLine(buildWindowsShawlArgv({ component: 'bot', serviceKey: 'bot', launch: oldLaunch })), description: `gjc-remote:v1:${hex('a')}`, startType: 'demand', failurePolicy: 'none', failureResetPeriod: 0, failureActions: [] };
   const oldResource = windowsServiceResourceFingerprint(asDescriptor(oldSnapshot));
-  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: oldResource, applicationManifestFingerprint: hex('a'), shawlManifestFingerprint: shawl.sha256, serviceGeneration: 1, activation: 'enabled' }, 'win32');
-  const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.sha256, releaseSequence: 2, releaseTreeFingerprint: hex('e'), compatibilityFingerprint: hex('f') }, 'win32');
-  const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: oldResource, expectedAfterResourceFingerprint: candidateResource, platformResourceFingerprint: candidateResource, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
-  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: hex('2'), resourceProof: candidateResource, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.sha256, serviceGeneration: 2, activation: 'enabled' }, 'win32');
+  const finalResource = f.driver.planResource({ phase: 'final', applicationManifestFingerprint: hex('d') }).resourceFingerprint;
+  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: oldResource, applicationManifestFingerprint: hex('a'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
+  const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, releaseSequence: 2, releaseTreeFingerprint: hex('e'), compatibilityFingerprint: hex('f') }, 'win32');
+  const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: oldResource, expectedAfterResourceFingerprint: finalResource, platformResourceFingerprint: candidateResource, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
+  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: hex('2'), resourceProof: finalResource, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 2, activation: 'enabled' }, 'win32');
   const fields = { transactionId: 'tx-update', transactionNonce: '3'.repeat(32), operation: 'update', component: 'bot', serviceKey: 'bot', platform: 'win32', architecture: 'x64', serviceGeneration: 2, old, candidate, transition, final };
   const prepared = buildServiceTransaction({ ...fields, phase: 'prepared', substep: 'none', previousJournalFingerprint: hex('0') });
   f.session.state.entries = [buildServiceTransaction({ ...fields, phase: 'transition-marker-intent', substep: 'observed', previousJournalFingerprint: prepared.transactionFingerprint })];
