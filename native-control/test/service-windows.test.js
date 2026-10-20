@@ -197,7 +197,10 @@ class FakeWindowsNative {
   create_win32_service_disabled(name, serviceRole, launch, servicePassword, nativeRoles) {
     this.call('create_win32_service_disabled', [...arguments]);
     this.service = { ...serviceResourceDescriptor(this.component, this.serviceKey, launch, hex('0'), 'trial', this.configuration), startType: 'disabled', description: '', runtime: { state: 'stopped', controlsAccepted: 0, win32ExitCode: 0, serviceExitCode: 0, checkpoint: 0, waitHint: 0, processId: 0, serviceFlags: 0, fingerprint: hash('runtime') } };
-    return this.result(1, { handle: { name } });
+    // The published native capability returns its opaque handle directly,
+    // without a writes property. Keep physical model effects separate.
+    this.writes += 1;
+    return { name };
   }
   protect_win32_service(handle, config, runtime, description) { this.call('protect_win32_service', [handle, config, runtime, description]); this.service.description = description; return this.result(1); }
   set_win32_service_marker(handle, config, runtime, description) { this.call('set_win32_service_marker', [handle, config, runtime, description]); this.service.description = description; return this.result(1); }
@@ -619,6 +622,39 @@ test('fault injection preserves closed error codes and cumulative native writes'
   assert.throws(() => f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null }), (e) => e.code === 'SERVICE_IO_FAILED' && e.writes === 3 && e.ambiguous === true);
   const before = f.driver.writes; assert.equal(before, 3);
   assert.throws(() => f.driver.publishSuppressedResource({ phase: 'bad', release: release(), expectedCurrentSha256: null }), (e) => e.code === 'SERVICE_INVALID' && e.writes === before);
+});
+
+test('raw native create handle contributes exactly one effect before publication setters', () => {
+  const f = fixture();
+  f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null });
+  assert.equal(f.native.writes, 5);
+  assert.equal(f.driver.writes, f.native.writes);
+  assert.equal(f.native.calls.filter(([method]) => method === 'create_win32_service_disabled').length, 1);
+});
+
+test('raw native create effect survives failure of the first post-create query', () => {
+  const f = fixture();
+  f.native.fault('query_win32_service', { code: 'SERVICE_IO_FAILED', writes: 0, ambiguous: false });
+  assert.throws(() => f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null }),
+    (error) => error.code === 'SERVICE_IO_FAILED' && error.writes === 1 && error.ambiguous === false);
+  assert.equal(f.driver.writes, 1);
+  assert.equal(f.native.writes, 1);
+  assert.equal(f.native.calls.some(([method]) => method === 'protect_win32_service'), false);
+  assert.equal(f.native.calls.at(-1)[0], 'close_win32_service');
+});
+
+test('raw native create effect accumulates reported and unknown setter failures without replay', () => {
+  for (const reported of [0, 3, undefined]) {
+    const f = fixture();
+    const failure = { code: 'SERVICE_IO_FAILED', ambiguous: false };
+    if (reported !== undefined) failure.writes = reported;
+    f.native.fault('protect_win32_service', failure);
+    assert.throws(() => f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(), expectedCurrentSha256: null }),
+      (error) => error.code === 'SERVICE_IO_FAILED' && error.writes === 1 + (reported ?? 0) && error.ambiguous === (reported === undefined));
+    assert.equal(f.driver.writes, 1 + (reported ?? 0));
+    assert.equal(f.native.calls.filter(([method]) => method === 'create_win32_service_disabled').length, 1);
+    assert.equal(f.native.calls.at(-1)[0], 'close_win32_service');
+  }
 });
 
 test('C4 callable recovery carries the durable journal phase rather than the platform phase', async () => {
