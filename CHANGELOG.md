@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Installation-contract release preparation
+
+- Select distinct application `0.4.0-rc.13`, local tag `v0.4.0-rc.13` and
+  sequence 13 after supported read-only application/Shawl floor and immutable
+  local/remote tag observations. Include PR #267's independent trial/final
+  resource identities, separate Shawl manifest authority, authenticated initial
+  metadata-pair admission and durable recovery-phase contract repairs.
+- Align managed workspace, lock, producer/verifier, fixture, image and docs
+  metadata while retaining official SDK 0.18.12, native-control 2.1.0 (contract
+  5 revision 2), N-API 8, Bun 1.4.2 and existing trust/dependency inputs.
+- Preserve signed local rc.12 at `6af3ef0b` and rc.11/rc.10 assets. The new
+  local-only immutable tag must identify independently reviewed, CI-verified
+  final main; an unsigned candidate does not admit signing, installation,
+  protected-operation custody, recovery or connected bot readiness.
+
 ### Distinct local reinstall release preparation
 
 - Select application `0.4.0-rc.12`, local tag `v0.4.0-rc.12` and sequence 12

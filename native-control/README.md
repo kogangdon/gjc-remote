@@ -16,7 +16,7 @@ Before publishing, provision both host leaves under their actual native actors:
 On Windows, these leaves are separate OS-drive subtrees:
 `<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
 `<OS-drive>:\gjc-remote\native-reader\<host-key>` for the daemon reader.
-These remain the v0.4.0-rc.12 source candidate paths, sharing the OS-derived base with
+These remain the v0.4.0-rc.13 source candidate paths, sharing the OS-derived base with
 service state. The layout was introduced by merged PR #259 (source commit
 `91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) and is present in published and
 deployed rc.8. Published rc.7 remains immutable and continues to use ProgramData
@@ -542,7 +542,7 @@ release. Build takes exactly `--source`, `--output`, `--platform`,
 `--architecture`, `--release-sequence`, `--signing-key-id`, `--native-addon`,
 `--native-manifest`, and `--native-signature`. Verify takes only `--candidate`.
 Output must be a new directory outside the source tree.
-For the rc.12 source candidate, `--release-sequence 12` must match the pinned contract; build and
+For the rc.13 source candidate, `--release-sequence 13` must match the pinned contract; build and
 candidate verification reject every other sequence.
 
 `deploy/native/release-contract.json` fixes the repository, release tag, supported
@@ -550,18 +550,20 @@ tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
 Signed `v0.4.0-rc.10` contains native-control 2.0.0 (contract 5, revision 1).
-Current source metadata selects application `0.4.0-rc.12`, release tag
-`v0.4.0-rc.12`, and sequence 12, with native-control 2.1.0 (contract 5,
+Current source metadata selects application `0.4.0-rc.13`, release tag
+`v0.4.0-rc.13`, and sequence 13, with native-control 2.1.0 (contract 5,
 revision 2), unchanged N-API 8, and official unpatched SDK 0.18.12. This is source candidate
 preparation only, not an existing signed tag or published release; do not
-reuse the immutable rc.11 identity for this source. Its local tag must identify
+reuse the immutable signed rc.12 identity at `6af3ef0b` for this source. The
+new candidate includes PR #267's installation-contract repairs at `24079e3c`.
+Its local tag must identify
 the independently reviewed, CI-verified final main merge, not the PR head.
 Local tagging, unsigned building, application signing, protected installation,
 and external publication are distinct gates; this preparation admits none of
 the later gates by itself. Revalidate sequence floors and reservations before
-each protected attempt, and preserve rc.11/rc.10 assets and all existing state.
+each protected attempt, and preserve rc.12/rc.11/rc.10 assets and all existing state.
 The tag workflow uses the
-same Bun 1.4.2 producer version. Existing rc.1 through rc.11 releases and
+same Bun 1.4.2 producer version. Existing rc.1 through rc.12 releases and
 artifacts remain historical, immutable inputs. A later release must select its
 own version and sequence and build from a clean checkout of its exact immutable
 tag, with that commit recorded in its source manifest.

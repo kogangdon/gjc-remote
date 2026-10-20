@@ -16,9 +16,9 @@
     "producerTimeoutMs": 600000
   },
   "repository": "kogangdon/gjc-remote",
-  "releaseVersion": "0.4.0-rc.12",
-  "releaseTag": "v0.4.0-rc.12",
-  "releaseSequence": 12,
+  "releaseVersion": "0.4.0-rc.13",
+  "releaseTag": "v0.4.0-rc.13",
+  "releaseSequence": 13,
   "producer": {
     "bunVersion": "1.4.2",
     "executableModeAuthority": {
@@ -73,7 +73,7 @@
     {
       "path": "bot",
       "packageName": "@gjc-remote/bot",
-      "packageVersion": "0.4.0-rc.12",
+      "packageVersion": "0.4.0-rc.13",
       "productionRoots": [
         "package.json",
         "src"
@@ -82,7 +82,7 @@
     {
       "path": "daemon",
       "packageName": "@gjc-remote/daemon",
-      "packageVersion": "0.4.0-rc.12",
+      "packageVersion": "0.4.0-rc.13",
       "productionRoots": [
         "package.json",
         "src"
@@ -103,7 +103,7 @@
     {
       "path": "shared",
       "packageName": "@gjc-remote/shared",
-      "packageVersion": "0.4.0-rc.12",
+      "packageVersion": "0.4.0-rc.13",
       "productionRoots": [
         "package.json",
         "*.js"
