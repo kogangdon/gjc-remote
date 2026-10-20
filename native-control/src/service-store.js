@@ -7706,7 +7706,16 @@ class Session {
     this.#assertMetadataAdmission(transaction, manifest);
     const currentManifest = this.#boundReceipt(input.expectedManifest, 'manifest:current', 'publish_current_metadata');
     const currentResource = this.#boundReceipt(input.expectedResource, 'resource:current', 'publish_current_metadata');
-    if (currentManifest.native === null || currentResource.native === null) throwStore('SERVICE_STALE', 'publish_current_metadata', this.#calls.writes);
+    if (currentManifest.native === null || currentResource.native === null) {
+      // Only a fresh first install may create the pair from authenticated
+      // absence. Partial pairs and later generations still require exact CAS.
+      const initialPair = currentManifest.native === null && currentResource.native === null &&
+        transaction.operation === 'install' && transaction.serviceGeneration === 1 &&
+        transaction.old.disposition === 'absent' && transaction.old.serviceGeneration === 0 &&
+        transaction.old.manifestFingerprint === null && transaction.old.resourceProof === null &&
+        transaction.old.applicationManifestFingerprint === null && transaction.old.shawlManifestFingerprint === null;
+      if (!initialPair) throwStore('SERVICE_STALE', 'publish_current_metadata', this.#calls.writes);
+    }
     // This is the single store-accepted pair transition.  The two files are
     // written under one authenticated session and never independently exposed
     // through the lifecycle facade.

@@ -146,12 +146,19 @@ function windowsShawlPublication(manifest) {
   return Object.freeze({ binding, locations: Object.freeze([location]) });
 }
 
-function recoveryTransaction(phase, operation = 'install') {
-  const old = buildServiceOldProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, 'linux');
-  const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint: 'a'.repeat(64), shawlManifestFingerprint: null, releaseSequence: 1, releaseTreeFingerprint: 'b'.repeat(64), compatibilityFingerprint: 'c'.repeat(64) }, 'linux');
-  const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: null, expectedAfterResourceFingerprint: 'd'.repeat(64), platformResourceFingerprint: 'e'.repeat(64), platformState: buildServicePlatformState('linux', 'trial') }, 'linux');
-  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: 'f'.repeat(64), resourceProof: '1'.repeat(64), applicationManifestFingerprint: 'a'.repeat(64), shawlManifestFingerprint: null, serviceGeneration: 1, activation: 'enabled' }, 'linux');
-  return buildServiceTransaction({ transactionId: 'tx-recover', transactionNonce: '2'.repeat(32), operation, component: 'bot', serviceKey: 'bot', platform: 'linux', architecture: 'x64', serviceGeneration: 1, old, candidate, transition, final, phase, substep: phase === 'prepared' ? 'none' : 'intent', previousJournalFingerprint: null });
+function recoveryTransaction(phase, operation = 'install', platform = 'linux') {
+  const shawlManifestFingerprint = platform === 'win32' ? '9'.repeat(64) : null;
+  const old = buildServiceOldProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, platform);
+  const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint: 'a'.repeat(64), shawlManifestFingerprint, releaseSequence: 1, releaseTreeFingerprint: 'b'.repeat(64), compatibilityFingerprint: 'c'.repeat(64) }, platform);
+  const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: null, expectedAfterResourceFingerprint: 'd'.repeat(64), platformResourceFingerprint: 'e'.repeat(64), platformState: buildServicePlatformState(platform, 'trial') }, platform);
+  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: 'f'.repeat(64), resourceProof: '1'.repeat(64), applicationManifestFingerprint: 'a'.repeat(64), shawlManifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, platform);
+  const prepared = buildServiceTransaction({ transactionId: 'tx-recover', transactionNonce: '2'.repeat(32), operation, component: 'bot', serviceKey: 'bot', platform, architecture: 'x64', serviceGeneration: 1, old, candidate, transition, final, phase: 'prepared', substep: 'none', previousJournalFingerprint: null });
+  return phase === 'prepared' ? prepared : buildServiceTransaction({
+    ...prepared,
+    phase,
+    substep: 'intent',
+    previousJournalFingerprint: prepared.transactionFingerprint,
+  });
 }
 
 function readOnlyFixture() {
@@ -1018,6 +1025,69 @@ test('a compatibility refusal precedes the transaction, journal head, provisiona
   assert.equal(session.writes, 0);
   assert.deepEqual(calls, ['acquisition-close', 'session-close']);
 });
+
+for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pending']) {
+  test(`windows recovery consumer requires durable phase and actionable classification (${variant})`, async () => {
+    const prepared = recoveryTransaction('prepared', 'install', 'win32');
+    const head = recoveryTransaction('trial-start-intent', 'install', 'win32');
+    assert.equal(head.previousJournalFingerprint, prepared.transactionFingerprint);
+    const configuration = {
+      runtimePath: 'C:/runtime', workingDirectory: 'C:/work', homeDirectory: 'C:/home',
+      logDirectory: 'C:/log', channelsConfig: 'C:/channels',
+      expectedHostSetFingerprint: '7'.repeat(64), expectedHostCount: 0,
+    };
+    const application = { ...windowsApplicationManifest({ manifestFingerprint: head.candidate.applicationManifestFingerprint }), configuration };
+    const shawl = windowsShawlManifest({ manifestFingerprint: head.candidate.shawlManifestFingerprint });
+    const publications = { application: windowsApplicationPublication(application), shawl: windowsShawlPublication(shawl) };
+    const absent = () => ({ present: false, value: null });
+    const calls = [];
+    const markers = [];
+    const session = {
+      platform: 'win32', architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
+      readJournal: () => ({ entries: [prepared, head], head: { present: true, value: head }, pending: null }),
+      readManifest: absent, readManualCleanup: absent,
+      readRetainedDeploymentEnvelope: ({ purpose }) => ({ manifest: purpose === 'application' ? application : shawl }),
+      readPublicationReceipt: ({ slot, artifactKind }) => {
+        assert.equal(slot, 'provisional');
+        return publications[artifactKind];
+      },
+      appendJournal: () => assert.fail('classifier admission must not replay the journal'),
+      publishManualCleanup(value) {
+        markers.push(value);
+        this.writes += 1;
+        return { present: true, value };
+      },
+      close: () => calls.push('close'),
+    };
+    const classification = {
+      classification: variant === 'pending' ? 'pending' : 'manual-cleanup',
+      platformPhase: 'trial', reason: 'platform-evidence-gap',
+      ...(variant === 'missing-phase' ? {} : { phase: variant === 'mismatched-phase' ? 'trial-running' : head.phase }),
+    };
+    const lifecycle = createServiceLifecycle({
+      platform: 'win32', architecture: 'x64', native: {}, store: { openRecovery: () => session },
+      driver: {
+        recoverTrialState: () => { calls.push('classify'); return classification; },
+        probe: () => { calls.push('probe'); return { platformPhase: 'trial', resourceFingerprint: head.transition.platformResourceFingerprint }; },
+        startTrial: () => assert.fail('manual or pending classifiers cannot start a trial'),
+      },
+    });
+    await assert.rejects(lifecycle.recover({
+      schemaVersion: 1, target: { component: 'bot' }, roles: windowsRoles,
+      expected: { transactionId: head.transactionId, journalFingerprint: head.transactionFingerprint },
+      acceptServiceDisruption: false,
+    }), { code: variant === 'durable-phase' ? 'SERVICE_MANUAL_CLEANUP' : 'SERVICE_PENDING' });
+    assert.deepEqual(calls, variant === 'durable-phase' ? ['classify', 'probe', 'close'] : ['classify', 'close']);
+    assert.equal(session.writes, variant === 'durable-phase' ? 1 : 0);
+    assert.equal(markers.length, variant === 'durable-phase' ? 1 : 0);
+    if (markers.length) {
+      assert.equal(markers[0].phase, head.phase);
+      assert.equal(markers[0].journalFingerprint, head.transactionFingerprint);
+      assert.equal(markers[0].transactionId, head.transactionId);
+      assert.equal(markers[0].blockedUntilOperatorAction, true);
+    }
+  });
+}
 
 test('recovery refuses an unknown classifier without replay or synthetic proof', async () => {
   const calls = [];

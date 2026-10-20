@@ -152,6 +152,7 @@ function releaseFor(component) {
       },
     },
     applicationManifestFingerprint: hex('d'),
+    shawlManifestFingerprint: hex('7'),
     entrypointPath: `${root}\\${entry.replaceAll('/', '\\')}`,
     entrypointSha256: hex('c'),
     supervisorPath: `C:\\ProgramData\\GJC\\shawl\\${hex('a')}\\shawl.exe`,
@@ -188,6 +189,24 @@ test('install preflight captures protected authority through native read-only ro
   assert.equal(h.fake.openHandles(), 0);
 });
 
+test('C2 host forwards separate Shawl manifest authority without changing executable launch identity', async () => {
+  const h = harness({ env: '' });
+  const operation = h.create();
+  await operation.effectiveConfigPreflight(context(h));
+  const options = operation.lifecycleOptions(context(h));
+  const s = session('bot');
+  const release = { ...releaseFor('bot'), shawlManifestFingerprint: hex('7') };
+  assert.notEqual(release.shawlManifestFingerprint, release.supervisorSha256);
+  options.planResource({ session: s, request: h.request, release });
+  options.createWindowsDriver({ session: s, request: h.request, release });
+  assert.equal(h.drivers.length, 1);
+  const captured = h.drivers[0];
+  assert.equal(captured.launch.supervisorSha256, release.supervisorSha256);
+  assert.equal(captured.shawl.sha256, release.supervisorSha256);
+  assert.equal(captured.shawl.path, release.supervisorPath);
+  assert.equal(captured.shawl.manifestFingerprint, release.shawlManifestFingerprint);
+});
+
 test('bot install composes one Launch-bound driver and plans trial and final resources', async () => {
   const h = harness();
   const operation = h.create();
@@ -209,7 +228,7 @@ test('bot install composes one Launch-bound driver and plans trial and final res
   assert.equal(launch.configSourceIdentityFingerprint, physical('c'.repeat(32)));
   assert.equal(launch.runtimeSha256, hex('b'));
   assert.equal(launch.runtimePolicyFingerprint, windowsServiceRuntimePolicyFingerprint(launch, 'bot', 'bot'));
-  assert.deepEqual(shawl, { path: release.supervisorPath, sha256: hex('a'), runtimeSha256: hex('b'), entrypointSha256: hex('c') });
+  assert.deepEqual(shawl, { path: release.supervisorPath, sha256: hex('a'), manifestFingerprint: hex('7'), runtimeSha256: hex('b'), entrypointSha256: hex('c') });
   assert.ok(buildWindowsShawlArgv({ component: 'bot', serviceKey: 'bot', launch: { ...launch } }).includes('--env'));
   const observer = options.observeApplication({ trial: true });
   assert.deepEqual(observer.options.expectedState, { expectedHostSetFingerprint: hex('8'), expectedHostCount: 2 });

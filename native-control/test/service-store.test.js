@@ -1177,11 +1177,15 @@ function realArchiveApplication({
   };
 }
 
-function committedScratchResidue() {
+function committedScratchResidue({ admitCurrentMetadata = false } = {}) {
   const fake = new FakeServiceNative();
   const store = bootstrap(fake);
   const deployment = realArchiveApplication();
   const session = store.openMutation();
+  const initialCurrent = admitCurrentMetadata ? {
+    manifest: session.readManifest('current'),
+    resource: session.readResourceProof('current'),
+  } : null;
   const identity = fake.seedApplicationPublication(deployment.manifest);
   const transactionId = 'tx-scratch-residue';
   const transactionNonce = '6'.repeat(32);
@@ -1239,6 +1243,17 @@ function committedScratchResidue() {
     ...signedEnvelope('application', deployment.manifest),
     transaction: prepared,
   });
+  if (admitCurrentMetadata) {
+    const writes = session.writes;
+    session.acceptProvisionalMetadata({
+      transaction: prepared,
+      manifest: manifestRecord,
+      resource,
+    });
+    assert.equal(session.writes, writes);
+    assert.equal(session.readManifest('current').present, false);
+    assert.equal(session.readResourceProof('current').present, false);
+  }
   session.reserveApplicationSequence({
     manifest: deployment.manifest,
     transaction: prepared,
@@ -1256,6 +1271,7 @@ function committedScratchResidue() {
     reserved,
     resource,
     manifestRecord,
+    initialCurrent,
   };
 }
 
@@ -2273,6 +2289,171 @@ function expectCode(fn, code) {
     return true;
   });
 }
+
+function admittedInitialCurrentPair() {
+  const model = committedScratchResidue({ admitCurrentMetadata: true });
+  const { session, deployment, identity, reserved } = model;
+  const expectedManifest = model.initialCurrent.manifest;
+  const expectedResource = model.initialCurrent.resource;
+  assert.equal(expectedManifest.present, false);
+  assert.equal(expectedResource.present, false);
+  const transaction = nextJournal(reserved, 'release-published', 'observed');
+  session.appendJournal(transaction);
+  const publication = session.observeApplicationPublication(deployment.manifest, identity);
+  assert.equal(publication.binding.manifestFingerprint, transaction.candidate.applicationManifestFingerprint);
+  const floor = session.readApplicationFloor();
+  assert.equal(floor.pending, false);
+  assert.equal(floor.floor.activeReservation.transactionId, transaction.transactionId);
+  assert.equal(floor.floor.activeReservation.transactionNonce, transaction.transactionNonce);
+  assert.equal(floor.floor.activeReservation.transactionFingerprint, model.prepared.transactionFingerprint);
+  assert.equal(floor.floor.activeReservation.manifestFingerprint, transaction.candidate.applicationManifestFingerprint);
+  return {
+    ...model,
+    input: { transaction, manifest: model.manifestRecord, resource: model.resource, expectedManifest, expectedResource },
+  };
+}
+
+test('current metadata creates an authenticated first-install empty pair without a null CAS bypass', () => {
+  const { session, input, fake } = admittedInitialCurrentPair();
+  try {
+    const writes = session.writes;
+    for (const forged of [null, { present: false, value: null }]) {
+      expectCode(() => session.publishCurrentMetadata({ ...input, expectedManifest: forged }),
+        forged === null ? 'SERVICE_INVALID' : 'SERVICE_STALE');
+    }
+    expectCode(() => session.publishCurrentMetadata({ ...input, expectedManifest: input.expectedResource }), 'SERVICE_STALE');
+    assert.equal(session.writes, writes);
+    const beforeCalls = fake.calls.length;
+    const result = session.publishCurrentMetadata(input);
+    assert.equal(result.resource.value.resourceProof, input.transaction.final.resourceProof);
+    assert.equal(result.manifest.value.manifestFingerprint, input.transaction.final.manifestFingerprint);
+    assert.deepEqual(fake.calls.slice(beforeCalls).filter((call) => call.startsWith('publish:')), [
+      'publish:bot/current-resource.json',
+      'publish:bot/current.json',
+    ]);
+    assert.equal(session.readManifest('current').value.resourceProof, session.readResourceProof('current').value.resourceProof);
+    assert.equal(session.readJournal().head.value.transactionFingerprint, input.transaction.transactionFingerprint);
+    assert.equal(session.readApplicationFloor().floor.activeReservation.transactionId, input.transaction.transactionId);
+    expectCode(() => session.publishCurrentMetadata(input), 'SERVICE_PENDING');
+  } finally {
+    session.close();
+  }
+});
+
+test('current metadata initial absence still uses native no-replace collision protection', () => {
+  const { session, input, fake } = admittedInitialCurrentPair();
+  try {
+    const writes = session.writes;
+    fake.publishCollision = { name: 'current-resource.json', bytes: null };
+    expectCode(() => session.publishCurrentMetadata(input), 'SERVICE_ALREADY_EXISTS');
+    assert.equal(session.writes, writes);
+    assert.equal(session.readManifest('current').present, false);
+    assert.equal(session.readResourceProof('current').present, true);
+  } finally {
+    session.close();
+  }
+});
+
+test('current metadata second-write collision retains resource and uncommitted journal without cleanup', () => {
+  const { session, input, fake } = admittedInitialCurrentPair();
+  try {
+    const writes = session.writes;
+    const head = session.readJournal().head.value;
+    const floor = session.readApplicationFloor();
+    fake.collidePublish('current.json', Buffer.from('foreign-manifest'));
+    expectCode(() => session.publishCurrentMetadata(input), 'SERVICE_ALREADY_EXISTS');
+    assert.ok(session.writes > writes);
+    assert.equal(session.readResourceProof('current').value.resourceProof, input.resource.resourceProof);
+    assert.equal(fake.recordBytes('manifest', 'bot', 'current.json').toString(), 'foreign-manifest');
+    assert.equal(session.readJournal().head.value.transactionFingerprint, head.transactionFingerprint);
+    assert.equal(session.readJournal().entries.at(-1).phase, 'release-published');
+    assert.deepEqual(session.readApplicationFloor(), floor);
+    assert.equal(session.readManualCleanup().present, false);
+    const failedWrites = session.writes;
+    expectCode(() => session.publishCurrentMetadata(input), 'SERVICE_STALE');
+    assert.equal(session.writes, failedWrites);
+    assert.equal(fake.recordBytes('manifest', 'bot', 'current.json').toString(), 'foreign-manifest');
+  } finally {
+    session.close();
+  }
+});
+
+test('current metadata update cannot create a missing pair from authenticated absence', () => {
+  const fake = new FakeServiceNative();
+  const store = bootstrap(fake);
+  const session = store.openMutation();
+  try {
+    const original = applicationManifest();
+    const installed = publishCommittedInstallation(session, original, fake.seedApplicationPublication(original));
+    const deployment = applicationManifest({ sequence: 2, version: '2.0.0', archiveHash: hash('5') });
+    const identity = fake.seedApplicationPublication(deployment);
+    const successor = successorFixture(installed, deployment);
+    session.appendJournal(successor.transaction);
+    session.retainDeploymentEnvelope({ ...signedEnvelope('application', deployment), transaction: successor.transaction });
+    session.acceptProvisionalMetadata({ transaction: successor.transaction, manifest: successor.manifest, resource: successor.resource });
+    session.reserveApplicationSequence({ manifest: deployment, transaction: successor.transaction, currentSequence: original.releaseSequence });
+    const reserved = nextJournal(successor.transaction, 'sequence-reserved', 'observed');
+    session.appendJournal(reserved);
+    const published = nextJournal(reserved, 'release-published', 'observed');
+    session.appendJournal(published);
+    session.observeApplicationPublication(deployment, identity);
+    session.removeManifest('current', session.readManifest('current'));
+    session.removeResourceProof('current', session.readResourceProof('current'));
+    const expectedManifest = session.readManifest('current');
+    const expectedResource = session.readResourceProof('current');
+    assert.equal(expectedManifest.present, false);
+    assert.equal(expectedResource.present, false);
+    const writes = session.writes;
+    expectCode(() => session.publishCurrentMetadata({
+      transaction: published, manifest: successor.manifest, resource: successor.resource,
+      expectedManifest, expectedResource,
+    }), 'SERVICE_STALE');
+    assert.equal(session.writes, writes);
+    assert.equal(session.readManifest('current').present, false);
+    assert.equal(session.readResourceProof('current').present, false);
+  } finally {
+    session.close();
+  }
+});
+
+test('current metadata refuses a partial first-install pair and foreign-session absence receipts', () => {
+  const model = admittedInitialCurrentPair();
+  const foreign = admittedInitialCurrentPair();
+  try {
+    const { session, input } = model;
+    const writes = session.writes;
+    expectCode(() => session.publishCurrentMetadata({ ...input, expectedManifest: foreign.input.expectedManifest }), 'SERVICE_STALE');
+    assert.equal(session.writes, writes);
+    session.publishResourceProof('current', input.resource, input.expectedResource);
+    const partialWrites = session.writes;
+    expectCode(() => session.publishCurrentMetadata({ ...input, expectedResource: session.readResourceProof('current') }), 'SERVICE_STALE');
+    assert.equal(session.writes, partialWrites);
+    assert.equal(session.readManifest('current').present, false);
+  } finally {
+    model.session.close();
+    foreign.session.close();
+  }
+});
+
+test('current metadata initial absence does not bypass provisional admission', () => {
+  const { session, reserved, manifestRecord, resource, deployment, identity } = committedScratchResidue();
+  try {
+    const published = nextJournal(reserved, 'release-published', 'observed');
+    session.appendJournal(published);
+    session.observeApplicationPublication(deployment.manifest, identity);
+    const expectedManifest = session.readManifest('current');
+    const expectedResource = session.readResourceProof('current');
+    const writes = session.writes;
+    expectCode(() => session.publishCurrentMetadata({
+      transaction: published, manifest: manifestRecord, resource, expectedManifest, expectedResource,
+    }), 'SERVICE_PENDING');
+    assert.equal(session.writes, writes);
+    assert.equal(session.readManifest('current').present, false);
+    assert.equal(session.readResourceProof('current').present, false);
+  } finally {
+    session.close();
+  }
+});
 
 function expectPinnedStoreFailure(invoke, writes) {
   assert.throws(invoke, (error) => {

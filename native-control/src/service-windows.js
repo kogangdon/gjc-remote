@@ -439,7 +439,7 @@ export function createWindowsServiceDriver(options) {
   const component = session.component; const serviceKey = session.serviceKey;
   try { validateServiceKey(serviceKey, component); validateServiceRoles(roles, 'win32'); } catch { fail('SERVICE_INVALID', op); }
   if (!validateConfiguration(configuration, component)) fail('SERVICE_INVALID', op);
-  if (!exact(shawl, ['path', 'sha256', 'runtimeSha256', 'entrypointSha256']) || !contentAddressedShawlPath(shawl.path, shawl.sha256) || !validHash(shawl.runtimeSha256) || !validHash(shawl.entrypointSha256)) fail('SERVICE_INVALID', op);
+  if (!exact(shawl, ['path', 'sha256', 'manifestFingerprint', 'runtimeSha256', 'entrypointSha256']) || !validHash(shawl.manifestFingerprint) || !contentAddressedShawlPath(shawl.path, shawl.sha256) || !validHash(shawl.runtimeSha256) || !validHash(shawl.entrypointSha256)) fail('SERVICE_INVALID', op);
   let launch;
   try {
     launch = Object.freeze({ ...launchFields(launchInput, component, serviceKey, true) });
@@ -796,7 +796,9 @@ export function createWindowsServiceDriver(options) {
     const expectedResources = applicationManifestFingerprint === candidate
       ? [transaction.transition?.platformResourceFingerprint, transaction.transition?.expectedAfterResourceFingerprint]
       : [transaction.transition?.expectedBeforeResourceFingerprint];
-    const matches = [...new Set(expectedResources.filter((value) => validHash(value)))].filter((value) => value === observedResource || value === projectedResource);
+    const declaredResources = [...new Set(expectedResources.filter((value) => validHash(value)))];
+    let matches = declaredResources.filter((value) => value === observedResource);
+    if (matches.length === 0) matches = declaredResources.filter((value) => value === projectedResource);
     if (matches.length !== 1) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
     const entrypointPath = commandLineEntrypoint(snapshot.binaryPath);
     if (entrypointPath === null) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
@@ -975,7 +977,7 @@ export function createWindowsServiceDriver(options) {
       { phase: 'resource-published' },
     ]);
     const declared = [transaction.candidate.applicationManifestFingerprint, transaction.old.applicationManifestFingerprint].filter((value) => value !== null);
-    if (transaction.candidate.shawlManifestFingerprint !== shawl.sha256 || !declared.includes(input.release.applicationManifestFingerprint)) fail('SERVICE_STALE', 'publish_suppressed_resource', driverWrites, true, 'resource-drift');
+    if (transaction.candidate.shawlManifestFingerprint !== shawl.manifestFingerprint || !declared.includes(input.release.applicationManifestFingerprint)) fail('SERVICE_STALE', 'publish_suppressed_resource', driverWrites, true, 'resource-drift');
     const expectedBefore = transaction.transition.expectedBeforeResourceFingerprint;
     if (currentFingerprint === null) {
       if (input.expectedCurrentSha256 !== null || expectedBefore !== null) fail('SERVICE_MANUAL_CLEANUP', 'publish_suppressed_resource', driverWrites, true, 'recreated-resource');
@@ -1016,8 +1018,8 @@ export function createWindowsServiceDriver(options) {
       ]);
       const transitionReplay = transaction.phase === 'transition-marker-intent' && ['intent', 'action'].includes(transaction.substep) && input.expectedCurrentSha256 === transaction.transition.expectedBeforeResourceFingerprint;
       const planned = resourcePlan('trial', input.release.applicationManifestFingerprint, operation);
-      const expectedPlanned = transaction.transition.expectedAfterResourceFingerprint ?? transaction.transition.platformResourceFingerprint;
-      if (planned.resourceFingerprint !== expectedPlanned || planned.resourceFingerprint !== transaction.transition.platformResourceFingerprint) {
+      const plannedFinal = resourcePlan('final', input.release.applicationManifestFingerprint, operation);
+      if (planned.resourceFingerprint !== transaction.transition.platformResourceFingerprint || plannedFinal.resourceFingerprint !== transaction.transition.expectedAfterResourceFingerprint) {
         fail('SERVICE_STALE', operation, driverWrites, true, 'resource-drift');
       }
       // The operation's release is authoritative for this transaction.  A
@@ -1042,12 +1044,11 @@ export function createWindowsServiceDriver(options) {
         marker: currentProbe.service.description,
       });
       const expectedBefore = transaction.transition.expectedBeforeResourceFingerprint;
-      const expectedAfter = transaction.transition.expectedAfterResourceFingerprint ?? transaction.transition.platformResourceFingerprint;
       if (transitionReplay && currentProbe.service !== null) {
         // A durable action may have completed before the controller vanished.
         // Accept only the exact declared post-state; hybrids are never
         // repaired by guessing which native edge crossed the ABI.
-        if (currentProbe.resourceFingerprint === expectedAfter && currentProbe.resourceFingerprint === transaction.transition.platformResourceFingerprint) {
+        if (currentProbe.resourceFingerprint === transaction.transition.platformResourceFingerprint) {
           if (currentProbe.service.description !== marker(transaction.candidate.applicationManifestFingerprint)) fail('SERVICE_MANUAL_CLEANUP', operation, driverWrites, true, 'resource-drift');
           append('transition-marker-intent', 'observed');
           append('resource-published', 'observed');
@@ -1470,9 +1471,10 @@ export function createWindowsServiceDriver(options) {
       ]);
       // Recovery binds the marker/resource pair observed in SCM.  A newer or
       // undeclared constructor release is never used as an expected path.
+      // Preserve the classified input phase even if recovery promotes the journal.
       let observed;
-      try { observed = probe(operation, transaction); } catch (error) {
-        if (error?.code === 'SERVICE_MANUAL_CLEANUP') return freeze({ recovery: 'manual-cleanup', reason: error.reason ?? 'resource-drift' });
+      try { observed = { ...probe(operation, transaction), phase: transaction.phase }; } catch (error) {
+        if (error?.code === 'SERVICE_MANUAL_CLEANUP') return freeze({ phase: transaction.phase, recovery: 'manual-cleanup', reason: error.reason ?? 'resource-drift' });
         throw error;
       }
       if (observed.platformPhase === null) return freeze({ ...observed, recovery: 'manual-cleanup', reason: observed.driftReasons[0] ?? 'resource-drift' });

@@ -378,6 +378,7 @@ export function createWindowsHostOperationFactory(dependencyValues) {
         configuration, launch,
         shawl: {
           path: release.supervisorPath, sha256: release.supervisorSha256,
+          manifestFingerprint: release.shawlManifestFingerprint,
           runtimeSha256: captured.runtimeSha256, entrypointSha256: release.entrypointSha256,
         },
         clock: dependencies.clock, sleep: dependencies.sleep,
