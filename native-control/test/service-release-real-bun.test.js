@@ -39,7 +39,7 @@ const originalMkdtemp = fsPromises.mkdtemp;
 const originalRealpath = fsPromises.realpath;
 const productRoot = fileURLToPath(new URL('../..', import.meta.url));
 const ACKNOWLEDGEMENT_FLAG = '--acknowledge-real-bun-fixture-build';
-const RELEASE_SEQUENCE = 12;
+const RELEASE_SEQUENCE = 13;
 
 function copyRegular(source, destination, mode = undefined) {
   const stat = lstatSync(source);
@@ -327,15 +327,34 @@ test('real-Bun evidence harness rejects invalid release identities before side e
     assert.deepEqual(boundary.snapshot(), beforeAcknowledgement);
 
     const invalidSequenceContracts = [
-      ['malformed string', (contract) => { contract.releaseSequence = '12'; }],
-      ['malformed fraction', (contract) => { contract.releaseSequence = 12.5; }],
+      ['malformed string', (contract) => { contract.releaseSequence = '13'; }],
+      ['malformed fraction', (contract) => { contract.releaseSequence = 13.5; }],
       ['missing', (contract) => { delete contract.releaseSequence; }],
       ['historical', (contract) => { contract.releaseSequence = 10; }],
-      ['stale', (contract) => { contract.releaseSequence = 11; }],
-      ['future', (contract) => { contract.releaseSequence = 13; }],
+      ['historical rc11', (contract) => { contract.releaseSequence = 11; }],
+      ['stale', (contract) => { contract.releaseSequence = 12; }],
+      ['future', (contract) => { contract.releaseSequence = 14; }],
     ];
     const invalidIdentityContracts = [
-      ['coherent previous rc11 tuple', (contract) => {
+      ...[12, 14].flatMap((sequence) => [
+        [`coherent rc${sequence} tuple`, (contract) => {
+          contract.releaseVersion = `0.4.0-rc.${sequence}`;
+          contract.releaseTag = `v0.4.0-rc.${sequence}`;
+          contract.releaseSequence = sequence;
+          for (const workspace of contract.sourceWorkspaces) {
+            if (workspace.path !== 'native-control') workspace.packageVersion = `0.4.0-rc.${sequence}`;
+          }
+        }],
+        [`rc${sequence} version`, (contract) => { contract.releaseVersion = `0.4.0-rc.${sequence}`; }],
+        [`rc${sequence} tag`, (contract) => { contract.releaseTag = `v0.4.0-rc.${sequence}`; }],
+        ...['bot', 'daemon', 'shared', 'native-control'].map((path) => [
+          `wrong rc${sequence} ${path} workspace version`,
+          (contract) => {
+            contract.sourceWorkspaces.find((workspace) => workspace.path === path).packageVersion = `0.4.0-rc.${sequence}`;
+          },
+        ]),
+      ]),
+      ['coherent historical rc11 tuple', (contract) => {
         contract.releaseVersion = '0.4.0-rc.11';
         contract.releaseTag = 'v0.4.0-rc.11';
         contract.releaseSequence = 11;
@@ -343,8 +362,8 @@ test('real-Bun evidence harness rejects invalid release identities before side e
           if (workspace.path !== 'native-control') workspace.packageVersion = '0.4.0-rc.11';
         }
       }],
-      ['previous version', (contract) => { contract.releaseVersion = '0.4.0-rc.11'; }],
-      ['previous tag', (contract) => { contract.releaseTag = 'v0.4.0-rc.11'; }],
+      ['historical rc11 version', (contract) => { contract.releaseVersion = '0.4.0-rc.11'; }],
+      ['historical rc11 tag', (contract) => { contract.releaseTag = 'v0.4.0-rc.11'; }],
       ['historical version', (contract) => { contract.releaseVersion = '0.4.0-rc.10'; }],
       ['historical tag', (contract) => { contract.releaseTag = 'v0.4.0-rc.10'; }],
       ...['bot', 'daemon', 'shared', 'native-control'].map((path) => [
@@ -392,8 +411,8 @@ test('real-Bun evidence harness rejects invalid release identities before side e
 
     writeFileSync(contractPath, originalContractBytes);
     const admittedContract = await installation.releaseBuilder.loadServiceReleaseContract();
-    assert.equal(admittedContract.releaseVersion, '0.4.0-rc.12');
-    assert.equal(admittedContract.releaseTag, 'v0.4.0-rc.12');
+    assert.equal(admittedContract.releaseVersion, '0.4.0-rc.13');
+    assert.equal(admittedContract.releaseTag, 'v0.4.0-rc.13');
     assert.equal(admittedContract.releaseSequence, RELEASE_SEQUENCE);
     for (const [description, mutate] of invalidSequenceContracts) {
       const invalidInput = { ...buildInput };
