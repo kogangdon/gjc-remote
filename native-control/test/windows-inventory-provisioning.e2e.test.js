@@ -289,7 +289,7 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
   const packageJson = JSON.parse(readFileSync(packageUrl, 'utf8'));
   assert.equal(packageJson.version, '2.1.0');
   assert.equal(packageJson.nativeControlContract.version, 5);
-  assert.equal(packageJson.nativeControlContract.revision, 2);
+  assert.equal(packageJson.nativeControlContract.revision, 3);
   assert.equal(validateBuildManifest(manifest, packageJson, addonBytes), true,
     'the built native addon must match the ABI 5/revision 3 contract and package payload');
 
