@@ -37,6 +37,7 @@
 #pragma comment(lib, "bcrypt.lib")
 #endif
 #include <sddl.h>
+#include "windows-lineage.h"
 #else
 #include <fcntl.h>
 #include <sys/file.h>
@@ -9846,6 +9847,423 @@ napi_value TerminateWin32ServiceTree(napi_env env,
   return nullptr;
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// Win32 lineage scopes. Source-owned creation-time containment: an anonymous
+// non-breakaway job receives the suspended root through JOB_LIST, identity is
+// verified before resume, closure is sealed kernel accounting zero plus the
+// retained root exit, and termination is scoped to the exact job. Receipts
+// fail closed: coverageComplete is never claimed by this inheritance-only
+// primitive (alternate-parent creation is outside its authority boundary).
+#ifdef _WIN32
+const napi_type_tag kWin32LineageScopeTypeTag = {
+  0x9d1c4f2a7b3e58a6ULL, 0xc4e20a17f6b9d835ULL,
+};
+
+struct Win32LineageScopeHandle {
+  windows_lineage::WindowsLineageScope* scope = nullptr;
+};
+
+void FinalizeWin32LineageScope(napi_env, void* data, void*) {
+  auto* handle = static_cast<Win32LineageScopeHandle*>(data);
+  if (handle) {
+    if (handle->scope) handle->scope->Close();
+    delete handle->scope;
+    delete handle;
+  }
+}
+
+bool Win32LineageScopeUnwrap(napi_env env, napi_value value,
+                             Win32LineageScopeHandle** result) {
+  bool tagged = false;
+  void* raw = nullptr;
+  if (napi_check_object_type_tag(env, value, &kWin32LineageScopeTypeTag,
+                                 &tagged) != napi_ok ||
+      !tagged || napi_unwrap(env, value, &raw) != napi_ok || !raw) {
+    return false;
+  }
+  *result = static_cast<Win32LineageScopeHandle*>(raw);
+  return true;
+}
+
+// Validates a plain enumerable own-data object and captures the requested
+// properties, following the inventory validator's exact convention: cached
+// Object.prototype/getOwnPropertyDescriptors, no accessor evaluation, exact
+// own-key count.
+bool LineagePlainData(napi_env env, napi_value value, const char* const* names,
+                      size_t expected, napi_value* captured) {
+  napi_valuetype type;
+  napi_value prototype, object_prototype, get_descriptors, descriptors, keys;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_object ||
+      !gInventoryObjectPrototype || !gInventoryGetOwnPropertyDescriptors ||
+      napi_get_reference_value(env, gInventoryObjectPrototype, &object_prototype) != napi_ok ||
+      napi_get_reference_value(env, gInventoryGetOwnPropertyDescriptors, &get_descriptors) != napi_ok ||
+      napi_get_prototype(env, value, &prototype) != napi_ok) return false;
+  bool same = false;
+  if (napi_strict_equals(env, prototype, object_prototype, &same) != napi_ok || !same ||
+      napi_get_all_property_names(env, value, napi_key_own_only, napi_key_all_properties,
+                                  napi_key_numbers_to_strings, &keys) != napi_ok) return false;
+  uint32_t count = 0;
+  if (napi_get_array_length(env, keys, &count) != napi_ok || count != expected) return false;
+  if (napi_call_function(env, object_prototype, get_descriptors, 1, &value, &descriptors) != napi_ok)
+    return false;
+  for (size_t i = 0; i < expected; ++i) {
+    napi_value descriptor, enumerable, descriptor_value;
+    bool flag = false, has_getter = false, has_setter = false;
+    if (napi_get_named_property(env, descriptors, names[i], &descriptor) != napi_ok ||
+        napi_typeof(env, descriptor, &type) != napi_ok || type != napi_object ||
+        napi_get_named_property(env, descriptor, "enumerable", &enumerable) != napi_ok ||
+        napi_get_value_bool(env, enumerable, &flag) != napi_ok || !flag ||
+        napi_has_named_property(env, descriptor, "value", &flag) != napi_ok || !flag ||
+        napi_has_named_property(env, descriptor, "get", &has_getter) != napi_ok || has_getter ||
+        napi_has_named_property(env, descriptor, "set", &has_setter) != napi_ok || has_setter ||
+        napi_get_named_property(env, descriptor, "value", &descriptor_value) != napi_ok)
+      return false;
+    if (captured) captured[i] = descriptor_value;
+  }
+  return true;
+}
+
+bool LineageString(napi_env env, napi_value value, std::wstring* out) {
+  std::string utf8;
+  if (!InventoryString(env, value, &utf8)) return false;
+  *out = Wide(utf8);
+  return !utf8.empty() && !out->empty();
+}
+
+bool LineageArgsArray(napi_env env, napi_value value,
+                      std::vector<std::wstring>* out) {
+  bool is_array = false;
+  if (napi_is_array(env, value, &is_array) != napi_ok || !is_array) return false;
+  uint32_t length = 0;
+  if (napi_get_array_length(env, value, &length) != napi_ok || length > 128)
+    return false;
+  // A dense array owns exactly length+1 keys: the indexes plus "length". A
+  // sparse array has fewer, so the count check rejects holes up front.
+  napi_value keys, object_prototype, get_descriptors, descriptors;
+  if (!gInventoryObjectPrototype || !gInventoryGetOwnPropertyDescriptors ||
+      napi_get_reference_value(env, gInventoryObjectPrototype, &object_prototype) != napi_ok ||
+      napi_get_reference_value(env, gInventoryGetOwnPropertyDescriptors, &get_descriptors) != napi_ok ||
+      napi_get_all_property_names(env, value, napi_key_own_only, napi_key_all_properties,
+                                  napi_key_numbers_to_strings, &keys) != napi_ok)
+    return false;
+  uint32_t count = 0;
+  if (napi_get_array_length(env, keys, &count) != napi_ok || count != length + 1)
+    return false;
+  if (napi_call_function(env, object_prototype, get_descriptors, 1, &value, &descriptors) != napi_ok)
+    return false;
+  for (uint32_t index = 0; index < length; ++index) {
+    const std::string name = std::to_string(index);
+    napi_value descriptor, enumerable, descriptor_value;
+    napi_valuetype type;
+    bool flag = false, has_getter = false, has_setter = false;
+    // Each index must be an enumerable own data property; accessors are never
+    // invoked, only inspected and refused.
+    if (napi_get_named_property(env, descriptors, name.c_str(), &descriptor) != napi_ok ||
+        napi_typeof(env, descriptor, &type) != napi_ok || type != napi_object ||
+        napi_get_named_property(env, descriptor, "enumerable", &enumerable) != napi_ok ||
+        napi_get_value_bool(env, enumerable, &flag) != napi_ok || !flag ||
+        napi_has_named_property(env, descriptor, "value", &flag) != napi_ok || !flag ||
+        napi_has_named_property(env, descriptor, "get", &has_getter) != napi_ok || has_getter ||
+        napi_has_named_property(env, descriptor, "set", &has_setter) != napi_ok || has_setter ||
+        napi_get_named_property(env, descriptor, "value", &descriptor_value) != napi_ok)
+      return false;
+    std::wstring text;
+    if (!LineageString(env, descriptor_value, &text)) return false;
+    out->push_back(std::move(text));
+  }
+  return true;
+}
+
+bool LineageBindingArg(napi_env env, napi_value value,
+                       windows_lineage::WindowsLineageBinding* out) {
+  static const char* fields[] = {"serviceKey", "bootId", "configFingerprint",
+                                 "roleSid", "lifetimeId"};
+  napi_value captured[5];
+  if (!LineagePlainData(env, value, fields, 5, captured)) return false;
+  std::wstring* targets[] = {&out->serviceKey, &out->bootId,
+                             &out->configFingerprint, &out->roleSid,
+                             &out->lifetimeId};
+  for (size_t index = 0; index < 5; ++index) {
+    if (!LineageString(env, captured[index], targets[index])) return false;
+  }
+  return true;
+}
+
+void LineageEffectsValue(napi_env env, napi_value object,
+                         const windows_lineage::Effects& effects) {
+  napi_value value;
+  napi_create_object(env, &value);
+  ServiceSetBoolean(env, value, "jobCreated", effects.jobCreated);
+  ServiceSetBoolean(env, value, "rootCreated", effects.rootCreated);
+  ServiceSetBoolean(env, value, "rootResumed", effects.rootResumed);
+  ServiceSetBoolean(env, value, "forced", effects.forced);
+  ServiceSetUint32(env, value, "terminationCalls", effects.terminationCalls);
+  ServiceSetUint32(env, value, "cleanupTerminationCalls",
+                   effects.cleanupTerminationCalls);
+  napi_set_named_property(env, object, "effects", value);
+}
+
+uint32_t LineageWrites(const windows_lineage::Effects& effects) {
+  return (effects.jobCreated || effects.rootCreated || effects.rootResumed ||
+          effects.terminationCalls > 0 || effects.cleanupTerminationCalls > 0)
+             ? 1
+             : 0;
+}
+
+void LineageError(napi_env env, const char* operation,
+                  const windows_lineage::Error& error, uint32_t writes) {
+  napi_value thrown, text, value;
+  napi_create_string_utf8(env, error.message.c_str(), NAPI_AUTO_LENGTH, &text);
+  napi_create_error(env, nullptr, text, &thrown);
+  napi_create_string_utf8(env, error.code.c_str(), NAPI_AUTO_LENGTH, &value);
+  napi_set_named_property(env, thrown, "code", value);
+  napi_create_string_utf8(env, operation, NAPI_AUTO_LENGTH, &value);
+  napi_set_named_property(env, thrown, "operation", value);
+  napi_create_uint32(env, writes, &value);
+  napi_set_named_property(env, thrown, "writes", value);
+  napi_get_boolean(env, error.ambiguous, &value);
+  napi_set_named_property(env, thrown, "ambiguous", value);
+  napi_create_uint32(env, error.win32, &value);
+  napi_set_named_property(env, thrown, "win32", value);
+  LineageEffectsValue(env, thrown, error.effects);
+  if (error.rootPid > 0) {
+    ServiceSetUint32(env, thrown, "rootPid", error.rootPid);
+    ServiceSetString(env, thrown, "rootStartTime",
+                     std::to_string(error.rootStartTime));
+    ServiceSetString(env, thrown, "rootExecutable", Utf8(error.rootExecutable));
+    ServiceSetString(env, thrown, "rootOwner", Utf8(error.rootOwner));
+    ServiceSetString(env, thrown, "scopeId", Utf8(error.scopeId));
+  }
+  napi_throw(env, thrown);
+}
+
+napi_value LineageReceiptValue(napi_env env,
+                               const windows_lineage::Receipt& receipt,
+                               const windows_lineage::Effects& effects,
+                               bool writes) {
+  napi_value object, binding;
+  if (napi_create_object(env, &object) != napi_ok ||
+      napi_create_object(env, &binding) != napi_ok) return nullptr;
+  ServiceSetString(env, binding, "serviceKey", Utf8(receipt.binding.serviceKey));
+  ServiceSetString(env, binding, "bootId", Utf8(receipt.binding.bootId));
+  ServiceSetString(env, binding, "configFingerprint",
+                   Utf8(receipt.binding.configFingerprint));
+  ServiceSetString(env, binding, "roleSid", Utf8(receipt.binding.roleSid));
+  ServiceSetString(env, binding, "lifetimeId", Utf8(receipt.binding.lifetimeId));
+  napi_set_named_property(env, object, "binding", binding);
+  ServiceSetString(env, object, "scopeId", Utf8(receipt.scopeId));
+  ServiceSetString(env, object, "operationId", Utf8(receipt.operationId));
+  ServiceSetString(env, object, "rootExecutable", Utf8(receipt.rootExecutable));
+  ServiceSetString(env, object, "rootOwner", Utf8(receipt.rootOwner));
+  ServiceSetUint32(env, object, "rootPid", receipt.rootPid);
+  ServiceSetString(env, object, "rootStartTime",
+                   std::to_string(receipt.rootStartTime));
+  ServiceSetBoolean(env, object, "rootExited", receipt.rootExited);
+  ServiceSetUint32(env, object, "rootExitCode", receipt.rootExitCode);
+  ServiceSetUint32(env, object, "activeProcesses", receipt.activeProcesses);
+  ServiceSetUint32(env, object, "totalProcesses", receipt.totalProcesses);
+  ServiceSetBoolean(env, object, "coverageComplete", receipt.coverageComplete);
+  ServiceSetBoolean(env, object, "escapeDetected", receipt.escapeDetected);
+  ServiceSetBoolean(env, object, "sealed", receipt.sealed);
+  ServiceSetBoolean(env, object, "closed", receipt.closed);
+  ServiceSetBoolean(env, object, "forced", receipt.forced);
+  ServiceSetUint32(env, object, "terminationCalls", receipt.terminationCalls);
+  ServiceSetUint32(env, object, "writes", writes ? 1 : 0);
+  ServiceSetBoolean(env, object, "ambiguous", false);
+  LineageEffectsValue(env, object, effects);
+  return object;
+}
+
+napi_value CreateWin32LineageScope(napi_env env, napi_callback_info info) {
+#ifdef _WIN32
+  napi_value args[3];
+  std::string executable;
+  std::vector<std::wstring> child_args;
+  windows_lineage::WindowsLineageBinding binding;
+  if (!InventoryArgs(env, info, 3, args) ||
+      !InventoryString(env, args[0], &executable) ||
+      !LineageArgsArray(env, args[1], &child_args) ||
+      !LineageBindingArg(env, args[2], &binding)) {
+    ServiceError(env, "LINEAGE_INVALID", "create_win32_lineage_scope");
+    return nullptr;
+  }
+  // The tagged wrapper is fully allocated before the first mutating native
+  // effect, so a JavaScript allocation failure can never orphan a process.
+  auto* handle = new (std::nothrow) Win32LineageScopeHandle();
+  napi_value object;
+  if (!handle || napi_create_object(env, &object) != napi_ok ||
+      napi_type_tag_object(env, object, &kWin32LineageScopeTypeTag) != napi_ok ||
+      napi_wrap(env, object, handle, FinalizeWin32LineageScope, nullptr,
+                nullptr) != napi_ok) {
+    delete handle;
+    ServiceError(env, "LINEAGE_TRACKING_LOST", "create_win32_lineage_scope");
+    return nullptr;
+  }
+  std::unique_ptr<windows_lineage::WindowsLineageScope> scope;
+  try {
+    scope = std::make_unique<windows_lineage::WindowsLineageScope>(binding);
+    scope->CreateContained(Wide(executable), child_args);
+  } catch (windows_lineage::Error& error) {
+    if (scope && !error.ambiguous &&
+        (!error.effects.rootCreated ||
+         (!error.effects.rootResumed && error.effects.cleanupTerminationCalls > 0))) {
+      // Confirmed rollback: release handles and the executable read lock
+      // deterministically instead of waiting for garbage collection. An
+      // ambiguous/live root is never discarded through this path.
+      scope->Close();
+    }
+    // Retain the same root identity diagnostics the owned fixture exposes on
+    // failed creates; effects/writes stay exactly as observed.
+    if (scope) scope->DescribeError(error);
+    // A fresh scope's effects are all attributable to this creation call.
+    LineageError(env, "create_win32_lineage_scope", error, LineageWrites(error.effects));
+    return nullptr;
+  } catch (...) {
+    ServiceError(env, "LINEAGE_TRACKING_LOST", "create_win32_lineage_scope", 0,
+                 true);
+    return nullptr;
+  }
+  handle->scope = scope.release();
+  return object;
+#else
+  ServiceError(env, "SERVICE_UNSUPPORTED", "create_win32_lineage_scope");
+  return nullptr;
+#endif
+}
+
+napi_value ObserveWin32LineageScope(napi_env env, napi_callback_info info) {
+#ifdef _WIN32
+  napi_value args[3];
+  Win32LineageScopeHandle* handle = nullptr;
+  windows_lineage::WindowsLineageBinding binding;
+  std::wstring operation_id;
+  if (!InventoryArgs(env, info, 3, args) ||
+      !Win32LineageScopeUnwrap(env, args[0], &handle)) {
+    ServiceError(env, "LINEAGE_INVALID", "observe_win32_lineage_scope");
+    return nullptr;
+  }
+  if (!handle->scope) {
+    ServiceError(env, "LINEAGE_STALE", "observe_win32_lineage_scope");
+    return nullptr;
+  }
+  if (!LineageBindingArg(env, args[1], &binding) ||
+      !LineageString(env, args[2], &operation_id)) {
+    ServiceError(env, "LINEAGE_INVALID", "observe_win32_lineage_scope");
+    return nullptr;
+  }
+  try {
+    const windows_lineage::Receipt receipt =
+        handle->scope->Observe(binding, operation_id);
+    return LineageReceiptValue(env, receipt, handle->scope->GetEffects(), false);
+  } catch (windows_lineage::Error& error) {
+    handle->scope->DescribeError(error);
+    // Observation never mutates scope effects.
+    LineageError(env, "observe_win32_lineage_scope", error, 0);
+    return nullptr;
+  } catch (...) {
+    ServiceError(env, "LINEAGE_TRACKING_LOST", "observe_win32_lineage_scope", 0,
+                 true);
+    return nullptr;
+  }
+#else
+  ServiceError(env, "SERVICE_UNSUPPORTED", "observe_win32_lineage_scope");
+  return nullptr;
+#endif
+}
+
+napi_value TerminateWin32LineageScope(napi_env env, napi_callback_info info) {
+#ifdef _WIN32
+  napi_value args[4];
+  Win32LineageScopeHandle* handle = nullptr;
+  windows_lineage::WindowsLineageBinding binding;
+  std::wstring operation_id;
+  double timeout = 0;
+  if (!InventoryArgs(env, info, 4, args) ||
+      !Win32LineageScopeUnwrap(env, args[0], &handle)) {
+    ServiceError(env, "LINEAGE_INVALID", "terminate_win32_lineage_scope");
+    return nullptr;
+  }
+  if (!handle->scope) {
+    ServiceError(env, "LINEAGE_STALE", "terminate_win32_lineage_scope");
+    return nullptr;
+  }
+  if (!LineageBindingArg(env, args[1], &binding) ||
+      !LineageString(env, args[2], &operation_id) ||
+      napi_get_value_double(env, args[3], &timeout) != napi_ok ||
+      !std::isfinite(timeout) || timeout < 1 || timeout > 60000 ||
+      std::floor(timeout) != timeout) {
+    ServiceError(env, "LINEAGE_INVALID", "terminate_win32_lineage_scope");
+    return nullptr;
+  }
+  const uint32_t calls_before = handle->scope->GetEffects().terminationCalls;
+  try {
+    const windows_lineage::Receipt receipt = handle->scope->Terminate(
+        binding, operation_id, static_cast<DWORD>(timeout));
+    const bool wrote =
+        handle->scope->GetEffects().terminationCalls != calls_before;
+    return LineageReceiptValue(env, receipt, handle->scope->GetEffects(), wrote);
+  } catch (windows_lineage::Error& error) {
+    handle->scope->DescribeError(error);
+    LineageError(env, "terminate_win32_lineage_scope", error,
+                 error.effects.terminationCalls > calls_before ? 1 : 0);
+    return nullptr;
+  } catch (...) {
+    ServiceError(env, "LINEAGE_TRACKING_LOST", "terminate_win32_lineage_scope",
+                 0, true);
+    return nullptr;
+  }
+#else
+  ServiceError(env, "SERVICE_UNSUPPORTED", "terminate_win32_lineage_scope");
+  return nullptr;
+#endif
+}
+
+napi_value CloseWin32LineageScope(napi_env env, napi_callback_info info) {
+#ifdef _WIN32
+  napi_value args[1];
+  Win32LineageScopeHandle* handle = nullptr;
+  if (!InventoryArgs(env, info, 1, args) ||
+      !Win32LineageScopeUnwrap(env, args[0], &handle)) {
+    ServiceError(env, "LINEAGE_INVALID", "close_win32_lineage_scope");
+    return nullptr;
+  }
+  if (!handle->scope) {
+    ServiceError(env, "LINEAGE_STALE", "close_win32_lineage_scope");
+    return nullptr;
+  }
+  // Handle release only. No kill-on-close and no implicit termination.
+  handle->scope->Close();
+  delete handle->scope;
+  handle->scope = nullptr;
+  napi_value result;
+  napi_create_object(env, &result);
+  ServiceSetUint32(env, result, "writes", 0);
+  return result;
+#else
+  ServiceError(env, "SERVICE_UNSUPPORTED", "close_win32_lineage_scope");
+  return nullptr;
+#endif
+}
+#endif  // _WIN32 (lineage scope section; stubs below keep the contract on all platforms)
+#ifndef _WIN32
+napi_value CreateWin32LineageScope(napi_env env, napi_callback_info) {
+  ServiceError(env, "SERVICE_UNSUPPORTED", "create_win32_lineage_scope");
+  return nullptr;
+}
+napi_value ObserveWin32LineageScope(napi_env env, napi_callback_info) {
+  ServiceError(env, "SERVICE_UNSUPPORTED", "observe_win32_lineage_scope");
+  return nullptr;
+}
+napi_value TerminateWin32LineageScope(napi_env env, napi_callback_info) {
+  ServiceError(env, "SERVICE_UNSUPPORTED", "terminate_win32_lineage_scope");
+  return nullptr;
+}
+napi_value CloseWin32LineageScope(napi_env env, napi_callback_info) {
+  ServiceError(env, "SERVICE_UNSUPPORTED", "close_win32_lineage_scope");
+  return nullptr;
+}
+#endif
 
 // Retained, service-only filesystem capabilities. These handles deliberately
 // cannot be constructed from an arbitrary path: roots are resolved here to the
@@ -22176,6 +22594,10 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
     "set_win32_service_failure_actions_flag", "start_win32_service",
     "stop_win32_service", "delete_win32_service",
     "terminate_win32_service_tree",
+    "create_win32_lineage_scope",
+    "observe_win32_lineage_scope",
+    "terminate_win32_lineage_scope",
+    "close_win32_lineage_scope",
     "open_service_root", "open_service_directory",
     "acquire_service_lock", "close_service_handle",
     "read_service_file", "publish_service_file_atomic",
@@ -22204,7 +22626,7 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   napi_value result, value, array, signatures;
   napi_create_object(env, &result);
   napi_create_uint32(env, 5, &value); napi_set_named_property(env, result, "contractVersion", value);
-  napi_create_uint32(env, 2, &value); napi_set_named_property(env, result, "contractRevision", value);
+  napi_create_uint32(env, 3, &value); napi_set_named_property(env, result, "contractRevision", value);
   napi_create_uint32(env, 8, &value); napi_set_named_property(env, result, "napi", value);
   napi_create_array_with_length(env, sizeof(capabilities) / sizeof(capabilities[0]), &array);
   for (uint32_t i = 0; i < sizeof(capabilities) / sizeof(capabilities[0]); ++i) {
@@ -22275,6 +22697,10 @@ napi_value NativeControlContract(napi_env env, napi_callback_info) {
   signature("stop_win32_service", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint"});
   signature("delete_win32_service", {"serviceHandle", "expectedConfigFingerprint", "expectedRuntimeFingerprint"});
   signature("terminate_win32_service_tree", {"serviceHandle", "expectedConfigFingerprint", "rootPid", "rootStartTime", "rootExecutable", "rootOwner", "expectedTreeFingerprint"});
+  signature("create_win32_lineage_scope", {"executable", "args", "binding"});
+  signature("observe_win32_lineage_scope", {"scopeHandle", "binding", "operationId"});
+  signature("terminate_win32_lineage_scope", {"scopeHandle", "binding", "operationId", "timeoutMs"});
+  signature("close_win32_lineage_scope", {"scopeHandle"});
   signature("open_service_root", {"rootKind", "roles", "access"});
   signature("open_service_directory", {"parentHandle", "name", "access", "expectedIdentity", "lockHandle"});
   signature("acquire_service_lock", {"controlRootHandle", "scope", "serviceKey", "mode"});
@@ -22375,6 +22801,10 @@ napi_value Init(napi_env env, napi_value exports) {
     {"stop_win32_service", nullptr, StopWin32Service, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"delete_win32_service", nullptr, DeleteWin32Service, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"terminate_win32_service_tree", nullptr, TerminateWin32ServiceTree, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"create_win32_lineage_scope", nullptr, CreateWin32LineageScope, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"observe_win32_lineage_scope", nullptr, ObserveWin32LineageScope, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"terminate_win32_lineage_scope", nullptr, TerminateWin32LineageScope, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"close_win32_lineage_scope", nullptr, CloseWin32LineageScope, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"open_service_root", nullptr, OpenServiceRoot, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"open_service_directory", nullptr, OpenServiceDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"acquire_service_lock", nullptr, AcquireServiceLock, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -37,8 +37,11 @@ const capabilities = [
   'set_win32_service_failure_actions_flag', 'start_win32_service',
   'stop_win32_service', 'delete_win32_service',
   'terminate_win32_service_tree',
+  'create_win32_lineage_scope', 'observe_win32_lineage_scope',
+  'terminate_win32_lineage_scope', 'close_win32_lineage_scope',
   'open_service_root', 'open_service_directory',
   'acquire_service_lock', 'close_service_handle',
+
   'read_service_file', 'publish_service_file_atomic',
   'remove_service_object_exact', 'list_service_directory',
   'publish_service_directory_no_replace',
@@ -100,6 +103,10 @@ const capabilitySignatures = {
   stop_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
   delete_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
   terminate_win32_service_tree: ['serviceHandle', 'expectedConfigFingerprint', 'rootPid', 'rootStartTime', 'rootExecutable', 'rootOwner', 'expectedTreeFingerprint'],
+  create_win32_lineage_scope: ['executable', 'args', 'binding'],
+  observe_win32_lineage_scope: ['scopeHandle', 'binding', 'operationId'],
+  terminate_win32_lineage_scope: ['scopeHandle', 'binding', 'operationId', 'timeoutMs'],
+  close_win32_lineage_scope: ['scopeHandle'],
   open_service_root: ['rootKind', 'roles', 'access'],
   open_service_directory: ['parentHandle', 'name', 'access', 'expectedIdentity', 'lockHandle'],
   acquire_service_lock: ['controlRootHandle', 'scope', 'serviceKey', 'mode'],
@@ -133,7 +140,8 @@ const capabilitySignatures = {
 };
 
 const nativeContractVersion = 5;
-const nativeContractRevision = 2;
+const nativeContractRevision = 3;
+
 const nativeNapiVersion = 8;
 
 function fail(message) {

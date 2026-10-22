@@ -171,7 +171,7 @@ function applicationManifest({
         manifestPath: "native-control/build/Release/native-control.manifest.json",
         manifestFingerprint: hex("5"),
         contractVersion: 5,
-        contractRevision: 2,
+        contractRevision: 3,
       },
       wireCapabilities: ["gate_presentation_v1", "terminal_disposition_v1"],
       compatibility: deploymentCompatibility,
@@ -328,7 +328,7 @@ test("application manifest binds canonical inventory, tuple, runtime, native, an
 
 test("application manifest rejects stale and future native contract revisions without fallback", () => {
   const { manifest, inventory: files } = applicationManifest();
-  for (const contractRevision of [1, 3]) {
+  for (const contractRevision of [2, 4]) {
     const refused = {
       ...manifest,
       nativeControl: { ...manifest.nativeControl, contractRevision },

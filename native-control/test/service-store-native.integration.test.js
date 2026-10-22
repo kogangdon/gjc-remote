@@ -40,7 +40,7 @@ const storeSignatures = {
 };
 
 function addon() {
-  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 2 native addon must be built before this integration gate');
+  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 3 native addon must be built before this integration gate');
   const native = require(addonPath);
   const contract = native.native_control_contract();
   assert.deepEqual(contract, {
@@ -94,8 +94,8 @@ function sourceReaderRoles(native) {
   };
 }
 
-test('ABI 5 revision 2 exposes the exact service store and Linux object substrate', () => {
-  assert.equal(contractRevision, 2);
+test('ABI 5 revision 3 exposes the exact service store and Linux object substrate', () => {
+  assert.equal(contractRevision, 3);
   assert.deepEqual(
     Object.fromEntries(Object.keys(storeSignatures).map((name) => [name, capabilitySignatures[name]])),
     storeSignatures,

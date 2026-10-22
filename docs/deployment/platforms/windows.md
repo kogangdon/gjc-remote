@@ -83,7 +83,7 @@ environment variables. Service state uses `service-control`, `staging`,
 `releases`, and `supervisors\shawl`; inventory uses the separate
 `native\<host-key>` and daemon-reader `native-reader\<host-key>` subtrees.
 Before inventory operations, the canonical witnessed platform container must
-already exist. Unreleased native-control 2.1.0 (contract 5 revision 2) adds
+already exist. Unreleased native-control 2.1.0 (contract 5 revision 3) adds
 `gjc-remote-inventory provision-bases`: an explicit management-only operation,
 with exact `{}` standard input and `GJC_INVENTORY_ROLE_BINDINGS`, to create its
 absent `native` and `native-reader` parents. It accepts no path override,
@@ -125,7 +125,7 @@ node bound. Signed/live rc.10 remains immutable with native-control 2.0.0
 (contract 5 revision 1) and SDK 0.16.7, as do all existing rc.1 through rc.10
 assets. The current source candidate selects application `0.4.0-rc.13`, tag
 `v0.4.0-rc.13`, and release sequence 13, with native-control 2.1.0 (contract 5
-revision 2), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It includes PR #263
+revision 3), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It includes PR #263
 (merge `c4a2ebe5`): the hashing-bound fix, SDK sidecar validation against observed
 package facts, and explicit inventory-parent provisioning. This preparation is
 not a published, signed, or deployed release.

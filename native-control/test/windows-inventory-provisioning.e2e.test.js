@@ -291,12 +291,12 @@ test('opted-in Windows hosted runner provisions fixed native inventory bases and
   assert.equal(packageJson.nativeControlContract.version, 5);
   assert.equal(packageJson.nativeControlContract.revision, 2);
   assert.equal(validateBuildManifest(manifest, packageJson, addonBytes), true,
-    'the built native addon must match the ABI 5/revision 2 contract and package payload');
+    'the built native addon must match the ABI 5/revision 3 contract and package payload');
 
   const native = require(fileURLToPath(addonUrl));
   const contract = native.native_control_contract();
   assert.equal(contract.contractVersion, 5);
-  assert.equal(contract.contractRevision, 2);
+  assert.equal(contract.contractRevision, 3);
   assert.ok(contract.capabilities.includes('provision_inventory_bases'));
   assert.deepEqual(contract.capabilitySignatures.provision_inventory_bases, ['roles']);
   for (const method of ['current_os_principal', 'open_service_root', 'close_service_handle',

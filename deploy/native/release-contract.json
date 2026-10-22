@@ -146,7 +146,7 @@
     "shawlTrustPath": "native-control/deployment-keys/shawl-trusted.json",
     "trustPath": "native-control/release-keys/trusted.json",
     "contractVersion": 5,
-    "contractRevision": 2,
+    "contractRevision": 3,
     "napi": 8,
     "executablePolicy": "required"
   },

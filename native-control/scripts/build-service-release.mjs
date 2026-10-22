@@ -542,7 +542,7 @@ function parseContract(bytes) {
       contract.nativeControl.applicationTrustPath !== 'native-control/deployment-keys/application-trusted.json' ||
       contract.nativeControl.shawlTrustPath !== 'native-control/deployment-keys/shawl-trusted.json' ||
       contract.nativeControl.trustPath !== 'native-control/release-keys/trusted.json' ||
-      contract.nativeControl.contractVersion !== 5 || contract.nativeControl.contractRevision !== 2 ||
+      contract.nativeControl.contractVersion !== 5 || contract.nativeControl.contractRevision !== 3 ||
       contract.nativeControl.napi !== 8 || contract.nativeControl.executablePolicy !== 'required') fail(CODES.contract);
   if (!Array.isArray(contract.wireCapabilities) || contract.wireCapabilities.length === 0 ||
       contract.wireCapabilities.some((value, index) => typeof value !== 'string' ||

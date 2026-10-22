@@ -175,16 +175,16 @@ function loadOptions(fixture, extra) {
   };
 }
 
-test('contract revision 2 preserves the fence write-receipt provenance boundary', () => {
+test('contract revision 3 preserves the fence write-receipt provenance boundary', () => {
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
   assert.equal(packageJson.version, '2.1.0');
   assert.equal(packageJson.nativeControlContract.version, 5);
-  assert.equal(contractRevision, 2);
+  assert.equal(contractRevision, 3);
   assert.equal(packageJson.nativeControlContract.revision, contractRevision);
   assert.deepEqual(capabilitySignatures.acquire_inventory_fence, ['path', 'roles']);
 });
 
-test('native contract 5 revision 2 is the only accepted capability contract', () => {
+test('native contract 5 revision 3 is the only accepted capability contract', () => {
   const addonBytes = Buffer.from('current-native-addon');
   const packageJson = JSON.parse(readFileSync(realPackageJsonPath, 'utf8'));
   const manifest = {
