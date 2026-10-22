@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, symlinkSync } from "node:fs";
 import { promisify } from "node:util";
 import { chmod, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
@@ -136,7 +136,7 @@ test("public inventory adapters and service facade do not expose low-level helpe
   assert.equal("createInventoryReaderAdapter" in publicApi, false);
   assert.equal("createServiceNativeFactory" in publicApi, false);
   assert.equal(publicApi.buildManifest.contractVersion, 5);
-  assert.equal(publicApi.buildManifest.contractRevision, 2);
+  assert.equal(publicApi.buildManifest.contractRevision, 3);
   assert.deepEqual(publicApi.buildManifest.capabilities, capabilities);
   assert.deepEqual(publicApi.buildManifest.capabilitySignatures, capabilitySignatures);
 });
@@ -1265,4 +1265,89 @@ test("native source contains fail-closed ACL and publication guards", () => {
   assert.match(posixFence,
     /int fd = OpenObjectNoFollow[\s\S]*if \(fd < 0\) \{[\s\S]*const int failure = errno;[\s\S]*close\(parent\);[\s\S]*failure == ENOENT/);
   assert.doesNotMatch(posixFence, /napi_set_named_property\([^;]*"release"/);
+});
+
+test("built addon lineage scopes contain an owned child, verify binding, and fail closed", async (t) => {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    t.skip("Win32 lineage scope runtime evidence is Windows x64 only");
+    return;
+  }
+  if (!existsSync(addonUrl)) {
+    t.skip("native addon is not built for this checkout");
+    return;
+  }
+  const native = require(fileURLToPath(addonUrl));
+  const contract = native.native_control_contract();
+  if (!contract.capabilities.includes("create_win32_lineage_scope")) {
+    t.skip("built addon predates lineage scopes; rebuild required for runtime evidence");
+    return;
+  }
+  const principal = native.current_os_principal();
+  if (principal?.kind !== "sid" || !principal.value.startsWith("S-1-5-21-")) {
+    t.skip("lineage scope runtime evidence requires an ordinary user principal");
+    return;
+  }
+  const binding = {
+    serviceKey: `lineage-runtime-${randomUUID()}`,
+    bootId: native.read_boot_id(),
+    configFingerprint: createHash("sha256").update(`lineage-${randomUUID()}`).digest("hex"),
+    roleSid: principal.value,
+    lifetimeId: randomUUID(),
+  };
+  const invalid = (error) => error?.code === "LINEAGE_INVALID" && error.writes === 0;
+  assert.throws(() => native.create_win32_lineage_scope(process.execPath, [], { ...binding, extra: "x" }), invalid);
+  assert.throws(() => native.create_win32_lineage_scope(process.execPath, ["ok"], { ...binding, bootId: "win32:1" }), invalid);
+  assert.throws(() => native.create_win32_lineage_scope(process.execPath, "not-an-array", binding), invalid);
+  let getterCalls = 0;
+  assert.throws(() => native.create_win32_lineage_scope(process.execPath, [], { get binding() { getterCalls += 1; return binding; }, executable: process.execPath, args: [] }), invalid);
+  assert.equal(getterCalls, 0, "descriptor reads must never evaluate accessor authority");
+  assert.throws(() => native.observe_win32_lineage_scope({}, binding, randomUUID()), invalid);
+  assert.throws(() => native.close_win32_lineage_scope({}), invalid);
+
+  const observeUntil = async (scope, predicate) => {
+    const deadline = Date.now() + 10000;
+    let receipt;
+    do {
+      receipt = native.observe_win32_lineage_scope(scope, binding, randomUUID());
+      assert.equal(receipt.coverageComplete, false,
+        "inheritance-only containment must never claim complete adversarial coverage");
+      assert.equal(receipt.escapeDetected, false);
+      assert.deepEqual(receipt.binding, binding);
+      if (predicate(receipt)) return receipt;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (Date.now() < deadline);
+    assert.fail(`lineage scope did not reach the requested state: ${JSON.stringify(receipt)}`);
+  };
+
+  // Graceful: the owned finite child exits naturally; the receipt proves the
+  // sealed job reached kernel zero without any termination call.
+  const graceful = native.create_win32_lineage_scope(
+    process.execPath, ["--eval", "setTimeout(() => process.exit(0), 400)"], binding);
+  const gracefulClosed = await observeUntil(graceful, (receipt) => receipt.closed);
+  assert.equal(gracefulClosed.forced, false);
+  assert.equal(gracefulClosed.terminationCalls, 0);
+  assert.equal(gracefulClosed.rootExitCode, 0);
+  assert.ok(gracefulClosed.rootPid > 0);
+  assert.equal(gracefulClosed.sealed, true);
+  assert.equal(native.close_win32_lineage_scope(graceful).writes, 0);
+  assert.throws(() => native.observe_win32_lineage_scope(graceful, binding, randomUUID()),
+    (error) => error?.code === "LINEAGE_STALE" && error.writes === 0);
+  assert.throws(() => native.close_win32_lineage_scope(graceful),
+    (error) => error?.code === "LINEAGE_STALE" && error.writes === 0);
+
+  // Forged/stale binding authority is rejected before any effect.
+  const bound = native.create_win32_lineage_scope(
+    process.execPath, ["--eval", "setTimeout(() => process.exit(0), 30000)"], binding);
+  assert.throws(() => native.observe_win32_lineage_scope(bound, { ...binding, lifetimeId: randomUUID() }, randomUUID()), invalid);
+  assert.throws(() => native.terminate_win32_lineage_scope(bound, { ...binding, serviceKey: `${binding.serviceKey}-x` }, randomUUID(), 1000), invalid);
+
+  // Forced: scoped termination targets only the exact validated job and
+  // verifies kernel zero; the receipt reports the forced effect.
+  const forced = await native.terminate_win32_lineage_scope(bound, binding, randomUUID(), 5000);
+  assert.equal(forced.closed, true);
+  assert.equal(forced.forced, true);
+  assert.equal(forced.terminationCalls, 1);
+  assert.equal(forced.writes, 1);
+  assert.equal(forced.activeProcesses, 0);
+  assert.equal(native.close_win32_lineage_scope(bound).writes, 0);
 });

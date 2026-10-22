@@ -45,6 +45,10 @@ const serviceSignatures = {
   stop_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
   delete_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
   terminate_win32_service_tree: ['serviceHandle', 'expectedConfigFingerprint', 'rootPid', 'rootStartTime', 'rootExecutable', 'rootOwner', 'expectedTreeFingerprint'],
+  create_win32_lineage_scope: ['executable', 'args', 'binding'],
+  observe_win32_lineage_scope: ['scopeHandle', 'binding', 'operationId'],
+  terminate_win32_lineage_scope: ['scopeHandle', 'binding', 'operationId', 'timeoutMs'],
+  close_win32_lineage_scope: ['scopeHandle'],
   open_service_root: ['rootKind', 'roles', 'access'],
   open_service_directory: ['parentHandle', 'name', 'access', 'expectedIdentity', 'lockHandle'],
   acquire_service_lock: ['controlRootHandle', 'scope', 'serviceKey', 'mode'],
@@ -89,25 +93,25 @@ const win32LaunchFields = [
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 function loadCurrentAddon() {
-  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 2 native_control.node must be built before this gate');
-  assert.equal(existsSync(manifestPath), true, 'ABI 5/revision 2 native-control.manifest.json must be built before this gate');
+  assert.equal(existsSync(addonPath), true, 'ABI 5/revision 3 native_control.node must be built before this gate');
+  assert.equal(existsSync(manifestPath), true, 'ABI 5/revision 3 native-control.manifest.json must be built before this gate');
   const addonBytes = readFileSync(addonPath);
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
   assert.equal(
     validateBuildManifest(manifest, packageJson, addonBytes),
     true,
-    'the present addon must positively validate as the current ABI 5/revision 2 platform tuple',
+    'the present addon must positively validate as the current ABI 5/revision 3 platform tuple',
   );
   return { addon: require(addonPath), addonBytes, manifest, packageJson };
 }
 
-test('ABI 5 revision 2 declares one exact service-native ABI without replacing retained capabilities', () => {
+test('ABI 5 revision 3 declares one exact service-native ABI without replacing retained capabilities', () => {
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
   assert.equal(packageJson.version, '2.1.0');
   assert.equal(packageJson.nativeControlContract.version, 5);
   assert.equal(packageJson.nativeControlContract.napi, 8);
-  assert.equal(contractRevision, 2);
+  assert.equal(contractRevision, 3);
   assert.equal(packageJson.nativeControlContract.revision, contractRevision);
   assert.deepEqual(registeredServiceCapabilities, serviceCapabilities);
   const serviceStart = capabilities.indexOf(serviceCapabilities[0]);
@@ -125,7 +129,7 @@ test('ABI 5 revision 2 declares one exact service-native ABI without replacing r
   assert.deepEqual(Object.keys(capabilitySignatures), capabilities);
 });
 
-test('current ABI 5/revision 2 addon and manifest agree exactly and reject revision/table drift', () => {
+test('current ABI 5/revision 3 addon and manifest agree exactly and reject revision/table drift', () => {
   const { addon, addonBytes, manifest, packageJson } = loadCurrentAddon();
   const contract = addon.native_control_contract();
   assert.deepEqual(contract, {

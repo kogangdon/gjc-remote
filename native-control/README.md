@@ -89,7 +89,7 @@ Service state uses different children of `<OS-drive>:\gjc-remote`, including
 `service-control`, `staging`, `releases`, and `supervisors\shawl`. Before
 inventory operations, the platform container must already exist with its
 canonical witness and exact ACL. Unreleased native-control 2.1.0 (contract 5,
-revision 2) adds an explicit management-only operation for its two inventory
+revision 3) adds an explicit management-only operation for its two inventory
 parents:
 
 ```text
@@ -552,7 +552,7 @@ injected by the builder; the serialized contract must not carry it.
 Signed `v0.4.0-rc.10` contains native-control 2.0.0 (contract 5, revision 1).
 Current source metadata selects application `0.4.0-rc.13`, release tag
 `v0.4.0-rc.13`, and sequence 13, with native-control 2.1.0 (contract 5,
-revision 2), unchanged N-API 8, and official unpatched SDK 0.18.12. This is source candidate
+revision 3), unchanged N-API 8, and official unpatched SDK 0.18.12. This is source candidate
 preparation only, not an existing signed tag or published release; do not
 reuse the immutable signed rc.12 identity at `6af3ef0b` for this source. The
 new candidate includes PR #267's installation-contract repairs at `24079e3c`.

@@ -39,9 +39,9 @@ test('public self observation rejects caller authority before loading native cod
   assert.equal(accessed, false);
 });
 
-test('source ABI accepts only native contract v5 revision 2 and N-API 8', () => {
+test('source ABI accepts only native contract v5 revision 3 and N-API 8', () => {
   assert.equal(packageJson.version, '2.1.0');
-  assert.equal(contractRevision, 2);
+  assert.equal(contractRevision, 3);
   assert.deepEqual(publicApi.buildManifest, {
     contractVersion: 5,
     contractRevision,

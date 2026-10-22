@@ -1,4 +1,4 @@
-export const contractRevision = 2;
+export const contractRevision = 3;
 export const managementCapabilities = Object.freeze(['open_verified_parent', 'open_no_follow', 'read_identity', 'read_acl', 'path_exists_no_follow', 'set_exact_role_acl', 'verify_exact_role_acl', 'read_verified_bytes', 'create_exclusive_temp', 'flush_file', 'flush_directory_or_volume', 'replace_existing_atomic', 'create_absent_exclusive', 'ensure_control_directory', 'acquire_native_lock', 'current_os_principal', 'principal_access_check', 'remove_verified_file', 'open_verified_parent_handle', 'open_verified_object_handle', 'read_handle_identity', 'read_handle_bytes', 'write_handle_bytes', 'remove_verified_handle', 'verify_role_sid_not_group']);
 export const inventoryCapabilities = Object.freeze([
   'resolve_native_state_root',
@@ -41,6 +41,14 @@ export const serviceCapabilities = Object.freeze([
   'stop_win32_service',
   'delete_win32_service',
   'terminate_win32_service_tree',
+  // Source-owned Win32 lineage scopes: creation-time job containment with
+  // exact binding authentication, kernel-zero closure observation and scoped
+  // termination. Inheritance-only containment; receipts fail closed and never
+  // claim complete adversarial no-escape coverage.
+  'create_win32_lineage_scope',
+  'observe_win32_lineage_scope',
+  'terminate_win32_lineage_scope',
+  'close_win32_lineage_scope',
   'open_service_root',
   'open_service_directory',
   'acquire_service_lock',
@@ -128,6 +136,11 @@ export const capabilitySignatures = Object.freeze({
   stop_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
   delete_win32_service: ['serviceHandle', 'expectedConfigFingerprint', 'expectedRuntimeFingerprint'],
   terminate_win32_service_tree: ['serviceHandle', 'expectedConfigFingerprint', 'rootPid', 'rootStartTime', 'rootExecutable', 'rootOwner', 'expectedTreeFingerprint'],
+  create_win32_lineage_scope: ['executable', 'args', 'binding'],
+  observe_win32_lineage_scope: ['scopeHandle', 'binding', 'operationId'],
+  terminate_win32_lineage_scope: ['scopeHandle', 'binding', 'operationId', 'timeoutMs'],
+  close_win32_lineage_scope: ['scopeHandle'],
+
   open_service_root: ['rootKind', 'roles', 'access'],
   open_service_directory: ['parentHandle', 'name', 'access', 'expectedIdentity', 'lockHandle'],
   acquire_service_lock: ['controlRootHandle', 'scope', 'serviceKey', 'mode'],

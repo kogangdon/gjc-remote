@@ -45,11 +45,11 @@ const trustedPromotionRepository = 'kogangdon/gjc-remote';
 const trustedPromotionEvent = 'push';
 const trustedPromotionRef = 'refs/heads/main';
 
-test('native source package, verifier, and signed metadata use only contract 5 revision 2', () => {
+test('native source package, verifier, and signed metadata use only contract 5 revision 3', () => {
   assert.equal(nativeControlPackage.version, '2.1.0');
   assert.deepEqual(nativeControlPackage.nativeControlContract, {
     version: 5,
-    revision: 2,
+    revision: 3,
     napi: 8,
     platforms: nativeTargets,
   });
@@ -62,7 +62,7 @@ test('native source package, verifier, and signed metadata use only contract 5 r
   });
 
   assert.match(nativeBuildVerifier, /const nativeContractVersion = 5;/);
-  assert.match(nativeBuildVerifier, /const nativeContractRevision = 2;/);
+  assert.match(nativeBuildVerifier, /const nativeContractRevision = 3;/);
   assert.match(nativeBuildVerifier, /const nativeNapiVersion = 8;/);
   assert.match(nativeBuildVerifier, /packageJson\.version !== '2\.1\.0'/);
   assert.match(nativeBuildVerifier, /plan_win32_service_resource: \['name', 'serviceRole', 'launch', 'applicationManifestFingerprint', 'phase', 'roles'\]/);

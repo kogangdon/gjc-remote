@@ -99,7 +99,7 @@ function candidateManifest() {
       manifestPath: 'native-control/build/Release/native-control.manifest.json',
       manifestFingerprint: hex('5'),
       contractVersion: 5,
-      contractRevision: 2,
+      contractRevision: 3,
     },
     wireCapabilities: ['gate_presentation_v1', 'terminal_disposition_v1'],
     compatibility,
