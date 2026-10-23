@@ -457,8 +457,8 @@ function parseContract(bytes) {
   ];
   if (!exact(contract, keys) || contract.schemaVersion !== 1 ||
       contract.kind !== 'gjc-remote-application-release-contract' ||
-      contract.repository !== 'kogangdon/gjc-remote' || contract.releaseVersion !== '0.4.0-rc.13' ||
-      contract.releaseTag !== 'v0.4.0-rc.13' || contract.releaseSequence !== 13 ||
+      contract.repository !== 'kogangdon/gjc-remote' || contract.releaseVersion !== '0.4.0-rc.14' ||
+      contract.releaseTag !== 'v0.4.0-rc.14' || contract.releaseSequence !== 14 ||
       !exact(contract.entrypoints, ['bot', 'daemon']) ||
       contract.entrypoints.bot !== 'bot/src/bot.js' || contract.entrypoints.daemon !== 'daemon/src/daemon.js' ||
       !exact(contract.runtimes, ['node', 'bun']) || contract.runtimes.node?.minimumVersion !== '26.0.0' ||
@@ -514,14 +514,14 @@ function parseContract(bytes) {
         'path', 'packageName', 'packageVersion', 'productionRoots',
       ]) || workspace.path !== SOURCE_WORKSPACES[index] || !Array.isArray(workspace.productionRoots))) fail(CODES.contract);
   const expectedWorkspace = [
-    ['bot', '@gjc-remote/bot', '0.4.0-rc.13', ['package.json', 'src']],
-    ['daemon', '@gjc-remote/daemon', '0.4.0-rc.13', ['package.json', 'src']],
+    ['bot', '@gjc-remote/bot', '0.4.0-rc.14', ['package.json', 'src']],
+    ['daemon', '@gjc-remote/daemon', '0.4.0-rc.14', ['package.json', 'src']],
     ['native-control', '@gjc-remote/native-control', '2.1.0', [
       'deployment-keys/application-trusted.json',
       'deployment-keys/shawl-trusted.json', 'package.json',
       'release-keys/trusted.json', 'src',
     ]],
-    ['shared', '@gjc-remote/shared', '0.4.0-rc.13', ['package.json', '*.js']],
+    ['shared', '@gjc-remote/shared', '0.4.0-rc.14', ['package.json', '*.js']],
   ];
   if (contract.sourceWorkspaces.some((workspace, index) =>
     workspace.path !== expectedWorkspace[index][0] || workspace.packageName !== expectedWorkspace[index][1] ||

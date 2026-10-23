@@ -16,7 +16,7 @@ Before publishing, provision both host leaves under their actual native actors:
 On Windows, these leaves are separate OS-drive subtrees:
 `<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
 `<OS-drive>:\gjc-remote\native-reader\<host-key>` for the daemon reader.
-These remain the v0.4.0-rc.13 source candidate paths, sharing the OS-derived base with
+These remain the v0.4.0-rc.14 source candidate paths, sharing the OS-derived base with
 service state. The layout was introduced by merged PR #259 (source commit
 `91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) and is present in published and
 deployed rc.8. Published rc.7 remains immutable and continues to use ProgramData
@@ -542,7 +542,7 @@ release. Build takes exactly `--source`, `--output`, `--platform`,
 `--architecture`, `--release-sequence`, `--signing-key-id`, `--native-addon`,
 `--native-manifest`, and `--native-signature`. Verify takes only `--candidate`.
 Output must be a new directory outside the source tree.
-For the rc.13 source candidate, `--release-sequence 13` must match the pinned contract; build and
+For the rc.14 source candidate, `--release-sequence 14` must match the pinned contract; build and
 candidate verification reject every other sequence.
 
 `deploy/native/release-contract.json` fixes the repository, release tag, supported
@@ -550,12 +550,13 @@ tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
 Signed `v0.4.0-rc.10` contains native-control 2.0.0 (contract 5, revision 1).
-Current source metadata selects application `0.4.0-rc.13`, release tag
-`v0.4.0-rc.13`, and sequence 13, with native-control 2.1.0 (contract 5,
+Current source metadata selects application `0.4.0-rc.14`, release tag
+`v0.4.0-rc.14`, and sequence 14, with native-control 2.1.0 (contract 5,
 revision 3), unchanged N-API 8, and official unpatched SDK 0.18.12. This is source candidate
 preparation only, not an existing signed tag or published release; do not
 reuse the immutable signed rc.12 identity at `6af3ef0b` for this source. The
-new candidate includes PR #267's installation-contract repairs at `24079e3c`.
+new candidate carries the rc.13 lineage (PR #267's installation-contract repairs at `24079e3c`),
+PR #269's creation-accounting repair and PR #270's owned Win32 lineage scopes.
 Its local tag must identify
 the independently reviewed, CI-verified final main merge, not the PR head.
 Local tagging, unsigned building, application signing, protected installation,

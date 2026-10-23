@@ -123,18 +123,19 @@ readiness were verified. Canonical service installation then refused with zero
 writes because SDK compatibility listing hashing exceeded the generic JSON
 node bound. Signed/live rc.10 remains immutable with native-control 2.0.0
 (contract 5 revision 1) and SDK 0.16.7, as do all existing rc.1 through rc.10
-assets. The current source candidate selects application `0.4.0-rc.13`, tag
-`v0.4.0-rc.13`, and release sequence 13, with native-control 2.1.0 (contract 5
-revision 3), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It includes PR #263
-(merge `c4a2ebe5`): the hashing-bound fix, SDK sidecar validation against observed
-package facts, and explicit inventory-parent provisioning. This preparation is
-not a published, signed, or deployed release.
+assets. The current source candidate selects application `0.4.0-rc.14`, tag
+`v0.4.0-rc.14`, and release sequence 14, with native-control 2.1.0 (contract 5
+revision 3), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It includes PR #269
+(merge `ec64e073`): the Windows service creation-accounting repair, and PR #270
+(merge `fbe8ccd5`): owned Win32 lineage scopes with fail-closed receipts. This
+preparation is not a published, signed, or deployed release.
 
 Published rc.11 remains immutable at `116b60caf0ce6361eb3f17d1b9cf3a17e22e92cb`.
 Signed local rc.12 remains immutable at `6af3ef0b480a38da502d8d2ca1cc5c15dbe9b3ae`.
-The distinct rc.13 candidate includes PR #267's installation-contract repairs
-at `24079e3c`. Its local tag must follow independent source review, required
-exact-head CI and the verified main merge; never move rc.12/rc.11 or push a release
+Local rc.13 remains immutable at `87a4d969acac674d620e3b44cdd7f7b010a26817`; the
+distinct rc.13 candidate included PR #267's installation-contract repairs
+at `24079e3c`. Its local tag followed independent source review, required
+exact-head CI and the verified main merge; never move rc.13/rc.12/rc.11 or push a release
 tag as part of local reinstall preparation. Signed native compatibility,
 application signing custody, preservation and fresh per-operation floor/CAS/UAC
 admission remain separate gates. A read-only lock refusal is not evidence of a
