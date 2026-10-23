@@ -39,7 +39,7 @@ const originalMkdtemp = fsPromises.mkdtemp;
 const originalRealpath = fsPromises.realpath;
 const productRoot = fileURLToPath(new URL('../..', import.meta.url));
 const ACKNOWLEDGEMENT_FLAG = '--acknowledge-real-bun-fixture-build';
-const RELEASE_SEQUENCE = 13;
+const RELEASE_SEQUENCE = 14;
 
 function copyRegular(source, destination, mode = undefined) {
   const stat = lstatSync(source);
@@ -327,16 +327,16 @@ test('real-Bun evidence harness rejects invalid release identities before side e
     assert.deepEqual(boundary.snapshot(), beforeAcknowledgement);
 
     const invalidSequenceContracts = [
-      ['malformed string', (contract) => { contract.releaseSequence = '13'; }],
-      ['malformed fraction', (contract) => { contract.releaseSequence = 13.5; }],
+      ['malformed string', (contract) => { contract.releaseSequence = '14'; }],
+      ['malformed fraction', (contract) => { contract.releaseSequence = 14.5; }],
       ['missing', (contract) => { delete contract.releaseSequence; }],
       ['historical', (contract) => { contract.releaseSequence = 10; }],
       ['historical rc11', (contract) => { contract.releaseSequence = 11; }],
-      ['stale', (contract) => { contract.releaseSequence = 12; }],
-      ['future', (contract) => { contract.releaseSequence = 14; }],
+      ['stale', (contract) => { contract.releaseSequence = 13; }],
+      ['future', (contract) => { contract.releaseSequence = 15; }],
     ];
     const invalidIdentityContracts = [
-      ...[12, 14].flatMap((sequence) => [
+      ...[13, 15].flatMap((sequence) => [
         [`coherent rc${sequence} tuple`, (contract) => {
           contract.releaseVersion = `0.4.0-rc.${sequence}`;
           contract.releaseTag = `v0.4.0-rc.${sequence}`;
@@ -411,8 +411,8 @@ test('real-Bun evidence harness rejects invalid release identities before side e
 
     writeFileSync(contractPath, originalContractBytes);
     const admittedContract = await installation.releaseBuilder.loadServiceReleaseContract();
-    assert.equal(admittedContract.releaseVersion, '0.4.0-rc.13');
-    assert.equal(admittedContract.releaseTag, 'v0.4.0-rc.13');
+    assert.equal(admittedContract.releaseVersion, '0.4.0-rc.14');
+    assert.equal(admittedContract.releaseTag, 'v0.4.0-rc.14');
     assert.equal(admittedContract.releaseSequence, RELEASE_SEQUENCE);
     for (const [description, mutate] of invalidSequenceContracts) {
       const invalidInput = { ...buildInput };

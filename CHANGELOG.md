@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Install-phase rc.14 release preparation
+
+- Select distinct application `0.4.0-rc.14`, local tag `v0.4.0-rc.14` and
+  sequence 14 after fresh supported read-only floor evidence (application and
+  Shawl floors committed 0 / reserved 0, no active reservation) and immutable
+  tag observation (rc.13 `bf5c6b04` -> `87a4d969` and rc.11 `116b60ca`
+  immovable; no rc.14 ref exists). Include PR #269's creation-accounting repair
+  and PR #270's owned Win32 lineage scopes with fail-closed receipts.
+- Align contract, builder, managed workspace, lock, producer/verifier fixture,
+  image and docs metadata while retaining official SDK 0.18.12, native-control
+  2.1.0 (contract 5 revision 3), N-API 8, Bun 1.4.2 and existing
+  trust/dependency inputs.
+- Preserve signed local rc.12 at `6af3ef0b`, local rc.13 at `87a4d969` and
+  rc.11/rc.10 assets. The new local-only immutable tag must identify
+  independently reviewed, CI-verified final main; an unsigned candidate does
+  not admit signing, installation, protected-operation custody, recovery or
+  connected bot readiness.
+
 ### Installation-contract release preparation
 
 - Select distinct application `0.4.0-rc.13`, local tag `v0.4.0-rc.13` and
