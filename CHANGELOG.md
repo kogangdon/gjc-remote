@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SDK 0.19.0 source upgrade
+
+- Pin official unpatched `@gajae-code/coding-agent`, `agent-core`, and `ai`
+  to 0.19.0. Align the lock graph, native SDK contract version/integrity,
+  Docker lock digest and SDK labels, and credentialless contract probes.
+- Keep config schema 2 and transcript version 5, verified against the
+  published source. Preserve fail-closed active controls and cancellation
+  containment; upgrading the SDK does not qualify new adapter behavior.
+- Separate current source verification from historical 0.18.12 receipts.
+  Upstream #6578 is closed; #6700 closed without merging, and the 0.19.0
+  release includes the actual guard repair #6970. Inclusion is not local
+  workflow-gate qualification. The existing uninstall generation defect is
+  tracked separately in [#273](https://github.com/kogangdon/gjc-remote/issues/273).
+- No application release identity, signed asset, installed service, account,
+  credential, or host ACL is changed. The SDK source upgrade does not authorize
+  rebuilding or signing under an existing immutable release tag.
+
 ### Service lifecycle manifest-fingerprint domain repair
 
 - Fix `service-lifecycle.js` writing the application deployment-manifest

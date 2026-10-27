@@ -157,27 +157,35 @@ and restart count. Every release packet runs path/secret/control sentinel scans.
 The five documents carry an assumptions ledger: #44 route/envelope and mapping persistence,
 receiver TTL/skew/probe bounds, Git refs/allowlist/dirty policy, lease/resource budgets, provider
 key recovery, #42/#45 evidence schedules, and SDK/package/lock reconciliation at official unpatched
-0.18.12. Post-admission parent SDK-only evidence records Windows focused 333/333 (zero skips),
+0.19.0. The single authoritative [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+records the source base, SRI, actual Windows tests/imports/provider smoke, separate
+review status, and unchanged promotion limits.
+No historical result below qualifies that upgrade; no release, installation, signing, or
+platform qualification is claimed. The separate uninstall bug remains issue #273, outside this SDK PR.
+
+Historical 0.18.12 post-admission parent SDK-only evidence recorded Windows focused 333/333 (zero skips),
 bounded workspace 2704 tests/2700 pass/zero fail/four skips under nine explicit historical
 authority exclusion patterns, and actual isolated Linux credentialless 248/248 without provider
 calls. Skips are not passes, and four skips do not represent all nine exclusions.
 One separately authorized native Windows `codex-eco` smoke used a child-only profile override
 and passed three exact A-B-A `SMOKE_OK` responses, heartbeat/three invoke-terminal assertions,
 exit 0, and ephemeral relay-port cleanup, without optional model query or wrapper retry.
-That single smoke was not repeated after fixture/test-only changes; production SDK runtime/package/lock are unchanged.
+That single smoke was not repeated after fixture/test-only changes; the 0.18.12 production SDK runtime/package/lock were unchanged by those changes.
 Main native code was freshly built unchanged; separate native repairs and private native fixture
 claims are excluded. This same-profile continuity does not establish a fix for #247 or isolation.
-The [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-01812-evidence)
-lists exact exclusions; current local unshipped runtime receipts are
+The [historical SDK-only verification record](daemon-workspace-verification.md#historical-sdk-only-01812-evidence)
+preserves exact exclusions; the historical local unshipped runtime receipts are
 `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 `artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`. Each run qualifies only its exact pins;
-local receipts alone do not approve landing. Both original P2s and owner-admission are verified
+local receipts alone do not approve landing. Both original P2s and owner-admission were verified
 and independently cleared in `artifacts/sdk-first-0.18.12-final-review.json`: static agent
 review APPROVE, zero P0/P1/P2, not independent runtime or CI/merge/deployment approval.
-Exact-head CI/landing is tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
-the final follow-up is not yet committed/pushed, and CI/merge completion is not claimed.
+Historical exact-head CI/landing was tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
+that record's final follow-up was not yet committed/pushed, and it did not claim CI/merge completion.
 Active controls remain fail-closed, with no inferred standalone abort support;
-#6578/#6700 remain unresolved. Docker/image/release/security/native/service/fault/OOM/noDump/
+active cancellation remains nonterminal `cancellation_pending`. #6578 is closed and #6700
+is closed-unmerged; #6970 is the actual repair included in the 0.19.0 release notes,
+not local workflow qualification. Docker/image/release/security/native/service/fault/OOM/noDump/
 installation/deployment and isolation gates remain unqualified and open. Each item
 has an owner, closure gate, and fail-closed behavior; illustrative values are not final approvals.

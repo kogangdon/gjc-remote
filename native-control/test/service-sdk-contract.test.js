@@ -217,7 +217,7 @@ test('derives and exactly matches a bounded pinned SDK installation closure', ()
   const result = derive(installation);
 
   assert.equal(result.sdkContract.packageName, '@gajae-code/coding-agent');
-  assert.equal(result.sdkContract.packageVersion, '0.18.12');
+  assert.equal(result.sdkContract.packageVersion, '0.19.0');
   assert.equal(result.sdkContract.lockIntegrity, SDK_EXTERNAL_STATE_REQUIREMENTS.lockIntegrity);
   assert.equal(result.sdkContract.configSchemaVersion, 2);
   assert.equal(result.packageCount, 2);

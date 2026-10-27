@@ -16,7 +16,7 @@ Before publishing, provision both host leaves under their actual native actors:
 On Windows, these leaves are separate OS-drive subtrees:
 `<OS-drive>:\gjc-remote\native\<host-key>` for management inventory and
 `<OS-drive>:\gjc-remote\native-reader\<host-key>` for the daemon reader.
-These remain the v0.4.0-rc.14 source candidate paths, sharing the OS-derived base with
+These remain the historical v0.4.0-rc.14 candidate paths, sharing the OS-derived base with
 service state. The layout was introduced by merged PR #259 (source commit
 `91fe87f7baa5b8da9e501f1f74f77ee7385bab76`) and is present in published and
 deployed rc.8. Published rc.7 remains immutable and continues to use ProgramData
@@ -41,21 +41,41 @@ Published rc.10 is immutable, from tag source
 readiness were verified; canonical Windows service installation refused with
 zero writes at the SDK compatibility listing's generic JSON node bound.
 Signed rc.10 contains native-control 2.0.0 (contract 5 revision 1) and SDK
-0.16.7. The rc.11 source candidate includes PR #263 (merge `c4a2ebe5`): it
-fixes that hashing bound, validates SDK sidecars against observed package facts,
-and adds explicit inventory-base provisioning. These changes are not present
-in the signed rc.10 runtime. The current preparation is not publication,
+0.16.7. The historical rc.11 candidate included PR #263 (merge `c4a2ebe5`): it
+fixed that hashing bound, validated SDK sidecars against observed package facts,
+and added explicit inventory-base provisioning. These changes are not present
+in the signed rc.10 runtime. That historical preparation was not publication,
 signing, or deployment and does not replace any immutable rc.1 through rc.10
 asset.
 
-The current SDK-only main-based source pin is official unpatched 0.18.12.
-Only SDK contract version/integrity defaults and their expectations change in
-native-control; native lifetime/ACL/publication/construction/fixture repairs
-remain excluded and deferred. Main native code was freshly built unchanged.
-Post-admission parent-run SDK-only receipts record Windows focused **333/333 passed**, zero
+### Current SDK 0.19.0 source evidence
+
+The current SDK-only source pin is official unpatched **0.19.0**. SDK contract
+version/integrity defaults and their expectations align to that source pin;
+this is not native/service qualification. Windows focused tests passed 265/265,
+native SDK/build contracts 70/70, and unrestricted workspace tests recorded
+2739 pass, zero fail and 10 skips out of 2749. Canonical imports and one newly
+authorized same-profile provider smoke passed; final review and exact-head
+CI/landing remain separate gates. See [current 0.19.0 evidence](../docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
+No historical native fixture, SDK receipt or static approval qualifies 0.19.0.
+Upstream #6578 is CLOSED and #6700 is CLOSED UNMERGED; the actual #6970 repair
+appears in official 0.19.0 release notes. Inclusion is not local workflow-gate
+qualification. Gate/admission containment and active-control fail-closed policy
+remain unchanged; active cancellation is nonterminal `cancellation_pending`.
+The existing uninstall generation defect is separately tracked in
+[issue #273](https://github.com/kogangdon/gjc-remote/issues/273) and is **not repaired**
+by the SDK upgrade. Source 0.19.0 authorizes neither installation nor signing
+nor reuse of immutable rc.14/rc.12 identities.
+
+### Historical SDK 0.18.12 source evidence (PR #265)
+
+These receipts describe the prior official unpatched 0.18.12 source snapshot,
+not current 0.19.0 qualification. Its native lifetime/ACL/publication/construction/
+fixture repairs were excluded and deferred; main native code was freshly built unchanged.
+Post-admission parent-run SDK-only receipts recorded Windows focused **333/333 passed**, zero
 skips, bounded workspace **2704 tests: 2700 passed, 0 failed, 4 skipped**, and
 actual isolated credentialless Linux **248/248 passed** without provider calls.
-The workspace retains the [nine explicit historical authority exclusions](../docs/deployment/README.md#current-sdk-only-evidence);
+The workspace retained the [nine explicit historical authority exclusions](../docs/verification/issue62-evidence.md#unchanged-authority-exclusions-and-limits);
 four reported skips do not represent those exclusions and are not passes.
 
 One separately authorized native Windows provider smoke **passed**, using the
@@ -65,25 +85,26 @@ relay port free. No optional model query, wrapper retry, or wrapper persistent
 profile write occurred. Same-profile basic continuity is not isolation or a
 proven #247 disconnect fix. Active daemon controls remain fail-closed and
 active cancellation remains nonterminal `cancellation_pending`; aggregate
-oracle success does not establish standalone SDK abort support. Workflow guard
-issues #6578/#6700 remain unresolved; #6763's approval binding is not that repair.
-The smoke was not repeated after fixture/test-only changes; production SDK runtime/
-package/lock are unchanged. Current local runtime receipts are
+oracle success does not establish standalone SDK abort support. The 0.18.12
+snapshot did not include the later #6970 workflow guard repair; #6763's approval
+binding is distinct. The smoke was not repeated after the historical fixture/test-only
+changes; SDK runtime/package/lock were unchanged within that cohort. Historical receipts are
 `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 `artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; see the
-[SDK-only evidence record](../docs/deployment/README.md#current-sdk-only-evidence).
+[historical SDK-only evidence record](../docs/verification/issue62-evidence.md#historical-01812-parent-observations).
 
-No private native fixture or combined-worktree result qualifies this tree.
+No private native fixture or combined-worktree result qualified that SDK-only snapshot.
 Local receipts are unshipped and alone do not approve landing. Both original P2s and
 owner-admission are verified and independently cleared in
 `artifacts/sdk-first-0.18.12-final-review.json`: static agent review APPROVE,
 zero P0/P1/P2, not independent runtime or CI/merge/deployment approval.
-Exact-head CI/landing is tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
-the final follow-up is not yet committed/pushed, and CI/merge completion is not claimed;
-each run qualifies only its exact pins.
+Historical review/landing belongs to [PR #265](https://github.com/kogangdon/gjc-remote/pull/265),
+not the 0.19.0 upgrade; each run qualifies only its exact pins.
 Native/service/security/fault/OOM/noDump, signing, signed deployment,
 installation, release, support, and production qualification remain excluded.
+
+### Native inventory provisioning contract
 
 Service state uses different children of `<OS-drive>:\gjc-remote`, including
 `service-control`, `staging`, `releases`, and `supervisors\shawl`. Before
@@ -542,22 +563,24 @@ release. Build takes exactly `--source`, `--output`, `--platform`,
 `--architecture`, `--release-sequence`, `--signing-key-id`, `--native-addon`,
 `--native-manifest`, and `--native-signature`. Verify takes only `--candidate`.
 Output must be a new directory outside the source tree.
-For the rc.14 source candidate, `--release-sequence 14` must match the pinned contract; build and
-candidate verification reject every other sequence.
+For the historical rc.14 candidate, `--release-sequence 14` matched the pinned contract;
+its build and candidate verification rejected every other sequence. That historical
+recipe does not authorize building the current SDK source under the rc.14 identity.
 
 `deploy/native/release-contract.json` fixes the repository, release tag, supported
 tuples, Bun 1.4.2 recipe, runtime versions, and source selection. The deployment
 format registry is code-owned (`shared/deployment-format-registry.js`) and is
 injected by the builder; the serialized contract must not carry it.
 Signed `v0.4.0-rc.10` contains native-control 2.0.0 (contract 5, revision 1).
-Current source metadata selects application `0.4.0-rc.14`, release tag
+Historical rc.14 source metadata selected application `0.4.0-rc.14`, release tag
 `v0.4.0-rc.14`, and sequence 14, with native-control 2.1.0 (contract 5,
-revision 3), unchanged N-API 8, and official unpatched SDK 0.18.12. This is source candidate
-preparation only, not an existing signed tag or published release; do not
-reuse the immutable signed rc.12 identity at `6af3ef0b` for this source. The
-new candidate carries the rc.13 lineage (PR #267's installation-contract repairs at `24079e3c`),
+revision 3), unchanged N-API 8, and official unpatched SDK 0.18.12. These are historical
+candidate facts, not the current SDK pin or authorization to recreate that identity.
+Current 0.19.0 source must not sign, install or reuse immutable rc.14 or signed
+rc.12 (`6af3ef0b`) identities. The historical candidate carried the rc.13 lineage
+(PR #267's installation-contract repairs at `24079e3c`),
 PR #269's creation-accounting repair and PR #270's owned Win32 lineage scopes.
-Its local tag must identify
+Any future release's local tag must identify
 the independently reviewed, CI-verified final main merge, not the PR head.
 Local tagging, unsigned building, application signing, protected installation,
 and external publication are distinct gates; this preparation admits none of
@@ -565,7 +588,8 @@ the later gates by itself. Revalidate sequence floors and reservations before
 each protected attempt, and preserve rc.12/rc.11/rc.10 assets and all existing state.
 The tag workflow uses the
 same Bun 1.4.2 producer version. Existing rc.1 through rc.12 releases and
-artifacts remain historical, immutable inputs. A later release must select its
+artifacts remain historical, immutable inputs; rc.14 identities likewise are not
+reusable. A later release must select its
 own version and sequence and build from a clean checkout of its exact immutable
 tag, with that commit recorded in its source manifest.
 The rc.5 native addon moves
@@ -574,7 +598,7 @@ directory and does not migrate the old ProgramData service store. PR #259
 moved Windows inventory and daemon-reader state beneath that same OS-derived
 base. Published and deployed rc.8 used these paths; published rc.7
 remains immutable and continues resolving inventory and native-reader state
-under ProgramData. The current candidate does not migrate or fall back to those
+under ProgramData. Current source does not migrate or fall back to those
 paths.
 The rc.6 native addon fixes Windows management-auth private ACL validation to
 require only the effective management and SYSTEM roles (PR #255), without

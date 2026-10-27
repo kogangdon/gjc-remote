@@ -236,7 +236,7 @@ attestation, and supported-platform promotion remain Phase 4 obligations.
 
 Every verification-matrix evidence layer and non-negotiable gate must close before promotion:
 
-- ownership/fixture agreement and exact SDK/package/lock provenance at official unpatched 0.18.12;
+- ownership/fixture agreement and exact SDK/package/lock provenance at official unpatched 0.19.0;
 - unit/integration/Compose tests for mapping, readiness, lifecycle, resource, Git, backup/restore,
   provider recovery, remap fencing, and cleanup;
 - image/base/source/lock/SDK digests, SBOM, scan, signature/attestation, volume manifests, copied or
@@ -250,7 +250,13 @@ Every verification-matrix evidence layer and non-negotiable gate must close befo
 
 Any missing or failed gate is a hard no-promotion result; interim feature flags are rejected.
 
-SDK 0.18.12 has post-admission parent SDK-only source evidence: Windows focused 333/333 with
+The single authoritative [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+records the 0.19.0 source base, official unpatched provenance/SRI, actual Windows focused/full
+tests, canonical imports and one provider smoke, plus separate review status. No release,
+installation, signing, or platform qualification is claimed. The separate uninstall bug
+remains issue #273, outside this SDK PR.
+
+Historical SDK 0.18.12 post-admission parent SDK-only source evidence recorded Windows focused 333/333 with
 zero skips; bounded workspace 2704 tests, 2700 pass, zero fail, four skips under
 nine explicit historical authority exclusion patterns; and actual isolated Linux
 credentialless 248/248 without provider calls. Skips are not passes; four skips
@@ -258,24 +264,26 @@ do not represent all nine exclusions. One separately authorized native Windows
 `codex-eco` provider smoke used a child-only profile override and passed three
 exact A-B-A `SMOKE_OK` responses, heartbeat/three invoke-terminal assertions,
 exit 0, and ephemeral relay-port cleanup. No optional model query or wrapper
-retry ran. The smoke was not repeated after fixture/test-only changes; production SDK
-runtime/package/lock are unchanged. Main native code was freshly built unchanged; separate native repairs
+retry ran. The smoke was not repeated after fixture/test-only changes; the 0.18.12 production SDK
+runtime/package/lock were unchanged by those changes. Main native code was freshly built unchanged; separate native repairs
 and private native fixture claims are excluded. Same-profile continuity is not
 a fix for #247 or proof of profile/tenant isolation. Active controls remain
-fail-closed; standalone abort support is not inferred, and #6578/#6700 persist.
+fail-closed; active cancellation remains nonterminal `cancellation_pending`, and standalone
+abort support is not inferred. #6578 is closed and #6700 is closed-unmerged; #6970 is
+the actual repair included in the 0.19.0 release notes, not local workflow qualification.
 
-The [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-01812-evidence)
-lists exact exclusions; current local unshipped runtime receipts are
+The [historical SDK-only verification record](daemon-workspace-verification.md#historical-sdk-only-01812-evidence)
+preserves exact exclusions; the historical local unshipped runtime receipts are
 `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 `artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`. Each run
 qualifies only its exact pins; local receipts alone do not approve landing.
-Historical or combined SDK/native receipts do not qualify this tree. Both original P2s and
-owner-admission are verified and independently cleared in
+Historical or combined SDK/native receipts do not qualify the current 0.19.0 upgrade. Both original P2s and
+owner-admission were verified and independently cleared in
 `artifacts/sdk-first-0.18.12-final-review.json`: static agent review APPROVE, zero P0/P1/P2,
-not independent runtime or CI/merge/deployment approval. Exact-head CI/landing is tracked in
-[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is not yet
-committed/pushed, and CI/merge completion is not claimed. These source tests and basic provider smoke do
+not independent runtime or CI/merge/deployment approval. Historical exact-head CI/landing was tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); that record's final follow-up was not yet
+committed/pushed, and it did not claim CI/merge completion. These historical source tests and basic provider smoke do
 not close existing phase gates or qualify Docker/images/releases/security,
 native/service, fault/OOM/noDump, installation/deployment, or isolation.
 

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG BUN_IMAGE=oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
-ARG LOCK_SHA256=eb1f764acb61573f8ace96271909984b1c864c1e497c55c129a4492d07d2fbe5
+ARG LOCK_SHA256=068df1c33f120a826bd5a3d4c0819b96f7c2360dce73da85f5ee98727d563af2
 
 FROM ${BUN_IMAGE} AS deps
 ARG LOCK_SHA256
@@ -14,7 +14,7 @@ COPY shared/package.json ./shared/package.json
 RUN echo "${LOCK_SHA256}  bun.lock" | sha256sum --check --strict \
     && bun install --frozen-lockfile --production --ignore-scripts \
       --filter @gjc-remote/daemon \
-    && bun -e 'const p=require("./node_modules/@gajae-code/coding-agent/package.json"); if(p.version!=="0.18.12") process.exit(1)'
+    && bun -e 'const p=require("./node_modules/@gajae-code/coding-agent/package.json"); if(p.version!=="0.19.0") process.exit(1)'
 
 # Test-only registration peer. This stage intentionally precedes the signed
 # native bundle stage so Compose validation can build it without release keys.
@@ -94,7 +94,7 @@ LABEL org.opencontainers.image.title="gjc-remote daemon" \
       org.opencontainers.image.source="https://github.com/kogangdon/gjc-remote" \
       org.opencontainers.image.base.name="oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6" \
       io.gjc-remote.lock.sha256="${LOCK_SHA256}" \
-      io.gjc-remote.sdk.version="0.18.12"
+      io.gjc-remote.sdk.version="0.19.0"
 
 COPY --chmod=0444 --from=signed-native /native_control.node ./native-control/build/Release/native_control.node
 COPY --chmod=0444 --from=signed-native /native-control.manifest.json ./native-control/build/Release/native-control.manifest.json
