@@ -1026,6 +1026,107 @@ test('a compatibility refusal precedes the transaction, journal head, provisiona
   assert.deepEqual(calls, ['acquisition-close', 'session-close']);
 });
 
+test('install binds final.manifestFingerprint to the service manifest self-fingerprint (rc14 domain regression)', async () => {
+  // Regression pin for the rc14 defect where #mutate wrote the application
+  // deployment-manifest fingerprint into final.manifestFingerprint while the
+  // store guard (service-store.js accept_provisional_metadata) requires the
+  // service manifest self-fingerprint — every genuine install/update/rollback
+  // died with SERVICE_SCOPE_MISMATCH before driver.probe.  Store unit tests
+  // construct `final` in the correct domain and cannot see this coupling
+  // defect, so this session doubles the guard's seven comparisons exactly;
+  // the fixture keeps both fingerprint domains distinct so the wrong domain
+  // cannot pass vacuously.
+  const platform = 'linux';
+  const calls = [];
+  const entries = [];
+  const absent = () => ({ present: false, value: null });
+  const floor = () => ({ floor: { committedSequence: 0 } });
+  const configuration = {
+    runtimePath: '/runtime', workingDirectory: '/work',
+    homeDirectory: '/home', logDirectory: '/log',
+    channelsConfig: '/channels',
+    expectedHostSetFingerprint: '0'.repeat(64), expectedHostCount: 0,
+  };
+  const applicationManifestFingerprint = 'a'.repeat(64);
+  let provisional;
+  const session = {
+    platform, architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
+    readManifest: absent, readResourceProof: absent, readReferences: absent,
+    readManualCleanup: absent, readStartupProof: absent,
+    readSiblingReferences: () => [],
+    readJournal: () => ({
+      entries,
+      head: entries.length ? { present: true, value: entries.at(-1) } : absent(),
+      pending: null,
+    }),
+    assertFloorCas: () => ({ application: floor() }),
+    appendJournal(value) { entries.push(value); this.writes += 1; return value; },
+    acceptProvisionalMetadata({ transaction, manifest, resource }) {
+      // Mirror of the store guard comparisons (service-store.js
+      // accept_provisional_metadata); drift here must fail exactly like the
+      // production guard.
+      if (manifest.resourceProof !== resource.resourceProof ||
+          manifest.serviceGeneration !== transaction.serviceGeneration ||
+          resource.serviceGeneration !== transaction.serviceGeneration ||
+          manifest.manifestFingerprint !== transaction.final.manifestFingerprint ||
+          resource.resourceProof !== transaction.final.resourceProof ||
+          manifest.applicationManifestFingerprint !== transaction.final.applicationManifestFingerprint ||
+          resource.applicationManifestFingerprint !== transaction.final.applicationManifestFingerprint) {
+        throw lifecycleStoreError('SERVICE_SCOPE_MISMATCH', 'accept_provisional_metadata', this.writes);
+      }
+      provisional = { transaction, manifest, resource };
+      return Object.freeze({ transactionFingerprint: transaction.transactionFingerprint });
+    },
+    publishCurrentMetadata: () => assert.fail('probe stop precedes current metadata publication'),
+    publishManualCleanup(value) { this.writes += 1; return { present: true, value }; },
+    close: () => calls.push('session-close'),
+  };
+  const acquisition = {
+    readManifests: () => ({
+      application: {
+        manifestFingerprint: applicationManifestFingerprint, releaseSequence: 1,
+        releaseTreeFingerprint: 'b'.repeat(64), compatibilityFingerprint: 'c'.repeat(64),
+        archive: { sha256: 'd'.repeat(64) },
+        inventory: { treeFingerprint: 'b'.repeat(64) },
+        entrypoints: { bot: 'bot/src/bot.js' },
+        entrypointPath: '/release/bot.js',
+      },
+    }),
+    reserve: () => assert.fail('probe stop precedes sequence reservation'),
+    publish: () => assert.fail('probe stop precedes release publication'),
+    close: () => calls.push('acquisition-close'),
+  };
+  const probeStop = Object.assign(new Error('fixture stops after provisional metadata'), { code: 'SERVICE_PROBE_STOP_FIXTURE' });
+  const lifecycle = createServiceLifecycle({
+    platform, architecture: 'x64', native: {}, store: { openMutation: () => session },
+    acquisition, compatibility: () => {},
+    observeApplication: () => assert.fail('probe stop precedes application observation'),
+    driver: { probe: () => { throw probeStop; } },
+    planResource: () => ({
+      trial: { resourceFingerprint: 'e'.repeat(64), resourceDescriptor: { name: 'gjc-remote-bot' } },
+      final: { resourceFingerprint: 'f'.repeat(64), resourceDescriptor: { name: 'gjc-remote-bot' } },
+    }),
+  });
+  const source = {
+    kind: 'offline', applicationManifestPath: '/m',
+    applicationSignaturePath: '/s', applicationArchivePath: '/a',
+  };
+  await assert.rejects(lifecycle.install({
+    schemaVersion: 1, target: { component: 'bot' },
+    roles, configuration, source,
+    expected: { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0 },
+  }), (error) => error.code === 'SERVICE_PROBE_STOP_FIXTURE');
+  assert.ok(provisional, 'provisional metadata admission must run before the probe stop');
+  assert.equal(provisional.transaction.final.manifestFingerprint, provisional.manifest.manifestFingerprint);
+  assert.notEqual(provisional.manifest.manifestFingerprint, applicationManifestFingerprint);
+  assert.equal(provisional.transaction.final.applicationManifestFingerprint, applicationManifestFingerprint);
+  assert.equal(provisional.manifest.applicationManifestFingerprint, applicationManifestFingerprint);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].phase, 'prepared');
+  assert.equal(session.writes, 1);
+  assert.deepEqual(calls, ['acquisition-close', 'session-close']);
+});
+
 for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pending']) {
   test(`windows recovery consumer requires durable phase and actionable classification (${variant})`, async () => {
     const prepared = recoveryTransaction('prepared', 'install', 'win32');

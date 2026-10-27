@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Service lifecycle manifest-fingerprint domain repair
+
+- Fix `service-lifecycle.js` writing the application deployment-manifest
+  fingerprint into the final proof's `manifestFingerprint` while the store
+  guard (`accept_provisional_metadata`) requires the service manifest
+  self-fingerprint, which refused every genuine install/update/rollback with
+  `SERVICE_SCOPE_MISMATCH` (first observed by the attempt-20 native-lineage
+  reinstall proof). Build the provisional manifest before the final proof and
+  bind `final.manifestFingerprint` to its self-fingerprint.
+- Add a lifecycle-level regression test that doubles the store guard's seven
+  comparisons against the real mutation flow; store unit tests construct
+  `final` in the correct domain and could not see this coupling defect.
+
 ### Install-phase rc.14 release preparation
 
 - Select distinct application `0.4.0-rc.14`, local tag `v0.4.0-rc.14` and
