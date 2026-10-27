@@ -77,6 +77,11 @@ and retains one immediate predecessor. Production signing keys and a human
 release/platform gate are still required; no signed production asset or live
 service deployment is claimed here.
 
+The existing uninstall generation/schema defect is tracked separately in
+[repository issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
+and is excluded from this SDK upgrade. The SDK source change does not authorize
+rebuilding, signing, or installing under an immutable old release tag.
+
 ## Register and start
 
 Run both package scripts with real Node (not `bun run --bun`):
@@ -167,16 +172,29 @@ inspect the host before retrying. Bot idle/hard-cap expiry, presentation
 failure, and shutdown/disconnect ownership changes use the same revocation
 path. This does not restore active `steer`/`follow_up` or unblock #231.
 
-Official unpatched SDK 0.18.12 includes the late-follow-up continuation fix and
+Official unpatched SDK 0.19.0 includes the late-follow-up continuation fix and
 public tracked `submitUserMessage` ownership API. API existence is not qualified
-daemon integration: active controls remain fail-closed, and active cancellation
-remains nonterminal `cancellation_pending`. Aggregate oracle success does not
-establish standalone SDK abort support.
+daemon integration: active `steer` and `follow_up` remain fail-closed, and active
+cancellation remains nonterminal `cancellation_pending`, not interruption proof.
+Aggregate oracle success does not establish standalone SDK abort support.
 
-Post-admission parent-run SDK-only receipts record Windows focused **333/333 passed** (zero
+Current 0.19.0 source evidence is tracked in the
+[current SDK-only 0.19.0 evidence record](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+and records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
+skips, canonical imports, and one newly authorized same-profile provider smoke.
+Review/CI/landing are tracked separately; no signed-release, installation, or
+deployment PASS is claimed here.
+Upstream #6578 is closed and #6700 is closed unmerged. Repair #6970 is included
+in the official 0.19.0 release notes, not a local workflow-gate PASS. #6763's
+transcript-content approval binding is a separate change; do not bypass containment.
+
+### Historical SDK-only 0.18.12 evidence
+
+The following 0.18.12 receipts and PR #265 are historical and do not qualify
+0.19.0. Post-admission parent-run SDK-only receipts record Windows focused **333/333 passed** (zero
 skips), bounded workspace **2704 tests: 2700 passed, 0 failed, 4 skipped**, and
 actual isolated credentialless Linux **248/248 passed** without provider calls.
-The workspace retains the [nine explicit historical authority exclusions](README.md#current-sdk-only-evidence);
+The workspace retained the [nine explicit historical authority exclusions](README.md#historical-sdk-only-01812-evidence);
 four reported skips do not represent those exclusions and are not passes.
 One separately authorized native Windows provider smoke **passed** with the
 existing `codex-eco` runtime-only child override: three exact A-B-A `SMOKE_OK`
@@ -184,29 +202,27 @@ responses, heartbeat, three successful invoke terminals, exit 0, and ephemeral
 relay port free. No optional model query, wrapper retry, or wrapper persistent
 profile write occurred. Same-profile basic continuity is not isolation or a
 proven #247 disconnect fix.
-The smoke was not repeated after fixture/test-only changes; production SDK runtime/
-package/lock are unchanged. Current local runtime receipts are
+The smoke was not repeated after the historical fixture/test-only changes;
+SDK runtime/package/lock were unchanged within that 0.18.12 verification.
+Historical local runtime receipts are
 `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 `artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; see the
-[SDK-only evidence record](README.md#current-sdk-only-evidence).
+[historical SDK-only evidence record](README.md#historical-sdk-only-01812-evidence).
 
 Main native code was freshly built unchanged. Native lifetime, ACL, publication,
-construction, and fixture repairs remain deferred; no private native fixture or
+construction, and fixture repairs were deferred; no private native fixture or
 combined-worktree result is claimed. Local receipts are unshipped, not promotion
 authority. Both original P2s and owner-admission are verified and independently
 cleared in `artifacts/sdk-first-0.18.12-final-review.json`: static agent review
 APPROVE, zero P0/P1/P2, not independent runtime or CI/merge/deployment approval.
-Exact-head CI/landing is tracked in
-[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
-not yet committed/pushed, and CI/merge completion is not claimed. Local receipts alone
+The historical 0.18.12 landing reference is
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265), not current 0.19.0 evidence. Local receipts alone
 do not approve landing and each run qualifies only its exact pins. Native/service/security/fault/OOM/noDump,
 signed deployment, production, release, support, and installation qualification
 remain excluded. See [current SDK status](../../README.md#local-quick-start).
 
-Upstream #6578 and direct repair #6700 remain open/unmerged and can affect
-SDK-exposed Ultragoal/Ralplan workflow gates. Merged #6763's transcript-content
-approval binding does not repair that guard deadlock; do not bypass containment.
+### Operational alerts
 
 Alert separately for bot exit, listener failure, Discord disconnects, unknown
 or rejected host registrations, absent expected daemons, gate presentation/

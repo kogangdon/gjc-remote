@@ -28,7 +28,7 @@
       "name": "@gjc-remote/daemon",
       "version": "0.4.0-rc.14",
       "dependencies": {
-        "@gajae-code/coding-agent": "0.18.12",
+        "@gajae-code/coding-agent": "0.19.0",
         "@gjc-remote/native-control": "*",
         "@gjc-remote/shared": "0.4.0-rc.14",
         "dotenv": "^16.4.5",
@@ -93,29 +93,29 @@
 
     "@discordjs/ws": ["@discordjs/ws@1.2.3", "", { "dependencies": { "@discordjs/collection": "^2.1.0", "@discordjs/rest": "^2.5.1", "@discordjs/util": "^1.1.0", "@sapphire/async-queue": "^1.5.2", "@types/ws": "^8.5.10", "@vladfrangu/async_event_emitter": "^2.2.4", "discord-api-types": "^0.38.1", "tslib": "^2.6.2", "ws": "^8.17.0" } }, "sha512-wPlQDxEmlDg5IxhJPuxXr3Vy9AjYq5xCvFWGJyD7w7Np8ZGu+Mc+97LCoEc/+AYCo2IDpKioiH0/c/mj5ZR9Uw=="],
 
-    "@gajae-code/agent-core": ["@gajae-code/agent-core@0.18.12", "", { "dependencies": { "@gajae-code/ai": "0.18.12", "@gajae-code/natives": "0.18.12", "@gajae-code/utils": "0.18.12", "@opentelemetry/api": "^1.9.0" } }, "sha512-orSusBXFWv+uOUDUZeGF3X+P7ks12Rdik8TrYKHFHgEKLcsXPK/CQmsfzqwO1ePBSAPrUr3T1rZoN708zga1uA=="],
+    "@gajae-code/agent-core": ["@gajae-code/agent-core@0.19.0", "", { "dependencies": { "@gajae-code/ai": "0.19.0", "@gajae-code/natives": "0.19.0", "@gajae-code/utils": "0.19.0", "@opentelemetry/api": "^1.9.0" } }, "sha512-ypUPTQQ3CHSqkXGIjNH+XyqCkvvAa+/jLWRiUxnRnGM6Qf1VpJORVgpxUlxIAm7VFs01kNrlQUYTEZ5AH4luPw=="],
 
-    "@gajae-code/ai": ["@gajae-code/ai@0.18.12", "", { "dependencies": { "@agentclientprotocol/sdk": "1.3.0", "@anthropic-ai/sdk": "^0.94.0", "@bufbuild/protobuf": "^2.12.0", "@gajae-code/natives": "0.18.12", "@gajae-code/utils": "0.18.12", "openai": "^6.36.0", "partial-json": "^0.1.7", "zod": "4.4.3" }, "bin": { "pi-ai": "src/cli.ts" } }, "sha512-bqLKKIA0LTU1PDKkdV2clNC+XzSKTCy+BCN6wn02xRpXN66iSj1rz+GD8vLhi/FCegIZsRNa5ZzFPYxrlX/FYg=="],
+    "@gajae-code/ai": ["@gajae-code/ai@0.19.0", "", { "dependencies": { "@agentclientprotocol/sdk": "1.3.0", "@anthropic-ai/sdk": "^0.94.0", "@bufbuild/protobuf": "^2.12.0", "@gajae-code/natives": "0.19.0", "@gajae-code/utils": "0.19.0", "openai": "^6.36.0", "partial-json": "^0.1.7", "zod": "4.4.3" }, "bin": { "pi-ai": "src/cli.ts" } }, "sha512-WbYlPNicE+NTBT0rurpKlbKUkxPtl2SXBezYLdKBh4YJHZQLF94a37FVgnIv+Vj20Tp2DfpBaCs3ByP/BuNg2Q=="],
 
-    "@gajae-code/coding-agent": ["@gajae-code/coding-agent@0.18.12", "", { "dependencies": { "@agentclientprotocol/sdk": "1.3.0", "@babel/parser": "^7.29.3", "@gajae-code/agent-core": "0.18.12", "@gajae-code/ai": "0.18.12", "@gajae-code/natives": "0.18.12", "@gajae-code/stats": "0.18.12", "@gajae-code/tui": "0.18.12", "@gajae-code/utils": "0.18.12", "@mozilla/readability": "^0.6.0", "@puppeteer/browsers": "^2.13.0", "@types/turndown": "5.0.6", "@xterm/headless": "^6.0.0", "chalk": "^5.6.2", "commander": "14.0.3", "diff": "^9.0.0", "exifr": "7.1.3", "fast-xml-parser": "5.10.1", "fflate": "0.8.2", "handlebars": "^4.7.9", "jsonc-parser": "3.3.1", "jszip": "3.10.1", "linkedom": "^0.18.12", "lru-cache": "11.3.6", "mammoth": "1.12.0", "marked": "18.0.6", "music-metadata": "11.14.0", "puppeteer-core": "^24.42.0", "rss-parser": "3.13.0", "turndown": "7.2.4", "turndown-plugin-gfm": "1.0.2", "zod": "4.4.3" }, "bin": { "gjc": "bin/gjc.js", "가재씨": "bin/gajaessi.js" } }, "sha512-ls1SkP0FmXhHGxi3oft+1M9HbWwfaAjq6ubWGekFHptegxZEIP/tO8Soha6+xxTSFWvBhdPOuZLtP86Qzcs7vQ=="],
+    "@gajae-code/coding-agent": ["@gajae-code/coding-agent@0.19.0", "", { "dependencies": { "@agentclientprotocol/sdk": "1.3.0", "@babel/parser": "^7.29.3", "@gajae-code/agent-core": "0.19.0", "@gajae-code/ai": "0.19.0", "@gajae-code/natives": "0.19.0", "@gajae-code/stats": "0.19.0", "@gajae-code/tui": "0.19.0", "@gajae-code/utils": "0.19.0", "@mozilla/readability": "^0.6.0", "@puppeteer/browsers": "^2.13.0", "@types/turndown": "5.0.6", "@xterm/headless": "^6.0.0", "chalk": "^5.6.2", "commander": "14.0.3", "diff": "^9.0.0", "exifr": "7.1.3", "fast-xml-parser": "5.10.1", "fflate": "0.8.2", "handlebars": "^4.7.9", "jsonc-parser": "3.3.1", "jszip": "3.10.1", "linkedom": "^0.18.12", "lru-cache": "11.3.6", "mammoth": "1.12.0", "marked": "18.0.6", "music-metadata": "11.14.0", "puppeteer-core": "^24.42.0", "rss-parser": "3.13.0", "turndown": "7.2.4", "turndown-plugin-gfm": "1.0.2", "zod": "4.4.3" }, "bin": { "gjc": "bin/gjc.js", "가재씨": "bin/gajaessi.js" } }, "sha512-nBNwJ81sZ4zX5n3jR4KbSTa5/DxLqsEfpGuFuPwOkSs73GYwW9B6arXNz7o2zhDqRjAwoTotblyabLVWh+hkiQ=="],
 
-    "@gajae-code/natives": ["@gajae-code/natives@0.18.12", "", { "optionalDependencies": { "@gajae-code/natives-darwin-arm64": "0.18.12", "@gajae-code/natives-darwin-x64": "0.18.12", "@gajae-code/natives-linux-arm64": "0.18.12", "@gajae-code/natives-linux-x64": "0.18.12", "@gajae-code/natives-win32-x64": "0.18.12" } }, "sha512-9B0u+0JfkcIDUyslcmGfXavGgt4g9GOLj4WDDB6/NP+oCrVkUbJTfoJ3uwMa0YTbEyoqtJsm5WX0Vm2T/OAc8Q=="],
+    "@gajae-code/natives": ["@gajae-code/natives@0.19.0", "", { "optionalDependencies": { "@gajae-code/natives-darwin-arm64": "0.19.0", "@gajae-code/natives-darwin-x64": "0.19.0", "@gajae-code/natives-linux-arm64": "0.19.0", "@gajae-code/natives-linux-x64": "0.19.0", "@gajae-code/natives-win32-x64": "0.19.0" } }, "sha512-Cca8R6xCBOAcCROx0aU/sFgKW8uSNgu2rr36z7O3hyfNRhot6o7Vkuh1bTNbLqQpGd78MWLyDejHRVia+MI7ww=="],
 
-    "@gajae-code/natives-darwin-arm64": ["@gajae-code/natives-darwin-arm64@0.18.12", "", { "os": "darwin", "cpu": "arm64" }, "sha512-G2HIbdfpnXZmomepqtXwSztDGYVVpXiQHfpxFHLWgHUCtVqPwaQIpTRWQK5urNKYJ7AXyM1MDAB3stV+UNEvLA=="],
+    "@gajae-code/natives-darwin-arm64": ["@gajae-code/natives-darwin-arm64@0.19.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-lGs5ZljTMHfCCRyRk8WBFtogN4a4/XhXpvzAzhQPiJdhroOL16ZDtJQn3q/09PzpX5noqLoEX3DlN19Dmx7yVg=="],
 
-    "@gajae-code/natives-darwin-x64": ["@gajae-code/natives-darwin-x64@0.18.12", "", { "os": "darwin", "cpu": "x64" }, "sha512-EvQ5CF4k2kJOj5HBxkpX5MbcJvq+0yw1jn6e/skA+KamnDH6+M29/aT4usSJoR4rWUcX61mr9S7++MQqB3Tceg=="],
+    "@gajae-code/natives-darwin-x64": ["@gajae-code/natives-darwin-x64@0.19.0", "", { "os": "darwin", "cpu": "x64" }, "sha512-MWKDfNS4uIlEw6QXHvMgpgJlmyBDJWXvRp87ka/tA86OMeGtE6fKKCETVp6gHlTlo+4wE+w1+mEueP+L0sdDuQ=="],
 
-    "@gajae-code/natives-linux-arm64": ["@gajae-code/natives-linux-arm64@0.18.12", "", { "os": "linux", "cpu": "arm64" }, "sha512-GdbbiupjoQqwvhPX2bSt83CaAIcsCDY4yuKV99atLBqM6cYoEGm5nSTT0nqyUs15X2pLyTdvEbe0eFVUTMz9Dw=="],
+    "@gajae-code/natives-linux-arm64": ["@gajae-code/natives-linux-arm64@0.19.0", "", { "os": "linux", "cpu": "arm64" }, "sha512-jm2sOaqZRT7dlCbH6F5bLsXNbNw8FT+LoovtN+KW9AQ/fqG9k4CIEdgIxRENfWDpb0JEhsA0ftjN7BlHxGdtng=="],
 
-    "@gajae-code/natives-linux-x64": ["@gajae-code/natives-linux-x64@0.18.12", "", { "os": "linux", "cpu": "x64" }, "sha512-M22rwcRbYycMc/HkhIHDo6nRE6L1N9cRe49N2AB86CBJLPJd04H3bYlddc9y3AgmI+q7vH5sgqr6gQr4PwN34A=="],
+    "@gajae-code/natives-linux-x64": ["@gajae-code/natives-linux-x64@0.19.0", "", { "os": "linux", "cpu": "x64" }, "sha512-2Ynfi8ZOE5H7ikIwQ443A7pndHF8rJSfbXm6c3P9+824oxx8C0WgV3Mgnacdm7qLtByGf25q+aXfnzyaPZFhAg=="],
 
-    "@gajae-code/natives-win32-x64": ["@gajae-code/natives-win32-x64@0.18.12", "", { "os": "win32", "cpu": "x64" }, "sha512-xFreBJELZJi7aT1Q9gUFQITS0+AYWXru4PQURMfUURbq3XDE8XlwiHkMh9D6/TffuXlEzp+3P0gUW9XA1fw9bg=="],
+    "@gajae-code/natives-win32-x64": ["@gajae-code/natives-win32-x64@0.19.0", "", { "os": "win32", "cpu": "x64" }, "sha512-7f+3TkyTpfxAIwKXkd7Ez3PUyjfAapfF942N5j5EThwLwOhzK8N+NRVRzTFvf9UdujpnolnHT2K6P4zsm43EEw=="],
 
-    "@gajae-code/stats": ["@gajae-code/stats@0.18.12", "", { "dependencies": { "@gajae-code/ai": "0.18.12", "@gajae-code/utils": "0.18.12", "@tailwindcss/node": "^4.2.4", "chart.js": "^4.5.1", "date-fns": "^4.1.0", "lucide-react": "^1.14.0", "react": "19.2.5", "react-chartjs-2": "^5.3.1", "react-dom": "19.2.5", "tailwindcss": "^4.2.4" }, "bin": { "gjc-stats": "src/index.ts" } }, "sha512-R7tAc7NiINPnnt/MX9aQPoO3AYkGFJ4bYb0gbD9XEVeE/V5nT5vQOWl5+paVveBsWJDEHnpRSHmIrW7dbkgHUA=="],
+    "@gajae-code/stats": ["@gajae-code/stats@0.19.0", "", { "dependencies": { "@gajae-code/ai": "0.19.0", "@gajae-code/utils": "0.19.0", "@tailwindcss/node": "^4.2.4", "chart.js": "^4.5.1", "date-fns": "^4.1.0", "lucide-react": "^1.14.0", "react": "19.2.5", "react-chartjs-2": "^5.3.1", "react-dom": "19.2.5", "tailwindcss": "^4.2.4" }, "bin": { "gjc-stats": "src/index.ts" } }, "sha512-d4bGm3nFPYbse/h9qzavuZSiCUz29w/A8AUDsgnytnKiYygt6Faw+I33s3yiX11ghMPfAqupKt5eFn6HMXBS/w=="],
 
-    "@gajae-code/tui": ["@gajae-code/tui@0.18.12", "", { "dependencies": { "@gajae-code/natives": "0.18.12", "@gajae-code/utils": "0.18.12", "lru-cache": "11.3.6", "marked": "18.0.6" } }, "sha512-YZG6LOX+Ej8H1KOf841uexp9qI44He4L36L2XuEjOijxIppeFD1ImEq7GJunVDrg6QhARhYOZ9zx65Bj/K9B6w=="],
+    "@gajae-code/tui": ["@gajae-code/tui@0.19.0", "", { "dependencies": { "@gajae-code/natives": "0.19.0", "@gajae-code/utils": "0.19.0", "lru-cache": "11.3.6", "marked": "18.0.6" } }, "sha512-vFub3jX+TWkoemeDZ7LsR113cBmXvmL89QILnv2ku5YBgQhOS4/jOA7ZU73+d2EEsoidOasYkcGIcMQKkXvIzQ=="],
 
-    "@gajae-code/utils": ["@gajae-code/utils@0.18.12", "", { "dependencies": { "@gajae-code/natives": "0.18.12", "handlebars": "^4.7.9", "winston": "^3.19.0", "winston-daily-rotate-file": "^5.0.0" } }, "sha512-qbrqPSgM9qeEGZABBSNJh02j6pVLEW9agPrDszJ9bw/spNd6j5QPAcTTTjyKibkYYCZlz4Mo0o21pNpiLZLaZQ=="],
+    "@gajae-code/utils": ["@gajae-code/utils@0.19.0", "", { "dependencies": { "@gajae-code/natives": "0.19.0", "handlebars": "^4.7.9", "winston": "^3.19.0", "winston-daily-rotate-file": "^5.0.0" } }, "sha512-S+l68ibYB/ezoFksv26KanBPq9B49lZoaB5TVZCDCY1pSDQdID3TJM9wfletnRnXZvAk2fStjUPA6kqYmHqzHg=="],
 
     "@gjc-remote/bot": ["@gjc-remote/bot@workspace:bot"],
 

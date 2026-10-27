@@ -65,7 +65,7 @@ key version, and restart count. Release evidence includes path/secret/control se
 | Git refs, remote allowlist, dirty policy, cadence, and storage budget | #43/#44 | Complete-graph and destructive-operation fixtures | `GIT_GRAPH_INCOMPLETE` and preserve prior generation |
 | Lease TTL, fence recovery, resource budgets, backup RPO/RTO | #43/#33 | Numeric boundary and crash/recovery fixtures | `LEASE_CONFLICT`/`RESOURCE_EXHAUSTED` or manual cleanup |
 | Provider backup key ownership, escrow, rotation, and restore | #42/#43 | Independent key recovery and restore rehearsal | Preserve data and require manual cleanup |
-| SDK/package/lock reconciliation at official unpatched 0.18.12 and evidence schedule | #42/#45 | Source/lock/version/provenance packet; bounded SDK-only source evidence below, promotion gates still open | Stop image/release work |
+| SDK/package/lock reconciliation at official unpatched 0.19.0 and evidence schedule | #42/#45 | Source/lock/version/provenance packet; [current Windows SDK-only evidence](#current-sdk-only-0190-evidence) recorded, promotion gates still open | Stop image/release work |
 | Docker production target and Windows-host primitive support | #42/#43 | Linux-engine matrix and Windows/UNC containment fixtures | Unsupported target refuses startup |
 | Singleton legacy fallback fence | #43/#44 | Live remap/invalidation and re-registration fixture | Invalidate socket; never silently remap |
 | Protocol v0/v1 retirement | #43/#44/#55 | [ADR 0005](adr/0005-managed-protocol-floor.md): managed v3 floor now; remove local parsers by v0.4.0 RC or 2026-10-01 | Reject managed lower peers with `PROTOCOL_INCOMPATIBLE`; no inferred mapping or downgrade |
@@ -73,9 +73,70 @@ key version, and restart count. Release evidence includes path/secret/control se
 Illustrative values such as 60-second readiness maximum and 8/8/64/4 admission are not final
 approvals until their owners close the corresponding gates. TTL alone never authorizes takeover.
 
-## Current SDK-only 0.18.12 evidence
+## Current SDK-only 0.19.0 evidence
 
-The parent verified the SDK-only source tree after the fixture ownership,
+The current source upgrade targets official unpatched SDK 0.19.0 on
+`feat/sdk-0.19.0-upgrade`, from base
+`69f5ab69f488f7c88ee55af4a24007b6ac33ef8a` (`69f5ab6`). The SDK distribution SRI is
+`sha512-nBNwJ81sZ4zX5n3jR4KbSTa5/DxLqsEfpGuFuPwOkSs73GYwW9B6arXNz7o2zhDqRjAwoTotblyabLVWh+hkiQ==`.
+This is a source upgrade, not an installed/signed runtime replacement or a release packet.
+The parent executed the following on native Windows x64 with Node 26.7.0 and an official
+Bun 1.4.0 executable on a child-only PATH. The lock SHA-256 is
+`068df1c33f120a826bd5a3d4c0819b96f7c2360dce73da85f5ee98727d563af2`.
+The installed coding-agent, agent-core and ai packages are all 0.19.0. Historical receipts
+below cannot qualify this upgrade.
+
+| Required current evidence | Status |
+| --- | --- |
+| Parent focused daemon regressions | 265 tests, 265 pass, zero fail/skips; real SDK contract/isolation probes plus adapter, model, pool, lifecycle and documentation checks |
+| Native SDK/source-closure and release-builder contracts | 70 tests, 70 pass, zero fail/skips |
+| Parent full workspace suite | Unrestricted `npm test`: 2749 tests, 2739 pass, zero fail, 10 skips, exit 0; no historical exclusion pattern |
+| Canonical SDK import verification | PASS inside the real SDK oracle, including factory/Settings/host/lifecycle exports and private-subpath refusals |
+| Local provider smoke | One newly authorized Windows run: exact A-B-A `SMOKE_OK` responses, current heartbeat and three successful invoke terminals, exit 0, relay port free; `codex-eco` child-only profile, no optional model query or wrapper retry |
+| Independent read-only review | Five separate provenance, adapter/oracle, isolation/closure, root-evidence and deployment-guidance lanes APPROVE; no remaining introduced blockers. Static review is not independent runtime or merge/deployment approval |
+
+The full-suite workspace totals were scripts 165/165, bot 377/377, daemon 1151/1153
+(two skips), native-control 847/855 (eight skips), and shared 199/199. The ten skips
+are the Linux cgroup read, Windows privileged symlink creation, the distinct-actor inventory
+fixture, four Linux-only ACL/process-scan cases, two exact-service-Bun guard cases, and
+hosted-runner-only account provisioning. Skips are not passes and no opt-in was enabled.
+The unsigned addon is byte-identical to the local main-verification build from the same
+unchanged native sources; its manifest was regenerated and verified for this upgrade.
+The owned-lineage fixture was rebuilt with `build-lineage-owned-fixture.mjs`, with source/output
+pins in `native-control/build/owned-lineage-fixture/build.json`. This is not signed
+service/account/ACL or canonical installation qualification. Earlier native build warnings
+remain recorded; the SDK upgrade does not claim a new independent native implementation build.
+
+Local ignored/unshipped receipts are `.git/sdk019-focused-01.json`,
+`.git/sdk019-workspace-02.json`, `.git/sdk019-docs-refresh-01.json`, and
+`.git/sdk019-provider-smoke.json`; source hashes and
+stdout/stderr paths are retained with them. The initial full entrypoint failure is preserved
+in `.git/sdk019-workspace-01.json`: scripts 165 tests, 164 pass, one stale Docker SDK-version
+expectation failure. Updating its two exact version regexes resolved it without weakening
+the contract. Documentation-only evidence refreshes do not change the tested SDK, lock,
+adapter or fixture bytes; no second provider smoke is authorized or inferred.
+
+The smoke is same-profile continuity, not profile/tenant isolation or a fix for #247.
+No fresh Linux/macOS/Docker execution, Discord UI canary, CI result or landing is claimed
+by these local receipts. Exact-head CI and any merge remain separate gates.
+
+Upstream #6578 is closed; #6700 is closed-unmerged. The actual repair is #6970,
+included in the official 0.19.0 release notes. Upstream inclusion is not local workflow
+qualification: active controls remain fail-closed, active cancellation remains nonterminal
+`cancellation_pending`, and standalone abort support is not inferred.
+
+No release, installation, signing, or platform qualification is claimed. Docker/images,
+provenance/security, native/service, fault/OOM/noDump, deployment, production, and isolation
+gates remain open; missing evidence stops promotion. Native workspace serving remains
+default-off and subject to all existing receipt, authority, containment, and operation gates.
+The existing uninstall bug is tracked separately in
+[issue #273](https://github.com/kogangdon/gjc-remote/issues/273); this SDK PR does not repair it.
+
+## Historical SDK-only 0.18.12 evidence
+
+The following records apply only to the historical 0.18.12 source tree, not the current
+0.19.0 upgrade. Counts, artifact names, exclusions, and limitations retain their original scope.
+The parent verified that SDK-only source tree after the fixture ownership,
 startup-cleanup diagnostic, source-redaction and owner-admission repairs, plus
 the FIFO-only mock-clock correction. Each run qualifies only
 its exact pins; the following local unshipped receipts alone do not approve landing:
@@ -99,16 +160,17 @@ workspace qualification. Four reported skips are not passes and do not represent
 the entire excluded scope. Main native code was freshly built unchanged;
 separate native lifetime/ACL/publication/construction/fixture repairs remain
 deferred. No private native fixture counts or combined SDK/native results
-qualify this SDK-only tree.
+qualified that historical SDK-only tree; none qualify the current upgrade.
 
 The single smoke ran no optional model query or wrapper retry and made no
 wrapper persistent-profile writes. It was not repeated after fixture/test-only
-changes; production SDK runtime/package/lock are unchanged. It proves basic native Windows same-profile
+changes; the 0.18.12 production SDK runtime/package/lock were unchanged by those changes. It proves basic native Windows same-profile
 A-B-A continuity only, not a fix for #247, generic disconnect recovery, or
 profile/tenant isolation. Active live controls remain fail-closed; active
 cancellation remains nonterminal `cancellation_pending`. Standalone abort
-support is not inferred. Upstream workflow guard issues #6578/#6700 remain
-unresolved; #6763 approval binding does not repair them.
+support is not inferred. The historical run did not qualify upstream workflow guards;
+#6763 approval binding was not their repair. Current upstream status and the #6970 release
+inclusion are recorded in the 0.19.0 section above, not evidence of a local guard pass.
 
 Historical passing pre-admission receipts retain their original counts:
 `artifacts/sdk-first-0.18.12-review-fix2-focused.json` (328/328),
@@ -130,9 +192,9 @@ independently cleared in `artifacts/sdk-first-0.18.12-final-review.json`:
 static agent review APPROVE, zero P0/P1/P2, not independent runtime or
 CI/merge/deployment approval. That review did not observe the concurrent workspace
 result; the completed 2704/2700/0/4 result above comes from its own parent receipt.
-Exact-head CI/landing is tracked in
-[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is not
-yet committed/pushed, and CI/merge completion is not claimed. Existing phase promotion
+Historical exact-head CI/landing was tracked in
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); that record's final follow-up was not
+yet committed/pushed, and it did not claim CI/merge completion. Existing phase promotion
 gates remain open: source tests and this basic provider smoke do not qualify
 Docker/images, release/provenance/security, native/service, fault/OOM/noDump,
 installation/deployment, or isolation. These receipts describe their exact

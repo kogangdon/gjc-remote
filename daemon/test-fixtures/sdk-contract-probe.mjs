@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /*
- * Real installed SDK 0.18.12 contract oracle. It verifies fail-closed live
+ * Real installed SDK 0.19.0 contract oracle. It verifies fail-closed live
  * controls without qualifying the new public tracked-submission integration.
  * Stdout contains one bounded receipt.
  */
@@ -10,7 +10,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
-const EXPECTED_SDK_VERSION = "0.18.12";
+const EXPECTED_SDK_VERSION = "0.19.0";
 const HISTORICAL_SDK_VERSION = "0.16.4";
 const QUEUED_CONTROL_OWNERSHIP_CODE =
   "PUBLIC_TRACKED_SUBMISSION_NOT_INTEGRATED_OR_QUALIFIED";

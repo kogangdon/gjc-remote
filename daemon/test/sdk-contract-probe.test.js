@@ -11,7 +11,7 @@ const testFile = fileURLToPath(import.meta.url);
 const daemonDir = resolve(dirname(testFile), "..");
 const fixture = join(daemonDir, "test-fixtures", "sdk-contract-probe.mjs");
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
-const SDK_VERSION = "0.18.12";
+const SDK_VERSION = "0.19.0";
 const CHILD_TIMEOUT_MS = 50_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const SECRET_ASSIGNMENT =
@@ -344,7 +344,7 @@ test("failure diagnostics preserve partial cells without qualifying the whole co
 });
 
 test(
-  "SDK 0.18.12 real AgentSession contracts contain live controls and govern gates, failures, and disposal",
+  "SDK 0.19.0 real AgentSession contracts contain live controls and govern gates, failures, and disposal",
   { timeout: 55_000 },
   async () => {
     assert.ok(existsSync(fixture), "real SDK contract fixture is missing");
@@ -550,7 +550,7 @@ test(
       "public abort rejected before late-answer probe"
     );
 
-    // SDK 0.18.12 does not publicly export the decision-gate builders. This
+    // SDK 0.19.0 does not publicly export the decision-gate builders. This
     // oracle deliberately reports that boundary instead of copying a private
     // approval/execution schema and accidentally turning another fake into truth.
     assert.deepEqual(receipt.decisionGate, {

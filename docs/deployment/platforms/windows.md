@@ -13,6 +13,28 @@ Foreground operation is the operational fallback when service, provenance, or
 evidence gates are not satisfied. It is not boot-managed and does not roll
 back the application artifact, runtime, mapping authority, or durable state.
 
+## Current SDK-only 0.19.0 source boundary
+
+Current source uses the official unpatched SDK 0.19.0. Its evidence is tracked
+in the [current SDK-only 0.19.0 evidence record](../../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+and records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
+skips, canonical imports, and one newly authorized same-profile provider smoke.
+Historical 0.18.12 receipts, PR #265 and signed/prepared release records below do
+not qualify 0.19.0. Review/CI/landing are tracked separately; no signed-release,
+installation or deployment PASS is claimed here.
+
+Active `steer` and `follow_up` remain fail-closed. Active cancellation remains
+nonterminal `cancellation_pending`, not interruption proof; aggregate oracle
+success does not establish standalone SDK abort support. Upstream #6578 is
+closed and #6700 is closed unmerged. Repair #6970 is included in the official
+0.19.0 release notes, not a local workflow-gate PASS. #6763's approval binding
+is a separate change; do not bypass containment.
+
+The existing uninstall generation/schema defect is tracked separately in
+[repository issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
+and is excluded from this SDK upgrade. The SDK source change does not authorize
+rebuilding, signing, or installing under an immutable old release tag.
+
 ## Service boundary
 
 The host-local lifecycle CLI is **`gjc-remote-service`** from package
@@ -123,12 +145,14 @@ readiness were verified. Canonical service installation then refused with zero
 writes because SDK compatibility listing hashing exceeded the generic JSON
 node bound. Signed/live rc.10 remains immutable with native-control 2.0.0
 (contract 5 revision 1) and SDK 0.16.7, as do all existing rc.1 through rc.10
-assets. The current source candidate selects application `0.4.0-rc.14`, tag
+assets. The historical rc.14 preparation selected application `0.4.0-rc.14`, tag
 `v0.4.0-rc.14`, and release sequence 14, with native-control 2.1.0 (contract 5
-revision 3), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It includes PR #269
+revision 3), unchanged N-API 8, official unpatched SDK 0.18.12, and Bun 1.4.2. It included PR #269
 (merge `ec64e073`): the Windows service creation-accounting repair, and PR #270
 (merge `fbe8ccd5`): owned Win32 lineage scopes with fail-closed receipts. This
-preparation is not a published, signed, or deployed release.
+preparation record is not authorization to publish, sign, install, or deploy
+SDK 0.19.0 under `v0.4.0-rc.14`; historical prepared or signed bytes and their
+application, sequence, Bun, and native identities remain unchanged.
 
 Published rc.11 remains immutable at `116b60caf0ce6361eb3f17d1b9cf3a17e22e92cb`.
 Signed local rc.12 remains immutable at `6af3ef0b480a38da502d8d2ca1cc5c15dbe9b3ae`.
@@ -145,9 +169,12 @@ tombstoned service needs a proven supported fresh-install and failure route
 before any removal. Neither an unsigned build nor local fixture smoke proves
 canonical installation or provider/remote E2E.
 
-Post-admission parent-run main-based SDK-only verification records Windows focused **333/333
+### Historical SDK-only 0.18.12 evidence
+
+The following receipts and PR #265 are historical and do not qualify 0.19.0.
+Post-admission parent-run main-based 0.18.12 SDK-only verification records Windows focused **333/333
 passed**, zero skips, and bounded workspace **2704 tests: 2700 passed, 0 failed,
-4 skipped**, under the [nine explicit historical authority exclusions](../README.md#current-sdk-only-evidence).
+4 skipped**, under the [nine explicit historical authority exclusions](../README.md#historical-sdk-only-01812-evidence).
 Those exclusions are not represented by just four skips; skips are not passes.
 Actual isolated credentialless Linux verification passed **248/248** without
 provider calls. One separately authorized native Windows provider smoke
@@ -156,30 +183,29 @@ exact A-B-A `SMOKE_OK` responses, heartbeat, three successful invoke terminals,
 exit 0, and ephemeral relay port free. No optional model query, wrapper retry,
 or wrapper persistent profile write occurred. This is same-profile basic
 continuity, not isolation or a proven #247 disconnect fix.
-The smoke was not repeated after fixture/test-only changes; production SDK runtime/
-package/lock are unchanged. Current local runtime receipts are
+The smoke was not repeated after the historical fixture/test-only changes;
+SDK runtime/package/lock were unchanged within that 0.18.12 verification.
+Historical local runtime receipts are
 `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 `artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; see the
-[SDK-only evidence record](../README.md#current-sdk-only-evidence).
+[historical SDK-only evidence record](../README.md#historical-sdk-only-01812-evidence).
 
 Main native code was freshly built unchanged. Separate native lifetime, ACL,
-publication, construction, and fixture repairs remain deferred; no private
-native fixture or combined-worktree result qualifies this tree. No service,
+publication, construction, and fixture repairs were deferred; no private
+native fixture or combined-worktree result qualified that tree. No service,
 account, ACL, mapping, installed asset, or signed release was changed. Local
 receipts alone do not approve landing. Independent review and exact-head
 CI/landing are separate: `artifacts/sdk-first-0.18.12-final-review.json` records
 static agent review APPROVE, zero P0/P1/P2, clearing both original P2s and
 owner-admission, not independent runtime or CI/merge/deployment approval.
-Exact-head CI/landing is tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
-the final follow-up is not yet committed/pushed, and CI/merge completion is not claimed;
+The historical 0.18.12 landing reference is [PR #265](https://github.com/kogangdon/gjc-remote/pull/265),
+not current 0.19.0 evidence;
 each run qualifies only its exact pins.
 Native/service/security/fault/OOM/noDump, signed deployment, installation,
-production, release, and support qualification remain excluded. Active live
-controls remain fail-closed and active cancellation remains nonterminal
-`cancellation_pending`; aggregate oracle success does not establish standalone
-SDK abort support. Upstream workflow guard issues #6578/#6700 remain unresolved;
-#6763's approval binding is not that repair.
+production, release, and support qualification remain excluded.
+
+### Historical inventory-base CI evidence
 
 Isolated CI run [37167043415](https://github.com/kogangdon/gjc-remote/actions/runs/37167043415)
 and main CI run [37167663638](https://github.com/kogangdon/gjc-remote/actions/runs/37167663638)

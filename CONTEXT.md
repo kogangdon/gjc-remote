@@ -11,34 +11,45 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (official SDK 0.18.12; bounded source evidence)
+## Architecture (official SDK 0.19.0; bounded Windows source evidence)
 
-The daemon dependency and lockfile target official unpatched 0.18.12. Actual
-post-admission parent SDK-only evidence is Windows focused 333/333, bounded workspace 2704
+The daemon dependency and lockfile target official unpatched 0.19.0.
+Windows focused tests passed 265/265; unrestricted `npm test` recorded 2749 tests,
+2739 pass, zero fail and 10 skips. Canonical imports and one newly authorized
+same-profile A-B-A provider smoke passed. Final independent review and exact-head
+CI/landing are separate gates; no fresh Linux/macOS/Docker evidence is claimed. See
+[current 0.19.0 evidence](docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
+No historical receipt or review qualifies the new source pins. This source change
+does not authorize signing, installation or reuse of immutable rc.14/rc.12
+identities; their SDK/version evidence remains historical. The existing uninstall
+generation defect is separately tracked as [issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
+and is **not repaired** by the SDK upgrade.
+
+**Historical 0.18.12 evidence (PR #265).** Recorded post-admission parent
+SDK-only evidence is Windows focused 333/333, bounded workspace 2704
 tests / 2700 pass / 0 fail / 4 skips, and isolated Linux 248/248 with no provider
 calls. The workspace run used nine explicit historical authority exclusion
 patterns, not unrestricted `npm test`; the four skips are not passes or a
 complete account of the exclusions. Exact patterns and local unshipped receipt
-references are in `docs/verification/issue62-evidence.md#current-parent-observations`.
+references are in `docs/verification/issue62-evidence.md#historical-01812-parent-observations`.
 Canonical imports are covered by real SDK probes, not independent all-platform
 qualification. One separately authorized native Windows smoke passed: three
 exact `SMOKE_OK` responses A-B-A, existing `codex-eco` child-only override,
 heartbeat/three successful invoke terminals, exit 0, ephemeral relay port free,
 no optional model query or wrapper retry. It was not repeated after fixture/test-only
-changes; production SDK runtime/package/lock are unchanged. Same-profile continuity is not
-isolation or a fix for #247. Combined-worktree and historical results do not
-qualify this tree. Main native code was freshly built unchanged; native
+changes; SDK runtime/package/lock were unchanged within that historical cohort.
+Same-profile continuity is not isolation or a fix for #247. These results do not
+qualify 0.19.0. At that snapshot, main native code was freshly built unchanged; native
 lifetime, ACL, publication, construction, and fixture repairs are deferred.
 No private native fixture passes, SOURCEPATCH changes, admission recovery,
 native/service/security/fault/OOM/noDump, production, release, support,
 installation, or deployment qualification is claimed. Independent static agent review
 `artifacts/sdk-first-0.18.12-final-review.json` is **APPROVE**, with zero P0/P1/P2,
 clearing both original P2s and owner-admission; it is not independent runtime or
-CI/merge/deployment approval. Exact-head CI/landing is tracked in
-[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
-not yet committed/pushed, and CI/merge completion is not claimed;
+CI/merge/deployment approval. Historical review/landing belongs to
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265), not the 0.19.0 upgrade;
 local receipts alone do not approve landing. Each run qualifies only its exact pins.
-Current receipts are `artifacts/sdk-first-0.18.12-admission2-focused.json`,
+Historical receipts are `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 `artifacts/sdk-first-0.18.12-admission2-workspace.json` and
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; the single smoke remains
 `artifacts/sdk-first-0.18.12-provider-smoke.json`. The fixture retains actual
@@ -57,7 +68,7 @@ and `follow_up` with `SDK_LIVE_CONTROL_UNSUPPORTED` whenever a prompt is active;
 idle controls remain serialized prompt-equivalent work. Active cancellation
 remains nonterminal `cancellation_pending`, not interruption or quiescence proof.
 
-The actual credentialless SDK Ask abort oracle verifies one event-level
+The historical 0.18.12 credentialless SDK Ask abort oracle verified one event-level
 `cancelled` terminal and no provider continuation after unwind. It permits
 standalone settlement within 250 ms or late-answer-assisted unwind; the
 aggregate parent receipt does not retain which boolean branch occurred.
@@ -71,15 +82,17 @@ for active controls, and does not consume internal `queuedAtDispatch` or SDK-hos
 `onQueuedPromoted` hooks. Do not substitute queue-text matching, private
 capabilities, or forced lower-level continuation.
 
-Upstream v0.18.12 includes #6600's fix #6693 and follow-up #6715, and #6604's
+Upstream v0.19.0 retains #6600's fix #6693 and follow-up #6715, and #6604's
 SQLite statement-finalization fix #6696. Inclusion is not local verification.
-[#6578](https://github.com/Yeachan-Heo/gajae-code/issues/6578) and direct repair
-[#6700](https://github.com/Yeachan-Heo/gajae-code/pull/6700) remain open/unmerged;
-the guard deadlock can affect SDK-exposed Ultragoal/Ralplan workflow gates.
-Merged #6763 binds approvals to transcript content, not a guard-deadlock repair.
-No gate/admission bypass or recovery is authorized.
+[#6578](https://github.com/Yeachan-Heo/gajae-code/issues/6578) is CLOSED;
+[#6700](https://github.com/Yeachan-Heo/gajae-code/pull/6700) is CLOSED UNMERGED.
+The actual [#6970 repair](https://github.com/Yeachan-Heo/gajae-code/pull/6970)
+appears in official 0.19.0 release notes; that inclusion does not qualify local
+Ultragoal/Ralplan workflow gates. Merged #6763's transcript-content approval
+binding is distinct. Gate and live-control policies remain fail-closed;
+no gate/admission bypass or recovery is authorized.
 
-The topology below remains the implemented integration. The observed current
+The topology below remains the implemented integration. The current Windows
 scoped probe boundary and explicitly historical observations are recorded in
 `docs/verification/issue62-evidence.md`. Adapter regressions, the real-SDK
 contract oracle, and local smoke are separate bounded checks, not
@@ -155,7 +168,7 @@ selection, workDir canonicalization, workspace admission/lifecycle policy, and
 relay limits. The SDK runtime remains authoritative for provider/model
 catalogs, provider authentication, and agent-turn semantics; the bridge
 resolves remote selectors and schedules/relays controls without reimplementing
-those semantics. Public SDK 0.18.12 `router` and `lifecycle` namespaces are reserved for a
+those semantics. Public SDK 0.19.0 `router` and `lifecycle` namespaces are reserved for a
 separate evaluation as a possible future external-session path. No
 Broker/Router adapter, route, product-policy migration, or fallback is
 implemented.
@@ -182,7 +195,7 @@ does not make them public imports. Broker terminology does not imply a public
   $PATH: "tmux"`. Unrelated to the RPC socket issue above — two independent
   Windows gaps. Not used by this project's architecture at all (we drive skills
   through SDK `AgentSession` prompt methods, not via `gjc team`). SDK 0.16.4
-  had already retired `team`; SDK 0.18.12 retains that catalog change. The
+  had already retired `team`; SDK 0.19.0 retains that catalog change. The
   current bundled skill is `autoresearch`, and this historical Windows
   observation does not assess the current Broker/Router.
 - **One `gjc -p "..."` subprocess per Discord command** — this was the
@@ -296,7 +309,7 @@ current transport lives in `daemon/src/sdk-session.js`.
 
 ## Runtime: Bun vs Node
 
-The daemon pins official unpatched `@gajae-code/coding-agent` 0.18.12, requires Bun 1.4.0 or newer,
+The daemon pins official unpatched `@gajae-code/coding-agent` 0.19.0, requires Bun 1.4.0 or newer,
 and embeds GJC in-process. The bot and Node built-in test runner remain
 Node-compatible. `bun.lock` is the committed dependency lockfile;
 `package-lock.json` is gitignored.
@@ -319,21 +332,21 @@ loader is narrow.
 Every pooled `AgentSession` runs *in-process* inside the one daemon Bun process
 (see `session-pool.js` / `sdk-session.js`; `daemon/src` has no
 `spawn`/`child_process`/`--mode`). Multiple channels mapped to the same host
-therefore share **one JS event loop**. The 0.18.12 upgrade does not add an
-external-session adapter. Current 0.18.12 real-SDK A/B and B/A probes passed
+therefore share **one JS event loop**. The 0.19.0 upgrade does not add an
+external-session adapter; its real-SDK A/B and B/A probes passed on Windows. Historical 0.18.12 A/B and B/A probes passed
 within the parent Windows and isolated Linux checks for scoped policy/model
 and registered-cwd capability boundaries. Windows local order receipts also
 record first-attempt child scratch removal after public close, with the
 separate launcher cache removed only after child exit. This is not CPU
 parallelism, tenant isolation or an aggregate process-global drain. Historical
-0.16.7 results remain historical and are not promoted to this dependency.
+0.16.7 and 0.18.12 results remain historical and are not promoted to this dependency.
 
 **Historical 0.12.21 runtime evidence.** Two concurrent remote prompts (for the
 `gjc-remote` and `nk-jenkins` channels) both made progress: both workDirs'
 `.gjc-remote-session/*.jsonl` updated within seconds of each other, and both
 resident-cache directories carried the same daemon PID suffix
 (`…-<daemonPid>-1`, `…-<daemonPid>-2`). That observation showed distinct
-0.12.21 SDK sessions coexisting in one process; it is not a 0.18.12 isolation or
+0.12.21 SDK sessions coexisting in one process; it is not a 0.19.0 isolation or
 concurrency result.
 
 Constraint that follows:
@@ -348,8 +361,9 @@ Constraint that follows:
   omitted. Both creation orders preserved scoped policies and available model
   resolution; unregistered cwd capability fallback and global introspection
   were `LAST_CREATED`. The historical 0.16.7 execution passed the same checks in
-  both orders; neither historical receipt is promoted to 0.18.12. Current
-  0.18.12 probes separately preserve this bounded scoped/unscoped distinction.
+  both orders; none of these historical receipts is promoted to 0.19.0. Historical
+  0.18.12 probes separately preserved this bounded scoped/unscoped distinction;
+  current 0.19.0 Windows probes also passed this bounded distinction.
   Unfiltered model
   catalogs are not availability/authorization
   decisions. Do not use unscoped APIs as per-workDir policy. Empty-fixture auth
@@ -359,7 +373,7 @@ Constraint that follows:
   [docs/verification/issue62-evidence.md](docs/verification/issue62-evidence.md).
 
 The current SDK pin is established independently in `daemon/package.json` and
-`bun.lock` (0.18.12). That pin is a runtime dependency fact; it is not isolation,
+`bun.lock` (0.19.0). That pin is a runtime dependency fact; it is not isolation,
 Broker/Router, or ACP conformance evidence.
 
 ### Historical ACP feasibility evidence (ca411c3; 2026-07-28)
@@ -367,7 +381,7 @@ Broker/Router, or ACP conformance evidence.
 Commit `ca411c3` records a source inspection requested on **2026-07-28**. The
 SDK version inspected for that note was **unknown/not established**. The
 following bullets are therefore historical feasibility evidence only; they do
-not establish the current 0.18.12 package's ACP conformance, behavior, or
+not establish the current 0.19.0 package's ACP conformance, behavior, or
 support contract.
 
 - The historical inspection reported that `gjc` was a spawnable bin and that the
@@ -405,7 +419,7 @@ reaping, stdio backpressure, and possible version drift between an on-PATH
 `gjc` child and the daemon's imported SDK.
 
 **Router/lifecycle is a separate evaluation, not a third implemented route.** The
-public `router` and `lifecycle` namespaces in SDK 0.18.12 may be assessed as a future
+public `router` and `lifecycle` namespaces in SDK 0.19.0 may be assessed as a future
 external-session path, but their presence does not establish ACP conformance,
 process isolation, authentication ownership, lifecycle compatibility, or
 product-policy fit. No such behavior is inferred or enabled by the dependency
@@ -483,7 +497,7 @@ Use these rules for Telegram delivery:
 ## What is NOT done yet (pick up here)
 
 1. **Historical Discord E2E: first manual canary passed 2026-07-28; formal
-   evidence table and current 0.18.12 rerun PENDING.** This predates both the
+   evidence table and current 0.19.0 rerun PENDING.** This predates both the
    0.16.4 and 0.16.7 upgrades and is not current-SDK evidence. The non-Discord
    relay path is designed to be covered by
    `npm run smoke:local` (local `HostRegistry` + `daemon/src/daemon.js` under Bun
@@ -530,14 +544,14 @@ Use these rules for Telegram delivery:
    Shared/production deployment must also set
    `GJC_REMOTE_REQUIRE_ALLOWLIST=1`; local unrestricted mode remains available
    only for backward-compatible development and emits a startup warning.
-4. **Historical Linux provider run retained; current Linux credentialless
-   checks passed 248/248, not provider/deployment qualification. The macOS
+4. **Historical Linux provider run retained; historical 0.18.12 credentialless
+   checks passed 248/248; current 0.19.0 checks PENDING. Neither is provider/deployment qualification. The macOS
    daemon path remains unverified.** Built on native Windows (this repo's origin
    host). On 2026-07-25, a real local smoke passed on WSL2 Ubuntu 24.04 using
    the then-current Bun 1.3.14 (repo cloned to native ext4 `~/gjc-remote`,
    Windows `~/.gjc/agent` config + auth DBs copied to WSL `~/.gjc/agent`) —
    `SMOKE_OK`, protocol v1, profile activation against real Copilot creds. That
-   dated result is not evidence for SDK 0.18.12 or the Bun 1.4.0 minimum.
+   dated result is not evidence for SDK 0.19.0 or the Bun 1.4.0 minimum.
    Two useful fail-fast modes observed en route: no config → "No model
    selected"; profile without credentials → "requires credentials for:
    github-copilot". macOS remains unverified; run `npm run smoke:local` there
@@ -551,9 +565,10 @@ Use these rules for Telegram delivery:
    command) — manually verified 2026-07-28** against the real test guild (see
    item 1: `/hosts` online/offline, live progress edit + tool-call preview
    during a running prompt). Underlying `HostRegistry`/SDK session plumbing has
-   historical unit-test coverage. Current-tree 0.18.12 bounded regressions and
-   the non-Discord Windows smoke passed as recorded above; this is not a
-   fresh manual Discord UI canary.
+   historical unit-test coverage. Historical 0.18.12 bounded regressions and
+   the non-Discord Windows smoke passed as recorded above. Current 0.19.0
+   regressions and one non-Discord smoke passed; a fresh manual Discord UI canary
+   remains unverified.
 7. **Remote host files are not attached automatically.** Assistant output may
    contain absolute paths from the daemon host, but the Discord bot treats those
    paths as text. It never reads matching paths from the bot host. A future
@@ -584,7 +599,7 @@ verification path because it starts the real Bun daemon and embedded agent.
 ## Historical Settings singleton finding (pre-0.16.4)
 
 The following API names, behavior, and probe result describe the older SDK used
-when the issue was found; they do not establish how current 0.18.12 scopes
+when the issue was found; they do not establish how current 0.19.0 scopes
 settings. The later 0.16.4 focused result is separately retained as historical
 evidence in `docs/verification/issue62-evidence.md`.
 `Settings.init({ cwd })` (and the `settings` a bare `createAgentSession`
@@ -599,7 +614,7 @@ each new session's activation clobber every other live session's roles. The fix
 `const scoped = await (await Settings.init()).cloneForCwd(workDir)` and passed
 `settings: scoped` to `createAgentSession`; `cloneForCwd` returned an
 independent instance (`ca===cb` false, override on one did not leak to another).
-Regenerate this reasoning with a probe before trusting 0.18.12 scoping
+Regenerate this reasoning with a probe before trusting 0.19.0 scoping
 assumptions.
 
 **Process note:** PR #24 was merged after only ad-hoc self-review; the missed
@@ -624,11 +639,12 @@ capability and model/provider registry retained process-global state, so
 concurrent pooled sessions with divergent `disabledProviders` or model policy
 could observe last-created-session behavior. The 0.12.21 result and old
 0.11.4/0.11.10 probe remain historical evidence only; they establish neither
-isolation nor state bleed for 0.18.12. The later 0.16.4 and 0.16.7 results are
+isolation nor state bleed for 0.19.0. The later 0.16.4 and 0.16.7 results are
 also historical; the 0.16.7 divergent-session probe established the scoped
 boundary only, not full isolation or the disappearance of unscoped global
-behavior. Current-tree 0.18.12 probes separately passed the bounded scoped
-checks recorded above; they do not qualify isolation. Upstream fix reference:
+behavior. Historical 0.18.12 probes separately passed the bounded scoped
+checks recorded above; they do not qualify isolation or 0.19.0. Current Windows
+0.19.0 probes separately passed the bounded checks, not tenant isolation. Upstream fix reference:
 **Yeachan-Heo/gajae-code#2774**, merged through PR #2865.
 For the issue #62 boundary review, the source-controlled evidence now requires
 both A→B and B→A sanitized matrices, concrete canonical resolver provider/selector

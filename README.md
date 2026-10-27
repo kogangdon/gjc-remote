@@ -2,21 +2,17 @@
 
 Discord-controlled remote GJC sessions.
 
-> **Official unpatched SDK 0.18.12: bounded source evidence.**
+> **Official unpatched SDK 0.19.0: bounded Windows source evidence.**
 > Published types expose `QueuedInputSubmission` / `submitUserMessage` ownership;
 > API existence is not qualified daemon integration. Active `steer` and
 > `follow_up` remain fail-closed; idle controls remain prompt-equivalent FIFO
-> work. Post-admission SDK-only, main-based evidence is Windows focused 333/333, bounded
-> workspace 2704 tests / 2700 pass / 0 fail / 4 skips, isolated Linux 248/248,
-> and one separately authorized Windows provider smoke PASS. Nine historical
-> authority exclusions bound the workspace run; skips are not passes.
-> Independent static agent review is APPROVE, with zero P0/P1/P2; it is not
-> independent runtime or CI/merge/deployment approval. Exact-head CI/landing is tracked in
-> [PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the final follow-up is
-> not yet committed/pushed, and CI/merge completion is not claimed. Local receipts alone
-> do not approve landing. No production, release, support,
-> installation, or deployment qualification is claimed. See the bounded
-> [evidence record](docs/verification/issue62-evidence.md#current-parent-observations).
+> work. Windows focused tests passed 265/265; unrestricted workspace tests passed
+> 2739/2749 with zero failures and 10 skips. Canonical imports and one newly
+> authorized A-B-A provider smoke passed. Final review and CI/landing are separate gates.
+> See [current 0.19.0 evidence](docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
+> [PR #265](https://github.com/kogangdon/gjc-remote/pull/265) and its 0.18.12
+> receipts are historical, not qualification for this upgrade. No production,
+> release, support, installation or deployment qualification is claimed.
 
 > **⚠️ Security: this grants remote code execution.** A mapped Discord channel
 > runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
@@ -62,7 +58,7 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    the SDK queue. This prevents an unowned request from hanging or being matched
    to an unrelated terminal. SDK failure outcomes reject the invocation. Each
    prompt receives its event stream. Idle sessions (no requests for 1 hour) are
-   disposed automatically. SDK 0.18.12 exposes the submission-ownership lifecycle,
+   disposed automatically. SDK 0.19.0 exposes the submission-ownership lifecycle,
    but active controls remain disabled until the daemon integrates and qualifies
    it; upgrading the dependency does not restore them automatically.
    Workflow gates require negotiated `gate_presentation_v1` in addition to
@@ -277,7 +273,7 @@ bun run --filter '@gjc-remote/daemon' start
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
 daemon runs on Bun (>=1.4.0) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.18.12**
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.19.0**
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
@@ -300,28 +296,32 @@ implements no Broker/Router or product-policy migration.
 
 Use canonical `@gajae-code/coding-agent/sdk` exports, including the `host`,
 `router`, `lifecycle`, `bus`, and `mcp` namespaces. Old `sdk/broker`, `sdk/client`,
-and `sdk/models` import subpaths are blocked in 0.18.12; source-file presence
+and `sdk/models` import subpaths are blocked in 0.19.0; source-file presence
 does not make them public entrypoints.
 
-SDK 0.18.12 retains the bundled catalog change introduced in 0.16.4: the retired
+SDK 0.19.0 retains the bundled catalog change introduced in 0.16.4: the retired
 `team` command is replaced by `autoresearch`. After deploying this upgrade, run
 `npm run register` from `bot/` to replace the guild slash-command catalog.
 Registration is an explicit operator action; upgrading dependencies alone does
 not change Discord's stored commands.
 
-> **SDK source evidence:** the implementation uses official unpatched
-> `@gajae-code/coding-agent` **0.18.12**, requiring **Bun 1.4.0 or newer**.
-> Post-admission parent evidence: Windows focused **333/333**, bounded workspace **2704 tests,
+> **Current 0.19.0 evidence: bounded Windows verification.** Source pins target official unpatched
+> `@gajae-code/coding-agent` **0.19.0**, requiring **Bun 1.4.0 or newer**.
+> Focused tests, the full suite, canonical imports and one authorized provider smoke passed;
+> this is not all-platform, installation or deployment qualification. See
+> [the current evidence ledger](docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
+>
+> **Historical 0.18.12 source evidence (PR #265):** Windows focused **333/333**, bounded workspace **2704 tests,
 > 2700 pass, 0 fail, 4 skips**, and isolated Linux **248/248** (no provider calls).
 > This is not unrestricted `npm test`: its nine historical authority exclusion
-> patterns are recorded in the [current evidence](docs/verification/issue62-evidence.md#current-parent-observations), separately from the four skips.
+> patterns are recorded in the [historical evidence](docs/verification/issue62-evidence.md#historical-01812-parent-observations), separately from the four skips.
 > Canonical imports are exercised by real SDK probes, not independently
 > qualified on all platforms. One separately authorized native Windows smoke
 > passed with three exact `SMOKE_OK` responses in A-B-A order, the existing
 > `codex-eco` child-only override, heartbeat/three successful invoke terminals,
 > exit 0 and ephemeral relay port free; no optional model query or wrapper retry.
-> That single smoke was not repeated after fixture/test-only changes; production SDK
-> runtime/package/lock are unchanged. Current run receipts are
+> That single smoke was not repeated after the historical fixture/test-only changes;
+> its recorded SDK runtime/package/lock were unchanged within that cohort. Historical receipts are
 > `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 > `artifacts/sdk-first-0.18.12-admission2-workspace.json` and
 > `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`; the smoke remains
@@ -337,37 +337,44 @@ not change Discord's stored commands.
 > Combined-worktree results are not evidence for this tree. Native lifetime,
 > ACL, publication, construction, and fixture repairs are excluded/deferred.
 > No local SOURCEPATCH modifications or admission recovery are included.
-> Main native code was freshly built unchanged; no native repair or private
+> At that historical snapshot, main native code was freshly built unchanged; no native repair or private
 > native fixture pass is claimed. Native/service/security/fault/OOM/noDump and
-> release qualification remain unavailable. Independent review and exact-head
-> CI/landing status are tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265).
-> Local receipts alone do not approve landing; each run qualifies only its exact pins.
+> release qualification were not established. Historical review/landing belongs to
+> [PR #265](https://github.com/kogangdon/gjc-remote/pull/265), not the 0.19.0 upgrade.
+> Each run qualifies only its exact pins; none of these counts or verdicts qualify 0.19.0.
 >
 > **Historical 0.16.4 blocker evidence:** the real-SDK oracle observed
 > `waitForIdle()` resolving with the exact executable late follow-up still
 > queued and no successor run. Its receipt recorded `BLOCK`
 > (`SDK_0_16_4_LATE_FOLLOW_UP_NOT_AUTO_CONTINUED`). That is retained as
-> old-run evidence, not a current 0.18.12 oracle result.
+> old-run evidence, not a current 0.19.0 oracle result.
 >
 > **Historical 0.12.21 verification:** that pin superseded 0.12.7, and its
 > 2026-08-09 verification covered package/lock reconciliation, canonical SDK
 > imports, root/workspace regression suites, local smoke (`SMOKE_OK`), and
 > manual bot/daemon runtime execution. Provider/model switch coverage was
 > environment-dependent. This is retained as old-run evidence, not evidence for
-> 0.18.12.
+> 0.19.0.
 
-SDK 0.18.12 includes the late-follow-up continuation fix for
+SDK 0.19.0 retains the late-follow-up continuation fix for
 [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) and the public
 tracked ownership API associated with
 [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429); neither restores
 active controls in this adapter. Release inclusion is not local verification:
 [#6600](https://github.com/Yeachan-Heo/gajae-code/issues/6600) is addressed by
 #6693 and follow-up #6715, and #6604 by #6696. Upstream
-[#6578](https://github.com/Yeachan-Heo/gajae-code/issues/6578) and direct repair
-[#6700](https://github.com/Yeachan-Heo/gajae-code/pull/6700) remain open/unmerged;
-the guard deadlock can affect SDK-exposed Ultragoal/Ralplan workflow gates.
-Merged #6763 binds approvals to transcript content, not a guard-deadlock repair.
-Do not bypass gate/admission containment.
+[#6578](https://github.com/Yeachan-Heo/gajae-code/issues/6578) is CLOSED and
+[#6700](https://github.com/Yeachan-Heo/gajae-code/pull/6700) is CLOSED UNMERGED;
+the actual [#6970 repair](https://github.com/Yeachan-Heo/gajae-code/pull/6970)
+appears in the official 0.19.0 release notes. Inclusion is not local workflow
+qualification. Merged #6763's transcript-content approval binding is distinct.
+Gate/admission containment and active-control fail-closed policy remain unchanged.
+
+The existing uninstall generation defect is tracked separately in
+[issue #273](https://github.com/kogangdon/gjc-remote/issues/273) and is **not repaired**
+by this SDK upgrade. Source 0.19.0 does not authorize signing, installation or
+reuse of immutable rc.14/rc.12 release identities; their recorded SDK/version
+evidence remains historical.
 
 **Optional environment variables** — beyond the required keys above:
 

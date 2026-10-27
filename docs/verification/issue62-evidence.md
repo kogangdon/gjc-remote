@@ -1,8 +1,38 @@
 # Issue #62 SDK isolation probe
 
-Status: **SDK-ONLY MAIN-BASED IMPLEMENTATION** targeting official, unpatched
+## Current SDK 0.19.0 evidence
+
+Current source targets official unpatched `@gajae-code/coding-agent`,
+`@gajae-code/agent-core` and `@gajae-code/ai` **0.19.0**, on
+`feat/sdk-0.19.0-upgrade` from main `69f5ab69f488f7c88ee55af4a24007b6ac33ef8a`.
+Windows focused tests passed 265/265, and unrestricted workspace tests recorded
+2739 pass, zero fail and 10 skips out of 2749. Real-SDK probes/canonical imports
+and one newly authorized same-profile provider smoke passed. Final independent
+review and exact-head CI/landing remain separate gates. The
+[current evidence ledger](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+owns exact current 0.19.0 results and limits. No fresh Linux/macOS/Docker result
+is claimed. Historical counts, artifact names,
+smoke and PR #265 below remain bound to their original pins, not 0.19.0.
+
+Upstream #6578 is CLOSED; #6700 is CLOSED UNMERGED. The actual #6970 repair
+appears in official 0.19.0 release notes. Inclusion is not local Ultragoal/Ralplan
+workflow-gate qualification. Gate/admission containment and live-control policy
+remain fail-closed: active `steer`/`follow_up` are unsupported, and active
+cancellation is only nonterminal `cancellation_pending`, not interruption proof.
+No bypass or admission recovery is authorized.
+
+The existing uninstall generation defect is tracked separately as
+[repo issue #273](https://github.com/kogangdon/gjc-remote/issues/273) and is **not repaired**
+by the SDK upgrade. Current source authorizes no installation, signing or reuse
+of immutable rc.14/rc.12 identities; older candidate SDK/version evidence stays
+historical. Native/service/security/fault/OOM/noDump and installation/deployment/
+production/support/release qualification are not established by this upgrade.
+
+## Historical SDK 0.18.12 implementation and PR #265
+
+Historical status: **SDK-ONLY MAIN-BASED IMPLEMENTATION** targeting official, unpatched
 `@gajae-code/coding-agent`, `@gajae-code/agent-core` and `@gajae-code/ai`
-**0.18.12**. This tree starts from main
+**0.18.12**. That tree started from main
 `116b60caf0ce6361eb3f17d1b9cf3a17e22e92cb` on
 `feat/sdk-0.18.12-upgrade`. **Bounded actual parent verification and one
 separately authorized Windows provider smoke are recorded below.** SDK-only
@@ -14,20 +44,20 @@ and the later `SDK-FIRST-P2-1-OWNER-ADMISSION` correction now have **passing
 post-admission parent verification** below and are independently cleared.
 `artifacts/sdk-first-0.18.12-final-review.json` records **APPROVE**, with zero
 P0/P1/P2. This is independent static agent review, not independent runtime or
-CI/merge/deployment approval. Exact-head CI/landing is tracked in that PR;
-the final follow-up is not yet committed/pushed, and CI/merge completion is not
-claimed. Local receipts alone do not approve landing.
+CI/merge/deployment approval. Historical review/landing belongs to that PR,
+not the new 0.19.0 upgrade. Local receipts alone do not approve landing.
 No prior combined-worktree result, count, receipt or
-provider smoke qualifies this SDK-only main-based tree. This is not release,
+provider smoke qualified that SDK-only main-based tree. This was not release,
 native-repair, deployment or tenant-isolation qualification.
 
-## Current parent observations
+## Historical 0.18.12 parent observations
 
-These are the latest recorded parent results **after the owner-admission
-correction and FIFO-only mock-clock change**. They supersede the historical
-328/2695/243 cohort for current qualification, without relabeling old receipts.
+These are the recorded 0.18.12 parent results **after the owner-admission
+correction and FIFO-only mock-clock change**. They superseded the earlier
+328/2695/243 cohort within that historical pin, without relabeling old receipts.
+They do not qualify 0.19.0.
 
-The current parent receipts are `artifacts/sdk-first-0.18.12-admission2-focused.json`,
+The historical parent receipts are `artifacts/sdk-first-0.18.12-admission2-focused.json`,
 `artifacts/sdk-first-0.18.12-admission2-workspace.json`,
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json` and
 `artifacts/sdk-first-0.18.12-provider-smoke.json` (all local, ignored/unshipped).
@@ -54,15 +84,15 @@ Each run qualifies only its exact recorded pins, not a future snapshot:
   port 12219 free after exit. No optional model query, wrapper retry or
   persistent profile write. Same-profile continuity is not profile/tenant
   isolation, a generic disconnect repair or a fix for #247.
-  This smoke was **not repeated** after fixture/test-only changes; production SDK
-  runtime/package/lock are unchanged.
+  This smoke was **not repeated** after the historical fixture/test-only changes;
+  SDK runtime/package/lock were unchanged within that cohort.
 
 The final static review inspected parent focused/Linux evidence but did not
 observe the concurrent workspace result; the completed workspace counts above
 are attributed separately to `sdk-first-0.18.12-admission2-workspace.json`.
-No test, gate, SDK import or provider invocation was run for this docs refresh;
-the final parent docs gate remains pending. These refreshed docs are not a new
-runtime-qualified source snapshot.
+No test, gate, SDK import or provider invocation was run by the documentation
+lane. The parent separately executed current 0.19.0 verification recorded in
+the ledger above; historical results here do not qualify that snapshot.
 
 ### Historical initial, intermediate and failed attempts
 
@@ -119,7 +149,7 @@ workspace receipt's single `--test-skip-pattern` argument):
 8. `current management or system caller can reapply`
 9. `opted-in Windows hosted runner provisions`
 
-Canonical SDK imports are covered by actual real-SDK probes in these bounded
+Historical 0.18.12 canonical SDK imports were covered by actual real-SDK probes in these bounded
 runs, not an independent all-platform import qualification. The real Ask abort
 oracle asserts exactly one event-level SDK `cancelled` terminal, rejected owned
 prompt and no continuation provider call after unwind; it never fabricates a
@@ -145,27 +175,29 @@ The pre-admission-fix postrepair parent source-set digest
 uses the parent's recorded file-set algorithm; it is **not** the original
 implementation-scope digest or this probe's ordered four-file digest. Run
 receipts qualify their exact pins; a later snapshot needs its own evidence.
-The implementation, failed-attempt and redaction-repair receipts are preserved.
+The historical implementation, failed-attempt and redaction-repair receipts are preserved.
 All artifacts are unshipped local evidence,
 not authority or promotion grants. Main native code was freshly built
 unchanged; native lifetime/ACL/publication/construction/fixture repairs remain
 deferred and no private native fixture passes are claimed. Independent review
-and exact-head CI/landing status are tracked in
-[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the passing local
+and landing history belong to
+[PR #265](https://github.com/kogangdon/gjc-remote/pull/265); the historical passing local
 receipts alone do not approve landing. Native/service/security/fault/OOM/noDump,
 installation/deployment/production/support/release remain unqualified.
-Upstream #6578 and direct repair #6700 remain open/unmerged; merged #6763's
-transcript-content approval binding is not a guard-deadlock fix. No bypass or
-admission recovery is authorized.
+That 0.18.12 snapshot did not contain the later #6970 workflow guard repair;
+merged #6763's transcript-content approval binding is distinct. Current upstream
+closure/release-inclusion facts are recorded above, not inferred as local passes.
+No bypass or admission recovery is authorized.
 
 ## Current implementation contract
 
 The probe requires Bun **>=1.4.0** and Node wrapper **>=26**. Exact daemon,
-installed coding-agent and lockfile pins must be 0.18.12. The coding-agent
+installed coding-agent and lockfile pins must be 0.19.0. The coding-agent
 declarations, installed versions and lockfile entries for agent-core and ai
-must independently equal 0.18.12; mismatches fail, with no fallback. Dependency
-installation used official npm with `--ignore-scripts`; the committed Bun lock
-was regenerated separately. The parent isolated Linux install log records Bun
+must independently equal 0.19.0; mismatches fail, with no fallback. These are
+current source requirements, not observed 0.19.0 execution results. Historical 0.18.12 dependency
+installation used official npm with `--ignore-scripts`; its Bun lock
+was regenerated separately. That historical parent isolated Linux install log records Bun
 1.4.2 installing 291 packages; the bounded receipts establish version/lock
 agreement, not an independent tarball-provenance or release attestation. No
 upstream package, node_modules, SOURCEPATCH or native-control repair is part of
@@ -210,7 +242,7 @@ delay, retry, chmod/cwd repair, file exclusion, fake fallback or suppressed
 close error can turn a failure into success. The first removal verdict and
 bounded diagnostics are retained. `cleanup.nativeCache` describes the separate
 process-lifetime cache; Windows additionally requires a staged `.node` under
-its exact 0.18.12 directory. Only after child close may the parent remove the
+its exact 0.19.0 directory for a new run. Only after child close may the parent remove the
 launcher root, once, as `cleanup.parentCacheRemoval`; its
 `immediateSessionCloseProof` is false. Post-exit failed-scratch salvage is
 separate (`cleanup.parentSalvage`) and never replaces the child's verdict.
@@ -230,7 +262,7 @@ loaders must not run, model fallback must remain false and intercepted network
 attempts must be zero. This guard covers intercepted Bun fetch/preconnect only,
 not other network APIs, calls after restoration or production startup.
 
-### Repaired failure boundaries
+### Historical 0.18.12 repaired failure boundaries
 
 - **P2-1:** The fixture retains each in-flight raw/adapter disposal promise
   separately from its bounded caller result. Where supported, it also joins
@@ -272,10 +304,10 @@ remain distinct; no native exclusion or production source changes accompany
 these repairs. `artifacts/sdk-first-0.18.12-review-fixes.json` and
 `artifacts/sdk-first-0.18.12-review-fixes-redaction.json` preserve implementation
 hashes and the then-pending verification state, not passing gates. Actual
-current passing results belong to the `admission2` run receipts above;
+historical passing results belong to the `admission2` run receipts above;
 `review-fix2` remains the historical pre-admission cohort. Independent static
 clearance is in `artifacts/sdk-first-0.18.12-final-review.json`; exact-head
-CI/landing status belongs in PR #265, not that static verdict.
+landing history belongs in PR #265, not that static verdict or the 0.19.0 ledger.
 
 #### Owner-admission follow-up (verified and independently cleared)
 
@@ -310,19 +342,21 @@ workspace verification recorded **2704 tests / 2700 pass / 0 fail / 4 skips**
 under the same nine exclusions. Both original P2s and owner-admission are
 independently cleared by `artifacts/sdk-first-0.18.12-final-review.json`
 (static agent review **APPROVE**, zero P0/P1/P2, no independent runtime).
-The single earlier provider smoke was not repeated; production SDK runtime,
-package and lock remain unchanged.
+The single earlier provider smoke was not repeated; SDK runtime, package and lock
+were unchanged within that historical 0.18.12 cohort, not across this upgrade.
 `artifacts/sdk-first-0.18.12-owner-admission-fix.json` preserves implementation
 hashes and its then-unverified state only; it is not relabeled as a passing
 run or approval. The earlier 328/2695/243 cohort and both prior
 `REQUEST_CHANGES` reviews remain historical. Exact-head CI/landing and the
-pending final parent docs gate are separate from static review clearance.
+then-pending final parent docs gate were separate from static review clearance.
 
-### Probe commands and environment
+### Current probe commands and environment
 
-Run from `D:/dev/gjc-remote-sdk-only-0.18.12`, with Node >=26 and Bun >=1.4.0.
+Run from the current `feat/sdk-0.19.0-upgrade` checkout, with Node >=26 and Bun >=1.4.0.
+The older `D:/dev/gjc-remote-sdk-only-0.18.12` worktree is historical evidence,
+not a new-version verification target.
 These focused commands describe the probe entrypoints, not additional
-executions by this documentation lane. The actual parent commands/counts are
+executions by this documentation lane. The historical parent commands/counts are
 in the receipts above; do not substitute unrestricted workspace execution:
 
 ```text
@@ -343,13 +377,15 @@ provider credentials, forced-GC flags, delays or cleanup retries to make this
 probe pass. Preserve the expected controlled-provider warning and all other
 warnings in parent output; unexpected warnings require investigation.
 
-Canonical imports were exercised by the actual SDK probes above; this is not
-all-platform qualification. The separately authorized single provider smoke
+Historical 0.18.12 canonical imports were exercised by the actual SDK probes above;
+current 0.19.0 imports separately passed the parent Windows probes. Neither is
+all-platform qualification.
+The separately authorized historical single provider smoke
 is distinct from this credentialless probe and must not be inferred from it.
 Any further provider execution requires separate authorization. Observations
 bind the bytes at execution, not later refreshed docs or future checkouts.
 
-### Source identity
+### Current source identity
 
 Each receipt carries separate
 `approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of
@@ -371,12 +407,12 @@ The Node wrapper is the sole durable receipt writer. It removes any stale output
 The Bun fixture writes no repository artifact and emits a bounded structured receipt to stdout only. Raw stdout/stderr and unredacted temporary paths are never persisted. The wrapper owns the final files; this document is the durable reader/reference. Receipts are evidence attachments, not source-controlled proof by themselves.
 
 These ignored mutable paths are output locations, not permanent proof of any
-checkout. The current parent receipts identify their post-admission run pins;
+checkout. The historical 0.18.12 parent receipts identify their post-admission run pins;
 historical initial and failed attempts retain their own pins and results.
 Any new receipt must independently report `sdkVersionExpected`,
 `sdkVersionObserved`, `daemonDependencyVersion`, and `lockfileVersionEvidence`
-as `0.18.12`, and its ordered working-tree digest must match the four live files.
-The `sdkDependencyProvenance` entries must independently match 0.18.12 for
+as `0.19.0`, and its ordered working-tree digest must match the four live files.
+The `sdkDependencyProvenance` entries must independently match 0.19.0 for
 agent-core and ai (coding-agent declaration, installed version and lockfile).
 The wrapper removes each stale order-specific output before running that order.
 
@@ -385,7 +421,7 @@ The wrapper removes each stale order-specific output before running that order.
 The then-current parent-run wrapper passed all three tests on Windows x64 (Bun
 1.4.2, Node wrapper 26.7.0) and Linux x86_64 (WSL Ubuntu 24.04, Bun 1.4.2,
 Node wrapper 26.9.0), including both creation orders and zero network
-attempts. This remains historical scoped policy evidence, not 0.18.12 evidence
+attempts. This remains historical scoped policy evidence, not 0.19.0 evidence
 or tenant isolation. The following observations apply to that dependency only.
 
 The installed 0.16.7 package source and exports map were inspected before
@@ -599,8 +635,8 @@ fixture stores only; no broker or credential claim is made.
 
 When executed against matching version and provenance, the probe measures the
 installed SDK behavior; it does not repair process-global
-capability/model-provider state or claim full isolation. Historical 0.16.7
-receipts do not qualify 0.18.12 or remove those limits. Preserve the requirement to rerun this focused
+capability/model-provider state or claim full isolation. Historical 0.16.7 and
+0.18.12 receipts do not qualify 0.19.0 or remove those limits. Preserve the requirement to rerun this focused
 probe after every SDK bump before changing the caveat. A reproducible global
 direction is evidence only for the exact observed upstream/architecture
 boundary, not a local workaround authorization.
