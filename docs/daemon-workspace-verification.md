@@ -73,7 +73,116 @@ key version, and restart count. Release evidence includes path/secret/control se
 Illustrative values such as 60-second readiness maximum and 8/8/64/4 admission are not final
 approvals until their owners close the corresponding gates. TTL alone never authorizes takeover.
 
+## Current tracked-input evidence
+
+The supported subset of issue [#231](https://github.com/kogangdon/gjc-remote/issues/231) is integrated on
+`feat/sdk-tracked-live-controls`, from main
+`891c7aad71307f56ce5a140fb08599b1a53551ab`. Official SDK/core/ai remain **0.19.0**;
+the SDK distribution, lock digest and schema/transcript markers do not change.
+This integration is separate from the adoption-only PR #274 evidence below.
+
+The adapter contract is public `submitUserMessage` admission, execution and final
+terminal receipts for the exact submission, with `queuePolicy: "sequential"`.
+Sequential prevents batching within SDK queues; it does not promise global FIFO
+across steering/follow-up queues or independent generations. Executed inputs can
+join the same logical run and share its terminal. Scope/cohort attribution must
+retain provider-turn scope changes and a successor starting before predecessor
+terminal publication; a lifecycle receipt labelled `completed` is not model success.
+Tracked-input success requires the exact genuine SDK-public terminal and its
+failure/stop metadata; raw observations never manufacture a handle receipt.
+
+Root result proof is separate from SDK readiness publication. Official 0.19.0
+can coalesce unbranded `AgentSession.subscribe` terminal publications during
+late promotion. A root may instead use the public `AgentSession.agent.subscribe`
+terminal for its exact SDK-proven scope, together with settlement of that exact
+root's public `prompt` promise. Success still requires prompt fulfillment and a
+completed classified outcome. Unknown scopes, an earlier continuation terminal,
+prompt fulfillment alone and continuing maintenance are not completion proof.
+Only sanitized outcome metadata is retained; raw output is not streamed twice.
+
+This root-only proof does not publish SDK readiness or retire gate authority.
+The SDK can perform Ask-producing continuations after a raw execution end.
+When a promoted successor opens an unscoped gate while predecessor readiness
+remains unresolved, `runtime_turn_id` supplies no immutable bridge to tracked
+attempt scopes. The adapter refuses with `SDK_TRACKED_INPUT_GATE_OWNERSHIP`
+instead of presenting or answering an unproven owner's gate. Missing genuine
+tracked terminal receipts likewise remain a bounded failure, never borrowed
+from a successor or synthesized from raw execution evidence.
+
+Idle controls remain real serialized prompts; accepted tracked work must not be
+overtaken by root/model operations. Gate authority belongs to one proven cohort
+owner, never merely the latest submitter. Ambiguous gate ownership is bounded and
+explicitly refused rather than borrowed. Queued removal requires positive proof:
+losing the dequeue race keeps `cancellation_pending`, not `cancelled_before_start`.
+Executing work is not selectively aborted and shared siblings are not cancelled.
+
+| Required feature evidence | Status |
+| --- | --- |
+| Tracked adapter/router unit regressions and bounds | Post-review PASS within Windows focused **474/474**, zero failures/skips/cancellations; adapter/router units **240/240** |
+| Genuine SDK admission, consumption, terminal, per-queue sequential delivery and duplicate-text ownership | PASS with actual public handles/receipts and credentialless mock providers; no fabricated receipts or private ownership hooks |
+| Root execution proof versus coalescible SDK readiness | PASS for the exact SDK-proven raw terminal plus its own prompt finalization; no synthetic readiness or tracked receipt |
+| Genuine SDK late-unwind follow-up/steer successor consumption | PASS: actual promoted execution, provider consumption, exact genuine tracked/public final terminal and no successor output leakage |
+| Genuine SDK primary and joined-run Ask ownership | PASS: original logical-run owner presents/answers; joined caller cannot steal the gate; genuine shared final scope and handle terminal |
+| Ambiguous promoted-overlap Ask | **SDK limit remains**: 500 ms bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP` refusal, zero presentations/answers/continuations, actual disposal; not positive promoted-gate support |
+| Daemon cancellation/dequeue race and disconnect containment | Post-review lifecycle **52/52** PASS: positive removal is distinct from executing `cancellation_pending`; fatal/contradictory failures retain admission through actual disposal, while healthy model errors permit reuse |
+| Full workspace suite | Post-review unrestricted Windows `npm test`: **2897 tests, 2887 pass, zero fail, 10 skips**, exit 0; no exclusion pattern |
+| Canonical SDK imports and isolation regression | PASS within focused/full suites; no profile/tenant isolation qualification follows |
+| Local real-provider root smoke | **PRE-REVIEW source only**: one authorized child-only `codex-eco` A-B-A run consumed-PASS, three exact `SMOKE_OK` calls, heartbeat/three invoke terminals, exit 0 in 13,392 ms, relay port free; not provider evidence for later router/fatal-retirement fixes; no replay |
+| Independent read-only review | Five original lanes statically APPROVE after three P2 fixes; separate final test-correction review APPROVE, no remaining blockers; not independent runtime evidence |
+| Exact-head CI | Pending |
+
+These are native Windows x64, Node 26.7.0 and official Bun 1.4.0 results for this
+branch, not historical SDK-adoption evidence. The full-suite per-package totals
+are scripts 165/165, bot 377/377, daemon 1299/1301 (two skips), native-control
+847/855 (eight skips), and shared 199/199. The ten skips are cgroup live reading,
+privileged Windows symlink creation, distinct-actor inventory, two Linux ACL
+cases, two Linux process-scan cases, two exact-service-Bun guard cases and
+hosted-only account provisioning. Skips are not passes. The best-effort native
+AC2b self-test also observed genuine fail-closed refusal, not positive native
+self-test or distinct-principal qualification.
+
+Current local unshipped receipts are `.git/issue231-focused-04.json`,
+`.git/issue231-workspace-02.json`, `.git/issue231-unit-05.json` and
+`.git/issue231-lifecycle-03.json`; they include commands, source/lock pins,
+environment, deadlines and exit status. `.git/issue231-provider-smoke.json`
+and `.git/issue231-pre-review-source.json` retain the earlier smoke source pins.
+The SDK/lock digest remains
+`068df1c33f120a826bd5a3d4c0819b96f7c2360dce73da85f5ee98727d563af2`.
+Initial focused-01 (374/377), oracle-02/03/04 and post-review focused-03
+(474 tests, 463 pass, 11 reported failures) remain preserved, never relabeled.
+The latter failed because the new retirement helper omitted managed-v3
+capabilities and six foreign-scope assertions omitted the sanitizer's fixed
+generic message (plus their failed parent). Both test corrections preserve
+ownership, sanitization, receipt proof and timeout bounds. Focused-04 and
+workspace-02 qualify the corrected source; focused-02 (444/444) and workspace-01
+(2857 pass/10 skips) remain pre-review history only.
+
+The three independent P2 findings were resolved: unknown foreign scopes cannot
+inherit root completion authority, buffered unscoped failures cannot become
+scoped failures, and fatal adapter/cancellation failures cannot release activity
+admission before successful disposal. All five original lanes retain scoped
+APPROVE verdicts: lanes 24/25 additionally re-reviewed their router/unit and
+daemon/fixture/lifecycle corrections; lanes 26–28 retain their original scoped
+approvals. `agent://32-FinalTestCorrectionReview` independently approved the
+final two test corrections. Scope is recorded in
+`.git/issue231-independent-review.json`. Read-only review does not substitute for runtime
+verification or authorize merge. Exact-head CI remains pending.
+
+Both the prior SDK-adoption grant and the separate feature-only provider grant
+are now consumed and must never be replayed. The new run is pre-review basic
+root regression only, not exact post-fix-tree, tracked live-input provider or
+isolation qualification. Later runtime changes were verified by focused/full
+mock-provider regressions, not another provider run. Tests use
+credentialless real SDK mock providers without source patches or private ownership
+hooks. #273, issue closure, merge, release, signing, service/account/ACL changes,
+installation, deployment and tenant isolation are outside this source task.
+
 ## Current SDK-only 0.19.0 evidence
+
+This is the **historical adoption-only cohort** at reviewed head `9512dd8`, merged
+through [PR #274](https://github.com/kogangdon/gjc-remote/pull/274). Its counts and
+smoke do not qualify the tracked-input integration above; current feature results
+must be recorded independently.
 
 The current source upgrade targets official unpatched SDK 0.19.0 on
 `feat/sdk-0.19.0-upgrade`, from base
@@ -122,7 +231,7 @@ by these local receipts. Exact-head CI and any merge remain separate gates.
 
 Upstream #6578 is closed; #6700 is closed-unmerged. The actual repair is #6970,
 included in the official 0.19.0 release notes. Upstream inclusion is not local workflow
-qualification: active controls remain fail-closed, active cancellation remains nonterminal
+qualification: that adoption-only cohort kept active controls fail-closed; executing cancellation remains nonterminal
 `cancellation_pending`, and standalone abort support is not inferred.
 
 No release, installation, signing, or platform qualification is claimed. Docker/images,

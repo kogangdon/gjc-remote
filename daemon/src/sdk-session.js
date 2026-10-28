@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
 import {
-  PROTOCOL_ERROR_CODES,
   V0_LIMITS,
   INVOKE_OWNERSHIP_RETENTION_MS,
   isGateRequestEvent,
 } from "@gjc-remote/shared";
+import { SdkLiveInputRouter, scopeKey, trackedInputError } from "./sdk-live-input-router.js";
 
 const GATE_KINDS = new Set(["question", "approval", "execution"]);
 // @gajae-code/agent-core 0.19.0 can emit an `agent_end` checkpoint before
@@ -21,9 +21,6 @@ const APPROVAL_DECISIONS = ["approve", "request-changes", "reject"];
 const EXECUTION_DECISIONS = ["approve", "decline"];
 const SAFE_FAILURE_CODE = /^[A-Za-z0-9._-]+$/;
 const SAFE_FAILURE_CODE_MAX = 64;
-const LIVE_CONTROL_UNSUPPORTED_CODE =
-  PROTOCOL_ERROR_CODES.LIVE_CONTROL_UNSUPPORTED;
-
 const SDK_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SDK_HARD_CAP_MS = 30 * 60 * 1000;
 // #35: while a workflow gate is pending the agent loop is blocked awaiting the
@@ -471,30 +468,6 @@ function isTerminalAgentEnd(event) {
   );
 }
 
-function attemptScopeBoundary(scope) {
-  if (
-    !isPlainRecord(scope) ||
-    typeof scope.attemptId !== "string" ||
-    !Number.isSafeInteger(scope.generation) ||
-    typeof scope.lineage !== "string"
-  ) {
-    return undefined;
-  }
-  return {
-    attemptId: scope.attemptId,
-    generation: scope.generation,
-    lineage: scope.lineage,
-  };
-}
-
-function attemptScopesEqual(left, right) {
-  return (
-    left?.attemptId === right?.attemptId &&
-    left?.generation === right?.generation &&
-    left?.lineage === right?.lineage
-  );
-}
-
 /**
  * Load only the canonical SDK surfaces this daemon needs, rather than the
  * package-root barrel (`@gajae-code/coding-agent`) which pulls the entire
@@ -667,9 +640,18 @@ export class SdkSession {
     // has a completed resolution; the owning run's existing gate/hard-cap
     // timers bound this candidate.
     this.deferredGateCandidate = undefined;
-    // #35: active prompt runs, most-recent last ({ onEvent, controller }). A gate
-    // emitted on the shared session-level emitter is attributed to the most
-    // recently started run.
+    this.trackedWork = new Set();
+    this.submissionIds = new Set();
+    this.inputRouter = new SdkLiveInputRouter(session, {
+      classifyTerminal: terminalOutcome,
+      sanitizeFailure: sanitizedFailure,
+      isTerminal: isTerminalAgentEnd,
+      onFatal: (error) => {
+        this.#closeAdapter(error);
+        void this.#disposeUnderlying().catch(() => {});
+      },
+    });
+    // One gate/output owner per logical run; joined controls never replace it.
     this.activeGateRuns = [];
     // #35: the session-level workflow-gate subscription is registered ONCE
     // (lazily, on the first prompt run) rather than per-run, so a single emitted
@@ -683,28 +665,16 @@ export class SdkSession {
   isBusy() {
     return (
       this.queuedCommands > 0 ||
+      this.ownedQueueTickets.size > 0 ||
+      this.trackedWork.size > 0 ||
+      this.inFlightGateAnswers.size > 0 ||
       this.activePromptRuns > 0 ||
       this.pendingGates.size > 0 ||
       this.deferredGateCandidate !== undefined
     );
   }
   send(command, onEvent, timeoutMs = this.idleTimeoutMs) {
-    if (this.closed) return Promise.reject(new Error("GJC SDK session is not running"));
-
-    const isLiveControl = command?.type === "steer" || command?.type === "follow_up";
-    if (!isLiveControl) return this.#enqueue(command, onEvent, timeoutMs).result;
-
-    return Promise.resolve().then(() => {
-      if (this.closed) throw new Error("GJC SDK session is not running");
-      if (this.activePromptRuns <= 0) {
-        return this.#enqueue(command, onEvent, timeoutMs).result;
-      }
-      const error = new Error(
-        `Live SDK ${command.type} is unavailable until this daemon integrates and qualifies the SDK's supported queued-input ownership contract`
-      );
-      error.code = LIVE_CONTROL_UNSUPPORTED_CODE;
-      throw error;
-    });
+    return this.sendOwned(randomUUID(), command, onEvent, timeoutMs).result;
   }
 
   sendOwned(
@@ -743,16 +713,12 @@ export class SdkSession {
           );
           return;
         }
-        if (this.activePromptRuns > 0) {
-          const error = new Error(
-            `Live SDK ${command.type} is unavailable until this daemon integrates and qualifies the SDK's supported queued-input ownership contract`
-          );
-          error.code = LIVE_CONTROL_UNSUPPORTED_CODE;
-          this.#rejectOwnedQueueTicket(ticket, error);
+        if (this.activePromptRuns > 0 || this.trackedWork.size > 0) {
+          this.#submitTrackedControl(command, onEvent, timeoutMs, ticket, onActivate);
           return;
         }
         this.#enqueue(command, onEvent, timeoutMs, ticket, onActivate);
-      });
+      }).catch((error) => this.#rejectOwnedQueueTicket(ticket, error));
       return ticket.publicTicket;
     }
     this.#enqueue(command, onEvent, timeoutMs, ticket, onActivate);
@@ -767,6 +733,7 @@ export class SdkSession {
       resolve: undefined,
       reject: undefined,
       publicTicket: undefined,
+      revoke: undefined,
     };
     const result = new Promise((resolve, reject) => {
       ticket.resolve = resolve;
@@ -776,6 +743,7 @@ export class SdkSession {
       result,
       revokeBeforeStart: () => {
         if (ticket.phase !== "queued") return false;
+        if (ticket.revoke) return ticket.revoke();
         ticket.phase = "terminal";
         ticket.settled = true;
         this.ownedQueueTickets.delete(ticket);
@@ -818,6 +786,14 @@ export class SdkSession {
       .then(async () => {
         if (ticket.phase !== "queued") return;
         if (this.closed) throw new Error("GJC SDK session is not running");
+        // Live admissions do not occupy this serial tail. A root/model command
+        // waits for the accepted tracked work without blocking later controls
+        // from being admitted into the current SDK run.
+        while (this.trackedWork.size > 0 || this.inFlightGateAnswers.size > 0) {
+          await Promise.allSettled([...this.trackedWork, ...this.inFlightGateAnswers]);
+          if (this.closed) throw new Error("GJC SDK session is not running");
+          if (ticket.phase !== "queued") return;
+        }
         ticket.phase = "active";
         onActivate?.();
         return this.#dispatch(command, onEvent, timeoutMs, ticket.ownerId);
@@ -890,78 +866,25 @@ export class SdkSession {
   }
 
   async #runPromptCommand(command, onEvent, timeoutMs, ownerId) {
-    let resolveAgentEnd;
-    const agentEnd = new Promise((resolve) => {
-      resolveAgentEnd = resolve;
-    });
     let promptActive = true;
-    let eventConsumerError;
-    const reportedFailures = [];
     let promptFailure;
-    const terminalOutcomes = [];
-    let sawAgentStart = false;
-    let observedAgentEnds = 0;
-    let resetIdle = () => {};
+    let resultOutcome;
+    let cohort;
     // #35: track this run before registering the session-level gate listener.
     // SDK 0.19.0 replays durable pending gates synchronously from
     // onGateEmitted(), so subscribing first would see no owner and quarantine a
     // valid resumed gate.
     const gateRun = { ownerId, onEvent, controller: undefined };
     this.activeGateRuns.push(gateRun);
-    this.#ensureGateSubscription();
     this.activePromptRuns += 1;
     const markPromptInactive = () => {
       if (!promptActive) return;
       promptActive = false;
       this.activePromptRuns -= 1;
     };
-    const unsubscribe = this.session.subscribe((event) => {
-      resetIdle();
-      if (event?.type === "agent_start") {
-        sawAgentStart = true;
-      }
-      if (event?.type === "agent_failed") {
-        reportedFailures.push({
-          scope: attemptScopeBoundary(event.scope),
-          failure: sanitizedFailure(event.error),
-        });
-      }
-      if (isTerminalAgentEnd(event)) {
-        markPromptInactive();
-        const terminalScope = attemptScopeBoundary(event.scope);
-        let failureIndex = -1;
-        for (let index = reportedFailures.length - 1; index >= 0; index -= 1) {
-          const reported = reportedFailures[index];
-          if (
-            (terminalScope === undefined && reported.scope === undefined) ||
-            attemptScopesEqual(reported.scope, terminalScope)
-          ) {
-            failureIndex = index;
-            break;
-          }
-        }
-        const reportedFailure =
-          failureIndex >= 0
-            ? reportedFailures.splice(failureIndex, 1)[0].failure
-            : undefined;
-        terminalOutcomes.push(terminalOutcome(event, reportedFailure));
-        observedAgentEnds += 1;
-        if (observedAgentEnds >= 1) resolveAgentEnd();
-      }
-      if (event?.type === "agent_failed" || event?.type === "agent_end") {
-        return;
-      }
-      try {
-        onEvent(event);
-      } catch (error) {
-        eventConsumerError ??=
-          error instanceof Error
-            ? error
-            : new Error("SDK event consumer failed", { cause: error });
-      }
-    });
-
     try {
+      cohort = this.inputRouter.openPrimary(gateRun);
+      this.#ensureGateSubscription();
       await this.#withStreamingTimeout(
         async () => {
           let promptSubmission;
@@ -977,35 +900,37 @@ export class SdkSession {
               failure: sanitizedFailure(error),
             })
           );
-          const first = await Promise.race([
+          cohort.promptOutcome = promptOutcome;
+          const first = await this.#withAdapterClose(() => Promise.race([
             promptOutcome.then((outcome) => ({ type: "prompt", outcome })),
-            agentEnd.then(() => ({ type: "terminal" })),
-          ]);
+            cohort.terminal.then(() => ({ type: "terminal" })),
+          ]));
           if (
             first.type === "prompt" &&
             !first.outcome.ok &&
-            !sawAgentStart &&
-            observedAgentEnds === 0
+            !gateRun.sawAgentStart &&
+            !cohort.ended
           ) {
             throw sdkTerminalError(failedTerminalOutcome(first.outcome.failure));
           }
-          await agentEnd;
           const outcome =
-            first.type === "prompt" ? first.outcome : await promptOutcome;
+            first.type === "prompt" ? first.outcome : await this.#withAdapterClose(() => promptOutcome);
           if (!outcome.ok) promptFailure = outcome.failure;
+          // Select root-only execution evidence after this exact public prompt
+          // settles. Raw ends cannot publish readiness or tracked receipts.
+          resultOutcome = await this.#withAdapterClose(() => this.inputRouter.primaryResult(cohort));
         },
         timeoutMs,
         this.hardCapMs,
         this.gateAnswerWindowMs,
         (controller) => {
-          resetIdle = controller.arm;
           gateRun.controller = controller;
-          if (this.pendingGates.size > 0) {
+          if (this.pendingGates.size > 0 || this.inputRouter.hasPendingGate()) {
             controller.suspendForGate();
           }
         }
       );
-      const outcomeAtTerminal = terminalOutcomes[0];
+      const outcomeAtTerminal = resultOutcome;
       if (outcomeAtTerminal?.disposition !== "completed") {
         throw sdkTerminalError(
           outcomeAtTerminal ?? failedTerminalOutcome(sanitizedFailure(undefined))
@@ -1014,11 +939,17 @@ export class SdkSession {
       if (promptFailure) {
         throw sdkTerminalError(failedTerminalOutcome(promptFailure));
       }
-      if (eventConsumerError) throw eventConsumerError;
+      if (gateRun.eventConsumerError) throw gateRun.eventConsumerError;
       return outcomeAtTerminal;
     } finally {
       markPromptInactive();
-      unsubscribe();
+      if (cohort) this.inputRouter.release();
+      this.#retireRun(gateRun);
+      if (this.closed) throw this.closeError;
+    }
+  }
+
+  #retireRun(gateRun) {
       for (const [gateId, entry] of this.pendingGates) {
         if (entry.owner !== gateRun) continue;
         // answerGate owns cleanup while a direct resolution is in flight. The
@@ -1026,8 +957,8 @@ export class SdkSession {
         // quarantining it in that window would race the SDK completion path.
         if (entry.resolving) continue;
         this.pendingGates.delete(gateId);
-        for (const activeRun of this.activeGateRuns) {
-          activeRun.controller?.resumeAfterGate();
+        if (this.pendingGates.size === 0 && !this.inputRouter.hasPendingGate()) {
+          for (const activeRun of this.activeGateRuns) activeRun.controller?.resumeAfterGate();
         }
         this.#quarantineGate(entry.emitter, gateId);
       }
@@ -1038,7 +969,157 @@ export class SdkSession {
       }
       const runIndex = this.activeGateRuns.indexOf(gateRun);
       if (runIndex >= 0) this.activeGateRuns.splice(runIndex, 1);
-    }
+  }
+
+  #submitTrackedControl(command, onEvent, timeoutMs, ticket, onActivate) {
+    const delivery = command.type === "steer" ? "steer" : "followUp";
+    const preflight = new AbortController();
+    const owner = { ownerId: ticket.ownerId, onEvent, controller: undefined };
+    let committed = false;
+    let handle;
+    let registered = false;
+    let cancellationRequested = false;
+    let cohort;
+    const token = {};
+    this.inputRouter.expectExecution(token);
+    this.activeGateRuns.push(owner);
+    ticket.revoke = () => {
+      if (cancellationRequested) return false;
+      if (handle) {
+        // False is an authoritative lost dequeue race, not removal proof.
+        let cancelled;
+        try { cancelled = handle.cancel(); } catch {
+          const error = trackedInputError("queue cancellation failed");
+          this.#closeAdapter(error);
+          void this.#disposeUnderlying().catch(() => {});
+          return false;
+        }
+        if (typeof cancelled !== "boolean") {
+          const error = trackedInputError("invalid queue cancellation receipt");
+          this.#closeAdapter(error);
+          void this.#disposeUnderlying().catch(() => {});
+          return false;
+        }
+        if (cancelled !== true) return false;
+        cancellationRequested = true;
+        return true;
+      }
+      if (committed) return false;
+      cancellationRequested = true;
+      preflight.abort();
+      this.#resolveOwnedQueueTicket(ticket, { revokedBeforeStart: true });
+      return true;
+    };
+    const validateIdentity = (receipt) => {
+      if (!isPlainRecord(receipt) || receipt.submissionId !== handle.submissionId || receipt.delivery !== delivery) {
+        throw trackedInputError("receipt identity mismatch");
+      }
+    };
+    const removed = (receipt) => receipt.disposition === "removed" &&
+      (receipt.reason === "cancelled" || receipt.reason === "removed");
+    const work = this.#withStreamingTimeout(async () => {
+      if (typeof this.session.submitUserMessage !== "function") {
+        throw trackedInputError("submitUserMessage is unavailable");
+      }
+      const submission = this.session.submitUserMessage(command.message, {
+        deliverAs: delivery,
+        trackSubmission: true,
+        queuePolicy: "sequential",
+        preflightSignal: preflight.signal,
+        onPreflightAcceptCommit: () => {
+          if (preflight.signal.aborted) {
+            const error = new Error("SDK input admission was revoked");
+            error.code = "prompt_preflight_cancelled";
+            throw error;
+          }
+          committed = true;
+        },
+      });
+      // Contain late handles after disposal too. Never leave an unobserved
+      // rejecting SDK lifecycle promise, even when admission itself lost a race.
+      handle = await this.#withAdapterClose(() => Promise.resolve(submission).then((value) => {
+        for (const promise of [value?.admitted, value?.execution, value?.terminal]) {
+          if (promise && typeof promise.then === "function") Promise.resolve(promise).catch(() => {});
+        }
+        if (this.closed || preflight.signal.aborted) value?.cancel?.();
+        return value;
+      }));
+      if (!handle || typeof handle.submissionId !== "string" || handle.submissionId.length === 0 ||
+          this.submissionIds.has(handle.submissionId) || typeof handle.cancel !== "function" ||
+          ![handle.admitted, handle.execution, handle.terminal].every((promise) => promise && typeof promise.then === "function")) {
+        throw trackedInputError("malformed or duplicate submission handle");
+      }
+      this.submissionIds.add(handle.submissionId);
+      registered = true;
+      const admission = await this.#withAdapterClose(() => handle.admitted);
+      validateIdentity(admission);
+      if (admission.queuePolicy !== "sequential") throw trackedInputError("admission queue policy mismatch");
+      owner.controller.suspendForQueue();
+      const execution = await this.#withAdapterClose(() => handle.execution);
+      validateIdentity(execution);
+      if (removed(execution)) {
+        this.inputRouter.forgetExecution(token);
+        owner.controller.resumeAfterQueue();
+        const terminal = await this.#withAdapterClose(() => handle.terminal);
+        validateIdentity(terminal);
+        if (!removed(terminal) || terminal.reason !== execution.reason) throw trackedInputError("removal terminal mismatch");
+        return { revokedBeforeStart: true };
+      }
+      if (!["joined-current-run", "promoted-to-run"].includes(execution.disposition) || !scopeKey(execution.attemptScope)) {
+        throw trackedInputError("invalid execution receipt");
+      }
+      if (cancellationRequested) throw trackedInputError("cancelled input executed");
+      cohort = this.inputRouter.bindExecution(token, execution, owner, () => {
+        ticket.phase = "active";
+        owner.controller.resumeAfterQueue();
+        try { onActivate?.(); } catch (error) {
+          owner.eventConsumerError = error instanceof Error ? error : new Error("SDK activation consumer failed");
+        }
+      });
+      const terminal = await this.#withAdapterClose(() => handle.terminal);
+      validateIdentity(terminal);
+      if (terminal.disposition !== "completed" || !scopeKey(terminal.attemptScope)) {
+        throw trackedInputError("executed input lacks completed terminal receipt");
+      }
+      const outcome = await this.#withAdapterClose(() => this.inputRouter.finalTerminal(cohort, terminal.attemptScope));
+      if (outcome.disposition !== "completed") throw sdkTerminalError(outcome);
+      if (cohort.promptOutcome) {
+        const promptOutcome = await this.#withAdapterClose(() => cohort.promptOutcome);
+        if (!promptOutcome.ok) throw sdkTerminalError(failedTerminalOutcome(promptOutcome.failure));
+      }
+      if (cohort.owner.eventConsumerError) throw cohort.owner.eventConsumerError;
+      if (owner.eventConsumerError) throw owner.eventConsumerError;
+      return outcome;
+    }, timeoutMs, this.hardCapMs, this.gateAnswerWindowMs, (controller) => {
+      owner.controller = controller;
+      if (this.pendingGates.size > 0 || this.inputRouter.hasPendingGate()) controller.suspendForGate();
+    }).finally(() => {
+      preflight.abort();
+      this.inputRouter.forgetExecution(token);
+      this.inputRouter.release();
+      this.#retireRun(owner);
+      if (registered) this.submissionIds.delete(handle.submissionId);
+      this.trackedWork.delete(work);
+    }).then(
+      (value) => {
+        if (this.closed) this.#rejectOwnedQueueTicket(ticket, this.closeError);
+        else this.#resolveOwnedQueueTicket(ticket, value);
+      },
+      (error) => {
+        if (!ticket.settled) this.#rejectOwnedQueueTicket(ticket,
+          error?.terminalDisposition || error === this.closeError ? error : sdkTerminalError(failedTerminalOutcome(sanitizedFailure(error))));
+        if (error?.code === "SDK_TRACKED_INPUT_CONTRACT") {
+          this.#closeAdapter(error);
+          void this.#disposeUnderlying().catch(() => {});
+        }
+      }
+    ).catch((error) => {
+      this.trackedWork.delete(work);
+      if (registered) this.submissionIds.delete(handle.submissionId);
+      this.#closeAdapter(error);
+      void this.#disposeUnderlying().catch(() => {});
+    });
+    this.trackedWork.add(work);
   }
 
   // #35: register the workflow-gate subscription once for the whole session.
@@ -1055,15 +1136,24 @@ export class SdkSession {
       return;
     }
     this.gateEmitter = emitter;
-    this.gateUnsubscribe = emitter.onGateEmitted((gate) =>
-      this.#handleGateEmitted(gate, emitter)
-    );
+    this.gateUnsubscribe = emitter.onGateEmitted((gate) => {
+      try {
+        this.inputRouter.gate(gate, (owner) => this.#handleGateEmitted(gate, emitter, owner));
+        if (this.pendingGates.size > 0 || this.inputRouter.hasPendingGate()) {
+          for (const run of this.activeGateRuns) run.controller?.suspendForGate();
+        }
+      } catch (error) {
+        this.#quarantineGate(emitter, gate?.gate_id);
+        this.#closeAdapter(error);
+        void this.#disposeUnderlying().catch(() => {});
+      }
+    });
   }
 
   // A workflow gate opened during an active run. Register it, suspend the
   // owning run's idle timer, and synthesize one complete bounded gate_request;
   // unrepresentable content is quarantined rather than truncated.
-  #handleGateEmitted(gate, gateEmitter) {
+  #handleGateEmitted(gate, gateEmitter, owner) {
     const gateId = gate?.gate_id;
     if (typeof gateId !== "string" || gateId.length === 0) return;
     // The single session-level listener can be invoked more than once for the
@@ -1078,7 +1168,7 @@ export class SdkSession {
       this.#retireCompletedGateBeforeSuccessor(gateEmitter);
     if (this.pendingGates.size > 0) {
       if (predecessorState === "accepted_incomplete") {
-        this.#deferGateCandidate(gate, gateEmitter);
+        this.#deferGateCandidate(gate, gateEmitter, owner);
         return;
       }
       // Concurrent-gate guard: never overwrite the first resolver. Best-effort
@@ -1089,16 +1179,12 @@ export class SdkSession {
       this.#quarantineGate(gateEmitter, gateId);
       return;
     }
-    this.#presentGate(gate, gateEmitter);
+    this.#presentGate(gate, gateEmitter, owner);
   }
 
   #presentGate(gate, gateEmitter, deferredOwner, deferredEvent, deferredPresentationId) {
     const gateId = gate.gate_id;
-    // Attribute the gate to the most recently started run (gates emit while that
-    // run's prompt() is executing). With no active run there is nothing to
-    // suspend or stream to, so reject rather than leak a pending gate.
-    const gateRun =
-      deferredOwner ?? this.activeGateRuns[this.activeGateRuns.length - 1];
+    const gateRun = deferredOwner;
     if (!gateRun || !this.activeGateRuns.includes(gateRun)) {
       this.#quarantineGate(gateEmitter, gateId);
       return;
@@ -1134,7 +1220,7 @@ export class SdkSession {
     }
   }
 
-  #deferGateCandidate(gate, gateEmitter) {
+  #deferGateCandidate(gate, gateEmitter, owner) {
     const gateId = gate.gate_id;
     if (this.deferredGateCandidate) {
       console.warn(
@@ -1143,7 +1229,6 @@ export class SdkSession {
       this.#quarantineGate(gateEmitter, gateId);
       return;
     }
-    const owner = this.activeGateRuns[this.activeGateRuns.length - 1];
     const presentationId = randomUUID();
     const event = this.#buildGateRequestEvent(gate, gateId, presentationId);
     if (!owner || !event) {
@@ -1270,7 +1355,7 @@ export class SdkSession {
   #retirePendingGate(gateId, entry) {
     if (this.pendingGates.get(gateId) !== entry) return false;
     this.pendingGates.delete(gateId);
-    if (this.pendingGates.size === 0) {
+    if (this.pendingGates.size === 0 && !this.inputRouter.hasPendingGate()) {
       for (const activeRun of this.activeGateRuns) {
         activeRun.controller?.resumeAfterGate();
       }
@@ -1512,6 +1597,7 @@ export class SdkSession {
   }
 
   #withAdapterClose(operation) {
+    if (this.closed) return Promise.reject(this.closeError ?? new Error("GJC SDK session was disposed"));
     let active = true;
     let rejectClosed;
     const closed = new Promise((_, reject) => {
@@ -1547,6 +1633,11 @@ export class SdkSession {
 
   #closeAdapter(error) {
     this.closed = true;
+    this.closeError ??= error;
+    for (const gate of this.inputRouter.pendingGateValues()) {
+      this.#quarantineGate(this.gateEmitter, gate?.gate_id);
+    }
+    this.inputRouter.close();
     try {
       this.gateUnsubscribe?.();
     } catch {
@@ -1600,10 +1691,21 @@ export class SdkSession {
     });
     let settled = false;
     let gateSuspended = false;
+    let queueSuspended = false;
     const armIdle = () => {
-      if (settled || gateSuspended) return;
+      if (settled || gateSuspended || queueSuspended) return;
       this.clearTimeoutFn(idleTimer);
       idleTimer = this.setTimeoutFn(() => rejectTimeout(idleError), idleMs);
+    };
+    const suspendForQueue = () => {
+      if (settled || queueSuspended) return;
+      queueSuspended = true;
+      this.clearTimeoutFn(idleTimer);
+    };
+    const resumeAfterQueue = () => {
+      if (settled || !queueSuspended) return;
+      queueSuspended = false;
+      armIdle();
     };
     // #35: while a workflow gate is pending, stop the idle timer and bound the
     // wait by the dedicated gate-answer window instead. Idempotent: repeated
@@ -1612,7 +1714,13 @@ export class SdkSession {
       if (settled || gateSuspended) return;
       gateSuspended = true;
       this.clearTimeoutFn(idleTimer);
-      gateTimer = this.setTimeoutFn(() => rejectTimeout(gateError), gateWindowMs);
+      gateTimer = this.setTimeoutFn(() => {
+        if (this.inputRouter.hasPendingGate()) {
+          gateError.code = "SDK_TRACKED_INPUT_GATE_OWNERSHIP";
+          gateError.message = "SDK workflow gate ownership is not provable from public run events";
+        }
+        rejectTimeout(gateError);
+      }, gateWindowMs);
     };
     const resumeAfterGate = () => {
       if (settled || !gateSuspended) return;
@@ -1623,7 +1731,7 @@ export class SdkSession {
     armIdle();
     hardCapTimer = this.setTimeoutFn(() => rejectTimeout(hardCapError), hardCapMs);
 
-    onArm?.({ arm: armIdle, suspendForGate, resumeAfterGate });
+    onArm?.({ arm: armIdle, suspendForGate, resumeAfterGate, suspendForQueue, resumeAfterQueue });
 
     try {
       return await Promise.race([this.#withAdapterClose(operation), timeout]);
@@ -1656,6 +1764,7 @@ export class SdkSession {
     const disposal = this.#disposeUnderlying();
     const commands = Promise.allSettled([
       this.queue,
+      ...this.trackedWork,
       ...this.inFlightGateAnswers,
     ]);
     const [disposalResult] = await Promise.allSettled([disposal]);

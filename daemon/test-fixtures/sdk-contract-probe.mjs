@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 /*
- * Real installed SDK 0.19.0 contract oracle. It verifies fail-closed live
- * controls without qualifying the new public tracked-submission integration.
+ * Real installed SDK 0.19.0 tracked-control contract oracle.
  * Stdout contains one bounded receipt.
  */
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
@@ -12,10 +11,10 @@ import { fileURLToPath } from "node:url";
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
 const EXPECTED_SDK_VERSION = "0.19.0";
 const HISTORICAL_SDK_VERSION = "0.16.4";
-const QUEUED_CONTROL_OWNERSHIP_CODE =
-  "PUBLIC_TRACKED_SUBMISSION_NOT_INTEGRATED_OR_QUALIFIED";
 const DECISION_GATE_CODE =
   "DECISION_GATE_BUILDERS_NOT_PUBLIC";
+const PROMOTED_GATE_OWNERSHIP_CODE = "SDK_TRACKED_INPUT_GATE_OWNERSHIP";
+const OVERLAP_GATE_WINDOW_MS = 500;
 const STEP_TIMEOUT_MS = 3_000;
 const CLEANUP_TIMEOUT_MS = 4_000;
 const HARD_TIMEOUT_MS = 45_000;
@@ -124,12 +123,14 @@ async function waitFor(predicate, code, timeoutMs = STEP_TIMEOUT_MS) {
 function observe(promise) {
   const state = { status: "pending", failureCode: "NONE" };
   state.settled = Promise.resolve(promise).then(
-    () => {
+    (value) => {
       state.status = "fulfilled";
+      state.value = value;
     },
     (error) => {
       state.status = "rejected";
       state.failureCode = observedFailureCode(error);
+      state.error = error;
     }
   );
   return state;
@@ -238,7 +239,7 @@ function trackSubscriptions(harness, target, method, kind) {
 async function initializeHarness(
   harness,
   responseSets,
-  { withAsk = false, onRawAgentEvent, shouldPause } = {}
+  { withAsk = false, onRawAgentEvent, shouldPause, gateAnswerWindowMs = 6_000 } = {}
 ) {
   const { sequence, ownedRoot } = harness;
   const cwd = join(ownedRoot, "workspace");
@@ -371,6 +372,27 @@ async function initializeHarness(
     customCommands: [],
   });
   harness.session = session;
+  harness.promptCalls = [];
+  const publicPrompt = session.prompt;
+  session.prompt = function (...args) {
+    const result = publicPrompt.apply(this, args);
+    harness.promptCalls.push(observe(result));
+    return result;
+  };
+  // Observe the real public handles without replacing receipts, options, queue
+  // callbacks, capabilities, or the handle returned to the adapter.
+  harness.submissions = [];
+  const submitUserMessage = session.submitUserMessage;
+  session.submitUserMessage = async function (...args) {
+    const handle = await submitUserMessage.apply(this, args);
+    harness.submissions.push({
+      handle,
+      admitted: observe(handle.admitted),
+      execution: observe(handle.execution),
+      terminal: observe(handle.terminal),
+    });
+    return handle;
+  };
   trackMethod(harness, session, "dispose", "sessionDispose");
   trackSubscriptions(harness, session, "subscribe", "session");
   if (withAsk) {
@@ -384,7 +406,7 @@ async function initializeHarness(
   adapter = new SdkSession(session, {
     idleTimeoutMs: 6_000,
     hardCapMs: 10_000,
-    gateAnswerWindowMs: 6_000,
+    gateAnswerWindowMs,
   });
 
   return Object.assign(harness, {
@@ -495,6 +517,7 @@ async function closeHarness(harness) {
   }
 
   const outcome = {
+    stage: harness.stage,
     completed,
     failures,
     modelCacheState,
@@ -508,6 +531,7 @@ async function closeHarness(harness) {
 
 async function withHarness(stage, ownerRoot, responseSets, options, run) {
   const harness = await createHarness(ownerRoot, responseSets, options);
+  harness.stage = stage;
   let value;
   let primaryFailure;
   const secondaryFailures = [];
@@ -518,9 +542,23 @@ async function withHarness(stage, ownerRoot, responseSets, options, run) {
     primaryFailure = {
       stage,
       code: failureCode(error, "UNEXPECTED_SCENARIO_FAILURE"),
-      ...(error instanceof ProbeError && error.state !== undefined
-        ? { state: boundedDiagnosticState(error.state) }
-        : {}),
+      state: boundedDiagnosticState({
+        ...(error instanceof ProbeError && error.state !== undefined ? error.state : {}),
+        providerCalls: [...harness.mockModels.values()].reduce((count, model) => count + model.calls.length, 0),
+        publicTerminalCount: terminalEvents(harness.events).length,
+        publicRootPromptStatus: harness.promptCalls[0]?.status ?? "not-started",
+        sdkPendingGateCount: harness.session.getWorkflowGateEmitter()?.listPendingGates().length ?? 0,
+        adapterPendingGateCount: harness.adapter.pendingGates.size,
+        trackedSubmissions: harness.submissions.map((record) => ({
+          submissionId: record.handle.submissionId,
+          admittedStatus: record.admitted.status,
+          executionStatus: record.execution.status,
+          executionDisposition: record.execution.value?.disposition ?? "pending",
+          terminalStatus: record.terminal.status,
+          terminalDisposition: record.terminal.value?.disposition ?? "pending",
+          removalReason: record.terminal.value?.reason ?? "none",
+        })),
+      }),
     };
   }
   const cleanup = await closeHarness(harness);
@@ -536,97 +574,508 @@ async function withHarness(stage, ownerRoot, responseSets, options, run) {
   }
   return value;
 }
-async function probeLiveControlContainment(ownerRoot) {
-  const releasePrompt = deferred();
-  try {
-    return await withHarness(
-      "live-control-containment",
-      ownerRoot,
-      {
-        primary: [
-          async () => {
-            await releasePrompt.promise;
-            return { content: ["initial complete"] };
-          },
-        ],
-      },
-      {},
-      async (harness) => {
-        harness.releases.push(() => releasePrompt.resolve());
-        const prompt = observe(
-          harness.adapter.send(
-            { type: "prompt", message: "initial" },
-            () => {},
-            5_000
-          )
-        );
-        await waitFor(
-          () => harness.mockModels.get("primary").calls.length === 1,
-          "INITIAL_PROVIDER_CALL_MISSING"
-        );
+function scopeKey(scope) {
+  requireCondition(
+    scope && typeof scope.attemptId === "string" && Number.isSafeInteger(scope.generation) &&
+      typeof scope.lineage === "string",
+    "GENUINE_ATTEMPT_SCOPE_MISSING"
+  );
+  return JSON.stringify([scope.attemptId, scope.generation, scope.lineage]);
+}
 
-        const steer = observe(
-          harness.adapter.send(
-            { type: "steer", message: "adjust" },
-            () => {},
-            5_000
-          )
-        );
-        const followUp = observe(
-          harness.adapter.send(
-            { type: "follow_up", message: "continue" },
-            () => {},
-            5_000
-          )
-        );
-        await withDeadline(
-          Promise.all([steer.settled, followUp.settled]),
-          STEP_TIMEOUT_MS,
-          "LIVE_CONTROLS_DID_NOT_FAIL_CLOSED"
-        );
+function startOwned(harness, owner, command) {
+  const events = [];
+  let activations = 0;
+  let executionIdsAtActivation = [];
+  let settledAtTerminalScopes;
+  const ticket = harness.adapter.sendOwned(owner, command, (event) => events.push(event), 8_000, {
+    onActivate: () => {
+      activations += 1;
+      executionIdsAtActivation = harness.submissions.filter((record) => record.execution.status === "fulfilled")
+        .map((record) => record.handle.submissionId);
+    },
+  });
+  const captureSettlement = () => {
+    settledAtTerminalScopes = terminalEvents(harness.events).map((event) => scopeKey(event.scope));
+  };
+  const result = Promise.resolve(ticket.result).then((value) => {
+    captureSettlement();
+    return value;
+  }, (error) => {
+    captureSettlement();
+    throw error;
+  });
+  return { ticket, events, run: observe(result), get activations() { return activations; },
+    get executionIdsAtActivation() { return executionIdsAtActivation; },
+    get settledAtTerminalScopes() { return settledAtTerminalScopes; } };
+}
 
-        requireCondition(
-          steer.status === "rejected" &&
-            steer.failureCode === "SDK_LIVE_CONTROL_UNSUPPORTED" &&
-            followUp.status === "rejected" &&
-            followUp.failureCode === "SDK_LIVE_CONTROL_UNSUPPORTED",
-          "LIVE_CONTROL_REJECTION_WRONG",
-          {
-            steerStatus: steer.status,
-            steerFailureCode: steer.failureCode,
-            followUpStatus: followUp.status,
-            followUpFailureCode: followUp.failureCode,
-          }
-        );
-        const queues = harness.agent.snapshotQueues();
-        requireCondition(
-          queues.steering.length === 0 && queues.followUp.length === 0,
-          "LIVE_CONTROL_REACHED_SDK_QUEUE"
-        );
-        requireCondition(prompt.status === "pending", "ACTIVE_PROMPT_SETTLED_TOO_EARLY");
+async function requireSubmission(harness, index, delivery) {
+  await waitFor(() => harness.submissions.length > index, "TRACKED_SUBMISSION_NOT_OBSERVED");
+  const record = harness.submissions[index];
+  await withDeadline(record.admitted.settled, STEP_TIMEOUT_MS, "TRACKED_ADMISSION_TIMEOUT");
+  requireCondition(
+    typeof record.handle.submissionId === "string" && record.handle.submissionId.length > 0 &&
+      record.admitted.status === "fulfilled" &&
+      record.admitted.value.submissionId === record.handle.submissionId &&
+      record.admitted.value.delivery === delivery && record.admitted.value.queuePolicy === "sequential",
+    "TRACKED_ADMISSION_MISMATCH"
+  );
+  return record;
+}
 
-        releasePrompt.resolve();
-        await withDeadline(
-          prompt.settled,
-          STEP_TIMEOUT_MS,
-          "ACTIVE_PROMPT_DID_NOT_SETTLE"
-        );
-        requireCondition(prompt.status === "fulfilled", "ACTIVE_PROMPT_FAILED");
+async function requireOwningTerminal(harness, control, record, status = "fulfilled") {
+  await withDeadline(Promise.all([control.run.settled, record.execution.settled, record.terminal.settled]),
+    STEP_TIMEOUT_MS, "TRACKED_OWNER_DID_NOT_SETTLE");
+  const execution = record.execution.value;
+  const terminal = record.terminal.value;
+  requireCondition(
+    record.execution.status === "fulfilled" && record.terminal.status === "fulfilled" &&
+      execution.submissionId === record.handle.submissionId && terminal.submissionId === record.handle.submissionId &&
+      execution.delivery === record.admitted.value.delivery && terminal.delivery === execution.delivery &&
+      ["joined-current-run", "promoted-to-run"].includes(execution.disposition) && terminal.disposition === "completed",
+    "TRACKED_LIFECYCLE_IDENTITY_MISMATCH"
+  );
+  const scope = scopeKey(terminal.attemptScope);
+  const owning = terminalEvents(harness.events).filter((event) => scopeKey(event.scope) === scope);
+  // Terminal callbacks are deliberately suppressed; settlement still requires
+  // the exact genuine public SDK terminal, not an admission acknowledgement.
+  requireCondition(owning.length === 1 && control.settledAtTerminalScopes.includes(scope) &&
+    terminalEvents(control.events).length === 0,
+    "TRACKED_EXACT_TERMINAL_MISMATCH");
+  requireCondition(control.run.status === status && control.ticket.phase === "terminal" && control.activations === 1,
+    "TRACKED_ADAPTER_SETTLEMENT_MISMATCH", { status: control.run.status, failureCode: control.run.failureCode });
+  requireCondition(control.executionIdsAtActivation.includes(record.handle.submissionId), "ACTIVATED_BEFORE_GENUINE_EXECUTION_RECEIPT");
+  requireCondition(record.handle.cancel() === false && control.ticket.revokeBeforeStart() === false,
+    "EXECUTED_SUBMISSION_CANCELLED");
+  return {
+    delivery: execution.delivery,
+    executionDisposition: execution.disposition,
+    finalScopeChanged: scopeKey(execution.attemptScope) !== scope,
+    exactOwningTerminal: true,
+    activatedAfterExecution: true,
+    adapterStatus: control.run.status,
+    cancelAfterExecution: false,
+  };
+}
 
+function userTexts(context) {
+  return context.messages.filter((message) => message.role === "user").map((message) =>
+    typeof message.content === "string" ? message.content : message.content
+      .filter((part) => part.type === "text").map((part) => part.text).join("\n"));
+}
+
+function submissionEvidence(record) {
+  return {
+    submissionId: record.handle.submissionId,
+    admitted: record.admitted.value,
+    execution: record.execution.value,
+    terminal: record.terminal.value,
+  };
+}
+
+async function probeTrackedControls(ownerRoot, fail = false) {
+  const release = deferred();
+  const releaseExecuting = deferred();
+  const stage = fail ? "tracked-control-failure" : "tracked-control-sequential";
+  const texts = fail ? ["failure-steer", "failure-follow"] :
+    ["steer-one", "steer-two", "duplicate-follow", "duplicate-follow", "follow-tail"];
+  const consumed = [];
+  const responses = [async () => {
+    await release.promise;
+    return { content: ["initial complete"] };
+  }];
+  for (let index = 0; index < (fail ? 2 : 4); index += 1) {
+    responses.push(async (context) => {
+      const matching = userTexts(context).filter((text) => texts.includes(text));
+      requireCondition(matching.length === consumed.length + 1, "SEQUENTIAL_CONTROLS_BATCHED_OR_LOST");
+      consumed.push(matching.at(-1));
+      if (index === 0) await releaseExecuting.promise;
+      return fail && index === 1 ? { throw: "fixture-owned-control-failure" } : { content: ["control complete"] };
+    });
+  }
+  responses.push({ content: ["unrelated successor"] });
+  return withHarness(stage, ownerRoot, { primary: responses }, {}, async (harness) => {
+    harness.releases.push(() => release.resolve());
+    harness.releases.push(() => releaseExecuting.resolve());
+    // The explicit sequential policy must override both SDK batching modes.
+    harness.agent.setSteeringMode("all");
+    harness.agent.setFollowUpMode("all");
+    const primary = startOwned(harness, "tracked-primary", { type: "prompt", message: "initial" });
+    await waitFor(() => harness.mockModels.get("primary").calls.length === 1, "ACTIVE_PROVIDER_NOT_ENTERED");
+    const controls = [];
+    const records = [];
+    for (let index = 0; index < texts.length; index += 1) {
+      const type = index < (fail ? 1 : 2) ? "steer" : "follow_up";
+      controls.push(startOwned(harness, `tracked-control-${index}`, { type, message: texts[index] }));
+      records.push(await requireSubmission(harness, index, type === "steer" ? "steer" : "followUp"));
+      requireCondition(controls[index].ticket.phase === "queued" && controls[index].activations === 0 &&
+        controls[index].run.status === "pending" && records[index].execution.status === "pending",
+      "QUEUED_CONTROL_ACTIVATED_BEFORE_EXECUTION");
+    }
+    requireCondition(new Set(records.map((record) => record.handle.submissionId)).size === records.length,
+      "TRACKED_SUBMISSION_IDS_REUSED");
+    if (!fail) {
+      requireCondition(controls[2].ticket.revokeBeforeStart() === true && controls[2].ticket.revokeBeforeStart() === false,
+        "EXACT_QUEUED_REVOCATION_FAILED");
+      await withDeadline(Promise.all([controls[2].run.settled, records[2].execution.settled, records[2].terminal.settled]),
+        STEP_TIMEOUT_MS, "CANCELLED_CONTROL_DID_NOT_SETTLE");
+      for (const value of [records[2].execution.value, records[2].terminal.value]) {
+        requireCondition(value.submissionId === records[2].handle.submissionId && value.disposition === "removed" &&
+          value.reason === "cancelled", "CANCELLED_CONTROL_RECEIPT_WRONG");
+      }
+      requireCondition(controls[2].run.status === "fulfilled" && controls[2].run.value?.revokedBeforeStart === true &&
+        controls[2].activations === 0 &&
+        controls[2].ticket.phase === "terminal", "CANCELLED_CONTROL_ACTIVATED");
+    }
+    release.resolve();
+    await waitFor(() => records[0].execution.status === "fulfilled" && controls[0].ticket.phase === "active" &&
+      harness.mockModels.get("primary").calls.length === 2, "EXECUTING_CONTROL_NOT_OBSERVED");
+    requireCondition(records[0].handle.cancel() === false && controls[0].ticket.revokeBeforeStart() === false &&
+      controls[0].run.status === "pending", "EXECUTING_CONTROL_WRONGLY_CANCELLED");
+    releaseExecuting.resolve();
+    const receipts = [];
+    for (let index = 0; index < controls.length; index += 1) {
+      if (!fail && index === 2) continue;
+      receipts.push(await requireOwningTerminal(harness, controls[index], records[index], fail ? "rejected" : "fulfilled"));
+      requireCondition(receipts.at(-1).executionDisposition === "joined-current-run", "ACTIVE_CONTROL_NOT_JOINED");
+    }
+    await withDeadline(primary.run.settled, STEP_TIMEOUT_MS, "PRIMARY_DID_NOT_SETTLE");
+    const terminal = terminalEvents(harness.events);
+    requireCondition(terminal.length === 1 && terminalEvents(primary.events).length === 0 &&
+      primary.settledAtTerminalScopes.includes(scopeKey(terminal[0].scope)) &&
+      primary.run.status === (fail ? "rejected" : "fulfilled"), "PRIMARY_COHORT_TERMINAL_WRONG");
+    if (fail) requireCondition(terminal[0].messages.some((message) => message.role === "assistant" && message.stopReason === "error"),
+      "OWNING_TERMINAL_FAILURE_MISSING");
+    if (fail) requireCondition(controls.every((control) => control.run.failureCode === primary.run.failureCode),
+      "OWNING_FAILURE_NOT_SHARED_BY_COHORT");
+    requireCondition(receipts.some((receipt) => receipt.finalScopeChanged), "FINAL_SCOPE_CHANGE_NOT_EXERCISED");
+    const steeringTexts = texts.slice(0, fail ? 1 : 2);
+    const followUpTexts = fail ? texts.slice(1) : ["duplicate-follow", "follow-tail"];
+    requireCondition(JSON.stringify(consumed.filter((text) => steeringTexts.includes(text))) ===
+      JSON.stringify(steeringTexts), "STEERING_PER_QUEUE_ORDER_WRONG");
+    requireCondition(JSON.stringify(consumed.filter((text) => !steeringTexts.includes(text))) ===
+      JSON.stringify(followUpTexts), "FOLLOW_UP_PER_QUEUE_ORDER_WRONG");
+    const counts = [primary, ...controls].map((control) => control.events.length);
+    await withDeadline(harness.adapter.send({ type: "prompt", message: "unrelated successor" }, () => {}, 5_000),
+      STEP_TIMEOUT_MS, "SUCCESSOR_SEND_DID_NOT_SETTLE");
+    requireCondition([primary, ...controls].every((control, index) => control.events.length === counts[index]),
+      "SUCCESSOR_EVENTS_LEAKED_TO_PREDECESSOR");
+    return {
+      status: "qualified", acceptedDuringProviderExecution: true,
+      queuePolicy: "sequential", ordering: "per-delivery-not-global-FIFO",
+      providerCalls: harness.mockModels.get("primary").calls.length,
+      exactPrimaryTerminal: true, receipts,
+      submissions: records.map(submissionEvidence),
+      duplicateTextDistinctIds: !fail, exactlyOneQueuedHandleCancelled: !fail,
+      cancellationReason: fail ? "not-exercised" : "cancelled",
+      noSuccessorEventLeakage: true, owningFailureObserved: fail,
+      fabricatedReceiptUsed: false,
+    };
+  });
+}
+
+async function probeLateControl(ownerRoot, delivery, { overlapGate = false } = {}) {
+  let late;
+  let boundaryObserved = false;
+  let boundaryState;
+  let boundaryScope;
+  let originalRawScope;
+  let rawTerminalStopReason;
+  let rawTerminalBeforeLateSubmission = false;
+  let initial;
+  let harnessRef;
+  const isFollowUp = delivery === "followUp";
+  const options = {
+    withAsk: overlapGate,
+    ...(overlapGate ? { gateAnswerWindowMs: OVERLAP_GATE_WINDOW_MS } : {}),
+    onRawAgentEvent(event, getAdapter, getState) {
+      if (event.type === "agent_start" && !originalRawScope) {
+        originalRawScope = structuredClone(event.scope);
+      }
+      if (event.type !== "agent_end" || boundaryObserved) return;
+      boundaryObserved = true;
+      boundaryScope = scopeKey(event.scope);
+      rawTerminalStopReason = event.stopReason;
+      requireCondition(scopeKey(originalRawScope) === boundaryScope,
+        "LATE_RAW_TERMINAL_NOT_ORIGINALLY_OWNED");
+      requireCondition(rawTerminalStopReason === "completed" && !event.messages.some((message) =>
+        message.role === "assistant" && ["error", "aborted", "cancelled"].includes(message.stopReason)),
+      "LATE_RAW_ROOT_NOT_SUCCESSFUL");
+      rawTerminalBeforeLateSubmission = !late && harnessRef.submissions.length === 0;
+      requireCondition(rawTerminalBeforeLateSubmission, "LATE_RAW_PROOF_AFTER_SUBMISSION");
+      const { agent, session } = getState();
+      boundaryState = { agentStreaming: agent.state.isStreaming, sessionStreaming: session.isStreaming };
+      requireCondition(getAdapter() === harnessRef.adapter, "LATE_ADAPTER_BINDING_CHANGED");
+      late = startOwned(harnessRef, "late-control-owner", {
+        type: isFollowUp ? "follow_up" : "steer", message: "late boundary control",
+      });
+    },
+  };
+  const responses = [{ content: ["initial boundary complete"] },
+    overlapGate ? { content: [{ type: "toolCall", name: "ask", arguments: {
+      questions: [{ id: "promoted-question", question: "Choose promoted answer", options: [{ label: "Proceed" }], multi: false }],
+    } }] } : { content: ["late control consumed"] }];
+  // This response must never run in the deliberate overlapping-gate case.
+  responses.push({ content: ["unrelated boundary successor"] });
+  const stage = overlapGate ? "late-follow-up-gate-overlap" : isFollowUp ? "late-follow-up-continuation" : "late-steer-rearm";
+  return withHarness(stage, ownerRoot,
+    { primary: responses }, options, async (harness) => {
+      harnessRef = harness;
+      const rawGates = [];
+      let resolveCalls = 0;
+      if (overlapGate) {
+        const emitter = harness.session.getWorkflowGateEmitter();
+        const originalResolve = emitter.resolveGate;
+        emitter.resolveGate = function (...args) {
+          resolveCalls += 1;
+          return originalResolve.apply(this, args);
+        };
+        harness.releases.push(() => { emitter.resolveGate = originalResolve; });
+        harness.releases.push(emitter.onGateEmitted((gate) => rawGates.push({
+          gate,
+          publicTerminalCount: terminalEvents(harness.events).length,
+          publicRootPromptStatus: harness.promptCalls[0]?.status ?? "not-started",
+          initialStatus: initial.run.status,
+          lateStatus: late.run.status,
+        })));
+      }
+      initial = startOwned(harness, "late-initial-owner", { type: "prompt", message: "initial boundary" });
+      await waitFor(() => boundaryObserved && late, "RAW_UNWIND_BOUNDARY_NOT_OBSERVED");
+      requireCondition(boundaryState.agentStreaming === false && boundaryState.sessionStreaming === true,
+        "LATE_CONTROL_NOT_IN_UNWIND_WINDOW", boundaryState);
+      const record = await requireSubmission(harness, 0, delivery);
+      await withDeadline(record.execution.settled, STEP_TIMEOUT_MS, "LATE_CONTROL_NOT_EXECUTED");
+      requireCondition(record.execution.value?.disposition === "promoted-to-run", "LATE_CONTROL_NOT_ACTUALLY_PROMOTED");
+      await waitFor(() => harness.mockModels.get("primary").calls.length >= 2, "LATE_CONTROL_PROVIDER_NOT_INVOKED");
+      requireCondition(userTexts(harness.mockModels.get("primary").calls[1].context).includes("late boundary control"),
+        "LATE_CONTROL_NOT_CONSUMED_BY_PROVIDER");
+      if (overlapGate) {
+        await waitFor(() => rawGates.length === 1, "ACTUAL_PROMOTED_OVERLAP_GATE_MISSING");
+        const emitted = rawGates[0];
+        const emitter = harness.session.getWorkflowGateEmitter();
+        requireCondition(emitted.gate.kind === "question" && emitted.publicTerminalCount === 0 &&
+          ["pending", "fulfilled"].includes(emitted.initialStatus) &&
+          ["pending", "fulfilled"].includes(emitted.publicRootPromptStatus) &&
+          (emitted.initialStatus !== "fulfilled" || emitted.publicRootPromptStatus === "fulfilled") &&
+          rawTerminalBeforeLateSubmission &&
+          emitted.lateStatus === "pending" && record.terminal.status === "pending" &&
+          emitter.listPendingGates().some((gate) => gate.gate_id === emitted.gate.gate_id),
+        "PROMOTED_GATE_OVERLAP_NOT_REPRODUCED");
+        const execution = record.execution.value;
+        requireCondition(execution.submissionId === record.handle.submissionId && execution.delivery === "followUp" &&
+          scopeKey(execution.attemptScope) !== boundaryScope &&
+          late.executionIdsAtActivation.includes(record.handle.submissionId) && late.activations === 1 &&
+          record.handle.cancel() === false && late.ticket.revokeBeforeStart() === false,
+        "PROMOTED_OVERLAP_EXECUTION_NOT_GENUINE");
+        const beforeTeardown = {
+          publicTerminalCount: emitted.publicTerminalCount,
+          publicRootPromptStatus: emitted.publicRootPromptStatus,
+          initialStatus: emitted.initialStatus,
+          lateStatus: emitted.lateStatus,
+          trackedTerminalStatus: record.terminal.status,
+        };
+        const adapterGateRelease = harness.adapter.gateUnsubscribe;
+        requireCondition([...harness.subscriptions].some((subscription) => subscription.release === adapterGateRelease),
+          "PROMOTED_GATE_ADAPTER_LISTENER_NOT_REGISTERED");
+        await withDeadline(Promise.all([initial.run.settled, late.run.settled]),
+          STEP_TIMEOUT_MS, "PROMOTED_GATE_REFUSAL_NOT_BOUNDED");
+        const originalPublicPromptStatus = harness.promptCalls[0]?.status ?? "not-started";
+        const originalRootProven = rawTerminalBeforeLateSubmission &&
+          scopeKey(originalRawScope) === boundaryScope && originalPublicPromptStatus === "fulfilled";
+        // A completed original result cannot be retroactively failed by the
+        // ambiguous promoted gate. The unresolved tracked caller must refuse it.
+        requireCondition(late.run.status === "rejected" &&
+          late.run.failureCode === PROMOTED_GATE_OWNERSHIP_CODE && late.ticket.phase === "terminal" &&
+          initial.ticket.phase === "terminal" &&
+          (initial.run.status === "fulfilled" ? originalRootProven :
+            initial.run.status === "rejected" && initial.run.failureCode === PROMOTED_GATE_OWNERSHIP_CODE),
+        "PROMOTED_GATE_OWNERSHIP_NOT_REFUSED", {
+          initialStatus: initial.run.status, initialFailureCode: initial.run.failureCode,
+          publicRootPromptStatus: originalPublicPromptStatus,
+          followUpStatus: late.run.status, followUpFailureCode: late.run.failureCode,
+        });
+        requireCondition(![...initial.events, ...late.events].some((event) => event.type === "gate_request") &&
+          resolveCalls === 0 && harness.mockModels.get("primary").calls.length === 2,
+        "AMBIGUOUS_PROMOTED_GATE_PRESENTED_OR_ANSWERED");
+        await withDeadline(harness.adapter.dispose(), STEP_TIMEOUT_MS, "PROMOTED_GATE_REFUSAL_TEARDOWN_TIMEOUT");
+        requireCondition(emitter.listPendingGates().length === 0 && harness.adapter.pendingGates.size === 0 &&
+          harness.adapter.activeGateRuns.length === 0 && harness.adapter.ownedQueueTickets.size === 0 &&
+          harness.adapter.adapterWaiterCancellations.size === 0 && !harness.adapter.isBusy() &&
+          harness.adapter.inFlightGateAnswers.size === 0 && harness.adapter.deferredGateCandidate === undefined &&
+          ![...harness.subscriptions].some((subscription) => subscription.release === adapterGateRelease) &&
+          harness.calls.sessionDispose === 1 && harness.calls.managerClose === 1 &&
+          harness.calls.registryDispose === 0 && harness.calls.providerRelease === 0 &&
+          harness.calls.authClose === 0 && harness.calls.settingsClose === 0,
+        "PROMOTED_GATE_REFUSAL_TEARDOWN_INCOMPLETE");
+        requireCondition(resolveCalls === 0 && harness.mockModels.get("primary").calls.length === 2 &&
+          ![...initial.events, ...late.events].some((event) => event.type === "gate_request"),
+        "PROMOTED_GATE_REFUSAL_CONTINUATION_OR_PRESENTATION_LEAKED");
         return {
-          mode: "fail-closed",
-          errorCode: "SDK_LIVE_CONTROL_UNSUPPORTED",
-          steerStatus: steer.status,
-          followUpStatus: followUp.status,
-          executableSteeringCount: queues.steering.length,
-          executableFollowUpCount: queues.followUp.length,
-          promptStatus: prompt.status,
+          status: "bounded-refusal-qualified", code: PROMOTED_GATE_OWNERSHIP_CODE,
+          boundary: "raw-Agent-agent_end-before-AgentSession-unwind",
+          actualSuccessorProviderInvoked: true, actualQueuedTextConsumed: true,
+          submissionId: record.handle.submissionId, admitted: record.admitted.value, execution,
+          beforeTeardown, gateWindowMs: OVERLAP_GATE_WINDOW_MS,
+          originalRootResult: {
+            evidenceKind: "public-AgentSession.agent-raw-scope-and-own-public-prompt",
+            rawScope: originalRawScope, rawTerminalStopReason, rawTerminalBeforeLateSubmission,
+            publicPromptCallIndex: 0, publicPromptStatus: originalPublicPromptStatus,
+            adapterStatus: initial.run.status, fulfilledWithOwnProof: initial.run.status === "fulfilled" && originalRootProven,
+            sdkPublicRootTerminalCountAtGateEmission: emitted.publicTerminalCount,
+          },
+          initialFailureCode: initial.run.failureCode, promotedFailureCode: late.run.failureCode,
+          gateRequestCount: 0, sdkResolveCalls: resolveCalls, continuationProviderCalls: 0,
+          pendingGatesRetired: true, realTeardownCompleted: true,
+          fixtureResourcesOpenUntilOwnerTeardown: true,
+          promotedGateExactOwnerAndPresentation: false,
+          fabricatedReceiptUsed: false,
         };
       }
-    );
-  } finally {
-    releasePrompt.resolve();
-  }
+      const receipt = await requireOwningTerminal(harness, late, record);
+      await withDeadline(initial.run.settled, STEP_TIMEOUT_MS, "LATE_INITIAL_DID_NOT_SETTLE");
+      const terminals = terminalEvents(harness.events);
+      const publicRootTerminals = terminals.filter((event) => scopeKey(event.scope) === boundaryScope);
+      const trackedFinalScope = scopeKey(record.terminal.value.attemptScope);
+      // SDK publication may coalesce to the promoted scope. Raw root execution
+      // plus its own prompt proves only the root result, not SDK readiness or a
+      // tracked terminal; requireOwningTerminal above still requires both real
+      // successor handle completion and its exact public SDK terminal.
+      requireCondition(rawTerminalBeforeLateSubmission && scopeKey(originalRawScope) === boundaryScope &&
+        harness.promptCalls[0]?.status === "fulfilled" && initial.run.status === "fulfilled" &&
+        publicRootTerminals.length <= 1 &&
+        terminals.every((event) => [boundaryScope, trackedFinalScope].includes(scopeKey(event.scope))) &&
+        terminalEvents(initial.events).length === 0 &&
+        boundaryScope !== scopeKey(record.execution.value.attemptScope) && boundaryScope !== trackedFinalScope &&
+        initial.events.filter((event) => event.scope).every((event) => scopeKey(event.scope) === boundaryScope) &&
+        !late.events.some((event) => event.scope && scopeKey(event.scope) === boundaryScope),
+      "LATE_INITIAL_TERMINAL_OWNERSHIP_WRONG");
+      const initialCount = initial.events.length;
+      const lateCount = late.events.length;
+      await withDeadline(harness.adapter.send({ type: "prompt", message: "boundary successor" }, () => {}, 5_000),
+        STEP_TIMEOUT_MS, "LATE_SUCCESSOR_DID_NOT_SETTLE");
+      requireCondition(initial.events.length === initialCount && late.events.length === lateCount, "LATE_SUCCESSOR_EVENTS_LEAKED");
+      return {
+        status: "qualified", boundary: "raw-Agent-agent_end-before-AgentSession-unwind",
+        actualSuccessorProviderInvoked: true, actualQueuedTextConsumed: true,
+        executionDisposition: receipt.executionDisposition, exactOwningTerminal: true,
+        submission: submissionEvidence(record),
+        originalRootResult: {
+          evidenceKind: "public-AgentSession.agent-raw-scope-and-own-public-prompt",
+          rawScope: originalRawScope, rawTerminalStopReason, rawTerminalBeforeLateSubmission,
+          publicPromptCallIndex: 0, publicPromptStatus: "fulfilled", adapterStatus: initial.run.status,
+          sdkPublicRootTerminalCount: publicRootTerminals.length,
+          sdkPublicTerminalCount: terminals.length,
+        },
+        trackedTerminalProof: "genuine-handle-terminal-and-matching-public-SDK-agent_end",
+        noSuccessorEventLeakage: true, cancelAfterExecution: false,
+        providerCalls: harness.mockModels.get("primary").calls.length, fabricatedReceiptUsed: false,
+      };
+    });
+}
+
+async function probeJoinedAsk(ownerRoot) {
+  const ownerId = "joined-ask-primary-owner";
+  const joinerId = "joined-ask-steer-owner";
+  const steerText = "joined ask steer";
+  let resultText = "";
+  const askResponse = (id, label) => ({ content: [{ type: "toolCall", name: "ask", arguments: {
+    questions: [{ id, question: "Choose a joined run answer", options: [{ label }], multi: false }],
+  } }] });
+  return withHarness("joined-steer-ask", ownerRoot, { primary: [
+    askResponse("primary-held-question", "Primary answer"),
+    (context) => {
+      requireCondition(userTexts(context).includes(steerText), "JOINED_ASK_STEER_NOT_CONSUMED");
+      return askResponse("joined-continuation-question", "Joined answer");
+    },
+    (context) => {
+      resultText = toolResultText(context);
+      return { content: ["joined ask run complete"] };
+    },
+  ] }, { withAsk: true }, async (harness) => {
+    const emitter = harness.session.getWorkflowGateEmitter();
+    const rawGates = [];
+    const originalResolve = emitter.resolveGate;
+    let resolveCalls = 0;
+    emitter.resolveGate = function (...args) {
+      resolveCalls += 1;
+      return originalResolve.apply(this, args);
+    };
+    harness.releases.push(() => { emitter.resolveGate = originalResolve; });
+    harness.releases.push(emitter.onGateEmitted((gate) => rawGates.push(structuredClone(gate))));
+    const primary = startOwned(harness, ownerId, { type: "prompt", message: "hold primary for joined ask" });
+    await waitFor(() => rawGates.length === 1 && primary.events.some((event) => event.type === "gate_request"),
+      "JOINED_ASK_PRIMARY_GATE_MISSING");
+    const firstGate = primary.events.find((event) => event.type === "gate_request");
+    const joined = startOwned(harness, joinerId, { type: "steer", message: steerText });
+    const record = await requireSubmission(harness, 0, "steer");
+    requireCondition(primary.run.status === "pending" && harness.promptCalls[0]?.status === "pending" &&
+      joined.run.status === "pending" && joined.ticket.phase === "queued" && joined.activations === 0 &&
+      record.execution.status === "pending" && record.terminal.status === "pending" &&
+      emitter.listPendingGates().some((gate) => gate.gate_id === firstGate.gateId) &&
+      harness.mockModels.get("primary").calls.length === 1,
+    "JOINED_ASK_PRIMARY_NOT_HELD_AT_ADMISSION");
+    requireCondition(harness.adapter.presentGate(ownerId, firstGate.gateId, firstGate.presentationId,
+      "joined-primary-presentation") === true, "JOINED_ASK_PRIMARY_PRESENTATION_REFUSED");
+    const firstAnswer = await withDeadline(harness.adapter.answerGate(ownerId, firstGate.gateId,
+      firstGate.presentationId, "Primary answer"), STEP_TIMEOUT_MS, "JOINED_ASK_PRIMARY_ANSWER_TIMEOUT");
+    requireCondition(firstAnswer?.ok === true, "JOINED_ASK_PRIMARY_ANSWER_REFUSED");
+    await withDeadline(record.execution.settled, STEP_TIMEOUT_MS, "JOINED_ASK_EXECUTION_MISSING");
+    requireCondition(record.execution.value?.disposition === "joined-current-run",
+      "JOINED_ASK_NOT_GENUINELY_JOINED", { executionDisposition: record.execution.value?.disposition });
+    await waitFor(() => rawGates.length === 2 &&
+      primary.events.filter((event) => event.type === "gate_request").length === 2,
+    "JOINED_ASK_CONTINUATION_GATE_MISSING");
+    const secondGate = primary.events.filter((event) => event.type === "gate_request")[1];
+    requireCondition(rawGates.every((gate, index) => gate.type === "workflow_gate" && gate.kind === "question" &&
+      gate.gate_id === [firstGate, secondGate][index].gateId) && firstGate.gateId !== secondGate.gateId &&
+      primary.run.status === "pending" && joined.run.status === "pending" &&
+      record.terminal.status === "pending" && joined.activations === 1 &&
+      joined.executionIdsAtActivation.includes(record.handle.submissionId) &&
+      !joined.events.some((event) => event.type === "gate_request") && resolveCalls === 1 &&
+      harness.mockModels.get("primary").calls.length === 2,
+    "JOINED_ASK_LOGICAL_OWNER_CHANGED");
+    requireCondition(harness.adapter.presentGate(joinerId, secondGate.gateId, secondGate.presentationId,
+      "wrong-joined-presentation") === false, "JOINED_ASK_JOINER_PRESENTATION_ACCEPTED");
+    requireCondition(harness.adapter.presentGate(ownerId, secondGate.gateId, secondGate.presentationId,
+      "joined-continuation-presentation") === true, "JOINED_ASK_OWNER_PRESENTATION_REFUSED");
+    // Try the wrong owner only after a real owner has made the gate answerable,
+    // so refusal cannot be explained by the presentation barrier alone.
+    const wrongAnswer = await withDeadline(harness.adapter.answerGate(joinerId, secondGate.gateId,
+      secondGate.presentationId, "Joined answer"), STEP_TIMEOUT_MS, "JOINED_ASK_WRONG_ANSWER_TIMEOUT");
+    requireCondition(wrongAnswer?.ok === false && resolveCalls === 1 &&
+      emitter.listPendingGates().some((gate) => gate.gate_id === secondGate.gateId),
+    "JOINED_ASK_JOINER_ANSWER_CONSUMED");
+    const secondAnswer = await withDeadline(harness.adapter.answerGate(ownerId, secondGate.gateId,
+      secondGate.presentationId, "Joined answer"), STEP_TIMEOUT_MS, "JOINED_ASK_OWNER_ANSWER_TIMEOUT");
+    requireCondition(secondAnswer?.ok === true, "JOINED_ASK_OWNER_ANSWER_REFUSED");
+    const owning = await requireOwningTerminal(harness, joined, record);
+    await withDeadline(primary.run.settled, STEP_TIMEOUT_MS, "JOINED_ASK_PRIMARY_DID_NOT_SETTLE");
+    const terminals = terminalEvents(harness.events);
+    const finalScope = scopeKey(record.terminal.value.attemptScope);
+    requireCondition(primary.run.status === "fulfilled" && primary.ticket.phase === "terminal" &&
+      harness.promptCalls[0]?.status === "fulfilled" && terminals.length === 1 &&
+      scopeKey(terminals[0].scope) === finalScope && primary.settledAtTerminalScopes.includes(finalScope) &&
+      joined.settledAtTerminalScopes.includes(finalScope) && terminalEvents(primary.events).length === 0 &&
+      !joined.events.some((event) => event.type === "gate_request") && rawGates.length === 2 && resolveCalls === 2 &&
+      harness.mockModels.get("primary").calls.length === 3 &&
+      resultText.includes("Primary answer") && resultText.includes("Joined answer") &&
+      emitter.listPendingGates().length === 0 && harness.adapter.pendingGates.size === 0,
+    "JOINED_ASK_SHARED_PUBLIC_TERMINAL_MISMATCH");
+    return {
+      status: "qualified", evidenceKind: "installed-public-SDK-Ask-with-credentialless-mock-provider",
+      primaryAskHeldAtAdmission: true, actualQueuedTextConsumed: true,
+      executionDisposition: owning.executionDisposition, submission: submissionEvidence(record),
+      emittedGateCount: rawGates.length, originalOwnerGateRequestCount: 2, joinedCallerGateRequestCount: 0,
+      joinedCallerPresentationRefused: true, joinedCallerAnswerRefused: true,
+      originalOwnerAnsweredBothGates: true, sdkResolveCalls: resolveCalls, providerCalls: 3,
+      originalPublicPromptStatus: harness.promptCalls[0].status,
+      adapterStatuses: { original: primary.run.status, joined: joined.run.status },
+      sharedPublicTerminalCount: terminals.length, exactSharedPublicTerminalAndHandleScope: true,
+      trackedTerminalProof: "genuine-handle-terminal-and-matching-public-SDK-agent_end",
+      fabricatedReceiptUsed: false,
+    };
+  });
 }
 
 async function probeGates(ownerRoot) {
@@ -1355,7 +1804,7 @@ async function readExpectedDeclaration(artifact, segments) {
   }
 }
 
-async function queuedControlOwnershipLimitation(sdkPackage) {
+async function queuedControlOwnershipQualification(sdkPackage, scenarios) {
   const [agentSessionTypes, extensionTypes, sessionRuntimeSource, agentSessionSource, sdkSource, sdkTypes] =
     await Promise.all([
       readExpectedDeclaration(
@@ -1440,11 +1889,18 @@ async function queuedControlOwnershipLimitation(sdkPackage) {
       canonicalTrackedTypesExported,
     "QUEUED_CONTROL_CONTRACT_EVIDENCE_CHANGED"
   );
+  requireCondition(
+    scenarios.trackedControls.status === "qualified" && scenarios.trackedControlFailure.owningFailureObserved &&
+      scenarios.lateFollowUp.actualSuccessorProviderInvoked && scenarios.lateFollowUp.executionDisposition === "promoted-to-run" &&
+      scenarios.lateSteer.actualSuccessorProviderInvoked && scenarios.lateSteer.executionDisposition === "promoted-to-run" &&
+      scenarios.joinedAsk.status === "qualified" && scenarios.joinedAsk.executionDisposition === "joined-current-run" &&
+      scenarios.joinedAsk.exactSharedPublicTerminalAndHandleScope,
+    "TRACKED_CONTROL_RUNTIME_QUALIFICATION_MISSING"
+  );
 
   return {
-    status: "contained",
-    code: QUEUED_CONTROL_OWNERSHIP_CODE,
-    affectedAdapterPath: "SdkSession.send rejects live steer/follow_up",
+    status: "qualified",
+    affectedAdapterPath: "SdkSession.send-sendOwned-public-tracked-submissions",
     sendUserMessageHooksStructurallyDeclared: true,
     queuedAtDispatchClassification: "internal-sdk-signal",
     onQueuedPromotedClassification: "sdk-host-ownership-correlation",
@@ -1455,8 +1911,11 @@ async function queuedControlOwnershipLimitation(sdkPackage) {
     publicTrackedSubmissionDeclared: true,
     publicTrackedLifecycleDeclared: true,
     canonicalTrackedTypesExported: true,
-    trackedSubmissionIntegrated: false,
-    trackedSubmissionBehaviorallyQualified: false,
+    trackedSubmissionIntegrated: true,
+    trackedSubmissionBehaviorallyQualified: true,
+    joinedGateExactOwnerAndPresentationQualified: true,
+    promotedGateExactOwnerAndPresentationQualified: false,
+    successfulScenarioEvidence: Object.keys(scenarios),
     unsupportedFallbackUsed: false,
     publicContractRequestIssue: 5429,
   };
@@ -1544,13 +2003,24 @@ async function runProbe(ownerRoot) {
   const disposal = await completed("disposal", () => probeDisposeWithoutTerminal(ownerRoot));
   const pendingAskDisposal = await completed("pendingAskDisposal", () => probePendingAskDisposal(ownerRoot));
   const pendingAskActiveCancel = await completed("pendingAskActiveCancel", () => probePendingAskActiveCancel(ownerRoot));
-  const liveControlContainment =
-    await completed("liveControlContainment", () => probeLiveControlContainment(ownerRoot));
+  const trackedControls = await completed("trackedControls", () => probeTrackedControls(ownerRoot));
+  const trackedControlFailure = await completed("trackedControlFailure", () => probeTrackedControls(ownerRoot, true));
+  const lateFollowUp = await completed("lateFollowUp", () => probeLateControl(ownerRoot, "followUp"));
+  const lateSteer = await completed("lateSteer", () => probeLateControl(ownerRoot, "steer"));
+  const promotedGateOverlap = await completed("promotedGateOverlap", () => probeLateControl(ownerRoot, "followUp", { overlapGate: true }));
+  const joinedAsk = await completed("joinedAsk", () => probeJoinedAsk(ownerRoot));
   const decisionGate = await completed("decisionGate", () => decisionGateLimitation());
   const queuedControlOwnership =
-    await queuedControlOwnershipLimitation(sdkPackage);
+    await completed("queuedControlOwnership", () => queuedControlOwnershipQualification(sdkPackage, {
+      trackedControls, trackedControlFailure, lateFollowUp, lateSteer, joinedAsk,
+    }));
   requireCondition(networkAttempts === 0, "NETWORK_ACCESS_ATTEMPTED");
-  requireCondition(harnessCleanupOutcomes.length === 6, "CLEANUP_OUTCOME_COUNT_WRONG");
+  const harnessNames = ["workflow-gates", "failure-terminal", "dispose-without-terminal", "pending-ask-disposal",
+    "pending-ask-active-cancel", "tracked-control-sequential", "tracked-control-failure", "late-follow-up-continuation",
+    "late-steer-rearm", "late-follow-up-gate-overlap", "joined-steer-ask"];
+  requireCondition(harnessCleanupOutcomes.length === harnessNames.length &&
+    harnessCleanupOutcomes.every((outcome, index) => outcome.stage === harnessNames[index]),
+    "CLEANUP_OUTCOME_COUNT_OR_NAME_WRONG");
   requireCondition(
     harnessCleanupOutcomes.every(
       (outcome) => outcome.failures.length === 0 && outcome.completed.length === 8 && outcome.ownedScratchRemoved === true
@@ -1565,8 +2035,8 @@ async function runProbe(ownerRoot) {
     upgradeAssessment: {
       verdict: "PASS",
       oracleStatus: "completed",
-      containment: "live-controls-fail-closed",
-      limitationCodes: [QUEUED_CONTROL_OWNERSHIP_CODE],
+      liveControls: "public-tracked-submissions-behaviorally-qualified",
+      limitationCodes: [DECISION_GATE_CODE, promotedGateOverlap.code],
     },
     historicalProvenance: {
       oracleOriginSdkVersion: HISTORICAL_SDK_VERSION,
@@ -1576,7 +2046,7 @@ async function runProbe(ownerRoot) {
       upstreamFixPullRequest: 5371,
       upstreamFixBranch: "dev",
       upstreamFixMarkerPresentInObservedVersion: true,
-      continuationBehaviorQualifiedByOracle: false,
+      continuationBehaviorQualifiedByOracle: lateFollowUp.actualSuccessorProviderInvoked,
     },
     environment: {
       credentialVariableCount: Object.keys(process.env).filter((key) =>
@@ -1589,6 +2059,7 @@ async function runProbe(ownerRoot) {
     },
     cleanup: {
       harnessCount: harnessCleanupOutcomes.length,
+      harnessNames: harnessCleanupOutcomes.map((outcome) => outcome.stage),
       sdkResourcesClosed: true,
       modelCacheStates: harnessCleanupOutcomes.map((outcome) => outcome.modelCacheState),
       ownedScratchRemoved: harnessCleanupOutcomes.map((outcome) => outcome.ownedScratchRemoved),
@@ -1611,8 +2082,13 @@ async function runProbe(ownerRoot) {
       },
     },
     canonicalImports,
-    liveControlContainment,
+    trackedControls,
+    trackedControlFailure,
+    lateFollowUp,
+    lateSteer,
+    promotedGateOverlap,
     gates,
+    joinedAsk,
     failureTerminal,
     disposal,
     pendingAskDisposal,
@@ -1621,11 +2097,9 @@ async function runProbe(ownerRoot) {
     queuedControlOwnership,
     limitations: {
       lateFollowUpAutoContinuation: {
-        status: "not-behaviorally-qualified",
-        code: "LATE_FOLLOW_UP_CONTINUATION_NOT_QUALIFIED",
-        boundary: "live controls rejected before SDK queue admission",
-        evidence:
-          "The published package contains the continuation marker; the adapter does not enter that queue path and this oracle does not qualify it.",
+        status: lateFollowUp.status,
+        boundary: lateFollowUp.boundary,
+        actualSuccessorProviderInvoked: lateFollowUp.actualSuccessorProviderInvoked,
       },
       successorGateCompletion: {
         status: "completed-response-loss-qualified-with-public-SDK-mock-provider",
@@ -1634,12 +2108,28 @@ async function runProbe(ownerRoot) {
         observedEvidence: "exact-response lookupCompletedResolution.kind=completed",
       },
       lateSteerRearm: {
-        status: "unsupported-fail-closed",
-        code: "LATE_STEER_REARM_NOT_OBSERVED",
-        excludedCase: "live steer",
-        reason:
-          "Public tracked submission is present, but its daemon lifecycle integration and behavior are not qualified by this oracle.",
+        status: lateSteer.status,
+        boundary: lateSteer.boundary,
+        actualSuccessorProviderInvoked: lateSteer.actualSuccessorProviderInvoked,
       },
+      joinedSteerGate: {
+        status: joinedAsk.status,
+        positiveOwnerPresentationQualification: true,
+        executionDisposition: joinedAsk.executionDisposition,
+        gateOwner: "original-logical-run-owner-not-joined-submission",
+        actualSharedPublicTerminalAndHandleScope: joinedAsk.exactSharedPublicTerminalAndHandleScope,
+      },
+      promotedFollowUpGate: {
+        status: "unavailable-public-scope-correlation",
+        code: promotedGateOverlap.code,
+        positiveOwnerPresentationQualification: promotedGateOverlap.promotedGateExactOwnerAndPresentation,
+        negativeOverlapRefusalQualified: promotedGateOverlap.status === "bounded-refusal-qualified",
+        reason: "public-gate-runtime_turn_id-has-no-public-attempt-scope-mapping",
+        publicTerminalBarrier: "live-prompts-must-unwind-before-AgentSession-agent_end-publication",
+        delayedHandleCandidate: "unqualified-return-delay-does-not-release-SDK-live-prompt-barrier",
+      },
+      excludedCases: ["structured-decision-denial-builders-not-public", "accepted-incomplete-predecessor-gate",
+        "global-cross-mode-FIFO", "real-provider-network-or-credentials", "positive-promoted-overlap-gate-binding"],
     },
   };
 }
@@ -1709,6 +2199,13 @@ try {
       completedCells,
       ...(completedCells.pendingAskActiveCancel && activeCancelDiagnostic
         ? { pendingAskActiveCancel: boundedDiagnosticState(activeCancelDiagnostic) }
+        : {}),
+      ...(primaryFailure?.stage === "joined-steer-ask"
+        ? { joinedAsk: {
+            status: "blocked", blockedCase: "joined-current-run-Ask-owner-presentation",
+            code: primaryFailure.code, positiveOwnerPresentationQualification: false,
+            observedState: primaryFailure.state, fabricatedReceiptUsed: false,
+          } }
         : {}),
     },
     harnessCleanupOutcomes: boundedDiagnosticState(harnessCleanupOutcomes),

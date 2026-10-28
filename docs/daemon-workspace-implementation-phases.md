@@ -209,6 +209,76 @@ dual-manifest, reversible migration succeeds.
 The final implementation also requires explicit POSIX/Windows drive/UNC identity, race-resistant
 no-follow containment, final lease/fence/generation recovery, cgroup headroom, and no unbounded queue.
 
+## Current tracked-input integration — LOCAL qualified subset
+
+The issue #231 slice keeps official unpatched SDK **0.19.0** and its SRI
+unchanged. Active steering/follow-up uses `submitUserMessage` with distinct tracked
+admission, execution, terminal, and cancellation ownership. Admission alone is not
+execution or completion. Delivery is sequential per queue, not a global FIFO.
+Execution receipts bind submissions to logical-run cohorts: joined inputs can share
+the originating run's terminal rather than each creating an independent generation.
+Events and terminals follow proven cohort ownership, never prompt-text matching or
+latest-invoke guesses.
+
+Root result proof is separate from SDK readiness: an exact SDK-proven public Agent
+terminal plus that root's own settled prompt can prove its result despite coalesced
+readiness publication. It never manufactures tracked receipts or retires gate
+authority; post-raw SDK continuations can still issue Ask. Prompt fulfillment alone
+and unknown raw scopes are not completion proof.
+
+Gate presentation and answers require a deliberate, uniquely proven owner. Resolve
+receipt/ownership races within bounded buffers and time limits or fail explicitly;
+ambiguity must not silently drop a gate or select a guessed owner. Promoted overlap
+without a public immutable owner bridge remains SDK-limited and is refused with
+`SDK_TRACKED_INPUT_GATE_OWNERSHIP`, not treated as positive gate support. Queue
+removal is allowed only on positive SDK proof of removal before execution. Unknown/running
+outcomes do not prove removal. Running cancellation remains nonterminal
+`cancellation_pending`, not interruption or completed cancellation, and the owner
+remains until the authoritative terminal outcome. Executing shared-run work is not
+selectively aborted, and shared siblings are not cancelled.
+
+Idle requests continue to use real SDK prompts; root prompts and model changes stay
+serialized. This is not a Broker/Router/subprocess redesign and adds no feature flag
+or opt-in.
+
+The [current tracked-input evidence](daemon-workspace-verification.md#current-tracked-input-evidence)
+records the **LOCAL Windows qualified subset**: focused-04 passed 474/474 with zero
+failures, skips or cancellations; unrestricted workspace-02 `npm test` exited 0 with
+2897 tests/2887 pass/zero fail/10 existing platform/privilege skips and no exclusion
+patterns. Unit-05 passed 240/240 and lifecycle-03 passed 52/52. These post-review
+regressions use mock providers, not current-tree real-provider proof. Genuine SDK
+harnesses prove primary/joined Ask presentation and exact
+ownership, real late follow-up/steer successor consumption, tracked handles/public
+terminals and root raw-terminal plus own-prompt proof. The promoted-overlap negative
+case proves bounded ownership refusal/no wrong-owner answer, not universal gate success.
+
+The earlier focused-02 444/444 and workspace-01 2867 tests/2857 pass/10 skips
+remain pre-review receipts only. Focused-03 remains a preserved failed receipt
+(474 tests/463 pass/11 reported failures), not a pass.
+All five independent lanes retain scoped static **APPROVE** verdicts;
+lanes 24/25 additionally re-reviewed their respective product corrections,
+while lanes 26–28 retain their original scoped approvals;
+the final test-only corrections independently **APPROVE** in
+`agent://32-FinalTestCorrectionReview`. The aggregate review now records
+`STATIC_APPROVE_RUNTIME_PASS` against focused-04/workspace-02. Exact-head CI
+remains a separate gate; issue #231 remains **OPEN**.
+
+The issue231 one-run provider grant is **CONSUMED-PASS** on **PRE-REVIEW source only**
+(`.git/issue231-provider-smoke.json`, `.git/issue231-pre-review-source.json`): one child-only
+`codex-eco` A-B-A run, three exact `SMOKE_OK` responses, current heartbeat and three
+successful invoke terminals, exit 0 in 13392 ms and relay port free; no optional model
+query or retry. It does not cover the later router, fatal-retirement, or test
+corrections and is not current-tree provider proof. Never replay or relabel it.
+It qualifies basic root regression only, not tracked active-control provider or
+profile/tenant isolation, and does not resolve #247 disconnect behavior.
+PR #274's 0.19.0 adoption receipts and the 0.18 historical receipts remain tied to
+their original scope/counts; no consumed paid/provider smoke grant is reusable.
+Native C++ is unchanged; these local results do not qualify Linux/macOS/Docker,
+native/service/SCM, security, release/install/sign/deploy or isolation.
+Issue #273 is excluded, #33 subprocess work remains deferred, and all prior immutable
+release identities remain intact. Existing phase and native-serving gates below
+are neither bypassed nor newly qualified by this slice.
+
 ## Phase 3 — Docker runtime
 
 Build the pinned non-root daemon image and test-only same-host Compose fixture. Prove read-only root,
@@ -250,11 +320,13 @@ Every verification-matrix evidence layer and non-negotiable gate must close befo
 
 Any missing or failed gate is a hard no-promotion result; interim feature flags are rejected.
 
-The single authoritative [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
-records the 0.19.0 source base, official unpatched provenance/SRI, actual Windows focused/full
-tests, canonical imports and one provider smoke, plus separate review status. No release,
-installation, signing, or platform qualification is claimed. The separate uninstall bug
-remains issue #273, outside this SDK PR.
+The [SDK 0.19.0 adoption record (PR #274)](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+preserves the source base, official unpatched provenance/SRI, original Windows
+focused/full tests, canonical imports/provider smoke, and review/CI/landing history.
+These historical adoption receipts do not qualify the tracked-input integration,
+whose separate **LOCAL qualified subset**, static review approval and separate CI gate are recorded above. No release, installation,
+signing, or platform qualification is claimed. The separate uninstall bug remains
+issue #273, outside this integration.
 
 Historical SDK 0.18.12 post-admission parent SDK-only source evidence recorded Windows focused 333/333 with
 zero skips; bounded workspace 2704 tests, 2700 pass, zero fail, four skips under
@@ -267,9 +339,10 @@ exit 0, and ephemeral relay-port cleanup. No optional model query or wrapper
 retry ran. The smoke was not repeated after fixture/test-only changes; the 0.18.12 production SDK
 runtime/package/lock were unchanged by those changes. Main native code was freshly built unchanged; separate native repairs
 and private native fixture claims are excluded. Same-profile continuity is not
-a fix for #247 or proof of profile/tenant isolation. Active controls remain
-fail-closed; active cancellation remains nonterminal `cancellation_pending`, and standalone
-abort support is not inferred. #6578 is closed and #6700 is closed-unmerged; #6970 is
+a fix for #247 or proof of profile/tenant isolation. In that historical snapshot,
+active controls remained fail-closed; active cancellation remained nonterminal
+`cancellation_pending`, and standalone abort support was not inferred. That is not
+the current tracked-input admission contract above. #6578 is closed and #6700 is closed-unmerged; #6970 is
 the actual repair included in the 0.19.0 release notes, not local workflow qualification.
 
 The [historical SDK-only verification record](daemon-workspace-verification.md#historical-sdk-only-01812-evidence)
@@ -278,7 +351,7 @@ preserves exact exclusions; the historical local unshipped runtime receipts are
 `artifacts/sdk-first-0.18.12-admission2-workspace.json`, and
 `artifacts/sdk-first-0.18.12-admission2-wsl-final.json`. Each run
 qualifies only its exact pins; local receipts alone do not approve landing.
-Historical or combined SDK/native receipts do not qualify the current 0.19.0 upgrade. Both original P2s and
+Historical or combined SDK/native receipts do not qualify the current tracked-input integration. Both original P2s and
 owner-admission were verified and independently cleared in
 `artifacts/sdk-first-0.18.12-final-review.json`: static agent review APPROVE, zero P0/P1/P2,
 not independent runtime or CI/merge/deployment approval. Historical exact-head CI/landing was tracked in

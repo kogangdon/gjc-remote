@@ -48,29 +48,70 @@ in the signed rc.10 runtime. That historical preparation was not publication,
 signing, or deployment and does not replace any immutable rc.1 through rc.10
 asset.
 
-### Current SDK 0.19.0 source evidence
+### Current SDK 0.19.0 tracked-input integration — locally qualified subset
 
 The current SDK-only source pin is official unpatched **0.19.0**. SDK contract
-version/integrity defaults and their expectations align to that source pin;
-this is not native/service qualification. Windows focused tests passed 265/265,
+version/SRI defaults remain unchanged, as does native C++. The issue #231
+integration uses `submitUserMessage` for active steering/follow-up with tracked
+admission, execution, terminal, and cancellation ownership. Admission is not
+execution or completion. Delivery is sequential within each queue, not a global
+FIFO. Execution receipts establish logical-run cohorts: joined submissions can
+share the originating run's terminal, not independent per-submission generations.
+Public events and terminals must follow proven cohort ownership rather than
+prompt text, arrival order, or the newest invoke.
+
+Workflow gates require a deliberate, uniquely proven owner. Bounded buffering/time
+limits may resolve an ownership race; unresolved ambiguity fails explicitly rather
+than guessing an owner, silently dropping a gate, or synthesizing an answer.
+Genuine primary/joined Ask and late successor consumption are locally qualified;
+ambiguous promoted overlap still fails `SDK_TRACKED_INPUT_GATE_OWNERSHIP` without
+presentation, answer or continuation. Universal gate support is not claimed.
+Queue removal requires positive SDK proof of removal before execution; unknown or
+running cancellation outcomes do not prove removal. Running cancellation stays
+nonterminal `cancellation_pending`, not interruption or completed cancellation,
+with ownership retained until an authoritative terminal outcome.
+
+Idle input still uses real SDK prompts, and root prompts/model changes remain
+serialized. No Broker/Router/subprocess redesign, new feature flag, or opt-in is
+introduced. The [current tracked-input evidence](../docs/daemon-workspace-verification.md#current-tracked-input-evidence)
+records post-review Windows focused **474/474** and unrestricted workspace
+**2897 tests, 2887 pass, 0 fail, 10 existing skips**, using credentialless mock
+providers. The consumed-PASS basic-root provider smoke qualifies **PRE-REVIEW source
+only**; later router/fatal-retirement fixes and final test corrections were not
+provider rerun. It does not qualify current behavioral source, active-control
+provider behavior or isolation and cannot be replayed. Five prior independent lanes
+plus final test-correction review statically **APPROVE**, not independent runtime
+evidence; exact-head CI remains pending. Issue #231 stays **OPEN**.
+PR #274 and 0.18 receipts below remain historical and their consumed
+paid/provider smoke grants cannot be reused. This integration provides no native/
+service/security/platform/release/install/sign/deploy qualification, excludes issue
+#273, and cannot reuse or alter prior immutable release identities.
+
+### Historical SDK 0.19.0 adoption evidence (PR #274)
+
+These receipts belong to the SDK adoption in
+[PR #274](https://github.com/kogangdon/gjc-remote/pull/274), not the tracked-input
+feature. Windows focused tests passed 265/265,
 native SDK/build contracts 70/70, and unrestricted workspace tests recorded
 2739 pass, zero fail and 10 skips out of 2749. Canonical imports and one newly
-authorized same-profile provider smoke passed; final review and exact-head
-CI/landing remain separate gates. See [current 0.19.0 evidence](../docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
-No historical native fixture, SDK receipt or static approval qualifies 0.19.0.
+authorized same-profile provider smoke passed in that adoption campaign; the grant
+was consumed and is not renewed here. Its final review and exact-head CI/landing
+history is preserved in the [0.19.0 adoption evidence](../docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
+No historical native fixture, SDK receipt or static approval qualifies the new
+tracked-input feature or any native/service behavior.
 Upstream #6578 is CLOSED and #6700 is CLOSED UNMERGED; the actual #6970 repair
 appears in official 0.19.0 release notes. Inclusion is not local workflow-gate
-qualification. Gate/admission containment and active-control fail-closed policy
-remain unchanged; active cancellation is nonterminal `cancellation_pending`.
+qualification. That adoption retained gate/admission containment and active-control
+fail-closed policy; active cancellation was nonterminal `cancellation_pending`.
 The existing uninstall generation defect is separately tracked in
 [issue #273](https://github.com/kogangdon/gjc-remote/issues/273) and is **not repaired**
-by the SDK upgrade. Source 0.19.0 authorizes neither installation nor signing
+by the SDK adoption or tracked-input integration. Source 0.19.0 authorizes neither installation nor signing
 nor reuse of immutable rc.14/rc.12 identities.
 
 ### Historical SDK 0.18.12 source evidence (PR #265)
 
 These receipts describe the prior official unpatched 0.18.12 source snapshot,
-not current 0.19.0 qualification. Its native lifetime/ACL/publication/construction/
+not current tracked-input qualification. Its native lifetime/ACL/publication/construction/
 fixture repairs were excluded and deferred; main native code was freshly built unchanged.
 Post-admission parent-run SDK-only receipts recorded Windows focused **333/333 passed**, zero
 skips, bounded workspace **2704 tests: 2700 passed, 0 failed, 4 skipped**, and
@@ -83,8 +124,8 @@ existing `codex-eco` runtime-only child override: three exact A-B-A `SMOKE_OK`
 responses, heartbeat, three successful invoke terminals, exit 0, and ephemeral
 relay port free. No optional model query, wrapper retry, or wrapper persistent
 profile write occurred. Same-profile basic continuity is not isolation or a
-proven #247 disconnect fix. Active daemon controls remain fail-closed and
-active cancellation remains nonterminal `cancellation_pending`; aggregate
+proven #247 disconnect fix. In that historical snapshot, active daemon controls
+remained fail-closed and active cancellation remained nonterminal `cancellation_pending`; aggregate
 oracle success does not establish standalone SDK abort support. The 0.18.12
 snapshot did not include the later #6970 workflow guard repair; #6763's approval
 binding is distinct. The smoke was not repeated after the historical fixture/test-only

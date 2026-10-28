@@ -13,26 +13,71 @@ Foreground operation is the operational fallback when service, provenance, or
 evidence gates are not satisfied. It is not boot-managed and does not roll
 back the application artifact, runtime, mapping authority, or durable state.
 
-## Current SDK-only 0.19.0 source boundary
+## Current tracked-input source contract — LOCAL qualified subset
 
-Current source uses the official unpatched SDK 0.19.0. Its evidence is tracked
-in the [current SDK-only 0.19.0 evidence record](../../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
-and records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
-skips, canonical imports, and one newly authorized same-profile provider smoke.
-Historical 0.18.12 receipts, PR #265 and signed/prepared release records below do
-not qualify 0.19.0. Review/CI/landing are tracked separately; no signed-release,
-installation or deployment PASS is claimed here.
+The issue #231 source integration uses official unpatched SDK 0.19.0's public
+tracked `submitUserMessage` for active `steer` and `follow_up`. Admission,
+execution, and final terminal ownership are separate; admission is not execution
+or completion. Sequential delivery is per SDK queue; joined requests may share
+a logical run and terminal. No global cross-mode FIFO or isolated per-request
+generation is promised. Idle controls remain serialized real prompts, and
+root/model serial operations wait for tracked work to settle.
 
-Active `steer` and `follow_up` remain fail-closed. Active cancellation remains
-nonterminal `cancellation_pending`, not interruption proof; aggregate oracle
-success does not establish standalone SDK abort support. Upstream #6578 is
+SDK queue cancellation must positively remove queued work before reporting
+`cancelled_before_start` and terminal `cancelled`. Queued-looking revocation
+may lose the dequeue race and then remains `cancellation_pending`; executing
+shared-run interruption is still unqualified. Gate ownership is deliberately
+scope/cohort-bound, never inferred from the most recent submitter. Genuine
+primary and joined-run Ask qualify exact owner/presentation routing; ambiguous
+promoted overlap has no immutable public owner bridge and fails bounded
+`SDK_TRACKED_INPUT_GATE_OWNERSHIP`, without wrong-owner presentation or answer.
+See the [current tracked-input evidence](../../daemon-workspace-verification.md#current-tracked-input-evidence).
+
+Current **LOCAL Windows** evidence is focused **474/474 passed** (zero failures
+or skips) and unrestricted workspace **2897 total: 2887 passed, 0 failed,
+10 existing platform/privilege skips**, with no exclusion patterns. It covers
+genuine SDK tracked handles/terminals, late follow-up/steer successor consumption,
+root execution proof, bounded gate refusal and canonical/isolation/lifecycle/
+protocol/docs regressions, not universal gate or isolation qualification.
+These post-review regressions use mock providers, with no real-provider calls.
+Independent static review is **APPROVE** across all five product-review lanes
+and the final test-only correction; it is not independent runtime approval.
+Exact-head CI remains **PENDING**; #231 remains open.
+
+The feature-only smoke grant is **CONSUMED-PASS** on the pinned **PRE-REVIEW**
+source (`.git/issue231-pre-review-source.json`), not the post-review
+fatal-retirement/router source. It was one child-only `codex-eco`
+A-B-A run, three exact `SMOKE_OK` responses, heartbeat and three successful
+invoke terminals, exit 0, relay port free, no optional model query or retry.
+It proves basic roots only at that pin, not the current tree, a #247 disconnect
+fix, tracked active-control provider behavior, profile/tenant
+isolation, other-platform, service-install, security or deployment qualification.
+Neither this grant nor older consumed grants may be replayed.
+
+### Historical SDK-only 0.19.0 adoption evidence
+
+PR [#274](https://github.com/kogangdon/gjc-remote/pull/274) adopted official
+0.19.0; its SDK-only evidence is **HISTORICAL for tracked-input integration**.
+The [SDK-only 0.19.0 evidence record](../../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
+skips, canonical imports, and the then-authorized same-profile provider smoke.
+That paid grant is consumed and cannot be replayed. Neither the old smoke nor
+prior CI/review/landing qualifies this integration. Historical 0.18.12 receipts,
+PR #265 and signed/prepared release records below do not qualify 0.19.0 or this
+feature. Current local subset evidence and static review APPROVE are recorded
+above; exact-head CI remains pending, with no signed-release, installation or deployment
+PASS claimed. SDK version/SRI and immutable release identities
+remain unchanged. This work does not authorize install/service/sign/deploy
+operations, account/ACL/credential changes, or issue closure.
+
+Aggregate oracle success does not establish standalone SDK abort support. Upstream #6578 is
 closed and #6700 is closed unmerged. Repair #6970 is included in the official
 0.19.0 release notes, not a local workflow-gate PASS. #6763's approval binding
 is a separate change; do not bypass containment.
 
 The existing uninstall generation/schema defect is tracked separately in
 [repository issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
-and is excluded from this SDK upgrade. The SDK source change does not authorize
+and is excluded from SDK adoption and tracked-input integration. The SDK source change does not authorize
 rebuilding, signing, or installing under an immutable old release tag.
 
 ## Service boundary
@@ -170,6 +215,9 @@ before any removal. Neither an unsigned build nor local fixture smoke proves
 canonical installation or provider/remote E2E.
 
 ### Historical SDK-only 0.18.12 evidence
+
+These receipts are **HISTORICAL for tracked-input integration**, not feature
+qualification. Their paid smoke grant is consumed and cannot be replayed.
 
 The following receipts and PR #265 are historical and do not qualify 0.19.0.
 Post-admission parent-run main-based 0.18.12 SDK-only verification records Windows focused **333/333

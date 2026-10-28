@@ -79,7 +79,7 @@ service deployment is claimed here.
 
 The existing uninstall generation/schema defect is tracked separately in
 [repository issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
-and is excluded from this SDK upgrade. The SDK source change does not authorize
+and is excluded from SDK adoption and tracked-input integration. The SDK source change does not authorize
 rebuilding, signing, or installing under an immutable old release tag.
 
 ## Register and start
@@ -142,12 +142,19 @@ is exactly one of `cancelled_before_start`, `cancellation_pending`,
 receipt. Request/cancel tombstones are bounded and retained through the
 hard-cap/receipt horizon.
 
-A queued cancellation is revoked before SDK, provider, or tool execution. It
-receives `cancelled_before_start`, followed by the authoritative terminal
-`cancelled` frame. Active work can only receive nonterminal
-`cancellation_pending`: the daemon has no qualified active-interruption
-integration, and the natural terminal remains authoritative. A cancellation receipt
-does not prove a terminal outcome or host quiescence.
+For tracked work, gate ownership is deliberately bound to the logical-run
+scope/cohort, not the most recent submitter. Joined requests may share that run
+and terminal without transferring gate ownership. Ambiguity is bounded and
+fails explicitly rather than guessing a gate recipient; the exact presentation
+and initiating-user checks above still apply.
+
+Positive removal from the daemon queue or through SDK queue cancellation before
+execution receives `cancelled_before_start`, followed by the authoritative
+terminal `cancelled` frame. Queued-looking SDK work can win the dequeue race;
+without positive removal the result remains nonterminal `cancellation_pending`.
+Executing shared-run interruption is still unqualified, and the tracked run's
+eventual terminal remains authoritative. A cancellation receipt does not prove
+a terminal outcome or host quiescence.
 
 The daemon's authoritative final response is an `event` containing
 `invoke_terminal`, `done: true`, and no top-level `error`.
@@ -170,25 +177,69 @@ that cancellation was requested—not that interruption occurred. Operators
 should use it for a known owned request, wait for its terminal outcome, and
 inspect the host before retrying. Bot idle/hard-cap expiry, presentation
 failure, and shutdown/disconnect ownership changes use the same revocation
-path. This does not restore active `steer`/`follow_up` or unblock #231.
+path. This does not qualify executing shared-run interruption or authorize
+issue #231 closure.
 
-Official unpatched SDK 0.19.0 includes the late-follow-up continuation fix and
-public tracked `submitUserMessage` ownership API. API existence is not qualified
-daemon integration: active `steer` and `follow_up` remain fail-closed, and active
-cancellation remains nonterminal `cancellation_pending`, not interruption proof.
-Aggregate oracle success does not establish standalone SDK abort support.
+### Current tracked-input source contract — LOCAL qualified subset
 
-Current 0.19.0 source evidence is tracked in the
-[current SDK-only 0.19.0 evidence record](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
-and records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
-skips, canonical imports, and one newly authorized same-profile provider smoke.
-Review/CI/landing are tracked separately; no signed-release, installation, or
-deployment PASS is claimed here.
+The issue #231 source integration uses official unpatched SDK 0.19.0's public
+tracked `submitUserMessage` for active `steer` and `follow_up`. Admission,
+execution, and final terminal ownership are distinct; admission is not execution
+or completion. Sequential delivery is per SDK queue. Joined requests may share
+a logical run and terminal; there is no global cross-mode FIFO or isolated
+per-request generation promise. Idle controls remain serialized real prompts,
+and root/model serial operations wait for tracked work to settle.
+Genuine primary and joined-run Ask qualify exact owner/presentation routing;
+ambiguous promoted overlap has no immutable public owner bridge and fails bounded
+`SDK_TRACKED_INPUT_GATE_OWNERSHIP`, without wrong-owner presentation or answer.
+See the
+[current tracked-input evidence](../daemon-workspace-verification.md#current-tracked-input-evidence).
+
+Current **LOCAL Windows** evidence is focused **474/474 passed** (zero failures
+or skips) and unrestricted workspace **2897 total: 2887 passed, 0 failed,
+10 existing platform/privilege skips**, with no exclusion patterns. It covers
+genuine SDK tracked handles/terminals, late follow-up/steer successor consumption,
+root execution proof, bounded gate refusal and canonical/isolation/lifecycle/
+protocol/docs regressions, not universal gate or isolation qualification.
+These post-review regressions use mock providers, with no real-provider calls.
+Independent static review is **APPROVE** across all five product-review lanes
+and the final test-only correction; it is not independent runtime approval.
+Exact-head CI remains **PENDING**; #231 remains open.
+
+The feature-only smoke grant is **CONSUMED-PASS** on the pinned **PRE-REVIEW**
+source (`.git/issue231-pre-review-source.json`), not the post-review
+fatal-retirement/router source. It was one child-only `codex-eco`
+A-B-A run, three exact `SMOKE_OK` responses, heartbeat and three successful
+invoke terminals, exit 0, relay port free, no optional model query or retry.
+It proves basic roots only at that pin, not the current tree, a #247 disconnect
+fix, tracked active-control provider behavior, profile/tenant
+isolation, other-platform, service-install, security or deployment qualification.
+Neither this grant nor older consumed grants may be replayed.
+
+### Historical SDK-only 0.19.0 adoption evidence
+
+PR [#274](https://github.com/kogangdon/gjc-remote/pull/274) adopted official
+0.19.0; its SDK-only evidence is **HISTORICAL for tracked-input integration**.
+The [SDK-only 0.19.0 evidence record](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
+skips, canonical imports, and the then-authorized same-profile provider smoke.
+That paid grant is consumed and cannot be replayed. Neither the old smoke nor
+prior CI/review/landing qualifies the new integration; aggregate oracle success
+does not establish standalone SDK abort support. Current local subset evidence is
+recorded above with static review APPROVE; exact-head CI remains pending, with no
+signed-release, installation, or deployment PASS claimed here.
+SDK version/SRI and immutable release identities remain unchanged. This work
+does not authorize install/service/sign/deploy operations, account/ACL/credential
+changes, or issue closure. The separate uninstall defect remains
+[issue #273](https://github.com/kogangdon/gjc-remote/issues/273), not part of this feature.
 Upstream #6578 is closed and #6700 is closed unmerged. Repair #6970 is included
 in the official 0.19.0 release notes, not a local workflow-gate PASS. #6763's
 transcript-content approval binding is a separate change; do not bypass containment.
 
 ### Historical SDK-only 0.18.12 evidence
+
+These receipts are **HISTORICAL for tracked-input integration**, not feature
+qualification. Their paid smoke grant is consumed and cannot be replayed.
 
 The following 0.18.12 receipts and PR #265 are historical and do not qualify
 0.19.0. Post-admission parent-run SDK-only receipts record Windows focused **333/333 passed** (zero

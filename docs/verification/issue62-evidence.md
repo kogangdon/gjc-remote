@@ -1,32 +1,71 @@
 # Issue #62 SDK isolation probe
 
-## Current SDK 0.19.0 evidence
+## Current tracked-input evidence — locally qualified subset
 
-Current source targets official unpatched `@gajae-code/coding-agent`,
-`@gajae-code/agent-core` and `@gajae-code/ai` **0.19.0**, on
-`feat/sdk-0.19.0-upgrade` from main `69f5ab69f488f7c88ee55af4a24007b6ac33ef8a`.
-Windows focused tests passed 265/265, and unrestricted workspace tests recorded
-2739 pass, zero fail and 10 skips out of 2749. Real-SDK probes/canonical imports
-and one newly authorized same-profile provider smoke passed. Final independent
-review and exact-head CI/landing remain separate gates. The
-[current evidence ledger](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
-owns exact current 0.19.0 results and limits. No fresh Linux/macOS/Docker result
-is claimed. Historical counts, artifact names,
-smoke and PR #265 below remain bound to their original pins, not 0.19.0.
+`feat/sdk-tracked-live-controls` implements #231 atop merged SDK 0.19.0 main
+`891c7aad71307f56ce5a140fb08599b1a53551ab`. Official unpatched
+`@gajae-code/coding-agent`, `@gajae-code/agent-core` and `@gajae-code/ai`
+remain **0.19.0**, with version/SRI unchanged. Current Windows focused/full
+post-review regressions passed with credentialless mock providers: **474/474**
+focused and unrestricted workspace **2897 tests, 2887 pass, 0 fail, 10 existing
+skips**, exit 0. Five prior independent lanes plus final test-correction review
+statically **APPROVE**, not independent runtime evidence; exact-head CI remains
+pending. The
+[current tracked-input ledger](../daemon-workspace-verification.md#current-tracked-input-evidence)
+owns detailed counts, receipts, review provenance and remaining SDK limits.
+The consumed-PASS issue231 basic-root provider smoke qualifies **PRE-REVIEW source
+only**; later router/fatal-retirement fixes and final test corrections were not
+provider rerun. It cannot be replayed and is not current-source, active-control
+provider or isolation qualification. Issue #231 remains **OPEN**. Historical
+counts, artifacts and reviews below qualify only their original cohorts,
+not tracked-input integration or profile/tenant isolation.
+
+The source contract admits active `steer`/`follow_up` through public
+`AgentSession.submitUserMessage()` / `QueuedInputSubmission` tracked handles,
+stable submission identity, sequential per-queue policy and scoped cohort/run
+event routing. Multiple controls can JOIN one logical run and share its terminal;
+sequential does not promise global cross-mode FIFO or independent generations.
+Genuine execution, terminal and pre-start removal receipts are required, not
+text matching or unrelated-terminal correlation. Idle controls remain serialized
+real prompts; root prompt/model operations cannot overtake tracked work.
+Each cohort has one deliberate gate owner; unprovable ownership must fail
+explicitly within a bound. Genuine primary/joined Ask and late successor
+consumption qualify locally; ambiguous promoted overlap still fails with
+`SDK_TRACKED_INPUT_GATE_OWNERSHIP`, without presentation, answer or continuation.
+Universal gate support is not claimed. Queued cancellation requires positive pre-start removal; a lost
+dequeue race or executing work remains nonterminal `cancellation_pending`.
+There is no selective running abort or interruption/quiescence proof.
 
 Upstream #6578 is CLOSED; #6700 is CLOSED UNMERGED. The actual #6970 repair
 appears in official 0.19.0 release notes. Inclusion is not local Ultragoal/Ralplan
-workflow-gate qualification. Gate/admission containment and live-control policy
-remain fail-closed: active `steer`/`follow_up` are unsupported, and active
-cancellation is only nonterminal `cancellation_pending`, not interruption proof.
+workflow-gate qualification. Gate/admission containment remains fail-closed when
+ownership is unprovable; tracked-input integration does not qualify all gates.
 No bypass or admission recovery is authorized.
 
 The existing uninstall generation defect is tracked separately as
 [repo issue #273](https://github.com/kogangdon/gjc-remote/issues/273) and is **not repaired**
-by the SDK upgrade. Current source authorizes no installation, signing or reuse
+by tracked-input integration. Current source authorizes no release, installation,
+deployment, signing, host-ACL/account/credential changes, issue closure or reuse
 of immutable rc.14/rc.12 identities; older candidate SDK/version evidence stays
 historical. Native/service/security/fault/OOM/noDump and installation/deployment/
-production/support/release qualification are not established by this upgrade.
+production/support/release qualification are not established by this integration.
+
+## Historical SDK 0.19.0 adoption — 9512dd8 / PR #274
+
+The SDK adoption cohort on `feat/sdk-0.19.0-upgrade` started from main
+`69f5ab69f488f7c88ee55af4a24007b6ac33ef8a` and was published as
+`9512dd85e7a7ae6e826b8628efad6480cdd569ec` in
+[PR #274](https://github.com/kogangdon/gjc-remote/pull/274), merged at
+`891c7aad71307f56ce5a140fb08599b1a53551ab`. Its Windows focused tests passed
+**265/265**, and unrestricted workspace tests recorded **2749 tests, 2739 pass,
+zero fail, 10 skips**. Real-SDK probes/canonical imports and one authorized
+same-profile A-B-A provider smoke passed for that adoption cohort. These are
+historical results, not tracked-input tests. Its paid smoke grant is consumed,
+cannot be replayed and provides no fresh provider authority. Original receipts
+remain `.git/sdk019-focused-01.json`, `.git/sdk019-workspace-01.json`,
+`.git/sdk019-workspace-02.json`, `.git/sdk019-docs-refresh-01.json`,
+`.git/sdk019-final-docs-01.json` and `.git/sdk019-provider-smoke.json`.
+Review/CI/merge evidence belongs to PR #274, not the current feature.
 
 ## Historical SDK 0.18.12 implementation and PR #265
 
@@ -45,7 +84,7 @@ post-admission parent verification** below and are independently cleared.
 `artifacts/sdk-first-0.18.12-final-review.json` records **APPROVE**, with zero
 P0/P1/P2. This is independent static agent review, not independent runtime or
 CI/merge/deployment approval. Historical review/landing belongs to that PR,
-not the new 0.19.0 upgrade. Local receipts alone do not approve landing.
+not the tracked-input integration. Local receipts alone do not approve landing.
 No prior combined-worktree result, count, receipt or
 provider smoke qualified that SDK-only main-based tree. This was not release,
 native-repair, deployment or tenant-isolation qualification.
@@ -91,8 +130,8 @@ The final static review inspected parent focused/Linux evidence but did not
 observe the concurrent workspace result; the completed workspace counts above
 are attributed separately to `sdk-first-0.18.12-admission2-workspace.json`.
 No test, gate, SDK import or provider invocation was run by the documentation
-lane. The parent separately executed current 0.19.0 verification recorded in
-the ledger above; historical results here do not qualify that snapshot.
+lane. The parent separately executed the historical 0.19.0 adoption verification;
+none of these results qualifies the current tracked-input snapshot.
 
 ### Historical initial, intermediate and failed attempts
 
@@ -156,8 +195,9 @@ prompt and no continuation provider call after unwind; it never fabricates a
 terminal. It allows either standalone settlement inside 250 ms or settlement
 only after a late-answer unwind. The boolean branch is **not retained in the
 aggregate parent receipt**, so a passing aggregate does not prove standalone
-bounded interruption. Active daemon cancellation still returns only
-nonterminal `cancellation_pending`; active `steer`/`follow_up` remain fail-closed.
+bounded interruption. In that historical cohort, active daemon cancellation
+returned only nonterminal `cancellation_pending`, and active `steer`/`follow_up`
+were rejected. Those observations are not the current tracked-input contract.
 
 Windows local order outputs `artifacts/issue62-A-B.json` and
 `artifacts/issue62-B-A.json` (unshipped) independently report expected/observed,
@@ -352,9 +392,10 @@ then-pending final parent docs gate were separate from static review clearance.
 
 ### Current probe commands and environment
 
-Run from the current `feat/sdk-0.19.0-upgrade` checkout, with Node >=26 and Bun >=1.4.0.
+Probe entrypoints target `feat/sdk-tracked-live-controls`, with Node >=26 and Bun >=1.4.0.
 The older `D:/dev/gjc-remote-sdk-only-0.18.12` worktree is historical evidence,
-not a new-version verification target.
+not a current-feature verification target. Current focused/full execution is
+recorded in the central ledger above; this documentation update adds no runs.
 These focused commands describe the probe entrypoints, not additional
 executions by this documentation lane. The historical parent commands/counts are
 in the receipts above; do not substitute unrestricted workspace execution:
@@ -378,8 +419,8 @@ probe pass. Preserve the expected controlled-provider warning and all other
 warnings in parent output; unexpected warnings require investigation.
 
 Historical 0.18.12 canonical imports were exercised by the actual SDK probes above;
-current 0.19.0 imports separately passed the parent Windows probes. Neither is
-all-platform qualification.
+historical 0.19.0 adoption imports separately passed the parent Windows probes
+at `9512dd8` / PR #274. Neither is tracked-input or all-platform qualification.
 The separately authorized historical single provider smoke
 is distinct from this credentialless probe and must not be inferred from it.
 Any further provider execution requires separate authorization. Observations
@@ -389,8 +430,9 @@ bind the bytes at execution, not later refreshed docs or future checkouts.
 
 Each receipt carries separate
 `approvedBaseCommit` and `sourceCommit` fields; source may be a descendant of
-the approved base. The approved original base remains
-`a5bb530bd5a063b6571a7ba963e938bb6f97616f`. A deterministic SHA-256 digest
+the approved base. The isolation probe's approved original base remains
+`a5bb530bd5a063b6571a7ba963e938bb6f97616f`, not the tracked-input branch base.
+A deterministic SHA-256 digest
 covers these four files, in this exact order:
 `daemon/test-fixtures/sdk-isolation-probe.mjs`,
 `daemon/test/sdk-isolation-probe.test.js`,
@@ -451,7 +493,7 @@ the real factory path, not inferred merely from package declarations.
 
 The queued-follow-up liveness gap remained in that published package. The daemon
 contained it by rejecting `steer` and `follow_up` while a prompt was active,
-before SDK queue admission; idle controls remain prompt-equivalent FIFO work.
+before SDK queue admission; idle controls were prompt-equivalent FIFO work.
 Upstream issue
 [`Yeachan-Heo/gajae-code#5351`](https://github.com/Yeachan-Heo/gajae-code/issues/5351)
 was closed after
@@ -466,8 +508,8 @@ lists only the smoke-test timing and SDK lifecycle-replay fixes for that
 release. Issue closure on `dev` is therefore not release inclusion. A supported
 public ownership lifecycle is requested in
 [`Yeachan-Heo/gajae-code#5429`](https://github.com/Yeachan-Heo/gajae-code/issues/5429);
-the contract oracle verifies fail-closed containment independently of this
-historical isolation probe.
+the historical contract oracle verified fail-closed containment independently
+of this historical isolation probe, not the current tracked-input contract.
 
 ## Historical SDK 0.16.4 observed boundary
 

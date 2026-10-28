@@ -18,32 +18,76 @@ describes only the current command contract, not boot supervision, production
 promotion, or tenant isolation. “Release candidate” and “future phase” are
 design/release states, not observed production support.
 
-The official unpatched SDK 0.19.0 source pin keeps live controls fail-closed: an active
-`steer` or `follow_up` is rejected before SDK queue admission, while an idle
-control remains prompt-equivalent FIFO work. The published package includes the
-late-follow-up continuation fix and public tracked submission ownership, but
-daemon live-control integration and qualification remain outstanding. Active
-cancellation remains nonterminal `cancellation_pending`, not proof of interruption.
+### Current tracked-input source contract — LOCAL qualified subset
+
+The issue #231 source integration uses official unpatched SDK 0.19.0's public
+tracked `submitUserMessage` for active `steer` and `follow_up`, with distinct
+admission, execution, and final terminal ownership. Admission is not execution
+or completion. Sequential delivery is per SDK queue; joined requests may share
+a logical run and terminal. There is no global cross-mode FIFO or isolated
+per-request generation promise. Idle controls remain serialized real prompts;
+root/model serial operations wait for tracked work to settle.
+
+SDK queue cancellation must positively remove queued work before reporting
+`cancelled_before_start` and terminal `cancelled`. A queued-looking revocation
+can lose the dequeue race and must then remain `cancellation_pending`.
+Executing shared-run interruption is still unqualified. Gate ownership is
+deliberately scope/cohort-bound. Genuine primary and joined-run Ask qualify
+exact owner/presentation routing; ambiguous promoted overlap has no immutable
+public owner bridge and fails bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP`, without
+wrong-owner presentation or answer. See the
+[current tracked-input evidence](../daemon-workspace-verification.md#current-tracked-input-evidence)
+and [daemon integration boundary](daemon.md#invoke-and-integration-boundary).
+
+Current **LOCAL Windows** evidence is focused **474/474 passed** (zero failures
+or skips) and unrestricted workspace **2897 total: 2887 passed, 0 failed,
+10 existing platform/privilege skips**, with no exclusion patterns. It covers
+genuine SDK tracked handles/terminals, late follow-up/steer successor consumption,
+root execution proof, bounded gate refusal and canonical/isolation/lifecycle/
+protocol/docs regressions, not universal gate or isolation qualification.
+These post-review regressions use mock providers, with no real-provider calls.
+Independent static review is **APPROVE** across all five product-review lanes
+and the final test-only correction; it is not independent runtime approval.
+Exact-head CI remains **PENDING**; #231 remains open.
+
+The feature-only smoke grant is **CONSUMED-PASS** on the pinned **PRE-REVIEW**
+source (`.git/issue231-pre-review-source.json`), not the post-review
+fatal-retirement/router source. It was one child-only `codex-eco`
+A-B-A run, three exact `SMOKE_OK` responses, heartbeat and three successful
+invoke terminals, exit 0, relay port free, no optional model query or retry.
+It proves basic roots only at that pin, not the current tree, a #247 disconnect
+fix, tracked active-control provider behavior, profile/tenant
+isolation, other-platform, service-install, security or deployment qualification.
+Neither this grant nor older consumed grants may be replayed.
+
 Upstream #6578 is closed and #6700 is closed unmerged. Repair #6970 is included
 in the official 0.19.0 release notes; that is not a local workflow-gate PASS.
 #6763's approval binding is a separate change. Do not bypass containment.
-See the [current SDK boundary](daemon.md).
 
-### Current SDK-only evidence
+### Historical SDK-only 0.19.0 adoption evidence
 
-Current official 0.19.0 source evidence is tracked in the
-[current SDK-only 0.19.0 evidence record](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
-and records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
-skips, canonical imports, and one newly authorized same-profile provider smoke.
-Review/CI/landing are tracked separately; no signed-release, installation, or
-deployment PASS is claimed here.
-The 0.18.12 receipts and PR #265 below are historical and do not qualify 0.19.0.
+PR [#274](https://github.com/kogangdon/gjc-remote/pull/274) adopted official
+0.19.0; its SDK-only evidence is **HISTORICAL for tracked-input integration**.
+The [SDK-only 0.19.0 evidence record](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
+skips, canonical imports, and the then-authorized same-profile provider smoke.
+That paid grant is consumed and must not be replayed. Neither that smoke nor
+prior CI/review/landing qualifies the new integration. Current local subset
+evidence and static review APPROVE are recorded above; exact-head CI remains pending,
+with no signed-release, installation, or deployment PASS claimed.
+The 0.18.12 receipts and PR #265 below are also historical and do not qualify
+0.19.0 or this feature. SDK version/SRI and immutable release identities remain
+unchanged. This work does not authorize install/service/sign/deploy operations,
+account/ACL/credential changes, or issue closure.
 The existing uninstall generation/schema defect is tracked separately in
 [repository issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
-and is excluded from the SDK upgrade scope. Changing the SDK source does not
+and is excluded from SDK adoption and tracked-input integration. Changing the SDK source does not
 authorize rebuilding, signing, or installing under an immutable old release tag.
 
 ### Historical SDK-only 0.18.12 evidence
+
+These receipts are **HISTORICAL for tracked-input integration**, not feature
+qualification. Their paid smoke grant is consumed and cannot be replayed.
 
 Post-admission parent-run local receipts for the prior main-based 0.18.12 SDK-only tree record Windows
 focused **333/333 passed**, zero skips, and bounded Windows workspace **2704
