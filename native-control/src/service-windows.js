@@ -1245,7 +1245,7 @@ export function createWindowsServiceDriver(options) {
             component, serviceKey, platform: 'win32', architecture: 'x64',
             serviceGeneration: transaction.serviceGeneration,
             transactionId: transaction.transactionId,
-            resourceProof: transaction.transition.platformResourceFingerprint,
+            resourceProof: transaction.final.resourceProof,
             applicationManifestFingerprint: trial.releaseFingerprint,
             bootFingerprint: boundary.bootFingerprint,
             processEpochFingerprint: canonicalJsonHash({ kind: 'windows-process-epoch/v1', wrapperEpochFingerprint: boundary.wrapperEpochFingerprint, childEpochFingerprint: boundary.childEpochFingerprint, wrapper: trial.wrapper, tree: trial.process.tree }),

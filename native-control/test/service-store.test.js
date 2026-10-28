@@ -1544,7 +1544,18 @@ function emptyReferences(serviceKey = 'bot', component = 'bot', generation = 0) 
   });
 }
 
-function startupProofFor(transaction, resource) {
+function startupProofFor(transaction, resource, boundary = null, overrides = {}) {
+  const clock = transaction.platform === 'win32' ? {
+    clockKind: 'windows-boot-tick',
+    boundaryFingerprint: boundary.boundaryFingerprint,
+    observedTickMs: boundary.lastTickMs,
+    deadlineTickMs: boundary.deadlineTickMs,
+    logEvidenceFingerprint: hash('5'),
+  } : {
+    startBoundaryMs: 1_000,
+    observedAtMs: 50_000,
+    expiresAtMs: 61_000,
+  };
   return buildServiceStartupProof({
     component: transaction.component,
     serviceKey: transaction.serviceKey,
@@ -1554,18 +1565,17 @@ function startupProofFor(transaction, resource) {
     transactionId: transaction.transactionId,
     resourceProof: resource.resourceProof,
     applicationManifestFingerprint: resource.applicationManifestFingerprint,
-    bootFingerprint: hash('1'),
+    bootFingerprint: boundary?.bootFingerprint ?? hash('1'),
     processEpochFingerprint: hash('2'),
     platformEvidenceFingerprint: hash('3'),
     applicationEvidenceFingerprint: hash('4'),
     platformState: buildServicePlatformState(transaction.platform, 'trial'),
-    startBoundaryMs: 1_000,
-    observedAtMs: 50_000,
-    expiresAtMs: 61_000,
+    ...clock,
     startupEvidence: 'fresh-current-epoch',
     connectivityObservation: transaction.component === 'bot'
       ? 'last-observed-connected'
       : 'startup-only',
+    ...overrides,
   });
 }
 
@@ -6892,6 +6902,145 @@ test('model: shared-template binding rejects caller-supplied digest authority', 
   assert.equal(binding.artifactKind, 'shared-template');
   assert.equal(binding.artifactFingerprint, sha256(Buffer.from('daemon-template')));
   session.close();
+});
+
+test('Linux model: actual store admits update/rollback startup service proofs against provisional metadata', () => {
+  for (const operation of ['update', 'rollback']) {
+    const model = committedUpdateModel();
+    const deployment = operation === 'rollback' ? model.originalDeployment : applicationManifest({
+      sequence: 3, version: '3.0.0', archiveHash: hash('6'),
+    });
+    const successor = successorFixture(model.updated, deployment, { operation });
+    const { transaction, resource, manifest } = successor;
+    const session = model.store.openMutation();
+    try {
+      session.appendJournal(transaction);
+      const current = session.readResourceProof('current').value;
+      assert.notEqual(current.resourceProof, resource.resourceProof);
+      const trialPlatform = transaction.transition.platformResourceFingerprint;
+      const finalPlatform = transaction.transition.expectedAfterResourceFingerprint;
+      assert.equal(resource.platformResourceFingerprint, finalPlatform);
+      assert.equal(new Set([trialPlatform, finalPlatform, resource.resourceProof]).size, 3);
+      const proof = startupProofFor(transaction, resource);
+      const absent = session.readStartupProof();
+      const before = session.writes;
+      expectCode(() => session.publishStartupProof(proof, absent), 'SERVICE_SCOPE_MISMATCH');
+      session.acceptProvisionalMetadata({ transaction, resource, manifest });
+      assert.equal(session.writes, before);
+      assert.equal(session.readResourceProof('current').value.resourceProof, current.resourceProof);
+      for (const overrides of [
+        { resourceProof: trialPlatform }, { resourceProof: finalPlatform },
+        { transactionId: 'tx-foreign' }, { serviceGeneration: transaction.serviceGeneration + 1 },
+        { applicationManifestFingerprint: hash('0') },
+      ]) {
+        expectCode(() => session.publishStartupProof(startupProofFor(transaction, resource, null, overrides), absent), 'SERVICE_SCOPE_MISMATCH');
+        assert.equal(session.writes, before);
+        assert.equal(session.readStartupProof().present, false);
+      }
+      const published = session.publishStartupProof(proof, absent);
+      assert.equal(published.value.resourceProof, resource.resourceProof);
+      assert.equal(published.value.startupProof, proof.startupProof);
+      const after = session.writes;
+      expectCode(() => session.publishStartupProof(proof, absent), 'SERVICE_STALE');
+      assert.equal(session.writes, after);
+    } finally {
+      session.close();
+    }
+  }
+});
+
+function windowsStartupStoreModel() {
+  const fake = new FakeServiceNative('win32');
+  const store = bootstrap(fake);
+  const application = applicationManifest({ platform: 'win32' });
+  const shawl = shawlManifest();
+  const session = store.openMutation();
+  const installed = publishCommittedWindowsInstallation(
+    session, application, fake.seedApplicationPublication(application),
+    shawl, fake.seedShawlPublication(shawl),
+    { transactionId: 'tx-startup-store', transactionNonce: 'c'.repeat(32) },
+  );
+  // Reuse the existing boundary model's resource/platform binding, not the
+  // driver's distinct trial/final configuration plans. This is NOT the full
+  // Windows driver -> store seam: that seam currently fails boundary admission
+  // when the final resource record's platform hash differs from the trial hash.
+  const published = nextJournal(installed.committed, 'resource-published', 'observed');
+  session.appendJournal(published);
+  const captured = trialBoundaryFor(published, installed.resource);
+  session.publishTrialBoundary(captured, session.readTrialBoundary());
+  const started = nextJournal(published, 'trial-start-observed', 'observed');
+  session.appendJournal(started);
+  const boundary = trialBoundaryFor(published, installed.resource, {
+    ...captured, phase: 'observed', revision: 2,
+    previousBoundaryFingerprint: captured.boundaryFingerprint,
+    lastTickMs: 1_500, wrapperEpochFingerprint: hash('6'), childEpochFingerprint: hash('7'),
+    childCursor: trialCursorSet({ configFingerprint: installed.resource.configurationFingerprint }),
+  });
+  session.publishTrialBoundary(boundary, session.readTrialBoundary());
+  const transaction = nextJournal(started, 'starting', 'intent');
+  session.appendJournal(transaction);
+  return { fake, store, session, installed, transaction, boundary };
+}
+
+test('Windows boundary model: actual recovery store requires the exact final service proof and boundary', () => {
+  const model = windowsStartupStoreModel();
+  model.session.close();
+  const recovery = model.store.openRecovery();
+  const { transaction, installed, boundary } = model;
+  try {
+    const absent = recovery.readStartupProof();
+    const before = recovery.writes;
+    for (const overrides of [
+      { resourceProof: transaction.transition.platformResourceFingerprint },
+      { resourceProof: transaction.transition.expectedAfterResourceFingerprint },
+      { transactionId: 'tx-foreign' }, { serviceGeneration: transaction.serviceGeneration + 1 },
+      { applicationManifestFingerprint: hash('0') },
+    ]) {
+      expectCode(() => recovery.publishStartupProof(startupProofFor(transaction, installed.resource, boundary, overrides), absent), 'SERVICE_PENDING');
+      assert.equal(recovery.writes, before);
+    }
+    for (const overrides of [
+      { boundaryFingerprint: hash('0') }, { bootFingerprint: hash('0') },
+      { observedTickMs: boundary.lastTickMs - 1 },
+      { deadlineTickMs: boundary.deadlineTickMs + 1 },
+    ]) {
+      expectCode(() => recovery.publishStartupProof(startupProofFor(transaction, installed.resource, boundary, overrides), absent), 'SERVICE_SCOPE_MISMATCH');
+      assert.equal(recovery.writes, before);
+    }
+    const proof = startupProofFor(transaction, installed.resource, boundary);
+    const published = recovery.publishStartupProof(proof, absent);
+    assert.equal(published.value.resourceProof, transaction.final.resourceProof);
+    const after = recovery.writes;
+    expectCode(() => recovery.publishStartupProof(proof, absent), 'SERVICE_STALE');
+    assert.equal(recovery.writes, after);
+  } finally {
+    recovery.close();
+  }
+});
+
+test('Windows boundary model: committed reopen correlates startup service proof with current resource', () => {
+  const model = windowsStartupStoreModel();
+  const { session, transaction, installed, boundary, store, fake } = model;
+  const proof = startupProofFor(transaction, installed.resource, boundary);
+  session.publishStartupProof(proof, session.readStartupProof());
+  session.appendJournal(nextJournal(transaction, 'committed', 'observed'));
+  session.close();
+  const readOnly = store.openReadOnly();
+  assert.equal(readOnly.readStartupProof().value.resourceProof, readOnly.readResourceProof('current').value.resourceProof);
+  assert.equal(readOnly.writes, 0);
+  readOnly.close();
+  for (const overrides of [
+    { resourceProof: transaction.transition.platformResourceFingerprint },
+    { resourceProof: transaction.transition.expectedAfterResourceFingerprint },
+    { transactionId: 'tx-foreign' }, { serviceGeneration: transaction.serviceGeneration + 1 },
+    { applicationManifestFingerprint: hash('0') }, { boundaryFingerprint: hash('0') },
+  ]) {
+    fake.putRaw('manifest', 'bot', SERVICE_STORE_LAYOUT.startup,
+      canonicalJsonBytes(startupProofFor(transaction, installed.resource, boundary, overrides)));
+    const before = fake.totalWrites;
+    expectCode(() => store.openReadOnly(), 'SERVICE_MANUAL_CLEANUP');
+    assert.equal(fake.totalWrites, before);
+  }
 });
 
 test('model: Windows trial boundary is durable, CAS-branded, and never resets a same-attempt budget', () => {

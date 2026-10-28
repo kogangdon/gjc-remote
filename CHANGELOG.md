@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Windows startup-proof resource-domain repair (issue #240)
+
+- Bind the Windows startup proof's `resourceProof` to the admitted transaction's
+  service resource proof, not its trial platform-configuration fingerprint.
+  Trial and final platform fingerprints remain in their existing OS-evidence
+  fields; protected-store, epoch, cursor and readiness guards are unchanged.
+- Separate source renderer/driver availability from signed deployment and real
+  systemd/SCM qualification. This repair does not resolve the independently
+  observed Windows trial-boundary/provisional-metadata admission mismatch or
+  authorize any service, account, ACL, signing or deployment operation.
+
 ### Recovery success receipt contract repair (issue #240)
 
 - Return the exact `recover` result from successful trial completion,
