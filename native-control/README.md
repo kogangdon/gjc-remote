@@ -684,6 +684,16 @@ operation proof, or production signing authority.
 
 ## Lifecycle evidence harness
 
+Uninstall final absence proof and transaction sequencing have distinct
+generations: `final.serviceGeneration` is zero with null manifest/resource
+fingerprints and `disabled-not-startable` activation, while the transaction,
+tombstone and cleared reference record retain `old.serviceGeneration + 1`.
+Stable install/update/rollback final proofs retain the incremented generation.
+The issue #273 source repair does not relax ownership, CAS, journal, or absent
+proof validation, and does not establish real systemd/SCM uninstall evidence.
+SDK adoption and tracked-input evidence above remain their historical cohorts;
+neither cohort repaired this independently tracked lifecycle defect.
+
 `node scripts/service-lifecycle-evidence.js generate --output <outside-checkout>/service-lifecycle-evidence.json --acknowledge-service-lifecycle-fixture`
 creates a bounded, canonical, fixture-only lifecycle receipt. The harness
 creates temporary source, worktree, and configuration roots outside the

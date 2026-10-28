@@ -4,12 +4,15 @@ import { createServiceLifecycle } from '../src/service-lifecycle.js';
 import {
   buildServiceCandidateProof,
   buildServiceFinalProof,
+  buildServiceManifest,
   buildServiceOldProof,
   buildServicePlatformState,
+  buildServiceResourceProof,
   buildServiceTransaction,
   buildServiceTransitionProof,
   serviceConfigurationFingerprint,
   serviceRolesFingerprint,
+  validateServiceTransaction,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import { canonicalJsonHash } from '@gjc-remote/shared/strict-json';
 
@@ -1026,7 +1029,231 @@ test('a compatibility refusal precedes the transaction, journal head, provisiona
   assert.deepEqual(calls, ['acquisition-close', 'session-close']);
 });
 
-test('install binds final.manifestFingerprint to the service manifest self-fingerprint (rc14 domain regression)', async () => {
+function ownedMutationFixture(platform) {
+  const calls = [];
+  const absent = () => ({ present: false, value: null });
+  const present = (value) => ({ present: true, value });
+  const fixtureRoles = platform === 'win32' ? windowsRoles : roles;
+  const prefix = platform === 'win32' ? 'C:' : '';
+  const configuration = {
+    runtimePath: `${prefix}/runtime`, workingDirectory: `${prefix}/work`,
+    homeDirectory: `${prefix}/home`, logDirectory: `${prefix}/log`, channelsConfig: `${prefix}/channels`,
+    expectedHostSetFingerprint: '0'.repeat(64), expectedHostCount: 0,
+  };
+  const application = windowsApplicationManifest({ manifestFingerprint: '8'.repeat(64) });
+  const shawl = windowsShawlManifest({ manifestFingerprint: '9'.repeat(64) });
+  const tuple = { serviceKey: 'bot', component: 'bot', platform, architecture: 'x64' };
+  const bindings = {
+    serviceGeneration: 4, applicationManifestFingerprint: application.manifestFingerprint,
+    shawlManifestFingerprint: platform === 'win32' ? shawl.manifestFingerprint : null,
+    configurationFingerprint: serviceConfigurationFingerprint(configuration, { component: 'bot', platform }),
+    rolesFingerprint: serviceRolesFingerprint(fixtureRoles, platform),
+    platformState: buildServicePlatformState(platform, 'final'),
+  };
+  const resource = buildServiceResourceProof({
+    ...tuple, ...bindings, operation: 'update', transactionId: 'tx-owned', transactionNonce: '2'.repeat(32),
+    predecessorResourceProof: '3'.repeat(64), platformResourceFingerprint: 'd'.repeat(64),
+  });
+  const current = buildServiceManifest({
+    ...tuple, ...bindings, configuration, roles: fixtureRoles,
+    predecessorManifestFingerprint: '4'.repeat(64), resourceProof: resource.resourceProof,
+  });
+  const old = buildServiceOldProof({
+    disposition: 'stable', manifestFingerprint: '4'.repeat(64), resourceProof: '3'.repeat(64),
+    applicationManifestFingerprint: '5'.repeat(64), shawlManifestFingerprint: bindings.shawlManifestFingerprint,
+    serviceGeneration: 3, activation: 'enabled',
+  }, platform);
+  const candidate = buildServiceCandidateProof({
+    disposition: 'release', applicationManifestFingerprint: application.manifestFingerprint,
+    shawlManifestFingerprint: bindings.shawlManifestFingerprint, releaseSequence: 1,
+    releaseTreeFingerprint: application.inventory.treeFingerprint, compatibilityFingerprint: application.compatibilityFingerprint,
+  }, platform);
+  const final = buildServiceFinalProof({
+    disposition: 'stable', manifestFingerprint: current.manifestFingerprint, resourceProof: resource.resourceProof,
+    applicationManifestFingerprint: current.applicationManifestFingerprint, shawlManifestFingerprint: current.shawlManifestFingerprint,
+    serviceGeneration: current.serviceGeneration, activation: 'enabled',
+  }, platform);
+  const transition = buildServiceTransitionProof({
+    oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint,
+    expectedBeforeResourceFingerprint: '6'.repeat(64), expectedAfterResourceFingerprint: resource.platformResourceFingerprint,
+    platformResourceFingerprint: 'e'.repeat(64), platformState: buildServicePlatformState(platform, 'trial'),
+  }, platform);
+  const entries = [buildServiceTransaction({
+    ...tuple, transactionId: resource.transactionId, transactionNonce: resource.transactionNonce, operation: 'update',
+    serviceGeneration: current.serviceGeneration, old, candidate, transition, final,
+    phase: 'committed', substep: 'observed', previousJournalFingerprint: '7'.repeat(64),
+  })];
+  let manifestReceipt = present(current);
+  let resourceReceipt = present(resource);
+  let references = absent();
+  let tombstone = absent();
+  const rawResourceSha256 = 'f'.repeat(64);
+  const session = {
+    ...tuple, writes: 0,
+    readManifest: (slot) => slot === 'current' ? manifestReceipt : absent(),
+    readResourceProof: (slot) => slot === 'current' ? resourceReceipt : absent(),
+    readReferences: () => references,
+    readManualCleanup: absent, readStartupProof: absent, readSiblingReferences: () => [],
+    readJournal: () => ({ entries, head: present(entries.at(-1)), pending: null }),
+    assertFloorCas(input) {
+      calls.push('floor-cas');
+      if (input.applicationSequenceFloor !== 1 || (platform === 'win32' && input.shawlSequenceFloor !== 1)) {
+        throw lifecycleStoreError('SERVICE_STALE', 'assert_floor_cas');
+      }
+      return { application: { floor: { committedSequence: 1 } }, ...(platform === 'win32' ? { shawl: { floor: { committedSequence: 1 } } } : {}) };
+    },
+    appendJournal(value) {
+      validateServiceTransaction(value);
+      assert.equal(value.previousJournalFingerprint, entries.at(-1).transactionFingerprint);
+      entries.push(value);
+      this.writes += 1;
+      calls.push(value.phase);
+      return value;
+    },
+    acceptProvisionalMetadata: () => assert.fail('uninstall must not publish provisional metadata'),
+    publishCurrentMetadata: () => assert.fail('uninstall must not publish current metadata'),
+    readRetainedDeploymentEnvelope: ({ purpose }) => ({ manifest: purpose === 'application' ? application : shawl }),
+    readPublicationReceipt: ({ slot, artifactKind }) => {
+      assert.equal(slot, 'current');
+      return artifactKind === 'application' ? windowsApplicationPublication(application) : windowsShawlPublication(shawl);
+    },
+    readTombstone: () => tombstone,
+    publishTombstone(value, expected) {
+      assert.equal(expected, tombstone);
+      tombstone = present(value);
+      this.writes += 1;
+      calls.push('publish-tombstone');
+      return tombstone;
+    },
+    publishReferences(value, expected) {
+      assert.equal(expected, references);
+      references = present(value);
+      this.writes += 1;
+      calls.push('publish-references');
+      return references;
+    },
+    removeManifest(slot, expected) {
+      assert.equal(slot, 'current');
+      assert.equal(expected, manifestReceipt);
+      manifestReceipt = absent();
+      this.writes += 1;
+      calls.push('remove-manifest');
+    },
+    removeResourceProof(slot, expected) {
+      assert.equal(slot, 'current');
+      assert.equal(expected, resourceReceipt);
+      resourceReceipt = absent();
+      this.writes += 1;
+      calls.push('remove-resource-proof');
+    },
+    close: () => calls.push('session-close'),
+  };
+  const driver = {
+    writes: 0,
+    probe() {
+      assert.equal(entries.at(-1).phase, 'prepared');
+      calls.push('probe');
+      return { platformPhase: 'final', resourceFingerprint: resource.platformResourceFingerprint, resourceDescriptor: { botUnitSha256: rawResourceSha256 } };
+    },
+    stopAndQuiesce(input) {
+      assert.equal(entries.at(-1).phase, 'transition-marker-intent');
+      assert.deepEqual(input, { expectedResourceFingerprint: resource.platformResourceFingerprint });
+      this.writes += 1;
+      calls.push('stop');
+    },
+    removeResource(input) {
+      assert.equal(entries.at(-1).phase, 'tombstoned');
+      assert.equal(tombstone.present, true);
+      assert.deepEqual(input, platform === 'linux'
+        ? { expectedCurrentSha256: rawResourceSha256, siblings: [] }
+        : { expectedResourceFingerprint: resource.platformResourceFingerprint });
+      this.writes += 1;
+      calls.push('remove-resource');
+    },
+  };
+  const request = {
+    schemaVersion: 1, target: { component: 'bot' }, roles: fixtureRoles, acceptServiceDisruption: true,
+    expected: {
+      serviceGeneration: current.serviceGeneration, resourceProof: current.resourceProof,
+      currentManifestFingerprint: current.manifestFingerprint, applicationSequenceFloor: 1,
+      ...(platform === 'win32' ? { shawlSequenceFloor: 1 } : {}),
+    },
+  };
+  const lifecycle = createServiceLifecycle({ platform, architecture: 'x64', native: {}, store: { openMutation: () => session }, driver });
+  return { lifecycle, session, driver, request, current, resource, entries, calls };
+}
+
+for (const platform of ['linux', 'win32']) {
+  test(`${platform} owned uninstall commits an absent generation-zero final proof and an incremented transaction`, async () => {
+    const fixture = ownedMutationFixture(platform);
+    const { current, session, driver, entries, calls } = fixture;
+    const receipt = await fixture.lifecycle.uninstall(fixture.request);
+    assert.equal(receipt.serviceGeneration, current.serviceGeneration + 1);
+    assert.equal(receipt.writes, session.writes + driver.writes);
+    assert.equal(driver.writes, 2);
+    const final = buildServiceFinalProof({
+      disposition: 'absent', manifestFingerprint: null, resourceProof: null,
+      applicationManifestFingerprint: null, shawlManifestFingerprint: null,
+      serviceGeneration: 0, activation: 'disabled-not-startable',
+    }, platform);
+    for (const entry of entries.slice(1)) {
+      assert.equal(entry.operation, 'uninstall');
+      assert.equal(entry.old.serviceGeneration, current.serviceGeneration);
+      assert.equal(entry.serviceGeneration, current.serviceGeneration + 1);
+      assert.deepEqual(entry.final, final);
+    }
+    assert.equal(session.readTombstone().value.serviceGeneration, current.serviceGeneration + 1);
+    assert.equal(session.readTombstone().value.resourceProof, current.resourceProof);
+    assert.equal(session.readTombstone().value.currentManifestFingerprint, current.manifestFingerprint);
+    assert.equal(session.readReferences().value.serviceGeneration, current.serviceGeneration + 1);
+    assert.equal(session.readReferences().value.current, null);
+    assert.equal(session.readReferences().value.previous, null);
+    assert.equal(session.readReferences().value.provisional, null);
+    assert.equal(session.readManifest('current').present, false);
+    assert.equal(session.readResourceProof('current').present, false);
+    assert.deepEqual(calls, [
+      'floor-cas', 'prepared', 'probe', 'transition-marker-intent', 'stop', 'tombstoned',
+      'publish-tombstone', 'remove-resource', 'publish-references', 'references-released',
+      'remove-manifest', 'remove-resource-proof', 'committed', 'session-close',
+    ]);
+  });
+
+  for (const variant of ['stale-generation', 'stale-resource', 'stale-manifest', 'stale-floor', 'foreign-roles', 'resource-roles', 'configuration', 'pending-journal']) {
+    test(`${platform} uninstall refuses ${variant} before journal writes or driver mutation`, async () => {
+      const fixture = ownedMutationFixture(platform);
+      const { request, session, current, resource, entries } = fixture;
+      let code = 'SERVICE_STALE';
+      if (variant === 'stale-generation') request.expected.serviceGeneration -= 1;
+      if (variant === 'stale-resource') request.expected.resourceProof = '0'.repeat(64);
+      if (variant === 'stale-manifest') request.expected.currentManifestFingerprint = '0'.repeat(64);
+      if (variant === 'stale-floor') request.expected.applicationSequenceFloor = 0;
+      if (variant === 'foreign-roles') {
+        const kind = platform === 'win32' ? 'sid' : 'uid';
+        request.roles = { ...request.roles, management: { kind, value: platform === 'win32' ? 'S-1-5-21-2001' : 'uid:2001' } };
+        code = 'SERVICE_SCOPE_MISMATCH';
+      }
+      if (variant === 'resource-roles') {
+        session.readResourceProof = () => ({ present: true, value: { ...resource, rolesFingerprint: '0'.repeat(64) } });
+        code = 'SERVICE_SCOPE_MISMATCH';
+      }
+      if (variant === 'configuration') {
+        session.readManifest = () => ({ present: true, value: { ...current, configurationFingerprint: '0'.repeat(64) } });
+        code = 'SERVICE_SCOPE_MISMATCH';
+      }
+      if (variant === 'pending-journal') {
+        session.readJournal = () => ({ entries, head: { present: true, value: entries.at(-1) }, pending: {} });
+        code = 'SERVICE_PENDING';
+      }
+      await assert.rejects(fixture.lifecycle.uninstall(request), { code });
+      assert.equal(session.writes, 0);
+      assert.equal(fixture.driver.writes, 0);
+      assert.equal(entries.length, 1);
+      assert.deepEqual(fixture.calls, ['floor-cas', 'session-close']);
+    });
+  }
+}
+
+for (const operation of ['install', 'update', 'rollback']) test(`${operation} binds the stable final proof to the incremented service manifest (rc14 domain regression)`, async () => {
   // Regression pin for the rc14 defect where #mutate wrote the application
   // deployment-manifest fingerprint into final.manifestFingerprint while the
   // store guard (service-store.js accept_provisional_metadata) requires the
@@ -1048,10 +1275,16 @@ test('install binds final.manifestFingerprint to the service manifest self-finge
     expectedHostSetFingerprint: '0'.repeat(64), expectedHostCount: 0,
   };
   const applicationManifestFingerprint = 'a'.repeat(64);
+  const owned = ownedMutationFixture(platform);
+  if (operation !== 'install') entries.push(owned.entries[0]);
   let provisional;
   const session = {
     platform, architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
-    readManifest: absent, readResourceProof: absent, readReferences: absent,
+    readManifest: operation === 'install' ? absent : owned.session.readManifest,
+    readResourceProof: operation === 'install' ? absent : owned.session.readResourceProof,
+    readReferences: operation === 'rollback'
+      ? () => ({ present: true, value: { previous: { serviceGeneration: 3 } } })
+      : absent,
     readManualCleanup: absent, readStartupProof: absent,
     readSiblingReferences: () => [],
     readJournal: () => ({
@@ -1060,6 +1293,13 @@ test('install binds final.manifestFingerprint to the service manifest self-finge
       pending: null,
     }),
     assertFloorCas: () => ({ application: floor() }),
+    readRetainedDeploymentEnvelope: () => ({ manifest: acquisition.readManifests().application }),
+    readPublicationReceipt: () => ({ artifactKind: 'application', manifestFingerprint: applicationManifestFingerprint }),
+    assertApplicationRollback: ({ manifest, publication }) => {
+      assert.equal(manifest.manifestFingerprint, applicationManifestFingerprint);
+      assert.equal(publication.manifestFingerprint, applicationManifestFingerprint);
+      calls.push('rollback-verified');
+    },
     appendJournal(value) { entries.push(value); this.writes += 1; return value; },
     acceptProvisionalMetadata({ transaction, manifest, resource }) {
       // Mirror of the store guard comparisons (service-store.js
@@ -1111,20 +1351,38 @@ test('install binds final.manifestFingerprint to the service manifest self-finge
     kind: 'offline', applicationManifestPath: '/m',
     applicationSignaturePath: '/s', applicationArchivePath: '/a',
   };
-  await assert.rejects(lifecycle.install({
+  const expected = operation === 'install'
+    ? { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0 }
+    : {
+      serviceGeneration: owned.current.serviceGeneration, resourceProof: owned.current.resourceProof,
+      currentManifestFingerprint: owned.current.manifestFingerprint,
+      ...(operation === 'rollback' ? { predecessorManifestFingerprint: applicationManifestFingerprint } : { applicationSequenceFloor: 0 }),
+    };
+  await assert.rejects(lifecycle[operation]({
     schemaVersion: 1, target: { component: 'bot' },
-    roles, configuration, source,
-    expected: { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0 },
+    roles,
+    ...(operation === 'install' ? { configuration } : {}),
+    ...(operation === 'rollback' ? {} : { source }),
+    ...(operation === 'install' ? {} : { acceptServiceDisruption: true }),
+    expected,
   }), (error) => error.code === 'SERVICE_PROBE_STOP_FIXTURE');
   assert.ok(provisional, 'provisional metadata admission must run before the probe stop');
   assert.equal(provisional.transaction.final.manifestFingerprint, provisional.manifest.manifestFingerprint);
   assert.notEqual(provisional.manifest.manifestFingerprint, applicationManifestFingerprint);
   assert.equal(provisional.transaction.final.applicationManifestFingerprint, applicationManifestFingerprint);
   assert.equal(provisional.manifest.applicationManifestFingerprint, applicationManifestFingerprint);
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].phase, 'prepared');
+  const generation = expected.serviceGeneration + 1;
+  assert.equal(provisional.transaction.old.serviceGeneration, expected.serviceGeneration);
+  assert.equal(provisional.transaction.serviceGeneration, generation);
+  assert.equal(provisional.transaction.final.disposition, 'stable');
+  assert.equal(provisional.transaction.final.activation, 'enabled');
+  assert.equal(provisional.transaction.final.serviceGeneration, generation);
+  assert.equal(provisional.manifest.serviceGeneration, generation);
+  assert.equal(provisional.resource.serviceGeneration, generation);
+  assert.equal(entries.length, operation === 'install' ? 1 : 2);
+  assert.equal(entries.at(-1).phase, 'prepared');
   assert.equal(session.writes, 1);
-  assert.deepEqual(calls, ['acquisition-close', 'session-close']);
+  assert.deepEqual(calls, operation === 'rollback' ? ['rollback-verified', 'session-close'] : ['acquisition-close', 'session-close']);
 });
 
 for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pending']) {
