@@ -684,6 +684,21 @@ operation proof, or production signing authority.
 
 ## Lifecycle evidence harness
 
+Successful recovery returns the strict recovery result: `operation: "recover"`,
+`transactionId`, `transactionFingerprint`, and `writes`. It does not expose a
+mutation-only `serviceGeneration` result field or substitute the original
+transaction's operation for the CLI command. The journal still records the
+original install/update/rollback/uninstall operation and generation; the
+recovery result retains the actual store/driver write count. Recovery admission
+keeps an uninstall's schema-valid absent final generation zero distinct from
+its positive transaction generation; stable final generations must still match
+their transaction. Uninstall continuation skips suppressed-resource publication
+and trial startup but retains the stop required by `stop-and-continue`.
+Modeled classifier/session/driver coverage does not establish that a concrete
+platform classifier supports the modeled uninstall state. These recovery
+repairs do not change disruption-acknowledgment enforcement or establish real
+systemd/SCM recovery evidence.
+
 Uninstall final absence proof and transaction sequencing have distinct
 generations: `final.serviceGeneration` is zero with null manifest/resource
 fingerprints and `disabled-not-startable` activation, while the transaction,

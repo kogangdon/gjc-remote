@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Recovery success receipt contract repair (issue #240)
+
+- Return the exact `recover` result from successful trial completion,
+  activation resumption and uninstall recovery: `operation: recover`,
+  transaction identity/fingerprint and the actual write count, without the
+  mutation-only `serviceGeneration` field. Preserve the original mutation
+  operation and generation in the transaction journal.
+- Keep strict CLI validation unchanged so a completed recovery is not rejected
+  as `SERVICE_INVALID` with zero writes merely because its producer returned
+  the original mutation's result shape. Admit a schema-valid uninstall
+  transaction whose absent final proof has generation zero while its transaction
+  generation remains positive; stable final proofs still match the transaction
+  generation. This source repair does not add a new
+  disruption-acknowledgment guard or qualify real systemd/SCM recovery.
+- Keep uninstall continuation out of suppressed-resource publication and trial
+  startup while preserving the classifier-required `stop-and-continue` stop.
+  In-memory classifier/session/driver tests exercise orchestration and public
+  receipts, not concrete platform-classifier support for those states.
+
 ### Uninstall absent-final generation repair (issue #273)
 
 - Construct an uninstall's absent final proof with service generation zero,

@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServiceLifecycle } from '../src/service-lifecycle.js';
+import { runServiceCli, serviceReceiptBytes } from '../src/service-cli.js';
+import { EXIT_CODES, runServiceEntrypoint } from '../src/service-entrypoint.js';
 import {
+  buildServiceArtifactBinding,
   buildServiceCandidateProof,
   buildServiceFinalProof,
   buildServiceManifest,
   buildServiceOldProof,
   buildServicePlatformState,
+  buildServiceReferenceRecord,
+  buildServiceReferenceSlot,
   buildServiceResourceProof,
   buildServiceTransaction,
   buildServiceTransitionProof,
@@ -14,7 +19,7 @@ import {
   serviceRolesFingerprint,
   validateServiceTransaction,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
-import { canonicalJsonHash } from '@gjc-remote/shared/strict-json';
+import { canonicalJson, canonicalJsonBytes, canonicalJsonHash } from '@gjc-remote/shared/strict-json';
 
 const roles = Object.freeze({
   management: { kind: 'uid', value: 'uid:1001' },
@@ -1445,6 +1450,366 @@ for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pe
       assert.equal(markers[0].transactionId, head.transactionId);
       assert.equal(markers[0].blockedUntilOperatorAction, true);
     }
+  });
+}
+
+// In-memory Linux contract fixtures only: the real lifecycle performs recovery,
+// while explicit session/driver doubles model durable writes and phase receipts.
+// They do not qualify native locks, filesystem CAS, startup epochs, or systemd.
+function recoverySuccessFixture(classifier, recoveryClassification = classifier === 'uninstall' ? 'continue' : classifier) {
+  const { session, driver, current, resource, entries, calls } = ownedMutationFixture('linux');
+  const seed = recoveryTransaction('prepared');
+  const uninstall = classifier === 'uninstall';
+  const operation = uninstall ? 'uninstall' : 'update';
+  const generation = current.serviceGeneration + 1;
+  const old = buildServiceOldProof({
+    disposition: 'stable', manifestFingerprint: current.manifestFingerprint,
+    resourceProof: current.resourceProof, applicationManifestFingerprint: current.applicationManifestFingerprint,
+    shawlManifestFingerprint: null, serviceGeneration: current.serviceGeneration, activation: 'enabled',
+  }, 'linux');
+  const candidate = uninstall ? buildServiceCandidateProof({
+    disposition: 'none', applicationManifestFingerprint: null, shawlManifestFingerprint: null,
+    releaseSequence: 0, releaseTreeFingerprint: null, compatibilityFingerprint: null,
+  }, 'linux') : seed.candidate;
+  const finalResource = uninstall ? null : buildServiceResourceProof({
+    ...resource, operation, serviceGeneration: generation,
+    applicationManifestFingerprint: candidate.applicationManifestFingerprint,
+    transactionId: seed.transactionId, transactionNonce: seed.transactionNonce,
+    predecessorResourceProof: resource.resourceProof, platformResourceFingerprint: '6'.repeat(64),
+  });
+  const finalManifest = uninstall ? null : buildServiceManifest({
+    ...current, serviceGeneration: generation,
+    applicationManifestFingerprint: candidate.applicationManifestFingerprint,
+    predecessorManifestFingerprint: current.manifestFingerprint, resourceProof: finalResource.resourceProof,
+  });
+  const final = buildServiceFinalProof(uninstall ? {
+    disposition: 'absent', manifestFingerprint: null, resourceProof: null,
+    applicationManifestFingerprint: null, shawlManifestFingerprint: null,
+    serviceGeneration: 0, activation: 'disabled-not-startable',
+  } : {
+    disposition: 'stable', manifestFingerprint: finalManifest.manifestFingerprint,
+    resourceProof: finalResource.resourceProof, applicationManifestFingerprint: candidate.applicationManifestFingerprint,
+    shawlManifestFingerprint: null, serviceGeneration: generation, activation: 'enabled',
+  }, 'linux');
+  const transition = buildServiceTransitionProof({
+    oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint,
+    expectedBeforeResourceFingerprint: resource.platformResourceFingerprint,
+    expectedAfterResourceFingerprint: finalResource?.platformResourceFingerprint ?? null,
+    platformResourceFingerprint: seed.transition.platformResourceFingerprint,
+    platformState: buildServicePlatformState('linux', 'trial'),
+  }, 'linux');
+  const prepared = buildServiceTransaction({
+    ...seed, operation, serviceGeneration: generation, old, candidate, transition, final,
+    previousJournalFingerprint: entries.at(-1).transactionFingerprint,
+  });
+  const head = buildServiceTransaction({
+    ...prepared,
+    phase: uninstall ? 'quiescent' : classifier === 'resume' ? 'trial-start-intent' : 'startup-observed',
+    substep: classifier === 'resume' ? 'intent' : 'observed',
+    previousJournalFingerprint: prepared.transactionFingerprint,
+  });
+  entries.push(prepared, head);
+  const initialEntries = entries.slice();
+  const absent = () => ({ present: false, value: null });
+  const present = (value) => ({ present: true, value });
+  const publication = (manifestFingerprint, inode) => {
+    const directoryIdentity = {
+      profile: 'service-release-directory', kind: 'linux-service-object-v1',
+      device: '1', inode, mode: 0o40555, owner: 'uid:0', securitySha256: '7'.repeat(64),
+    };
+    return { binding: buildServiceArtifactBinding({
+      artifactKind: 'application', rootKind: 'releases', artifactFingerprint: manifestFingerprint,
+      manifestFingerprint, treeFingerprint: 'b'.repeat(64), directoryIdentity,
+      directoryIdentityFingerprint: canonicalJsonHash(directoryIdentity),
+    }, 'linux') };
+  };
+  const oldPublication = publication(current.applicationManifestFingerprint, '1');
+  const candidatePublication = uninstall ? null : publication(candidate.applicationManifestFingerprint, '2');
+  let references = present(buildServiceReferenceRecord({
+    component: 'bot', serviceKey: 'bot', platform: 'linux', architecture: 'x64',
+    serviceGeneration: current.serviceGeneration,
+    current: buildServiceReferenceSlot({
+      serviceGeneration: current.serviceGeneration, transactionId: resource.transactionId,
+      transactionNonce: resource.transactionNonce, artifacts: [oldPublication.binding],
+    }, { platform: 'linux', component: 'bot' }),
+    previous: null, provisional: null,
+  }));
+  let manifestReceipt = present(current);
+  let resourceReceipt = present(resource);
+  session.readReferences = () => references;
+  session.publishReferences = function (value, expected) {
+    assert.equal(expected, references);
+    references = present(value);
+    this.writes += 1;
+    calls.push('publish-references');
+    return references;
+  };
+  session.readApplicationFloor = () => ({ floor: { committedSequence: 1 } });
+  session.readPublicationReceipt = ({ slot, artifactKind }) => {
+    assert.equal(slot, 'provisional');
+    assert.equal(artifactKind, 'application');
+    return candidatePublication;
+  };
+  session.readRetainedDeploymentEnvelope = ({ purpose, manifestFingerprint }) => {
+    assert.equal(purpose, 'application');
+    assert.equal(manifestFingerprint, candidate.applicationManifestFingerprint);
+    return { manifest: {
+      manifestFingerprint, releaseSequence: candidate.releaseSequence,
+      inventory: { treeFingerprint: candidate.releaseTreeFingerprint },
+      compatibilityFingerprint: candidate.compatibilityFingerprint,
+      entrypointPath: '/releases/candidate/bot.js', configuration: current.configuration,
+    } };
+  };
+  if (!uninstall) {
+    session.readManifest = (slot) => slot === 'current' ? manifestReceipt : absent();
+    session.readResourceProof = (slot) => slot === 'current' ? resourceReceipt : absent();
+    session.publishCurrentMetadata = function (input) {
+      assert.equal(entries.at(-1).phase, 'activation-observed');
+      assert.equal(input.transaction, entries.at(-1));
+      assert.equal(input.expectedManifest, manifestReceipt);
+      assert.equal(input.expectedResource, resourceReceipt);
+      assert.deepEqual(input.manifest, finalManifest);
+      assert.deepEqual(input.resource, finalResource);
+      manifestReceipt = present(input.manifest);
+      resourceReceipt = present(input.resource);
+      this.writes += 1;
+      calls.push('publish-current');
+    };
+  }
+  const appendDriverPhase = (phase, substep = 'observed') => {
+    const previous = entries.at(-1);
+    session.appendJournal(buildServiceTransaction({
+      ...previous, phase, substep, previousJournalFingerprint: previous.transactionFingerprint,
+    }));
+  };
+  const trial = { resourceFingerprint: transition.platformResourceFingerprint };
+  const observeApplication = () => { calls.push('observe-application'); return { ready: true }; };
+  driver.recoverTrialState = () => {
+    calls.push('classify');
+    return { classification: recoveryClassification, phase: head.phase, trial };
+  };
+  driver.probe = () => {
+    calls.push('probe');
+    return { platformPhase: 'trial', resourceFingerprint: transition.platformResourceFingerprint, resourceDescriptor: { botUnitSha256: 'f'.repeat(64) } };
+  };
+  if (uninstall) {
+    driver.publishSuppressedResource = () => assert.fail('uninstall recovery must not publish a candidate resource');
+    driver.stopAndQuiesce = function (input) {
+      assert.equal(recoveryClassification, 'stop-and-continue');
+      assert.equal(entries.at(-1).phase, 'quiescent');
+      assert.deepEqual(input, { expectedResourceFingerprint: transition.platformResourceFingerprint });
+      appendDriverPhase('stopping', 'intent');
+      this.writes += 1;
+      calls.push('stop');
+      appendDriverPhase('quiescent');
+    };
+  }
+  driver.startTrial = function (input) {
+    assert.equal(uninstall || classifier === 'resume-activation', false);
+    assert.deepEqual(input, { expectedResourceFingerprint: transition.platformResourceFingerprint });
+    if (classifier === 'retrial') appendDriverPhase('trial-start-intent', 'intent');
+    appendDriverPhase('trial-start-observed');
+    this.writes += 1;
+    calls.push('start-trial');
+    return trial;
+  };
+  driver.runStartupGate = async ({ trial: suppliedTrial, observeApplication: observe }) => {
+    assert.equal(uninstall, false);
+    assert.equal(suppliedTrial, trial);
+    assert.equal(observe, observeApplication);
+    assert.deepEqual(await observe(), { ready: true });
+    if (classifier !== 'resume-activation') appendDriverPhase('startup-observed');
+    calls.push('startup-gate');
+  };
+  driver.armFinalRestart = function (input) {
+    assert.equal(uninstall, false);
+    assert.equal(entries.at(-1).phase, 'startup-observed');
+    assert.deepEqual(input, {
+      release: { entrypointPath: '/releases/candidate/bot.js', applicationManifestFingerprint: candidate.applicationManifestFingerprint },
+      siblings: [],
+    });
+    this.writes += 1;
+    calls.push('arm-final');
+  };
+  driver.enableFinal = function (input) {
+    assert.equal(uninstall, false);
+    assert.deepEqual(input, { siblings: [] });
+    appendDriverPhase('activation-observed');
+    this.writes += 1;
+    calls.push('enable-final');
+    return { resourceFingerprint: finalResource.platformResourceFingerprint };
+  };
+  const lifecycle = createServiceLifecycle({
+    platform: 'linux', architecture: 'x64', native: {},
+    store: { openRecovery: () => { calls.push('open-recovery'); return session; } },
+    driver, observeApplication,
+  });
+  const request = {
+    schemaVersion: 1, target: { component: 'bot' }, roles,
+    expected: { transactionId: head.transactionId, journalFingerprint: head.transactionFingerprint },
+    acceptServiceDisruption: true,
+  };
+  return { lifecycle, request, session, driver, entries, initialEntries, head, current, finalManifest, finalResource, calls };
+}
+
+async function publicRecovery(fixture, boundary) {
+  const options = {
+    argv: ['recover'], input: canonicalJsonBytes(fixture.request), lifecycle: fixture.lifecycle,
+    platform: 'linux', architecture: 'x64',
+  };
+  if (boundary === 'cli') {
+    const receipt = await runServiceCli(options);
+    return { receipt, serialized: serviceReceiptBytes(receipt).toString('utf8') };
+  }
+  const chunks = [];
+  const result = await runServiceEntrypoint({
+    ...options, stdout: { write: (chunk) => { chunks.push(Buffer.from(chunk)); } },
+  });
+  return { ...result, serialized: Buffer.concat(chunks).toString('utf8') };
+}
+
+for (const classifier of ['resume', 'retrial', 'resume-activation', 'uninstall']) {
+  for (const boundary of ['cli', 'entrypoint']) {
+    test(`real lifecycle ${classifier} recovery exposes exact public success through ${boundary}`, async () => {
+      const fixture = recoverySuccessFixture(classifier);
+      const { session, driver, entries, initialEntries, head, calls } = fixture;
+      const result = await publicRecovery(fixture, boundary);
+      assert.equal(result.receipt.status, 'ok', canonicalJson(result.receipt));
+      if (boundary === 'entrypoint') assert.equal(result.exitCode, EXIT_CODES.ok);
+      assert.ok(session.writes > 0);
+      assert.equal(driver.writes, classifier === 'uninstall' ? 1 : classifier === 'resume-activation' ? 2 : 3);
+      const writes = session.writes + driver.writes;
+      const expected = {
+        status: 'ok', operation: 'recover', writes,
+        receipt: { operation: 'recover', transactionId: head.transactionId, transactionFingerprint: entries.at(-1).transactionFingerprint, writes },
+      };
+      assert.deepEqual(result.receipt, expected);
+      assert.equal(result.serialized, `${canonicalJson(expected)}\n`);
+      assert.deepEqual(JSON.parse(result.serialized), expected);
+      assert.deepEqual(entries.slice(0, initialEntries.length), initialEntries);
+      assert.equal(entries.at(-1).phase, 'committed');
+      assert.equal(entries.at(-1).substep, 'observed');
+      assert.notEqual(entries.at(-1).transactionFingerprint, head.transactionFingerprint);
+      for (const entry of entries.slice(initialEntries.length)) {
+        assert.equal(entry.operation, head.operation);
+        assert.equal(entry.serviceGeneration, head.serviceGeneration);
+        assert.equal(entry.transactionId, head.transactionId);
+        assert.equal(entry.transactionNonce, head.transactionNonce);
+        for (const proof of ['old', 'candidate', 'transition', 'final']) assert.deepEqual(entry[proof], head[proof]);
+      }
+      const phases = entries.slice(initialEntries.length).map((entry) => entry.phase);
+      if (classifier === 'uninstall') {
+        assert.deepEqual(phases, ['tombstoned', 'resource-removed', 'references-released', 'committed']);
+        assert.equal(head.final.serviceGeneration, 0);
+        assert.equal(session.readTombstone().value.serviceGeneration, head.serviceGeneration);
+        assert.equal(session.readTombstone().value.currentManifestFingerprint, fixture.current.manifestFingerprint);
+        assert.equal(session.readTombstone().value.resourceProof, fixture.current.resourceProof);
+        assert.equal(session.readManifest('current').present, false);
+        assert.equal(session.readResourceProof('current').present, false);
+        for (const slot of ['current', 'previous', 'provisional']) assert.equal(session.readReferences().value[slot], null);
+        assert.equal(calls.includes('start-trial'), false);
+        assert.equal(calls.includes('enable-final'), false);
+        assert.ok(calls.indexOf('publish-tombstone') < calls.indexOf('remove-resource'));
+      } else {
+        assert.deepEqual(phases, [
+          ...(classifier === 'retrial' ? ['trial-start-intent'] : []),
+          ...(classifier === 'resume-activation' ? [] : ['trial-start-observed', 'startup-observed']),
+          'activation-observed', 'committed',
+        ]);
+        assert.deepEqual(session.readManifest('current').value, fixture.finalManifest);
+        assert.deepEqual(session.readResourceProof('current').value, fixture.finalResource);
+        assert.equal(session.readReferences().value.current.serviceGeneration, head.serviceGeneration);
+        assert.equal(session.readReferences().value.previous.serviceGeneration, fixture.current.serviceGeneration);
+        assert.equal(calls.includes('start-trial'), classifier !== 'resume-activation');
+        assert.ok(calls.indexOf('startup-gate') < calls.indexOf('arm-final'));
+        assert.ok(calls.indexOf('enable-final') < calls.indexOf('publish-current'));
+        assert.ok(calls.indexOf('publish-current') < calls.indexOf('committed'));
+      }
+      assert.equal(session.readReferences().value.serviceGeneration, head.serviceGeneration);
+      assert.equal(calls.at(-1), 'session-close');
+    });
+  }
+
+  for (const refusal of ['stale-transaction', 'stale-journal', 'missing-disruption']) {
+    test(`real lifecycle ${classifier} recovery refuses ${refusal} before writes`, async () => {
+      const fixture = recoverySuccessFixture(classifier);
+      if (refusal === 'stale-transaction') fixture.request.expected.transactionId = 'tx-other';
+      if (refusal === 'stale-journal') fixture.request.expected.journalFingerprint = '0'.repeat(64);
+      if (refusal === 'missing-disruption') delete fixture.request.acceptServiceDisruption;
+      await assert.rejects(fixture.lifecycle.recover(fixture.request), {
+        code: refusal === 'missing-disruption' ? 'SERVICE_INVALID' : 'SERVICE_STALE', writes: 0,
+      });
+      assert.equal(fixture.session.writes, 0);
+      assert.equal(fixture.driver.writes, 0);
+      assert.deepEqual(fixture.entries, fixture.initialEntries);
+      assert.deepEqual(fixture.calls, refusal === 'missing-disruption' ? [] : ['open-recovery', 'session-close']);
+    });
+  }
+}
+
+for (const boundary of ['cli', 'entrypoint']) {
+  test(`real lifecycle uninstall stop-and-continue preserves stop without candidate replay through ${boundary}`, async () => {
+    const fixture = recoverySuccessFixture('uninstall', 'stop-and-continue');
+    const { session, driver, entries, head, calls, initialEntries } = fixture;
+    const result = await publicRecovery(fixture, boundary);
+    assert.equal(result.receipt.status, 'ok', canonicalJson(result.receipt));
+    if (boundary === 'entrypoint') assert.equal(result.exitCode, EXIT_CODES.ok);
+    assert.equal(driver.writes, 2);
+    assert.ok(session.writes > 0);
+    const writes = session.writes + driver.writes;
+    const expected = {
+      status: 'ok', operation: 'recover', writes,
+      receipt: { operation: 'recover', transactionId: head.transactionId, transactionFingerprint: entries.at(-1).transactionFingerprint, writes },
+    };
+    assert.deepEqual(result.receipt, expected);
+    assert.equal(result.serialized, `${canonicalJson(expected)}\n`);
+    assert.deepEqual(entries.slice(initialEntries.length).map((entry) => entry.phase), [
+      'stopping', 'quiescent', 'tombstoned', 'resource-removed', 'references-released', 'committed',
+    ]);
+    for (const entry of entries.slice(initialEntries.length)) {
+      assert.equal(entry.operation, 'uninstall');
+      assert.equal(entry.serviceGeneration, head.serviceGeneration);
+      assert.equal(entry.final.serviceGeneration, 0);
+    }
+    assert.equal(calls.filter((call) => call === 'stop').length, 1);
+    assert.ok(calls.indexOf('stop') < calls.indexOf('publish-tombstone'));
+    assert.ok(calls.indexOf('publish-tombstone') < calls.indexOf('remove-resource'));
+    assert.equal(calls.includes('start-trial'), false);
+    assert.equal(calls.includes('arm-final'), false);
+    assert.equal(calls.includes('enable-final'), false);
+    assert.equal(session.readManifest('current').present, false);
+    assert.equal(session.readResourceProof('current').present, false);
+    for (const slot of ['current', 'previous', 'provisional']) assert.equal(session.readReferences().value[slot], null);
+    assert.equal(calls.at(-1), 'session-close');
+  });
+}
+
+for (const classifier of ['resume', 'uninstall']) {
+  test(`real lifecycle ${classifier} recovery refuses a malformed final generation before writes`, async () => {
+    const fixture = recoverySuccessFixture(classifier);
+    const malformedFinalFields = {
+      ...fixture.head.final,
+      serviceGeneration: classifier === 'uninstall' ? fixture.head.serviceGeneration : fixture.head.serviceGeneration + 1,
+    };
+    delete malformedFinalFields.finalFingerprint;
+    const malformedFinal = classifier === 'uninstall'
+      ? { ...malformedFinalFields, finalFingerprint: canonicalJsonHash(malformedFinalFields) }
+      : buildServiceFinalProof(malformedFinalFields, 'linux');
+    if (classifier === 'uninstall') assert.throws(() => buildServiceFinalProof(malformedFinalFields, 'linux'));
+    const malformedHeadFields = { ...fixture.head, final: malformedFinal };
+    delete malformedHeadFields.transactionFingerprint;
+    const malformedHead = { ...malformedHeadFields, transactionFingerprint: canonicalJsonHash(malformedHeadFields) };
+    assert.throws(() => buildServiceTransaction(malformedHead));
+    // Only this fault-injection case bypasses the production builder. Matching
+    // fingerprints must not turn a semantically invalid journal into authority.
+    fixture.entries[fixture.entries.length - 1] = malformedHead;
+    fixture.request.expected.journalFingerprint = malformedHead.transactionFingerprint;
+    const before = fixture.entries.slice();
+    await assert.rejects(fixture.lifecycle.recover(fixture.request), { code: 'SERVICE_PENDING', writes: 0 });
+    assert.equal(fixture.session.writes, 0);
+    assert.equal(fixture.driver.writes, 0);
+    assert.deepEqual(fixture.entries, before);
+    assert.deepEqual(fixture.calls, ['open-recovery', 'classify', 'session-close']);
   });
 }
 
