@@ -1107,7 +1107,7 @@ export class ServiceLifecycle {
           transaction.transactionFingerprint !== request.expected.journalFingerprint ||
           transaction.transition.oldFingerprint !== transaction.old.oldFingerprint ||
           transaction.transition.candidateFingerprint !== transaction.candidate.candidateFingerprint ||
-          transaction.final.serviceGeneration !== transaction.serviceGeneration)) transaction = null;
+          transaction.final.serviceGeneration !== (transaction.operation === 'uninstall' ? 0 : transaction.serviceGeneration))) transaction = null;
       if (head.phase === 'committed') fail('SERVICE_PENDING', 'recover');
       const manifest = required(session, 'readManifest', 'read_manifest', 'current');
       const release = manifest.present
@@ -1381,7 +1381,7 @@ export class ServiceLifecycle {
         const activation = await activate();
         await finishMetadata(activation);
         append('committed');
-        return Object.freeze({ operation, transactionId: transaction.transactionId, transactionFingerprint: transaction.transactionFingerprint, serviceGeneration: transaction.serviceGeneration, writes: writesOf(session, driver) });
+        return Object.freeze({ operation: 'recover', transactionId: transaction.transactionId, transactionFingerprint: transaction.transactionFingerprint, writes: writesOf(session, driver) });
       };
       const transitionObserved = () => currentHead.phase === 'transition-marker-intent' && currentHead.substep === 'observed';
 
@@ -1462,11 +1462,15 @@ export class ServiceLifecycle {
       }
       if (classifier === 'stop-and-continue') {
         await stop();
-        if (!transitionObserved() && (currentHead.phase === 'transition-marker-intent' || currentHead.phase === 'quiescent')) await publishSuppressed();
-        if (currentHead.phase === 'resource-published') return await completeTrial();
+        if (operation !== 'uninstall') {
+          if (!transitionObserved() && (currentHead.phase === 'transition-marker-intent' || currentHead.phase === 'quiescent')) await publishSuppressed();
+          if (currentHead.phase === 'resource-published') return await completeTrial();
+        }
       } else if (classifier === 'continue' || classifier === 'resume') {
-        if (!transitionObserved() && (currentHead.phase === 'transition-marker-intent' || currentHead.phase === 'quiescent')) await publishSuppressed();
-        if (currentHead.phase === 'resource-published') return await completeTrial();
+        if (operation !== 'uninstall') {
+          if (!transitionObserved() && (currentHead.phase === 'transition-marker-intent' || currentHead.phase === 'quiescent')) await publishSuppressed();
+          if (currentHead.phase === 'resource-published') return await completeTrial();
+        }
       }
       if (currentHead.phase === 'release-published' && operation !== 'uninstall') {
         await publishSuppressed();
@@ -1486,7 +1490,7 @@ export class ServiceLifecycle {
         const activation = await activate();
         await finishMetadata(activation);
         append('committed');
-        return Object.freeze({ operation, transactionId: transaction.transactionId, transactionFingerprint: transaction.transactionFingerprint, serviceGeneration: transaction.serviceGeneration, writes: writesOf(session, driver) });
+        return Object.freeze({ operation: 'recover', transactionId: transaction.transactionId, transactionFingerprint: transaction.transactionFingerprint, writes: writesOf(session, driver) });
       }
       if (operation !== 'uninstall' && (currentHead.phase === 'stopping' || currentHead.phase === 'quiescent')) {
         if (currentHead.phase === 'stopping') await stop();
@@ -1517,7 +1521,7 @@ export class ServiceLifecycle {
           }
           for (const slot of ['current', 'previous']) { const m = required(session, 'readManifest', 'read_manifest', slot); const r = required(session, 'readResourceProof', 'read_resource_proof', slot); if (m.present) required(session, 'removeManifest', 'remove_manifest', slot, m); if (r.present) required(session, 'removeResourceProof', 'remove_resource_proof', slot, r); }
           append('committed');
-          return Object.freeze({ operation, transactionId: transaction.transactionId, transactionFingerprint: transaction.transactionFingerprint, serviceGeneration: transaction.serviceGeneration, writes: writesOf(session, driver) });
+          return Object.freeze({ operation: 'recover', transactionId: transaction.transactionId, transactionFingerprint: transaction.transactionFingerprint, writes: writesOf(session, driver) });
         }
       }
       fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
