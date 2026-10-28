@@ -2,17 +2,26 @@
 
 Discord-controlled remote GJC sessions.
 
-> **Official unpatched SDK 0.19.0: bounded Windows source evidence.**
-> Published types expose `QueuedInputSubmission` / `submitUserMessage` ownership;
-> API existence is not qualified daemon integration. Active `steer` and
-> `follow_up` remain fail-closed; idle controls remain prompt-equivalent FIFO
-> work. Windows focused tests passed 265/265; unrestricted workspace tests passed
-> 2739/2749 with zero failures and 10 skips. Canonical imports and one newly
-> authorized A-B-A provider smoke passed. Final review and CI/landing are separate gates.
-> See [current 0.19.0 evidence](docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
-> [PR #265](https://github.com/kogangdon/gjc-remote/pull/265) and its 0.18.12
-> receipts are historical, not qualification for this upgrade. No production,
-> release, support, installation or deployment qualification is claimed.
+> **Tracked-input source integration (#231): LOCAL Windows subset qualified; issue OPEN.**
+> On `feat/sdk-tracked-live-controls`, active `steer`/`follow_up` use public
+> `submitUserMessage` tracked handles with scoped cohort/run ownership; idle
+> controls remain serialized real prompts. Official unpatched SDK **0.19.0**
+> and its SRI stay unchanged. Post-review Windows focused **474/474** and unrestricted
+> workspace **2897 tests, 2887 pass, 0 fail, 10 existing skips** passed,
+> including genuine SDK primary/joined Ask ownership and late successor consumption.
+> Ambiguous promoted-overlap gates remain bounded refusals, not universal gate support.
+> The issue231 basic-root provider smoke is CONSUMED-PASS on **PRE-REVIEW source only**;
+> later router/fatal-retirement fixes and final test corrections were not provider rerun.
+> Current focused/full checks use credentialless mock providers, not provider-backed
+> active-control or profile/tenant isolation qualification. Never replay the smoke.
+> Five prior independent review lanes and the final test-correction review **APPROVE**
+> statically only; exact-head CI remains **PENDING**. See
+> [current tracked-input evidence](docs/daemon-workspace-verification.md#current-tracked-input-evidence).
+> SDK adoption at `9512dd8` / [PR #274](https://github.com/kogangdon/gjc-remote/pull/274)
+> and [PR #265](https://github.com/kogangdon/gjc-remote/pull/265)'s 0.18.12 receipts
+> are historical, not tracked-input qualification or fresh provider authority.
+> No fresh Linux/macOS/Docker, profile/tenant isolation, security, production,
+> release, support, installation or deployment qualification or issue closure is claimed.
 
 > **⚠️ Security: this grants remote code execution.** A mapped Discord channel
 > runs arbitrary GJC workflows (bash, file writes, etc.) on your host machines.
@@ -50,17 +59,31 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
 2. On each Discord command, the daemon resolves its configured `workDir` to the
    host filesystem's current canonical real path, so retargeted symlinks or
    junctions cannot reuse a stale target. Different path spellings for the same
-   directory reuse one in-process GJC SDK `AgentSession`. Prompt and model
-   operations are serialized per session. Idle `steer`/`follow_up` requests join
-   that FIFO and start a prompt-equivalent run instead of waiting on an inactive
-   control queue. While a prompt is active, `steer` and `follow_up` fail
-   immediately with `SDK_LIVE_CONTROL_UNSUPPORTED`; they are never admitted to
-   the SDK queue. This prevents an unowned request from hanging or being matched
-   to an unrelated terminal. SDK failure outcomes reject the invocation. Each
-   prompt receives its event stream. Idle sessions (no requests for 1 hour) are
-   disposed automatically. SDK 0.19.0 exposes the submission-ownership lifecycle,
-   but active controls remain disabled until the daemon integrates and qualifies
-   it; upgrading the dependency does not restore them automatically.
+   directory reuse one in-process GJC SDK `AgentSession`. Root prompt and model
+   operations are serialized and cannot overtake tracked work. Idle
+   `steer`/`follow_up` requests start serialized real prompts rather than wait on
+   an inactive control queue. Active controls use public
+   `AgentSession.submitUserMessage()` / `QueuedInputSubmission` handles, stable
+   submission identity, and sequential per-queue policy. Sequential does not
+   mean global cross-mode FIFO or independent generations: multiple controls can
+   JOIN one logical run and share its terminal. Event routing is scoped to the
+   owned cohort/run; only genuine execution, terminal and pre-start removal
+   receipts settle tracked work, never queue-text matching or an unrelated
+   terminal. SDK failure outcomes reject the invocation. Idle sessions (no
+   requests for 1 hour) are disposed automatically. The locally qualified
+   Windows subset and remaining limits are recorded in
+   [current tracked-input evidence](docs/daemon-workspace-verification.md#current-tracked-input-evidence).
+   Root results distinguish execution from coalescible SDK readiness: an exact
+   SDK-proven public Agent terminal plus that root's settled public prompt can
+   prove the result. This never synthesizes a tracked receipt or retires gate
+   authority; prompt fulfillment alone is not successful completion.
+   Each cohort has one deliberate gate owner; unprovable ownership fails
+   explicitly within a bound rather than guessing or broadcasting answers.
+   Genuine SDK primary and joined-run Ask checks prove exact owner/presentation;
+   late `follow_up` and `steer` checks prove real successor consumption.
+   Promoted-overlap gates without a public immutable owner bridge are refused
+   with bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP`, with no gate presentation,
+   answer or continuation; this negative check is not universal gate support.
    Workflow gates require negotiated `gate_presentation_v1` in addition to
    `terminal_disposition_v1` and `invoke_cancellation_v1`; mixed bot/daemon
    peers refuse a gate-capable invoke before execution, so deploy them
@@ -87,11 +110,11 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    `presentation_failed` as its reason and receives exactly one
    `cancel_result`: `cancelled_before_start`, `cancellation_pending`,
    `already_terminal`, or `not_owned`. Duplicate cancel IDs replay the exact
-   original receipt. A queued request is revoked before SDK, provider, or tool
-   execution, receives `cancelled_before_start`, then receives terminal
-   `cancelled`. Active work receives only nonterminal `cancellation_pending`:
-   the daemon has no qualified active-interruption integration, and its natural terminal
-   remains authoritative. A receipt is neither a terminal result nor proof of
+   original receipt. Only positive pre-start removal of queued work authorizes
+   `cancelled_before_start`, followed by terminal `cancelled`. Losing the
+   dequeue race or already-executing work receives only nonterminal
+   `cancellation_pending`; no selective running abort is provided, and its
+   genuine terminal remains authoritative. A receipt is neither a terminal result nor proof of
    quiescence. Request/cancel tombstones are bounded and survive the
    hard-cap/receipt horizon.
    Their authoritative final frame is an `event` carrying `invoke_terminal`
@@ -105,11 +128,11 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    while cleanup settles, since continued work is possible. On a daemon socket
    close, exact socket-generation gate owners are synchronously quarantined
    before cancellation retirement and reconnect scheduling; queued sibling
-   invokes are synchronously revoked and each active shared session enters #234
+   revocation is requested subject to positive removal proof, and each active shared session enters #234
    containment once. Its leases and admission fence remain until positive
-   disposal proof. The existing #231 live-control
-   containment remains in force: cancellation does not restore active
-   `steer`/`follow_up` or unblock #231.
+   disposal proof. Tracked-input source integration does not establish active
+   interruption or close #231; local qualification is limited to the ledger's
+   proven subset. Independent review is static **APPROVE**; exact-head CI is **PENDING**.
 3. `bot/` exposes mapped-channel plain chat as direct GJC prompts, except an
    exact reply to an answerable owned gate message, plus GJC's
    bundled skills (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`), `/gjc`,
@@ -305,11 +328,21 @@ SDK 0.19.0 retains the bundled catalog change introduced in 0.16.4: the retired
 Registration is an explicit operator action; upgrading dependencies alone does
 not change Discord's stored commands.
 
-> **Current 0.19.0 evidence: bounded Windows verification.** Source pins target official unpatched
-> `@gajae-code/coding-agent` **0.19.0**, requiring **Bun 1.4.0 or newer**.
-> Focused tests, the full suite, canonical imports and one authorized provider smoke passed;
-> this is not all-platform, installation or deployment qualification. See
-> [the current evidence ledger](docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
+> **Current tracked-input evidence: LOCAL Windows subset qualified.** Source pins remain official unpatched
+> `@gajae-code/coding-agent` **0.19.0**, requiring **Bun 1.4.0 or newer**;
+> SDK version/SRI are unchanged. Post-review focused and unrestricted workspace checks
+> passed with mock providers; the consumed basic-root smoke qualifies **PRE-REVIEW source only**,
+> not later router/fatal-retirement fixes or final test corrections, active controls or isolation.
+> It cannot be replayed. Ambiguous promoted-overlap gates remain bounded refusals.
+> Five prior independent lanes plus final test-correction review statically **APPROVE**;
+> exact-head CI remains **PENDING**;
+> #231 remains OPEN. See [the current evidence ledger](docs/daemon-workspace-verification.md#current-tracked-input-evidence).
+>
+> **Historical 0.19.0 adoption (`9512dd8`, PR #274):** Windows focused **265/265**;
+> unrestricted workspace **2749 tests, 2739 pass, 0 fail, 10 skips**; canonical
+> imports and one authorized A-B-A provider smoke passed for that cohort.
+> These are not tracked-input integration results. The paid smoke grant is consumed,
+> cannot be replayed, and provides no fresh provider authority.
 >
 > **Historical 0.18.12 source evidence (PR #265):** Windows focused **333/333**, bounded workspace **2704 tests,
 > 2700 pass, 0 fail, 4 skips**, and isolated Linux **248/248** (no provider calls).
@@ -359,8 +392,11 @@ not change Discord's stored commands.
 SDK 0.19.0 retains the late-follow-up continuation fix for
 [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) and the public
 tracked ownership API associated with
-[#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429); neither restores
-active controls in this adapter. Release inclusion is not local verification:
+[#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429). This branch integrates
+that public tracked lifecycle for active controls; only the
+[recorded LOCAL Windows subset](docs/daemon-workspace-verification.md#current-tracked-input-evidence)
+is qualified, not universal workflow gates or provider-backed active controls.
+Release inclusion is not local verification:
 [#6600](https://github.com/Yeachan-Heo/gajae-code/issues/6600) is addressed by
 #6693 and follow-up #6715, and #6604 by #6696. Upstream
 [#6578](https://github.com/Yeachan-Heo/gajae-code/issues/6578) is CLOSED and
@@ -368,11 +404,13 @@ active controls in this adapter. Release inclusion is not local verification:
 the actual [#6970 repair](https://github.com/Yeachan-Heo/gajae-code/pull/6970)
 appears in the official 0.19.0 release notes. Inclusion is not local workflow
 qualification. Merged #6763's transcript-content approval binding is distinct.
-Gate/admission containment and active-control fail-closed policy remain unchanged.
+Gate/admission containment remains fail-closed when ownership is unprovable;
+tracked routing does not establish universal gate qualification or authorize bypass.
 
 The existing uninstall generation defect is tracked separately in
 [issue #273](https://github.com/kogangdon/gjc-remote/issues/273) and is **not repaired**
-by this SDK upgrade. Source 0.19.0 does not authorize signing, installation or
+by this tracked-input integration. Source 0.19.0 does not authorize release,
+signing, installation, deployment, host-ACL/account/credential changes or
 reuse of immutable rc.14/rc.12 release identities; their recorded SDK/version
 evidence remains historical.
 

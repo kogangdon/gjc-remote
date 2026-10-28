@@ -95,10 +95,13 @@ function failureSummary(receipt, signal) {
         "followUpStatus",
         "followUpFailureCode",
         "initialStatus",
+        "initialFailureCode",
         "rawTerminalCount",
         "publicTerminalCount",
+        "publicRootPromptStatus",
         "publicTerminalCountAtAdmission",
         "agentStreaming",
+        "sessionStreaming",
         "executableSteeringCount",
         "executableFollowUpCount",
         "displayQueueCount",
@@ -132,6 +135,17 @@ function failureSummary(receipt, signal) {
         }
       }
       const beforeLateAnswer = state.beforeLateAnswer;
+      if (Array.isArray(state.trackedSubmissions)) {
+        for (const [index, record] of state.trackedSubmissions.slice(0, 8).entries()) {
+          for (const key of ["submissionId", "admittedStatus", "executionStatus", "executionDisposition",
+            "terminalStatus", "terminalDisposition", "removalReason"]) {
+            const value = record?.[key];
+            if (typeof value === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(value)) {
+              safeState.push(`trackedSubmissions.${index}.${key}=${value}`);
+            }
+          }
+        }
+      }
       if (beforeLateAnswer && typeof beforeLateAnswer === "object" && !Array.isArray(beforeLateAnswer)) {
         for (const key of [
           "ownedPromptStatus",
@@ -194,7 +208,7 @@ function failureSummary(receipt, signal) {
     }
   }
   if (Array.isArray(receipt?.harnessCleanupOutcomes)) {
-    for (const [index, outcome] of receipt.harnessCleanupOutcomes.slice(0, 8).entries()) {
+    for (const [index, outcome] of receipt.harnessCleanupOutcomes.slice(0, 12).entries()) {
       if (!outcome || typeof outcome !== "object") continue;
       const fields = [`phase=fixture-owner-close`, `modelCacheState=${safeCode(outcome.modelCacheState, "unknown")}`];
       for (const key of ["sessionDispose", "managerClose", "registryDispose", "providerRelease", "authClose", "settingsClose"]) {
@@ -211,9 +225,9 @@ function failureSummary(receipt, signal) {
   if (partial?.status === "diagnostic-only-not-whole-contract-PASS") {
     parts.push(`partialEvidence.status=${partial.status}`);
     const cellNames = [
-      "canonicalImports", "gates", "failureTerminal", "disposal",
-      "pendingAskDisposal", "pendingAskActiveCancel", "liveControlContainment",
-      "decisionGate",
+      "canonicalImports", "gates", "joinedAsk", "failureTerminal", "disposal",
+      "pendingAskDisposal", "pendingAskActiveCancel", "trackedControls", "trackedControlFailure",
+      "lateFollowUp", "lateSteer", "promotedGateOverlap", "decisionGate", "queuedControlOwnership",
     ];
     for (const name of cellNames) {
       if (partial.completedCells?.[name] && typeof partial.completedCells[name] === "object") {
@@ -236,6 +250,7 @@ function failureSummary(receipt, signal) {
       }
     };
     appendState(partial.pendingAskActiveCancel, "pendingAskActiveCancel");
+    appendState(partial.joinedAsk, "joinedAsk");
     if (fields.length > 0) parts.push(`partialEvidence[${fields.join(";")}]`);
   }
   return parts.join(", ");
@@ -305,12 +320,21 @@ test("failure diagnostics preserve partial cells without qualifying the whole co
         declaredArtifact: "agent-session-types",
         operation: "expected-declaration-read",
         filesystemCode: "ENOENT",
+        trackedSubmissions: [{ submissionId: "queued-diagnostic", admittedStatus: "fulfilled",
+          executionStatus: "fulfilled", executionDisposition: "promoted-to-run", terminalStatus: "pending",
+          terminalDisposition: "pending", removalReason: "none", rawText: "authorization=private credential" }],
         rawPath: "D:/private/owned/root",
       },
     },
     partialEvidence: {
       status: "diagnostic-only-not-whole-contract-PASS",
       completedCells: { gates: {}, pendingAskActiveCancel: {} },
+      joinedAsk: {
+        status: "blocked", blockedCase: "joined-current-run-Ask-owner-presentation",
+        code: "JOINED_ASK_CONTINUATION_GATE_MISSING", positiveOwnerPresentationQualification: false,
+        observedState: { publicRootPromptStatus: "pending", sdkPendingGateCount: 1 },
+        fabricatedReceiptUsed: false,
+      },
       pendingAskActiveCancel: {
         afterLateAnswer: {
           ownedPromptStatus: "rejected",
@@ -333,6 +357,9 @@ test("failure diagnostics preserve partial cells without qualifying the whole co
   assert.match(summary, /partialEvidence.status=diagnostic-only-not-whole-contract-PASS/);
   assert.match(summary, /completedCell=gates/);
   assert.match(summary, /completedCell=pendingAskActiveCancel/);
+  assert.match(summary, /trackedSubmissions.0.submissionId=queued-diagnostic/);
+  assert.match(summary, /trackedSubmissions.0.executionDisposition=promoted-to-run/);
+  assert.match(summary, /trackedSubmissions.0.terminalStatus=pending/);
   for (const field of [
     "afterLateAnswer.ownedPromptStatus=rejected", "afterLateAnswer.ownedPromptFailureCode=aborted",
     "afterLateAnswer.publicAbortStatus=fulfilled", "afterLateAnswer.underlyingTerminalCount=1",
@@ -340,11 +367,39 @@ test("failure diagnostics preserve partial cells without qualifying the whole co
     "providerCalls=1", "continuationProviderCalls=0", "teardown.calls.sessionDispose=1",
     "teardown.calls.managerClose=1", "teardown.exactAdapterListenerRemaining=false",
   ]) assert.ok(summary.includes(`pendingAskActiveCancel.${field}`), field);
+  for (const field of [
+    "status=blocked", "blockedCase=joined-current-run-Ask-owner-presentation",
+    "code=JOINED_ASK_CONTINUATION_GATE_MISSING", "positiveOwnerPresentationQualification=false",
+    "observedState.publicRootPromptStatus=pending", "observedState.sdkPendingGateCount=1",
+    "fabricatedReceiptUsed=false",
+  ]) assert.ok(summary.includes(`joinedAsk.${field}`), field);
   assert.doesNotMatch(summary, /private|authorization|rawPath|secret=/);
 });
 
+function assertSubmissionEvidence(record, delivery, disposition, removed = false) {
+  assert.equal(typeof record.submissionId, "string");
+  assert.ok(record.submissionId.length > 0);
+  assert.deepEqual(record.admitted, { submissionId: record.submissionId, delivery, queuePolicy: "sequential" });
+  for (const value of [record.execution, record.terminal]) {
+    assert.equal(value.submissionId, record.submissionId);
+    assert.equal(value.delivery, delivery);
+    if (!removed) {
+      assert.equal(typeof value.attemptScope.attemptId, "string");
+      assert.ok(value.attemptScope.attemptId.length > 0);
+      assert.ok(Number.isSafeInteger(value.attemptScope.generation));
+      assert.equal(value.attemptScope.lineage, "main");
+    }
+  }
+  assert.equal(record.execution.disposition, removed ? "removed" : disposition);
+  assert.equal(record.terminal.disposition, removed ? "removed" : "completed");
+  if (removed) {
+    assert.equal(record.execution.reason, "cancelled");
+    assert.equal(record.terminal.reason, "cancelled");
+  }
+}
+
 test(
-  "SDK 0.19.0 real AgentSession contracts contain live controls and govern gates, failures, and disposal",
+  "SDK 0.19.0 real tracked controls qualify ownership, sequential delivery, late rearm, joined Ask, gates, failures, and disposal",
   { timeout: 55_000 },
   async () => {
     assert.ok(existsSync(fixture), "real SDK contract fixture is missing");
@@ -380,10 +435,8 @@ test(
     assert.deepEqual(receipt.upgradeAssessment, {
       verdict: "PASS",
       oracleStatus: "completed",
-      containment: "live-controls-fail-closed",
-      limitationCodes: [
-        "PUBLIC_TRACKED_SUBMISSION_NOT_INTEGRATED_OR_QUALIFIED",
-      ],
+      liveControls: "public-tracked-submissions-behaviorally-qualified",
+      limitationCodes: ["DECISION_GATE_BUILDERS_NOT_PUBLIC", "SDK_TRACKED_INPUT_GATE_OWNERSHIP"],
     });
     assert.deepEqual(receipt.historicalProvenance, {
       oracleOriginSdkVersion: "0.16.4",
@@ -393,7 +446,7 @@ test(
       upstreamFixPullRequest: 5371,
       upstreamFixBranch: "dev",
       upstreamFixMarkerPresentInObservedVersion: true,
-      continuationBehaviorQualifiedByOracle: false,
+      continuationBehaviorQualifiedByOracle: true,
     });
     assert.deepEqual(receipt.environment, {
       credentialVariableCount: 0,
@@ -402,12 +455,15 @@ test(
     });
     assert.equal(existsSync(root), false, "parent wrapper did not remove its fixture root");
     assert.deepEqual(receipt.cleanup, {
-      harnessCount: 6,
+      harnessCount: 11,
+      harnessNames: ["workflow-gates", "failure-terminal", "dispose-without-terminal", "pending-ask-disposal",
+        "pending-ask-active-cancel", "tracked-control-sequential", "tracked-control-failure", "late-follow-up-continuation",
+        "late-steer-rearm", "late-follow-up-gate-overlap", "joined-steer-ask"],
       sdkResourcesClosed: true,
-      modelCacheStates: ["closed", "closed", "closed", "closed", "closed", "closed"],
-      ownedScratchRemoved: [true, true, true, true, true, true],
+      modelCacheStates: Array(11).fill("closed"),
+      ownedScratchRemoved: Array(11).fill(true),
       authStorageBacking: "owned-file",
-      resourceReleaseCalls: Array.from({ length: 6 }, () => ({
+      resourceReleaseCalls: Array.from({ length: 11 }, () => ({
         settingsClose: 1,
         authClose: 1,
         registryDispose: 1,
@@ -415,7 +471,7 @@ test(
         managerClose: 1,
         sessionDispose: 1,
       })),
-      subscriptionsRemaining: [0, 0, 0, 0, 0, 0],
+      subscriptionsRemaining: Array(11).fill(0),
       cleanupOrder: [
         "event-subscription-release",
         "adapter-session-dispose",
@@ -448,14 +504,127 @@ test(
       publicNamespacesExported: ["host", "lifecycle"],
       privateSubpathsRejected: ["./sdk/broker", "./sdk/client", "./sdk/models"],
     });
-    assert.deepEqual(receipt.liveControlContainment, {
-      mode: "fail-closed",
-      errorCode: "SDK_LIVE_CONTROL_UNSUPPORTED",
-      steerStatus: "rejected",
-      followUpStatus: "rejected",
-      executableSteeringCount: 0,
-      executableFollowUpCount: 0,
-      promptStatus: "fulfilled",
+    for (const [name, failure, providerCalls, deliveries] of [
+      ["trackedControls", false, 6, ["steer", "steer", "followUp", "followUp"]],
+      ["trackedControlFailure", true, 4, ["steer", "followUp"]],
+    ]) {
+      const actual = receipt[name];
+      assert.equal(actual.receipts.length, deliveries.length);
+      const submittedDeliveries = failure ? ["steer", "followUp"] : ["steer", "steer", "followUp", "followUp", "followUp"];
+      assert.equal(actual.submissions.length, submittedDeliveries.length);
+      assert.equal(new Set(actual.submissions.map((item) => item.submissionId)).size, submittedDeliveries.length);
+      actual.submissions.forEach((item, index) => assertSubmissionEvidence(item, submittedDeliveries[index],
+        "joined-current-run", !failure && index === 2));
+      assert.ok(actual.receipts.some((item) => item.finalScopeChanged), "final owning scope change was not exercised");
+      assert.deepEqual(actual, {
+        status: "qualified", acceptedDuringProviderExecution: true,
+        queuePolicy: "sequential", ordering: "per-delivery-not-global-FIFO", providerCalls,
+        exactPrimaryTerminal: true,
+        submissions: actual.submissions,
+        receipts: deliveries.map((delivery, index) => ({
+          delivery, executionDisposition: "joined-current-run",
+          finalScopeChanged: actual.receipts[index].finalScopeChanged,
+          exactOwningTerminal: true, activatedAfterExecution: true,
+          adapterStatus: failure ? "rejected" : "fulfilled", cancelAfterExecution: false,
+        })),
+        duplicateTextDistinctIds: !failure, exactlyOneQueuedHandleCancelled: !failure,
+        cancellationReason: failure ? "not-exercised" : "cancelled",
+        noSuccessorEventLeakage: true, owningFailureObserved: failure, fabricatedReceiptUsed: false,
+      });
+      for (const item of actual.receipts) assert.equal(typeof item.finalScopeChanged, "boolean");
+    }
+    for (const [name, delivery] of [["lateFollowUp", "followUp"], ["lateSteer", "steer"]]) {
+      assertSubmissionEvidence(receipt[name].submission, delivery, "promoted-to-run");
+      const proof = receipt[name].originalRootResult;
+      assert.equal(typeof proof.rawScope.attemptId, "string");
+      assert.ok(proof.rawScope.attemptId.length > 0);
+      assert.ok(Number.isSafeInteger(proof.rawScope.generation));
+      assert.equal(proof.rawScope.lineage, "main");
+      assert.notDeepEqual(proof.rawScope, receipt[name].submission.execution.attemptScope);
+      assert.notDeepEqual(proof.rawScope, receipt[name].submission.terminal.attemptScope);
+      assert.ok([0, 1].includes(proof.sdkPublicRootTerminalCount));
+      assert.equal(proof.sdkPublicTerminalCount, proof.sdkPublicRootTerminalCount + 1);
+      assert.deepEqual(proof, {
+        evidenceKind: "public-AgentSession.agent-raw-scope-and-own-public-prompt",
+        rawScope: proof.rawScope, rawTerminalStopReason: "completed", rawTerminalBeforeLateSubmission: true,
+        publicPromptCallIndex: 0, publicPromptStatus: "fulfilled", adapterStatus: "fulfilled",
+        sdkPublicRootTerminalCount: proof.sdkPublicRootTerminalCount,
+        sdkPublicTerminalCount: proof.sdkPublicTerminalCount,
+      });
+      assert.deepEqual(receipt[name], {
+        status: "qualified", boundary: "raw-Agent-agent_end-before-AgentSession-unwind",
+        actualSuccessorProviderInvoked: true, actualQueuedTextConsumed: true,
+        executionDisposition: "promoted-to-run", exactOwningTerminal: true,
+        submission: receipt[name].submission,
+        originalRootResult: proof,
+        trackedTerminalProof: "genuine-handle-terminal-and-matching-public-SDK-agent_end",
+        noSuccessorEventLeakage: true, cancelAfterExecution: false, providerCalls: 3, fabricatedReceiptUsed: false,
+      });
+    }
+    const overlap = receipt.promotedGateOverlap;
+    assert.deepEqual(overlap.admitted, {
+      submissionId: overlap.submissionId, delivery: "followUp", queuePolicy: "sequential",
+    });
+    assert.equal(typeof overlap.submissionId, "string");
+    assert.ok(overlap.submissionId.length > 0);
+    assert.equal(overlap.execution.submissionId, overlap.submissionId);
+    assert.equal(overlap.execution.delivery, "followUp");
+    assert.equal(overlap.execution.disposition, "promoted-to-run");
+    assert.equal(typeof overlap.execution.attemptScope.attemptId, "string");
+    assert.ok(Number.isSafeInteger(overlap.execution.attemptScope.generation));
+    assert.equal(overlap.execution.attemptScope.lineage, "main");
+    const originalRoot = overlap.originalRootResult;
+    assert.equal(typeof originalRoot.rawScope.attemptId, "string");
+    assert.ok(originalRoot.rawScope.attemptId.length > 0);
+    assert.ok(Number.isSafeInteger(originalRoot.rawScope.generation));
+    assert.equal(originalRoot.rawScope.lineage, "main");
+    assert.notDeepEqual(originalRoot.rawScope, overlap.execution.attemptScope);
+    assert.ok(["pending", "fulfilled"].includes(overlap.beforeTeardown.initialStatus));
+    assert.ok(["pending", "fulfilled"].includes(overlap.beforeTeardown.publicRootPromptStatus));
+    assert.ok(["fulfilled", "rejected"].includes(originalRoot.adapterStatus));
+    assert.ok(["pending", "fulfilled", "rejected"].includes(originalRoot.publicPromptStatus));
+    if (overlap.beforeTeardown.initialStatus === "fulfilled") {
+      assert.equal(overlap.beforeTeardown.publicRootPromptStatus, "fulfilled");
+      assert.equal(originalRoot.adapterStatus, "fulfilled", "completed root was retroactively rejected");
+    }
+    if (originalRoot.adapterStatus === "fulfilled") assert.equal(originalRoot.publicPromptStatus, "fulfilled");
+    assert.deepEqual(originalRoot, {
+      evidenceKind: "public-AgentSession.agent-raw-scope-and-own-public-prompt",
+      rawScope: originalRoot.rawScope, rawTerminalStopReason: "completed", rawTerminalBeforeLateSubmission: true,
+      publicPromptCallIndex: 0, publicPromptStatus: originalRoot.publicPromptStatus,
+      adapterStatus: originalRoot.adapterStatus, fulfilledWithOwnProof: originalRoot.adapterStatus === "fulfilled",
+      sdkPublicRootTerminalCountAtGateEmission: 0,
+    });
+    assert.deepEqual(overlap, {
+      status: "bounded-refusal-qualified", code: "SDK_TRACKED_INPUT_GATE_OWNERSHIP",
+      boundary: "raw-Agent-agent_end-before-AgentSession-unwind",
+      actualSuccessorProviderInvoked: true, actualQueuedTextConsumed: true,
+      submissionId: overlap.submissionId, admitted: overlap.admitted, execution: overlap.execution,
+      beforeTeardown: {
+        publicTerminalCount: 0, publicRootPromptStatus: overlap.beforeTeardown.publicRootPromptStatus,
+        initialStatus: overlap.beforeTeardown.initialStatus, lateStatus: "pending", trackedTerminalStatus: "pending",
+      },
+      gateWindowMs: 500, originalRootResult: originalRoot,
+      initialFailureCode: originalRoot.adapterStatus === "fulfilled" ? "NONE" : "SDK_TRACKED_INPUT_GATE_OWNERSHIP",
+      promotedFailureCode: "SDK_TRACKED_INPUT_GATE_OWNERSHIP",
+      gateRequestCount: 0, sdkResolveCalls: 0, continuationProviderCalls: 0,
+      pendingGatesRetired: true, realTeardownCompleted: true, fixtureResourcesOpenUntilOwnerTeardown: true,
+      promotedGateExactOwnerAndPresentation: false, fabricatedReceiptUsed: false,
+    });
+
+    const joinedAsk = receipt.joinedAsk;
+    assertSubmissionEvidence(joinedAsk.submission, "steer", "joined-current-run");
+    assert.deepEqual(joinedAsk, {
+      status: "qualified", evidenceKind: "installed-public-SDK-Ask-with-credentialless-mock-provider",
+      primaryAskHeldAtAdmission: true, actualQueuedTextConsumed: true,
+      executionDisposition: "joined-current-run", submission: joinedAsk.submission,
+      emittedGateCount: 2, originalOwnerGateRequestCount: 2, joinedCallerGateRequestCount: 0,
+      joinedCallerPresentationRefused: true, joinedCallerAnswerRefused: true,
+      originalOwnerAnsweredBothGates: true, sdkResolveCalls: 2, providerCalls: 3,
+      originalPublicPromptStatus: "fulfilled", adapterStatuses: { original: "fulfilled", joined: "fulfilled" },
+      sharedPublicTerminalCount: 1, exactSharedPublicTerminalAndHandleScope: true,
+      trackedTerminalProof: "genuine-handle-terminal-and-matching-public-SDK-agent_end",
+      fabricatedReceiptUsed: false,
     });
 
     assert.equal(receipt.gates.emittedGateCount, 2);
@@ -561,10 +730,8 @@ test(
       fabricatedSchemaUsed: false,
     });
     assert.deepEqual(receipt.queuedControlOwnership, {
-      status: "contained",
-      code:
-        "PUBLIC_TRACKED_SUBMISSION_NOT_INTEGRATED_OR_QUALIFIED",
-      affectedAdapterPath: "SdkSession.send rejects live steer/follow_up",
+      status: "qualified",
+      affectedAdapterPath: "SdkSession.send-sendOwned-public-tracked-submissions",
       sendUserMessageHooksStructurallyDeclared: true,
       queuedAtDispatchClassification: "internal-sdk-signal",
       onQueuedPromotedClassification: "sdk-host-ownership-correlation",
@@ -575,18 +742,19 @@ test(
       publicTrackedSubmissionDeclared: true,
       publicTrackedLifecycleDeclared: true,
       canonicalTrackedTypesExported: true,
-      trackedSubmissionIntegrated: false,
-      trackedSubmissionBehaviorallyQualified: false,
+      trackedSubmissionIntegrated: true,
+      trackedSubmissionBehaviorallyQualified: true,
+      joinedGateExactOwnerAndPresentationQualified: true,
+      promotedGateExactOwnerAndPresentationQualified: false,
+      successfulScenarioEvidence: ["trackedControls", "trackedControlFailure", "lateFollowUp", "lateSteer", "joinedAsk"],
       unsupportedFallbackUsed: false,
       publicContractRequestIssue: 5429,
     });
     assert.deepEqual(receipt.limitations, {
       lateFollowUpAutoContinuation: {
-        status: "not-behaviorally-qualified",
-        code: "LATE_FOLLOW_UP_CONTINUATION_NOT_QUALIFIED",
-        boundary: "live controls rejected before SDK queue admission",
-        evidence:
-          "The published package contains the continuation marker; the adapter does not enter that queue path and this oracle does not qualify it.",
+        status: "qualified",
+        boundary: "raw-Agent-agent_end-before-AgentSession-unwind",
+        actualSuccessorProviderInvoked: true,
       },
       successorGateCompletion: {
         status: "completed-response-loss-qualified-with-public-SDK-mock-provider",
@@ -595,12 +763,28 @@ test(
         observedEvidence: "exact-response lookupCompletedResolution.kind=completed",
       },
       lateSteerRearm: {
-        status: "unsupported-fail-closed",
-        code: "LATE_STEER_REARM_NOT_OBSERVED",
-        excludedCase: "live steer",
-        reason:
-          "Public tracked submission is present, but its daemon lifecycle integration and behavior are not qualified by this oracle.",
+        status: "qualified",
+        boundary: "raw-Agent-agent_end-before-AgentSession-unwind",
+        actualSuccessorProviderInvoked: true,
       },
+      joinedSteerGate: {
+        status: "qualified",
+        positiveOwnerPresentationQualification: true,
+        executionDisposition: "joined-current-run",
+        gateOwner: "original-logical-run-owner-not-joined-submission",
+        actualSharedPublicTerminalAndHandleScope: true,
+      },
+      promotedFollowUpGate: {
+        status: "unavailable-public-scope-correlation",
+        code: "SDK_TRACKED_INPUT_GATE_OWNERSHIP",
+        positiveOwnerPresentationQualification: false,
+        negativeOverlapRefusalQualified: true,
+        reason: "public-gate-runtime_turn_id-has-no-public-attempt-scope-mapping",
+        publicTerminalBarrier: "live-prompts-must-unwind-before-AgentSession-agent_end-publication",
+        delayedHandleCandidate: "unqualified-return-delay-does-not-release-SDK-live-prompt-barrier",
+      },
+      excludedCases: ["structured-decision-denial-builders-not-public", "accepted-incomplete-predecessor-gate",
+        "global-cross-mode-FIFO", "real-provider-network-or-credentials", "positive-promoted-overlap-gate-binding"],
     });
   }
 );

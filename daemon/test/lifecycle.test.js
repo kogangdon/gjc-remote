@@ -1983,8 +1983,25 @@ test("cancellation before session admission terminalizes without execution", asy
         { type: "invoke_terminal", disposition: "cancelled" },
       ]
     );
+    const framesBeforeReplay = daemon.frames.length;
+    socket.send(JSON.stringify({
+      type: "cancel_invoke",
+      requestId,
+      cancelId: "cancel-before-admission-1",
+      reason: "idle_timeout",
+    }));
+    await waitForLength(daemon.frames, framesBeforeReplay + 1, "pre-admission receipt replay");
+    const replay = daemon.frames.filter(
+      (frame) => frame.event?.cancelId === "cancel-before-admission-1"
+    );
+    assert.equal(replay.length, 2);
+    assert.deepEqual(replay[0], replay[1]);
     daemon.child.send({ type: "cancellation_fixture_release_creation" });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitForFrame(
+      daemon.telemetry,
+      (event) => event.name === "daemon" && event.action === "invoke" && event.outcome === "failed",
+      "pre-admission invoke cleanup after creation resumes"
+    );
     assert.equal(
       daemon.cancellationFixtureEvents.some(
         (event) =>
@@ -1993,10 +2010,613 @@ test("cancellation before session admission terminalizes without execution", asy
       ),
       false
     );
+    assert.equal(
+      daemon.cancellationFixtureEvents.some((event) => event.event === "ticket_created"),
+      false,
+      "pre-admission cancellation must prevent SDK ticket creation"
+    );
+    assert.equal(
+      daemon.frames.filter(
+        (frame) => frame.requestId === requestId && frame.event?.type === "invoke_terminal"
+      ).length,
+      1
+    );
   } finally {
     await daemon.stop();
   }
 });
+
+async function startReceiptCancellationDaemon(envOverrides) {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "gjc-fatal-retirement-"));
+  const sourcePlatform = process.platform === "win32" ? "windows-drive" : "posix";
+  const casePolicy = process.platform === "win32" ? "insensitive" : "sensitive";
+  // Fill the existing host ceiling, then probe a distinct ninth workspace.
+  // Every invocation uses a verified receipt and the real SdkSession adapter.
+  const mappings = Array.from({ length: 9 }, (_, index) => {
+    const workspaceId = `retirement-workspace-${index}`;
+    return fingerprintManagedMappingRecord({
+      mappingId: `retirement-mapping-${index}`,
+      hostId: "readiness-test-host",
+      fenceGeneration: 1,
+      mappingGeneration: 1,
+      workspaceGeneration: 1,
+      mappingVersion: 1,
+      sourcePlatform,
+      workspaceId,
+      workDir: null,
+      sourceRoot: join(workspaceRoot, workspaceId),
+      containerRoot: null,
+      volumeIdentity: `retirement-volume-${index}`,
+      casePolicy,
+      immutableDefault: false,
+      mappingFingerprint: null,
+    });
+  });
+  const bindings = mappings.map((mapping, index) => ({
+    type: "bind_workspace",
+    bindingId: `retirement-binding-${index}`,
+    authorityEpoch: 1,
+    fenceGeneration: mapping.fenceGeneration,
+    hostId: mapping.hostId,
+    mappingId: mapping.mappingId,
+    mappingGeneration: mapping.mappingGeneration,
+    mappingVersion: mapping.mappingVersion,
+    workspaceId: mapping.workspaceId,
+    workspaceGeneration: mapping.workspaceGeneration,
+    sourcePlatform: mapping.sourcePlatform,
+    authorityFingerprint: mapping.mappingFingerprint,
+    mapping,
+  }));
+  const inventory = workspaceInventoryBytes(buildWorkspaceInventory({
+    hostId: "readiness-test-host",
+    inventoryGeneration: 1,
+    workspaces: mappings.map((mapping) => ({
+      hostId: mapping.hostId,
+      workspaceId: mapping.workspaceId,
+      sourcePlatform,
+      workDir: mapping.sourceRoot,
+      rootIdentityFingerprint: "3".repeat(64),
+      storageIdentityFingerprint: "4".repeat(64),
+    })),
+  })).toString("utf8");
+  let bindSent = false;
+  const daemon = await startReadinessDaemon({
+    daemonEntryOverride: fileURLToPath(
+      new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
+    ),
+    observabilityTestIpc: true,
+    registerResponse: {
+      type: "register_ok",
+      protocolVersion: 3,
+      // CAPABILITIES alone is the v1 baseline, not the managed v3 floor.
+      capabilities: [
+        ...CAPABILITIES,
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+      ],
+    },
+    workspaceInventory: inventory,
+    envOverrides: {
+      GJC_NATIVE_INVENTORY_MODE: "verify",
+      GJC_NATIVE_WORKSPACE_SERVING: "1",
+      GJC_NATIVE_WORKSPACE_ROOT: workspaceRoot,
+      GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+      GJC_READINESS_TEST_WORKSPACE_ID: "",
+      GJC_READINESS_TEST_WORKSPACE_GENERATION: "",
+      GJC_READINESS_TEST_MAPPING_ID: "",
+      GJC_READINESS_TEST_MAPPING_GENERATION: "",
+      GJC_READINESS_TEST_MAPPING_VERSION: "",
+      GJC_READINESS_TEST_WORK_DIR: "",
+      ...envOverrides,
+    },
+    onMessage(message, socket) {
+      if (message.type !== "readiness" || bindSent) return;
+      bindSent = true;
+      for (const binding of bindings) socket.send(JSON.stringify(binding));
+    },
+  });
+  const stop = daemon.stop.bind(daemon);
+  daemon.stop = async () => {
+    await stop();
+    await rm(workspaceRoot, { recursive: true, force: true });
+  };
+  try {
+    await waitForFrame(daemon.registrations, (registration) =>
+      registration.protocolVersion === 3 &&
+      [
+        WORKSPACE_READINESS_CAPABILITY,
+        WORKSPACE_INVENTORY_RECEIPT_CAPABILITY,
+        WORKSPACE_BIND_AUTHORITY_VERIFICATION_CAPABILITY,
+      ].every((capability) => registration.capabilities?.includes(capability)),
+    "v3 retirement managed registration");
+    for (const binding of bindings) {
+      await waitForFrame(daemon.frames, (frame) =>
+        frame.type === "bind_ok" && frame.bindingId === binding.bindingId &&
+        frame.inventoryGeneration === 1 &&
+        typeof frame.inventoryFingerprint === "string" &&
+        typeof frame.bindingFingerprint === "string",
+      "retirement binding receipt");
+      await waitForFrame(daemon.frames, (frame) =>
+        frame.type === "readiness" && frame.bindingId === binding.bindingId &&
+        frame.status?.runtime === "ready" && frame.status?.providerAuth === "configured" &&
+        frame.status?.modelProfile === "ready" && frame.status?.workspace === "ready",
+      "receipt-backed retirement readiness");
+      // As in the receipt-bound admission test, boot recovery may have removed
+      // these unrecognized directories before publishing bound readiness.
+      mkdirSync(binding.mapping.sourceRoot, { recursive: true });
+    }
+    daemon.invoke = (index, requestId, command) => {
+      const binding = bindings[index];
+      daemon.sockets[0].send(JSON.stringify({
+        type: "invoke",
+        requestId,
+        bindingId: binding.bindingId,
+        mappingId: binding.mappingId,
+        mappingGeneration: binding.mappingGeneration,
+        mappingVersion: binding.mappingVersion,
+        workspaceId: binding.workspaceId,
+        workspaceGeneration: binding.workspaceGeneration,
+        command,
+      }));
+    };
+    daemon.activityHolders = (index) => daemon.telemetry.reduce((holders, event) => {
+      if (event.name !== "workspace_lease_registry" ||
+          event.workspaceId !== bindings[index].workspaceId || event.outcome !== "succeeded") {
+        return holders;
+      }
+      return holders + (event.action === "acquire" ? 1 : event.action === "release" ? -1 : 0);
+    }, 0);
+    daemon.waitTerminal = async (requestId) => {
+      await waitForFrame(daemon.frames, (frame) =>
+        frame.requestId === requestId && frame.event?.type === "invoke_terminal",
+      "retirement terminal frame");
+      await waitForFrame(daemon.telemetry, (event) =>
+        event.name === "daemon" && event.action === "invoke" && event.transactionId === requestId,
+      "settled retirement invocation");
+      const terminals = daemon.frames.filter((frame) =>
+        frame.requestId === requestId && frame.event?.type === "invoke_terminal");
+      assert.equal(terminals.length, 1);
+      return terminals[0].event;
+    };
+    daemon.fillHost = async () => {
+      for (let index = 0; index < 8; index += 1) {
+        const message = `retirement-root-${index}`;
+        daemon.invoke(index, `${message}-request`, { kind: "prompt", message });
+        await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+          event.event === "prompt_started" && event.message === message,
+        "reserved host activity slot");
+      }
+      assert.deepEqual(mappings.slice(0, 8).map((_, index) => daemon.activityHolders(index)),
+        Array(8).fill(1));
+    };
+    daemon.assertHostHeld = async (requestId) => {
+      const creations = daemon.cancellationFixtureEvents.filter((event) => event.event === "session_created").length;
+      daemon.invoke(8, requestId, { kind: "prompt", message: requestId });
+      assert.deepEqual(await daemon.waitTerminal(requestId), {
+        type: "invoke_terminal", disposition: "failed", code: "WORKSPACE_ADMISSION_EXCEEDED",
+      });
+      assert.equal(daemon.cancellationFixtureEvents.some((event) =>
+        event.event === "ticket_created" && event.message === requestId), false);
+      assert.equal(daemon.cancellationFixtureEvents.filter((event) => event.event === "session_created").length,
+        creations, "host admission refusal must precede session creation");
+      assert.equal(mappings.filter((_, index) => daemon.activityHolders(index) > 0).length, 8);
+    };
+    daemon.releaseDisposalAndAdmit = async () => {
+      daemon.child.send({ type: "cancellation_fixture_release_disposal" });
+      await waitForFrame(daemon.cancellationFixtureEvents,
+        (event) => event.event === "dispose_completed", "actual fixture disposal fulfillment");
+      assert.equal(daemon.cancellationFixtureEvents.find((event) => event.event === "dispose_completed").pendingPrompts, 0);
+      await waitForFrame(daemon.telemetry, () => daemon.activityHolders(0) === 0,
+        "lease release after successful adapter disposal");
+      daemon.invoke(8, "retirement-after-proof-request", {
+        kind: "prompt", message: "retirement-after-proof",
+      });
+      await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+        event.event === "prompt_started" && event.message === "retirement-after-proof",
+      "distinct workspace admission after disposal proof");
+      daemon.child.send({ type: "cancellation_fixture_release_prompt", message: "retirement-after-proof" });
+      assert.deepEqual(await daemon.waitTerminal("retirement-after-proof-request"), {
+        type: "invoke_terminal", disposition: "completed",
+      });
+    };
+    return daemon;
+  } catch (error) {
+    await daemon.stop();
+    throw error;
+  }
+}
+
+for (const disposal of ["blocked", "rejected"]) {
+  test(`fatal non-timeout tracked contract failure holds host admission with ${disposal} disposal`, async () => {
+    const daemon = await startReceiptCancellationDaemon({
+      GJC_CANCELLATION_FIXTURE_BLOCK_DISPOSAL: disposal === "blocked" ? "1" : "0",
+      GJC_CANCELLATION_FIXTURE_REJECT_DISPOSAL: disposal === "rejected" ? "1" : "0",
+    });
+    const rootRequestId = "retirement-root-0-request";
+    const controlRequestId = "retirement-fatal-control-request";
+    const cancel = {
+      type: "cancel_invoke", requestId: rootRequestId,
+      cancelId: "retirement-active/cancel", reason: "user_cancelled",
+    };
+    try {
+      await daemon.fillHost();
+      const socket = daemon.sockets[0];
+      socket.send(JSON.stringify(cancel));
+      await waitForFrame(daemon.frames, (frame) => frame.event?.cancelId === cancel.cancelId,
+        "active cancellation remains pending");
+      assert.equal(daemon.frames.find((frame) => frame.event?.cancelId === cancel.cancelId).event.outcome,
+        "cancellation_pending");
+
+      // A genuinely removed ordinary queued sibling remains authoritative.
+      daemon.invoke(0, "retirement-removed-request", { kind: "prompt", message: "retirement-removed" });
+      await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+        event.event === "ticket_created" && event.message === "retirement-removed", "queued sibling");
+      socket.send(JSON.stringify({ type: "cancel_invoke", requestId: "retirement-removed-request",
+        cancelId: "retirement-removed/cancel", reason: "user_cancelled" }));
+      assert.deepEqual(await daemon.waitTerminal("retirement-removed-request"), {
+        type: "invoke_terminal", disposition: "cancelled",
+      });
+      assert.equal(daemon.cancellationFixtureEvents.some((event) =>
+        event.event === "prompt_started" && event.message === "retirement-removed"), false);
+
+      // CancellationAgent intentionally lacks submitUserMessage. The real
+      // adapter detects that public contract failure while the root is active.
+      daemon.invoke(0, controlRequestId, { kind: "steer", message: "retirement-fatal-control" });
+      await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+        event.event === "ticket_failed" && event.message === "retirement-fatal-control",
+      "real non-timeout tracked failure");
+      const failure = daemon.cancellationFixtureEvents.find((event) =>
+        event.event === "ticket_failed" && event.message === "retirement-fatal-control");
+      assert.equal(failure.code, "SDK_TRACKED_INPUT_CONTRACT");
+      assert.equal(failure.terminalDisposition, "failed");
+      assert.equal(failure.closed, true);
+      await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+        event.event === (disposal === "rejected" ? "dispose_rejected" : "dispose_started"),
+      "unproven underlying disposal");
+      assert.equal(daemon.cancellationFixtureEvents.find((event) => event.event === "dispose_started").pendingPrompts, 1);
+      for (const requestId of [rootRequestId, controlRequestId]) {
+        assert.deepEqual(await daemon.waitTerminal(requestId), {
+          type: "invoke_terminal", disposition: "failed", code: "UNKNOWN_RUNTIME",
+        });
+      }
+      assert.equal(daemon.activityHolders(0), 2,
+        "both failed invocations transfer their activity holds, not just same-session reuse fencing");
+      assert.equal(daemon.cancellationFixtureEvents.some((event) => event.event === "dispose_completed"), false);
+      await daemon.assertHostHeld("retirement-ninth-before-proof-request");
+      daemon.invoke(0, "retirement-same-before-proof-request", {
+        kind: "prompt", message: "retirement-same-before-proof",
+      });
+      assert.deepEqual(await daemon.waitTerminal("retirement-same-before-proof-request"), {
+        type: "invoke_terminal", disposition: "failed",
+        code: disposal === "blocked" ? "SESSION_RETIREMENT_PENDING" : "SESSION_RETIREMENT_FAILED",
+      });
+      await waitForFrame(daemon.telemetry, () => daemon.activityHolders(0) === 2,
+        "same-workspace refusal releases only its own temporary admission lease");
+
+      socket.send(JSON.stringify(cancel));
+      await waitForFrame(daemon.frames, () =>
+        daemon.frames.filter((frame) => frame.event?.cancelId === cancel.cancelId).length === 2,
+      "pending cancellation replay after fatal failure");
+      const receipts = daemon.frames.filter((frame) => frame.event?.cancelId === cancel.cancelId);
+      assert.deepEqual(receipts[0], receipts[1]);
+      if (disposal === "blocked") {
+        await daemon.releaseDisposalAndAdmit();
+      } else {
+        // A release message cannot turn a rejected disposal into proof.
+        daemon.child.send({ type: "cancellation_fixture_release_disposal" });
+        await daemon.assertHostHeld("retirement-ninth-after-rejection-request");
+        assert.equal(daemon.activityHolders(0), 2);
+      }
+      for (const requestId of [rootRequestId, controlRequestId]) {
+        const terminals = daemon.frames.filter((frame) =>
+          frame.requestId === requestId && frame.event?.type === "invoke_terminal");
+        assert.equal(terminals.length, 1, "late disposal callbacks cannot publish a second terminal");
+        assert.equal(terminals[0].event.disposition, "failed");
+      }
+      assert.equal(daemon.cancellationFixtureEvents.filter((event) => event.event === "dispose_started").length, 1);
+      assert.deepEqual(daemon.policyCloses, []);
+    } finally {
+      daemon.child.send({ type: "cancellation_fixture_release_disposal" });
+      await daemon.stop();
+    }
+  });
+}
+
+test("ordinary model selection failure keeps a healthy adapter reusable", async () => {
+  const daemon = await startReceiptCancellationDaemon({});
+  try {
+    daemon.invoke(0, "retirement-healthy-model-failure", {
+      kind: "set_model", modelName: "fixture:missing-model",
+    });
+    assert.deepEqual(await daemon.waitTerminal("retirement-healthy-model-failure"), {
+      type: "invoke_terminal", disposition: "failed", code: "UNKNOWN_RUNTIME",
+    });
+    const listed = daemon.cancellationFixtureEvents.find((event) => event.event === "models_listed");
+    assert.ok(listed);
+    daemon.invoke(0, "retirement-healthy-successor", {
+      kind: "prompt", message: "retirement-healthy-successor",
+    });
+    await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+      event.event === "prompt_started" && event.message === "retirement-healthy-successor",
+    "healthy adapter reuse after ordinary failure");
+    assert.equal(daemon.cancellationFixtureEvents.find((event) =>
+      event.event === "prompt_started" && event.message === "retirement-healthy-successor").agentId, listed.agentId);
+    assert.equal(daemon.cancellationFixtureEvents.some((event) => event.event === "dispose_started"), false);
+    daemon.child.send({ type: "cancellation_fixture_release_prompt", message: "retirement-healthy-successor" });
+    assert.deepEqual(await daemon.waitTerminal("retirement-healthy-successor"), {
+      type: "invoke_terminal", disposition: "completed",
+    });
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("contradictory SDK removal receipt retires an open adapter without releasing host activity", async () => {
+  const daemon = await startReceiptCancellationDaemon({
+    GJC_CANCELLATION_FIXTURE_BLOCK_DISPOSAL: "1",
+    GJC_CANCELLATION_FIXTURE_DELAY_REMOVAL: "1",
+    GJC_CANCELLATION_FIXTURE_REMOVAL_RESULT: "completed",
+  });
+  const requestId = "retirement-contradictory-removal-request";
+  const message = "retirement-contradictory-removal";
+  try {
+    await daemon.fillHost();
+    daemon.invoke(0, requestId, { kind: "prompt", message });
+    await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+      event.event === "ticket_created" && event.message === message, "queued removal contradiction ticket");
+    daemon.sockets[0].send(JSON.stringify({ type: "cancel_invoke", requestId,
+      cancelId: "retirement-contradictory-removal/cancel", reason: "user_cancelled" }));
+    await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+      event.event === "removal_receipt_deferred" && event.message === message,
+    "underlying queued removal before contradictory result");
+    assert.equal(daemon.frames.some((frame) => frame.requestId === requestId && frame.done), false);
+    daemon.child.send({ type: "cancellation_fixture_release_removal", message });
+    await waitForFrame(daemon.cancellationFixtureEvents, (event) =>
+      event.event === "removal_result_overridden" && event.message === message,
+    "contradictory result while adapter was still open");
+    assert.equal(daemon.cancellationFixtureEvents.find((event) =>
+      event.event === "removal_result_overridden" && event.message === message).closed, false);
+    await waitForFrame(daemon.cancellationFixtureEvents,
+      (event) => event.event === "dispose_started", "contradictory removal containment");
+    for (const failedId of [requestId, "retirement-root-0-request"]) {
+      assert.deepEqual(await daemon.waitTerminal(failedId), {
+        type: "invoke_terminal", disposition: "failed", code: "UNKNOWN_RUNTIME",
+      });
+    }
+    assert.equal(daemon.activityHolders(0), 2);
+    await daemon.assertHostHeld("retirement-contradiction-ninth-request");
+    await daemon.releaseDisposalAndAdmit();
+    assert.equal(daemon.cancellationFixtureEvents.some((event) =>
+      event.event === "prompt_started" && event.message === message), false);
+    assert.deepEqual(daemon.frames.filter((frame) =>
+      frame.requestId === requestId && frame.event?.type === "invoke_terminal").map((frame) => frame.event),
+    [{ type: "invoke_terminal", disposition: "failed", code: "UNKNOWN_RUNTIME" }]);
+  } finally {
+    daemon.child.send({ type: "cancellation_fixture_release_removal", message });
+    daemon.child.send({ type: "cancellation_fixture_release_disposal" });
+    await daemon.stop();
+  }
+});
+
+for (const removalResult of ["verified", "reject", "completed"]) {
+  test(`queued cancellation waits for ${removalResult} removal result before terminal publication`, async () => {
+    const daemon = await startReadinessDaemon({
+      daemonEntryOverride: fileURLToPath(
+        new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
+      ),
+      observabilityTestIpc: true,
+      registerResponse: {
+        type: "register_ok",
+        protocolVersion: 1,
+        capabilities: CAPABILITIES,
+      },
+      envOverrides: {
+        GJC_READINESS_V2: "0",
+        GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+        GJC_CANCELLATION_FIXTURE_DELAY_REMOVAL: "1",
+        GJC_CANCELLATION_FIXTURE_REMOVAL_RESULT: removalResult,
+        GJC_NATIVE_INVENTORY_MODE: "off",
+        GJC_NATIVE_WORKSPACE_SERVING: "0",
+      },
+    });
+    const parentMessage = `removal-parent-${removalResult}`;
+    const message = `await-removal-${removalResult}`;
+    const requestId = `${message}/request`;
+    try {
+      await waitForLength(daemon.sockets, 1, "removal receipt socket");
+      await waitForDaemonOutput(daemon, "daemon: registration accepted");
+      const socket = daemon.sockets[0];
+      socket.send(JSON.stringify({
+        type: "invoke",
+        requestId: `${parentMessage}/request`,
+        workDir: process.cwd(),
+        command: { kind: "prompt", message: parentMessage },
+      }));
+      await waitForFrame(
+        daemon.cancellationFixtureEvents,
+        (event) => event.event === "prompt_started" && event.message === parentMessage,
+        "blocking parent prompt"
+      );
+      socket.send(JSON.stringify({
+        type: "invoke",
+        requestId,
+        workDir: process.cwd(),
+        command: { kind: "prompt", message },
+      }));
+      await waitForFrame(
+        daemon.cancellationFixtureEvents,
+        (event) => event.event === "ticket_created" && event.message === message,
+        "queued cancellation ticket"
+      );
+      const cancel = {
+        type: "cancel_invoke",
+        requestId,
+        cancelId: `${message}/cancel`,
+        reason: "user_cancelled",
+      };
+      socket.send(JSON.stringify(cancel));
+      await waitForFrame(
+        daemon.frames,
+        (frame) => frame.event?.cancelId === cancel.cancelId,
+        "immediate positive removal acknowledgement"
+      );
+      await waitForFrame(
+        daemon.cancellationFixtureEvents,
+        (event) => event.event === "removal_receipt_deferred" && event.message === message,
+        "blocked SDK removal-result validation"
+      );
+      socket.send(JSON.stringify(cancel));
+      await waitForFrame(
+        daemon.frames,
+        () => daemon.frames.filter((frame) => frame.event?.cancelId === cancel.cancelId).length === 2,
+        "removal acknowledgement replay"
+      );
+      const acknowledgements = daemon.frames.filter((frame) => frame.event?.cancelId === cancel.cancelId);
+      assert.deepEqual(acknowledgements[0], acknowledgements[1]);
+      assert.equal(acknowledgements[0].event.outcome, "cancelled_before_start");
+      const pongsBefore = daemon.frames.filter((frame) => frame.type === "pong").length;
+      socket.send(JSON.stringify({ type: "ping" }));
+      await waitForFrame(
+        daemon.frames,
+        () => daemon.frames.filter((frame) => frame.type === "pong").length > pongsBefore,
+        "post-acknowledgement wire ordering barrier"
+      );
+      assert.equal(
+        daemon.frames.some((frame) => frame.requestId === requestId && frame.done === true),
+        false,
+        "cancel acknowledgement is not a validated terminal result"
+      );
+      daemon.child.send({ type: "cancellation_fixture_release_removal", message });
+      await waitForFrame(
+        daemon.frames,
+        (frame) => frame.requestId === requestId && frame.event?.type === "invoke_terminal",
+        "terminal after removal result settles"
+      );
+      const terminals = daemon.frames.filter(
+        (frame) => frame.requestId === requestId && frame.event?.type === "invoke_terminal"
+      );
+      assert.equal(terminals.length, 1);
+      assert.deepEqual(terminals[0].event, removalResult === "verified"
+        ? { type: "invoke_terminal", disposition: "cancelled" }
+        : { type: "invoke_terminal", disposition: "failed", code: "UNKNOWN_RUNTIME" });
+      assert.equal(
+        daemon.cancellationFixtureEvents.some(
+          (event) => event.event === "prompt_started" && event.message === message
+        ),
+        false
+      );
+      daemon.child.send({ type: "cancellation_fixture_release_prompt", message: parentMessage });
+    } finally {
+      daemon.child.send({ type: "cancellation_fixture_release_removal", message });
+      daemon.child.send({ type: "cancellation_fixture_release_prompt", message: parentMessage });
+      await daemon.stop();
+    }
+  });
+}
+
+for (const releaseActivation of [false, true]) {
+  test(`failed queued cancellation stays pending with activation ${releaseActivation ? "delivered" : "deferred"}`, async () => {
+    const daemon = await startReadinessDaemon({
+      daemonEntryOverride: fileURLToPath(
+        new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
+      ),
+      observabilityTestIpc: true,
+      registerResponse: {
+        type: "register_ok",
+        protocolVersion: 1,
+        capabilities: CAPABILITIES,
+      },
+      envOverrides: {
+        GJC_READINESS_V2: "0",
+        GJC_SESSION_FACTORY_TEST_INJECTION: "1",
+        GJC_CANCELLATION_FIXTURE_DELAY_ACTIVATION: "1",
+        GJC_NATIVE_INVENTORY_MODE: "off",
+        GJC_NATIVE_WORKSPACE_SERVING: "0",
+      },
+    });
+    const requestId = "dequeued-cancellation/request";
+    const message = "dequeued-cancellation";
+    const cancel = {
+      type: "cancel_invoke",
+      requestId,
+      cancelId: "dequeued-cancellation-1",
+      reason: "user_cancelled",
+    };
+    try {
+      await waitForLength(daemon.sockets, 1, "dequeued cancellation socket");
+      await waitForDaemonOutput(daemon, "daemon: registration accepted");
+      const socket = daemon.sockets[0];
+      socket.send(JSON.stringify({
+        type: "invoke",
+        requestId,
+        workDir: process.cwd(),
+        command: { kind: "prompt", message },
+      }));
+      await waitForFrame(
+        daemon.cancellationFixtureEvents,
+        (event) => event.event === "prompt_started" && event.message === message,
+        "dequeued prompt before activation receipt"
+      );
+      socket.send(JSON.stringify(cancel));
+      socket.send(JSON.stringify(cancel));
+      await waitForFrame(
+        daemon.frames,
+        () => daemon.frames.filter(
+          (candidate) => candidate.event?.cancelId === cancel.cancelId
+        ).length === 2,
+        "duplicate pending receipt"
+      );
+      await waitForFrame(
+        daemon.cancellationFixtureEvents,
+        (event) => event.event === "ticket_revoked" && event.message === message,
+        "authoritative queued revocation refusal"
+      );
+      const receipts = daemon.frames.filter((frame) => frame.event?.cancelId === cancel.cancelId);
+      assert.deepEqual(receipts[0], receipts[1]);
+      assert.equal(receipts[0].event.outcome, "cancellation_pending");
+      assert.deepEqual(
+        daemon.cancellationFixtureEvents
+          .filter((event) => event.event === "ticket_revoked" && event.message === message)
+          .map(({ phase, accepted }) => ({ phase, accepted })),
+        [{ phase: "queued", accepted: false }],
+        "a duplicate cancel must not retry authoritative removal"
+      );
+      assert.equal(
+        daemon.frames.some((frame) => frame.requestId === requestId && frame.done === true),
+        false,
+        "failed revocation must not synthesize a terminal"
+      );
+      if (releaseActivation) {
+        daemon.child.send({ type: "cancellation_fixture_release_activation", message });
+      }
+      daemon.child.send({ type: "cancellation_fixture_release_prompt", message });
+      await waitForFrame(
+        daemon.frames,
+        (frame) => frame.requestId === requestId && frame.event?.type === "invoke_terminal",
+        "natural terminal after failed revocation"
+      );
+      assert.deepEqual(
+        daemon.frames.filter(
+          (frame) => frame.requestId === requestId && frame.event?.type === "invoke_terminal"
+        ).map((frame) => frame.event),
+        [{ type: "invoke_terminal", disposition: "completed" }]
+      );
+      socket.send(JSON.stringify(cancel));
+      await waitForFrame(
+        daemon.frames,
+        () => daemon.frames.filter((frame) => frame.event?.cancelId === cancel.cancelId).length === 3,
+        "pending receipt replay after natural terminal"
+      );
+      assert.deepEqual(
+        daemon.frames.filter((frame) => frame.event?.cancelId === cancel.cancelId),
+        [receipts[0], receipts[0], receipts[0]]
+      );
+    } finally {
+      await daemon.stop();
+    }
+  });
+}
 
 test("request cancellation revokes queued work and leaves active work pending", async () => {
   const daemon = await startReadinessDaemon({
@@ -2048,6 +2668,11 @@ test("request cancellation revokes queued work and leaves active work pending", 
       workDir: process.cwd(),
       command: { kind: "prompt", message: "second" },
     }));
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "ticket_created" && event.message === "second",
+      "ordinary queued SDK ticket"
+    );
     socket.send(JSON.stringify({
       type: "cancel_invoke",
       requestId: secondRequestId,
@@ -2072,6 +2697,17 @@ test("request cancellation revokes queued work and leaves active work pending", 
       },
       { type: "invoke_terminal", disposition: "cancelled" },
     ]);
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "ticket_revoked" && event.message === "second",
+      "ordinary queued removal receipt"
+    );
+    assert.deepEqual(
+      daemon.cancellationFixtureEvents
+        .filter((event) => event.event === "ticket_revoked" && event.message === "second")
+        .map(({ phase, accepted }) => ({ phase, accepted })),
+      [{ phase: "queued", accepted: true }]
+    );
     assert.equal(
       daemon.cancellationFixtureEvents.some(
         (event) => event.event === "prompt_started" && event.message === "second"
@@ -2311,7 +2947,8 @@ test("request cancellation revokes queued work and leaves active work pending", 
   }
 });
 
-test("socket loss revokes queued siblings and fences successor session creation", async () => {
+for (const delayActivation of [false, true]) {
+test(`socket loss contains ${delayActivation ? "dequeued queued-looking" : "active"} work and revokes queued siblings`, async () => {
   const daemon = await startReadinessDaemon({
     daemonEntryOverride: fileURLToPath(
       new URL("../test-fixtures/cancellation-daemon.mjs", import.meta.url)
@@ -2326,6 +2963,7 @@ test("socket loss revokes queued siblings and fences successor session creation"
       GJC_READINESS_V2: "0",
       GJC_SESSION_FACTORY_TEST_INJECTION: "1",
       GJC_CANCELLATION_FIXTURE_BLOCK_DISPOSAL: "1",
+      GJC_CANCELLATION_FIXTURE_DELAY_ACTIVATION: delayActivation ? "1" : "0",
       GJC_NATIVE_INVENTORY_MODE: "off",
       GJC_NATIVE_WORKSPACE_SERVING: "0",
     },
@@ -2353,12 +2991,33 @@ test("socket loss revokes queued siblings and fences successor session creation"
       workDir: process.cwd(),
       command: { kind: "prompt", message: "disconnect-second" },
     }));
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "ticket_created" && event.message === "disconnect-second",
+      "socket-owned queued sibling ticket"
+    );
     firstSocket.terminate();
 
     await waitForFrame(
       daemon.cancellationFixtureEvents,
       (event) => event.event === "dispose_started",
       "disconnect containment disposal"
+    );
+    await waitForFrame(
+      daemon.cancellationFixtureEvents,
+      (event) => event.event === "ticket_revoked" && event.message === "disconnect-second",
+      "queued sibling removal on socket loss"
+    );
+    assert.deepEqual(
+      daemon.cancellationFixtureEvents
+        .filter((event) => event.event === "ticket_revoked")
+        .map(({ message, phase, accepted }) => ({ message, phase, accepted })),
+      [
+        ...(delayActivation
+          ? [{ message: "disconnect-first", phase: "queued", accepted: false }]
+          : []),
+        { message: "disconnect-second", phase: "queued", accepted: true },
+      ]
     );
     assert.equal(
       daemon.cancellationFixtureEvents.some(
@@ -2436,6 +3095,7 @@ test("socket loss revokes queued siblings and fences successor session creation"
     await daemon.stop();
   }
 });
+}
 
 test("socket-loss disposal rejection permanently fences a successor", async () => {
   const daemon = await startReadinessDaemon({

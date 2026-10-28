@@ -664,6 +664,23 @@ function cancellationRecordPhase(record) {
   return record.phase;
 }
 
+function revokeCancellationBeforeStart(record) {
+  // A queued-looking SDK ticket may already have been dequeued before its
+  // activation receipt reaches the adapter. Only successful removal proves
+  // that execution cannot occur. Before admission, the revoked checks own it.
+  if (record.ticket) {
+    if (record.ticket.revokeBeforeStart() !== true) return false;
+    record.revokedTicket = record.ticket;
+  }
+  record.revoked = true;
+  return true;
+}
+
+function cancellationRemovalIsVerified(record) {
+  return record.revoked &&
+    (record.revokedTicket === undefined || record.removalVerified);
+}
+
 function retainCancellationTerminal(state, record) {
   record.phase = "terminal";
   state.records.delete(record.requestId);
@@ -719,13 +736,14 @@ function containCancellationOnClose(connection, readinessState) {
   for (const record of state.records.values()) {
     if (record.connection !== connection || record.socketGeneration !== readinessState.socketGeneration) continue;
     if (cancellationRecordPhase(record) === "queued") {
-      record.revoked = true;
-      record.ticket?.revokeBeforeStart?.();
-      continue;
+      if (revokeCancellationBeforeStart(record)) continue;
+      // SDK dequeue won: contain this session just like known active work,
+      // even while the adapter is still waiting for its activation receipt.
     }
-    if (record.phase !== "active" || !record.session) continue;
+    if (record.phase === "terminal" || !record.session) continue;
     const holds = retirements.get(record.session) ?? [];
-    if (record.activityLease) holds.push(() => record.activityLease.release());
+    const activityLease = record.activityLease;
+    if (activityLease) holds.push(() => activityLease.release());
     record.activityLease = undefined;
     retirements.set(record.session, holds);
   }
@@ -2352,11 +2370,12 @@ async function handleMessage(
         ? "already_terminal"
         : "not_owned";
     } else if (cancellationRecordPhase(record) === "queued") {
-      // This is the cancellation linearization point.  Everything below it
-      // must recheck record.revoked before it can reach an SDK/provider call.
-      record.revoked = true;
-      record.ticket?.revokeBeforeStart?.();
-      outcome = "cancelled_before_start";
+      if (revokeCancellationBeforeStart(record)) {
+        outcome = "cancelled_before_start";
+      } else {
+        record.cancelPending = true;
+        outcome = "cancellation_pending";
+      }
     } else if (record.phase === "terminal") {
       outcome = "already_terminal";
     } else {
@@ -2364,7 +2383,7 @@ async function handleMessage(
       outcome = "cancellation_pending";
     }
     sendCancellationReceipt(connection, cancellationState, msg, outcome);
-    if (outcome === "cancelled_before_start") {
+    if (outcome === "cancelled_before_start" && record.revokedTicket === undefined) {
       void sendRevokedCancellationTerminal(record);
     }
     daemonObservability.emitOwnerEvent({
@@ -3184,6 +3203,8 @@ async function handleMessage(
     requestId,
     phase: "queued",
     revoked: false,
+    revokedTicket: undefined,
+    removalVerified: false,
     cancelPending: false,
     send,
     session: undefined,
@@ -3304,7 +3325,17 @@ async function handleMessage(
         }
       );
       cancellationRecord.ticket = ticket;
-      return ticket.result;
+      return ticket.result.then((result) => {
+        if (cancellationRecord.revokedTicket === ticket) {
+          if (result?.revokedBeforeStart !== true) {
+            const error = new Error("SDK cancellation removal receipt was not verified");
+            error.code = "SDK_TRACKED_INPUT_CANCELLATION_RECEIPT";
+            throw error;
+          }
+          cancellationRecord.removalVerified = true;
+        }
+        return result;
+      });
     };
     if (command.kind === "set_model") {
       await setSessionModel(
@@ -3327,7 +3358,7 @@ async function handleMessage(
         rpcCommand,
         (event) => send(event)
       );
-      if (commandResult?.revokedBeforeStart === true || cancellationRecord.revoked) {
+      if (commandResult?.revokedBeforeStart === true || cancellationRemovalIsVerified(cancellationRecord)) {
         invokeOutcome = "failed";
         invokeCode = null;
         if (connection.readyState === WebSocket.OPEN) {
@@ -3346,14 +3377,6 @@ async function handleMessage(
     invokeOutcome = "succeeded";
     invokeCode = null;
   } catch (err) {
-    if (cancellationRecord.revoked) {
-      invokeOutcome = "failed";
-      invokeCode = null;
-      if (connection.readyState === WebSocket.OPEN) {
-        await sendRevokedCancellationTerminal(cancellationRecord);
-      }
-      return;
-    }
     const modelDiagnostic =
       command.kind === "set_model" ? modelCommandDiagnostic(err) : undefined;
     if (modelDiagnostic !== undefined) {
@@ -3363,9 +3386,14 @@ async function handleMessage(
     }
     let terminalError = err;
     if (
-      err?.terminalDisposition === "timed_out" &&
-      session
+      session &&
+      (err?.terminalDisposition === "timed_out" ||
+        session.closed === true ||
+        err?.code === "SDK_TRACKED_INPUT_CANCELLATION_RECEIPT")
     ) {
+      // Adapter closure or an untrustworthy removal receipt is not native
+      // quiescence. Transfer both lease references before retirement can await;
+      // only the pool's successful disposal proof may release this hold.
       const retirementLease = activityLease;
       activityLease = undefined;
       cancellationRecord.activityLease = undefined;
@@ -3376,8 +3404,20 @@ async function handleMessage(
             : [],
         });
       } catch (retirementError) {
-        terminalError = retirementError;
+        // Preserve the original fatal failure taxonomy. Timeouts retain their
+        // existing retirement diagnostic without treating the bound as proof.
+        if (err?.terminalDisposition === "timed_out") {
+          terminalError = retirementError;
+        }
       }
+    }
+    if (cancellationRemovalIsVerified(cancellationRecord)) {
+      invokeOutcome = "failed";
+      invokeCode = null;
+      if (connection.readyState === WebSocket.OPEN) {
+        await sendRevokedCancellationTerminal(cancellationRecord);
+      }
+      return;
     }
     const disposition =
       err?.terminalDisposition === "paused" ||

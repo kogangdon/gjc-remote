@@ -309,6 +309,13 @@ function schemaAccepts(schema, value) {
 class FakeAgentSession {
   constructor() {
     this.listeners = new Set();
+    this.rawListeners = new Set();
+    this.agent = {
+      subscribe: (listener) => {
+        this.rawListeners.add(listener);
+        return () => this.rawListeners.delete(listener);
+      },
+    };
     this.models = [
       { provider: "provider-a", id: "model-a", name: "Model A", extra: true },
     ];
@@ -328,6 +335,10 @@ class FakeAgentSession {
 
   emit(event) {
     for (const listener of this.listeners) listener(event);
+  }
+
+  emitRaw(event) {
+    for (const listener of this.rawListeners) listener(event);
   }
 
   getAvailableModels() {
@@ -1199,112 +1210,1204 @@ test("dispose rejects owned queued tickets without dispatching them", async () =
   assert.deepEqual(agent.calls, [["prompt", "active"]]);
 });
 
-test("live steer and follow-up fail closed without calling SDK queue hooks", async () => {
-  const agent = new FakeAgentSession();
-  let finishPrompt;
-  agent.prompt = (message) => {
-    agent.calls.push(["prompt", message]);
-    return new Promise((resolve) => {
-      finishPrompt = resolve;
-    });
-  };
-  const session = new SdkSession(agent);
-  const prompt = session.send(
-    { type: "prompt", message: "active" },
-    () => {},
-    100
-  );
-  await new Promise((resolve) => setImmediate(resolve));
+function trackedDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
 
-  for (const type of ["steer", "follow_up"]) {
-    await assert.rejects(
-      session.send({ type, message: "unsupported live control" }, () => {}, 100),
-      (error) => {
-        assert.equal(error.code, "SDK_LIVE_CONTROL_UNSUPPORTED");
-        assert.match(error.message, /supported queued-input ownership contract/);
-        return true;
-      }
-    );
-    const owned = session.sendOwned(
-      `owned-${type}`,
-      { type, message: "unsupported owned live control" },
-      () => {},
-      100
-    );
-    await assert.rejects(owned.result, (error) => {
-      assert.equal(error.code, "SDK_LIVE_CONTROL_UNSUPPORTED");
-      return true;
-    });
-    assert.equal(owned.phase, "terminal");
+class TrackedAgentSession extends FakeAgentSession {
+  constructor() {
+    super();
+    this.inputs = [];
+    this.root = trackedDeferred();
+    this.rootScope = attemptScope(1);
   }
-  assert.deepEqual(agent.calls, [["prompt", "active"]]);
-  assert.equal(session.closed, false);
+  prompt(message) {
+    this.calls.push(["prompt", message]);
+    this.emit({ type: "agent_start", scope: this.rootScope });
+    return this.root.promise;
+  }
+  submitUserMessage(message, options) {
+    const admitted = trackedDeferred();
+    const execution = trackedDeferred();
+    const terminal = trackedDeferred();
+    const input = {
+      message, options, admitted, execution, terminal,
+      executed: false, removed: false,
+      identity: { submissionId: `input-${this.inputs.length + 1}`, delivery: options.deliverAs },
+    };
+    input.remove = () => {
+      if (input.executed || input.removed) return false;
+      input.removed = true;
+      const receipt = { ...input.identity, disposition: "removed", reason: "cancelled" };
+      execution.resolve(receipt);
+      terminal.resolve(receipt);
+      return true;
+    };
+    input.execute = (scope, disposition = "joined-current-run") => {
+      input.executed = true;
+      execution.resolve({ ...input.identity, disposition, attemptScope: scope });
+    };
+    input.complete = (scope) => terminal.resolve({ ...input.identity, disposition: "completed", attemptScope: scope });
+    this.inputs.push(input);
+    options.onPreflightAcceptCommit?.();
+    admitted.resolve({ ...input.identity, queuePolicy: options.queuePolicy });
+    return Promise.resolve({
+      submissionId: input.identity.submissionId,
+      admitted: admitted.promise,
+      execution: execution.promise,
+      terminal: terminal.promise,
+      cancel: input.remove,
+    });
+  }
+  finishRoot(scope = this.rootScope, overrides = {}) {
+    this.emit(terminalEvent({ scope, ...overrides }));
+    this.root.resolve();
+  }
+}
 
-  agent.emit(terminalEvent());
-  finishPrompt();
-  await prompt;
-  agent.prompt = FakeAgentSession.prototype.prompt.bind(agent);
-  await session.send(
-    { type: "follow_up", message: "idle retry" },
-    () => {},
-    100
-  );
-  assert.deepEqual(agent.calls, [
-    ["prompt", "active"],
-    ["prompt", "idle retry"],
-  ]);
+test("coalesced root readiness uses owned raw evidence and exact prompt settlement without output duplication", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const events = [];
+  const root = session.send({ type: "prompt", message: "root" }, (event) => events.push(event));
+  await waitForImmediate(() => agent.calls.length === 1);
+  const cohort = session.inputRouter.primary;
+  assert.equal(agent.listeners.size, 1);
+  assert.equal(agent.rawListeners.size, 1);
+  const control = session.sendOwned("next", { type: "follow_up", message: "next" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  const update = { type: "message_update", scope: agent.rootScope, value: "one public copy" };
+  agent.emit(update);
+  agent.emitRaw(update);
+  agent.emitRaw(terminalEvent({ scope: agent.rootScope, text: "raw terminal must not stream" }));
+  const next = attemptScope(2, "promoted");
+  agent.emit({ type: "agent_start", scope: next });
+  agent.inputs[0].execute(next, "promoted-to-run");
+  await waitForImmediate(() => control.phase === "active");
+  let rootSettled = false;
+  void root.then(() => { rootSettled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rootSettled, false, "raw execution alone is not root prompt finalization");
+  agent.root.resolve();
+  assert.deepEqual(await root, { disposition: "completed" });
+  assert.equal(cohort.ended, false);
+  assert.equal(cohort.outcome, undefined);
+  assert.equal(session.inputRouter.record(agent.rootScope).terminal, undefined);
+  assert.equal(control.phase, "active");
+  assert.equal(events.filter((event) => event.value === "one public copy").length, 1);
+  assert.doesNotMatch(JSON.stringify(events), /raw terminal must not stream|agent_end/);
+  // Only the promoted handle publishes a genuine SDK terminal in this oracle.
+  agent.inputs[0].complete(next);
+  agent.emit(terminalEvent({ scope: next }));
+  assert.deepEqual(await control.result, { disposition: "completed" });
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
   await session.dispose();
 });
 
-test("adjacent owned live controls cannot outrun prompt activation", async () => {
-  const agent = new FakeAgentSession();
-  let finishPrompt;
+test("prompt fulfillment and unowned or continuing raw events cannot settle a root", async (t) => {
+  const cases = [
+    ["fulfillment alone", () => []],
+    ["unscoped terminal", () => [terminalEvent()]],
+    ["foreign attempt", (scope) => [terminalEvent({ scope: { ...scope, attemptId: "foreign" } })]],
+    ["foreign generation", (scope) => [terminalEvent({ scope: { ...scope, generation: 99 } })]],
+    ["foreign lineage", (scope) => [terminalEvent({ scope: { ...scope, lineage: "foreign" } })]],
+    ["raw-only scope proof", () => [
+      { type: "agent_start", scope: attemptScope(99) }, terminalEvent({ scope: attemptScope(99) }),
+    ]],
+    ["earlier success invalidated by continuing maintenance", (scope) => [
+      terminalEvent({ scope }),
+      terminalEvent({ scope, stopReason: "maintenance", maintenanceOutcome: "compacted" }),
+    ]],
+    ...["pruned", "compacted", "promoted"].map((maintenanceOutcome) => [maintenanceOutcome, (scope) => [
+      terminalEvent({ scope, stopReason: "maintenance", maintenanceOutcome }),
+    ]]),
+  ];
+  for (const [name, rawEvents] of cases) await t.test(name, async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const root = session.send({ type: "prompt", message: "root" }, () => {});
+    let settled = false;
+    void root.then(() => { settled = true; }, () => { settled = true; });
+    await waitForImmediate(() => agent.calls.length === 1);
+    agent.root.resolve();
+    for (const event of rawEvents(agent.rootScope)) agent.emitRaw(event);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(session.inputRouter.primary.ended, false);
+    const check = assert.rejects(root, /disposed/);
+    await session.dispose();
+    await check;
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(agent.rawListeners.size, 0);
+  });
+});
+
+test("raw evidence observed before SDK scope proof cannot be reused after prompt fulfillment", async () => {
+  const agent = new TrackedAgentSession();
   agent.prompt = (message) => {
     agent.calls.push(["prompt", message]);
-    return new Promise((resolve) => {
-      finishPrompt = resolve;
-    });
+    agent.emitRaw(terminalEvent({ scope: agent.rootScope }));
+    agent.emit({ type: "agent_start", scope: agent.rootScope });
+    return agent.root.promise;
   };
   const session = new SdkSession(agent);
-  const revoked = session.sendOwned(
-    "revoked-control-owner",
-    { type: "follow_up", message: "revoked before admission" },
-    () => {},
-    100
-  );
-  assert.equal(revoked.revokeBeforeStart(), true);
-  assert.deepEqual(await revoked.result, { revokedBeforeStart: true });
-  const prompt = session.sendOwned(
-    "prompt-owner",
-    { type: "prompt", message: "active" },
-    () => {},
-    100
-  );
-  const steer = session.sendOwned(
-    "steer-owner",
-    { type: "steer", message: "must not queue" },
-    () => {},
-    100
-  );
-  const followUp = session.sendOwned(
-    "follow-up-owner",
-    { type: "follow_up", message: "must not queue" },
-    () => {},
-    100
-  );
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  let settled = false;
+  void root.then(() => { settled = true; });
+  await waitForImmediate(() => agent.calls.length === 1);
+  agent.root.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  agent.emitRaw(terminalEvent({ scope: agent.rootScope }));
+  assert.deepEqual(await root, { disposition: "completed" });
+  assert.equal(agent.rawListeners.size, 0);
+  await session.dispose();
+});
 
-  for (const ticket of [steer, followUp]) {
-    await assert.rejects(ticket.result, (error) => {
-      assert.equal(error.code, "SDK_LIVE_CONTROL_UNSUPPORTED");
+test("post-start foreign public tuples cannot stream or settle a fulfilled root prompt", async (t) => {
+  for (const change of [
+    { attemptId: "foreign" }, { generation: 99 }, { lineage: "child" },
+  ]) {
+    for (const ownProof of [false, true]) await t.test(`${JSON.stringify(change)}: own proof ${ownProof}`, async () => {
+      const agent = new TrackedAgentSession();
+      const timers = createManualTimeouts();
+      const session = new SdkSession(agent, {
+        idleTimeoutMs: 100, hardCapMs: 1_000,
+        setTimeoutFn: timers.setTimeout, clearTimeoutFn: timers.clearTimeout,
+      });
+      const events = [];
+      const root = session.send({ type: "prompt", message: "root" }, (event) => events.push(event));
+      const check = assert.rejects(root, (error) => ownProof
+        ? error.code === "SDK_TRACKED_INPUT_CONTRACT"
+        : error.terminalDisposition === "timed_out");
+      let settled = false;
+      void root.then(() => { settled = true; }, () => { settled = true; });
+      await waitForImmediate(() => agent.calls.length === 1);
+      const cohort = session.inputRouter.primary;
+      const foreign = { ...agent.rootScope, ...change };
+      agent.emit({ type: "message_update", scope: foreign, value: "foreign private output" });
+      agent.emit({ type: "agent_failed", scope: foreign, error: { code: "foreign_failure", message: "private diagnostic" } });
+      agent.emit(terminalEvent({ scope: foreign }));
+      agent.emitRaw(terminalEvent({ scope: foreign }));
+      agent.root.resolve();
+      agent.emit({ type: "message_update", scope: agent.rootScope, value: "own output" });
+      agent.emit({ type: "turn_start", scope: agent.rootScope });
+      session.inputRouter.flush();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "foreign SDK-public events plus own prompt fulfillment are not own completion proof");
+      assert.equal(cohort.ended, false);
+      assert.equal(cohort.rawOutcome, undefined);
+      const record = session.inputRouter.record(foreign);
+      assert.equal(record.cohort, undefined);
+      assert.equal(record.terminal, undefined);
+      assert.deepEqual(record.failure, { code: "foreign_failure", message: "Prompt submission failed." });
+      assert.deepEqual(events.filter((event) => event.value).map((event) => event.value), ["own output"]);
+      assert.doesNotMatch(JSON.stringify([events, record]), /private|agent_failed|agent_end/);
+      if (ownProof) agent.emit(terminalEvent({ scope: agent.rootScope }));
+      else timers.advance(100);
+      await check;
+      assert.equal(cohort.ended, ownProof);
+      if (ownProof) assert.deepEqual(cohort.outcome, { disposition: "completed" });
+      assert.equal(session.closed, true, "unresolved foreign output cannot survive command cleanup");
+      await session.dispose();
+      assert.equal(agent.listeners.size, 0);
+      assert.equal(agent.rawListeners.size, 0);
+      assert.equal(session.inputRouter.buffer.length, 0);
+      assert.equal(session.inputRouter.bufferBytes, 0);
+      assert.equal(session.inputRouter.scopes.size, 0);
+      assert.equal(session.adapterWaiterCancellations.size, 0);
+      assert.equal(timers.size, 0);
+    });
+  }
+});
+
+test("root result chooses the latest proven primary continuation, not an earlier raw success", async (t) => {
+  for (const stopReason of ["completed", "paused"]) await t.test(stopReason, async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const root = session.send({ type: "prompt", message: "root" }, () => {});
+    let settled = false;
+    void root.then(() => { settled = true; }, () => { settled = true; });
+    await waitForImmediate(() => agent.calls.length === 1);
+    agent.emitRaw(terminalEvent({ scope: agent.rootScope }));
+    const final = attemptScope(2, "primary-continuation");
+    agent.emit({ type: "turn_start", scope: final });
+    agent.root.resolve();
+    agent.emitRaw(terminalEvent({ scope: agent.rootScope }));
+    agent.emitRaw(terminalEvent({ scope: attemptScope(99, "unrelated-latest") }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    const check = stopReason === "completed"
+      ? root.then((outcome) => assert.deepEqual(outcome, { disposition: "completed" }))
+      : assert.rejects(root, (error) => error.terminalDisposition === "paused");
+    agent.emitRaw(terminalEvent({ scope: final, stopReason }));
+    await check;
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(agent.rawListeners.size, 0);
+    await session.dispose();
+  });
+});
+
+test("raw root classification and late exact SDK prompt rejection cannot report success", async (t) => {
+  const cases = [
+    { name: "failed", terminal: { stopReason: "failed" }, disposition: "failed", code: "prompt_failed" },
+    { name: "cancelled", terminal: { stopReason: "cancelled" }, disposition: "cancelled", code: "aborted" },
+    { name: "paused", terminal: { stopReason: "paused" }, disposition: "paused" },
+    { name: "provider failure", terminal: { messages: [assistantMessage("private", { stopReason: "error", errorStatus: 429 })] }, disposition: "failed", code: "provider_http_429" },
+    { name: "raw diagnostic", diagnostic: true, terminal: {}, disposition: "failed", code: "provider_unavailable" },
+    { name: "maintenance failure", terminal: { stopReason: "maintenance", maintenanceOutcome: "failed" }, disposition: "failed", code: "context_maintenance_failed" },
+    { name: "late SDK rejection", rejection: true, terminal: {}, disposition: "failed", code: "submission_failed" },
+  ];
+  for (const fixture of cases) await t.test(fixture.name, async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const events = [];
+    const root = session.send({ type: "prompt", message: "root" }, (event) => events.push(event));
+    const check = assert.rejects(root, (error) => {
+      assert.equal(error.terminalDisposition, fixture.disposition);
+      if (fixture.code) assert.equal(error.code, fixture.code);
+      assert.doesNotMatch(error.message, /private secret/);
       return true;
     });
-    assert.equal(ticket.phase, "terminal");
+    await waitForImmediate(() => agent.calls.length === 1);
+    if (fixture.diagnostic) agent.emitRaw({
+      type: "agent_failed", scope: agent.rootScope,
+      error: { code: "provider_unavailable", message: "private secret" },
+    });
+    agent.emitRaw(terminalEvent({ scope: agent.rootScope, ...fixture.terminal }));
+    if (fixture.rejection) agent.root.reject(Object.assign(new Error("private secret"), { code: "submission_failed" }));
+    else agent.root.resolve();
+    await check;
+    assert.doesNotMatch(JSON.stringify(events), /private secret|agent_failed|agent_end/);
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(agent.rawListeners.size, 0);
+    await session.dispose();
+  });
+});
+
+test("late scoped SDK and raw diagnostics defeat completed raw proof before own prompt fulfills", async (t) => {
+  for (const lane of ["public", "raw"]) {
+    for (const code of ["provider_unavailable", "invalid private code"]) await t.test(`${lane}: ${code}`, async () => {
+      const agent = new TrackedAgentSession();
+      const session = new SdkSession(agent);
+      const events = [];
+      const root = session.send({ type: "prompt", message: "root" }, (event) => events.push(event));
+      const check = assert.rejects(root, (error) => {
+        assert.equal(error.terminalDisposition, "failed");
+        assert.equal(error.code, code === "provider_unavailable" ? code : "prompt_failed");
+        assert.doesNotMatch(error.message, /private/);
+        return true;
+      });
+      await waitForImmediate(() => agent.calls.length === 1);
+      const cohort = session.inputRouter.primary;
+      const record = session.inputRouter.record(agent.rootScope);
+      agent.emitRaw(terminalEvent({ scope: agent.rootScope, text: "private raw body" }));
+      const diagnostic = { type: "agent_failed", scope: agent.rootScope, error: { code, message: "private diagnostic body" } };
+      if (lane === "public") agent.emit(diagnostic);
+      else agent.emitRaw(diagnostic);
+      let settled = false;
+      void root.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "failure evidence still awaits the exact SDK prompt settlement");
+      agent.root.resolve();
+      await check;
+      assert.equal(cohort.ended, false);
+      assert.equal(cohort.outcome, undefined);
+      assert.equal(record.terminal, undefined);
+      assert.doesNotMatch(JSON.stringify([events, record, cohort.rawOutcome, cohort.rawFailure]), /private|messages|agent_failed|agent_end/);
+      assert.equal(agent.listeners.size, 0);
+      assert.equal(agent.rawListeners.size, 0);
+      await session.dispose();
+    });
   }
-  await waitForImmediate(() => prompt.phase === "active");
-  assert.deepEqual(agent.calls, [["prompt", "active"]]);
-  agent.emit(terminalEvent());
-  finishPrompt();
-  await prompt.result;
+});
+
+test("late diagnostic scope and terminal precedence remain exact for raw root results", async (t) => {
+  const cases = [
+    { name: "unscoped", scopes: () => [undefined], terminal: {}, disposition: "completed" },
+    { name: "foreign", scopes: (scope) => [
+      { ...scope, attemptId: "foreign" }, { ...scope, generation: 99 }, { ...scope, lineage: "foreign" },
+    ], terminal: {}, disposition: "completed" },
+    { name: "paused", terminal: { stopReason: "paused" }, disposition: "paused" },
+    { name: "cancelled", terminal: { stopReason: "cancelled" }, disposition: "cancelled", code: "aborted" },
+    { name: "maintenance failed", terminal: { stopReason: "maintenance", maintenanceOutcome: "failed" }, disposition: "failed", code: "context_maintenance_failed" },
+    { name: "maintenance aborted", terminal: { stopReason: "maintenance", maintenanceOutcome: "aborted" }, disposition: "failed", code: "aborted" },
+    { name: "provider rejected", terminal: { messages: [assistantMessage("private", { stopReason: "error", errorStatus: 429 })] }, disposition: "failed", code: "provider_http_429" },
+  ];
+  for (const fixture of cases) await t.test(fixture.name, async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const events = [];
+    const root = session.send({ type: "prompt", message: "root" }, (event) => events.push(event));
+    const check = fixture.disposition === "completed"
+      ? root.then((outcome) => assert.deepEqual(outcome, { disposition: "completed" }))
+      : assert.rejects(root, (error) => {
+        assert.equal(error.terminalDisposition, fixture.disposition);
+        if (fixture.code) assert.equal(error.code, fixture.code);
+        assert.doesNotMatch(error.message, /private|late_failure/);
+        return true;
+      });
+    await waitForImmediate(() => agent.calls.length === 1);
+    agent.emitRaw(terminalEvent({ scope: agent.rootScope, ...fixture.terminal }));
+    for (const scope of fixture.scopes?.(agent.rootScope) ?? [agent.rootScope]) {
+      const diagnostic = { type: "agent_failed", scope, error: { code: "late_failure", message: "private body" } };
+      agent.emit(diagnostic);
+      agent.emitRaw(diagnostic);
+    }
+    agent.root.resolve();
+    await check;
+    assert.doesNotMatch(JSON.stringify(events), /private|agent_failed|agent_end/);
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(agent.rawListeners.size, 0);
+    await session.dispose();
+  });
+});
+
+test("a raw-completed root still awaits genuine tracked receipts and a later SDK publication is not a duplicate", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("joined", { type: "steer", message: "joined" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.inputs[0].execute(agent.rootScope);
+  await waitForImmediate(() => control.phase === "active");
+  agent.emitRaw(terminalEvent({ scope: agent.rootScope }));
+  agent.root.resolve();
+  assert.deepEqual(await root, { disposition: "completed" });
+  let settled = false;
+  void control.result.then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "raw evidence cannot synthesize handle.terminal");
+  agent.inputs[0].complete(agent.rootScope);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "a handle receipt still requires its genuine SDK-public terminal");
+  assert.equal(session.inputRouter.record(agent.rootScope).terminal, undefined);
+  agent.emit(terminalEvent({ scope: agent.rootScope }));
+  assert.deepEqual(await control.result, { disposition: "completed" });
+  assert.equal(session.closed, false);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
+  await session.dispose();
+});
+
+test("raw root proof leaves true SDK gate overlap unowned and bounded", async () => {
+  const agent = new TrackedAgentSession();
+  const emitter = new FakeGateEmitter();
+  agent.getWorkflowGateEmitter = () => emitter;
+  const timers = createManualTimeouts();
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 100, hardCapMs: 1_000, gateAnswerWindowMs: 50,
+    setTimeoutFn: timers.setTimeout, clearTimeoutFn: timers.clearTimeout,
+  });
+  const events = [];
+  const root = session.send({ type: "prompt", message: "root" }, (event) => events.push(event));
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("next", { type: "follow_up", message: "next" }, (event) => events.push(event));
+  const controlCheck = assert.rejects(control.result, (error) => error.code === "SDK_TRACKED_INPUT_GATE_OWNERSHIP");
+  await waitForImmediate(() => agent.inputs.length === 1);
+  const next = attemptScope(2, "next");
+  agent.emit({ type: "agent_start", scope: next });
+  agent.inputs[0].execute(next, "promoted-to-run");
+  await waitForImmediate(() => control.phase === "active");
+  agent.emitRaw(terminalEvent({ scope: agent.rootScope }));
+  agent.root.resolve();
+  assert.deepEqual(await root, { disposition: "completed" });
+  const gate = emitter.emitGate(sdkAskGate({ gate_id: "raw-does-not-retire-root" }));
+  const gateCheck = assert.rejects(gate, /fenced/);
+  assert.equal(session.inputRouter.primary.ended, false);
+  assert.equal(session.pendingGates.size, 0);
+  assert.equal(session.inputRouter.hasPendingGate(), true);
+  assert.equal(events.some((event) => event.type === "gate_request"), false);
+  assert.deepEqual(emitter.resolveCalls, []);
+  timers.advance(50);
+  await Promise.all([controlCheck, gateCheck]);
+  await session.dispose();
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
+  assert.equal(emitter.listeners.size, 0);
+  assert.equal(timers.size, 0);
+});
+
+test("missing or failing public core subscription closes without leaking either listener", async (t) => {
+  const cases = [
+    ["missing agent", (agent) => { agent.agent = undefined; }],
+    ["missing subscribe", (agent) => { agent.agent = {}; }],
+    ["throwing core subscribe", (agent) => { agent.agent.subscribe = () => { throw new Error("core subscription failed"); }; }],
+    ["core missing disposal", (agent) => { agent.agent.subscribe = () => undefined; }],
+    ["throwing session subscribe", (agent) => { agent.subscribe = () => { throw new Error("session subscription failed"); }; }],
+    ["session missing disposal", (agent) => { agent.subscribe = () => undefined; }],
+  ];
+  for (const [name, configure] of cases) await t.test(name, async () => {
+    const agent = new FakeAgentSession();
+    configure(agent);
+    const session = new SdkSession(agent);
+    await assert.rejects(session.send({ type: "prompt", message: "root" }, () => {}), (error) => {
+      if (name.startsWith("missing")) assert.equal(error.code, "SDK_TRACKED_INPUT_CONTRACT");
+      return /subscribe|subscription|disposal/.test(error.message);
+    });
+    await session.dispose();
+    assert.equal(session.closed, true);
+    assert.equal(session.activePromptRuns, 0);
+    assert.equal(session.activeGateRuns.length, 0);
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(agent.rawListeners.size, 0);
+    assert.equal(agent.calls.length, 0);
+    assert.equal(agent.disposeCalls, 1);
+  });
+});
+
+test("fatal raw evidence closes both subscriptions without exposing raw getter failures", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const check = assert.rejects(root, (error) => {
+    assert.equal(error.code, "SDK_TRACKED_INPUT_CONTRACT");
+    assert.doesNotMatch(error.message, /private secret/);
+    return true;
+  });
+  await waitForImmediate(() => agent.calls.length === 1);
+  agent.emitRaw({
+    type: "agent_end", scope: agent.rootScope,
+    get stopReason() { throw new Error("private secret"); },
+  });
+  await check;
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
+  await session.dispose();
+});
+
+test("root success is published only after both subscription cleanups succeed", async () => {
+  const agent = new FakeAgentSession();
+  const subscribe = agent.agent.subscribe;
+  agent.agent.subscribe = (listener) => {
+    const unsubscribe = subscribe(listener);
+    return () => { unsubscribe(); throw new Error("core subscription cleanup failed"); };
+  };
+  const session = new SdkSession(agent);
+  await assert.rejects(
+    session.send({ type: "prompt", message: "root" }, () => {}),
+    /core subscription cleanup failed/,
+  );
+  assert.equal(session.closed, true);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
+  await session.dispose();
+});
+
+test("both live delivery modes use distinct public tracked handles and join the same run", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const primaryEvents = [];
+  const controlEvents = [];
+  const activations = [];
+  const prompt = session.sendOwned("primary", { type: "prompt", message: "root" }, (event) => primaryEvents.push(event));
+  const controls = ["steer", "follow_up"].map((type) => session.sendOwned(type,
+    { type, message: "identical input" }, (event) => controlEvents.push(event), undefined,
+    { onActivate: () => activations.push(type) }));
+  await waitForImmediate(() => agent.inputs.length === 2);
+  for (const [index, input] of agent.inputs.entries()) {
+    assert.equal(input.options.deliverAs, index === 0 ? "steer" : "followUp");
+    assert.equal(input.options.trackSubmission, true);
+    assert.equal(input.options.queuePolicy, "sequential");
+    assert.ok(input.options.preflightSignal instanceof AbortSignal);
+    assert.deepEqual(Object.keys(input.options).sort(), [
+      "deliverAs", "onPreflightAcceptCommit", "preflightSignal", "queuePolicy", "trackSubmission",
+    ]);
+    assert.equal(controls[index].phase, "queued");
+  }
+  assert.notEqual(agent.inputs[0].identity.submissionId, agent.inputs[1].identity.submissionId);
+  const middle = attemptScope(2);
+  agent.emit({ type: "turn_start", scope: middle });
+  agent.inputs[0].execute(middle);
+  agent.inputs[1].execute(middle);
+  await waitForImmediate(() => controls.every((ticket) => ticket.phase === "active"));
+  assert.deepEqual(activations, ["steer", "follow_up"]);
+  for (const ticket of controls) assert.equal(ticket.revokeBeforeStart(), false);
+  const final = attemptScope(3);
+  agent.emit({ type: "turn_start", scope: final });
+  agent.emit({ type: "message_update", scope: final, value: "shared output" });
+  for (const input of agent.inputs) input.complete(final);
+  agent.finishRoot(final);
+  assert.deepEqual(await Promise.all([prompt.result, ...controls.map((ticket) => ticket.result)]), [
+    { disposition: "completed" }, { disposition: "completed" }, { disposition: "completed" },
+  ]);
+  assert.equal(primaryEvents.filter((event) => event.type === "message_update").length, 1);
+  assert.deepEqual(controlEvents, []);
+  await waitForImmediate(() => !session.isBusy());
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(session.isBusy(), false);
+  await session.dispose();
+});
+
+test("SDK queue cancellation and a lost dequeue race have different authoritative results", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const cancelled = session.sendOwned("cancelled", { type: "steer", message: "same" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cancelled.phase, "queued");
+  assert.equal(cancelled.revokeBeforeStart(), true);
+  assert.deepEqual(await cancelled.result, { revokedBeforeStart: true });
+  const raced = session.sendOwned("raced", { type: "follow_up", message: "same" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 2);
+  await new Promise((resolve) => setImmediate(resolve));
+  agent.inputs[1].execute(agent.rootScope);
+  // The SDK has consumed it, but promise reactions have not activated it yet.
+  assert.equal(raced.phase, "queued");
+  assert.equal(raced.revokeBeforeStart(), false);
+  await waitForImmediate(() => raced.phase === "active");
+  agent.inputs[1].complete(agent.rootScope);
+  agent.finishRoot();
+  assert.deepEqual(await raced.result, { disposition: "completed" });
+  await root;
+  await session.dispose();
+});
+
+test("a promoted successor can start before predecessor terminal and receipt reactions", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const primaryEvents = [];
+  const successorEvents = [];
+  const root = session.send({ type: "prompt", message: "root" }, (event) => primaryEvents.push(event));
+  await waitForImmediate(() => agent.calls.length === 1);
+  const successor = session.sendOwned("next", { type: "follow_up", message: "next" }, (event) => successorEvents.push(event));
+  await waitForImmediate(() => agent.inputs.length === 1);
+  const next = attemptScope(2, "successor");
+  agent.emit({ type: "agent_start", scope: next });
+  agent.emit({ type: "message_update", scope: next, value: "successor-only" });
+  assert.equal(primaryEvents.some((event) => event.value === "successor-only"), false);
+  assert.deepEqual(successorEvents, []);
+  agent.inputs[0].execute(next, "promoted-to-run");
+  agent.finishRoot();
+  await root;
+  await waitForImmediate(() => successor.phase === "active");
+  assert.equal(successorEvents.some((event) => event.value === "successor-only"), true);
+  const final = attemptScope(3, "successor-final");
+  agent.emit({ type: "turn_start", scope: final });
+  agent.inputs[0].complete(final);
+  agent.emit(terminalEvent({ scope: final }));
+  assert.deepEqual(await successor.result, { disposition: "completed" });
+  assert.equal(primaryEvents.some((event) => event.value === "successor-only"), false);
+  assert.equal(agent.listeners.size, 0);
+  await session.dispose();
+});
+
+test("tracked lifecycle completion classifies the matching FINAL public terminal", async (t) => {
+  const cases = [
+    { name: "provider failure", terminal: { messages: [assistantMessage("partial", { stopReason: "error", errorCode: "provider_down" })] }, code: "provider_down", disposition: "failed" },
+    { name: "cancelled", terminal: { stopReason: "cancelled" }, code: "aborted", disposition: "cancelled" },
+    { name: "paused", terminal: { stopReason: "paused" }, disposition: "paused" },
+    { name: "maintenance failure", terminal: { stopReason: "maintenance", maintenanceOutcome: "failed" }, code: "context_maintenance_failed", disposition: "failed" },
+    { name: "scoped diagnostic", diagnostic: "provider_unavailable", terminal: {}, code: "provider_unavailable", disposition: "failed" },
+  ];
+  for (const fixture of cases) await t.test(fixture.name, async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const root = session.send({ type: "prompt", message: "root" }, () => {});
+    const rootCheck = assert.rejects(root, (error) => error.terminalDisposition === fixture.disposition);
+    await waitForImmediate(() => agent.calls.length === 1);
+    const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+    const controlCheck = assert.rejects(control.result, (error) => {
+      assert.equal(error.terminalDisposition, fixture.disposition);
+      assert.equal(error.code, fixture.code);
+      assert.doesNotMatch(error.message, /private provider secret/);
+      return true;
+    });
+    await waitForImmediate(() => agent.inputs.length === 1);
+    agent.inputs[0].execute(agent.rootScope);
+    await waitForImmediate(() => control.phase === "active");
+    const final = attemptScope(2);
+    agent.emit({ type: "turn_start", scope: final });
+    if (fixture.diagnostic) agent.emit({ type: "agent_failed", scope: final,
+      error: { code: fixture.diagnostic, message: "private provider secret" } });
+    agent.inputs[0].complete(final);
+    agent.finishRoot(final, fixture.terminal);
+    await Promise.all([rootCheck, controlCheck]);
+    await session.dispose();
+  });
+});
+
+test("malformed tracked identities, policies, and scopes fail explicitly and dispose sibling waiters", async (t) => {
+  const cases = [
+    { name: "admission id", change: (input) => input.admitted.resolve({ ...input.identity, submissionId: "wrong", queuePolicy: "sequential" }) },
+    { name: "admission delivery", change: (input) => input.admitted.resolve({ ...input.identity, delivery: "followUp", queuePolicy: "sequential" }) },
+    { name: "queue policy", change: (input) => input.admitted.resolve({ ...input.identity, queuePolicy: "respect-mode" }) },
+    { name: "execution id", change: (input) => input.execution.resolve({ ...input.identity, submissionId: "wrong", disposition: "joined-current-run", attemptScope: attemptScope(1) }) },
+    { name: "execution delivery", change: (input) => input.execution.resolve({ ...input.identity, delivery: "followUp", disposition: "joined-current-run", attemptScope: attemptScope(1) }) },
+    { name: "execution scope", change: (input) => input.execution.resolve({ ...input.identity, disposition: "joined-current-run", attemptScope: { attemptId: "missing-parts" } }) },
+    { name: "terminal id", execute: true, change: (input) => input.terminal.resolve({ ...input.identity, submissionId: "wrong", disposition: "completed", attemptScope: attemptScope(1) }) },
+    { name: "terminal delivery", execute: true, change: (input) => input.terminal.resolve({ ...input.identity, delivery: "followUp", disposition: "completed", attemptScope: attemptScope(1) }) },
+    { name: "terminal scope", execute: true, change: (input) => input.terminal.resolve({ ...input.identity, disposition: "completed", attemptScope: { attemptId: "missing-parts" } }) },
+    { name: "executed then removed", execute: true, change: (input) => input.terminal.resolve({ ...input.identity, disposition: "removed", reason: "cancelled" }) },
+  ];
+  for (const fixture of cases) await t.test(fixture.name, async () => {
+    const agent = new TrackedAgentSession();
+    // Hold admission so each malformed receipt is the first actual settlement.
+    const submit = agent.submitUserMessage.bind(agent);
+    agent.submitUserMessage = (message, options) => {
+      const result = submit(message, options);
+      const input = agent.inputs.at(-1);
+      const admitted = trackedDeferred();
+      input.admitted = admitted;
+      return result.then((handle) => ({ ...handle, admitted: admitted.promise }));
+    };
+    const session = new SdkSession(agent);
+    const root = session.send({ type: "prompt", message: "root" }, () => {});
+    const rootCheck = assert.rejects(root, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+    await waitForImmediate(() => agent.calls.length === 1);
+    const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+    const controlCheck = assert.rejects(control.result, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+    await waitForImmediate(() => agent.inputs.length === 1);
+    const input = agent.inputs[0];
+    if (!fixture.name.startsWith("admission") && fixture.name !== "queue policy") {
+      input.admitted.resolve({ ...input.identity, queuePolicy: "sequential" });
+    }
+    if (fixture.execute) input.execute(agent.rootScope);
+    fixture.change(input);
+    await Promise.all([rootCheck, controlCheck]);
+    assert.equal(session.closed, true);
+    await session.dispose();
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(session.adapterWaiterCancellations.size, 0);
+  });
+});
+
+test("queue removal is not a final ticket result until both removed receipts match", async () => {
+  const agent = new TrackedAgentSession();
+  const submit = agent.submitUserMessage.bind(agent);
+  agent.submitUserMessage = (message, options) => submit(message, options).then((handle) => ({
+    ...handle,
+    cancel: () => {
+      const input = agent.inputs.at(-1);
+      input.execution.resolve({ ...input.identity, disposition: "removed", reason: "cancelled" });
+      return true;
+    },
+  }));
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  let settled = false;
+  void control.result.then(() => { settled = true; });
+  assert.equal(control.revokeBeforeStart(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(control.phase, "queued");
+  const input = agent.inputs[0];
+  input.terminal.resolve({ ...input.identity, disposition: "removed", reason: "cancelled" });
+  assert.deepEqual(await control.result, { revokedBeforeStart: true });
+  agent.finishRoot();
+  await root;
+  await session.dispose();
+});
+
+test("a completed tracked receipt still waits for its exact scoped genuine terminal", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.inputs[0].execute(agent.rootScope);
+  await waitForImmediate(() => control.phase === "active");
+  const final = attemptScope(2);
+  agent.inputs[0].complete(final);
+  agent.emit(terminalEvent({ scope: agent.rootScope, stopReason: "maintenance", maintenanceOutcome: "compacted" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(control.phase, "active");
+  agent.emit({ type: "turn_start", scope: final });
+  agent.finishRoot(final);
+  assert.deepEqual(await control.result, { disposition: "completed" });
+  await root;
+  await session.dispose();
+});
+
+test("a mismatched final scope cannot borrow a completed cohort terminal", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+  const check = assert.rejects(control.result, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.inputs[0].execute(agent.rootScope);
+  await waitForImmediate(() => control.phase === "active");
+  agent.finishRoot();
+  await root;
+  agent.inputs[0].complete(attemptScope(9, "wrong-final"));
+  await check;
+  assert.equal(session.closed, true);
+  await session.dispose();
+});
+
+test("an unseen final public scope waits for the genuine handle terminal reaction", async (t) => {
+  for (const diagnostic of [undefined, "provider_unavailable"]) await t.test(diagnostic ?? "completed", async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const events = [];
+    const root = session.send({ type: "prompt", message: "root" }, (event) => events.push(event));
+    const rootCheck = diagnostic
+      ? assert.rejects(root, (error) => error.code === diagnostic)
+      : root.then((outcome) => assert.deepEqual(outcome, { disposition: "completed" }));
+    await waitForImmediate(() => agent.calls.length === 1);
+    const control = session.sendOwned("joined", { type: "steer", message: "joined" }, () => {});
+    const controlCheck = diagnostic
+      ? assert.rejects(control.result, (error) => error.code === diagnostic)
+      : control.result.then((outcome) => assert.deepEqual(outcome, { disposition: "completed" }));
+    await waitForImmediate(() => agent.inputs.length === 1);
+    agent.inputs[0].execute(agent.rootScope);
+    await waitForImmediate(() => control.phase === "active");
+    const final = { ...attemptScope(2, "changed-final"), lineage: "final-lineage" };
+    agent.emit({ type: "message_update", scope: final, value: "authorized final output" });
+    if (diagnostic) agent.emit({ type: "agent_failed", scope: final, error: { code: diagnostic, message: "private diagnostic" } });
+    agent.emit(terminalEvent({ scope: final, text: "private terminal body" }));
+    agent.root.resolve();
+    agent.emit({ type: "message_update", scope: agent.rootScope, value: "own flush" });
+    await new Promise((resolve) => setImmediate(resolve));
+    const record = session.inputRouter.record(final);
+    assert.equal(record.cohort, undefined);
+    assert.equal(record.terminal, undefined);
+    assert.equal(session.inputRouter.primary.ended, false);
+    assert.equal(control.phase, "active");
+    assert.equal(events.some((event) => event.value === "authorized final output"), false);
+    // No public start introduced this tuple. Only the actual SDK handle's
+    // completed receipt may authorize its already-buffered public terminal.
+    agent.inputs[0].complete(final);
+    assert.equal(record.cohort, undefined, "promise fulfillment precedes its adapter reaction");
+    await Promise.all([rootCheck, controlCheck]);
+    assert.equal(events.filter((event) => event.value === "authorized final output").length, 1);
+    assert.doesNotMatch(JSON.stringify(events), /private|agent_failed|agent_end/);
+    assert.equal(session.closed, false);
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(agent.rawListeners.size, 0);
+    assert.equal(session.inputRouter.buffer.length, 0);
+    await session.dispose();
+  });
+});
+
+test("duplicate unseen final terminals fail when the genuine receipt binds their scope", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("joined", { type: "steer", message: "joined" }, () => {});
+  const controlCheck = assert.rejects(control.result, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.inputs[0].execute(agent.rootScope);
+  await waitForImmediate(() => control.phase === "active");
+  const final = attemptScope(2, "final");
+  agent.emit(terminalEvent({ scope: final }));
+  agent.emit(terminalEvent({ scope: final }));
+  assert.equal(session.inputRouter.primary.ended, false);
+  agent.inputs[0].complete(final);
+  await Promise.all([rootCheck, controlCheck]);
+  assert.equal(session.closed, true);
+  await session.dispose();
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
+  assert.equal(session.inputRouter.buffer.length, 0);
+  assert.equal(session.adapterWaiterCancellations.size, 0);
+});
+
+test("an unscoped diagnostic buffered before promotion cannot fail the scoped successor", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const rootEvents = [];
+  const successorEvents = [];
+  const root = session.send({ type: "prompt", message: "root" }, (event) => rootEvents.push(event));
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("next", { type: "follow_up", message: "next" }, (event) => successorEvents.push(event));
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.emit(terminalEvent({ scope: agent.rootScope }));
+  const next = attemptScope(2, "next");
+  agent.emit({ type: "agent_start", scope: next });
+  agent.emit({ type: "agent_failed", error: { code: "unscoped_failure", message: "private diagnostic" } });
+  agent.emit({ type: "message_update", scope: next, value: "successor output" });
+  assert.equal(successorEvents.length, 0);
+  assert.equal(rootEvents.some((event) => event.value === "successor output"), false);
+  agent.inputs[0].execute(next, "promoted-to-run");
+  await waitForImmediate(() => control.phase === "active");
+  assert.equal(session.inputRouter.record(next).failure, undefined);
+  assert.equal(successorEvents.filter((event) => event.value === "successor output").length, 1);
+  assert.doesNotMatch(JSON.stringify([rootEvents, successorEvents]), /private|agent_failed|unscoped_failure/);
+  agent.inputs[0].complete(next);
+  agent.emit(terminalEvent({ scope: next }));
+  agent.root.resolve();
+  assert.deepEqual(await control.result, { disposition: "completed" });
+  assert.deepEqual(await root, { disposition: "completed" });
+  assert.equal(session.closed, false);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
+  assert.equal(session.inputRouter.buffer.length, 0);
+  await session.dispose();
+});
+
+test("joined controls retain a primary prompt rejection after an otherwise completed terminal", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, (error) => error.code === "submission_failed");
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+  const controlCheck = assert.rejects(control.result, (error) => error.code === "submission_failed");
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.inputs[0].execute(agent.rootScope);
+  await waitForImmediate(() => control.phase === "active");
+  agent.inputs[0].complete(agent.rootScope);
+  agent.emit(terminalEvent({ scope: agent.rootScope }));
+  agent.root.reject(Object.assign(new Error("private provider secret"), { code: "submission_failed" }));
+  await Promise.all([rootCheck, controlCheck]);
+  await session.dispose();
+});
+
+test("root/model commands cannot overtake tracked admission and do not block later live admission", async () => {
+  const agent = new TrackedAgentSession();
+  const admission = trackedDeferred();
+  const submit = agent.submitUserMessage.bind(agent);
+  agent.submitUserMessage = (message, options) => {
+    const result = submit(message, options);
+    return agent.inputs.length === 1 ? admission.promise.then(() => result) : result;
+  };
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const first = session.sendOwned("first", { type: "follow_up", message: "first" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  const model = session.send({ type: "set_model", provider: "provider-a", modelId: "model-a" }, () => {});
+  agent.finishRoot();
+  await root;
+  const second = session.sendOwned("second", { type: "steer", message: "second" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 2);
+  assert.deepEqual(agent.calls, [["prompt", "root"]]);
+  const successor = attemptScope(2, "successor");
+  agent.emit({ type: "agent_start", scope: successor });
+  agent.inputs[0].execute(successor, "promoted-to-run");
+  admission.resolve();
+  await waitForImmediate(() => first.phase === "active");
+  agent.inputs[1].execute(successor);
+  await waitForImmediate(() => second.phase === "active");
+  for (const input of agent.inputs) input.complete(successor);
+  agent.emit(terminalEvent({ scope: successor }));
+  await Promise.all([first.result, second.result, model]);
+  assert.deepEqual(agent.calls.map(([type]) => type), ["prompt", "set_model"]);
+  await session.dispose();
+});
+
+test("admission cancellation proves pre-start only before its public acceptance commit", async () => {
+  const agent = new TrackedAgentSession();
+  const preflight = trackedDeferred();
+  const submit = agent.submitUserMessage.bind(agent);
+  let publicOptions;
+  agent.submitUserMessage = async (message, options) => {
+    publicOptions = options;
+    await preflight.promise;
+    if (options.preflightSignal.aborted) throw Object.assign(new Error("revoked"), { code: "prompt_preflight_cancelled" });
+    return submit(message, options);
+  };
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+  await waitForImmediate(() => publicOptions !== undefined);
+  assert.equal(control.revokeBeforeStart(), true);
+  assert.equal(publicOptions.preflightSignal.aborted, true);
+  assert.deepEqual(await control.result, { revokedBeforeStart: true });
+  preflight.resolve();
+  await waitForImmediate(() => session.trackedWork.size === 0);
+  assert.equal(agent.inputs.length, 0);
+  assert.equal(session.closed, false);
+  agent.finishRoot();
+  await root;
+  await session.dispose();
+});
+
+test("after acceptance commit but before handle delivery revoke cannot claim removal", async () => {
+  const agent = new TrackedAgentSession();
+  const handleDelivery = trackedDeferred();
+  const submit = agent.submitUserMessage.bind(agent);
+  agent.submitUserMessage = (message, options) => {
+    const handle = submit(message, options);
+    return handleDelivery.promise.then(() => handle);
+  };
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  assert.equal(control.revokeBeforeStart(), false);
+  assert.equal(control.phase, "queued");
+  handleDelivery.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(control.revokeBeforeStart(), true);
+  assert.deepEqual(await control.result, { revokedBeforeStart: true });
+  agent.finishRoot();
+  await root;
+  await session.dispose();
+});
+
+test("close owns unsettled SDK admission and contains a late rejecting handle", async () => {
+  const agent = new TrackedAgentSession();
+  const admission = trackedDeferred();
+  agent.submitUserMessage = () => admission.promise;
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, /disposed/);
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "steer", message: "control" }, () => {});
+  const controlCheck = assert.rejects(control.result, /disposed/);
+  await waitForImmediate(() => session.trackedWork.size === 1);
+  await session.dispose();
+  await Promise.all([rootCheck, controlCheck]);
+  let cancelled = 0;
+  admission.resolve({
+    submissionId: "late", admitted: Promise.reject(new Error("late admission")),
+    execution: Promise.reject(new Error("late execution")), terminal: Promise.reject(new Error("late terminal")),
+    cancel: () => { cancelled += 1; return true; },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cancelled, 1);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(session.adapterWaiterCancellations.size, 0);
+  assert.equal(session.trackedWork.size, 0);
+});
+
+test("joined controls do not borrow gate authority and never overwrite a host runtime provider", async () => {
+  const agent = new TrackedAgentSession();
+  const emitter = new FakeGateEmitter();
+  let providerWrites = 0;
+  emitter.setRuntimeTurnProvider = () => { providerWrites += 1; };
+  agent.getWorkflowGateEmitter = () => emitter;
+  const session = new SdkSession(agent);
+  const rootEvents = [];
+  const controlEvents = [];
+  const root = session.sendOwned("primary", { type: "prompt", message: "root" }, (event) => rootEvents.push(event));
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("follower", { type: "follow_up", message: "follow" }, (event) => controlEvents.push(event));
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.inputs[0].execute(agent.rootScope);
+  await waitForImmediate(() => control.phase === "active");
+  const gate = emitter.emitGate(sdkAskGate({ gate_id: "joined-gate", options: [{ value: "yes", label: "Yes" }] }));
+  const entry = session.pendingGates.get("joined-gate");
+  assert.equal(entry.ownerId, "primary");
+  assert.equal(controlEvents.length, 0);
+  assert.equal(rootEvents.filter((event) => event.type === "gate_request").length, 1);
+  assert.equal(session.presentGate("follower", "joined-gate", entry.presentationId, "wrong-owner"), false);
+  await answerGate(session, "joined-gate", "Yes");
+  await gate;
+  agent.inputs[0].complete(agent.rootScope);
+  agent.finishRoot();
+  await Promise.all([root.result, control.result]);
+  assert.equal(providerWrites, 0);
+  await session.dispose();
+});
+
+test("a late public terminal callback still admits tracked control while root promise unwinds", async () => {
+  const agent = new TrackedAgentSession();
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  agent.emit(terminalEvent({ scope: agent.rootScope }));
+  const control = session.sendOwned("late", { type: "follow_up", message: "late" }, () => {});
+  await waitForImmediate(() => agent.inputs.length === 1);
+  assert.deepEqual(agent.calls, [["prompt", "root"]]);
+  const next = attemptScope(2, "late-successor");
+  agent.emit({ type: "agent_start", scope: next });
+  agent.inputs[0].execute(next, "promoted-to-run");
+  agent.root.resolve();
+  await root;
+  await waitForImmediate(() => control.phase === "active");
+  agent.inputs[0].complete(next);
+  agent.emit(terminalEvent({ scope: next }));
+  await control.result;
+  await session.dispose();
+});
+
+test("a unique promoted gate is buffered before execution receipt and presented only after activation", async () => {
+  const agent = new TrackedAgentSession();
+  const emitter = new FakeGateEmitter();
+  agent.getWorkflowGateEmitter = () => emitter;
+  const session = new SdkSession(agent);
+  const rootEvents = [];
+  const root = session.send({ type: "prompt", message: "root" }, (event) => rootEvents.push(event));
+  await waitForImmediate(() => agent.calls.length === 1);
+  let activated = false;
+  const controlEvents = [];
+  const control = session.sendOwned("promoted", { type: "follow_up", message: "next" }, (event) => {
+    assert.equal(activated, true);
+    controlEvents.push(event);
+  }, undefined, { onActivate: () => { activated = true; } });
+  await waitForImmediate(() => agent.inputs.length === 1);
+  agent.finishRoot();
+  const next = attemptScope(2, "next");
+  agent.emit({ type: "agent_start", scope: next });
+  const gate = emitter.emitGate(sdkAskGate({ gate_id: "promoted-gate" }));
+  assert.equal(session.pendingGates.size, 0);
+  assert.equal(session.inputRouter.hasPendingGate(), true);
+  agent.inputs[0].execute(next, "promoted-to-run");
+  await waitForImmediate(() => session.pendingGates.size === 1);
+  const entry = session.pendingGates.get("promoted-gate");
+  assert.equal(entry.ownerId, "promoted");
+  assert.equal(rootEvents.some((event) => event.type === "gate_request"), false);
+  assert.equal(controlEvents.filter((event) => event.type === "gate_request").length, 1);
+  await answerGate(session, "promoted-gate", "answer");
+  await gate;
+  agent.inputs[0].complete(next);
+  agent.emit(terminalEvent({ scope: next }));
+  await Promise.all([root, control.result]);
+  await session.dispose();
+});
+
+test("ambiguous overlapping gate ownership fails within the existing answer window", async () => {
+  const agent = new TrackedAgentSession();
+  const emitter = new FakeGateEmitter();
+  agent.getWorkflowGateEmitter = () => emitter;
+  const timers = createManualTimeouts();
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 100, hardCapMs: 1_000, gateAnswerWindowMs: 50,
+    setTimeoutFn: timers.setTimeout, clearTimeoutFn: timers.clearTimeout,
+  });
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, (error) => error.code === "SDK_TRACKED_INPUT_GATE_OWNERSHIP");
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("next", { type: "follow_up", message: "next" }, () => {});
+  const controlCheck = assert.rejects(control.result, (error) => error.code === "SDK_TRACKED_INPUT_GATE_OWNERSHIP");
+  await waitForImmediate(() => agent.inputs.length === 1);
+  const next = attemptScope(2, "next");
+  agent.emit({ type: "agent_start", scope: next });
+  agent.inputs[0].execute(next, "promoted-to-run");
+  await waitForImmediate(() => control.phase === "active");
+  const gate = emitter.emitGate(sdkAskGate({ gate_id: "ambiguous-gate" }));
+  const gateCheck = assert.rejects(gate, /fenced/);
+  assert.equal(session.pendingGates.size, 0);
+  assert.equal(session.inputRouter.hasPendingGate(), true);
+  timers.advance(50);
+  await Promise.all([rootCheck, controlCheck, gateCheck]);
+  await session.dispose();
+  assert.equal(session.closed, true);
+  assert.equal(timers.size, 0);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(emitter.listeners.size, 0);
+});
+
+test("duplicate SDK submission identities fail instead of conflating equal or distinct text", async () => {
+  const agent = new TrackedAgentSession();
+  const submit = agent.submitUserMessage.bind(agent);
+  agent.submitUserMessage = (message, options) => {
+    const result = submit(message, options);
+    const input = agent.inputs.at(-1);
+    input.identity.submissionId = "duplicate-id";
+    return result.then((handle) => ({ ...handle, submissionId: "duplicate-id",
+      admitted: Promise.resolve({ ...input.identity, queuePolicy: "sequential" }),
+    }));
+  };
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await waitForImmediate(() => agent.calls.length === 1);
+  const first = session.sendOwned("first", { type: "steer", message: "equal text" }, () => {});
+  const firstCheck = assert.rejects(first.result, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await waitForImmediate(() => session.submissionIds.size === 1);
+  const second = session.sendOwned("second", { type: "steer", message: "equal text" }, () => {});
+  const secondCheck = assert.rejects(second.result, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await Promise.all([rootCheck, firstCheck, secondCheck]);
+  await session.dispose();
+  assert.equal(session.submissionIds.size, 0);
+});
+
+test("malformed public tracked handles are rejected without independent prompt subscribers", async (t) => {
+  for (const [name, value] of [
+    ["missing handle", undefined],
+    ["missing lifecycle", { submissionId: "incomplete", cancel: () => true }],
+    ["non-promise lifecycle", { submissionId: "non-promise", admitted: {}, execution: {}, terminal: {}, cancel: () => true }],
+  ]) await t.test(name, async () => {
+    const agent = new TrackedAgentSession();
+    agent.submitUserMessage = () => Promise.resolve(value);
+    const session = new SdkSession(agent);
+    const root = session.send({ type: "prompt", message: "root" }, () => {});
+    const rootCheck = assert.rejects(root, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+    await waitForImmediate(() => agent.calls.length === 1);
+    await assert.rejects(session.send({ type: "steer", message: "control" }, () => {}),
+      (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+    await rootCheck;
+    await session.dispose();
+    assert.equal(agent.listeners.size, 0);
+  });
+});
+
+test("admitted tracked work waits without an execution idle timeout, then arms idle on consumption", async () => {
+  const agent = new TrackedAgentSession();
+  const timers = createManualTimeouts();
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 100, hardCapMs: 1_000,
+    setTimeoutFn: timers.setTimeout, clearTimeoutFn: timers.clearTimeout,
+  });
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, (error) => error.terminalDisposition === "timed_out");
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("queued", { type: "steer", message: "wait" }, () => {}, 30);
+  const controlCheck = assert.rejects(control.result, (error) => error.terminalDisposition === "timed_out");
+  await waitForImmediate(() => agent.inputs.length === 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  timers.advance(31);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(session.closed, false, "waiting SDK input must not time out an unrelated active root");
+  assert.equal(control.phase, "queued");
+  agent.inputs[0].execute(agent.rootScope);
+  await waitForImmediate(() => control.phase === "active");
+  timers.advance(29);
+  assert.equal(session.closed, false);
+  timers.advance(1);
+  await Promise.all([rootCheck, controlCheck]);
+  await session.dispose();
+  assert.equal(agent.disposeCalls, 1);
+  assert.equal(timers.size, 0);
+});
+
+test("tracked admission timeouts poison the session and settle every owned waiter", async () => {
+  const agent = new TrackedAgentSession();
+  agent.submitUserMessage = () => new Promise(() => {});
+  const timers = createManualTimeouts();
+  const session = new SdkSession(agent, {
+    idleTimeoutMs: 100, hardCapMs: 1_000,
+    setTimeoutFn: timers.setTimeout, clearTimeoutFn: timers.clearTimeout,
+  });
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, (error) => error.terminalDisposition === "timed_out");
+  await waitForImmediate(() => agent.calls.length === 1);
+  const control = session.sendOwned("control", { type: "follow_up", message: "control" }, () => {}, 30);
+  const controlCheck = assert.rejects(control.result, (error) => error.terminalDisposition === "timed_out");
+  await waitForImmediate(() => session.trackedWork.size === 1);
+  timers.advance(30);
+  await Promise.all([rootCheck, controlCheck]);
+  await session.dispose();
+  assert.equal(agent.disposeCalls, 1);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(session.adapterWaiterCancellations.size, 0);
+  assert.equal(session.trackedWork.size, 0);
+  assert.equal(timers.size, 0);
+});
+
+test("missing public tracked API is explicit rather than a legacy queue fallback", async () => {
+  const agent = new TrackedAgentSession();
+  agent.submitUserMessage = undefined;
+  const session = new SdkSession(agent);
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  const rootCheck = assert.rejects(root, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await waitForImmediate(() => agent.calls.length === 1);
+  await assert.rejects(session.send({ type: "steer", message: "not a fake prompt" }, () => {}),
+    (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+  await rootCheck;
+  assert.deepEqual(agent.calls, [["prompt", "root"]]);
   await session.dispose();
 });
 
@@ -1404,6 +2507,8 @@ test("SDK adapter poisons and disposes a timed-out session", async () => {
   assert.equal(session.closed, true);
   await session.dispose();
   assert.equal(agent.disposeCalls, 1);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
   await assert.rejects(
     session.send({ type: "prompt", message: "later" }, () => {}),
     /not running/
@@ -1602,6 +2707,8 @@ test("dispose cancels adapter waiters without relying on an SDK terminal", async
   assert.match(results[0].reason.message, /disposed/);
   assert.equal(timers.size, 0);
   assert.equal(agent.disposeCalls, 1);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
 });
 
 test("timeout-triggered disposal rejections are handled immediately", async () => {

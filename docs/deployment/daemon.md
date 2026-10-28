@@ -6,30 +6,84 @@ and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
 
-The daemon adapter rejects `steer` and `follow_up` while a prompt is active,
-before SDK queue admission. Idle controls remain prompt-equivalent FIFO work.
+### Current tracked-input source contract — LOCAL qualified subset
+
+The issue #231 source integration submits active `steer` and `follow_up`
+through official SDK 0.19.0's public tracked `submitUserMessage` API, not a
+blanket active-control rejection. It tracks admission, execution, and final
+terminal ownership separately: admission is neither execution nor completion.
+Sequential delivery is per SDK queue; joined requests may share a logical run
+and terminal, with no global cross-mode FIFO or isolated per-request generation
+promise. Idle controls remain serialized real prompts. Root/model serial
+operations wait for tracked work to settle.
+
+Root results separately require genuine execution and own prompt-finalization
+proof; SDK readiness publications can coalesce during late promotion. The exact
+SDK-proven public Agent terminal plus that root's settled public prompt may
+prove its result, never a tracked receipt or gate-owner handoff. Prompt
+fulfillment alone is not completion, and raw end alone cannot retire gates.
+
+Gate ownership is deliberately scope/cohort-bound. Ambiguous ownership is
+bounded and fails explicitly; it is never inferred from the most recent
+submitter. Genuine primary and joined-run Ask qualify exact owner/presentation
+routing. Ambiguous promoted overlap has no immutable public owner bridge and
+fails bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP`, without wrong-owner presentation
+or answer.
+SDK queue cancellation and its dequeue-race limits are described
+in [Invoke and integration boundary](#invoke-and-integration-boundary).
+See the
+[current tracked-input evidence](../daemon-workspace-verification.md#current-tracked-input-evidence).
+
+Current **LOCAL Windows** evidence is focused **474/474 passed** (zero failures
+or skips) and unrestricted workspace **2897 total: 2887 passed, 0 failed,
+10 existing platform/privilege skips**, with no exclusion patterns. It covers
+genuine SDK tracked handles/terminals, late follow-up/steer successor consumption,
+root execution proof, bounded gate refusal and canonical/isolation/lifecycle/
+protocol/docs regressions, not universal gate or isolation qualification.
+These post-review regressions use mock providers, with no real-provider calls.
+Independent static review is **APPROVE** across all five product-review lanes
+and the final test-only correction; it is not independent runtime approval.
+Exact-head CI remains **PENDING**; #231 remains open.
+
+The feature-only smoke grant is **CONSUMED-PASS** on the pinned **PRE-REVIEW**
+source (`.git/issue231-pre-review-source.json`), not the post-review
+fatal-retirement/router source. It was one child-only `codex-eco`
+A-B-A run, three exact `SMOKE_OK` responses, heartbeat and three successful
+invoke terminals, exit 0, relay port free, no optional model query or retry.
+It proves basic roots only at that pin, not the current tree, a #247 disconnect
+fix, tracked active-control provider behavior, profile/tenant
+isolation, other-platform, service-install, security or deployment qualification.
+Neither this grant nor older consumed grants may be replayed.
+
 SDK 0.19.0 includes the late-follow-up continuation fix for
 [#5351](https://github.com/Yeachan-Heo/gajae-code/issues/5351) and public tracked
 `submitUserMessage` ownership associated with
 [#5429](https://github.com/Yeachan-Heo/gajae-code/issues/5429). API existence is
-not qualified daemon integration; active controls remain fail-closed. See the
+not qualification of this integration. See the historical
 [containment record](../../CHANGELOG.md#sdk-0166-containment).
 
-### Current SDK-only 0.19.0 evidence
+### Historical SDK-only 0.19.0 adoption evidence
 
-Current source evidence is tracked in the
-[current SDK-only 0.19.0 evidence record](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
-and records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
-skips, canonical imports, and one newly authorized same-profile provider smoke.
-Review/CI/landing are tracked separately; no signed-release, installation, or
-deployment PASS is claimed here.
+PR [#274](https://github.com/kogangdon/gjc-remote/pull/274) adopted official
+0.19.0; its SDK-only evidence is **HISTORICAL for tracked-input integration**.
+The [SDK-only 0.19.0 evidence record](../daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+records Windows focused 265/265, unrestricted workspace 2739 pass/zero fail/10
+skips, canonical imports, and the then-authorized same-profile provider smoke.
+That paid grant is consumed and cannot be replayed. Neither the old smoke nor
+prior CI/review/landing qualifies this integration. Current local subset evidence
+is recorded above with static review APPROVE; exact-head CI remains pending, with no
+signed-release, installation, or deployment PASS claimed here.
+SDK version/SRI and immutable release identities remain unchanged. This work
+does not authorize install/service/sign/deploy operations, account/ACL/credential
+changes, or issue closure.
 Upstream #6578 is closed and #6700 is closed unmerged. Repair #6970 is included
 in the official 0.19.0 release notes, not a local workflow-gate PASS. #6763's
 transcript-content approval binding is a separate change. Do not bypass containment.
-Active cancellation remains nonterminal `cancellation_pending`, not proof of
-interruption; active `steer` and `follow_up` remain fail-closed.
 
 ### Historical SDK-only 0.18.12 evidence
+
+These receipts are **HISTORICAL for tracked-input integration**, not feature
+qualification. Their paid smoke grant is consumed and cannot be replayed.
 
 The following 0.18.12 receipts and PR #265 are historical and do not qualify
 0.19.0. Actual post-admission parent SDK-only evidence: Windows focused 333/333; bounded workspace
@@ -92,11 +146,13 @@ and `presentation_failed`; `cancel_result` outcomes are exactly
 `not_owned`. A duplicate cancel ID replays its exact receipt. Request/cancel
 tombstones are bounded and retained through the hard-cap/receipt horizon.
 
-A queued request is revoked before SDK, provider, or tool execution, receives
-`cancelled_before_start`, and then terminal `cancelled`. An active request
-receives only nonterminal `cancellation_pending`: the daemon has no qualified
-active-interruption integration, and its eventual natural terminal remains
-authoritative. A cancellation receipt is not terminal or quiescence proof.
+A request positively removed from the daemon queue or through SDK queue
+cancellation before execution receives `cancelled_before_start`, then terminal
+`cancelled`. Queued-looking SDK work can win the dequeue race: without positive
+removal, revocation reports nonterminal `cancellation_pending`, not an invented
+terminal cancellation. Executing shared-run interruption remains unqualified;
+the tracked run's eventual terminal stays authoritative. A cancellation receipt
+is not terminal or quiescence proof.
 
 Its authoritative final frame is an `event` with an
 `invoke_terminal` event, `done: true`, and no top-level `error`; the first
@@ -109,23 +165,26 @@ failure, not a daemon `timed_out` disposition. On adapter timeout, the daemon
 transfers the session/activity hold to SessionPool retirement containment (#234)
 while cleanup settles because work may continue. On socket close, the daemon
 synchronously quarantines exact socket-generation gate owners before
-cancellation retirement and reconnect scheduling, revokes queued sibling
-invokes, and retires each active shared session once through #234 containment.
+cancellation retirement and reconnect scheduling, requests queued sibling
+revocation under the positive-removal rule above, and retires each active
+shared session once through #234 containment.
 It retains associated leases and admission fences until positive disposal
-proof; no successor may adopt or downgrade owned work. The #231 live-control containment above remains active:
-cancellation does not restore active `steer`/`follow_up` or unblock #231.
+proof; no successor may adopt or downgrade owned work. The tracked-input source
+contract above does not qualify executing shared-run interruption or authorize
+issue #231 closure; only its documented LOCAL subset is qualified. Independent
+static review is APPROVE; exact-head CI is still pending.
 
 This repository provides the foreground start command below; it does not ship a
 native service installer, service wrapper, or rendered systemd deployment
 (source templates are under `native-control/src/systemd/`), and this guide is
 not evidence of a completed live deployment.
 
-The integration boundary is unchanged by the SDK bump. `gjc-remote` owns host
-authentication, route/workDir selection, and workspace admission/lifecycle
+The host-policy boundary is unchanged by tracked-input integration.
+`gjc-remote` owns host authentication, route/workDir selection, and workspace admission/lifecycle
 policy. The embedded SDK runtime owns provider/model catalogs, provider
 authentication, and agent-turn semantics. Public SDK `router` and `lifecycle`
 namespaces are reserved for separate future external-session evaluation; no
-adapter or migration is implemented. `sdk/broker` is not a public entrypoint.
+external-session adapter or migration is implemented. `sdk/broker` is not a public entrypoint.
 
 ## Prerequisites and provider identity
 
@@ -196,9 +255,11 @@ On a stop signal the daemon begins its bounded shutdown procedure under
 pending invokes or gates may fail, and forced termination is an operational
 failure because active workflows and local state may not have reached their
 normal cleanup boundary. Configure the external service supervisor's stop
-timeout above it. Socket close containment revokes queued siblings before
-execution and starts #234 retirement for active shared sessions; it is not
-proof that active SDK/provider work was interrupted.
+timeout above it. Socket close containment requests queued sibling revocation
+and starts #234 retirement for active shared sessions. Only positively removed
+work is cancelled before start; revocation that loses the dequeue race remains
+`cancellation_pending`. This is not proof that active SDK/provider work was
+interrupted.
 
 Monitor daemon process health, outbound WebSocket registration at the bot,
 provider/profile failures, gate presentation/abandonment/answer receipt
@@ -253,7 +314,7 @@ purpose-specific deployment key.
 
 The existing uninstall generation/schema defect is tracked separately in
 [repository issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
-and is excluded from this SDK upgrade. Changing SDK source does not authorize
+and is excluded from SDK adoption and tracked-input integration. Changing SDK source does not authorize
 rebuilding, signing, or installing under an immutable old release tag.
 
 Recovery is exact-transaction replay only. Missing, stale, foreign, hybrid,

@@ -105,6 +105,75 @@ volume. Credentials are never relayed through Discord, bot, or a future manageme
 Provider backups require external encrypted key ownership/recovery, independent signature and
 manifest verification, rotation, and restore rehearsal.
 
+## Current tracked-input runtime contract — LOCAL qualified subset
+
+The issue #231 integration uses official unpatched SDK **0.19.0**
+`submitUserMessage` for active steering/follow-up input. Track each submission's
+admission, execution receipt, terminal outcome, and cancellation ownership; an
+admission receipt is not execution or successful completion. Delivery is sequential
+within each queue, not a global FIFO across queues. Execution receipts bind inputs
+to logical-run cohorts: joined submissions can share the originating run's terminal,
+and do not each start an independent generation. Route public events and terminals
+by proven cohort ownership, not prompt text, arrival order, or the newest invoke.
+
+Root result proof is separate: the exact SDK-proven public Agent terminal plus
+that root's own settled prompt can prove its result despite coalesced readiness
+publication. This never manufactures tracked receipts or retires gate authority;
+SDK post-raw continuations may still issue Ask. Prompt fulfillment alone and
+unknown raw scopes are not completion proof.
+
+Workflow gates require a deliberate, uniquely proven owner. An unresolved ownership
+race may wait only within bounded buffering/time limits, then fails explicitly;
+never guess an owner, synthesize an answer, or silently drop an ambiguous gate.
+Promoted overlap without a public immutable owner bridge is refused with
+`SDK_TRACKED_INPUT_GATE_OWNERSHIP`; this limitation is not positive gate support.
+Queued cancellation removes an input only when the SDK positively proves removal
+before execution. An unknown or running outcome is not proof of removal. Running
+cancellation remains nonterminal `cancellation_pending`, not an interruption or
+completed cancellation; retain ownership until the authoritative terminal outcome.
+There is no selective abort of executing shared-run work or cancellation of siblings.
+
+Idle requests still use real SDK prompts; root prompts and model changes remain
+serialized. No Broker/Router/subprocess redesign or new feature flag/opt-in is
+introduced. SDK stays 0.19.0 with unchanged SRI, and native C++ is unchanged.
+
+The [current tracked-input evidence](daemon-workspace-verification.md#current-tracked-input-evidence)
+records the **LOCAL Windows qualified subset**: focused-04 passed 474/474 with zero
+failures, skips or cancellations; unrestricted workspace-02 `npm test` exited 0 with
+2897 tests/2887 pass/zero fail/10 existing platform/privilege skips and no exclusion
+patterns. Unit-05 passed 240/240 and lifecycle-03 passed 52/52. These post-review
+regressions use mock providers, not current-tree real-provider proof. Genuine SDK
+harnesses prove primary/joined Ask presentation and exact
+ownership, late follow-up/steer successor consumption, tracked handles/public
+terminals, and root raw-terminal plus own-prompt proof. Promoted-overlap gate
+ownership remains SDK-limited: bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP` refusal
+without a wrong-owner answer is qualified, not universal gate success.
+
+The earlier focused-02 444/444 and workspace-01 2867 tests/2857 pass/10 skips
+remain pre-review receipts only. Focused-03 remains a preserved failed receipt
+(474 tests/463 pass/11 reported failures), not a pass.
+All five independent lanes retain scoped static **APPROVE** verdicts;
+lanes 24/25 additionally re-reviewed their respective product corrections,
+while lanes 26–28 retain their original scoped approvals;
+the final test-only corrections independently **APPROVE** in
+`agent://32-FinalTestCorrectionReview`. The aggregate review now records
+`STATIC_APPROVE_RUNTIME_PASS` against focused-04/workspace-02. Exact-head CI
+remains a separate gate; issue #231 remains **OPEN**.
+
+The issue231 provider grant is **CONSUMED-PASS** on **PRE-REVIEW source only**
+(`.git/issue231-provider-smoke.json`, `.git/issue231-pre-review-source.json`): one child-only
+`codex-eco` A-B-A run, three exact `SMOKE_OK` responses, current heartbeat and three
+successful invoke terminals, exit 0 in 13392 ms and relay port free, without optional
+model query or retry. It does not cover the later router, fatal-retirement, or test
+corrections and is not current-tree provider proof. Never replay or relabel it.
+This is basic root regression only, not tracked active-control provider or
+profile/tenant-isolation qualification, and does not resolve #247 disconnect behavior.
+PR #274's SDK-adoption receipts and all 0.18 receipts remain historical, not feature
+proof; their consumed paid/provider smoke grants cannot be reused. Issue #273 is
+excluded and #33 subprocess work remains deferred. These local results do not qualify Linux/macOS/Docker, native/service/SCM,
+security, release/install/sign/deploy or isolation; prior immutable release identities
+remain unchanged.
+
 ## Deployment and shutdown contract
 
 #42 owns platform deployment examples, rollout/rollback instructions, and evidence. This document
@@ -157,11 +226,12 @@ and restart count. Every release packet runs path/secret/control sentinel scans.
 The five documents carry an assumptions ledger: #44 route/envelope and mapping persistence,
 receiver TTL/skew/probe bounds, Git refs/allowlist/dirty policy, lease/resource budgets, provider
 key recovery, #42/#45 evidence schedules, and SDK/package/lock reconciliation at official unpatched
-0.19.0. The single authoritative [current SDK-only verification record](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
-records the source base, SRI, actual Windows tests/imports/provider smoke, separate
-review status, and unchanged promotion limits.
-No historical result below qualifies that upgrade; no release, installation, signing, or
-platform qualification is claimed. The separate uninstall bug remains issue #273, outside this SDK PR.
+0.19.0. The [SDK 0.19.0 adoption record (PR #274)](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+preserves the source base, SRI, original Windows tests/imports/provider smoke,
+review/CI/landing history, and unchanged promotion limits. Those receipts do not
+qualify the tracked-input integration; its separate **LOCAL qualified subset** and
+static review approval and separate CI gate are recorded above. No release, installation, signing, or platform qualification is
+claimed. The separate uninstall bug remains issue #273, outside this integration.
 
 Historical 0.18.12 post-admission parent SDK-only evidence recorded Windows focused 333/333 (zero skips),
 bounded workspace 2704 tests/2700 pass/zero fail/four skips under nine explicit historical
@@ -183,8 +253,9 @@ and independently cleared in `artifacts/sdk-first-0.18.12-final-review.json`: st
 review APPROVE, zero P0/P1/P2, not independent runtime or CI/merge/deployment approval.
 Historical exact-head CI/landing was tracked in [PR #265](https://github.com/kogangdon/gjc-remote/pull/265);
 that record's final follow-up was not yet committed/pushed, and it did not claim CI/merge completion.
-Active controls remain fail-closed, with no inferred standalone abort support;
-active cancellation remains nonterminal `cancellation_pending`. #6578 is closed and #6700
+In that historical snapshot, active controls remained fail-closed, with no inferred
+standalone abort support; active cancellation remained nonterminal `cancellation_pending`.
+That is not the current tracked-input admission contract above. #6578 is closed and #6700
 is closed-unmerged; #6970 is the actual repair included in the 0.19.0 release notes,
 not local workflow qualification. Docker/image/release/security/native/service/fault/OOM/noDump/
 installation/deployment and isolation gates remain unqualified and open. Each item

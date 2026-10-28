@@ -11,19 +11,39 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (official SDK 0.19.0; bounded Windows source evidence)
+## Architecture (tracked-input source integration; LOCAL Windows subset qualified)
 
-The daemon dependency and lockfile target official unpatched 0.19.0.
-Windows focused tests passed 265/265; unrestricted `npm test` recorded 2749 tests,
-2739 pass, zero fail and 10 skips. Canonical imports and one newly authorized
-same-profile A-B-A provider smoke passed. Final independent review and exact-head
-CI/landing are separate gates; no fresh Linux/macOS/Docker evidence is claimed. See
-[current 0.19.0 evidence](docs/daemon-workspace-verification.md#current-sdk-only-0190-evidence).
-No historical receipt or review qualifies the new source pins. This source change
-does not authorize signing, installation or reuse of immutable rc.14/rc.12
+`feat/sdk-tracked-live-controls` implements #231 atop merged SDK 0.19.0 main
+`891c7aad71307f56ce5a140fb08599b1a53551ab`. The daemon dependency, lockfile and
+SRI remain official unpatched 0.19.0. Focused and unrestricted workspace checks
+passed post-review locally on Windows: **474/474** focused, **2897 tests, 2887 pass,
+0 fail, 10 existing skips** in unrestricted `npm test` (exit 0), using credentialless
+mock providers. These include genuine SDK primary/joined Ask ownership,
+late successor consumption, genuine tracked receipts and root execution proof.
+Ambiguous promoted-overlap gates are qualified only as bounded refusals, not
+positive gate support. The issue231 basic-root provider smoke is CONSUMED-PASS on
+**PRE-REVIEW source only**; later router/fatal-retirement fixes and final test
+corrections were not provider rerun. It cannot be replayed and does not qualify
+the current behavioral source, provider-backed active controls or profile/tenant
+isolation. Five prior independent lanes plus final test-correction review
+statically **APPROVE**; this is not independent runtime evidence. Exact-head CI
+remains **PENDING**. Full counts, receipts and review provenance are in
+[current tracked-input evidence](docs/daemon-workspace-verification.md#current-tracked-input-evidence).
+No historical receipt or review qualifies this feature. #231 remains **OPEN**, not
+universally complete. No fresh Linux/macOS/Docker, security, profile/tenant
+isolation or issue closure is claimed. This source change does not authorize
+release, signing, installation, deployment, host-ACL/account/credential changes
+or reuse of immutable rc.14/rc.12
 identities; their SDK/version evidence remains historical. The existing uninstall
 generation defect is separately tracked as [issue #273](https://github.com/kogangdon/gjc-remote/issues/273)
-and is **not repaired** by the SDK upgrade.
+and is **not repaired** by tracked-input integration.
+
+**Historical 0.19.0 adoption (`9512dd8`, PR #274).** Windows focused tests passed
+265/265; unrestricted `npm test` recorded 2749 tests, 2739 pass, zero fail and
+10 skips. Canonical imports and one authorized same-profile A-B-A provider smoke
+passed within that cohort. These results do not qualify tracked-input integration.
+The paid smoke grant is consumed, cannot be replayed, and provides no fresh
+provider authority. Review and CI receipts remain bound to their original source.
 
 **Historical 0.18.12 evidence (PR #265).** Recorded post-admission parent
 SDK-only evidence is Windows focused 333/333, bounded workspace 2704
@@ -61,12 +81,32 @@ The separate Windows FIFO 100 ms wall-clock flake remains in
 Only the gated FIFO ordering test uses Node mock `setTimeout`; actual timeout
 tests are unchanged. Subsequent admission2 focused 333/333 and Linux 248/248 passed.
 
-Published types expose `QueuedInputSubmission`, and
-`AgentSession.submitUserMessage()` provides tracked submission ownership.
-API existence is not qualified daemon integration. The adapter rejects `steer`
-and `follow_up` with `SDK_LIVE_CONTROL_UNSUPPORTED` whenever a prompt is active;
-idle controls remain serialized prompt-equivalent work. Active cancellation
-remains nonterminal `cancellation_pending`, not interruption or quiescence proof.
+The source integration uses public `AgentSession.submitUserMessage()` /
+`QueuedInputSubmission` handles for active `steer`/`follow_up`, with stable
+submission identity, sequential per-queue policy and scoped cohort/run event
+routing. Multiple controls can JOIN one logical run and share its terminal;
+sequential is neither global cross-mode FIFO nor independent generations.
+Genuine execution/terminal/removal receipts are authoritative, not text matches
+or unrelated terminals. Idle controls remain serialized real prompts, and root
+prompt/model operations cannot overtake tracked work. Each cohort has one
+deliberate gate owner; unprovable ownership produces a bounded explicit failure,
+not guessed ownership. Local genuine SDK primary and joined-run Ask checks prove
+exact owner/presentation; late `follow_up` and `steer` checks prove real successor
+consumption. Promoted-overlap gates without an immutable public owner bridge fail
+with bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP`, with no gate presentation, answer
+or continuation. This negative qualification is not universal gate support.
+Queued cancellation requires positive pre-start removal; a lost
+dequeue race or executing work remains nonterminal `cancellation_pending`.
+There is no selective running abort or interruption/quiescence proof.
+
+Root result proof is distinct from SDK readiness. Official 0.19.0 can coalesce
+unbranded session terminal publications during late promotion. The exact
+SDK-proven public `AgentSession.agent.subscribe` terminal plus that root's own
+settled public `prompt` can prove the root result; success additionally requires
+prompt fulfillment and completed stop/failure classification. Raw observations
+never establish unknown scope ownership, synthesize tracked receipts, duplicate
+stream output or retire a cohort's gate authority. SDK post-raw continuations
+can still issue Ask, so an execution end alone is insufficient gate proof.
 
 The historical 0.18.12 credentialless SDK Ask abort oracle verified one event-level
 `cancelled` terminal and no provider continuation after unwind. It permits
@@ -77,8 +117,9 @@ Do not promote its pass into bounded active-interruption qualification.
 Historically, the published 0.16.7 package lacked #5371's late-follow-up
 continuation fix for upstream #5351. SDK 0.18.12 includes that fix and the
 public ownership API associated with #5429; those are no longer absent SDK
-capabilities. The daemon does not yet integrate or qualify the tracked lifecycle
-for active controls, and does not consume internal `queuedAtDispatch` or SDK-host
+capabilities. This branch integrates the public tracked lifecycle for active
+controls within the recorded LOCAL Windows subset, not universal gate support,
+and does not consume internal `queuedAtDispatch` or SDK-host
 `onQueuedPromoted` hooks. Do not substitute queue-text matching, private
 capabilities, or forced lower-level continuation.
 
@@ -89,11 +130,11 @@ SQLite statement-finalization fix #6696. Inclusion is not local verification.
 The actual [#6970 repair](https://github.com/Yeachan-Heo/gajae-code/pull/6970)
 appears in official 0.19.0 release notes; that inclusion does not qualify local
 Ultragoal/Ralplan workflow gates. Merged #6763's transcript-content approval
-binding is distinct. Gate and live-control policies remain fail-closed;
-no gate/admission bypass or recovery is authorized.
+binding is distinct. Gate/admission ownership remains fail-closed when
+unprovable; no gate/admission bypass or recovery is authorized.
 
-The topology below remains the implemented integration. The current Windows
-scoped probe boundary and explicitly historical observations are recorded in
+The topology below remains the implemented integration. The scoped probe
+boundary and explicitly historical Windows observations are recorded in
 `docs/verification/issue62-evidence.md`. Adapter regressions, the real-SDK
 contract oracle, and local smoke are separate bounded checks, not
 tenant-isolation or Broker/Router proof. Older results later in this file remain
@@ -117,13 +158,18 @@ explicitly historical.
    host filesystem's current canonical real path, so retargeted symlinks or
    junctions cannot reuse a stale target. Different path spellings for the same
    directory share one in-process GJC SDK `AgentSession` with file-backed history
-   under `<workDir>/.gjc-remote-session`. Prompt and model operations are
-   serialized per session. Idle `steer`/`follow_up` requests join that FIFO and
-   start a prompt-equivalent run instead of waiting on an inactive control queue.
-   While a prompt is active, live controls fail immediately with
-   `SDK_LIVE_CONTROL_UNSUPPORTED` before SDK queue admission. This avoids
-   unowned completion and unrelated-terminal correlation. SDK failure outcomes
-   reject the invocation. Each prompt receives its event stream. Idle sessions
+   under `<workDir>/.gjc-remote-session`. Root prompt/model operations are
+   serialized per session and cannot overtake tracked work. Idle
+   `steer`/`follow_up` requests start serialized real prompts; active controls use
+   public tracked submissions with stable identity and sequential per-queue
+   policy, not global cross-mode FIFO. Scoped cohort/run routing permits
+   multiple controls to JOIN one logical run and share a genuine terminal,
+   rather than promising independent generations. SDK failure outcomes reject
+   the invocation. Gate ownership is deliberate and singular per cohort;
+   unprovable ownership fails explicitly within a bound. The locally qualified
+   subset includes genuine primary/joined Ask and late successor consumption;
+   ambiguous promoted-overlap gates remain bounded refusals, not universal gate
+   behavior. Independent review is static **APPROVE**; exact-head CI is **PENDING**. Idle sessions
    (`IDLE_TIMEOUT_MS` = 1h, in `shared/protocol.js`) are disposed.
    Gate-capable invokes require negotiated `gate_presentation_v1` as well as
    terminal-disposition and cancellation capabilities; mixed peers fail closed
@@ -286,21 +332,25 @@ current transport lives in `daemon/src/sdk-session.js`.
    `cancelled_before_start`, `cancellation_pending`, `already_terminal`, and
    `not_owned`. A duplicate cancellation ID replays its original receipt, while
    bounded request/cancel tombstones remain through the hard-cap/receipt
-   horizon. A queued request is revoked before SDK/provider/tool execution,
-   receives `cancelled_before_start`, and then terminal `cancelled`. An active
-   request receives only nonterminal `cancellation_pending`, because the daemon
-   has no qualified active-interruption integration; its natural terminal remains
-   authoritative. The daemon emits one exact completed, failed, cancelled,
+   horizon. Positive pre-start removal is required before a queued request
+   receives `cancelled_before_start` and then terminal `cancelled`. Losing the
+   dequeue race or executing work receives only nonterminal
+   `cancellation_pending`; there is no selective running abort, and its genuine
+   terminal remains authoritative. The daemon emits one exact completed, failed, cancelled,
    paused, timed-out, or disconnected disposition; the bot accepts the first
    valid terminal frame only. A receipt, timeout, or transport loss does not
    prove interruption or quiescence and Discord renders it as unconfirmed.
    Bot idle/hard-cap expiry, `/cancel`, presentation failure, and
    shutdown/disconnect ownership changes request revocation. Daemon close
    synchronously quarantines exact socket-generation gate owners before
-   cancellation retirement/reconnect, revokes queued siblings, and retires each
+   cancellation retirement/reconnect, requests queued sibling revocation subject
+   to positive removal proof, and retires each
    active shared session once through #234 containment, retaining leases and
-   admission fences until positive disposal proof. This does not restore active
-   `steer`/`follow_up` and does not unblock #231.
+   admission fences until positive disposal proof. Tracked-input source
+   integration does not establish active interruption or close #231;
+   local Windows mock-provider qualification passed. Exact-head CI remains
+   **PENDING**, and a fresh Discord UI canary is unverified. The consumed
+   provider smoke covers pre-review source only, not later behavioral fixes.
 9. **Equivalent workDir spellings created duplicate sessions.** `SessionPool`
    resolves every existing native workDir through the host filesystem and uses
    that canonical real path for the pool key, SDK cwd, and session directory.
@@ -332,8 +382,9 @@ loader is narrow.
 Every pooled `AgentSession` runs *in-process* inside the one daemon Bun process
 (see `session-pool.js` / `sdk-session.js`; `daemon/src` has no
 `spawn`/`child_process`/`--mode`). Multiple channels mapped to the same host
-therefore share **one JS event loop**. The 0.19.0 upgrade does not add an
-external-session adapter; its real-SDK A/B and B/A probes passed on Windows. Historical 0.18.12 A/B and B/A probes passed
+therefore share **one JS event loop**. No external-session adapter is added;
+the historical 0.19.0 adoption at `9512dd8` / PR #274 passed real-SDK A/B and B/A
+probes on Windows, not tracked-input qualification. Historical 0.18.12 A/B and B/A probes passed
 within the parent Windows and isolated Linux checks for scoped policy/model
 and registered-cwd capability boundaries. Windows local order receipts also
 record first-attempt child scratch removal after public close, with the
@@ -354,8 +405,10 @@ Constraint that follows:
   I/O (LLM calls, tool child-processes). A long *synchronous* CPU stretch on the
   main thread stalls every other session until it yields. Fine while work is
   I/O-bound; degrades under CPU-bound load.
-- **Per-session FIFO** serialization is intentional (prompt/model ops; see
-  Architecture §2). Cross-session there is no scheduling lock — independent.
+- **Per-session root serialization** is intentional (prompt/model ops cannot
+  overtake tracked work; see Architecture §2). Sequential control queues are
+  not a global cross-mode FIFO or independent generations. Cross-session there
+  is no scheduling lock — independent.
 - **Scoped versus unscoped SDK state.** The historical 0.16.4 probe observed
   independent SDK-owned `Settings.loadForScope` instances when settings were
   omitted. Both creation orders preserved scoped policies and available model
@@ -363,7 +416,8 @@ Constraint that follows:
   were `LAST_CREATED`. The historical 0.16.7 execution passed the same checks in
   both orders; none of these historical receipts is promoted to 0.19.0. Historical
   0.18.12 probes separately preserved this bounded scoped/unscoped distinction;
-  current 0.19.0 Windows probes also passed this bounded distinction.
+  historical 0.19.0 adoption Windows probes also passed this bounded distinction,
+  not tracked-input qualification.
   Unfiltered model
   catalogs are not availability/authorization
   decisions. Do not use unscoped APIs as per-workDir policy. Empty-fixture auth
@@ -566,9 +620,12 @@ Use these rules for Telegram delivery:
    item 1: `/hosts` online/offline, live progress edit + tool-call preview
    during a running prompt). Underlying `HostRegistry`/SDK session plumbing has
    historical unit-test coverage. Historical 0.18.12 bounded regressions and
-   the non-Discord Windows smoke passed as recorded above. Current 0.19.0
-   regressions and one non-Discord smoke passed; a fresh manual Discord UI canary
-   remains unverified.
+   the non-Discord Windows smoke passed as recorded above. Historical 0.19.0
+   adoption regressions and one non-Discord smoke passed at `9512dd8` / PR #274;
+   tracked-input local Windows mock-provider qualification passed; exact-head CI
+   remains **PENDING**, and a fresh manual Discord UI canary is unverified.
+   The feature smoke covers pre-review source only, not later behavioral fixes;
+   the consumed smoke grants cannot be replayed.
 7. **Remote host files are not attached automatically.** Assistant output may
    contain absolute paths from the daemon host, but the Discord bot treats those
    paths as text. It never reads matching paths from the bot host. A future
@@ -643,8 +700,9 @@ isolation nor state bleed for 0.19.0. The later 0.16.4 and 0.16.7 results are
 also historical; the 0.16.7 divergent-session probe established the scoped
 boundary only, not full isolation or the disappearance of unscoped global
 behavior. Historical 0.18.12 probes separately passed the bounded scoped
-checks recorded above; they do not qualify isolation or 0.19.0. Current Windows
-0.19.0 probes separately passed the bounded checks, not tenant isolation. Upstream fix reference:
+checks recorded above; they do not qualify isolation or 0.19.0. Historical Windows
+0.19.0 adoption probes at `9512dd8` / PR #274 separately passed the bounded checks,
+not tenant isolation or tracked-input integration. Upstream fix reference:
 **Yeachan-Heo/gajae-code#2774**, merged through PR #2865.
 For the issue #62 boundary review, the source-controlled evidence now requires
 both A→B and B→A sanitized matrices, concrete canonical resolver provider/selector

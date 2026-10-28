@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### SDK 0.19.0 source upgrade
+### Tracked live-input integration (issue #231)
+
+- Integrate active steering/follow-up through official SDK 0.19.0's public
+  `submitUserMessage` admission/execution/terminal/cancel lifecycle. Retain idle
+  prompt-equivalent behavior and serialized root/model operations.
+- Correlate stable submissions with observed run cohorts and genuine terminal
+  outcomes instead of message text, private queue hooks or unrelated terminals.
+  Per-queue sequential delivery does not imply independent runs or global FIFO.
+- Separate root execution/result proof from coalescible SDK readiness: the exact
+  public Agent terminal plus that root's settled public prompt can prove its
+  result, without synthesizing tracked receipts or transferring gate authority.
+- Preserve deliberate gate ownership, bounded ambiguity refusal and shared-run
+  safety. Only positive queued removal proves `cancelled_before_start`; losing
+  the dequeue race or executing work remains `cancellation_pending`.
+  Promoted-overlap gates lacking a public immutable owner bridge are refused
+  with `SDK_TRACKED_INPUT_GATE_OWNERSHIP`, not claimed as supported.
+- Remove the obsolete blanket `SDK_LIVE_CONTROL_UNSUPPORTED` runtime error
+  contract. Current integration evidence is tracked separately from historical
+  SDK-adoption receipts in `docs/daemon-workspace-verification.md`.
+- Post-review Windows focused **474/474** and unrestricted workspace **2897 tests,
+  2887 pass, 0 fail, 10 existing skips** passed with credentialless mock providers.
+  Five prior independent review lanes plus final test-correction review statically
+  **APPROVE**; this is not independent runtime evidence. Exact-head CI is pending.
+- Scope the consumed-PASS basic-root provider smoke to **PRE-REVIEW source only**;
+  later router/fatal-retirement fixes and final test corrections were not provider
+  rerun. Never replay it or treat it as current-source, active-control provider or
+  profile/tenant isolation qualification. See the
+  [current evidence ledger](docs/daemon-workspace-verification.md#current-tracked-input-evidence).
+  Issue #231 remains **OPEN**; universal promoted gates remain unsupported.
+- No SDK fork, real-provider grant reuse, selective running abort, issue closure,
+  merge, release, signing, installation or deployment is implied.
+
+### SDK 0.19.0 adoption-only source upgrade (PR #274)
 
 - Pin official unpatched `@gajae-code/coding-agent`, `agent-core`, and `ai`
   to 0.19.0. Align the lock graph, native SDK contract version/integrity,
