@@ -195,11 +195,26 @@ Use the per-service ACL/mode-protected transaction namespace specified in
 The Windows startup receipt's `resourceProof` binds the service resource proof
 declared by `transaction.final.resourceProof`. It must not substitute either
 the trial or final OS-resource configuration fingerprint. Those platform hashes
-retain their separate transition/boundary roles. Correcting the producer's proof
-domain does not relax protected-store admission: the separately observed Windows
-trial-boundary/provisional-metadata mismatch can still block the combined path
-before startup-proof publication. A Linux store test is not Windows integration
-evidence, and neither modeled path establishes real SCM/systemd qualification.
+retain their separate transition/boundary roles. Boundary admission selects one
+coherent manifest/resource pair: the already-admitted, same-session provisional
+final pair or the matching current final pair. The service proof and manifest
+fingerprint must match the transaction's final proof, and the resource's final
+OS fingerprint must match `transition.expectedAfterResourceFingerprint`. The
+boundary itself still matches `transition.platformResourceFingerprint` (trial).
+Predecessor current metadata is not mixed with a provisional final resource.
+
+Reopened pending state without a selectable final pair still refuses. A journal
+alone does not authorize reconstruction, re-admission or a new recovery phase.
+Existing historical boundary reads after recorded quiescence/finalization are
+not live-process evidence; their existing attempt/removal guards remain intact.
+A Linux store test is not Windows integration evidence, and modeled Windows
+store-method coverage is not complete driver-to-store or real SCM qualification.
+
+The service CLI limits stdin to 256 KiB of bytes. An oversized streamed request
+returns one canonical, newline-terminated `SERVICE_INVALID` refusal with usage
+exit code 64, before lifecycle/host authority construction. It closes the input
+iterator without draining the rest and never echoes request contents. Exact
+limit reader admission does not imply that those bytes form a valid request.
 
 Recovery must be symmetric and idempotent: install must commit only after metadata, manifest, and current-run readiness; update must retain old/new proofs and restore old settings only with an exact old proof; remove must use a proof-bound tombstone and remove only after no-process evidence. Env files, provider credentials, logs, and `.gjc-remote-session` must never be cleanup targets.
 

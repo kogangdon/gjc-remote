@@ -6,6 +6,7 @@ import { createServiceAcquisition } from './service-acquisition.js';
 import { createServiceLifecycle } from './service-lifecycle.js';
 import { createServiceStore } from './service-store.js';
 import {
+  ERROR_MESSAGES,
   REQUEST_LIMITS,
   runServiceCli,
   serviceReceiptBytes,
@@ -33,7 +34,7 @@ function failureReceipt(code = 'SERVICE_IO_FAILED', operation = 'service') {
     status: 'refused',
     operation: typeof operation === 'string' ? operation : 'service',
     code,
-    message: code === 'SERVICE_OUTPUT_LIMIT' ? 'service receipt exceeds its size limit' : 'service operation failed',
+    message: ERROR_MESSAGES[code] ?? ERROR_MESSAGES.SERVICE_FAILED,
     writes: 0,
     ambiguous: false,
   });

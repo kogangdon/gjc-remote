@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Windows boundary admission and streamed-input contracts (issue #240)
+
+- Validate Windows trial boundaries against one coherent, already-admitted
+  provisional final manifest/resource pair or the matching current final pair.
+  Keep the boundary bound to the trial OS fingerprint while final metadata
+  matches the declared final OS fingerprint and exact service/manifest proofs;
+  predecessor current metadata is not substituted for the provisional manifest.
+- Preserve refusal when reopened pending state has no selectable final pair.
+  No journal-only authority, metadata reconstruction/re-admission, phase
+  expansion, or relaxation of role, CAS, epoch, cursor or deadline checks.
+- Reuse the canonical CLI error-message table for entrypoint refusals so
+  oversized streamed stdin emits one `SERVICE_INVALID` usage receipt instead
+  of throwing during strict serialization. Preserve byte limits, early stream
+  closure, no lifecycle dispatch and sanitized output.
+- These are source/model corrections, not real SCM/systemd, provider, signing,
+  deployment or complete Windows driver-to-store qualification.
+
 ### Windows startup-proof resource-domain repair (issue #240)
 
 - Bind the Windows startup proof's `resourceProof` to the admitted transaction's
@@ -14,9 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trial and final platform fingerprints remain in their existing OS-evidence
   fields; protected-store, epoch, cursor and readiness guards are unchanged.
 - Separate source renderer/driver availability from signed deployment and real
-  systemd/SCM qualification. This repair does not resolve the independently
-  observed Windows trial-boundary/provisional-metadata admission mismatch or
-  authorize any service, account, ACL, signing or deployment operation.
+  systemd/SCM qualification. That producer-only repair did not address the
+  trial-boundary/provisional-metadata mismatch; the admission repair above
+  covers already-admitted same-session pairs, not new recovery authority.
+  Neither repair authorizes service, account, ACL, signing or deployment work.
 
 ### Recovery success receipt contract repair (issue #240)
 

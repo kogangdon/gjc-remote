@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { canonicalJson, canonicalJsonBytes } from '@gjc-remote/shared/strict-json';
 import { buildServiceStatusReceipt } from '@gjc-remote/shared/service-lifecycle-envelope';
-import { EXIT_CODES, runServiceEntrypoint } from '../src/service-entrypoint.js';
+import { REQUEST_LIMITS, serviceReceiptBytes } from '../src/service-cli.js';
+import { EXIT_CODES, readBoundedStdin, runServiceEntrypoint } from '../src/service-entrypoint.js';
 
 const roles = {
   management: { kind: 'uid', value: 'uid:1000' },
@@ -67,6 +68,87 @@ test('oversized stdin is refused before lifecycle construction', async () => {
   assert.equal(constructed, false);
   assert.match(captured.output(), /SERVICE_INVALID/);
 });
+
+for (const [name, chunks] of [
+  ['one chunk', [Buffer.alloc(REQUEST_LIMITS.maxBytes + 1, 'x')]],
+  ['multiple chunks', [Buffer.alloc(REQUEST_LIMITS.maxBytes - 1, 'x'), Buffer.from('x'), Buffer.from('x')]],
+  ['multibyte string chunk', [Buffer.alloc(REQUEST_LIMITS.maxBytes - 1, 'x'), 'é']],
+]) {
+  test(`streamed oversized stdin (${name}) emits one canonical refusal before dispatch`, async () => {
+    const captured = capture();
+    const secret = 'servicePassword=streamed-secret';
+    chunks[0].write(secret);
+    let reads = 0;
+    let closed = false;
+    let authorityReads = 0;
+    const sentinel = new Proxy({}, { get() { authorityReads += 1; throw new Error('authority must not be read'); } });
+    async function* stdin() {
+      try {
+        for (const chunk of chunks) {
+          reads += 1;
+          yield chunk;
+        }
+        throw new Error('oversized stdin must not be drained');
+      } finally {
+        closed = true;
+      }
+    }
+    const result = await runServiceEntrypoint({
+      argv: ['install'], stdin: stdin(), stdout: captured.stream,
+      lifecycle: sentinel, lifecycleOptions: sentinel, platform: 'win32', architecture: 'x64',
+    });
+    const expected = {
+      status: 'refused', operation: 'service', code: 'SERVICE_INVALID',
+      message: 'service request is invalid', writes: 0, ambiguous: false,
+    };
+    assert.equal(result.exitCode, 64);
+    assert.deepEqual(result.receipt, expected);
+    assert.equal(captured.output(), `${canonicalJson(expected)}\n`);
+    assert.equal(captured.output().includes(secret), false);
+    assert.equal(reads, chunks.length);
+    assert.equal(closed, true);
+    assert.equal(authorityReads, 0);
+    assert.throws(() => serviceReceiptBytes({ ...expected, message: 'service operation failed' }), { code: 'SERVICE_INVALID' });
+  });
+}
+
+for (const size of [REQUEST_LIMITS.maxBytes - 1, REQUEST_LIMITS.maxBytes]) {
+  test(`streamed stdin preserves all ${size} bytes at the request boundary`, async () => {
+    const bytes = Buffer.alloc(size, 'x');
+    async function* stdin() {
+      yield bytes.subarray(0, size - 1);
+      yield bytes.subarray(size - 1);
+    }
+    const result = await readBoundedStdin(stdin());
+    assert.deepEqual(result, { bytes, isTTY: false });
+  });
+}
+
+for (const partial of [false, true]) {
+  test(`stdin read error ${partial ? 'after a chunk' : 'before any chunk'} emits a canonical IO refusal`, async () => {
+    const captured = capture();
+    const secret = 'servicePassword=unreadable-secret';
+    let authorityReads = 0;
+    const sentinel = new Proxy({}, { get() { authorityReads += 1; throw new Error('authority must not be read'); } });
+    async function* stdin() {
+      if (partial) yield Buffer.from(secret);
+      throw new Error(secret);
+    }
+    const result = await runServiceEntrypoint({
+      argv: ['install'], stdin: stdin(), stdout: captured.stream,
+      lifecycle: sentinel, lifecycleOptions: sentinel, platform: 'win32', architecture: 'x64',
+    });
+    const expected = {
+      status: 'refused', operation: 'service', code: 'SERVICE_IO_FAILED',
+      message: 'service operation failed', writes: 0, ambiguous: false,
+    };
+    assert.equal(result.exitCode, EXIT_CODES.refused);
+    assert.deepEqual(result.receipt, expected);
+    assert.equal(captured.output(), `${canonicalJson(expected)}\n`);
+    assert.equal(captured.output().includes(secret), false);
+    assert.equal(authorityReads, 0);
+  });
+}
 
 test('invalid request does not construct the lifecycle facade', async () => {
   const captured = capture();

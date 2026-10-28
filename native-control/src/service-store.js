@@ -2978,10 +2978,16 @@ class Session {
     // restored or removed; that does not turn its historical boundary into
     // live process evidence.
     const currentResource = this.readResourceProof('current');
-    const provisionalResource = this.#provisionalMetadata?.resource ?? null;
-    const resource = provisionalResource?.transactionId === transaction.transactionId &&
-      provisionalResource.transactionNonce === transaction.transactionNonce
-      ? provisionalResource
+    const provisional = this.#provisionalMetadata;
+    const useProvisional = provisional !== null &&
+      provisional.resource.transactionId === transaction.transactionId &&
+      provisional.resource.transactionNonce === transaction.transactionNonce;
+    if (useProvisional && (provisional.transactionId !== transaction.transactionId ||
+        !this.#sameRetainedTransactionIdentity(provisional.transactionFingerprint, transaction))) {
+      this.#trialBoundaryFailure(operation);
+    }
+    const resource = useProvisional
+      ? provisional.resource
       : currentResource.present && currentResource.value.transactionId === transaction.transactionId &&
           currentResource.value.transactionNonce === transaction.transactionNonce
         ? currentResource.value
@@ -2993,17 +2999,23 @@ class Session {
         resource.operation !== transaction.operation ||
         resource.applicationManifestFingerprint !== boundary.applicationManifestFingerprint ||
         resource.shawlManifestFingerprint !== transaction.candidate.shawlManifestFingerprint ||
-        resource.platformResourceFingerprint !== boundary.resourceFingerprint ||
+        resource.resourceProof !== transaction.final.resourceProof ||
+        resource.platformResourceFingerprint !== transaction.transition.expectedAfterResourceFingerprint ||
+        resource.rolesFingerprint !== this.#rolesFingerprint ||
         resource.configurationFingerprint !== boundary.effectiveConfigFingerprint ||
         resource.serviceKey !== boundary.serviceKey) {
       this.#trialBoundaryFailure(operation);
     } else {
-      const manifest = this.readManifest('current');
-      if (!manifest.present || manifest.value.serviceGeneration !== transaction.serviceGeneration ||
-          manifest.value.applicationManifestFingerprint !== boundary.applicationManifestFingerprint ||
-          manifest.value.shawlManifestFingerprint !== transaction.candidate.shawlManifestFingerprint ||
-          manifest.value.configurationFingerprint !== boundary.effectiveConfigFingerprint ||
-          manifest.value.resourceProof !== resource.resourceProof) {
+      const manifest = useProvisional ? provisional.manifest : this.readManifest('current').value;
+      if (!manifest) this.#trialBoundaryFailure(operation, 'SERVICE_PENDING');
+      this.#scope(manifest, operation);
+      this.#scopeRoles(manifest, operation);
+      if (manifest.serviceGeneration !== transaction.serviceGeneration ||
+          manifest.applicationManifestFingerprint !== boundary.applicationManifestFingerprint ||
+          manifest.shawlManifestFingerprint !== transaction.candidate.shawlManifestFingerprint ||
+          manifest.configurationFingerprint !== boundary.effectiveConfigFingerprint ||
+          manifest.manifestFingerprint !== transaction.final.manifestFingerprint ||
+          manifest.resourceProof !== resource.resourceProof) {
         this.#trialBoundaryFailure(operation, 'SERVICE_PENDING');
       }
     }
