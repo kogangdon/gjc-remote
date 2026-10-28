@@ -9,7 +9,7 @@ Platform evidence remains scoped to the checks explicitly recorded below.
 | Platform path | Status | Repository artifact/evidence boundary |
 | --- | --- | --- |
 | Linux foreground | Available | Node/Bun process behavior only; not boot-managed |
-| Linux systemd | Approved design path | Source templates are checked in under `native-control/src/systemd/`; no renderer, installer, rendered units, live host deployment, or production boot/readiness evidence |
+| Linux systemd | Source renderer/driver implemented; production qualification incomplete | Source templates are checked in under `native-control/src/systemd/`; `service-linux.js` renders and drives owned units through injected authorities. Direct Linux CLI host composition, signed deployed units and production boot/readiness evidence remain separate gaps |
 | Windows foreground | Available on x64 | Node/Bun process behavior only; not boot-managed |
 | Windows Shawl | Evaluated candidate | v1.9.0 functional checks; unsigned binary and production identity/ACL evidence remain open |
 | Windows `sc.exe` | Documented degraded fallback | No production installer/update/remove script; host evidence remains open |
@@ -153,7 +153,7 @@ For a start, record the UTC boundary, boot identity, stdout/stderr offsets, serv
 
 ## Linux (systemd)
 
-**The source unit templates are checked into `native-control/src/systemd/`.** They are source inputs, not rendered units or a live host deployment; no renderer, installer, or production boot/readiness evidence is shipped. This section is the contract they must satisfy when an authorized operator renders and deploys them: render a bot unit and a true `gjc-remote-daemon@.service` template. The bot uses `User=gjc-bot`, an absolute Node entrypoint, component working directory, and `/etc/gjc-remote/bot.env`. The daemon uses `User=gjc-daemon`, an absolute Bun entrypoint, `/etc/gjc-remote/daemon-%i.env`, a per-instance `HOME`, and `SyslogIdentifier=gjc-remote-daemon-%i`. Render concrete instances and reject placeholders before installation.
+**The source unit templates are checked into `native-control/src/systemd/`.** The renderer and systemd driver exist in `native-control/src/service-linux.js`, alongside the existing lifecycle CLI. These are source implementations, not signed deployed units or production boot/readiness evidence; direct Linux CLI host composition remains incomplete. This section is the contract they must satisfy when an authorized operator renders and deploys them: render a bot unit and a true `gjc-remote-daemon@.service` template. The bot uses `User=gjc-bot`, an absolute Node entrypoint, component working directory, and `/etc/gjc-remote/bot.env`. The daemon uses `User=gjc-daemon`, an absolute Bun entrypoint, `/etc/gjc-remote/daemon-%i.env`, a per-instance `HOME`, and `SyslogIdentifier=gjc-remote-daemon-%i`. Render concrete instances and reject placeholders before installation.
 
 Both units use:
 
@@ -191,6 +191,15 @@ Use the per-service ACL/mode-protected transaction namespace specified in
 2. Compute a versioned, canonical SHA-256 `resourceProof` over secret-free transaction/resource fields.
 3. Persist the envelope in the journal and staged manifest/tombstone before mutation, and in service/unit metadata after publication.
 4. Recompute and compare all copies after every mutation. Only an exact three-way match (journal, manifest/tombstone, queried resource) proves ownership.
+
+The Windows startup receipt's `resourceProof` binds the service resource proof
+declared by `transaction.final.resourceProof`. It must not substitute either
+the trial or final OS-resource configuration fingerprint. Those platform hashes
+retain their separate transition/boundary roles. Correcting the producer's proof
+domain does not relax protected-store admission: the separately observed Windows
+trial-boundary/provisional-metadata mismatch can still block the combined path
+before startup-proof publication. A Linux store test is not Windows integration
+evidence, and neither modeled path establishes real SCM/systemd qualification.
 
 Recovery must be symmetric and idempotent: install must commit only after metadata, manifest, and current-run readiness; update must retain old/new proofs and restore old settings only with an exact old proof; remove must use a proof-bound tombstone and remove only after no-process evidence. Env files, provider credentials, logs, and `.gjc-remote-session` must never be cleanup targets.
 

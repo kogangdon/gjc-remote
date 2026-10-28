@@ -18,10 +18,16 @@ import {
   buildServiceFamilyCursor,
   buildServiceFileCursor,
   buildServiceFinalProof,
+  buildServiceManifest,
   buildServiceOldProof,
   buildServicePlatformState,
+  buildServiceResourceProof,
+  buildServiceStartupProof,
   buildServiceTransaction,
   buildServiceTransitionProof,
+  serviceConfigurationFingerprint,
+  serviceRolesFingerprint,
+  validateServiceStartupProof,
   validateServiceTrialBoundarySuccessor,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import { createServiceStartupObserver } from '../src/service-startup-observer.js';
@@ -299,11 +305,34 @@ class FakeWindowsNative {
 
 function sessionFixture(transaction, references = { present: false, value: null }) {
   const state = { entries: [transaction], proof: null, boundary: null };
+  // This is an independently bound guard double, NOT ServiceStore. The real
+  // store-method tests live in service-store.test.js; no native host is used.
+  const metadata = serviceMetadataFor(transaction);
   return {
     platform: 'win32', architecture: 'x64', component: transaction.component, serviceKey: transaction.serviceKey,
     readJournal: () => ({ entries: [...state.entries], pending: state.pending ?? null }), appendJournal: (entry) => { state.entries.push(entry); },
     readStartupProof: () => state.proof === null ? { present: false, value: null } : { present: true, value: state.proof },
-    publishStartupProof: (proof) => { state.proof = proof; }, readReferences: () => references,
+    publishStartupProof: (proof, prior) => {
+      validateServiceStartupProof(proof);
+      const head = state.entries.at(-1);
+      const boundary = state.boundary;
+      const refuse = (code, reason) => { const error = new Error(reason); Object.assign(error, { code, reason }); throw error; };
+      if ((prior?.present ? prior.value.startupProof : null) !== (state.proof?.startupProof ?? null)) refuse('SERVICE_STALE', 'startup-proof-cas');
+      if (proof.component !== transaction.component || proof.serviceKey !== transaction.serviceKey ||
+          proof.platform !== transaction.platform || proof.architecture !== transaction.architecture ||
+          proof.transactionId !== head.transactionId || proof.serviceGeneration !== head.serviceGeneration ||
+          proof.applicationManifestFingerprint !== metadata.resource.applicationManifestFingerprint ||
+          proof.resourceProof !== metadata.resource.resourceProof ||
+          proof.resourceProof !== head.final.resourceProof) refuse('SERVICE_SCOPE_MISMATCH', 'startup-proof-resource-domain');
+      if (boundary === null || boundary.phase !== 'observed' ||
+          proof.clockKind !== 'windows-boot-tick' ||
+          proof.boundaryFingerprint !== boundary.boundaryFingerprint ||
+          proof.bootFingerprint !== boundary.bootFingerprint ||
+          proof.deadlineTickMs !== boundary.deadlineTickMs ||
+          proof.observedTickMs < boundary.lastTickMs ||
+          proof.observedTickMs > boundary.deadlineTickMs) refuse('SERVICE_SCOPE_MISMATCH', 'startup-proof-boundary');
+      state.proof = proof;
+    }, readReferences: () => references,
     readTrialBoundary: () => state.boundary === null ? { present: false, value: null } : { present: true, value: state.boundary },
     publishTrialBoundary: (boundary, prior) => {
       // Mirror the store CAS: the caller's prior receipt must be the current
@@ -321,6 +350,31 @@ const expectedStateFor = (component) => component === 'bot' ? { expectedHostSetF
 // startup observer to the driver's protected trial observation.
 const observeWith = (component = 'bot') => (trialObservation) => createServiceStartupObserver({ trialObservation, expectedState: expectedStateFor(component) }).observeApplication;
 
+function serviceMetadataFor(transaction) {
+  const { component, serviceKey, architecture, operation, serviceGeneration, transactionId, transactionNonce } = transaction;
+  const configuration = component === 'bot' ? botConfiguration : daemonConfiguration;
+  const configurationFingerprint = serviceConfigurationFingerprint(configuration, { component, platform: 'win32' });
+  const rolesFingerprint = serviceRolesFingerprint(roles, 'win32');
+  const platformState = buildServicePlatformState('win32', 'final');
+  const resource = buildServiceResourceProof({
+    serviceKey, component, platform: 'win32', architecture, operation, serviceGeneration,
+    applicationManifestFingerprint: transaction.candidate.applicationManifestFingerprint,
+    shawlManifestFingerprint: transaction.candidate.shawlManifestFingerprint,
+    configurationFingerprint, rolesFingerprint, transactionId, transactionNonce,
+    predecessorResourceProof: transaction.old.resourceProof,
+    platformResourceFingerprint: transaction.transition.expectedAfterResourceFingerprint, platformState,
+  });
+  const manifest = buildServiceManifest({
+    serviceKey, component, platform: 'win32', architecture, serviceGeneration,
+    applicationManifestFingerprint: resource.applicationManifestFingerprint,
+    shawlManifestFingerprint: resource.shawlManifestFingerprint,
+    predecessorManifestFingerprint: transaction.old.manifestFingerprint,
+    configuration, configurationFingerprint, roles, rolesFingerprint,
+    resourceProof: resource.resourceProof, platformState,
+  });
+  return { resource, manifest };
+}
+
 function transactionFixture({ component = 'bot', serviceKey = 'bot', applicationManifestFingerprint = hex('d'), expectedAfterResourceFingerprint = undefined, shawlManifestFingerprint = shawl.manifestFingerprint } = {}) {
   const old = buildServiceOldProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, 'win32');
   const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint, shawlManifestFingerprint, releaseSequence: 1, releaseTreeFingerprint: hex('e'), compatibilityFingerprint: hex('f') }, 'win32');
@@ -332,14 +386,17 @@ function transactionFixture({ component = 'bot', serviceKey = 'bot', application
   const finalResource = windowsServiceResourceFingerprint(serviceResourceDescriptor(
     component, serviceKey, launch, applicationManifestFingerprint, 'final', configuration));
   const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: null, expectedAfterResourceFingerprint: expectedAfterResourceFingerprint === undefined ? finalResource : expectedAfterResourceFingerprint, platformResourceFingerprint: resource, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
-  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: finalResource, applicationManifestFingerprint, shawlManifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
-  const fields = { transactionId: `tx-${serviceKey.slice(0, 8)}`, transactionNonce: '1'.repeat(32), operation: 'install', component, serviceKey, platform: 'win32', architecture: 'x64', serviceGeneration: 1, old, candidate, transition, final };
+  const identity = { transactionId: `tx-${serviceKey.slice(0, 8)}`, transactionNonce: '1'.repeat(32), operation: 'install', component, serviceKey, platform: 'win32', architecture: 'x64', serviceGeneration: 1, old, candidate, transition };
+  const metadata = serviceMetadataFor(identity);
+  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: metadata.manifest.manifestFingerprint, resourceProof: metadata.resource.resourceProof, applicationManifestFingerprint, shawlManifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
+  const fields = { ...identity, final };
   const prepared = buildServiceTransaction({ ...fields, phase: 'prepared', substep: 'none', previousJournalFingerprint: null });
   return buildServiceTransaction({ ...fields, phase: 'transition-marker-intent', substep: 'observed', previousJournalFingerprint: prepared.transactionFingerprint });
 }
 
 function detachedUninstallTransaction(resourceFingerprint) {
-  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: resourceFingerprint, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
+  const metadata = serviceMetadataFor({ ...transactionFixture(), transition: { expectedAfterResourceFingerprint: resourceFingerprint } });
+  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: metadata.manifest.manifestFingerprint, resourceProof: metadata.resource.resourceProof, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
   const candidate = buildServiceCandidateProof({ disposition: 'none', applicationManifestFingerprint: null, shawlManifestFingerprint: null, releaseSequence: 0, releaseTreeFingerprint: null, compatibilityFingerprint: null }, 'win32');
   const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: resourceFingerprint, expectedAfterResourceFingerprint: null, platformResourceFingerprint: resourceFingerprint, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
   const final = buildServiceFinalProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, 'win32');
@@ -615,6 +672,43 @@ test('startup gate reduces native observer pages and refuses foreign epochs, epo
 
   const n = fixture(); publish(n); const nt = await n.driver.startTrial({});
   await assert.rejects(n.driver.runStartupGate({ trial: nt, observeApplication: () => null }), (e) => e.code === 'SERVICE_INVALID');
+});
+
+test('Windows driver startup output binds the service proof, never either platform configuration hash', async () => {
+  for (const component of ['bot', 'daemon']) {
+    const f = fixture({ component });
+    const metadata = serviceMetadataFor(f.transaction);
+    const trialPlatform = f.transaction.transition.platformResourceFingerprint;
+    const finalPlatform = f.transaction.transition.expectedAfterResourceFingerprint;
+    assert.equal(metadata.resource.platformResourceFingerprint, finalPlatform);
+    assert.equal(f.transaction.final.manifestFingerprint, metadata.manifest.manifestFingerprint);
+    assert.equal(f.transaction.final.resourceProof, metadata.resource.resourceProof);
+    assert.equal(new Set([trialPlatform, finalPlatform, metadata.resource.resourceProof]).size, 3);
+    const entrypointPath = launchFor(component, f.session.serviceKey).entrypointPath;
+    f.driver.publishSuppressedResource({ phase: 'transition-marker-intent', release: release(hex('d'), entrypointPath), expectedCurrentSha256: null });
+    const trial = await f.driver.startTrial({});
+    const proof = await f.driver.runStartupGate({ trial, observeApplication: observeWith(component) });
+    assert.equal(proof.resourceProof, metadata.resource.resourceProof);
+    assert.notEqual(proof.resourceProof, trialPlatform);
+    assert.notEqual(proof.resourceProof, finalPlatform);
+    assert.equal(f.session.state.proof.startupProof, proof.startupProof);
+
+    // Guard-double checks, not real protected-store admission.
+    const prior = f.session.readStartupProof();
+    const proofFields = { ...proof };
+    for (const generated of ['schemaVersion', 'kind', 'startupProof']) delete proofFields[generated];
+    for (const fields of [
+      { resourceProof: trialPlatform }, { resourceProof: finalPlatform },
+      { transactionId: 'tx-foreign' }, { serviceGeneration: proof.serviceGeneration + 1 },
+      { applicationManifestFingerprint: hex('0') }, { boundaryFingerprint: hex('0') },
+      { bootFingerprint: hex('0') },
+    ]) {
+      const forged = buildServiceStartupProof({ ...proofFields, ...fields });
+      assert.throws(() => f.session.publishStartupProof(forged, prior), (error) => error.code === 'SERVICE_SCOPE_MISMATCH');
+      assert.equal(f.session.state.proof.startupProof, proof.startupProof);
+    }
+    assert.throws(() => f.session.publishStartupProof(proof, { present: false, value: null }), (error) => error.code === 'SERVICE_STALE');
+  }
 });
 
 test('fault injection preserves closed error codes and cumulative native writes', () => {
@@ -1019,10 +1113,12 @@ test('recovery binds the old entrypoint when old and candidate entrypoints diffe
   const oldSnapshot = { ...candidateSnapshot, binaryPath: serializeWindowsCommandLine(buildWindowsShawlArgv({ component: 'bot', serviceKey: 'bot', launch: oldLaunch })), description: `gjc-remote:v1:${hex('a')}`, startType: 'demand', failurePolicy: 'none', failureResetPeriod: 0, failureActions: [] };
   const oldResource = windowsServiceResourceFingerprint(asDescriptor(oldSnapshot));
   const finalResource = f.driver.planResource({ phase: 'final', applicationManifestFingerprint: hex('d') }).resourceFingerprint;
-  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: hex('1'), resourceProof: oldResource, applicationManifestFingerprint: hex('a'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
+  const oldMetadata = serviceMetadataFor({ ...transactionFixture({ applicationManifestFingerprint: hex('a') }), transition: { expectedAfterResourceFingerprint: oldResource } });
+  const old = buildServiceOldProof({ disposition: 'stable', manifestFingerprint: oldMetadata.manifest.manifestFingerprint, resourceProof: oldMetadata.resource.resourceProof, applicationManifestFingerprint: hex('a'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 1, activation: 'enabled' }, 'win32');
   const candidate = buildServiceCandidateProof({ disposition: 'release', applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, releaseSequence: 2, releaseTreeFingerprint: hex('e'), compatibilityFingerprint: hex('f') }, 'win32');
   const transition = buildServiceTransitionProof({ oldFingerprint: old.oldFingerprint, candidateFingerprint: candidate.candidateFingerprint, expectedBeforeResourceFingerprint: oldResource, expectedAfterResourceFingerprint: finalResource, platformResourceFingerprint: candidateResource, platformState: buildServicePlatformState('win32', 'trial') }, 'win32');
-  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: hex('2'), resourceProof: finalResource, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 2, activation: 'enabled' }, 'win32');
+  const metadata = serviceMetadataFor({ transactionId: 'tx-update', transactionNonce: '3'.repeat(32), operation: 'update', component: 'bot', serviceKey: 'bot', platform: 'win32', architecture: 'x64', serviceGeneration: 2, old, candidate, transition });
+  const final = buildServiceFinalProof({ disposition: 'stable', manifestFingerprint: metadata.manifest.manifestFingerprint, resourceProof: metadata.resource.resourceProof, applicationManifestFingerprint: hex('d'), shawlManifestFingerprint: shawl.manifestFingerprint, serviceGeneration: 2, activation: 'enabled' }, 'win32');
   const fields = { transactionId: 'tx-update', transactionNonce: '3'.repeat(32), operation: 'update', component: 'bot', serviceKey: 'bot', platform: 'win32', architecture: 'x64', serviceGeneration: 2, old, candidate, transition, final };
   const prepared = buildServiceTransaction({ ...fields, phase: 'prepared', substep: 'none', previousJournalFingerprint: hex('0') });
   f.session.state.entries = [buildServiceTransaction({ ...fields, phase: 'transition-marker-intent', substep: 'observed', previousJournalFingerprint: prepared.transactionFingerprint })];
