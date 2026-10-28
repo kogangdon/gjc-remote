@@ -6,7 +6,9 @@ import {
   buildServiceCursorSet,
   buildServiceFamilyCursor,
   buildServiceFileCursor,
+  buildServiceFinalProof,
   buildServiceLogEvidence,
+  buildServiceOldProof,
   buildServiceStartupProof,
   buildServiceTrialBoundary,
   buildServicePlatformState,
@@ -24,6 +26,41 @@ import {
 } from "../service-lifecycle-envelope.js";
 
 const hash = (character) => character.repeat(64);
+
+for (const platform of ["linux", "win32"]) {
+  test(`${platform} absent old and final proofs require zero generation, null fingerprints, and disabled activation`, () => {
+    const fields = {
+      disposition: "absent", manifestFingerprint: null, resourceProof: null,
+      applicationManifestFingerprint: null, shawlManifestFingerprint: null,
+      serviceGeneration: 0, activation: "disabled-not-startable",
+    };
+    for (const build of [buildServiceOldProof, buildServiceFinalProof]) {
+      assert.equal(build(fields, platform).serviceGeneration, 0);
+      for (const [key, value] of [
+        ["serviceGeneration", 1], ["serviceGeneration", 5],
+        ["manifestFingerprint", hash("1")], ["resourceProof", hash("2")],
+        ["applicationManifestFingerprint", hash("3")], ["shawlManifestFingerprint", hash("4")],
+        ["activation", "enabled"], ["activation", "suppressed-controller-startable"],
+      ]) {
+        assert.throws(() => build({ ...fields, [key]: value }, platform), /absent relation/, `${build.name}: ${key}=${value}`);
+      }
+    }
+  });
+
+  test(`${platform} stable old and final proofs preserve positive generation rather than resetting it`, () => {
+    const fields = {
+      disposition: "stable", manifestFingerprint: hash("1"), resourceProof: hash("2"),
+      applicationManifestFingerprint: hash("3"), shawlManifestFingerprint: platform === "win32" ? hash("4") : null,
+      serviceGeneration: 5, activation: "enabled",
+    };
+    for (const build of [buildServiceOldProof, buildServiceFinalProof]) {
+      assert.equal(build(fields, platform).serviceGeneration, 5);
+      assert.equal(build({ ...fields, serviceGeneration: 6 }, platform).serviceGeneration, 6);
+      assert.throws(() => build({ ...fields, serviceGeneration: 0 }, platform), /stable relation/);
+      assert.throws(() => build({ ...fields, activation: "disabled-not-startable" }, platform), /stable relation/);
+    }
+  });
+}
 
 const physicalIdentity = Object.freeze({
   attributes: 32,

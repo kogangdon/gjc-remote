@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Uninstall absent-final generation repair (issue #273)
+
+- Construct an uninstall's absent final proof with service generation zero,
+  while retaining the incremented generation on its transaction, tombstone and
+  reference record. Stable install/update/rollback final proofs keep their
+  incremented generation; absent-proof validation and ownership/CAS/journal
+  admission remain unchanged.
+- This is a source correction with modeled regression coverage, not evidence
+  of an actual systemd/SCM uninstall or permission to modify installed services,
+  accounts, credentials, ACLs, signed releases or deployment state.
+
 ### Tracked live-input integration (issue #231)
 
 - Integrate active steering/follow-up through official SDK 0.19.0's public
