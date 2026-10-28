@@ -1416,6 +1416,7 @@ function transactionFixture({
   finalManifestFingerprint = hash('1'),
   finalResourceProof = hash('2'),
   platformResourceFingerprint = hash('f'),
+  expectedAfterResourceFingerprint = hash('e'),
 } = {}) {
   const oldProof = old ?? (operation === 'install'
     ? buildServiceOldProof({ disposition: 'absent', manifestFingerprint: null, resourceProof: null, applicationManifestFingerprint: null, shawlManifestFingerprint: null, serviceGeneration: 0, activation: 'disabled-not-startable' }, platform)
@@ -1432,7 +1433,7 @@ function transactionFixture({
     oldFingerprint: oldProof.oldFingerprint,
     candidateFingerprint: candidate.candidateFingerprint,
     expectedBeforeResourceFingerprint: operation === 'install' ? null : hash('d'),
-    expectedAfterResourceFingerprint: hash('e'),
+    expectedAfterResourceFingerprint,
     platformResourceFingerprint,
     platformState: buildServicePlatformState(platform, 'trial'),
   }, platform);
@@ -1781,35 +1782,37 @@ function successorFixture(installed, deploymentManifest, {
   operation = 'update',
   transactionId = `tx-${operation}-${installed.manifest.serviceGeneration + 1}`,
   transactionNonce = operation === 'update' ? '2'.repeat(32) : '3'.repeat(32),
+  shawlManifestFingerprint = installed.manifest.shawlManifestFingerprint,
 } = {}) {
+  const { platform, architecture } = installed.manifest;
   const serviceGeneration = installed.manifest.serviceGeneration + 1;
   const old = buildServiceOldProof({
     disposition: 'stable',
     manifestFingerprint: installed.manifest.manifestFingerprint,
     resourceProof: installed.resource.resourceProof,
     applicationManifestFingerprint: installed.manifest.applicationManifestFingerprint,
-    shawlManifestFingerprint: null,
+    shawlManifestFingerprint: installed.manifest.shawlManifestFingerprint,
     serviceGeneration: installed.manifest.serviceGeneration,
     activation: 'enabled',
-  }, 'linux');
+  }, platform);
   const candidate = buildServiceCandidateProof({
     disposition: 'release',
     applicationManifestFingerprint: deploymentManifest.manifestFingerprint,
-    shawlManifestFingerprint: null,
+    shawlManifestFingerprint,
     releaseSequence: deploymentManifest.releaseSequence,
     releaseTreeFingerprint: deploymentManifest.inventory.treeFingerprint,
     compatibilityFingerprint: canonicalJsonHash(deploymentManifest.compatibility),
-  }, 'linux');
-  const finalState = buildServicePlatformState('linux', 'final');
+  }, platform);
+  const finalState = buildServicePlatformState(platform, 'final');
   const resource = buildServiceResourceProof({
     serviceKey: installed.manifest.serviceKey,
     component: installed.manifest.component,
-    platform: 'linux',
-    architecture: 'x64',
+    platform,
+    architecture,
     operation,
     serviceGeneration,
     applicationManifestFingerprint: deploymentManifest.manifestFingerprint,
-    shawlManifestFingerprint: null,
+    shawlManifestFingerprint,
     configurationFingerprint: installed.manifest.configurationFingerprint,
     rolesFingerprint: installed.manifest.rolesFingerprint,
     transactionId,
@@ -1821,11 +1824,11 @@ function successorFixture(installed, deploymentManifest, {
   const manifest = buildServiceManifest({
     serviceKey: installed.manifest.serviceKey,
     component: installed.manifest.component,
-    platform: 'linux',
-    architecture: 'x64',
+    platform,
+    architecture,
     serviceGeneration,
     applicationManifestFingerprint: deploymentManifest.manifestFingerprint,
-    shawlManifestFingerprint: null,
+    shawlManifestFingerprint,
     predecessorManifestFingerprint: installed.manifest.manifestFingerprint,
     configuration: installed.manifest.configuration,
     configurationFingerprint: installed.manifest.configurationFingerprint,
@@ -1840,25 +1843,25 @@ function successorFixture(installed, deploymentManifest, {
     expectedBeforeResourceFingerprint: installed.resource.platformResourceFingerprint,
     expectedAfterResourceFingerprint: resource.platformResourceFingerprint,
     platformResourceFingerprint: hash(operation === 'update' ? 'e' : 'f'),
-    platformState: buildServicePlatformState('linux', 'trial'),
-  }, 'linux');
+    platformState: buildServicePlatformState(platform, 'trial'),
+  }, platform);
   const final = buildServiceFinalProof({
     disposition: 'stable',
     manifestFingerprint: manifest.manifestFingerprint,
     resourceProof: resource.resourceProof,
     applicationManifestFingerprint: deploymentManifest.manifestFingerprint,
-    shawlManifestFingerprint: null,
+    shawlManifestFingerprint,
     serviceGeneration,
     activation: 'enabled',
-  }, 'linux');
+  }, platform);
   const transaction = buildServiceTransaction({
     transactionId,
     transactionNonce,
     operation,
     component: installed.manifest.component,
     serviceKey: installed.manifest.serviceKey,
-    platform: 'linux',
-    architecture: 'x64',
+    platform,
+    architecture,
     serviceGeneration,
     old,
     candidate,
@@ -2229,7 +2232,8 @@ function publishCommittedWindowsInstallation(
     releaseTreeFingerprint: deploymentManifest.inventory.treeFingerprint,
     finalManifestFingerprint: manifest.manifestFingerprint,
     finalResourceProof: resource.resourceProof,
-    platformResourceFingerprint: resource.platformResourceFingerprint,
+    platformResourceFingerprint: hash('e'),
+    expectedAfterResourceFingerprint: resource.platformResourceFingerprint,
   });
   session.appendJournal(transaction);
   for (const envelope of retainedEnvelopes) {
@@ -6949,22 +6953,47 @@ test('Linux model: actual store admits update/rollback startup service proofs ag
   }
 });
 
-function windowsStartupStoreModel() {
+function windowsStartupStoreModel({ operation = null, prepareOnly = false, currentPair = false } = {}) {
   const fake = new FakeServiceNative('win32');
   const store = bootstrap(fake);
-  const application = applicationManifest({ platform: 'win32' });
+  const application = applicationManifest({
+    platform: 'win32',
+    ...(operation === 'rollback' ? { sequence: 2, version: '2.0.0', archiveHash: hash('5') } : {}),
+  });
   const shawl = shawlManifest();
   const session = store.openMutation();
-  const installed = publishCommittedWindowsInstallation(
+  const predecessor = publishCommittedWindowsInstallation(
     session, application, fake.seedApplicationPublication(application),
     shawl, fake.seedShawlPublication(shawl),
     { transactionId: 'tx-startup-store', transactionNonce: 'c'.repeat(32) },
   );
-  // Reuse the existing boundary model's resource/platform binding, not the
-  // driver's distinct trial/final configuration plans. This is NOT the full
-  // Windows driver -> store seam: that seam currently fails boundary admission
-  // when the final resource record's platform hash differs from the trial hash.
-  const published = nextJournal(installed.committed, 'resource-published', 'observed');
+  const installed = operation === null ? predecessor : successorFixture(
+    predecessor,
+    applicationManifest({
+      platform: 'win32',
+      ...(operation === 'update' ? { sequence: 2, version: '2.0.0', archiveHash: hash('5') } : {}),
+    }),
+    { operation, shawlManifestFingerprint: shawlManifest({ sequence: 2 }).manifestFingerprint },
+  );
+  if (prepareOnly) return { fake, store, session, predecessor, installed };
+  if (operation !== null) {
+    session.appendJournal(installed.transaction);
+    if (currentPair) {
+      session.removeManifest('current', session.readManifest('current'));
+      session.removeResourceProof('current', session.readResourceProof('current'));
+      session.publishResourceProof('current', installed.resource, session.readResourceProof('current'));
+      session.publishManifest('current', installed.manifest, session.readManifest('current'));
+    } else {
+      session.acceptProvisionalMetadata({
+        transaction: installed.transaction,
+        manifest: installed.manifest,
+        resource: installed.resource,
+      });
+    }
+  }
+  // Actual Store with fake native records: distinct trial OS, final OS, and
+  // final service-proof domains, not an integrated Windows driver/SCM run.
+  const published = nextJournal(operation === null ? installed.committed : installed.transaction, 'resource-published', 'observed');
   session.appendJournal(published);
   const captured = trialBoundaryFor(published, installed.resource);
   session.publishTrialBoundary(captured, session.readTrialBoundary());
@@ -6979,8 +7008,227 @@ function windowsStartupStoreModel() {
   session.publishTrialBoundary(boundary, session.readTrialBoundary());
   const transaction = nextJournal(started, 'starting', 'intent');
   session.appendJournal(transaction);
-  return { fake, store, session, installed, transaction, boundary };
+  return { fake, store, session, predecessor, installed, transaction, boundary };
 }
+
+test('Windows boundary model: update/rollback use admitted provisional F without replacing current O', () => {
+  for (const operation of ['update', 'rollback']) {
+    const model = windowsStartupStoreModel({ operation });
+    const { fake, session, predecessor, installed, transaction, boundary } = model;
+    try {
+      assert.equal(transaction.operation, operation);
+      assert.equal(transaction.old.shawlManifestFingerprint, predecessor.manifest.shawlManifestFingerprint);
+      assert.notEqual(transaction.candidate.shawlManifestFingerprint, transaction.old.shawlManifestFingerprint);
+      assert.equal(transaction.candidate.shawlManifestFingerprint, installed.manifest.shawlManifestFingerprint);
+      assert.equal(new Set([
+        transaction.transition.platformResourceFingerprint,
+        installed.resource.platformResourceFingerprint,
+        installed.resource.resourceProof,
+      ]).size, 3);
+      assert.equal(installed.resource.platformResourceFingerprint, transaction.transition.expectedAfterResourceFingerprint);
+      assert.equal(boundary.resourceFingerprint, transaction.transition.platformResourceFingerprint);
+      const oldManifest = canonicalJsonBytes(predecessor.manifest);
+      const oldResource = canonicalJsonBytes(predecessor.resource);
+      assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current.json'), oldManifest);
+      assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current-resource.json'), oldResource);
+      const beforeRead = session.writes;
+      assert.equal(session.readTrialBoundary().value.boundaryFingerprint, boundary.boundaryFingerprint);
+      assert.equal(session.writes, beforeRead);
+      const absent = session.readStartupProof();
+      for (const resourceProof of [transaction.transition.platformResourceFingerprint, transaction.transition.expectedAfterResourceFingerprint]) {
+        expectCode(() => session.publishStartupProof(startupProofFor(transaction, installed.resource, boundary, { resourceProof }), absent), 'SERVICE_SCOPE_MISMATCH');
+        assert.equal(session.writes, beforeRead);
+      }
+      const proof = startupProofFor(transaction, installed.resource, boundary);
+      assert.equal(session.publishStartupProof(proof, absent).value.resourceProof, transaction.final.resourceProof);
+      assert.equal(session.readStartupProof().value.startupProof, proof.startupProof);
+      const after = session.writes;
+      expectCode(() => session.removeTrialBoundary(session.readTrialBoundary()), 'SERVICE_PENDING');
+      assert.equal(session.writes, after);
+      assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current.json'), oldManifest);
+      assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current-resource.json'), oldResource);
+    } finally {
+      session.close();
+    }
+  }
+});
+
+test('Windows boundary model: exact current successor F reopens without provisional memory', () => {
+  const { fake, store, session, installed, transaction, boundary } = windowsStartupStoreModel({ operation: 'update', currentPair: true });
+  session.close();
+  const before = fake.totalWrites;
+  const readOnly = store.openReadOnly();
+  assert.equal(readOnly.readTrialBoundary().value.boundaryFingerprint, boundary.boundaryFingerprint);
+  assert.equal(readOnly.readManifest('current').value.manifestFingerprint, transaction.final.manifestFingerprint);
+  assert.equal(readOnly.readResourceProof('current').value.resourceProof, transaction.final.resourceProof);
+  assert.equal(readOnly.writes, 0);
+  readOnly.close();
+  assert.equal(fake.totalWrites, before);
+  const recovery = store.openRecovery();
+  try {
+    const proof = startupProofFor(transaction, installed.resource, boundary);
+    assert.equal(recovery.publishStartupProof(proof, recovery.readStartupProof()).value.startupProof, proof.startupProof);
+  } finally {
+    recovery.close();
+  }
+});
+
+test('Windows boundary model: boundary cannot substitute either final hash for the trial OS hash', () => {
+  const { session, installed } = windowsStartupStoreModel({ operation: 'update', prepareOnly: true });
+  const { transaction, manifest, resource } = installed;
+  try {
+    session.appendJournal(transaction);
+    session.acceptProvisionalMetadata({ transaction, manifest, resource });
+    const published = nextJournal(transaction, 'resource-published', 'observed');
+    session.appendJournal(published);
+    const absent = session.readTrialBoundary();
+    const before = session.writes;
+    for (const resourceFingerprint of [resource.platformResourceFingerprint, resource.resourceProof]) {
+      const badBoundary = trialBoundaryFor(published, resource, { resourceFingerprint });
+      expectCode(() => session.publishTrialBoundary(badBoundary, absent), 'SERVICE_SCOPE_MISMATCH');
+      assert.equal(session.writes, before);
+      assert.equal(session.readTrialBoundary().present, false);
+    }
+    session.publishTrialBoundary(trialBoundaryFor(published, resource), absent);
+  } finally {
+    session.close();
+  }
+});
+
+test('Windows boundary model: canonical provisional F cannot bypass final OS, labels, Shawl, or roles', () => {
+  for (const defect of ['final-os', 'transaction-id', 'transaction-nonce', 'shawl', 'resource-role', 'manifest-role', 'both-roles']) {
+    const { fake, session, predecessor, installed } = windowsStartupStoreModel({ operation: 'update', prepareOnly: true });
+    const substitutedRoles = {
+      ...windowsRoles,
+      bot: { kind: 'sid', value: 'S-1-5-21-22' },
+    };
+    const rolesFingerprint = serviceRolesFingerprint(substitutedRoles, 'win32');
+    const resource = buildServiceResourceProof({
+      ...installed.resource,
+      ...(defect === 'final-os' ? { platformResourceFingerprint: hash('0') } : {}),
+      ...(defect === 'transaction-id' ? { transactionId: 'tx-foreign' } : {}),
+      ...(defect === 'transaction-nonce' ? { transactionNonce: '0'.repeat(32) } : {}),
+      ...(defect === 'shawl' ? { shawlManifestFingerprint: hash('0') } : {}),
+      ...(['resource-role', 'both-roles'].includes(defect) ? { rolesFingerprint } : {}),
+    });
+    const manifest = buildServiceManifest({
+      ...installed.manifest,
+      resourceProof: resource.resourceProof,
+      ...(defect === 'shawl' ? { shawlManifestFingerprint: resource.shawlManifestFingerprint } : {}),
+      ...(['manifest-role', 'both-roles'].includes(defect) ? { roles: substitutedRoles, rolesFingerprint } : {}),
+    });
+    // Rebuild all self-hashes and the admitted final relation: rejection must
+    // come from boundary binding, not stale JSON fingerprints or admission.
+    const transaction = buildServiceTransaction({
+      ...installed.transaction,
+      final: buildServiceFinalProof({
+        ...installed.transaction.final,
+        resourceProof: resource.resourceProof,
+        manifestFingerprint: manifest.manifestFingerprint,
+      }, 'win32'),
+    });
+    try {
+      session.appendJournal(transaction);
+      const beforeAdmission = session.writes;
+      session.acceptProvisionalMetadata({ transaction, manifest, resource });
+      assert.equal(session.writes, beforeAdmission);
+      const published = nextJournal(transaction, 'resource-published', 'observed');
+      session.appendJournal(published);
+      const absent = session.readTrialBoundary();
+      const before = session.writes;
+      const nativeBefore = fake.totalWrites;
+      const code = ['transaction-id', 'transaction-nonce'].includes(defect) ? 'SERVICE_PENDING' : 'SERVICE_SCOPE_MISMATCH';
+      expectCode(() => session.publishTrialBoundary(trialBoundaryFor(published, resource), absent), code);
+      assert.equal(session.writes, before, defect);
+      assert.equal(fake.totalWrites, nativeBefore, defect);
+      assert.equal(session.readTrialBoundary().present, false);
+      assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current.json'), canonicalJsonBytes(predecessor.manifest));
+      assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current-resource.json'), canonicalJsonBytes(predecessor.resource));
+    } finally {
+      session.close();
+    }
+  }
+});
+
+test('Windows boundary model: selected bad current F never falls back to historical absence', () => {
+  for (const phase of ['starting', 'quiescent']) {
+    for (const defect of ['final-os', 'final-proof', 'final-manifest', 'mixed-manifest', 'missing-manifest']) {
+      const { fake, session, predecessor, installed, transaction } = windowsStartupStoreModel({ operation: 'update', currentPair: true });
+      try {
+        if (phase === 'quiescent') session.appendJournal(nextJournal(transaction, 'quiescent', 'observed'));
+        let resource = installed.resource;
+        let manifest = installed.manifest;
+        if (['final-os', 'final-proof'].includes(defect)) {
+          resource = buildServiceResourceProof({
+            ...resource,
+            ...(defect === 'final-os' ? { platformResourceFingerprint: hash('0') } : { predecessorResourceProof: hash('0') }),
+          });
+          manifest = buildServiceManifest({ ...manifest, resourceProof: resource.resourceProof });
+        } else if (defect === 'final-manifest') {
+          manifest = buildServiceManifest({ ...manifest, predecessorManifestFingerprint: hash('0') });
+        } else if (defect === 'mixed-manifest') {
+          manifest = predecessor.manifest;
+        }
+        fake.putRaw('manifest', 'bot', 'current-resource.json', canonicalJsonBytes(resource));
+        if (defect === 'missing-manifest') fake.deleteRecord('manifest', 'bot', 'current.json');
+        else fake.putRaw('manifest', 'bot', 'current.json', canonicalJsonBytes(manifest));
+        const before = session.writes;
+        const nativeBefore = fake.totalWrites;
+        const code = ['final-os', 'final-proof'].includes(defect) ? 'SERVICE_SCOPE_MISMATCH' : 'SERVICE_PENDING';
+        expectCode(() => session.readTrialBoundary(), code);
+        assert.equal(session.writes, before, `${phase}/${defect}`);
+        assert.equal(fake.totalWrites, nativeBefore, `${phase}/${defect}`);
+      } finally {
+        session.close();
+      }
+    }
+  }
+});
+
+test('Windows boundary model: reopening pending O-only metadata does not reconstruct provisional F', () => {
+  const { fake, store, session, predecessor } = windowsStartupStoreModel({ operation: 'update' });
+  session.close();
+  const before = fake.totalWrites;
+  expectCode(() => store.openReadOnly(), 'SERVICE_MANUAL_CLEANUP');
+  expectCode(() => store.openRecovery(), 'SERVICE_MANUAL_CLEANUP');
+  assert.equal(fake.totalWrites, before);
+  assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current.json'), canonicalJsonBytes(predecessor.manifest));
+  assert.deepEqual(fake.recordBytes('manifest', 'bot', 'current-resource.json'), canonicalJsonBytes(predecessor.resource));
+});
+
+test('Windows boundary model: quiescent O-only history remains readable but cannot increment attempts', () => {
+  const { fake, store, session, transaction, boundary, installed } = windowsStartupStoreModel({ operation: 'rollback' });
+  session.appendJournal(nextJournal(transaction, 'quiescent', 'observed'));
+  session.close();
+  const before = fake.totalWrites;
+  const readOnly = store.openReadOnly();
+  assert.equal(readOnly.readTrialBoundary().value.boundaryFingerprint, boundary.boundaryFingerprint);
+  assert.equal(readOnly.writes, 0);
+  readOnly.close();
+  const recovery = store.openRecovery();
+  try {
+    const expected = recovery.readTrialBoundary();
+    const retry = trialBoundaryFor(transaction, installed.resource, {
+      ...boundary,
+      attempt: 2,
+      revision: boundary.revision + 1,
+      previousBoundaryFingerprint: boundary.boundaryFingerprint,
+      phase: 'captured',
+      startTickMs: 6_000,
+      lastTickMs: 6_000,
+      wrapperEpochFingerprint: null,
+      childEpochFingerprint: null,
+      childCursor: null,
+    });
+    const writes = recovery.writes;
+    expectCode(() => recovery.publishTrialBoundary(retry, expected), 'SERVICE_PENDING');
+    assert.equal(recovery.writes, writes);
+    assert.equal(recovery.readTrialBoundary().value.boundaryFingerprint, boundary.boundaryFingerprint);
+    assert.equal(fake.totalWrites, before);
+  } finally {
+    recovery.close();
+  }
+});
 
 test('Windows boundary model: actual recovery store requires the exact final service proof and boundary', () => {
   const model = windowsStartupStoreModel();
