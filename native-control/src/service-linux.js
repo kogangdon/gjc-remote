@@ -2738,7 +2738,9 @@ export function createLinuxServiceDriver(options) {
     /**
      * Read-only OS observation: native object snapshots, manager state, boot
      * identity, derived platform state, and the resource fingerprint. No
-     * writes, no journal appends.
+     * writes, no journal appends. platformPhase describes configuration and
+     * activation, not liveness; manager ActiveState/SubState/MainPID carry
+     * the runtime observation. Object file bytes remain native Buffers.
      */
     probe() {
       const latest = journalState().latest;
