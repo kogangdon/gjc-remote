@@ -21,6 +21,7 @@ import {
   validateServiceLifecycleRequest,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import { canonicalJsonHash } from '@gjc-remote/shared/strict-json';
+import { recordServiceCleanupOutcomeInternal } from './service-store.js';
 
 const MUTATIONS = new Set(['install', 'update', 'rollback', 'uninstall']);
 const MANUAL_REASONS = new Set([
@@ -56,7 +57,16 @@ async function requiredAsync(object, name, operation, ...args) {
 }
 function writesOf(session, driver) {
   return (Number.isSafeInteger(session?.writes) ? session.writes : 0) +
-    (Number.isSafeInteger(driver?.writes) ? driver.writes : 0);
+    (driver !== session && Number.isSafeInteger(driver?.writes) ? driver.writes : 0);
+}
+async function settleLifecycleCleanup(subject, session, acquisition, primary, operation, driver) {
+  const failures = [];
+  try { await acquisition?.close?.(); } catch (error) { failures.push(error); }
+  try { required(session, 'close', 'close_service_store'); } catch (error) { failures.push(error); }
+  recordServiceCleanupOutcomeInternal(subject, primary.hasPrimary, primary.value, failures, session, writesOf(session, driver));
+  if (!primary.hasPrimary && failures.length !== 0) {
+    fail('SERVICE_MANUAL_CLEANUP', operation, writesOf(session, driver));
+  }
 }
 function nonce() { return randomBytes(16).toString('hex'); }
 function validHash(v) { return typeof v === 'string' && HEX.test(v); }
@@ -774,6 +784,7 @@ export class ServiceLifecycle {
     try { validateServiceLifecycleRequest(operation, request, { platform, architecture }); } catch (error) { fail('SERVICE_INVALID', operation, 0, error); }
     this.#preflight(operation, request);
     const session = this.#openMutation(operation, request, platform); let driver = null; let acquisition = null; let tx = null;
+    const primary = { hasPrimary: false, value: undefined };
     try {
       if (!session || session.component !== request.target.component || session.platform !== platform || session.architecture !== architecture || session.serviceKey !== serviceKeyForTarget(request.target)) fail('SERVICE_SCOPE_MISMATCH', 'open_service_store');
       const current = required(session, 'readManifest', 'read_manifest', 'current');
@@ -1053,6 +1064,7 @@ export class ServiceLifecycle {
       this.#append(session, tx, 'committed', 'observed');
       return Object.freeze({ operation, transactionId: tx.transactionId, transactionFingerprint: tx.transactionFingerprint, serviceGeneration: generation, writes: writesOf(session, driver) });
     } catch (error) {
+      try {
       const errorCode = safeErrorCode(error);
       if (tx && (safeErrorAmbiguous(error) || errorCode === 'SERVICE_MANUAL_CLEANUP' || errorCode === 'SERVICE_SCOPE_MISMATCH' || errorCode === 'SERVICE_STALE')) await this.#persistManual(session, tx, operation, error, driver);
       if (error?.name === 'ServiceLifecycleError') throw error;
@@ -1065,7 +1077,11 @@ export class ServiceLifecycle {
       if (ambiguous !== null) wrapped.ambiguous = ambiguous;
       Object.defineProperty(wrapped, 'cause', { value: error });
       throw wrapped;
-    } finally { try { await acquisition?.close?.(); } finally { required(session, 'close', 'close_service_store'); } }
+      } catch (delivered) {
+        primary.hasPrimary = true; primary.value = delivered;
+        throw delivered;
+      }
+    } finally { await settleLifecycleCleanup(this, session, acquisition, primary, operation, driver); }
   }
   async install(request) { return this.#mutate('install', request); }
   async update(request) { return this.#mutate('update', request); }
@@ -1076,6 +1092,7 @@ export class ServiceLifecycle {
     try { validateServiceLifecycleRequest('status', request, { platform, architecture }); } catch (error) { fail('SERVICE_INVALID', 'status', 0, error); }
     this.#preflight('status', request); const session = this.#open('read-only', request);
     if (session === null) {
+      recordServiceCleanupOutcomeInternal(this, false, undefined, [], this.#options.store);
       return Object.freeze({
         ...buildServiceStatusReceipt({
           component: request.target.component,
@@ -1092,7 +1109,7 @@ export class ServiceLifecycle {
         writes: 0,
       });
     }
-    let hasPrimary = false;
+    let hasPrimary = false; let primary; let driver = null;
     try {
       if (session.component !== request.target.component || session.platform !== platform || session.architecture !== architecture || session.serviceKey !== serviceKeyForTarget(request.target)) fail('SERVICE_SCOPE_MISMATCH', 'status');
       const manifest = required(session, 'readManifest', 'read_manifest', 'current');
@@ -1132,7 +1149,7 @@ export class ServiceLifecycle {
       const statusRequest = persistedConfiguration && !request.configuration
         ? { ...request, configuration: persistedConfiguration }
         : request;
-      const driver = await this.#driver(session, statusRequest, statusRelease);
+      driver = await this.#driver(session, statusRequest, statusRelease);
       // Pin the first byte/identity evidence before awaiting another probe:
       // Buffer-bearing native snapshots are not themselves deeply immutable.
       const firstFingerprint = statusProbeFingerprint(await requiredAsync(driver, 'probe', 'probe_status'), platform);
@@ -1148,11 +1165,19 @@ export class ServiceLifecycle {
         : second?.ownership === 'owned' ? { ...second, ownership: 'ambiguous' } : second;
       return statusFromProbe(evidenceProbe, currentManifest, resource.present ? resource.value : { resourceProof: null }, platform, architecture, this.#options.clock?.() ?? Date.now(), recovery, pending ? (journal.pending ?? latest) : null, startup);
     } catch (error) {
-      hasPrimary = true;
+      hasPrimary = true; primary = error;
       throw error;
     } finally {
-      try { required(session, 'close', 'close_service_store'); } catch {
-        if (!hasPrimary) fail('SERVICE_MANUAL_CLEANUP', 'status', writesOf(session));
+      let cleanupFailed = false; let cleanupError;
+      try { required(session, 'close', 'close_service_store'); } catch (error) {
+        cleanupFailed = true; cleanupError = error;
+      }
+      recordServiceCleanupOutcomeInternal(this, hasPrimary, primary, cleanupFailed ? [cleanupError] : [], session, writesOf(session, driver));
+      if (!hasPrimary) {
+        if (cleanupFailed) fail('SERVICE_MANUAL_CLEANUP', 'status', writesOf(session, driver));
+        // Status may never return its prepared zero-write receipt after a
+        // store/driver (including cleanup) actually recorded protected writes.
+        if (writesOf(session, driver) !== 0) fail('SERVICE_MANUAL_CLEANUP', 'status', writesOf(session, driver));
       }
     }
   }
@@ -1160,6 +1185,7 @@ export class ServiceLifecycle {
     const platform = this.#platform(request); const architecture = this.#architecture(request);
     try { validateServiceLifecycleRequest('recover', request, { platform, architecture }); } catch (error) { fail('SERVICE_INVALID', 'recover', 0, error); }
     this.#preflight('recover', request); const session = this.#open('recovery', request); let driver = null; let replayAcquisition = null; let classified = false;
+    const primary = { hasPrimary: false, value: undefined };
     try {
       const journal = required(session, 'readJournal', 'read_service_journal'); const head = journal.entries.at(-1); if (!head || head.transactionId !== request.expected.transactionId || head.transactionFingerprint !== request.expected.journalFingerprint) fail('SERVICE_STALE', 'recover');
       if (journal.pending !== null && journal.pending !== undefined && !same(journal.pending, head)) fail('SERVICE_PENDING', 'recover');
@@ -1593,6 +1619,7 @@ export class ServiceLifecycle {
       }
       fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
     } catch (error) {
+      try {
       if (!classified || error?.name === 'ServiceLifecycleError') throw error;
       const sanitized = new Error('recover failed');
       sanitized.name = 'ServiceLifecycleError';
@@ -1601,7 +1628,11 @@ export class ServiceLifecycle {
       sanitized.writes = writesOf(session, driver);
       if (sanitized.code === 'SERVICE_MANUAL_CLEANUP') sanitized.ambiguous = true;
       throw sanitized;
-    } finally { try { await replayAcquisition?.close?.(); } finally { required(session, 'close', 'close_service_store'); } }
+      } catch (delivered) {
+        primary.hasPrimary = true; primary.value = delivered;
+        throw delivered;
+      }
+    } finally { await settleLifecycleCleanup(this, session, replayAcquisition, primary, 'recover', driver); }
   }
   async run(operation, request) { if (!SERVICE_OPERATIONS.includes(operation)) fail('SERVICE_INVALID', operation); return this[operation](request); }
 }
