@@ -277,6 +277,27 @@ test('status does not promote persisted startup proof when the live service is s
   assert.equal(receipt.startupEvidence, 'historical-current-epoch');
 });
 
+for (const platformPhase of ['final', 'trial', 'final-restart-armed']) {
+  test(`Linux status does not infer runtime from configuration-only phase ${platformPhase}`, async () => {
+    const fixture = readOnlyFixture();
+    fixture.session.readJournal = () => ({ entries: [{ phase: 'committed' }], pending: null });
+    const lifecycle = createServiceLifecycle({
+      platform: 'linux', architecture: 'x64', store: fixture.store,
+      driver: { probe: () => ({ platformPhase }) },
+    });
+    const result = await runServiceCli({
+      argv: ['status'], input: canonicalJsonBytes({ schemaVersion: 1, target: { component: 'bot' }, roles }),
+      platform: 'linux', architecture: 'x64', lifecycle,
+    });
+    assert.equal(result.status, 'ok');
+    assert.equal(result.receipt.service, 'unknown');
+    assert.equal(result.receipt.ownership, 'foreign');
+    assert.equal(result.receipt.recovery, 'manual-cleanup');
+    assert.equal(result.writes, 0);
+    assert.deepEqual(JSON.parse(serviceReceiptBytes(result).toString('utf8')), result);
+  });
+}
+
 test('rollback refuses before driver construction when retained publication authority is unavailable', async () => {
   const calls = [];
   const currentManifestFingerprint = '4'.repeat(64);
@@ -2000,3 +2021,76 @@ test('windows status authenticates the SCM resource fingerprint, never a Linux b
     (error) => error.code === 'SERVICE_PENDING',
   );
 });
+
+for (const primaryFails of [false, true]) {
+  test(`status preserves primary failure when close fails: ${primaryFails}`, async () => {
+    const fixture = readOnlyFixture();
+    const primary = new Error('primary read failure');
+    const cleanup = new Error('close failure');
+    let closes = 0;
+    if (primaryFails) fixture.session.readManifest = () => { throw primary; };
+    fixture.session.close = () => { closes += 1; throw cleanup; };
+    const lifecycle = createServiceLifecycle({ platform: 'linux', architecture: 'x64', store: fixture.store });
+    await assert.rejects(lifecycle.status({ schemaVersion: 1, target: { component: 'bot' }, roles }), error => primaryFails
+      ? error === primary
+      : error.name === 'ServiceLifecycleError' && error.code === 'SERVICE_MANUAL_CLEANUP' && error.writes === 0);
+    assert.equal(closes, 1);
+    assert.equal(fixture.session.writes, 0);
+  });
+}
+
+for (const value of [undefined, null, false, 0, '']) {
+  for (const primaryFails of [false, true]) {
+    test(`status preserves exact falsy rejection ${String(value)}, primary=${primaryFails}`, async () => {
+      const fixture = readOnlyFixture();
+      let closes = 0;
+      if (primaryFails) fixture.session.readManifest = () => { throw value; };
+      fixture.session.close = () => {
+        closes += 1;
+        throw primaryFails ? new Error('secondary close failure') : value;
+      };
+      const lifecycle = createServiceLifecycle({ platform: 'linux', architecture: 'x64', store: fixture.store });
+      let rejected = false;
+      await lifecycle.status({ schemaVersion: 1, target: { component: 'bot' }, roles }).then(
+        () => assert.fail('status must reject'),
+        error => {
+          rejected = true;
+          if (primaryFails) assert.strictEqual(error, value);
+          else assert.equal(error.code, 'SERVICE_MANUAL_CLEANUP');
+        },
+      );
+      assert.equal(rejected, true);
+      assert.equal(closes, 1);
+      assert.equal(fixture.session.writes, 0);
+    });
+  }
+}
+
+for (const failProbe of [0, 1, 2]) {
+  test(`status cleanup preserves awaited probe outcome, failing probe=${failProbe}`, async () => {
+    const fixture = readOnlyFixture();
+    fixture.session.readJournal = () => ({ entries: [{ phase: 'committed' }], pending: null });
+    const primary = new Error('asynchronous probe failure');
+    const cleanup = new Error('close failure');
+    let probes = 0;
+    let closes = 0;
+    fixture.session.close = () => { closes += 1; throw cleanup; };
+    const lifecycle = createServiceLifecycle({
+      platform: 'linux', architecture: 'x64', store: fixture.store,
+      driver: { probe: async () => {
+        probes += 1;
+        await Promise.resolve();
+        if (probes === failProbe) throw primary;
+        return { platformPhase: 'absent' };
+      } },
+    });
+    await assert.rejects(
+      lifecycle.status({ schemaVersion: 1, target: { component: 'bot' }, roles }),
+      error => failProbe ? error === primary
+        : error.name === 'ServiceLifecycleError' && error.code === 'SERVICE_MANUAL_CLEANUP' && error.writes === 0,
+    );
+    assert.equal(probes, failProbe || 2);
+    assert.equal(closes, 1);
+    assert.equal(fixture.session.writes, 0);
+  });
+}

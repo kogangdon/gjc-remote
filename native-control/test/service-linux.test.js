@@ -8,7 +8,12 @@ import {
   buildServicePlatformState,
   buildServiceTransaction,
   buildServiceTransitionProof,
+  serviceKeyForTarget,
+  serviceRolesFingerprint,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
+import { createServiceLifecycle } from '../src/service-lifecycle.js';
+import { runServiceCli, serviceReceiptBytes } from '../src/service-cli.js';
+import { canonicalJsonBytes } from '@gjc-remote/shared/strict-json';
 import {
   createLinuxServiceDriver,
   linuxDaemonTemplateFingerprint,
@@ -366,6 +371,228 @@ function driverFixture(options = {}) {
   const session = options.sessionObject ?? sessionFixture(transaction, options.session);
   const driver = createLinuxServiceDriver({ native: native.facade, session, locks: { artifact: {}, sharedTemplate: {}, serviceKey: {} }, invoke: native.invoke.bind(native), roles, configuration, clock: () => baseClock, sleep: async () => {}, templates: options.templates ?? fakeTemplates() });
   return { driver, native, session, transaction, configuration };
+}
+
+function linuxStatusFixture(options = {}) {
+  const target = options.component === 'daemon' ? { component: 'daemon', hostId: 'status-host' } : { component: 'bot' };
+  const fixture = driverFixture({ ...options, serviceKey: serviceKeyForTarget(target) });
+  const { native, session, driver, transaction, configuration } = fixture;
+  const component = session.component;
+  const input = { configuration, entrypointPath: release().entrypointPath, restart: 'on-failure', releaseFingerprint: hex('a') };
+  if (component === 'bot') {
+    native.mapFor().set('bot-unit', { state: 'file', bytes: renderLinuxBotUnit(fakeTemplates(), input) });
+  } else {
+    native.mapFor('__shared__').set('daemon-template', { state: 'file', bytes: fakeTemplates().daemonTemplate });
+    native.mapFor().set('daemon-dropin-directory', { state: 'directory' });
+    native.mapFor().set('daemon-dropin', { state: 'file', bytes: renderLinuxDaemonDropin(input) });
+  }
+  native.mapFor('__shared__').set('enablement-directory', { state: 'directory' });
+  native.mapFor().set('enablement-link', {
+    state: 'symlink',
+    target: component === 'bot' ? '/etc/systemd/system/gjc-remote-bot.service' : '/etc/systemd/system/gjc-remote-daemon@.service',
+  });
+  session.state.entries = [buildServiceTransaction({ ...transaction, phase: 'committed', substep: 'observed', previousJournalFingerprint: transaction.transactionFingerprint })];
+  const baseline = driver.probe();
+  assert.equal(baseline.platformPhase, 'final');
+  assert.strictEqual(Object.getPrototypeOf(baseline.manager), null);
+  assert.throws(() => canonicalJsonBytes(baseline.manager), /JSON objects must be plain objects/);
+  const manifest = {
+    component, serviceKey: session.serviceKey, serviceGeneration: 1,
+    manifestFingerprint: hex('1'), resourceProof: hex('2'), applicationManifestFingerprint: hex('a'),
+    configuration, roles, rolesFingerprint: serviceRolesFingerprint(roles, 'linux'),
+  };
+  session.writes = 0;
+  session.readManifest = () => ({ present: true, value: manifest });
+  session.readResourceProof = () => ({ present: true, value: { resourceProof: manifest.resourceProof, platformResourceFingerprint: baseline.resourceFingerprint } });
+  session.readManualCleanup = () => ({ present: false, value: null });
+  let closes = 0;
+  session.close = () => { closes += 1; };
+  native.calls.length = 0;
+  native.managerProbeCount = 0;
+  const lifecycle = createServiceLifecycle({ platform: 'linux', architecture: 'x64', store: { openReadOnly: () => session }, driver, clock: () => baseClock });
+  const request = { schemaVersion: 1, target, roles };
+  return { ...fixture, baseline, lifecycle, request, closes: () => closes };
+}
+
+async function publicLinuxStatus(fixture, driver = fixture.driver) {
+  const lifecycle = driver === fixture.driver ? fixture.lifecycle : createServiceLifecycle({
+    platform: 'linux', architecture: 'x64', store: { openReadOnly: () => fixture.session }, driver, clock: () => baseClock,
+  });
+  const result = await runServiceCli({
+    argv: ['status'], input: canonicalJsonBytes(fixture.request), lifecycle,
+    platform: 'linux', architecture: 'x64',
+  });
+  assert.deepEqual(JSON.parse(serviceReceiptBytes(result).toString('utf8')), result);
+  assert.equal(fixture.native.writes, 0);
+  assert.equal(fixture.driver.writes, 0);
+  assert.equal(fixture.session.writes, 0);
+  assert.equal(fixture.native.managerProbeCount, 2);
+  assert.equal(fixture.closes(), 1);
+  assert.equal(fixture.native.calls.filter((call) => call[0] === 'invoke').every((call) => call[2] === 'show'), true);
+  assert.equal(fixture.native.calls.filter((call) => call[0] === 'open_linux_service_scope').every((call) => call[2] === 'read-existing'), true);
+  return result;
+}
+
+for (const component of ['bot', 'daemon']) {
+  for (const running of [false, true]) {
+    test(`Linux ${component} status compares real Buffer snapshots and distinguishes enabled from running: ${running}`, async () => {
+      const fixture = linuxStatusFixture({ component });
+      if (running) fixture.native.process = { pid: 4001, invocation: '1'.repeat(32), startTime: 'fake-start-1', treeFingerprint: hex('2') };
+      const file = component === 'bot' ? fixture.baseline.objects.botUnit : fixture.baseline.objects.dropin;
+      assert.equal(Buffer.isBuffer(file.bytes), true);
+      const next = fixture.driver.probe();
+      const nextFile = component === 'bot' ? next.objects.botUnit : next.objects.dropin;
+      assert.notStrictEqual(file.bytes, nextFile.bytes);
+      assert.equal(file.bytes.equals(nextFile.bytes), true);
+      fixture.native.calls.length = 0;
+      fixture.native.managerProbeCount = 0;
+      const result = await publicLinuxStatus(fixture);
+      assert.equal(result.status, 'ok');
+      assert.equal(result.receipt.ownership, 'owned');
+      assert.equal(result.receipt.service, running ? 'running' : 'stopped');
+      assert.equal(result.receipt.activation, 'enabled');
+      assert.equal(result.receipt.tree, 'unknown');
+      assert.equal(result.receipt.startupEvidence, 'unavailable');
+      assert.equal(Object.hasOwn(result.receipt, 'objects'), false);
+      assert.equal(Object.hasOwn(result.receipt, 'manager'), false);
+    });
+  }
+}
+
+for (const evidence of ['bytes', 'parentIdentity', 'containerIdentity', 'facts', 'link-target', 'bootId', 'invocation', 'manager-policy']) {
+  test(`Linux status refuses changed ${evidence} in real driver observations`, async () => {
+    const fixture = linuxStatusFixture();
+    let probes = 0;
+    const driver = { probe() {
+      const observation = fixture.driver.probe();
+      if (++probes !== 2) return observation;
+      if (evidence === 'bootId') return { ...observation, bootId: 'linux:00000000-0000-0000-0000-000000000002' };
+      if (evidence === 'invocation') return { ...observation, manager: { ...observation.manager, InvocationID: '2'.repeat(32) } };
+      if (evidence === 'manager-policy') return { ...observation, manager: { ...observation.manager, Description: 'changed manager policy' } };
+      if (evidence === 'link-target') return { ...observation, objects: { ...observation.objects, enablementLink: { ...observation.objects.enablementLink, target: '/foreign.service' } } };
+      const file = observation.objects.botUnit;
+      // Keep the descriptor/facts hashes fixed: raw byte evidence must also
+      // participate in comparison, not just its driver-reported digest.
+      if (evidence === 'bytes') file.bytes[0] ^= 0xff;
+      else return { ...observation, objects: { ...observation.objects, botUnit: { ...file, [evidence]: { ...file[evidence], inode: '999999999' } } } };
+      return observation;
+    } };
+    const result = await publicLinuxStatus(fixture, driver);
+    assert.equal(result.status, 'refused');
+    assert.equal(result.code, 'SERVICE_PENDING');
+    assert.equal(result.writes, 0);
+    assert.equal(result.ambiguous, false);
+  });
+}
+
+test('Linux status pins the first native Buffer before the next probe can mutate it', async () => {
+  const fixture = linuxStatusFixture();
+  const observation = fixture.baseline;
+  let probes = 0;
+  const driver = { probe() {
+    fixture.driver.probe();
+    if (++probes === 2) observation.objects.botUnit.bytes[0] ^= 0xff;
+    return observation;
+  } };
+  const result = await publicLinuxStatus(fixture, driver);
+  assert.equal(result.status, 'refused');
+  assert.equal(result.code, 'SERVICE_PENDING');
+});
+
+for (const [label, manager] of [
+  ['activating', { ActiveState: 'activating', SubState: 'start', MainPID: '0' }],
+  ['deactivating', { ActiveState: 'deactivating', SubState: 'stop-sigterm', MainPID: '4001' }],
+  ['running without PID', { ActiveState: 'active', SubState: 'running', MainPID: '0' }],
+  ['dead with PID', { ActiveState: 'inactive', SubState: 'dead', MainPID: '4001' }],
+  ['active but dead', { ActiveState: 'active', SubState: 'dead', MainPID: '4001' }],
+  ['inactive but running', { ActiveState: 'inactive', SubState: 'running', MainPID: '0' }],
+  ['noncanonical PID', { MainPID: '01' }],
+  ['overflow PID', { MainPID: '2147483648' }],
+  ['not found but running', { LoadState: 'not-found', ActiveState: 'active', SubState: 'running', MainPID: '4001' }],
+]) {
+  test(`Linux status refuses stable but incoherent/transitioning manager evidence: ${label}`, async () => {
+    const fixture = linuxStatusFixture();
+    fixture.native.managerMutator = (value) => Object.assign(value, manager);
+    const result = await publicLinuxStatus(fixture);
+    assert.equal(result.status, 'refused');
+    assert.equal(result.code, 'SERVICE_PENDING');
+    assert.equal(result.writes, 0);
+    assert.equal(result.ambiguous, false);
+  });
+}
+
+test('Linux failed/dead zero-PID manager evidence reports stopped, not running', async () => {
+  const fixture = linuxStatusFixture();
+  fixture.native.managerMutator = (manager) => { manager.ActiveState = 'failed'; };
+  const result = await publicLinuxStatus(fixture);
+  assert.equal(result.status, 'ok');
+  assert.equal(result.receipt.service, 'stopped');
+  assert.equal(result.receipt.activation, 'enabled');
+});
+
+test('Linux status manager runtime overrides a conflicting abstract service hint', async () => {
+  const fixture = linuxStatusFixture();
+  const driver = { probe: () => ({ ...fixture.driver.probe(), service: 'running' }) };
+  const result = await publicLinuxStatus(fixture, driver);
+  assert.equal(result.status, 'ok');
+  assert.equal(result.receipt.service, 'stopped');
+});
+
+for (const malformed of ['custom-prototype', 'non-string-value']) {
+  test(`Linux status refuses malformed manager maps: ${malformed}`, async () => {
+    const fixture = linuxStatusFixture();
+    const driver = { probe() {
+      const observation = fixture.driver.probe();
+      const manager = malformed === 'custom-prototype'
+        ? Object.assign(Object.create({ inherited: 'not native' }), observation.manager)
+        : { ...observation.manager, MainPID: 0 };
+      return { ...observation, manager };
+    } };
+    const result = await publicLinuxStatus(fixture, driver);
+    assert.equal(result.status, 'refused');
+    assert.equal(result.code, 'SERVICE_PENDING');
+    assert.equal(result.writes, 0);
+    assert.equal(result.ambiguous, false);
+  });
+}
+
+for (const malformed of ['changing-runtime-getters', 'throwing-getter', 'setter-only', 'non-enumerable-data', 'symbol-data']) {
+  test(`Linux status rejects manager descriptors without executing accessors: ${malformed}`, async () => {
+    const fixture = linuxStatusFixture();
+    let accessorCalls = 0;
+    const reads = { ActiveState: 0, SubState: 0, MainPID: 0 };
+    const driver = { probe() {
+      const observation = fixture.driver.probe();
+      const manager = Object.assign(Object.create(null), observation.manager);
+      if (malformed === 'changing-runtime-getters') {
+        for (const [key, running] of [['ActiveState', 'active'], ['SubState', 'running'], ['MainPID', '4001']]) {
+          Object.defineProperty(manager, key, { enumerable: true, get() {
+            accessorCalls += 1;
+            return ++reads[key] <= 2 ? observation.manager[key] : running;
+          } });
+        }
+      } else if (malformed === 'throwing-getter') {
+        Object.defineProperty(manager, 'Description', { enumerable: true, get() {
+          accessorCalls += 1;
+          throw new Error('manager getter must not execute');
+        } });
+      } else if (malformed === 'setter-only') {
+        Object.defineProperty(manager, 'Description', { enumerable: true, set(_) { accessorCalls += 1; } });
+      } else if (malformed === 'non-enumerable-data') {
+        Object.defineProperty(manager, 'MainPID', { value: '0', enumerable: false });
+      } else {
+        manager[Symbol('unexpected-manager-field')] = 'not native';
+      }
+      return { ...observation, manager };
+    } };
+    const result = await publicLinuxStatus(fixture, driver);
+    assert.equal(accessorCalls, 0);
+    assert.deepEqual(reads, { ActiveState: 0, SubState: 0, MainPID: 0 });
+    assert.equal(result.status, 'refused');
+    assert.equal(result.code, 'SERVICE_PENDING');
+    assert.equal(result.writes, 0);
+    assert.equal(result.ambiguous, false);
+  });
 }
 
 // Baselines are admitted only from the durable prepared boundary.  Tests that

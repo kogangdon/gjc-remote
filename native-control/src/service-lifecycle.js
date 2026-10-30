@@ -77,6 +77,40 @@ function validAbsoluteEntrypoint(v, platform) {
 }
 function validNonce(v) { return typeof v === 'string' && NONCE.test(v); }
 function same(left, right) { try { return hash(left) === hash(right); } catch { return false; } }
+function linuxStatusManager(manager) {
+  if (manager === null || typeof manager !== 'object' ||
+      (Object.getPrototypeOf(manager) !== null && !plain(manager))) return null;
+  // parseShowOutput returns a null-prototype string dictionary. Normalize
+  // only this known native record, preserving every manager property. Inspect
+  // descriptors before reading values: accessors must never execute or change
+  // runtime evidence between comparison and receipt construction.
+  const descriptors = Object.getOwnPropertyDescriptors(manager);
+  const keys = Reflect.ownKeys(descriptors);
+  if (!keys.every((key) => typeof key === 'string' && descriptors[key].enumerable &&
+      Object.hasOwn(descriptors[key], 'value') && typeof descriptors[key].value === 'string')) return null;
+  return Object.fromEntries(keys.map((key) => [key, descriptors[key].value]));
+}
+function statusProbeFingerprint(probe, platform) {
+  try {
+    const observation = { ...probe, resourceFingerprint: probe?.resourceFingerprint ?? null, platformPhase: probe?.platformPhase ?? null };
+    if (platform === 'linux' && Object.hasOwn(observation, 'manager')) {
+      observation.manager = linuxStatusManager(observation.manager);
+      if (observation.manager === null) return null;
+    }
+    if (platform === 'linux' && Object.hasOwn(observation, 'objects')) {
+      if (!plain(observation.objects)) return null;
+      // Only native Linux object bytes are binary. Encode them losslessly for
+      // this private comparison; retain every identity/facts field and keep
+      // strict JSON unchanged for durable records and public receipts.
+      observation.objects = Object.fromEntries(Object.entries(observation.objects).map(([key, snapshot]) => {
+        if (snapshot === null) return [key, null];
+        if (!plain(snapshot) || (snapshot.bytes !== null && !Buffer.isBuffer(snapshot.bytes))) throw new TypeError('invalid Linux object bytes');
+        return [key, { ...snapshot, bytes: snapshot.bytes === null ? null : snapshot.bytes.toString('hex') }];
+      }));
+    }
+    return hash(observation);
+  } catch { return null; }
+}
 function safeErrorCode(error) {
   try {
     const code = error?.code;
@@ -506,6 +540,24 @@ function startupEvidenceFromProof(startup, probe, manifest, resource, platform, 
   }
   return 'historical-current-epoch';
 }
+function linuxRuntimeService(manager, physicalAbsent) {
+  manager = linuxStatusManager(manager);
+  if (manager === null || typeof manager.MainPID !== 'string' ||
+      !/^(?:0|[1-9][0-9]{0,9})$/.test(manager.MainPID) || Number(manager.MainPID) > 0x7fffffff) {
+    fail('SERVICE_PENDING', 'status');
+  }
+  const pid = Number(manager.MainPID);
+  const quiet = ['inactive', 'failed'].includes(manager.ActiveState) && manager.SubState === 'dead' && pid === 0;
+  if (manager.LoadState === 'not-found' && physicalAbsent && manager.ActiveState === 'inactive' && quiet) return 'missing';
+  if (!physicalAbsent && ['loaded', 'masked'].includes(manager.LoadState)) {
+    if (manager.ActiveState === 'active' && manager.SubState === 'running' && pid > 0) return 'running';
+    if (quiet) return 'stopped';
+  }
+  // A transition or contradictory manager tuple is not a stable runtime
+  // observation. Do not invent a recovery transaction or emit a clean
+  // 'transitioning' receipt (which the public status contract forbids).
+  fail('SERVICE_PENDING', 'status');
+}
 function statusFromProbe(probe, manifest, resource, platform, architecture, now, recovery = 'clean', tx = null, startup = null) {
   if (!plain(probe)) fail('SERVICE_INVALID', 'probe_status');
   const durable = validHash(manifest?.manifestFingerprint) && validHash(resource?.resourceProof) &&
@@ -529,11 +581,16 @@ function statusFromProbe(probe, manifest, resource, platform, architecture, now,
   const serviceSnapshot = plain(probe.service) ? probe.service : null;
   const serviceState = typeof probe.service === 'string' ? probe.service :
     serviceSnapshot?.runtime?.state;
-  const service = ['running', 'stopped', 'missing', 'transitioning', 'unknown'].includes(serviceState)
-    ? serviceState
-    : physicalAbsent ? 'missing' :
-      ['trial', 'final-restart-armed'].includes(observedPhase) ? 'transitioning' :
-      ['final', 'final-auto'].includes(observedPhase) ? 'running' : 'unknown';
+  // Linux platformPhase describes installed configuration/activation, not
+  // whether systemd currently has a live main process. Manager evidence is
+  // authoritative when present; Windows retains its existing runtime shape.
+  const service = platform === 'linux' && Object.hasOwn(probe, 'manager')
+    ? linuxRuntimeService(probe.manager, physicalAbsent)
+    : ['running', 'stopped', 'missing', 'transitioning', 'unknown'].includes(serviceState)
+      ? serviceState
+      : physicalAbsent ? 'missing' : platform === 'linux' ? 'unknown' :
+        ['trial', 'final-restart-armed'].includes(observedPhase) ? 'transitioning' :
+        ['final', 'final-auto'].includes(observedPhase) ? 'running' : 'unknown';
   const platformActivation = plain(probe.platformState) ? probe.platformState.activation : null;
   const phaseActivation = ['final', 'final-auto'].includes(observedPhase) ? 'enabled' :
     ['trial', 'final-restart-armed'].includes(observedPhase) ? 'suppressed-controller-startable' :
@@ -1035,6 +1092,7 @@ export class ServiceLifecycle {
         writes: 0,
       });
     }
+    let hasPrimary = false;
     try {
       if (session.component !== request.target.component || session.platform !== platform || session.architecture !== architecture || session.serviceKey !== serviceKeyForTarget(request.target)) fail('SERVICE_SCOPE_MISMATCH', 'status');
       const manifest = required(session, 'readManifest', 'read_manifest', 'current');
@@ -1075,9 +1133,11 @@ export class ServiceLifecycle {
         ? { ...request, configuration: persistedConfiguration }
         : request;
       const driver = await this.#driver(session, statusRequest, statusRelease);
-      const first = await requiredAsync(driver, 'probe', 'probe_status');
+      // Pin the first byte/identity evidence before awaiting another probe:
+      // Buffer-bearing native snapshots are not themselves deeply immutable.
+      const firstFingerprint = statusProbeFingerprint(await requiredAsync(driver, 'probe', 'probe_status'), platform);
       const second = await requiredAsync(driver, 'probe', 'probe_status');
-      if (!same({ ...first, resourceFingerprint: first?.resourceFingerprint ?? null, platformPhase: first?.platformPhase ?? null }, { ...second, resourceFingerprint: second?.resourceFingerprint ?? null, platformPhase: second?.platformPhase ?? null })) fail('SERVICE_PENDING', 'status');
+      if (firstFingerprint === null || firstFingerprint !== statusProbeFingerprint(second, platform)) fail('SERVICE_PENDING', 'status');
       const fallback = { component: request.target.component, serviceKey: session.serviceKey, serviceGeneration: 0, manifestFingerprint: null };
       const currentManifest = manifest.present ? manifest.value : fallback;
       const latest = journal.entries.at(-1);
@@ -1087,7 +1147,14 @@ export class ServiceLifecycle {
         ? second
         : second?.ownership === 'owned' ? { ...second, ownership: 'ambiguous' } : second;
       return statusFromProbe(evidenceProbe, currentManifest, resource.present ? resource.value : { resourceProof: null }, platform, architecture, this.#options.clock?.() ?? Date.now(), recovery, pending ? (journal.pending ?? latest) : null, startup);
-    } finally { required(session, 'close', 'close_service_store'); }
+    } catch (error) {
+      hasPrimary = true;
+      throw error;
+    } finally {
+      try { required(session, 'close', 'close_service_store'); } catch {
+        if (!hasPrimary) fail('SERVICE_MANUAL_CLEANUP', 'status', writesOf(session));
+      }
+    }
   }
   async recover(request) {
     const platform = this.#platform(request); const architecture = this.#architecture(request);
