@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServiceLifecycle } from '../src/service-lifecycle.js';
+import { getServiceCleanupEvidenceInternal } from '../src/service-store.js';
 import { runServiceCli, serviceReceiptBytes } from '../src/service-cli.js';
 import { EXIT_CODES, runServiceEntrypoint } from '../src/service-entrypoint.js';
 import {
@@ -538,7 +539,7 @@ function windowsCandidateFixture(signedEntrypoint, store = null, acquisitionOver
     },
     expected: { serviceGeneration: 0, resourceProof: null, applicationSequenceFloor: 0, shawlSequenceFloor: 0 },
   };
-  return { calls, session, lifecycle, request, stoppedAtPlanner };
+  return { calls, session, lifecycle, request, stoppedAtPlanner, acquisition };
 }
 
 test('Windows candidate launch plans the signed entrypoint digest over write-free intents', async () => {
@@ -2092,5 +2093,90 @@ for (const failProbe of [0, 1, 2]) {
     assert.equal(probes, failProbe || 2);
     assert.equal(closes, 1);
     assert.equal(fixture.session.writes, 0);
+  });
+}
+
+for (const primary of [Object.freeze(new Error('frozen /private primary')), Object.preventExtensions(new Error('nonextensible primary'))]) {
+  test(`status preserves ${Object.isFrozen(primary) ? 'frozen' : 'nonextensible'} primary and retains separate bounded cleanup evidence`, async () => {
+    const fixture = readOnlyFixture();
+    const descriptors = Object.getOwnPropertyDescriptors(primary);
+    fixture.session.readManifest = () => { throw primary; };
+    fixture.session.close = () => { throw Object.freeze(new Error('secret close path')); };
+    const lifecycle = createServiceLifecycle({ platform: 'linux', architecture: 'x64', store: fixture.store });
+    await assert.rejects(lifecycle.status({ schemaVersion: 1, target: { component: 'bot' }, roles }), (error) => error === primary);
+    assert.deepEqual(Object.getOwnPropertyDescriptors(primary), descriptors);
+    const evidence = getServiceCleanupEvidenceInternal(lifecycle);
+    assert.equal(evidence.hasPrimary, true);
+    assert.equal(evidence.cleanup.attemptedUnconfirmed, 1);
+    assert.deepEqual(getServiceCleanupEvidenceInternal(primary), evidence);
+    assert.equal(JSON.stringify(evidence).includes('secret'), false);
+    assert.equal(JSON.stringify(evidence).includes('private'), false);
+  });
+}
+
+test('absent status closes once without constructing a driver; cleanup writes refuse prepared success', async () => {
+  for (const cleanupWrites of [0, 3]) {
+    const fixture = readOnlyFixture();
+    let closes = 0;
+    fixture.session.close = () => { closes += 1; fixture.session.writes += cleanupWrites; };
+    const lifecycle = createServiceLifecycle({ platform: 'linux', architecture: 'x64', store: fixture.store,
+      createDriver: () => assert.fail('absent status must not construct a driver') });
+    const pending = lifecycle.status({ schemaVersion: 1, target: { component: 'bot' }, roles });
+    if (cleanupWrites) await assert.rejects(pending, (error) => error.code === 'SERVICE_MANUAL_CLEANUP' && error.writes === cleanupWrites);
+    else assert.equal((await pending).ownership, 'absent');
+    assert.equal(closes, 1);
+  }
+});
+
+for (const existingLifecycleError of [false, true]) {
+  test(`mutation final cleanup preserves pre-cleanup wrapper/cause/writes (existing=${existingLifecycleError})`, async () => {
+    const fixture = windowsCandidateFixture(Object.freeze({ path: 'bot/src/bot.js', sha256: '6'.repeat(64), size: 42 }));
+    const original = fixture.stoppedAtPlanner;
+    const cause = Object.freeze(new Error('original cause'));
+    if (existingLifecycleError) {
+      Object.assign(original, { name: 'ServiceLifecycleError', code: 'SERVICE_PENDING', writes: 7, cause });
+      Object.freeze(original);
+    }
+    fixture.acquisition.close = () => { fixture.calls.push('acquisition-close'); throw new Error('acquisition close'); };
+    fixture.session.close = () => { fixture.calls.push('session-close'); fixture.session.writes += 4; throw new Error('session close'); };
+    await assert.rejects(fixture.lifecycle.install(fixture.request), (error) => {
+      assert.equal(error.name, 'ServiceLifecycleError');
+      assert.equal(error.writes, existingLifecycleError ? 7 : 0);
+      assert.equal(error.cause, existingLifecycleError ? cause : original);
+      if (existingLifecycleError) assert.equal(error, original);
+      return true;
+    });
+    assert.deepEqual(fixture.calls.slice(-2), ['acquisition-close', 'session-close']);
+    assert.equal(fixture.session.writes, 4);
+    const evidence = getServiceCleanupEvidenceInternal(fixture.lifecycle);
+    assert.equal(evidence.hasPrimary, true);
+    assert.equal(evidence.writes, 4);
+    assert.equal(evidence.cleanup.attemptedUnconfirmed, 2);
+  });
+}
+
+for (const existingLifecycleError of [false, true]) {
+  test(`recovery final cleanup preserves its existing wrapper decision (existing=${existingLifecycleError})`, async () => {
+    const fixture = recoverySuccessFixture('resume');
+    const cause = Object.freeze(new Error('original recovery cause'));
+    const original = new Error('recovery primary');
+    if (existingLifecycleError) {
+      Object.assign(original, { name: 'ServiceLifecycleError', code: 'SERVICE_PENDING', writes: 7, cause });
+      Object.freeze(original);
+    }
+    let beforeCleanup;
+    fixture.driver.startTrial = () => { beforeCleanup = fixture.session.writes + fixture.driver.writes; throw original; };
+    fixture.session.close = () => { fixture.calls.push('session-close'); fixture.session.writes += 4; throw new Error('secondary close'); };
+    await assert.rejects(fixture.lifecycle.recover(fixture.request), (error) => {
+      assert.notEqual(beforeCleanup, undefined, 'reach the classified recovery edge');
+      assert.equal(error.name, 'ServiceLifecycleError');
+      assert.equal(error.code, 'SERVICE_PENDING');
+      assert.equal(error.writes, existingLifecycleError ? 7 : beforeCleanup);
+      assert.equal(error.cause, existingLifecycleError ? cause : undefined);
+      if (existingLifecycleError) assert.equal(error, original);
+      return true;
+    });
+    assert.equal(fixture.calls.at(-1), 'session-close');
+    assert.equal(getServiceCleanupEvidenceInternal(fixture.lifecycle).cleanup.attemptedUnconfirmed, 1);
   });
 }

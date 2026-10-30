@@ -520,28 +520,176 @@ function validateRetainedDeploymentEnvelope(value) {
   return value;
 }
 
+// These records never enter a public receipt. Raw handles, primary values and
+// close failures stay in the operation's private ownership ledger.
+const cleanupOutcomes = new WeakMap();
+const CLEANUP_RESOURCES = new Set(['ROOT', 'DIRECTORY', 'LOCK', 'ARTIFACT_READER', 'ARTIFACT_WRITER', 'LINUX_SCOPE', 'UNKNOWN']);
+const CLEANUP_CODES = new Set(['SERVICE_IO_FAILED', 'SERVICE_PENDING', 'SERVICE_INVALID', 'SERVICE_ACCESS_DENIED', 'SERVICE_MANUAL_CLEANUP', 'UNKNOWN']);
+const CLEANUP_OPERATIONS = new Set(['CLOSE_SERVICE_HANDLE', 'CLOSE_SERVICE_STORE', 'UNKNOWN']);
+const CLEANUP_STATES = new Set(['BLOCKED_UNATTEMPTED', 'ATTEMPTED_UNCONFIRMED']);
+const HANDLE_RESOURCES = Object.freeze({
+  open_service_root: 'ROOT',
+  open_service_directory: 'DIRECTORY',
+  acquire_service_lock: 'LOCK',
+  open_service_artifact_reader: 'ARTIFACT_READER',
+  open_service_artifact_source: 'ARTIFACT_READER',
+  begin_service_artifact_write: 'ARTIFACT_WRITER',
+  open_linux_service_scope: 'LINUX_SCOPE',
+});
+function objectKey(value) { return value !== null && (typeof value === 'object' || typeof value === 'function'); }
+function ownValue(value, key) {
+  try { return objectKey(value) ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined; }
+  catch { return undefined; }
+}
+function cleanupEnum(value, allowed) { return allowed.has(value) ? value : 'UNKNOWN'; }
+
+export function projectServiceCleanupInternal({ total, closed, blockedUnattempted, attemptedUnconfirmed, failures, omittedFailures = 0 }) {
+  const counts = [total, closed, blockedUnattempted, attemptedUnconfirmed];
+  if (!counts.every(validWrites) || !Number.isSafeInteger(closed + blockedUnattempted + attemptedUnconfirmed) ||
+      total !== closed + blockedUnattempted + attemptedUnconfirmed || !Array.isArray(failures) || !validWrites(omittedFailures) ||
+      !Number.isSafeInteger(failures.length + omittedFailures) ||
+      failures.length + omittedFailures !== blockedUnattempted + attemptedUnconfirmed) {
+    throwStore('SERVICE_MANUAL_CLEANUP', 'project_service_cleanup', 0, true);
+  }
+  const summaries = failures.slice(0, 8).map((failure) => Object.freeze({
+    resource: cleanupEnum(ownValue(failure, 'resource'), CLEANUP_RESOURCES),
+    operation: cleanupEnum(ownValue(failure, 'operation'), CLEANUP_OPERATIONS),
+    code: cleanupEnum(ownValue(failure, 'code'), CLEANUP_CODES),
+    state: cleanupEnum(ownValue(failure, 'state'), CLEANUP_STATES),
+  }));
+  return Object.freeze({ total, closed, blockedUnattempted, attemptedUnconfirmed,
+    failures: Object.freeze(summaries), omittedFailures: blockedUnattempted + attemptedUnconfirmed - summaries.length });
+}
+
+export function getServiceCleanupEvidenceInternal(subject) {
+  const outcome = objectKey(subject) ? cleanupOutcomes.get(subject) : null;
+  return outcome ? Object.freeze({ hasPrimary: outcome.hasPrimary, writes: outcome.writes ?? null, cleanup: outcome.report }) : null;
+}
+
+export function recordServiceCleanupOutcomeInternal(subject, hasPrimary, primary, cleanupFailures = [], session = null, writes = null) {
+  const sessionOutcome = objectKey(session) ? cleanupOutcomes.get(session) : null;
+  let report = sessionOutcome?.report ?? null;
+  const included = new Set(report === null ? [] : [report]);
+  for (const error of cleanupFailures) {
+    let failureReport = objectKey(error) ? cleanupOutcomes.get(error)?.report : null;
+    if (included.has(failureReport)) continue;
+    failureReport ??= projectServiceCleanupInternal({ total: 1, closed: 0, blockedUnattempted: 0, attemptedUnconfirmed: 1,
+      failures: [{ resource: 'UNKNOWN', operation: 'CLOSE_SERVICE_STORE', code: ownValue(error, 'code'), state: 'ATTEMPTED_UNCONFIRMED' }] });
+    included.add(failureReport);
+    report = report === null ? failureReport : projectServiceCleanupInternal({
+      total: report.total + failureReport.total, closed: report.closed + failureReport.closed,
+      blockedUnattempted: report.blockedUnattempted + failureReport.blockedUnattempted,
+      attemptedUnconfirmed: report.attemptedUnconfirmed + failureReport.attemptedUnconfirmed,
+      failures: [...report.failures, ...failureReport.failures], omittedFailures: report.omittedFailures + failureReport.omittedFailures,
+    });
+  }
+  const outcome = { hasPrimary, value: primary, report,
+    writes: sessionOutcome?.writes === null ? null : validWrites(writes) ? writes : sessionOutcome?.writes ?? null };
+  if (objectKey(subject)) cleanupOutcomes.set(subject, outcome);
+  if (hasPrimary && objectKey(primary)) cleanupOutcomes.set(primary, outcome);
+}
+
 class Calls {
-  constructor(native) {
+  constructor(native, subject) {
     this.native = native;
     this.writes = 0;
+    this.writesKnown = true;
     this.handleOwner = null;
+    this.entries = [];
+    this.handles = new Map();
+    this.activeLocks = [];
+    this.settling = false;
+    this.outcome = { hasPrimary: false, value: undefined, report: null, writes: 0 };
+    if (subject) cleanupOutcomes.set(subject, this.outcome);
   }
 
   invoke(name, ...args) {
+    if (this.settling && name !== 'close_service_handle') this.error('SERVICE_PENDING', name);
+    const finishing = name === 'finish_service_artifact_write' ? this.handles.get(args[0]) : null;
+    const closing = name === 'close_service_handle' ? this.handles.get(args[0]) : finishing;
+    if (name === 'close_service_handle') {
+      // Unknown handles are borrowed, not ours to close.
+      if (!closing) this.error('SERVICE_INVALID', name);
+      if (closing.state === 'closed') {
+        if (this.handleOwner !== null) {
+          const index = this.handleOwner.handles.lastIndexOf(args[0]);
+          if (index !== -1) this.handleOwner.handles.splice(index, 1);
+        }
+        return undefined;
+      }
+      if (closing.state === 'attempted-unconfirmed') throw closing.failure;
+      if (closing.dependents.size !== 0) {
+        this.error('SERVICE_PENDING', name);
+      }
+      // Mark before crossing the native boundary. A throwing close may already
+      // have consumed its wrapper; a subsequent no-op is not closure proof.
+      closing.state = 'attempted-unconfirmed';
+    }
+    // Finalization owns the writer's native close as well. It consumes the
+    // writer on success; a failed close cannot be retried through closeHandle.
+    if (finishing) {
+      if (finishing.state !== 'open') this.error('SERVICE_STALE', name);
+      finishing.state = 'attempted-unconfirmed';
+    }
+    const publishing = name === 'publish_service_directory_no_replace' ? this.handles.get(args[0]) : null;
+    const destination = publishing ? this.handles.get(args[1]) : null;
+    const addedDestination = publishing && destination && !publishing.dependencies.has(destination);
+    // Until the publication receipt is validated, either parent may retain the
+    // native child. Fence the destination before crossing the native boundary.
+    if (addedDestination) this.addDependency(publishing, destination);
     let value;
     try { value = Reflect.apply(this.native[name], undefined, args); }
     catch (error) {
-      const writes = validWrites(error?.writes) ? error.writes : 0;
-      this.writes += writes;
-      throwStore(
-        typeof error?.code === 'string' ? error.code : 'SERVICE_IO_FAILED',
-        typeof error?.operation === 'string' ? error.operation : name,
-        this.writes,
-        error?.ambiguous === true || !validWrites(error?.writes),
-        error,
-      );
+      let writes;
+      try {
+        // Keep the native boundary's existing property-read semantics,
+        // including inherited fields and accessor-backed metadata.
+        const knownWrites = validWrites(error?.writes);
+        writes = knownWrites ? error.writes : 0;
+        if (!knownWrites || !validWrites(writes)) this.writesKnown = false;
+        this.writes += writes;
+        throwStore(
+          typeof error?.code === 'string' ? error.code : 'SERVICE_IO_FAILED',
+          typeof error?.operation === 'string' ? error.operation : name,
+          this.writes,
+          error?.ambiguous === true || !validWrites(error?.writes),
+          error,
+        );
+      } catch (translated) {
+        if (ownValue(translated, 'cause') !== error) this.writesKnown = false;
+        if (addedDestination && writes === 0 && ownValue(translated, 'ambiguous') === false) {
+          this.removeDependency(publishing, destination);
+        }
+        if (closing) {
+          closing.failure = translated;
+          if (finishing && writes === 0 && ownValue(translated, 'ambiguous') === false) {
+            // The native contract rejects invalid arguments before closure,
+            // while an exact digest/size mismatch reports confirmed closure.
+            if (ownValue(translated, 'code') === 'SERVICE_INVALID') closing.state = 'open';
+            else if (ownValue(translated, 'code') === 'SERVICE_STALE') this.confirmClosed(closing);
+          }
+        }
+        throw translated;
+      }
     }
-    if (name === 'close_service_handle' &&
+    if (closing) this.confirmClosed(closing);
+    if (Object.hasOwn(HANDLE_RESOURCES, name)) {
+      const handle = ownValue(value, 'handle');
+      if (handle !== null && handle !== undefined && !this.handles.has(handle)) {
+        const dependencies = new Set(args.flatMap((argument) => this.handles.has(argument) ? [this.handles.get(argument)] : []));
+        // Locks are a native stack. Non-lock resources acquired under a lock
+        // retain that fence even when their open call has no lock argument.
+        const lock = this.activeLocks.at(-1);
+        if (lock) dependencies.add(lock);
+        const entry = { handle, resource: HANDLE_RESOURCES[name], dependencies, dependents: new Set(),
+          parent: name === 'open_service_directory' ? this.handles.get(args[0]) : null, state: 'open', failure: null };
+        for (const dependency of dependencies) dependency.dependents.add(entry);
+        this.entries.push(entry);
+        this.handles.set(handle, entry);
+        if (entry.resource === 'LOCK') this.activeLocks.push(entry);
+      }
+    }
+    if ((name === 'close_service_handle' || finishing) &&
         this.handleOwner !== null) {
       const handle = args[0];
       const index = this.handleOwner.handles.lastIndexOf(handle);
@@ -563,10 +711,105 @@ class Calls {
 
     }
     if (value !== null && typeof value === 'object' && Object.hasOwn(value, 'writes')) {
-      if (!validWrites(value.writes)) throwStore('SERVICE_INVALID', name, this.writes, this.writes > 0);
-      this.writes += value.writes;
+      let writes;
+      try { writes = value.writes; } catch (error) { this.writesKnown = false; throw error; }
+      if (!validWrites(writes)) {
+        this.writesKnown = false;
+        throwStore('SERVICE_INVALID', name, this.writes, this.writes > 0);
+      }
+      this.writes += writes;
     }
     return value;
+  }
+
+  addDependency(entry, dependency) {
+    entry.dependencies.add(dependency);
+    dependency.dependents.add(entry);
+  }
+
+  removeDependency(entry, dependency) {
+    entry.dependencies.delete(dependency);
+    dependency.dependents.delete(entry);
+  }
+
+  confirmClosed(entry) {
+    entry.state = 'closed';
+    for (const dependency of entry.dependencies) dependency.dependents.delete(entry);
+    if (entry.resource === 'LOCK') this.activeLocks.pop();
+  }
+
+  confirmPublication(source, destination) {
+    const entry = this.handles.get(source);
+    const parent = this.handles.get(destination);
+    if (!entry || !parent) this.error('SERVICE_MANUAL_CLEANUP', 'publish_service_directory_no_replace', true);
+    if (entry.parent !== parent) {
+      if (entry.parent) this.removeDependency(entry, entry.parent);
+      this.addDependency(entry, parent);
+      entry.parent = parent;
+    }
+  }
+
+  primary(value) {
+    this.outcome.hasPrimary = true;
+    this.outcome.value = value;
+    if (objectKey(value)) cleanupOutcomes.set(value, this.outcome);
+  }
+
+  report() {
+    this.outcome.writes = this.writesKnown && validWrites(this.writes) ? this.writes : null;
+    const unresolved = this.entries.filter((entry) => entry.state !== 'closed');
+    const attemptedUnconfirmed = unresolved.filter((entry) => entry.state === 'attempted-unconfirmed').length;
+    this.outcome.report = projectServiceCleanupInternal({
+      total: this.entries.length, closed: this.entries.length - unresolved.length,
+      blockedUnattempted: unresolved.length - attemptedUnconfirmed, attemptedUnconfirmed,
+      failures: unresolved.map((entry) => ({ resource: entry.resource, operation: 'CLOSE_SERVICE_HANDLE',
+        code: entry.state === 'open' ? 'SERVICE_PENDING' : ownValue(entry.failure, 'code'),
+        state: entry.state === 'open' ? 'BLOCKED_UNATTEMPTED' : 'ATTEMPTED_UNCONFIRMED' })),
+    });
+    return this.outcome.report;
+  }
+
+  closeHandles(handles) {
+    let hasFailure = false;
+    let failure;
+    const selected = new Set(handles);
+    const visited = new Set();
+    const ordered = [];
+    // Publication can make a later-acquired root the parent of an earlier
+    // directory. Walk active dependents first, retaining reverse acquisition
+    // order for independent handles without rescanning historical entries.
+    for (const handle of [...handles].reverse()) {
+      const stack = [[handle, false]];
+      while (stack.length !== 0) {
+        const [current, expanded] = stack.pop();
+        if (expanded) {
+          ordered.push(current);
+          continue;
+        }
+        if (visited.has(current)) continue;
+        visited.add(current);
+        stack.push([current, true]);
+        for (const dependent of this.handles.get(current)?.dependents ?? []) {
+          if (selected.has(dependent.handle)) stack.push([dependent.handle, false]);
+        }
+      }
+    }
+    for (const handle of ordered) {
+      if (handle === null || handle === undefined) continue;
+      try { this.invoke('close_service_handle', handle); }
+      catch (error) { if (!hasFailure) { hasFailure = true; failure = error; } }
+    }
+    const report = this.report();
+    if (hasFailure) {
+      if (objectKey(failure)) cleanupOutcomes.set(failure, { hasPrimary: false, value: undefined, report });
+      throw failure;
+    }
+    return report;
+  }
+
+  closeAll(borrowedDependencies = []) {
+    this.settling = true;
+    return this.closeHandles(this.entries.filter((entry) => !borrowedDependencies.includes(entry.handle)).map((entry) => entry.handle));
   }
 
   adoptHandle(handle) {
@@ -603,15 +846,7 @@ class Calls {
         true,
       );
     }
-    let failure = null;
-    for (const handle of [...owner.handles].reverse()) {
-      try {
-        this.invoke('close_service_handle', handle);
-      } catch (error) {
-        failure ??= error;
-      }
-    }
-    if (failure !== null) throw failure;
+    this.closeHandles(owner.handles);
   }
 
   releaseHandleOwner(owner) {
@@ -799,31 +1034,20 @@ function parseRecord(calls, bytes, validator, operation) {
 }
 
 function closeReverse(calls, handles) {
-  let first;
-  for (let index = handles.length - 1; index >= 0; index -= 1) {
-    if (handles[index] === undefined || handles[index] === null) continue;
-    try { calls.invoke('close_service_handle', handles[index]); } catch (error) { first ??= error; }
-  }
-  if (first) throw first;
+  return calls.closeHandles(handles);
 }
 
 function throwAfterCleanup(calls, original, cleanup) {
-  let cleanupError;
-  try { cleanup(); } catch (error) { cleanupError = error; }
-  if (cleanupError) {
-    throwStore(
-      'SERVICE_MANUAL_CLEANUP',
-      'close_service_store_after_failure',
-      Math.max(
-        calls.writes,
-        validWrites(original?.writes) ? original.writes : 0,
-        validWrites(cleanupError?.writes) ? cleanupError.writes : 0,
-      ),
-      true,
-      new AggregateError([original, cleanupError], 'service store operation and cleanup both failed'),
-    );
-  }
+  calls.primary(original);
+  try { cleanup(); } catch { /* The ledger, not a replacement exception, retains cleanup uncertainty. */ }
+  calls.report();
+  calls.primary(original);
   throw original;
+}
+
+function finishCleanup(calls, primary, handles) {
+  if (primary.hasPrimary) throwAfterCleanup(calls, primary.value, () => closeReverse(calls, handles));
+  return closeReverse(calls, handles);
 }
 
 function acquire(calls, root, platform, scope, serviceKey, mode, expectedIdentity = undefined) {
@@ -846,6 +1070,7 @@ function acquire(calls, root, platform, scope, serviceKey, mode, expectedIdentit
 function readRegistration(calls, root, rootBinding, platform, architecture, roles, rolesFingerprint) {
   let directory;
   let history;
+  const primary = { hasPrimary: false, value: undefined };
   try {
     directory = validateOwnedDirectoryResult(calls, calls.invoke(
       'open_service_directory', root, 'floor', 'read-existing', rootBinding.directoryIdentities.floor, null,
@@ -906,18 +1131,17 @@ function readRegistration(calls, root, rootBinding, platform, architecture, role
       incarnationFacts: calls.validate('open_service_store', () => cloneJson(incarnationRaw.facts)),
       incarnationBytes: Buffer.from(incarnationRaw.bytes),
     });
+  } catch (error) {
+    primary.hasPrimary = true; primary.value = error;
+    throw error;
   } finally {
-    if (history?.handle) {
-      try { calls.invoke('close_service_handle', history.handle); } catch {}
-    }
-    if (directory?.handle) {
-      try { calls.invoke('close_service_handle', directory.handle); } catch {}
-    }
+    finishCleanup(calls, primary, [directory?.handle, history?.handle]);
   }
 }
 
 function preflightGlobalLocks(calls, root, platform) {
   const handles = [];
+  const primary = { hasPrimary: false, value: undefined };
   try {
     const artifact = acquire(calls, root, platform, 'artifact', null, 'shared-existing');
     handles.push(artifact.handle);
@@ -927,10 +1151,11 @@ function preflightGlobalLocks(calls, root, platform) {
     closeReverse(calls, handles);
     handles.length = 0;
     return identities;
+  } catch (error) {
+    primary.hasPrimary = true; primary.value = error;
+    throw error;
   } finally {
-    if (handles.length > 0) {
-      try { closeReverse(calls, handles); } catch {}
-    }
+    finishCleanup(calls, primary, handles);
   }
 }
 
@@ -1030,6 +1255,7 @@ function globalFloorPending(calls, floorDirectory, historyDirectory, artifactLoc
       calls.error('SERVICE_MANUAL_CLEANUP', 'read_sequence_floor', true);
     }
     let historyHandle;
+    const primary = { hasPrimary: false, value: undefined };
     try {
       historyHandle = validateOwnedDirectoryResult(calls, calls.invoke(
         'open_service_directory',
@@ -1086,10 +1312,11 @@ function globalFloorPending(calls, floorDirectory, historyDirectory, artifactLoc
       }
       calls.invoke('close_service_handle', historyHandle.handle);
       historyHandle = undefined;
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      if (historyHandle?.handle) {
-        try { calls.invoke('close_service_handle', historyHandle.handle); } catch {}
-      }
+      finishCleanup(calls, primary, [historyHandle?.handle]);
     }
   }
   return pending;
@@ -1135,18 +1362,17 @@ export function createServiceStore(options) {
   const rolesFingerprint = serviceRolesFingerprint(config.roles, config.platform);
 
   function openExisting(mode) {
-    const calls = new Calls(config.native);
+    const calls = new Calls(config.native, storeApi);
+    let session;
+    try {
     const rawRoot = calls.invoke('open_service_root', 'control', mode === 'read-only' ? 'read-existing' : 'write-existing');
     if (rawRoot === null) {
-      if (mode === 'read-only') return null;
+      if (mode === 'read-only') { calls.report(); return null; }
       calls.error('SERVICE_STORE_ABSENT', 'open_service_store');
     }
     const rootResult = validateOwnedRootResult(
       calls, rawRoot, config.platform, 'control', config.roles.management.value,
     );
-    const cleanup = [rootResult.handle];
-    let session;
-    try {
       if (rootResult.writes !== 0) calls.error('SERVICE_MANUAL_CLEANUP', 'open_service_store', true);
       const registrationSnapshot = readRegistration(
         calls,
@@ -1161,15 +1387,11 @@ export function createServiceStore(options) {
       let shared;
       if (mode === 'read-only') {
         artifact = acquire(calls, rootResult.handle, config.platform, 'artifact', null, 'shared-existing');
-        cleanup.push(artifact.handle);
         shared = acquire(calls, rootResult.handle, config.platform, 'shared-template', null, 'shared-existing');
-        cleanup.push(shared.handle);
       } else {
         const identities = preflightGlobalLocks(calls, rootResult.handle, config.platform);
         artifact = acquire(calls, rootResult.handle, config.platform, 'artifact', null, 'exclusive', identities.artifact);
-        cleanup.push(artifact.handle);
         shared = acquire(calls, rootResult.handle, config.platform, 'shared-template', null, 'exclusive', identities.shared);
-        cleanup.push(shared.handle);
       }
       const namespaces = Object.create(null);
       for (const name of OPEN_NAMESPACES) {
@@ -1178,7 +1400,6 @@ export function createServiceStore(options) {
           mode === 'read-only' ? 'read-existing' : 'write-existing',
           rootResult.rootBinding.directoryIdentities[name], artifact.handle,
         ), config.platform);
-        cleanup.push(opened.handle);
         if (opened.writes !== 0) calls.error('SERVICE_MANUAL_CLEANUP', 'open_service_store', true);
         namespaces[name] = opened;
       }
@@ -1190,7 +1411,6 @@ export function createServiceStore(options) {
         registrationSnapshot.value.historyRootIdentity,
         artifact.handle,
       ), config.platform);
-      cleanup.push(history.handle);
       if (history.writes !== 0) calls.error('SERVICE_MANUAL_CLEANUP', 'open_service_store', true);
       const hasMetadata = metadataExists(calls, Object.fromEntries(
         Object.entries(namespaces).map(([name, value]) => [name, value.handle]),
@@ -1214,14 +1434,11 @@ export function createServiceStore(options) {
         service = acquire(calls, rootResult.handle, config.platform, 'service-key', config.serviceKey, 'shared-existing');
       } else if (hasMetadata || mode === 'recovery') {
         const observed = acquire(calls, rootResult.handle, config.platform, 'service-key', config.serviceKey, 'shared-existing');
-        cleanup.push(observed.handle);
         calls.invoke('close_service_handle', observed.handle);
-        cleanup.pop();
         service = acquire(calls, rootResult.handle, config.platform, 'service-key', config.serviceKey, 'exclusive', observed.identity);
       } else {
         service = acquire(calls, rootResult.handle, config.platform, 'service-key', config.serviceKey, 'exclusive');
       }
-      cleanup.push(service.handle);
       session = new Session({
         calls,
         mode,
@@ -1237,11 +1454,9 @@ export function createServiceStore(options) {
         registrationSnapshot,
       });
       session.initialize();
-      cleanup.length = 0;
       if (mode === 'mutation' && session.blocked()) {
         const code = session.blockCode();
-        session.close();
-        throwStore(code, 'open_service_store', calls.writes);
+        calls.error(code, 'open_service_store');
       }
       if (mode === 'recovery') session.assertRecoveryAdmission();
       return session.publicApi();
@@ -1249,35 +1464,30 @@ export function createServiceStore(options) {
       if (session) {
         throwAfterCleanup(calls, error, () => session.close());
       } else {
-        throwAfterCleanup(calls, error, () => closeReverse(calls, cleanup));
+        throwAfterCleanup(calls, error, () => calls.closeAll());
       }
     }
   }
 
   function bootstrap() {
-    const calls = new Calls(config.native);
+    const calls = new Calls(config.native, storeApi);
+    let session;
+    try {
     const rawRoot = calls.invoke('open_service_root', 'control', 'create-new');
     if (rawRoot === null) calls.error('SERVICE_IO_FAILED', 'bootstrap_service_store');
     const rootResult = validateOwnedRootResult(
       calls, rawRoot, config.platform, 'control', config.roles.management.value,
     );
-    const cleanup = [rootResult.handle];
-    let session;
-    try {
       if (rootResult.writes < 1) calls.error('SERVICE_MANUAL_CLEANUP', 'bootstrap_service_store', true);
       const artifact = acquire(calls, rootResult.handle, config.platform, 'artifact', null, 'exclusive');
-      cleanup.push(artifact.handle);
       const shared = acquire(calls, rootResult.handle, config.platform, 'shared-template', null, 'exclusive');
-      cleanup.push(shared.handle);
       const service = acquire(calls, rootResult.handle, config.platform, 'service-key', config.serviceKey, 'exclusive');
-      cleanup.push(service.handle);
       const namespaces = Object.create(null);
       for (const name of OPEN_NAMESPACES) {
         const opened = validateOwnedDirectoryResult(calls, calls.invoke(
           'open_service_directory', rootResult.handle, name, 'write-existing',
           rootResult.rootBinding.directoryIdentities[name], artifact.handle,
         ), config.platform);
-        cleanup.push(opened.handle);
         if (opened.writes !== 0) calls.error('SERVICE_MANUAL_CLEANUP', 'bootstrap_service_store', true);
         namespaces[name] = opened;
       }
@@ -1289,7 +1499,6 @@ export function createServiceStore(options) {
         null,
         artifact.handle,
       ), config.platform);
-      cleanup.push(history.handle);
       if (history.writes < 1) calls.error('SERVICE_MANUAL_CLEANUP', 'bootstrap_service_store', true);
       session = new Session({
         calls,
@@ -1306,18 +1515,17 @@ export function createServiceStore(options) {
       });
       session.bootstrap();
       session.initialize();
-      cleanup.length = 0;
       return session.publicApi();
     } catch (error) {
       if (session) {
         throwAfterCleanup(calls, error, () => session.close());
       } else {
-        throwAfterCleanup(calls, error, () => closeReverse(calls, cleanup));
+        throwAfterCleanup(calls, error, () => calls.closeAll());
       }
     }
   }
 
-  return Object.freeze({
+  const storeApi = Object.freeze({
     component: config.component,
     serviceKey: config.serviceKey,
     platform: config.platform,
@@ -1327,6 +1535,7 @@ export function createServiceStore(options) {
     openMutation: () => openExisting('mutation'),
     openRecovery: () => openExisting('recovery'),
   });
+  return storeApi;
 }
 
 class Session {
@@ -1346,6 +1555,8 @@ class Session {
   #floors = new Map();
   #token = Object.freeze({});
   #closed = false;
+  #closing = false;
+  #closeReport = null;
   #tombstone;
   #manual;
   #journal;
@@ -1393,7 +1604,7 @@ class Session {
 
   publicApi() {
     const self = this;
-    return Object.freeze({
+    const api = Object.freeze({
       component: this.#config.component,
       serviceKey: this.#config.serviceKey,
       platform: this.#config.platform,
@@ -1454,10 +1665,13 @@ class Session {
       abandonShawlSequence: (input) => self.abandonShawlSequence(input),
       assertShawlRollback: (input) => self.assertShawlRollback(input),
     });
+    cleanupOutcomes.set(api, this.#calls.outcome);
+    return api;
   }
 
   #ensureOpen(operation) {
     if (this.#closed) throwStore('SERVICE_STALE', operation, this.#calls.writes);
+    if (this.#closing) throwStore('SERVICE_PENDING', operation, this.#calls.writes);
   }
 
   #ensureWritable(operation) {
@@ -2768,33 +2982,37 @@ class Session {
   }
 
   close() {
-    if (this.#closed) return;
-    if (this.#artifactCollectorOwner !== null) {
-      if (this.#artifactCollectionActive) {
-        throwStore(
-          'SERVICE_PENDING',
-          'close_service_store',
-          this.#calls.writes,
-        );
+    if (this.#closed) return this.#closeReport;
+    try {
+      if (this.#artifactCollectionActive ||
+          (this.#artifactAccesses !== 0 && this.#artifactCollectorOwner === null)) {
+        this.#calls.report();
+        throwStore('SERVICE_PENDING', 'close_service_store', this.#calls.writes);
       }
-      this.#retryArtifactCollectorCleanup('close_service_store');
+      // Refusing a close while another operation is active has not begun
+      // settlement. Do not revoke that operation's remaining native calls.
+      this.#closing = true;
+      this.#calls.settling = true;
+      if (this.#artifactCollectorOwner !== null) {
+        // A failed collector close retains its borrow. Its unresolved ledger
+        // entries fence parents, but unrelated resources can still close.
+        try { this.#retryArtifactCollectorCleanup('close_service_store'); } catch {}
+      }
+      const report = this.#calls.closeAll(this.#artifactAccesses === 0 ? [] : [
+        this.#root.handle, this.#artifact.handle, this.#shared.handle, this.#service.handle,
+      ]);
+      if (this.#artifactAccesses !== 0) {
+        throwStore('SERVICE_PENDING', 'close_service_store', this.#calls.writes);
+      }
+      this.#plannedArtifactLocations.clear();
+      this.#closed = true;
+      this.#closeReport = report;
+      return report;
+    } catch (error) {
+      this.#calls.report();
+      if (objectKey(error)) cleanupOutcomes.set(error, this.#calls.outcome);
+      throw error;
     }
-    if (this.#artifactAccesses !== 0) {
-      throwStore('SERVICE_PENDING', 'close_service_store', this.#calls.writes);
-    }
-    const handles = [
-      this.#root.handle,
-      this.#artifact.handle,
-      this.#shared.handle,
-      this.#service.handle,
-      ...OPEN_NAMESPACES.map((name) => this.#namespaces[name].handle),
-      this.#history.handle,
-      ...[...this.#historyDirectories.values()].map((directory) => directory.handle),
-      ...[...this.#serviceDirectories.values()].map((directory) => directory.handle),
-    ];
-    closeReverse(this.#calls, handles);
-    this.#plannedArtifactLocations.clear();
-    this.#closed = true;
   }
 
   readManifest(slot) {
@@ -4698,6 +4916,7 @@ class Session {
           this.#config.platform,
           'service-release-directory',
         );
+        this.#calls.confirmPublication(source, destination);
         rememberIdentity(source, result.identity);
         return Object.freeze({
           handle: source,
@@ -5882,6 +6101,7 @@ class Session {
       entry,
       'validate_reference_inventory',
     );
+    const primary = { hasPrimary: false, value: undefined };
     try {
       const listing = this.#list(directory.handle, this.#artifact.handle);
       const names = listing.entries.map(({ name }) => name);
@@ -5938,8 +6158,11 @@ class Session {
         );
       }
       return Object.freeze({ entries: Object.freeze(entries), latest });
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      this.#calls.invoke('close_service_handle', directory.handle);
+      finishCleanup(this.#calls, primary, [directory.handle]);
     }
   }
 
@@ -5956,6 +6179,7 @@ class Session {
       entry,
       'validate_reference_inventory',
     );
+    const primary = { hasPrimary: false, value: undefined };
     try {
       const listing = this.#list(directory.handle, this.#artifact.handle);
       for (const { name } of listing.entries) {
@@ -6006,8 +6230,11 @@ class Session {
         previousResource: read(SERVICE_STORE_LAYOUT.resourceFiles.previous, validateServiceResourceProof),
         startup: read(SERVICE_STORE_LAYOUT.startup, validateServiceStartupProof),
       });
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      this.#calls.invoke('close_service_handle', directory.handle);
+      finishCleanup(this.#calls, primary, [directory.handle]);
     }
   }
 
@@ -6018,6 +6245,7 @@ class Session {
       entry,
       'validate_reference_inventory',
     );
+    const primary = { hasPrimary: false, value: undefined };
     try {
       const listing = this.#list(directory.handle, this.#artifact.handle);
       if (listing.entries.length !== 1 ||
@@ -6036,8 +6264,11 @@ class Session {
         throwStore('SERVICE_MANUAL_CLEANUP', 'validate_reference_inventory', this.#calls.writes, true);
       }
       return tombstone;
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      this.#calls.invoke('close_service_handle', directory.handle);
+      finishCleanup(this.#calls, primary, [directory.handle]);
     }
   }
 
@@ -6048,6 +6279,7 @@ class Session {
       entry,
       'validate_reference_inventory',
     );
+    const primary = { hasPrimary: false, value: undefined };
     try {
       const listing = this.#list(directory.handle, this.#artifact.handle);
       if (listing.entries.some(({ name }) => !MANUAL_FILE_SET.has(name))) {
@@ -6078,8 +6310,11 @@ class Session {
         );
       }
       return Object.freeze({ manual, cleanup });
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      this.#calls.invoke('close_service_handle', directory.handle);
+      finishCleanup(this.#calls, primary, [directory.handle]);
     }
   }
 
@@ -6205,6 +6440,7 @@ class Session {
         entry,
         operation,
       );
+      const primary = { hasPrimary: false, value: undefined };
       try {
         const listing = this.#list(
           directory.handle,
@@ -6267,6 +6503,7 @@ class Session {
             manifestEntry,
             operation,
           );
+          const manifestPrimary = { hasPrimary: false, value: undefined };
           try {
             const retainedRecord = this.#readInventoryRecord(
               manifestDirectory.handle,
@@ -6357,19 +6594,19 @@ class Session {
                 operation,
               );
             }
+          } catch (error) {
+            manifestPrimary.hasPrimary = true; manifestPrimary.value = error;
+            throw error;
           } finally {
-            this.#calls.invoke(
-              'close_service_handle',
-              manifestDirectory.handle,
-            );
+            finishCleanup(this.#calls, manifestPrimary, [manifestDirectory.handle]);
           }
           intents.push(cleanup);
         }
+      } catch (error) {
+        primary.hasPrimary = true; primary.value = error;
+        throw error;
       } finally {
-        this.#calls.invoke(
-          'close_service_handle',
-          directory.handle,
-        );
+        finishCleanup(this.#calls, primary, [directory.handle]);
       }
     }
     const targets = new Set();
@@ -6803,6 +7040,7 @@ class Session {
 
     const parts = [];
     let offset = 0;
+    const primary = { hasPrimary: false, value: undefined };
     try {
       let eof = false;
       while (!eof) {
@@ -6816,8 +7054,12 @@ class Session {
         eof = result.eof;
         if (result.bytes.length !== 0) parts.push(result.bytes);
       }
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      bridge.closeHandle(reader.handle, operation);
+      if (primary.hasPrimary) throwAfterCleanup(this.#calls, primary.value, () => bridge.closeHandle(reader.handle, operation));
+      else bridge.closeHandle(reader.handle, operation);
     }
     if (offset !== manifest.inventory.byteLength) {
       throwStore('SERVICE_MANUAL_CLEANUP', operation, this.#calls.writes, true);
@@ -7102,6 +7344,7 @@ class Session {
     let root = null;
     let directory = null;
     let locations = null;
+    const primary = { hasPrimary: false, value: undefined };
     try {
       root = validateOwnedRootResult(
         this.#calls,
@@ -7130,9 +7373,11 @@ class Session {
           'read_publication_receipt',
         );
       }
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      if (directory?.handle) { try { this.#calls.invoke('close_service_handle', directory.handle); } catch {} }
-      if (root?.handle) { try { this.#calls.invoke('close_service_handle', root.handle); } catch {} }
+      finishCleanup(this.#calls, primary, [root?.handle, directory?.handle]);
     }
     const receipt = locations === null
       ? Object.freeze({ binding: cloneJson(binding) })
@@ -7201,6 +7446,7 @@ class Session {
     }
     let root;
     let directory;
+    const primary = { hasPrimary: false, value: undefined };
     try {
       const raw = this.#calls.invoke('open_service_root', rootKind, 'read-existing');
       if (raw === null) throwStore('SERVICE_STALE', operation, this.#calls.writes);
@@ -7259,13 +7505,11 @@ class Session {
       });
       this.#observedPublications.set(binding.bindingFingerprint, receipt);
       return receipt;
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      if (directory?.handle) {
-        try { this.#calls.invoke('close_service_handle', directory.handle); } catch {}
-      }
-      if (root?.handle) {
-        try { this.#calls.invoke('close_service_handle', root.handle); } catch {}
-      }
+      finishCleanup(this.#calls, primary, [root?.handle, directory?.handle]);
     }
   }
 
@@ -7293,6 +7537,7 @@ class Session {
       throwStore('SERVICE_PENDING', 'create_shared_template_binding', this.#calls.writes);
     }
     let scope = null;
+    const primary = { hasPrimary: false, value: undefined };
     try {
       const opened = this.#calls.invoke('open_linux_service_scope', this.#config.roles, null, 'read-existing');
       if (!opened || typeof opened !== 'object' || opened.handle === null || opened.writes !== 0) {
@@ -7316,10 +7561,11 @@ class Session {
       }, this.#config.platform));
       this.#observedSharedTemplateBindings.add(binding.bindingFingerprint);
       return binding;
+    } catch (error) {
+      primary.hasPrimary = true; primary.value = error;
+      throw error;
     } finally {
-      if (scope !== null) {
-        try { this.#calls.invoke('close_service_handle', scope); } catch {}
-      }
+      finishCleanup(this.#calls, primary, [scope]);
     }
   }
 
