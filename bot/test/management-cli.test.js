@@ -445,69 +445,21 @@ test("management CLI rejects obsolete mapping recovery input for public recover"
   assert.equal(stdout.read(), "");
 });
 
-function runFreshManagementEntrypoint({ command, roles, expectedRoles }) {
-  const directory = mkdtempSync(join(tmpdir(), "gjc-remote-management-entrypoint-"));
-  const capturePath = join(directory, "roles.json");
-  const fakeNativePath = join(directory, "fake-native.mjs");
-  const loaderSource = `
-    export async function resolve(specifier, context, nextResolve) {
-      if (specifier === "@gjc-remote/native-control") {
-        return { shortCircuit: true, url: process.env.GJC_TEST_FAKE_NATIVE_URL };
-      }
-      return nextResolve(specifier, context);
-    }
-  `;
-  writeFileSync(fakeNativePath, `
-    import { writeFileSync } from "node:fs";
-    export async function createManagementNative(options) {
-      writeFileSync(process.env.GJC_TEST_ROLE_CAPTURE, JSON.stringify(options.roles));
-      if (JSON.stringify(options.roles) !== process.env.GJC_TEST_EXPECTED_ROLES) return null;
-      return new Proxy({}, { get: () => async () => undefined });
-    }
-  `);
-  const loaderPath = join(directory, "native-loader.mjs");
-  writeFileSync(loaderPath, loaderSource);
-  try {
-    const result = spawnSync(process.execPath, [
-      "--experimental-loader", pathToFileURL(loaderPath).href,
-      "src/management-entrypoint.js",
-      command,
-      "--actor-principal", "sid:S-1-5-18",
-      "--actor-secret-stdin", "true",
-    ], {
-      cwd: fileURLToPath(new URL("../", import.meta.url)),
-      encoding: "utf8",
-      input: JSON.stringify({ actorSecret: "owner-secret-is-long-enough" }),
-      env: {
-        ...process.env,
-        ...(roles === undefined ? { GJC_MANAGEMENT_ROLE_BINDINGS: "" } : { GJC_MANAGEMENT_ROLE_BINDINGS: roles }),
-        GJC_TEST_EXPECTED_ROLES: expectedRoles,
-        GJC_TEST_FAKE_NATIVE_URL: pathToFileURL(fakeNativePath).href,
-        GJC_TEST_ROLE_CAPTURE: capturePath,
-      },
-    });
-    return {
-      ...result,
-      capturedRoles: (() => {
-        try {
-          return JSON.parse(readFileSync(capturePath, "utf8"));
-        } catch {
-          return null;
-        }
-      })(),
-    };
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-}
-
-function runScriptedMappingPreconditionsEntrypoint({
+function runScriptedManagementEntrypoint({
+  command = "mapping-preconditions",
+  roles = JSON.stringify({
+    managementSid: "S-1-5-18",
+    botSid: "S-1-5-19",
+    recoverySid: "S-1-5-20",
+    systemSid: "S-1-5-18",
+  }),
+  expectedRoles = roles,
   mappingId = "map-1",
   stateMappingId = "map-1",
   actorSecret = "owner-secret-is-long-enough",
   storedSecret = actorSecret,
 } = {}) {
-  const directory = mkdtempSync(join(tmpdir(), "gjc-remote-mapping-preconditions-"));
+  const directory = mkdtempSync(join(tmpdir(), "gjc-remote-management-entrypoint-"));
   const capturePath = join(directory, "capture.json");
   const fakeNativePath = join(directory, "fake-native.mjs");
   const bootstrapPath = join(directory, "register-loader.mjs");
@@ -526,9 +478,10 @@ function runScriptedMappingPreconditionsEntrypoint({
     import { writeFileSync } from "node:fs";
 
     const calls = [];
+    let capturedRoles = null;
     const persist = (extra = {}) => writeFileSync(
       process.env.GJC_TEST_CAPTURE_PATH,
-      JSON.stringify({ calls, ...extra }),
+      JSON.stringify({ calls, roles: capturedRoles, ...extra }),
     );
     const requiredMethods = ${JSON.stringify([
       "readManagementState",
@@ -586,6 +539,9 @@ function runScriptedMappingPreconditionsEntrypoint({
     ])};
 
     export async function createManagementNative(options) {
+      capturedRoles = options.roles;
+      persist();
+      if (JSON.stringify(options.roles) !== process.env.GJC_TEST_EXPECTED_ROLES) return null;
       const { bootstrapOwner } = await import(process.env.GJC_TEST_MANAGEMENT_AUTH_URL);
       const {
         fingerprintManagedMappingRecord,
@@ -670,6 +626,10 @@ function runScriptedMappingPreconditionsEntrypoint({
           record("readManagementAuth");
           return structuredClone(authState.auth);
         },
+        async readAuthoritySuccessorHeadRaw() {
+          record("readAuthoritySuccessorHeadRaw");
+          return null;
+        },
         async configureManagementRoles(candidate) {
           record("configureManagementRoles", candidate);
           if (JSON.stringify(candidate) !== JSON.stringify(options.roles)) {
@@ -700,17 +660,19 @@ function runScriptedMappingPreconditionsEntrypoint({
       return native;
     }
   `);
-  const roles = JSON.stringify({
-    managementSid: "S-1-5-18",
-    botSid: "S-1-5-19",
-    recoverySid: "S-1-5-20",
-    systemSid: "S-1-5-18",
-  });
+  const argv = command === "mapping-preconditions"
+    ? mappingPreconditionsArgv(mappingId)
+    : [
+      command,
+      "--actor-principal", "sid:S-1-5-18",
+      "--actor-secret-stdin", "true",
+      ...(command === "recover" ? ["--idempotency-key", "fixture-recovery-001"] : []),
+    ];
   try {
     const result = spawnSync(process.execPath, [
       "--import", pathToFileURL(bootstrapPath).href,
       "src/management-entrypoint.js",
-      ...mappingPreconditionsArgv(mappingId),
+      ...argv,
     ], {
       cwd: fileURLToPath(new URL("../", import.meta.url)),
       encoding: "utf8",
@@ -719,7 +681,8 @@ function runScriptedMappingPreconditionsEntrypoint({
       input: JSON.stringify({ actorSecret }),
       env: {
         ...process.env,
-        GJC_MANAGEMENT_ROLE_BINDINGS: roles,
+        GJC_MANAGEMENT_ROLE_BINDINGS: roles ?? "",
+        GJC_TEST_EXPECTED_ROLES: expectedRoles,
         GJC_TEST_CAPTURE_PATH: capturePath,
         GJC_TEST_FAKE_NATIVE_URL: pathToFileURL(fakeNativePath).href,
         GJC_TEST_MANAGEMENT_AUTH_URL: pathToFileURL(fileURLToPath(new URL("../src/management-auth.js", import.meta.url))).href,
@@ -767,7 +730,7 @@ test("scripted non-thenable child native reaches exact mapping-preconditions suc
     ["missing-map", "map-1", null],
     ["constructor", "constructor", "present"],
   ]) {
-    const child = runScriptedMappingPreconditionsEntrypoint({ mappingId, stateMappingId });
+    const child = runScriptedManagementEntrypoint({ mappingId, stateMappingId });
     const result = readEntrypointResult(child);
     assert.equal(child.status, EXIT.OK);
     assert.deepEqual(Object.keys(result).sort(), [
@@ -807,7 +770,7 @@ test("mapping-preconditions child preserves code-unit minimum and UTF-8 byte max
   const validAstralSecret = "𐐀".repeat(8);
   assert.equal(validAstralSecret.length, 16);
   for (const actorSecret of [validAstralSecret, "x".repeat(4096)]) {
-    const valid = runScriptedMappingPreconditionsEntrypoint({
+    const valid = runScriptedManagementEntrypoint({
       actorSecret,
       storedSecret: actorSecret,
     });
@@ -825,7 +788,7 @@ test("mapping-preconditions child preserves code-unit minimum and UTF-8 byte max
   assert.equal(invalidSecrets[1].length, 15);
   assert.ok(Buffer.byteLength(invalidSecrets[2], "utf8") > 4096);
   for (const actorSecret of invalidSecrets) {
-    const child = runScriptedMappingPreconditionsEntrypoint({
+    const child = runScriptedManagementEntrypoint({
       actorSecret,
       storedSecret: "owner-secret-is-long-enough",
     });
@@ -843,7 +806,7 @@ test("mapping-preconditions child preserves code-unit minimum and UTF-8 byte max
   }
 });
 
-test("fresh management status and recover construct native with exact trusted role bindings", () => {
+test("fresh management status and recover complete with exact trusted role bindings", () => {
   const roles = JSON.stringify({
     managementSid: "S-1-5-21-100",
     botSid: "S-1-5-21-101",
@@ -851,10 +814,40 @@ test("fresh management status and recover construct native with exact trusted ro
     systemSid: "S-1-5-18",
   });
   for (const command of ["status", "recover"]) {
-    const result = runFreshManagementEntrypoint({ command, roles, expectedRoles: roles });
-    assert.equal(result.error, undefined);
-    assert.deepEqual(result.capturedRoles, JSON.parse(roles));
-    assert.doesNotMatch(result.stdout, /MANAGED_NATIVE_UNAVAILABLE/);
+    const child = runScriptedManagementEntrypoint({ command, roles });
+    const result = readEntrypointResult(child);
+    const expected = command === "status" ? {
+      exitCode: EXIT.OK,
+      ok: true,
+      authorityEpoch: 7,
+      tokenConfigGeneration: 2,
+      genesis: true,
+      recovery: "terminal",
+      routeDisposition: "no-route",
+    } : {
+      exitCode: EXIT.RECOVERY,
+      ok: false,
+      error: "RECOVERY_REQUIRED",
+      routeDisposition: "no-route",
+    };
+    assert.equal(child.status, expected.exitCode);
+    assert.deepEqual(result, expected);
+    assert.deepEqual(child.capture.roles, JSON.parse(roles));
+    assert.equal(child.capture.nonThenable, true);
+    assert.equal(child.capture.stateReads, 2);
+    assert.deepEqual(child.capture.calls.map(([name]) => name), [
+      "runStartupSelfTest",
+      "readManagementState",
+      "configureManagementRoles",
+      "withManagementLocks:start",
+      "readManagementState",
+      "readManagementAuth",
+      ...(command === "recover" ? ["readAuthoritySuccessorHeadRaw"] : []),
+      "withManagementLocks:end",
+    ]);
+    const locks = command === "status" ? ["mapping"] : ["genesis", "mapping", "admission"];
+    assert.deepEqual(child.capture.calls[3][1], locks);
+    assert.deepEqual(child.capture.calls.at(-1)[1], locks);
   }
 });
 
@@ -866,7 +859,7 @@ test("fresh management entrypoint refuses missing, malformed, and swapped role b
     systemSid: "S-1-5-18",
   });
   for (const roles of [
-    undefined,
+    null,
     "{",
     JSON.stringify({
       managementSid: "S-1-5-21-101",
@@ -875,8 +868,19 @@ test("fresh management entrypoint refuses missing, malformed, and swapped role b
       systemSid: "S-1-5-18",
     }),
   ]) {
-    const result = runFreshManagementEntrypoint({ command: "status", roles, expectedRoles });
-    assert.equal(result.error, undefined);
-    assert.match(result.stdout, /MANAGED_NATIVE_UNAVAILABLE/);
+    const child = runScriptedManagementEntrypoint({ command: "status", roles, expectedRoles });
+    assert.equal(child.status, EXIT.NATIVE);
+    assert.deepEqual(readEntrypointResult(child), {
+      exitCode: EXIT.NATIVE,
+      ok: false,
+      error: "MANAGED_NATIVE_UNAVAILABLE",
+      routeDisposition: "no-route",
+    });
+    if (roles === null || roles === "{") {
+      assert.equal(child.capture, null);
+    } else {
+      assert.deepEqual(child.capture.roles, JSON.parse(roles));
+      assert.deepEqual(child.capture.calls, []);
+    }
   }
 });
