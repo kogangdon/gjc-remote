@@ -47,7 +47,7 @@ const pinnedInstallation = await createPinnedDeploymentInstallation({
   includeStore: true,
 });
 after(() => pinnedInstallation.dispose());
-const { SERVICE_STORE_LAYOUT, createServiceStore } = pinnedInstallation.store;
+const { SERVICE_STORE_LAYOUT, createServiceStore, getServiceCleanupEvidenceInternal, projectServiceCleanupInternal } = pinnedInstallation.store;
 
 // This suite is an in-memory metadata model. It is explicitly not filesystem,
 // lock-kernel, ACL, durability, systemd, SCM, Shawl, or disposable-host evidence.
@@ -103,6 +103,8 @@ class FakeServiceNative {
     this.identityCounter = 0;
     this.factCounter = 0;
     this.calls = [];
+    this.ownedHandles = [];
+    this.closeAttempts = [];
     this.totalWrites = 0;
     this.publishOccurrences = new Map();
     this.publishFault = null;
@@ -253,6 +255,7 @@ class FakeServiceNative {
   handle(kind, node, parent = null, extra = {}) {
     const handle = { kind, node, parent, children: 0, closed: false, ...extra };
     if (parent) parent.children += 1;
+    this.ownedHandles.push(handle);
     return handle;
   }
 
@@ -365,12 +368,13 @@ class FakeServiceNative {
   close_service_handle(handle) {
     if (arguments.length !== 1) throw nativeError('SERVICE_INVALID', 'close_service_handle');
     if (!handle || typeof handle !== 'object') throw nativeError('SERVICE_INVALID', 'close_service_handle');
+    this.closeAttempts.push(handle);
     if (handle.closed) return undefined;
     if (handle.children !== 0 || (handle.kind === 'lock' && this.heldLocks.at(-1) !== handle)) {
       throw nativeError('SERVICE_PENDING', 'close_service_handle');
     }
     const closeName = handle.name ?? handle.node?.name;
-    if (this.closeFailure?.name === closeName &&
+    if (this.closeFailure !== null && this.closeFailure.name === closeName &&
         this.closeFailure.remaining > 0) {
       this.closeFailure.remaining -= 1;
       throw nativeError(
@@ -511,8 +515,9 @@ class FakeServiceNative {
     this.assertHandle(destination);
     this.assertHandle(artifactLock);
     if (source.kind !== 'directory' || source.node.rootKind !== 'staging' ||
+        source.node.profile !== 'service-release-directory' || source.children !== 0 ||
         !same(source.node.identity, identity) || destination.node.entries.has(name) ||
-        artifactLock.scope !== 'artifact') {
+        artifactLock.scope !== 'artifact' || !artifactLock.exclusive) {
       throw nativeError('SERVICE_INVALID', 'publish_service_directory_no_replace');
     }
     source.parent.node.entries.delete(source.node.name);
@@ -523,6 +528,7 @@ class FakeServiceNative {
     source.node.name = name;
     source.node.rootKind = destination.node.rootKind;
     const writes = this.recordWrite(1);
+    this.calls.push(`artifact-publish:${name}`);
     return { handle: source, identity: clone(source.node.identity), writes };
   }
 
@@ -699,8 +705,41 @@ class FakeServiceNative {
     return { removed: true, writes };
   }
 
-  seal_service_directory() {
-    throw nativeError('SERVICE_INVALID', 'seal_service_directory');
+  seal_service_directory(directory, expectedIdentity, artifactLock) {
+    if (arguments.length !== 3) throw nativeError('SERVICE_INVALID', 'seal_service_directory');
+    this.assertHandle(directory);
+    this.assertHandle(artifactLock);
+    if (directory.kind !== 'directory' || directory.node.rootKind !== 'staging' ||
+        directory.node.profile !== 'service-staging-directory' || directory.children !== 0 ||
+        !directory.parent || !same(directory.node.identity, expectedIdentity) ||
+        artifactLock.scope !== 'artifact' || !artifactLock.exclusive) {
+      throw nativeError('SERVICE_INVALID', 'seal_service_directory');
+    }
+    // Match the native bottom-up seal contract: descendants must already be
+    // sealed, and no live child wrapper may remain. This changes only ACL
+    // evidence/profile on the existing directory, never its object identity.
+    let files = 0;
+    const pending = [...directory.node.entries.values()];
+    while (pending.length !== 0) {
+      const node = pending.pop();
+      if (node.type === 'directory' && node.profile === 'service-release-directory') {
+        pending.push(...node.entries.values());
+      } else if (node.type === 'file' &&
+          ['service-release-file', 'service-release-executable'].includes(node.profile) &&
+          node.facts.size === node.bytes.length && node.facts.sha256 === sha256(node.bytes)) {
+        files += 1;
+      } else {
+        throw nativeError('SERVICE_STALE', 'seal_service_directory', 0, true);
+      }
+    }
+    if (files === 0) throw nativeError('SERVICE_STALE', 'seal_service_directory', 0, true);
+    directory.node.profile = 'service-release-directory';
+    directory.node.identity = { ...directory.node.identity,
+      profile: directory.node.profile,
+      securitySha256: sha256(Buffer.from(`sealed:${directory.node.identity.securitySha256}`)),
+    };
+    this.calls.push(`artifact-seal:${directory.node.name}`);
+    return { handle: directory, identity: clone(directory.node.identity), writes: this.recordWrite(1) };
   }
 
   open_service_artifact_source() {
@@ -1095,6 +1134,7 @@ function realArchiveApplication({
   sequence = 1,
   version = '1.0.0',
   payloadSeed = 'scratch-payload',
+  flatPayloadEntries = 0,
 } = {}) {
   const files = new Map([
     ['bot/src/bot.js', Buffer.from(`${payloadSeed}:bot`)],
@@ -1105,6 +1145,9 @@ function realArchiveApplication({
     ],
     ['lib/data', Buffer.from(`${payloadSeed}:lib`)],
   ]);
+  for (let index = 0; index < flatPayloadEntries; index += 1) {
+    files.set(`flat-${String(index).padStart(6, '0')}`, Buffer.from(`${payloadSeed}:${index}`));
+  }
   const inventory = buildBundleInventory({
     payloadEntries: [...files].map(([path, bytes]) => ({
       path,
@@ -1170,6 +1213,7 @@ function realArchiveApplication({
   );
   return {
     archive,
+    files,
     inventory,
     inventoryBytes,
     manifest,
@@ -1177,10 +1221,11 @@ function realArchiveApplication({
   };
 }
 
-function committedScratchResidue({ admitCurrentMetadata = false } = {}) {
+function committedScratchResidue({ admitCurrentMetadata = false, deployment = realArchiveApplication(), configureNative = null } = {}) {
   const fake = new FakeServiceNative();
+  configureNative?.(fake);
   const store = bootstrap(fake);
-  const deployment = realArchiveApplication();
+  const handleStart = fake.ownedHandles.length;
   const session = store.openMutation();
   const initialCurrent = admitCurrentMetadata ? {
     manifest: session.readManifest('current'),
@@ -1265,6 +1310,7 @@ function committedScratchResidue({ admitCurrentMetadata = false } = {}) {
     fake,
     store,
     session,
+    handleStart,
     deployment,
     identity,
     prepared,
@@ -1285,6 +1331,12 @@ async function stagePartialScratchCandidate(model) {
   access.prepareCandidate(model.deployment.inventoryBytes);
   await access.writeCandidateFile('lib/data', [model.deployment.payloadBytes]);
   access.close();
+  const writers = model.fake.ownedHandles.filter((handle) => handle.kind === 'artifact-writer');
+  assert.ok(writers.length > 0);
+  for (const writer of writers) {
+    assert.equal(writer.closed, true, 'successful finalization confirms writer closure');
+    assert.equal(model.fake.closeAttempts.includes(writer), false, 'finalized writers must not receive another native close');
+  }
 }
 
 function commitScratchResidueTransaction(model) {
@@ -4088,7 +4140,7 @@ test('model: final cleanup-intent CAS failure retains recovery authority until e
   recovery.close();
 });
 
-test('model: failed reader, directory, and root closes retain the session borrow until explicit retry', async () => {
+test('model: failed reader, directory, and root closes retain uncertainty without native retries', async () => {
   for (const name of [
     'bundle-files.json',
     'bot',
@@ -4141,7 +4193,6 @@ test('model: failed reader, directory, and root closes retain the session borrow
     assert.throws(
       () => model.session.close(),
       (error) => error.code === 'SERVICE_IO_FAILED' &&
-        error.operation === 'close_service_store' &&
         error.writes === before &&
         error.ambiguous === true,
     );
@@ -4154,21 +4205,22 @@ test('model: failed reader, directory, and root closes retain the session borrow
     );
     await assert.rejects(
       model.session.recoverPublishedArtifactCollection(),
-      (error) => error.code === 'SERVICE_IO_FAILED' &&
+      (error) => error.code === 'SERVICE_PENDING' &&
         error.operation === 'recover_published_artifact_collection' &&
-        error.writes === before &&
-        error.ambiguous === true,
+        error.writes === before,
     );
+    const attempts = model.fake.closeAttempts.slice();
+    const evidence = getServiceCleanupEvidenceInternal(model.session).cleanup;
+    assert.ok(evidence.attemptedUnconfirmed > 0);
+    assert.ok(evidence.blockedUnattempted > 0);
     model.fake.closeFailure.remaining = 0;
-    assert.deepEqual(
-      await model.session.recoverPublishedArtifactCollection(),
-      { collected: false, cleanupReleased: true },
-    );
-    model.session.close();
+    assert.throws(() => model.session.close(), (error) => error.code === 'SERVICE_IO_FAILED');
+    assert.deepEqual(model.fake.closeAttempts, attempts);
+    assert.deepEqual(getServiceCleanupEvidenceInternal(model.session).cleanup, evidence);
   }
 });
 
-test('model: invalid reader receipts retain raw children ahead of collector parents until retry', async () => {
+test('model: invalid reader receipts retain raw children ahead of collector parents without retry', async () => {
   const model = unreferencedApplicationCollectionModel();
   model.fake.artifactReaderReceiptFault = 'bundle-files.json';
   model.fake.closeFailure = {
@@ -4197,26 +4249,24 @@ test('model: invalid reader receipts retain raw children ahead of collector pare
   assert.throws(
     () => model.session.close(),
     (error) => error.code === 'SERVICE_IO_FAILED' &&
-      error.operation === 'close_service_store' &&
       error.writes === before &&
       error.ambiguous === true,
   );
   assert.equal(model.fake.activeArtifactReaders, 1);
   await assert.rejects(
     model.session.recoverPublishedArtifactCollection(),
-    (error) => error.code === 'SERVICE_IO_FAILED' &&
+    (error) => error.code === 'SERVICE_PENDING' &&
       error.operation === 'recover_published_artifact_collection' &&
-      error.writes === before &&
-      error.ambiguous === true,
+      error.writes === before,
   );
   assert.equal(model.fake.activeArtifactReaders, 1);
+  const attempts = model.fake.closeAttempts.slice();
+  const evidence = getServiceCleanupEvidenceInternal(model.session).cleanup;
   model.fake.closeFailure.remaining = 0;
-  assert.deepEqual(
-    await model.session.recoverPublishedArtifactCollection(),
-    { collected: false, cleanupReleased: true },
-  );
-  assert.equal(model.fake.activeArtifactReaders, 0);
-  model.session.close();
+  assert.throws(() => model.session.close(), (error) => error.code === 'SERVICE_IO_FAILED');
+  assert.equal(model.fake.activeArtifactReaders, 1);
+  assert.deepEqual(model.fake.closeAttempts, attempts);
+  assert.deepEqual(getServiceCleanupEvidenceInternal(model.session).cleanup, evidence);
 });
 
 test('model: a sibling cleanup intent blocks digest-alias acquisition before staging while unrelated targets remain admissible', async () => {
@@ -7444,3 +7494,465 @@ test('model: Linux store remains write-free with no Windows trial boundary', () 
   );
   mutation.close();
 });
+
+test('model: session cleanup follows actual reverse acquisition and caches confirmed closure', () => {
+  const fake = new FakeServiceNative();
+  const store = bootstrap(fake);
+  const start = fake.ownedHandles.length;
+  const session = store.openReadOnly();
+  const owned = fake.ownedHandles.slice(start).filter((handle) => !handle.closed);
+  const locks = session.handoffDriverLocks();
+  const attempts = fake.closeAttempts.length;
+  const report = session.close();
+  assert.deepEqual(fake.closeAttempts.slice(attempts), owned.slice().reverse());
+  assert.equal(report.closed, report.total);
+  assert.equal(report.attemptedUnconfirmed, 0);
+  assert.equal(report.blockedUnattempted, 0);
+  assert.ok(owned.includes(locks.artifact));
+  assert.ok(owned.includes(locks.sharedTemplate));
+  assert.ok(owned.includes(locks.serviceKey));
+  assert.equal(session.writes, 0);
+  const settledAttempts = fake.closeAttempts.length;
+  assert.equal(session.close(), report);
+  assert.equal(fake.closeAttempts.length, settledAttempts);
+});
+
+for (const closesBeforeThrow of [false, true]) {
+  test(`model: independent close failures block parents and are never retried (consumed=${closesBeforeThrow})`, () => {
+    const fake = new FakeServiceNative();
+    bootstrap(fake);
+    const failing = new Set();
+    const base = fake.facade.close_service_handle;
+    fake.facade = Object.freeze({ ...fake.facade, close_service_handle: (handle) => {
+      if (!failing.has(handle)) return base(handle);
+      if (closesBeforeThrow) base(handle);
+      else fake.closeAttempts.push(handle);
+      throw nativeError('SERVICE_IO_FAILED', 'close_service_handle', 0, true);
+    } });
+    const start = fake.ownedHandles.length;
+    const session = storeFor(fake).openReadOnly();
+    const owned = fake.ownedHandles.slice(start).filter((handle) => !handle.closed);
+    for (const handle of owned) {
+      if (handle.kind === 'directory' && ['manifest', 'reference'].includes(handle.node.name)) failing.add(handle);
+    }
+    assert.equal(failing.size, 2);
+    const attemptStart = fake.closeAttempts.length;
+    expectCode(() => session.close(), 'SERVICE_IO_FAILED');
+    const attempts = fake.closeAttempts.slice(attemptStart);
+    assert.ok(attempts.length > failing.size, 'independent eligible resources must make progress');
+    for (const handle of failing) assert.equal(attempts.filter((entry) => entry === handle).length, 1);
+    assert.equal(attempts.some((handle) => handle.kind === 'root'), false);
+    assert.equal(attempts.some((handle) => handle.scope === 'artifact' || handle.scope === 'shared-template'), false);
+    const report = getServiceCleanupEvidenceInternal(session).cleanup;
+    assert.equal(report.attemptedUnconfirmed, 2);
+    assert.ok(report.blockedUnattempted >= 3);
+    const count = fake.closeAttempts.length;
+    failing.clear();
+    expectCode(() => session.close(), 'SERVICE_IO_FAILED');
+    assert.equal(fake.closeAttempts.length, count);
+    assert.deepEqual(getServiceCleanupEvidenceInternal(session).cleanup, report);
+    expectCode(() => session.handoffDriverLocks(), 'SERVICE_PENDING');
+    assert.equal(session.writes, 0);
+  });
+}
+
+test('model: partial close advances only unattempted resources after an outstanding borrow releases', () => {
+  const model = committedScratchResidue();
+  const locks = model.session.handoffDriverLocks();
+  const access = model.session.openArtifactAccess({
+    purpose: 'application', manifest: model.deployment.manifest, transaction: model.reserved,
+  });
+  const attempts = model.fake.closeAttempts.length;
+  expectCode(() => model.session.close(), 'SERVICE_PENDING');
+  assert.equal(model.fake.closeAttempts.length, attempts);
+  assert.equal(getServiceCleanupEvidenceInternal(model.session).cleanup.attemptedUnconfirmed, 0);
+  assert.equal(model.session.handoffDriverLocks(), locks, 'a refused close has not begun session settlement');
+  access.close();
+  const released = model.fake.closeAttempts.slice(attempts);
+  assert.ok(released.length > 0);
+  for (const lock of Object.values(locks)) {
+    assert.equal(lock.closed, false, 'artifact access must not close its borrowed session lock');
+    assert.equal(released.includes(lock), false);
+  }
+  const report = model.session.close();
+  assert.equal(report.closed, report.total);
+  for (const handle of released) {
+    assert.equal(model.fake.closeAttempts.slice(attempts).filter((entry) => entry === handle).length, 1);
+  }
+  assert.equal(model.session.close(), report);
+});
+
+for (const publication of ['confirmed', 'rejected-before-reparent', 'ambiguous-before-reparent', 'ambiguous-after-reparent', 'invalid-receipt']) {
+  for (const closesBeforeThrow of publication === 'confirmed' ? [false, true] : [false]) {
+    test(`model: publication cleanup fences the actual or possible parents (${publication}, consumed=${closesBeforeThrow})`, async () => {
+      let candidate;
+      let destination;
+      let scratch;
+      let stagingRoot;
+      const model = committedScratchResidue({ configureNative: (fake) => {
+        const base = fake.facade;
+        fake.facade = Object.freeze({ ...base,
+          publish_service_directory_no_replace: (...args) => {
+            [candidate, destination] = args;
+            scratch = candidate.parent;
+            stagingRoot = scratch.parent;
+            if (publication === 'rejected-before-reparent' || publication === 'ambiguous-before-reparent') {
+              throw nativeError('SERVICE_IO_FAILED', 'publish_service_directory_no_replace', 0, publication === 'ambiguous-before-reparent');
+            }
+            const result = base.publish_service_directory_no_replace(...args);
+            if (publication === 'ambiguous-after-reparent') {
+              throw nativeError('SERVICE_IO_FAILED', 'publish_service_directory_no_replace', result.writes, true);
+            }
+            if (publication === 'invalid-receipt') result.handle = null;
+            return result;
+          },
+          close_service_handle: (handle) => {
+            if (handle !== candidate) return base.close_service_handle(handle);
+            if (closesBeforeThrow) base.close_service_handle(handle);
+            else fake.closeAttempts.push(handle);
+            throw nativeError('SERVICE_IO_FAILED', 'close_service_handle', 0, true);
+          },
+        });
+      } });
+      const { fake, session, deployment } = model;
+      // The residue fixture normally seeds a reusable publication. Exercise a
+      // new publication so the same candidate wrapper actually changes parent.
+      fake.roots.get('releases').node.entries.delete(deployment.manifest.archive.sha256);
+      const baselineOpen = fake.ownedHandles.filter((handle) => !handle.closed).length;
+      const access = session.openArtifactAccess({
+        purpose: 'application', manifest: deployment.manifest, transaction: model.reserved,
+      });
+      await access.stageAsset([deployment.archive]);
+      access.prepareCandidate(deployment.inventoryBytes);
+      for (const [path, bytes] of deployment.files) await access.writeCandidateFile(path, [bytes]);
+      const attemptStart = fake.closeAttempts.length;
+      expectCode(() => access.publishCandidate(), publication === 'invalid-receipt' ? 'SERVICE_MANUAL_CLEANUP' : 'SERVICE_IO_FAILED');
+      assert.ok(candidate && destination && scratch && stagingRoot);
+      assert.ok(fake.calls.includes('artifact-seal:candidate'), 'reach publication only after real bottom-up model sealing');
+      assert.equal(candidate.node.profile, 'service-release-directory');
+      const rejected = publication === 'rejected-before-reparent';
+      assert.equal(candidate.parent, rejected || publication === 'ambiguous-before-reparent' ? scratch : destination);
+      assert.equal(fake.calls.includes(`artifact-publish:${deployment.manifest.archive.sha256}`),
+        !rejected && publication !== 'ambiguous-before-reparent');
+      expectCode(() => access.close(), 'SERVICE_IO_FAILED');
+      const attempts = fake.closeAttempts.slice(attemptStart);
+      assert.equal(attempts.filter((handle) => handle === candidate).length, 1, 'uncertain candidate closure must never be retried');
+      assert.equal(attempts.filter((handle) => handle === destination).length, rejected ? 1 : 0,
+        'a possible destination parent must be blocked before any native close');
+      const confirmed = publication === 'confirmed';
+      for (const parent of [scratch, stagingRoot]) {
+        assert.equal(parent.closed, confirmed, 'only validated publication releases the old-parent fence');
+        assert.equal(attempts.filter((handle) => handle === parent).length, confirmed ? 1 : 0);
+      }
+      assert.equal(candidate.closed, closesBeforeThrow);
+      assert.equal(destination.closed, rejected);
+      expectCode(() => session.close(), 'SERVICE_PENDING');
+      const report = getServiceCleanupEvidenceInternal(session).cleanup;
+      const total = fake.ownedHandles.length - model.handleStart;
+      const blocked = baselineOpen + (confirmed ? 1 : rejected ? 2 : 3);
+      assert.equal(report.total, total, 'history includes finalized writers and closed verification readers');
+      assert.equal(report.attemptedUnconfirmed, 1, 'no parent may be misclassified as attempted');
+      assert.equal(report.blockedUnattempted, blocked);
+      assert.equal(report.closed, total - blocked - 1);
+      const settledAttempts = fake.closeAttempts.length;
+      expectCode(() => access.close(), 'SERVICE_IO_FAILED');
+      expectCode(() => session.close(), 'SERVICE_PENDING');
+      assert.equal(fake.closeAttempts.length, settledAttempts);
+      assert.deepEqual(getServiceCleanupEvidenceInternal(session).cleanup, report);
+    });
+  }
+}
+
+test('model: large flat payload cleanup uses linear active-dependency work while retaining history', async () => {
+  const flatPayloadEntries = 2048;
+  const model = committedScratchResidue({ deployment: realArchiveApplication({ flatPayloadEntries }) });
+  const { fake, session, deployment } = model;
+  fake.roots.get('releases').node.entries.delete(deployment.manifest.archive.sha256);
+  const access = session.openArtifactAccess({
+    purpose: 'application', manifest: deployment.manifest, transaction: model.reserved,
+  });
+  await access.stageAsset([deployment.archive]);
+  access.prepareCandidate(deployment.inventoryBytes);
+  for (const [path, bytes] of deployment.files) await access.writeCandidateFile(path, [bytes]);
+  const handleStart = fake.ownedHandles.length;
+  const originals = { some: Array.prototype.some, findLast: Array.prototype.findLast,
+    add: Set.prototype.add, delete: Set.prototype.delete };
+  const operations = { historicalEntries: 0, activeEdges: 0 };
+  const budget = 128 * (deployment.files.size + 32);
+  const count = (entry, category) => {
+    if (entry === null || typeof entry !== 'object' ||
+        !Object.hasOwn(entry, 'dependencies') || !Object.hasOwn(entry, 'resource') ||
+        !Object.hasOwn(entry, 'state') || !Object.hasOwn(entry, 'handle')) return;
+    operations[category] += 1;
+    assert.ok(operations.historicalEntries + operations.activeEdges <= budget,
+      'dependency operations must stay linear in payload entries, not historical handle pairs');
+  };
+  let report;
+  // Instrument only this synchronous model phase and restore every intrinsic
+  // even on failure. Count real ledger visits/edge updates, never elapsed time.
+  try {
+    for (const method of ['some', 'findLast']) {
+      Array.prototype[method] = function(callback, thisArg) {
+        return originals[method].call(this, (entry, index, array) => {
+          count(entry, 'historicalEntries');
+          return callback.call(thisArg, entry, index, array);
+        });
+      };
+    }
+    for (const method of ['add', 'delete']) {
+      Set.prototype[method] = function(entry) {
+        count(entry, 'activeEdges');
+        return originals[method].call(this, entry);
+      };
+    }
+    access.publishCandidate();
+    access.close();
+    report = session.close();
+  } finally {
+    Array.prototype.some = originals.some;
+    Array.prototype.findLast = originals.findLast;
+    Set.prototype.add = originals.add;
+    Set.prototype.delete = originals.delete;
+  }
+  const readers = fake.ownedHandles.slice(handleStart).filter((handle) => handle.kind === 'artifact-reader');
+  assert.ok(fake.calls.includes('artifact-seal:candidate'), 'exercise the candidate seal, not a publication bypass');
+  assert.ok(fake.calls.includes(`artifact-publish:${deployment.manifest.archive.sha256}`), 'exercise actual native-model reparenting');
+  assert.ok(readers.length >= flatPayloadEntries * 3, 'exercise repeated full flat-payload verification');
+  assert.ok(operations.activeEdges >= readers.length * 2, 'the counter must observe real ledger work');
+  assert.equal(operations.historicalEntries, 0, 'neither close nor lock lookup may scan retained history');
+  assert.ok(operations.activeEdges <= budget);
+  assert.equal(report.total, fake.ownedHandles.length - model.handleStart);
+  assert.equal(report.closed, report.total, 'closed readers and finalized writers remain in outcome evidence');
+  assert.equal(report.blockedUnattempted, 0);
+  assert.equal(report.attemptedUnconfirmed, 0);
+  assert.equal(session.close(), report);
+  const closeAttempts = new Set(fake.closeAttempts);
+  for (const writer of fake.ownedHandles.filter((handle) => handle.kind === 'artifact-writer')) {
+    assert.equal(closeAttempts.has(writer), false, 'confirmed writer finalization is not closed again');
+  }
+});
+
+for (const fault of ['root', 'registration-history', 'lock', 'namespace', 'initialize']) {
+  test(`model: partial ${fault} acquisition/init failure closes every returned owned resource`, () => {
+    const fake = new FakeServiceNative();
+    bootstrap(fake);
+    const base = fake.facade;
+    const start = fake.ownedHandles.length;
+    fake.facade = Object.freeze({ ...base,
+      open_service_root: (...args) => {
+        const value = base.open_service_root(...args);
+        if (fault === 'root') value.rootBinding.identity.owner = 'uid:9999';
+        return value;
+      },
+      open_service_directory: (...args) => {
+        const value = base.open_service_directory(...args);
+        if ((fault === 'registration-history' && args[1] === SERVICE_STORE_LAYOUT.historyDirectory) ||
+            (fault === 'namespace' && args[1] === 'manifest')) value.identity = null;
+        return value;
+      },
+      acquire_service_lock: (...args) => {
+        const value = base.acquire_service_lock(...args);
+        if (fault === 'lock' && args[1] === 'shared-template') value.identity = null;
+        return value;
+      },
+      read_service_file: (...args) => {
+        if (fault === 'initialize' && args[0].node.name === 'bot') {
+          throw nativeError('SERVICE_IO_FAILED', 'read_service_file');
+        }
+        return base.read_service_file(...args);
+      },
+    });
+    if (fault === 'initialize') fake.serviceDirectory('manifest', 'bot', true);
+    const store = storeFor(fake);
+    assert.throws(() => store.openReadOnly());
+    const acquired = fake.ownedHandles.slice(start);
+    assert.ok(acquired.length > 0);
+    assert.ok(acquired.every((handle) => handle.closed));
+    for (const handle of acquired) assert.equal(fake.closeAttempts.filter((entry) => entry === handle).length, 1);
+    const evidence = getServiceCleanupEvidenceInternal(store);
+    assert.equal(evidence.hasPrimary, true);
+    assert.equal(evidence.cleanup.closed, evidence.cleanup.total);
+    assert.equal(fake.heldLocks.length, 0);
+  });
+}
+
+for (const primary of [Object.freeze(new Error('frozen primary /private')), Object.preventExtensions(new Error('sealed primary')), undefined, null, false, 0, '']) {
+  test(`model: partial returned handle preserves exact primary (${typeof primary}:${String(primary)}) with independent cleanup evidence`, () => {
+    const fake = new FakeServiceNative();
+    bootstrap(fake);
+    const base = fake.facade;
+    let failedHandle;
+    fake.facade = Object.freeze({ ...base,
+      open_service_directory: (...args) => {
+        const value = base.open_service_directory(...args);
+        if (args[1] === 'manifest') {
+          failedHandle = value.handle;
+          Object.defineProperty(value, 'writes', { get() { throw primary; } });
+        }
+        return value;
+      },
+      close_service_handle: (handle) => {
+        if (handle !== failedHandle) return base.close_service_handle(handle);
+        fake.closeAttempts.push(handle);
+        throw nativeError('SERVICE_IO_FAILED', 'close_service_handle', 0, true);
+      },
+    });
+    const store = storeFor(fake);
+    const descriptors = primary instanceof Error ? Object.getOwnPropertyDescriptors(primary) : null;
+    let caught = false;
+    try { store.openReadOnly(); } catch (error) { caught = true; assert.equal(error, primary); }
+    assert.equal(caught, true);
+    assert.ok(failedHandle);
+    assert.equal(fake.closeAttempts.filter((entry) => entry === failedHandle).length, 1);
+    const evidence = getServiceCleanupEvidenceInternal(store);
+    assert.equal(evidence.hasPrimary, true);
+    assert.equal(evidence.writes, null, 'throwing write evidence must not fabricate a known zero');
+    assert.equal(evidence.cleanup.attemptedUnconfirmed, 1);
+    assert.ok(evidence.cleanup.blockedUnattempted > 0);
+    if (descriptors) assert.deepEqual(Object.getOwnPropertyDescriptors(primary), descriptors);
+    if (primary instanceof Error) assert.deepEqual(getServiceCleanupEvidenceInternal(primary), evidence);
+  });
+}
+
+test('model: cleanup projection is bounded, enum-only and refuses unsafe/overflow counts', () => {
+  let reads = 0;
+  const failures = Array.from({ length: 10 }, (_, index) => ({
+    resource: index === 0 ? 'DIRECTORY' : '/private/path', operation: 'arbitrary-message',
+    code: index === 0 ? 'SERVICE_IO_FAILED' : 'SERVICE_SECRET_PAYLOAD', state: 'ATTEMPTED_UNCONFIRMED',
+    message: '/private/path', stack: 'secret stack', cause: { secret: true }, handle: { secret: true },
+  }));
+  Object.defineProperty(failures[1], 'code', { get() { reads += 1; throw new Error('must not read'); } });
+  const report = projectServiceCleanupInternal({ total: 12, closed: 2, blockedUnattempted: 0, attemptedUnconfirmed: 10, failures });
+  assert.equal(report.failures.length, 8);
+  assert.equal(report.omittedFailures, 2);
+  assert.equal(reads, 0);
+  assert.equal(report.failures[0].code, 'SERVICE_IO_FAILED');
+  assert.equal(report.failures[1].code, 'UNKNOWN');
+  for (const failure of report.failures) {
+    assert.deepEqual(Object.keys(failure), ['resource', 'operation', 'code', 'state']);
+    for (const value of Object.values(failure)) assert.match(value, /^[A-Z_]{1,48}$/);
+  }
+  assert.equal(JSON.stringify(report).includes('private'), false);
+  assert.equal(JSON.stringify(report).includes('secret'), false);
+  for (const total of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    expectCode(() => projectServiceCleanupInternal({ total, closed: total, blockedUnattempted: 0, attemptedUnconfirmed: 0, failures: [] }), 'SERVICE_MANUAL_CLEANUP');
+  }
+  expectCode(() => projectServiceCleanupInternal({ total: Number.MAX_SAFE_INTEGER, closed: Number.MAX_SAFE_INTEGER,
+    blockedUnattempted: 1, attemptedUnconfirmed: 0, failures: [{}] }), 'SERVICE_MANUAL_CLEANUP');
+  expectCode(() => projectServiceCleanupInternal({ total: 2, closed: 0, blockedUnattempted: 0, attemptedUnconfirmed: 2,
+    failures: [{}], omittedFailures: 0 }), 'SERVICE_MANUAL_CLEANUP');
+});
+
+test('model: native primary translation keeps its cause/writes while private cleanup accounts for later writes', () => {
+  const fake = new FakeServiceNative();
+  bootstrap(fake);
+  const base = fake.facade;
+  const primary = Object.freeze(nativeError('SERVICE_IO_FAILED', 'read_service_file', 2, true));
+  let history;
+  fake.facade = Object.freeze({ ...base,
+    open_service_directory: (...args) => {
+      const result = base.open_service_directory(...args);
+      if (args[1] === SERVICE_STORE_LAYOUT.historyDirectory) history = result.handle;
+      return result;
+    },
+    read_service_file: (...args) => {
+      if (args[1] === SERVICE_STORE_LAYOUT.registrationIncarnation) throw primary;
+      return base.read_service_file(...args);
+    },
+    close_service_handle: (handle) => {
+      if (handle !== history) return base.close_service_handle(handle);
+      fake.closeAttempts.push(handle);
+      throw nativeError('SERVICE_IO_FAILED', 'close_service_handle', 3, true);
+    },
+  });
+  const store = storeFor(fake);
+  assert.throws(() => store.openReadOnly(), (error) => {
+    assert.equal(error.name, 'ServiceStoreError');
+    assert.equal(error.code, primary.code);
+    assert.equal(error.operation, primary.operation);
+    assert.equal(error.cause, primary);
+    assert.equal(error.writes, 2);
+    const evidence = getServiceCleanupEvidenceInternal(error);
+    assert.equal(evidence.hasPrimary, true);
+    assert.equal(evidence.writes, 5);
+    assert.equal(evidence.cleanup.attemptedUnconfirmed, 1);
+    assert.equal(evidence.cleanup.blockedUnattempted, 2);
+    return true;
+  });
+  assert.equal(fake.closeAttempts.filter((entry) => entry === history).length, 1);
+});
+
+test('model: bootstrap tracks a returned root before a post-acquisition validation failure', () => {
+  const fake = new FakeServiceNative();
+  const base = fake.facade.open_service_root;
+  fake.facade = Object.freeze({ ...fake.facade, open_service_root: (...args) => {
+    const result = base(...args);
+    result.rootBinding = null;
+    return result;
+  } });
+  const store = storeFor(fake);
+  expectCode(() => store.bootstrap(), 'SERVICE_INVALID');
+  assert.equal(fake.ownedHandles.length, 1);
+  assert.equal(fake.ownedHandles[0].closed, true);
+  assert.equal(fake.closeAttempts.length, 1);
+  const evidence = getServiceCleanupEvidenceInternal(store);
+  assert.equal(evidence.hasPrimary, true);
+  assert.equal(evidence.writes, fake.totalWrites);
+  assert.equal(evidence.cleanup.closed, 1);
+});
+
+for (const accessorBacked of [false, true]) {
+  for (const ambiguous of [false, true]) {
+    test(`model: native translation preserves ${accessorBacked ? 'accessor' : 'inherited'} metadata and cause (ambiguous=${ambiguous})`, () => {
+      const fake = new FakeServiceNative();
+      bootstrap(fake);
+      const base = fake.facade;
+      const reads = { code: 0, operation: 0, writes: 0, ambiguous: 0 };
+      const metadata = { code: 'SERVICE_ACCESS_DENIED', operation: 'read_native_metadata', writes: 4, ambiguous };
+      const prototype = {};
+      for (const [key, value] of Object.entries(metadata)) {
+        Object.defineProperty(prototype, key, accessorBacked
+          ? { get() { reads[key] += 1; return value; } }
+          : { value });
+      }
+      const primary = Object.freeze(Object.create(prototype));
+      const cleanup = Object.freeze(Object.create({
+        code: 'SERVICE_IO_FAILED', operation: 'close_native_metadata', writes: 5, ambiguous: true,
+      }));
+      let history;
+      fake.facade = Object.freeze({ ...base,
+        open_service_directory: (...args) => {
+          const result = base.open_service_directory(...args);
+          if (args[1] === SERVICE_STORE_LAYOUT.historyDirectory) history = result.handle;
+          return result;
+        },
+        read_service_file: (...args) => {
+          if (args[1] === SERVICE_STORE_LAYOUT.registrationIncarnation) throw primary;
+          return base.read_service_file(...args);
+        },
+        close_service_handle: (handle) => {
+          if (handle !== history) return base.close_service_handle(handle);
+          fake.closeAttempts.push(handle);
+          throw cleanup;
+        },
+      });
+      const store = storeFor(fake);
+      assert.throws(() => store.openReadOnly(), (error) => {
+        assert.equal(error.name, 'ServiceStoreError');
+        assert.equal(error.code, metadata.code);
+        assert.equal(error.operation, metadata.operation);
+        assert.equal(error.writes, 4);
+        assert.equal(error.ambiguous, ambiguous);
+        assert.equal(error.cause, primary);
+        const evidence = getServiceCleanupEvidenceInternal(error);
+        assert.equal(evidence.hasPrimary, true);
+        assert.equal(evidence.writes, 9, 'valid inherited cleanup writes must not be discarded');
+        assert.equal(evidence.cleanup.attemptedUnconfirmed, 1);
+        assert.equal(evidence.cleanup.blockedUnattempted, 2);
+        return true;
+      });
+      if (accessorBacked) assert.deepEqual(reads, { code: 2, operation: 2, writes: ambiguous ? 2 : 3, ambiguous: 1 });
+      assert.equal(fake.closeAttempts.filter((handle) => handle === history).length, 1);
+    });
+  }
+}
