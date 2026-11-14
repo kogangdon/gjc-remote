@@ -342,11 +342,20 @@ function versionAtLeast(value, minimum) {
   return parsed !== null && parsed[0] > minimum[0] || parsed !== null && parsed[0] === minimum[0] && (parsed[1] > minimum[1] || parsed[1] === minimum[1] && parsed[2] >= minimum[2]);
 }
 
-async function gitHead() {
-  const child = Bun.spawn(["git", "rev-parse", "HEAD"], { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
-  const stdout = await new Response(child.stdout).text();
-  const status = await child.exited;
-  requireCondition(status === 0, "PROVENANCE_UNAVAILABLE", "git base commit could not be read");
+export async function gitHead(spawn = Bun.spawn) {
+  const canonicalRoot = await realpath(repoRoot);
+  const child = spawn([
+    "git", "-c", `safe.directory=${canonicalRoot.replaceAll("\\", "/")}`, "rev-parse", "HEAD",
+  ], { cwd: canonicalRoot, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, status] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  requireCondition(status === 0, "PROVENANCE_UNAVAILABLE", "git base commit could not be read", {
+    exitCode: status,
+    stderr: redactedText(stderr, {}),
+  });
   return stdout.trim();
 }
 async function orderedChangeDigest() {
