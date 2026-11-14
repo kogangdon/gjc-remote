@@ -6325,7 +6325,7 @@ napi_value ReadFileFactsNoFollow(napi_env env, napi_callback_info info) {
                                    sizeof(after_standard)) &&
       SameWindowsFileId(before_id, after_id) &&
       before_basic.CreationTime.QuadPart == after_basic.CreationTime.QuadPart &&
-      before_basic.LastAccessTime.QuadPart == after_basic.LastAccessTime.QuadPart &&
+      // ReadFile may update LastAccessTime without changing the file contents.
       before_basic.LastWriteTime.QuadPart == after_basic.LastWriteTime.QuadPart &&
       before_basic.ChangeTime.QuadPart == after_basic.ChangeTime.QuadPart &&
       before_basic.FileAttributes == after_basic.FileAttributes &&

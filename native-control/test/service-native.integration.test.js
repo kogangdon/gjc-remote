@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -249,6 +249,36 @@ test('native provider SHA-256 agrees with independent Node crypto boundary vecto
       assert.equal(facts.size, length);
       assert.equal(facts.sha256, sha256(bytes), `SHA-256 length ${length}`);
       assert.notEqual(facts.sha256, '', `SHA-256 length ${length} must not accept an empty provider result`);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('native file facts accept read-induced Windows access-time updates', {
+  skip: process.platform !== 'win32',
+}, (t) => {
+  const { addon } = loadCurrentAddon();
+  const directory = mkdtempSync(join(tmpdir(), 'gjc-service-native-access-time-'));
+  try {
+    const bytes = Buffer.alloc(65537, 0x5a);
+    const path = join(directory, 'payload.bin');
+    writeFileSync(path, bytes);
+    utimesSync(path, new Date('2000-01-01T00:00:00Z'), statSync(path).mtime);
+    const before = statSync(path, { bigint: true });
+
+    const facts = addon.read_file_facts_no_follow(path, bytes.length);
+
+    const after = statSync(path, { bigint: true });
+    assert.equal(facts.size, bytes.length);
+    assert.equal(facts.sha256, sha256(bytes));
+    assert.match(facts.securitySha256, /^[0-9a-f]{64}$/);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.equal(after.ctimeNs, before.ctimeNs);
+    if (after.atimeNs === before.atimeNs) {
+      t.diagnostic('This filesystem did not update access time; read-induced access-time-change coverage is unproven.');
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
