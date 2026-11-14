@@ -224,12 +224,21 @@ test('outside a service launch the guard does no work and its context is consuma
 });
 
 test('a service launch refusal stops the entrypoint before any application code runs', () => {
-  const env = { ...process.env, ...fixture('daemon').env, NODE_OPTIONS: '', NODE_PATH: '' };
+  const env = {
+    ...process.env,
+    ...fixture('daemon').env,
+    NODE_OPTIONS: '',
+    NODE_PATH: '',
+    BUN_INSPECT_PRELOAD: guardPath,
+    GJC_REMOTE_BOOTSTRAP_PATH: guardPath,
+  };
   const result = spawnSync(process.execPath, ['--input-type=module', '-e',
     `await import(${JSON.stringify(pathToFileURL(guardPath).href)}); console.log('APPLICATION-RAN');`], {
     env, encoding: 'utf8', timeout: 60_000,
   });
-  assert.notEqual(result.status, 0);
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
+  assert.equal(result.status, 1);
   assert.equal(result.stdout.includes('APPLICATION-RAN'), false);
   assert.match(result.stderr, /ERR_NATIVE_CONTROL_REFUSED|SERVICE_BOOTSTRAP_REFUSED/);
 });

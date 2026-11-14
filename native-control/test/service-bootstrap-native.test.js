@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import Module from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, toNamespacedPath } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createPinnedDeploymentInstallation } from '../test-fixtures/pinned-deployment-installation.mjs';
@@ -117,10 +116,10 @@ async function createHarness(t) {
       configurable: true,
     });
   }
-  const previousNativeLoader = Module._extensions['.node'];
+  const previousNativeLoader = process.dlopen;
   let nativeLoads = 0;
-  Module._extensions['.node'] = (module, filename) => {
-    if (filename !== addonPath) throw new Error('unexpected native path');
+  process.dlopen = (module, filename) => {
+    if (toNamespacedPath(filename) !== toNamespacedPath(addonPath)) throw new Error('unexpected native path');
     nativeLoads += 1;
     module.exports = nativeAddon;
   };
@@ -128,8 +127,7 @@ async function createHarness(t) {
   const restore = () => {
     if (restored) return;
     restored = true;
-    if (previousNativeLoader) Module._extensions['.node'] = previousNativeLoader;
-    else delete Module._extensions['.node'];
+    process.dlopen = previousNativeLoader;
   };
   t.after(restore);
 
