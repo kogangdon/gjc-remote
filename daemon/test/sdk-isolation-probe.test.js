@@ -99,6 +99,55 @@ async function stableEnv(order) {
   await mkdir(join(env.XDG_DATA_HOME, "gjc", "natives"), { recursive: true });
   return { env, roots: [root, join(root, "tmp")], launcherRoot };
 }
+
+test("SDK provenance Git trusts only the canonical source repository for one command", async () => {
+  const { gitHead } = await import(pathToFileURL(fixture).href);
+  const canonicalRoot = await realpath(repoRoot);
+  const head = "a".repeat(40);
+  let calls = 0;
+  const result = await gitHead((argv, options) => {
+    calls += 1;
+    assert.deepEqual(argv, [
+      "git", "-c", `safe.directory=${canonicalRoot.replaceAll("\\", "/")}`, "rev-parse", "HEAD",
+    ]);
+    assert.deepEqual(options, { cwd: canonicalRoot, stdout: "pipe", stderr: "pipe" });
+    return {
+      stdout: new Response(`${head}\n`).body,
+      stderr: new Response("").body,
+      exited: Promise.resolve(0),
+    };
+  });
+  assert.equal(calls, 1);
+  assert.equal(result, head);
+});
+
+test("SDK provenance Git rejects a failing command even with a plausible HEAD and redacts diagnostics", async () => {
+  const { gitHead } = await import(pathToFileURL(fixture).href);
+  const sentinel = "gitDiagnosticSecretQ7m4vN9x";
+  for (const message of ["detected dubious ownership", "unable to read HEAD"]) {
+    await assert.rejects(() => gitHead(() => ({
+      stdout: new Response(`${"b".repeat(40)}\n`).body,
+      stderr: new Response(`fatal: ${message} at '${repoRoot}'\nAPI_KEY = ${sentinel}\n${"x".repeat(1024)}`).body,
+      exited: Promise.resolve(128),
+    })), (error) => {
+      assert.equal(error.code, "PROVENANCE_UNAVAILABLE");
+      assert.equal(error.details.exitCode, 128);
+      assert.ok(error.details.stderr.includes(message));
+      assert.ok(error.details.stderr.length <= 512);
+      assert.equal(error.details.stderr.includes(repoRoot), false);
+      assert.equal(error.details.stderr.includes(sentinel), false);
+      assert.doesNotMatch(error.details.stderr, /API_KEY/);
+      return true;
+    });
+  }
+});
+
+test("SDK provenance Git spawn failure stays fatal without a fallback commit", async () => {
+  const { gitHead } = await import(pathToFileURL(fixture).href);
+  const failure = Object.assign(new Error("owned missing Git executable"), { code: "ENOENT" });
+  await assert.rejects(() => gitHead(() => { throw failure; }), (error) => error === failure);
+});
+
 async function orderedChangeDigest() {
   const digest = createHash("sha256");
   for (const relativePath of CHANGE_FILES) {
