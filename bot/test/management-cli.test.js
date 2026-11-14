@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { PassThrough } from "node:stream";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import { parseManagementArgs, runManagementCli } from "../src/management-cli.js";
 import { EXIT } from "../src/management-runtime.js";
@@ -461,27 +461,22 @@ function runScriptedManagementEntrypoint({
 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gjc-remote-management-entrypoint-"));
   const capturePath = join(directory, "capture.json");
-  const fakeNativePath = join(directory, "fake-native.mjs");
-  const bootstrapPath = join(directory, "register-loader.mjs");
-  writeFileSync(bootstrapPath, `
-    import { registerHooks } from "node:module";
-    registerHooks({
-      resolve(specifier, context, nextResolve) {
-        if (specifier === "@gjc-remote/native-control") {
-          return { shortCircuit: true, url: process.env.GJC_TEST_FAKE_NATIVE_URL };
-        }
-        return nextResolve(specifier, context);
-      }
-    });
-  `);
-  writeFileSync(fakeNativePath, `
+  const stagedSource = join(directory, "src");
+  const nativePackage = join(directory, "node_modules", "@gjc-remote", "native-control");
+  const sharedPackage = join(directory, "node_modules", "@gjc-remote", "shared");
+  const fakeNativeSource = `
     import { writeFileSync } from "node:fs";
 
     const calls = [];
     let capturedRoles = null;
+    const runtime = {
+      execPath: process.execPath,
+      node: process.versions.node,
+      bun: process.versions.bun ?? null,
+    };
     const persist = (extra = {}) => writeFileSync(
       process.env.GJC_TEST_CAPTURE_PATH,
-      JSON.stringify({ calls, roles: capturedRoles, ...extra }),
+      JSON.stringify({ calls, roles: capturedRoles, runtime, ...extra }),
     );
     const requiredMethods = ${JSON.stringify([
       "readManagementState",
@@ -542,11 +537,11 @@ function runScriptedManagementEntrypoint({
       capturedRoles = options.roles;
       persist();
       if (JSON.stringify(options.roles) !== process.env.GJC_TEST_EXPECTED_ROLES) return null;
-      const { bootstrapOwner } = await import(process.env.GJC_TEST_MANAGEMENT_AUTH_URL);
+      const { bootstrapOwner } = await import("../../../src/management-auth.js");
       const {
         fingerprintManagedMappingRecord,
         fingerprintManagedRouteRecord,
-      } = await import(process.env.GJC_TEST_MAPPING_ENVELOPE_URL);
+      } = await import("@gjc-remote/shared/mapping-envelope");
       const actorPrincipal = { kind: "sid", value: "S-1-5-18" };
       const mapping = fingerprintManagedMappingRecord({
         mappingId: process.env.GJC_TEST_STATE_MAPPING_ID,
@@ -659,7 +654,7 @@ function runScriptedManagementEntrypoint({
       });
       return native;
     }
-  `);
+  `;
   const argv = command === "mapping-preconditions"
     ? mappingPreconditionsArgv(mappingId)
     : [
@@ -669,12 +664,29 @@ function runScriptedManagementEntrypoint({
       ...(command === "recover" ? ["--idempotency-key", "fixture-recovery-001"] : []),
     ];
   try {
+    // Exercise unmodified CLI sources with normal, isolated package resolution.
+    cpSync(fileURLToPath(new URL("../src", import.meta.url)), stagedSource, { recursive: true });
+    copyFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), join(directory, "package.json"));
+    mkdirSync(nativePackage, { recursive: true });
+    writeFileSync(join(nativePackage, "package.json"), JSON.stringify({
+      name: "@gjc-remote/native-control",
+      private: true,
+      type: "module",
+      exports: "./index.js",
+    }));
+    writeFileSync(join(nativePackage, "index.js"), fakeNativeSource);
+    mkdirSync(sharedPackage, { recursive: true });
+    const sharedSource = fileURLToPath(new URL("../../shared", import.meta.url));
+    for (const entry of readdirSync(sharedSource, { withFileTypes: true })) {
+      if (entry.name !== "package.json" && !entry.name.endsWith(".js")) continue;
+      assert.equal(entry.isFile(), true);
+      copyFileSync(join(sharedSource, entry.name), join(sharedPackage, entry.name));
+    }
     const result = spawnSync(process.execPath, [
-      "--import", pathToFileURL(bootstrapPath).href,
-      "src/management-entrypoint.js",
+      join(stagedSource, "management-entrypoint.js"),
       ...argv,
     ], {
-      cwd: fileURLToPath(new URL("../", import.meta.url)),
+      cwd: directory,
       encoding: "utf8",
       timeout: 30000,
       maxBuffer: 1024 * 1024,
@@ -684,9 +696,6 @@ function runScriptedManagementEntrypoint({
         GJC_MANAGEMENT_ROLE_BINDINGS: roles ?? "",
         GJC_TEST_EXPECTED_ROLES: expectedRoles,
         GJC_TEST_CAPTURE_PATH: capturePath,
-        GJC_TEST_FAKE_NATIVE_URL: pathToFileURL(fakeNativePath).href,
-        GJC_TEST_MANAGEMENT_AUTH_URL: pathToFileURL(fileURLToPath(new URL("../src/management-auth.js", import.meta.url))).href,
-        GJC_TEST_MAPPING_ENVELOPE_URL: pathToFileURL(fileURLToPath(new URL("../../shared/mapping-envelope.js", import.meta.url))).href,
         GJC_TEST_STATE_MAPPING_ID: stateMappingId,
         GJC_TEST_STORED_SECRET: storedSecret,
       },
@@ -711,6 +720,13 @@ function readEntrypointResult(result) {
   assert.equal(result.signal, null);
   assert.equal(result.stderr, "");
   assert.match(result.stdout, /^[^\r\n]+\n$/);
+  if (result.capture !== null) {
+    assert.deepEqual(result.capture.runtime, {
+      execPath: process.execPath,
+      node: process.versions.node,
+      bun: process.versions.bun ?? null,
+    });
+  }
   return JSON.parse(result.stdout);
 }
 
