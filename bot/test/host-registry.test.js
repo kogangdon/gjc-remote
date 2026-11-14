@@ -1,4 +1,4 @@
-import { createServer } from "node:net";
+import { createServer } from "node:http";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import test from "node:test";
@@ -839,14 +839,17 @@ test("WebSocket server errors are surfaced through the registry callback", async
     },
   });
 
+  let timeout;
   try {
-    await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error("WebSocket listen error was not reported")), 5_000);
       reported = resolve;
       if (errors.length > 0) resolve();
     });
     assert.equal(errors.length, 1);
     assert.equal(errors[0]?.code, "EADDRINUSE");
   } finally {
+    clearTimeout(timeout);
     await registry.close().catch(() => {});
     await new Promise((resolve) => blocker.close(resolve));
   }

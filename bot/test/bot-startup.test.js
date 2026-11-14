@@ -1,4 +1,5 @@
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -74,7 +75,7 @@ test("strict mode rejects an empty allowlist before bot services start", () => {
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /HostRegistry|Loaded channel map/);
 });
 test("a WebSocket listen failure is reported once and exits non-zero", async () => {
-  const blocker = createServer();
+  const blocker = createHttpServer();
   await new Promise((resolve, reject) => {
     blocker.once("error", reject);
     blocker.listen(0, resolve);
@@ -89,6 +90,8 @@ test("a WebSocket listen failure is reported once and exits non-zero", async () 
       timeout: 15_000,
     });
 
+    assert.equal(result.error, undefined);
+    assert.equal(result.signal, null);
     assert.equal(result.status, 1);
     const fatalLines = result.stderr.trim().split(/\r?\n/).filter((line) => line.startsWith("{"));
     assert.equal(fatalLines.length, 1);
