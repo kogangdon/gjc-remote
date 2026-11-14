@@ -55,7 +55,7 @@ function staticClosure() {
       specifiers.push([key, specifier]);
       if (specifier.startsWith('node:') || builtins.has(specifier)) continue;
       const resolved = esm && !specifier.startsWith('.')
-        ? fileURLToPath(import.meta.resolve(specifier, pathToFileURL(file).href))
+        ? fileURLToPath(import.meta.resolve(specifier, pathToFileURL(file)))
         : require.resolve(specifier);
       if (resolved.endsWith('.json')) files.add(repoRelative(resolved));
       else queue.push(resolved);

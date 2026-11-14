@@ -1,9 +1,7 @@
 import { generateKeyPairSync, sign } from 'node:crypto';
-import {
+import fs, {
   copyFileSync,
   lstatSync,
-  mkdirSync,
-  mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -85,7 +83,7 @@ export async function createPinnedDeploymentInstallation({
   }
   let rootIdentity;
   try {
-    const createdRoot = mkdtempSync(
+    const createdRoot = fs.mkdtempSync(
       join(tmpdir(), 'gjc-pinned-deployment-fixture-'),
     );
     rootIdentity = captureFixtureRoot(createdRoot);
@@ -118,8 +116,8 @@ export async function createPinnedDeploymentInstallation({
   try {
     const source = join(root, 'native-control', 'src');
     const shared = join(root, 'node_modules', '@gjc-remote', 'shared');
-    mkdirSync(source, { recursive: true });
-    mkdirSync(shared, { recursive: true });
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(shared, { recursive: true });
     if (includeStore || includeAcquisition || includeReleaseBuilder) {
       symlinkSync(
         dirname(require.resolve('tar/package.json')),
@@ -137,8 +135,8 @@ export async function createPinnedDeploymentInstallation({
       }
       const scripts = join(root, 'native-control', 'scripts');
       const contract = join(root, 'deploy', 'native');
-      mkdirSync(scripts, { recursive: true });
-      mkdirSync(contract, { recursive: true });
+      fs.mkdirSync(scripts, { recursive: true });
+      fs.mkdirSync(contract, { recursive: true });
       copyFileSync(
         fileURLToPath(new URL('../scripts/build-service-release.mjs', import.meta.url)),
         join(scripts, 'build-service-release.mjs'),
@@ -187,7 +185,7 @@ export async function createPinnedDeploymentInstallation({
       ['release-keys', 'trusted.json', [entry(nativeKeyId, nativeKey)]],
     ]) {
       const path = join(root, 'native-control', directory);
-      mkdirSync(path, { recursive: true });
+      fs.mkdirSync(path, { recursive: true });
       const trustBytes = Buffer.from(JSON.stringify({ version: 1, keys: entries }));
       writeFileSync(join(path, fileName), trustBytes);
       if (fileName === 'application-trusted.json') bundledApplicationTrustBytes = trustBytes;
