@@ -146,6 +146,37 @@ only when its request acknowledges disruption. Status accepts only
 expected CAS, disruption acknowledgement, or password. It is read-only and
 creates no lock, file, receipt, or platform action.
 
+Recovery captures the validated disruption acknowledgement before callbacks.
+After exact transaction, classifier/original-phase, and continuation-authority
+admission, `acceptServiceDisruption: false` refuses a service-changing route
+with `SERVICE_PENDING` before optional compatibility/acquisition callbacks,
+payload publication, sequence-floor progression, tombstone preparation, or
+pre-activation observer/startup-proof replay. Stop, suppressed-resource
+publication/replacement, trial start, restart-policy arming, final activation,
+and resource removal each retain a caller-side permission backstop, including
+replay-capable calls that might turn out to be no-ops. Acknowledgement never
+substitutes for ownership, CAS, epoch/cursor, readiness, or native proof.
+
+False recovery is not read-only. Existing classifier reconciliation can
+resolve pending journal records or promote trial/boundary evidence before
+refusal. Existing manual-cleanup handling remains available. An uninstall
+already at `resource-removed` or `references-released` may finish only its
+existing metadata tail when `continue`/`resume` selects that tail; an earlier
+stop/retrial/activation selector cannot use the later-looking phase as an
+exception. Original admitted phase and branch order remain authoritative,
+not a fresh tail advanced by classification. This does not introduce new
+platform classifier outcomes or establish concrete post-removal reachability.
+
+Permission denial and the local returned-result checks (shape, classifier
+names, original phase, not-in-trial, or missing transaction) report actual
+cumulative session plus distinct-driver writes,
+including admitted classifier reconciliation. Unsupported/pending results
+remain refused; genuinely write-free earlier stale checks remain zero.
+Existing continuation-authority helper failures and general thrown-classifier
+error normalization are not changed. Cleanup keeps
+the existing primary error snapshot and separately records cumulative cleanup
+evidence; it does not retroactively rewrite the primary write count.
+
 A Windows password, when required, is optional protected stdin, at most 16 KiB
 UTF-8, with no NUL or unpaired surrogate. It is passed directly to the native
 SCM call and is never persisted or echoed.

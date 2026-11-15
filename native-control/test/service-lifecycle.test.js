@@ -7,18 +7,24 @@ import { EXIT_CODES, runServiceEntrypoint } from '../src/service-entrypoint.js';
 import {
   buildServiceArtifactBinding,
   buildServiceCandidateProof,
+  buildServiceCursorSet,
   buildServiceFinalProof,
   buildServiceManifest,
+  buildServiceManualCleanup,
   buildServiceOldProof,
   buildServicePlatformState,
   buildServiceReferenceRecord,
   buildServiceReferenceSlot,
   buildServiceResourceProof,
+  buildServiceStartupProof,
+  buildServiceTombstone,
   buildServiceTransaction,
+  buildServiceTrialBoundary,
   buildServiceTransitionProof,
   serviceConfigurationFingerprint,
   serviceRolesFingerprint,
   validateServiceTransaction,
+  validateServiceTrialBoundarySuccessor,
 } from '@gjc-remote/shared/service-lifecycle-envelope';
 import { canonicalJson, canonicalJsonBytes, canonicalJsonHash } from '@gjc-remote/shared/strict-json';
 
@@ -1412,7 +1418,7 @@ for (const operation of ['install', 'update', 'rollback']) test(`${operation} bi
   assert.deepEqual(calls, operation === 'rollback' ? ['rollback-verified', 'session-close'] : ['acquisition-close', 'session-close']);
 });
 
-for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pending']) {
+for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pending', 'boundary-prefix']) {
   test(`windows recovery consumer requires durable phase and actionable classification (${variant})`, async () => {
     const prepared = recoveryTransaction('prepared', 'install', 'win32');
     const head = recoveryTransaction('trial-start-intent', 'install', 'win32');
@@ -1428,6 +1434,7 @@ for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pe
     const absent = () => ({ present: false, value: null });
     const calls = [];
     const markers = [];
+    let boundaryReceipt = absent();
     const session = {
       platform: 'win32', architecture: 'x64', component: 'bot', serviceKey: 'bot', writes: 0,
       readJournal: () => ({ entries: [prepared, head], head: { present: true, value: head }, pending: null }),
@@ -1438,6 +1445,13 @@ for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pe
         return publications[artifactKind];
       },
       appendJournal: () => assert.fail('classifier admission must not replay the journal'),
+      publishTrialBoundary(value, expected) {
+        assert.equal(expected, boundaryReceipt);
+        if (boundaryReceipt.present) validateServiceTrialBoundarySuccessor(boundaryReceipt.value, value);
+        boundaryReceipt = { present: true, value };
+        this.writes += 1;
+        calls.push(`boundary:${value.phase}`);
+      },
       publishManualCleanup(value) {
         markers.push(value);
         this.writes += 1;
@@ -1446,14 +1460,46 @@ for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pe
       close: () => calls.push('close'),
     };
     const classification = {
-      classification: variant === 'pending' ? 'pending' : 'manual-cleanup',
+      classification: variant === 'pending' ? 'pending' : variant === 'boundary-prefix' ? 'resume' : 'manual-cleanup',
       platformPhase: 'trial', reason: 'platform-evidence-gap',
       ...(variant === 'missing-phase' ? {} : { phase: variant === 'mismatched-phase' ? 'trial-running' : head.phase }),
     };
     const lifecycle = createServiceLifecycle({
       platform: 'win32', architecture: 'x64', native: {}, store: { openRecovery: () => session },
+      observeApplication: () => assert.fail('false recovery must not replay a startup observer'),
       driver: {
-        recoverTrialState: () => { calls.push('classify'); return classification; },
+        recoverTrialState: () => {
+          calls.push('classify');
+          if (variant === 'boundary-prefix') {
+            const cursor = buildServiceCursorSet({
+              bootFingerprint: '3'.repeat(64), serviceKey: 'bot', configFingerprint: '4'.repeat(64),
+              families: ['wrapper', 'child'].map((family, index) => ({
+                family, baseName: `gjc-remote-bot-${family}`,
+                directoryIdentityFingerprint: String(index + 5).repeat(64),
+                files: [], nextLogicalOffset: 0, partialLineBytes: 0, absenceFingerprint: '7'.repeat(64),
+              })),
+            });
+            const fields = {
+              serviceKey: 'bot', transactionId: head.transactionId, transactionNonce: head.transactionNonce,
+              transitionFingerprint: head.transition.transitionFingerprint,
+              attempt: 1, revision: 1, previousBoundaryFingerprint: null,
+              phase: 'captured', bootFingerprint: cursor.bootFingerprint,
+              startTickMs: 10, lastTickMs: 10,
+              applicationManifestFingerprint: head.candidate.applicationManifestFingerprint,
+              resourceFingerprint: head.transition.platformResourceFingerprint,
+              effectiveConfigFingerprint: cursor.configFingerprint, configSourceIdentityFingerprint: '8'.repeat(64),
+              wrapperEpochFingerprint: null, childEpochFingerprint: null, initialCursor: cursor, childCursor: null,
+            };
+            const captured = buildServiceTrialBoundary(fields);
+            session.publishTrialBoundary(captured, boundaryReceipt);
+            session.publishTrialBoundary(buildServiceTrialBoundary({
+              ...fields, revision: 2, previousBoundaryFingerprint: captured.boundaryFingerprint,
+              phase: 'observed', wrapperEpochFingerprint: '9'.repeat(64), childEpochFingerprint: '0'.repeat(64),
+              childCursor: cursor,
+            }), boundaryReceipt);
+          }
+          return classification;
+        },
         probe: () => { calls.push('probe'); return { platformPhase: 'trial', resourceFingerprint: head.transition.platformResourceFingerprint }; },
         startTrial: () => assert.fail('manual or pending classifiers cannot start a trial'),
       },
@@ -1462,9 +1508,14 @@ for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pe
       schemaVersion: 1, target: { component: 'bot' }, roles: windowsRoles,
       expected: { transactionId: head.transactionId, journalFingerprint: head.transactionFingerprint },
       acceptServiceDisruption: false,
-    }), { code: variant === 'durable-phase' ? 'SERVICE_MANUAL_CLEANUP' : 'SERVICE_PENDING' });
-    assert.deepEqual(calls, variant === 'durable-phase' ? ['classify', 'probe', 'close'] : ['classify', 'close']);
-    assert.equal(session.writes, variant === 'durable-phase' ? 1 : 0);
+    }), {
+      code: variant === 'durable-phase' ? 'SERVICE_MANUAL_CLEANUP' : 'SERVICE_PENDING',
+      writes: variant === 'boundary-prefix' ? 2 : variant === 'durable-phase' ? 1 : 0,
+    });
+    assert.deepEqual(calls, variant === 'boundary-prefix'
+      ? ['classify', 'boundary:captured', 'boundary:observed', 'close']
+      : variant === 'durable-phase' ? ['classify', 'probe', 'close'] : ['classify', 'close']);
+    assert.equal(session.writes, variant === 'boundary-prefix' ? 2 : variant === 'durable-phase' ? 1 : 0);
     assert.equal(markers.length, variant === 'durable-phase' ? 1 : 0);
     if (markers.length) {
       assert.equal(markers[0].phase, head.phase);
@@ -1478,7 +1529,7 @@ for (const variant of ['durable-phase', 'missing-phase', 'mismatched-phase', 'pe
 // In-memory Linux contract fixtures only: the real lifecycle performs recovery,
 // while explicit session/driver doubles model durable writes and phase receipts.
 // They do not qualify native locks, filesystem CAS, startup epochs, or systemd.
-function recoverySuccessFixture(classifier, recoveryClassification = classifier === 'uninstall' ? 'continue' : classifier) {
+function recoverySuccessFixture(classifier, recoveryClassification = classifier === 'uninstall' ? 'continue' : classifier, options = {}) {
   const { session, driver, current, resource, entries, calls } = ownedMutationFixture('linux');
   const seed = recoveryTransaction('prepared');
   const uninstall = classifier === 'uninstall';
@@ -1524,13 +1575,26 @@ function recoverySuccessFixture(classifier, recoveryClassification = classifier 
     ...seed, operation, serviceGeneration: generation, old, candidate, transition, final,
     previousJournalFingerprint: entries.at(-1).transactionFingerprint,
   });
-  const head = buildServiceTransaction({
+  const phase = options.phase ?? (uninstall ? 'quiescent' : classifier === 'resume' ? 'trial-start-intent' : 'startup-observed');
+  let predecessor = prepared;
+  const metadataTail = uninstall && ['resource-removed', 'references-released'].includes(phase);
+  entries.push(prepared);
+  if (metadataTail) {
+    for (const priorPhase of phase === 'resource-removed' ? ['tombstoned'] : ['tombstoned', 'resource-removed']) {
+      predecessor = buildServiceTransaction({
+        ...prepared, phase: priorPhase, substep: priorPhase === 'tombstoned' ? 'intent' : 'observed',
+        previousJournalFingerprint: predecessor.transactionFingerprint,
+      });
+      entries.push(predecessor);
+    }
+  }
+  const head = phase === 'prepared' ? prepared : buildServiceTransaction({
     ...prepared,
-    phase: uninstall ? 'quiescent' : classifier === 'resume' ? 'trial-start-intent' : 'startup-observed',
-    substep: classifier === 'resume' ? 'intent' : 'observed',
-    previousJournalFingerprint: prepared.transactionFingerprint,
+    phase,
+    substep: options.substep ?? (classifier === 'resume' ? 'intent' : 'observed'),
+    previousJournalFingerprint: predecessor.transactionFingerprint,
   });
-  entries.push(prepared, head);
+  if (head !== prepared) entries.push(head);
   const initialEntries = entries.slice();
   const absent = () => ({ present: false, value: null });
   const present = (value) => ({ present: true, value });
@@ -1549,8 +1613,8 @@ function recoverySuccessFixture(classifier, recoveryClassification = classifier 
   const candidatePublication = uninstall ? null : publication(candidate.applicationManifestFingerprint, '2');
   let references = present(buildServiceReferenceRecord({
     component: 'bot', serviceKey: 'bot', platform: 'linux', architecture: 'x64',
-    serviceGeneration: current.serviceGeneration,
-    current: buildServiceReferenceSlot({
+    serviceGeneration: phase === 'references-released' ? generation : current.serviceGeneration,
+    current: phase === 'references-released' ? null : buildServiceReferenceSlot({
       serviceGeneration: current.serviceGeneration, transactionId: resource.transactionId,
       transactionNonce: resource.transactionNonce, artifacts: [oldPublication.binding],
     }, { platform: 'linux', component: 'bot' }),
@@ -1582,6 +1646,16 @@ function recoverySuccessFixture(classifier, recoveryClassification = classifier 
       entrypointPath: '/releases/candidate/bot.js', configuration: current.configuration,
     } };
   };
+  if (metadataTail) {
+    const tombstone = present(buildServiceTombstone({
+      component: 'bot', serviceKey: 'bot', platform: 'linux', architecture: 'x64',
+      serviceGeneration: generation, transactionId: head.transactionId,
+      transactionFingerprint: entries.find(entry => entry.phase === 'tombstoned').transactionFingerprint,
+      resourceProof: old.resourceProof, currentManifestFingerprint: old.manifestFingerprint,
+      applicationSequenceFloor: 1, shawlSequenceFloor: null,
+    }));
+    session.readTombstone = () => tombstone;
+  }
   if (!uninstall) {
     session.readManifest = (slot) => slot === 'current' ? manifestReceipt : absent();
     session.readResourceProof = (slot) => slot === 'current' ? resourceReceipt : absent();
@@ -1665,6 +1739,7 @@ function recoverySuccessFixture(classifier, recoveryClassification = classifier 
     platform: 'linux', architecture: 'x64', native: {},
     store: { openRecovery: () => { calls.push('open-recovery'); return session; } },
     driver, observeApplication,
+    ...options.lifecycleOptions,
   });
   const request = {
     schemaVersion: 1, target: { component: 'bot' }, roles,
@@ -2178,5 +2253,346 @@ for (const existingLifecycleError of [false, true]) {
     });
     assert.equal(fixture.calls.at(-1), 'session-close');
     assert.equal(getServiceCleanupEvidenceInternal(fixture.lifecycle).cleanup.attemptedUnconfirmed, 1);
+  });
+}
+
+const recoveryActions = [
+  'stopAndQuiesce', 'publishSuppressedResource', 'startTrial',
+  'runStartupGate', 'armFinalRestart', 'enableFinal', 'removeResource',
+];
+
+function forbidRecoveryContinuation(fixture) {
+  const forbidden = (name) => () => {
+    fixture.calls.push(`forbidden:${name}`);
+    assert.fail(`unapproved recovery entered ${name}`);
+  };
+  for (const name of recoveryActions) fixture.driver[name] = forbidden(name);
+  for (const name of ['readApplicationFloor', 'publishTombstone']) fixture.session[name] = forbidden(name);
+}
+
+// Model a virtual pending head: the journal reader includes it, but the
+// classifier must append those exact bytes to the physical fixture journal.
+function resolveRecoveryPending(fixture, result) {
+  const { session, driver, entries, head, calls } = fixture;
+  assert.equal(entries.pop(), head);
+  const readJournal = session.readJournal;
+  let pending = head;
+  session.readJournal = () => pending === null ? readJournal() : {
+    ...readJournal(), entries: [...entries, pending],
+    head: { present: true, value: pending }, pending,
+  };
+  driver.recoverTrialState = () => {
+    calls.push('classify');
+    session.appendJournal(pending);
+    pending = null;
+    return result;
+  };
+}
+
+const disruptiveRecoveryRoutes = [
+  ['continue', 'prepared', 'compatibility'],
+  ['continue', 'sequence-reserved', 'compatibility'],
+  ['continue', 'release-published', 'publishSuppressedResource'],
+  ['continue', 'transition-marker-intent', 'publishSuppressedResource'],
+  ['continue', 'quiescent', 'publishSuppressedResource'],
+  ['continue', 'resource-published', 'startTrial'],
+  ['stop-and-continue', 'quiescent', 'stopAndQuiesce'],
+  ['retrial', 'startup-observed', 'startTrial'],
+  ['stop-and-retrial', 'trial-start-intent', 'stopAndQuiesce'],
+  ['resuppress-and-retrial', 'trial-start-observed', 'stopAndQuiesce'],
+  ['resume', 'trial-start-intent', 'startTrial'],
+  ['resume', 'trial-start-observed', 'startTrial'],
+  ['resume', 'starting', 'startTrial'],
+  ['resume-activation', 'startup-observed', 'runStartupGate'],
+  ['continue', 'stopping', 'stopAndQuiesce'],
+  ['continue', 'quiescent', 'removeResource', 'uninstall'],
+  ['continue', 'tombstoned', 'removeResource', 'uninstall'],
+  ['stop-and-continue', 'stopping', 'stopAndQuiesce', 'uninstall'],
+];
+
+for (const [classification, phase, firstAction, operation] of disruptiveRecoveryRoutes) {
+  for (const accepted of [false, true]) {
+    test(`recovery permission ${accepted}: ${operation ?? 'update'} ${classification}/${phase} before ${firstAction}`, async () => {
+      const entered = [];
+      const enter = (name) => (input) => {
+        entered.push({ name, input });
+        throw new Error('controlled first authorized edge');
+      };
+      const fixture = recoverySuccessFixture(operation === 'uninstall' ? 'uninstall' : classification, classification, {
+        phase, substep: phase === 'transition-marker-intent' ? 'action' : 'observed',
+        lifecycleOptions: {
+          compatibility: enter('compatibility'),
+          createAcquisition: enter('acquisition-factory'),
+        },
+      });
+      fixture.request.acceptServiceDisruption = accepted;
+      if (accepted) {
+        for (const name of recoveryActions) fixture.driver[name] = enter(name);
+        fixture.session.readApplicationFloor = () => ({ floor: {
+          committedSequence: fixture.head.candidate.releaseSequence,
+          committedManifestFingerprint: fixture.head.candidate.applicationManifestFingerprint,
+          committedTransactionId: fixture.head.transactionId,
+          committedTransactionNonce: fixture.head.transactionNonce,
+          committedTransactionFingerprint: fixture.head.transactionFingerprint,
+        } });
+      } else forbidRecoveryContinuation(fixture);
+      await assert.rejects(fixture.lifecycle.recover(fixture.request), { code: 'SERVICE_PENDING', operation: 'recover' });
+      if (accepted) {
+        assert.deepEqual(entered.map(({ name }) => name), [firstAction]);
+        if (firstAction === 'startTrial' || firstAction === 'stopAndQuiesce') {
+          assert.deepEqual(entered[0].input, { expectedResourceFingerprint: fixture.head.transition.platformResourceFingerprint });
+        }
+      } else {
+        assert.deepEqual(entered, []);
+        assert.deepEqual(fixture.entries, fixture.initialEntries);
+        assert.equal(fixture.session.writes, 0);
+        assert.equal(fixture.driver.writes, 0);
+        assert.deepEqual(fixture.calls, ['open-recovery', 'classify', 'session-close']);
+      }
+    });
+  }
+}
+
+for (const accepted of [false, true]) {
+  for (const [variant, counted] of ['pending', 'non-plain', 'conflicting', 'wrong-phase', 'not-in-trial', 'null-transaction']
+    .flatMap(variant => [false, true].map(counted => [variant, counted]))) {
+    test(`recovery counts normal ${variant} refusal (accepted=${accepted}, prefix=${counted})`, async () => {
+      const fixture = recoverySuccessFixture('resume');
+      fixture.request.acceptServiceDisruption = accepted;
+      const result = variant === 'non-plain' ? null : {
+        classification: variant === 'pending' ? 'pending' : variant === 'not-in-trial' ? 'not-in-trial' : 'resume',
+        phase: variant === 'wrong-phase' ? 'starting' : fixture.head.phase,
+        ...(variant === 'conflicting' ? { recovery: 'retrial' } : {}),
+      };
+      if (counted) resolveRecoveryPending(fixture, result);
+      else fixture.driver.recoverTrialState = () => { fixture.calls.push('classify'); return result; };
+      if (variant === 'null-transaction') {
+        // Deliberately malformed reader view, not a native-store reachability
+        // claim. The optional pending append still uses the valid original
+        // record, so its counted bytes cannot authorize this forged F edge.
+        const malformed = { ...fixture.head, final: {
+          ...fixture.head.final, serviceGeneration: fixture.head.serviceGeneration + 1,
+        } };
+        const readJournal = fixture.session.readJournal;
+        fixture.session.readJournal = () => {
+          const journal = readJournal();
+          return {
+            ...journal, entries: [...journal.entries.slice(0, -1), malformed],
+            head: { present: true, value: malformed }, pending: journal.pending === null ? null : malformed,
+          };
+        };
+      }
+      forbidRecoveryContinuation(fixture);
+      await assert.rejects(fixture.lifecycle.recover(fixture.request), {
+        code: 'SERVICE_PENDING', operation: 'recover', writes: counted ? 1 : 0,
+      });
+      assert.equal(fixture.session.writes, counted ? 1 : 0);
+      assert.equal(fixture.driver.writes, 0);
+      assert.equal(fixture.session.readJournal().pending, null);
+      assert.deepEqual(fixture.entries, fixture.initialEntries);
+      assert.deepEqual(fixture.calls, ['open-recovery', 'classify', ...(counted ? [fixture.head.phase] : []), 'session-close']);
+    });
+  }
+  test(`recovery stale refusal precedes counted classification (accepted=${accepted})`, async () => {
+    const fixture = recoverySuccessFixture('resume');
+    fixture.request.acceptServiceDisruption = accepted;
+    resolveRecoveryPending(fixture, { classification: 'pending', phase: fixture.head.phase });
+    fixture.request.expected.journalFingerprint = '0'.repeat(64);
+    await assert.rejects(fixture.lifecycle.recover(fixture.request), {
+      code: 'SERVICE_STALE', operation: 'recover', writes: 0,
+    });
+    assert.equal(fixture.session.writes, 0);
+    assert.equal(fixture.driver.writes, 0);
+    assert.deepEqual(fixture.calls, ['open-recovery', 'session-close']);
+  });
+}
+
+for (const boundary of ['cli', 'entrypoint']) {
+  test(`recovery false exposes exact absorbing manual evidence through ${boundary}`, async () => {
+    const fixture = recoverySuccessFixture('resume', 'manual-cleanup');
+    fixture.request.acceptServiceDisruption = false;
+    const classify = fixture.driver.recoverTrialState;
+    fixture.driver.recoverTrialState = () => ({ ...classify(), reason: 'platform-evidence-gap' });
+    let manual = { present: false, value: null };
+    fixture.session.readManualCleanup = () => manual;
+    fixture.session.publishManualCleanup = (value, expected) => {
+      assert.equal(expected, manual);
+      manual = { present: true, value };
+      fixture.session.writes += 1;
+      fixture.calls.push('manual-marker');
+      return manual;
+    };
+    forbidRecoveryContinuation(fixture);
+    const result = await publicRecovery(fixture, boundary);
+    const expected = {
+      status: 'refused', operation: 'recover', code: 'SERVICE_MANUAL_CLEANUP',
+      message: 'service requires manual cleanup', writes: 1, ambiguous: false,
+    };
+    assert.deepEqual(result.receipt, expected);
+    assert.equal(result.serialized, `${canonicalJson(expected)}\n`);
+    if (boundary === 'entrypoint') assert.equal(result.exitCode, EXIT_CODES.refused);
+    assert.equal(manual.present, true);
+    assert.deepEqual(manual.value, buildServiceManualCleanup({
+      component: 'bot', serviceKey: 'bot', platform: 'linux', architecture: 'x64',
+      serviceGeneration: fixture.head.serviceGeneration, transactionId: fixture.head.transactionId,
+      journalFingerprint: fixture.head.transactionFingerprint, phase: fixture.head.phase,
+      reason: 'platform-evidence-gap', operatorAction: 'repair-protected-control-store',
+      expectedDisposition: 'stable-old', expectedOldProofFingerprint: fixture.head.old.oldFingerprint,
+      observedDisposition: 'hybrid', observedFingerprint: fixture.head.transition.platformResourceFingerprint,
+      blockedUntilOperatorAction: true,
+    }));
+    assert.equal(fixture.session.writes, 1);
+    assert.equal(fixture.driver.writes, 0);
+    assert.deepEqual(fixture.entries, fixture.initialEntries);
+    assert.deepEqual(fixture.calls, ['open-recovery', 'classify', 'probe', 'manual-marker', 'session-close']);
+  });
+  for (const classification of ['resume', 'pending']) {
+    test(`recovery ${boundary} exposes exact counted pending evidence for ${classification}`, async () => {
+      const fixture = recoverySuccessFixture('resume');
+      fixture.request.acceptServiceDisruption = false;
+      resolveRecoveryPending(fixture, { classification, phase: fixture.head.phase });
+      forbidRecoveryContinuation(fixture);
+      const result = await publicRecovery(fixture, boundary);
+      const expected = {
+        status: 'refused', operation: 'recover', code: 'SERVICE_PENDING',
+        message: 'service recovery is pending', writes: 1, ambiguous: false,
+      };
+      assert.deepEqual(result.receipt, expected);
+      assert.equal(result.serialized, `${canonicalJson(expected)}\n`);
+      if (boundary === 'entrypoint') assert.equal(result.exitCode, EXIT_CODES.refused);
+      assert.equal(fixture.session.writes, 1);
+      assert.deepEqual(fixture.entries, fixture.initialEntries);
+      assert.deepEqual(fixture.calls, ['open-recovery', 'classify', fixture.head.phase, 'session-close']);
+    });
+  }
+  for (const phase of ['resource-removed', 'references-released']) {
+    test(`recovery false completes only the modeled ${phase} uninstall metadata tail through ${boundary}`, async () => {
+      const fixture = recoverySuccessFixture('uninstall', 'continue', { phase });
+      fixture.request.acceptServiceDisruption = false;
+      let startup = { present: true, value: buildServiceStartupProof({
+        component: 'bot', serviceKey: 'bot', platform: 'linux', architecture: 'x64',
+        serviceGeneration: fixture.current.serviceGeneration, transactionId: 'tx-owned',
+        resourceProof: fixture.current.resourceProof,
+        applicationManifestFingerprint: fixture.current.applicationManifestFingerprint,
+        bootFingerprint: '1'.repeat(64), processEpochFingerprint: '2'.repeat(64),
+        platformEvidenceFingerprint: '3'.repeat(64), applicationEvidenceFingerprint: '4'.repeat(64),
+        startBoundaryMs: 10, observedAtMs: 11, expiresAtMs: 12,
+        platformState: buildServicePlatformState('linux', 'trial'),
+        startupEvidence: 'fresh-current-epoch', connectivityObservation: 'last-observed-connected',
+      }) };
+      fixture.session.readStartupProof = () => startup;
+      fixture.session.removeStartupProof = (expected) => {
+        assert.equal(expected, startup);
+        startup = { present: false, value: null };
+        fixture.session.writes += 1;
+        fixture.calls.push('remove-startup');
+      };
+      const floor = fixture.session.readApplicationFloor;
+      const tombstone = fixture.session.readTombstone();
+      assert.equal(tombstone.present, true);
+      forbidRecoveryContinuation(fixture);
+      const result = await publicRecovery(fixture, boundary);
+      assert.equal(result.receipt.status, 'ok', canonicalJson(result.receipt));
+      if (boundary === 'entrypoint') assert.equal(result.exitCode, EXIT_CODES.ok);
+      assert.equal(result.receipt.writes, fixture.session.writes);
+      assert.equal(fixture.driver.writes, 0);
+      assert.equal(result.serialized, `${canonicalJson(result.receipt)}\n`);
+      assert.equal(fixture.entries.at(-1).phase, 'committed');
+      assert.deepEqual(fixture.entries.slice(fixture.initialEntries.length).map(entry => entry.phase),
+        phase === 'resource-removed' ? ['references-released', 'committed'] : ['committed']);
+      assert.equal(fixture.entries.at(-1).final.serviceGeneration, 0);
+      assert.equal(fixture.entries.at(-1).serviceGeneration, fixture.head.serviceGeneration);
+      assert.equal(fixture.session.readReferences().value.serviceGeneration, fixture.head.serviceGeneration);
+      for (const slot of ['current', 'previous', 'provisional']) assert.equal(fixture.session.readReferences().value[slot], null);
+      assert.equal(fixture.session.readManifest('current').present, false);
+      assert.equal(fixture.session.readResourceProof('current').present, false);
+      assert.equal(fixture.session.readStartupProof().present, false);
+      assert.equal(fixture.calls.filter(call => call === 'remove-startup').length, 1);
+      assert.equal(fixture.session.readTombstone(), tombstone);
+      assert.deepEqual(floor(), { floor: { committedSequence: 1 } });
+      assert.equal(fixture.calls.some(call => call.startsWith('forbidden:')), false);
+    });
+  }
+}
+
+for (const classification of ['stop-and-continue', 'retrial', 'resume-activation']) {
+  test(`recovery false cannot launder ${classification} through a post-removal phase`, async () => {
+    const fixture = recoverySuccessFixture('uninstall', classification, { phase: 'resource-removed' });
+    fixture.request.acceptServiceDisruption = false;
+    forbidRecoveryContinuation(fixture);
+    await assert.rejects(fixture.lifecycle.recover(fixture.request), { code: 'SERVICE_PENDING', writes: 0 });
+    assert.deepEqual(fixture.entries, fixture.initialEntries);
+    assert.deepEqual(fixture.calls, ['open-recovery', 'classify', 'session-close']);
+  });
+}
+
+test('recovery captures false before a classifier mutates the caller request', async () => {
+  const fixture = recoverySuccessFixture('resume');
+  fixture.request.acceptServiceDisruption = false;
+  const classify = fixture.driver.recoverTrialState;
+  fixture.driver.recoverTrialState = () => {
+    fixture.request.acceptServiceDisruption = true;
+    return classify();
+  };
+  forbidRecoveryContinuation(fixture);
+  await assert.rejects(fixture.lifecycle.recover(fixture.request), { code: 'SERVICE_PENDING', writes: 0 });
+  assert.equal(fixture.request.acceptServiceDisruption, true);
+  assert.deepEqual(fixture.calls, ['open-recovery', 'classify', 'session-close']);
+});
+
+test('recovery false counts classifier phase promotion without adopting the advanced route', async () => {
+  const fixture = recoverySuccessFixture('resume', 'resume', { substep: 'action' });
+  fixture.request.acceptServiceDisruption = false;
+  fixture.driver.recoverTrialState = () => {
+    fixture.calls.push('classify');
+    for (const phase of ['trial-start-intent', 'trial-start-observed']) {
+      const previous = fixture.entries.at(-1);
+      fixture.session.appendJournal(buildServiceTransaction({
+        ...previous, phase, substep: 'observed', previousJournalFingerprint: previous.transactionFingerprint,
+      }));
+    }
+    return { classification: 'resume', phase: fixture.head.phase };
+  };
+  forbidRecoveryContinuation(fixture);
+  await assert.rejects(fixture.lifecycle.recover(fixture.request), { code: 'SERVICE_PENDING', writes: 2 });
+  assert.equal(fixture.session.writes, 2);
+  assert.equal(fixture.entries.at(-1).phase, 'trial-start-observed');
+  assert.deepEqual(fixture.calls, ['open-recovery', 'classify', 'trial-start-intent', 'trial-start-observed', 'session-close']);
+});
+
+for (const closeFails of [false, true]) {
+  test(`recovery false counts aliased session/driver once with cleanup failure=${closeFails}`, async () => {
+    const fixture = recoverySuccessFixture('resume');
+    fixture.request.acceptServiceDisruption = false;
+    resolveRecoveryPending(fixture, { classification: 'resume', phase: fixture.head.phase });
+    forbidRecoveryContinuation(fixture);
+    Object.assign(fixture.session, fixture.driver);
+    const lifecycle = createServiceLifecycle({
+      platform: 'linux', architecture: 'x64', native: {},
+      store: { openRecovery: () => fixture.session }, driver: fixture.session,
+      observeApplication: () => assert.fail('false must not observe startup'),
+    });
+    let closes = 0;
+    fixture.session.close = () => {
+      closes += 1;
+      fixture.session.writes += 3;
+      if (closeFails) throw new Error('private close diagnostics');
+    };
+    let primary;
+    await assert.rejects(lifecycle.recover(fixture.request), error => {
+      primary = error;
+      assert.equal(error.code, 'SERVICE_PENDING');
+      assert.equal(error.writes, 1);
+      return true;
+    });
+    assert.equal(closes, 1);
+    assert.equal(fixture.session.writes, 4);
+    const evidence = getServiceCleanupEvidenceInternal(lifecycle);
+    assert.equal(evidence.writes, 4);
+    assert.equal(evidence.hasPrimary, true);
+    if (closeFails) assert.equal(evidence.cleanup.attemptedUnconfirmed, 1);
+    else assert.equal(evidence.cleanup, null);
+    assert.deepEqual(getServiceCleanupEvidenceInternal(primary), evidence);
+    assert.equal(primary.writes, 1);
   });
 }

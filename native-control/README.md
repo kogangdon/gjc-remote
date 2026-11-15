@@ -699,6 +699,27 @@ platform classifier supports the modeled uninstall state. These recovery
 repairs do not change disruption-acknowledgment enforcement or establish real
 systemd/SCM recovery evidence.
 
+Separate recovery permission enforcement now captures the validated
+`acceptServiceDisruption` before callbacks. A false request refuses a selected
+service-changing route with `SERVICE_PENDING` before optional acquisition,
+payload/floor progression, tombstone preparation, or pre-activation
+observer/startup replay. Caller-side guards also precede stop, suppressed
+publication/replacement, trial start, restart-policy arming, activation, and
+removal, even when a driver might replay them without a new platform write.
+
+False is not a read-only/status request: admitted classifier journal/boundary
+reconciliation and manual-cleanup records can write. An already-removed
+uninstall at `resource-removed`/`references-released` may complete the existing
+metadata tail only when `continue`/`resume` actually selects it; a disruptive
+classifier cannot obtain this exception from a later-looking phase. Existing
+ownership/CAS/epoch/proof checks and true-path behavior remain required.
+The local returned-result validation checks and permission denials count
+recorded session plus distinct-driver writes; existing authority-helper and
+thrown-classifier error handling is unchanged. Later cleanup evidence remains
+separate from the primary error snapshot. These are source/model contract guarantees,
+not new concrete classifier, protected-store, systemd, or SCM qualification.
+The detailed boundary is in [ADR 0006](../docs/adr/0006-native-service-lifecycle.md).
+
 Uninstall final absence proof and transaction sequencing have distinct
 generations: `final.serviceGeneration` is zero with null manifest/resource
 fingerprints and `disabled-not-startable` activation, while the transaction,

@@ -1184,6 +1184,7 @@ export class ServiceLifecycle {
   async recover(request) {
     const platform = this.#platform(request); const architecture = this.#architecture(request);
     try { validateServiceLifecycleRequest('recover', request, { platform, architecture }); } catch (error) { fail('SERVICE_INVALID', 'recover', 0, error); }
+    const acceptServiceDisruption = request.acceptServiceDisruption;
     this.#preflight('recover', request); const session = this.#open('recovery', request); let driver = null; let replayAcquisition = null; let classified = false;
     const primary = { hasPrimary: false, value: undefined };
     try {
@@ -1195,7 +1196,7 @@ export class ServiceLifecycle {
       // checks all four proof edges (O/C/T/F); accepting a caller-shaped
       // transaction would allow adoption of a different operation.
       let transaction = null;
-      try { transaction = buildServiceTransaction(head); } catch { /* classifier still runs for a write-free pending result */ }
+      try { transaction = buildServiceTransaction(head); } catch { /* classifier may still reconcile protected metadata before refusing */ }
       if (transaction !== null && (!same(transaction, head) || transaction.transactionId !== request.expected.transactionId ||
           transaction.transactionFingerprint !== request.expected.journalFingerprint ||
           transaction.transition.oldFingerprint !== transaction.old.oldFingerprint ||
@@ -1320,17 +1321,17 @@ export class ServiceLifecycle {
           classification = { classification: 'not-in-trial', phase: head.phase };
         } else throw error;
       }
-      if (!plain(classification)) fail('SERVICE_PENDING', 'recover');
+      if (!plain(classification)) fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
       const recovery = classification.recovery;
       const named = classification.classification;
-      if (recovery !== undefined && named !== undefined && recovery !== named) fail('SERVICE_PENDING', 'recover');
+      if (recovery !== undefined && named !== undefined && recovery !== named) fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
       const classifier = recovery ?? named;
       const known = new Set(['manual-cleanup', 'resume-activation', 'stop-and-continue', 'resuppress-and-retrial', 'retrial', 'stop-and-retrial', 'continue', 'resume', 'not-in-trial']);
-      if (!known.has(classifier) || classification.phase !== head.phase) fail('SERVICE_PENDING', 'recover');
+      if (!known.has(classifier) || classification.phase !== head.phase) fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
       // `not-in-trial` is an observation, not permission to replay a journal
-      // edge.  Refuse it before any publish/start or journal write; callers
-      // must provide a fresh supported classifier from the native authority.
-      if (classifier === 'not-in-trial') fail('SERVICE_PENDING', 'recover');
+      // edge. Refuse orchestration replay; classification itself may already
+      // have reconciled protected journal or trial-boundary metadata.
+      if (classifier === 'not-in-trial') fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
       this.#recoveryAuthorities(classifier, head.phase, transaction?.operation ?? null);
       classified = true;
       if (classifier === 'manual-cleanup') {
@@ -1338,9 +1339,20 @@ export class ServiceLifecycle {
         await this.#persistManual(session, head, 'recover', error, driver);
         fail('SERVICE_MANUAL_CLEANUP', 'recover', writesOf(session, driver));
       }
-      if (transaction === null) fail('SERVICE_PENDING', 'recover');
+      if (transaction === null) fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
 
       const operation = transaction.operation;
+      const requireDisruptionAcceptance = () => {
+        if (!acceptServiceDisruption) fail('SERVICE_PENDING', 'recover', writesOf(session, driver));
+      };
+      // Manual handling above and this already-removed uninstall tail are
+      // the existing metadata-only continuations. Earlier classifier branches
+      // can select stop/start/activation even at a later-looking phase, so
+      // phase alone (or a tail advanced by classification) grants no exception.
+      const metadataOnly = operation === 'uninstall' &&
+        (classifier === 'continue' || classifier === 'resume') &&
+        (head.phase === 'resource-removed' || head.phase === 'references-released');
+      if (!metadataOnly) requireDisruptionAcceptance();
       let releaseForDriver = candidateRelease
         ? { entrypointPath: candidateRelease.entrypointPath, applicationManifestFingerprint: candidateRelease.applicationManifestFingerprint }
         : release;
@@ -1370,6 +1382,7 @@ export class ServiceLifecycle {
         return next;
       };
       const stop = async () => {
+        requireDisruptionAcceptance();
         if (typeof driver.stopAndQuiesce !== 'function') fail('SERVICE_PENDING', 'recover');
         const observed = probe();
         const fingerprint = observed?.resourceFingerprint;
@@ -1382,6 +1395,7 @@ export class ServiceLifecycle {
         return result;
       };
       const publishSuppressed = async () => {
+        requireDisruptionAcceptance();
         if (!releaseForDriver || typeof driver.publishSuppressedResource !== 'function') fail('SERVICE_PENDING', 'recover');
         const observed = probe();
         const expectedCurrentResource = transaction.operation === 'install'
@@ -1397,6 +1411,7 @@ export class ServiceLifecycle {
         return result;
       };
       const start = async () => {
+        requireDisruptionAcceptance();
         if (typeof driver.startTrial !== 'function') fail('SERVICE_PENDING', 'recover');
         const trial = await requiredAsync(driver, 'startTrial', 'start_trial', { expectedResourceFingerprint: expectedResource });
         refresh();
@@ -1407,16 +1422,19 @@ export class ServiceLifecycle {
         return result;
       };
       const activate = async () => {
+        requireDisruptionAcceptance();
         if (typeof driver.armFinalRestart !== 'function' || typeof driver.enableFinal !== 'function') fail('SERVICE_PENDING', 'recover');
         if (platform === 'linux') {
           await requiredAsync(driver, 'armFinalRestart', 'arm_final_restart', { release: releaseForDriver, siblings });
           refresh();
+          requireDisruptionAcceptance();
           const result = await requiredAsync(driver, 'enableFinal', 'enable_final', { siblings });
           refresh();
           return result;
         }
         await requiredAsync(driver, 'armFinalRestart', 'arm_final_restart');
         refresh();
+        requireDisruptionAcceptance();
         const result = await requiredAsync(driver, 'enableFinal', 'enable_final');
         refresh();
         return result;
@@ -1602,6 +1620,7 @@ export class ServiceLifecycle {
             required(session, 'publishTombstone', 'publish_tombstone', tombstone, required(session, 'readTombstone', 'read_tombstone'));
           }
           if (head.phase !== 'resource-removed' && head.phase !== 'references-released') {
+            requireDisruptionAcceptance();
             await requiredAsync(driver, 'removeResource', 'remove_resource', platform === 'linux' ? { expectedCurrentSha256: rawResourceSha256(probe(), transaction.component), siblings } : { expectedResourceFingerprint: transaction.transition.platformResourceFingerprint });
             append('resource-removed');
           }
