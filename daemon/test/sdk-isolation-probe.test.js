@@ -20,7 +20,7 @@ const CHANGE_FILES = [
 ];
 const artifactsDir = join(repoRoot, "artifacts");
 const BASE_COMMIT = "a5bb530bd5a063b6571a7ba963e938bb6f97616f";
-const SDK_VERSION = "0.19.0";
+const SDK_VERSION = "0.20.0";
 const MIN_BUN_VERSION = [1, 4, 0];
 const FIXTURE_ROOT_PREFIX = "gjc-issue62-sdk-";
 const MAX_RECEIPT_BYTES = 100_000;
@@ -503,16 +503,32 @@ async function runPooledFailureProbe(scenario) {
           const values = { disabledProviders: [], enabledModels: models.map(model => model.provider + "/" + model.id),
             modelRoles: { default: "issue62-provider-a/issue62-model-a" },
             "task.agentModelOverrides": { planner: "issue62-provider-a/issue62-model-a" },
+            "modelProfile.default": "issue62-profile-a",
             modelProviderOrder: order, "startup.networkPrewarm": false };
+          const globalValues = structuredClone(values);
           const settings = { getCwd: () => scenario === "validation" || (retainedScenario && !poolFailure) ? "wrong-scope" : options.cwd,
-            getAgentDir: () => options.agentDir, get: key => values[key], getGlobal: key => values[key],
+            getAgentDir: () => options.agentDir, get: key => values[key], getGlobal: key => globalValues[key],
             getModelRole: () => values.modelRoles.default, getStorage: () => null };
           const registry = { authStorage: { getAll: () => ({}) }, getAll: () => models,
             getAvailable: () => models, getCanonicalId: () => "issue62-canonical-model",
             getCanonicalVariants: () => models.map(model => ({ model })),
             getCanonicalModels: () => [{ id: "issue62-canonical-model", variants: models.map(model => ({ model })) }],
+            getModelProfile: name => ({ name, source: "user", requiredProviders: [],
+              modelMapping: { default: values.modelRoles.default, planner: values.modelRoles.default } }),
             resolveCanonicalModel: () => models[0] };
+          let activeProfile;
           const raw = { settings, modelRegistry: registry, model: models[0], isDisposed: false,
+            async activateModelProfileForControl(name) {
+              if (scenario === "profile-activation")
+                throw Object.assign(new Error("profile activation rejected"), { code: "PROFILE_PRIMARY" });
+              activeProfile = scenario === "profile-marker-mismatch" ? "issue62-profile-b" : name;
+              if (scenario === "profile-role-mismatch") values["task.agentModelOverrides"] = { planner: "issue62-provider-b/issue62-model-b" };
+              return true;
+            },
+            getActiveModelProfile: () => activeProfile,
+            getActivatedModelProfile: () => activeProfile,
+            getConfiguredModelChain: () => [scenario === "profile-chain-mismatch"
+              ? "issue62-provider-b/issue62-model-b" : values.modelRoles.default],
             async dispose() {
               raw.isDisposed = true; disposals += 1;
               if (retainedScenario || creationScenario) {
@@ -651,6 +667,27 @@ test("issue #62 actual validation failure retains nested disposal rejection with
   assert.equal(failure.details.cleanup.sessionDisposals[0].closed, false);
   assert.equal(failure.details.cleanup.sdkOwnedResourcesClosed, false);
 });
+
+test("issue #62 profile activation failure retains its primary and disposes the SDK session under guard", async () => {
+  const failure = await runPooledFailureProbe("profile-activation");
+  assert.equal(failure.code, "PROFILE_PRIMARY");
+  assert.match(failure.message, /profile activation rejected/);
+  const diagnostic = failure.details.cleanupErrors.find(item => item.operation === "create-A-dispose");
+  assert.equal(diagnostic.details.error.errors[0].errors[0].code, "DISTINCTIVE_DISPOSAL");
+});
+
+for (const scenario of ["profile-marker-mismatch", "profile-chain-mismatch", "profile-role-mismatch"]) {
+  test(`issue #62 rejects ${scenario} despite a successful profile control return`, async () => {
+    const failure = await runPooledFailureProbe(scenario);
+    assert.equal(failure.code, "API_CONTRACT_MISMATCH");
+    const expectedMessage = {
+      "profile-marker-mismatch": /SDK did not activate the workDir profile/,
+      "profile-chain-mismatch": /profile default chain did not remain workDir-local/,
+      "profile-role-mismatch": /role policy did not remain session-local/,
+    };
+    assert.match(failure.message, expectedMessage[scenario]);
+  });
+}
 
 test("issue #62 actual pool shutdown preserves nested SDK errors beside factory primary", async () => {
   const failure = await runPooledFailureProbe("nested-pool");
@@ -1318,7 +1355,15 @@ async function validateReceipt(receipt, order, roots = []) {
   const labels = new Set(receipt.model.sessions.map(item => item.label));
   assert.deepEqual(labels, new Set(["A", "B"]));
   for (const session of receipt.model.sessions) {
-    assert.equal(session.activeModel, session.label === "A" ? "issue62-provider-a/issue62-model-a" : "issue62-provider-b/issue62-model-b");
+    const expectedModel = session.label === "A" ? "issue62-provider-a/issue62-model-a" : "issue62-provider-b/issue62-model-b";
+    const expectedProfile = `issue62-profile-${session.label.toLowerCase()}`;
+    assert.equal(session.activeModel, expectedModel);
+    assert.equal(session.settings.modelRolesDefault, expectedModel);
+    assert.equal(session.settings.planner, expectedModel);
+    assert.equal(session.settings.modelProfileDefault, expectedProfile);
+    assert.equal(session.activeProfile, expectedProfile);
+    assert.equal(session.activatedProfile, expectedProfile);
+    assert.deepEqual(session.defaultChain, [expectedModel]);
     assert.equal(session.authEntryProviderCount, 0);
   }
   assert.deepEqual(receipt.registryClassification.availableResolvedProvider, {
@@ -1443,9 +1488,11 @@ async function validateReceipt(receipt, order, roots = []) {
   assert.deepEqual(receipt.cleanup.storeOutcomes.map(outcome => outcome.name),
     ["model-registry-C", "auth-C", "settings-C", "model-cache"]);
   assert.equal(receipt.artifactName, null);
-  assert.match(receipt.customFactoryBoundary, /Profile activation and live provider transport are not covered\./);
+  assert.match(receipt.customFactoryBoundary, /public session-only profile activation/);
+  assert.match(receipt.customFactoryBoundary, /Live provider transport is not covered\./);
   assert.equal(receipt.coverage.auth, "SDK-owned empty fixture auth for A/B; fixture-owned empty auth for C");
   assert.equal(receipt.coverage.sessionHostAccess, "not-exercised");
+  assert.equal(receipt.coverage.profileActivation, "workDir modelProfile.default via AgentSession.activateModelProfileForControl; user default/planner mappings, session-only");
   assert.ok(JSON.stringify(receipt).length < MAX_RECEIPT_BYTES);
   const serialized = JSON.stringify(receipt);
   assert.doesNotMatch(serialized, /OPENROUTER_API_KEY|access_token|refresh_token|Authorization|credential|secret|token/i);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -11,7 +11,7 @@ const testFile = fileURLToPath(import.meta.url);
 const daemonDir = resolve(dirname(testFile), "..");
 const fixture = join(daemonDir, "test-fixtures", "sdk-contract-probe.mjs");
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
-const SDK_VERSION = "0.19.0";
+const SDK_VERSION = "0.20.0";
 const CHILD_TIMEOUT_MS = 50_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const SECRET_ASSIGNMENT =
@@ -121,6 +121,21 @@ function failureSummary(receipt, signal) {
         "adapterPendingGateCount",
       ];
       const safeState = [];
+      for (const key of ["askActiveAtProvider", "askObjectSelectionOptions", "askScalarLabelOptions"]) {
+        if (typeof state[key] === "boolean") safeState.push(`${key}=${state[key]}`);
+      }
+      for (const key of [
+        "askCallCount", "askSchemaValidCount", "askSchemaInvalidCount",
+        "askExecutionEnteredCount", "askExecutionRejectedCount", "askToolResultErrorCount",
+        "askEmitterPromiseRejectedCount", "askEarliestGateListenerCount", "askQuarantineCount",
+        "askRawArgumentsRejectedCount", "askEmitterEnteredCount",
+        "askArgumentValidationFailureCount", "askExecutionFailureCount", "askNotFoundCount",
+      ]) {
+        const value = state[key];
+        if (Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000) {
+          safeState.push(`${key}=${value}`);
+        }
+      }
       for (const key of stateKeys) {
         const value = state[key];
         if (typeof value === "boolean") {
@@ -376,6 +391,147 @@ test("failure diagnostics preserve partial cells without qualifying the whole co
   assert.doesNotMatch(summary, /private|authorization|rawPath|secret=/);
 });
 
+test("Ask failure diagnostics allow only bounded dispatch and schema observations", () => {
+  const observations = {
+    askActiveAtProvider: true,
+    askCallCount: 1,
+    askSchemaValidCount: 1,
+    askSchemaInvalidCount: 0,
+    askExecutionEnteredCount: 0,
+    askExecutionRejectedCount: 0,
+    askObjectSelectionOptions: true,
+    askScalarLabelOptions: false,
+    askEmitterPromiseRejectedCount: 0,
+    askEarliestGateListenerCount: 0,
+    askQuarantineCount: 1,
+    askRawArgumentsRejectedCount: 0,
+    askEmitterEnteredCount: 0,
+    askToolResultErrorCount: 1,
+    askArgumentValidationFailureCount: 0,
+    askExecutionFailureCount: 1,
+    askNotFoundCount: 0,
+  };
+  const summarize = (state) => failureSummary({
+    code: "FIRST_GATE_NOT_EMITTED",
+    primaryFailure: { stage: "workflow-gates", code: "FIRST_GATE_NOT_EMITTED", state },
+  });
+  const summary = summarize({
+    ...observations,
+    question: "private question",
+    providerPayload: "authorization=private",
+    errorMessage: "private error",
+  });
+  for (const [key, value] of Object.entries(observations)) {
+    assert.ok(summary.includes(`${key}=${value}`), key);
+  }
+  assert.doesNotMatch(summary, /private|authorization|question|providerPayload|errorMessage/);
+  const rejected = summarize({
+    askActiveAtProvider: "true",
+    askCallCount: -1,
+    askSchemaValidCount: "1",
+    askSchemaInvalidCount: Infinity,
+    askExecutionEnteredCount: 0.5,
+    askExecutionRejectedCount: 1_000_001,
+    askToolResultErrorCount: NaN,
+    askArgumentValidationFailureCount: {},
+    askExecutionFailureCount: [],
+    askNotFoundCount: "authorization=private",
+  });
+  assert.doesNotMatch(rejected, /askActiveAtProvider|ask\w+Count|private|authorization/);
+});
+
+async function loadObservationHelpers() {
+  const source = await readFile(fixture, "utf8");
+  const start = source.indexOf("function boundedDiagnosticState(");
+  const end = source.indexOf("\nfunction deferred(", start);
+  assert.ok(start >= 0 && end > start, "actual observation helper boundaries exist");
+  return Function(`"use strict";\n${source.slice(start, end)}\nreturn { buildHarnessFailureState, observeAskExecution };`)();
+}
+
+test("Ask observer preserves receiver, arguments, promise and synchronous error identities", async () => {
+  const { observeAskExecution } = await loadObservationHelpers();
+  const diagnostics = {
+    askExecutionEnteredCount: 0,
+    askExecutionRejectedCount: 0,
+    askRawArgumentsRejectedCount: 0,
+  };
+  const receiver = {};
+  const params = { questions: [] };
+  const signal = new AbortController().signal;
+  let calls = 0;
+  const original = (result, error) => function (...args) {
+    calls += 1;
+    assert.equal(this, receiver);
+    assert.equal(args[0], "call-id");
+    assert.equal(args[1], params);
+    assert.equal(args[2], signal);
+    if (error) throw error;
+    return result;
+  };
+  const fulfilled = Promise.resolve("completed");
+  const success = observeAskExecution(original(fulfilled), diagnostics);
+  assert.equal(success.call(receiver, "call-id", params, signal), fulfilled);
+  await fulfilled;
+  const rejection = new Error('Validation failed for tool "ask": raw arguments rejected before coercion');
+  const rejected = Promise.reject(rejection);
+  const failure = observeAskExecution(original(rejected), diagnostics);
+  assert.equal(failure.call(receiver, "call-id", params, signal), rejected);
+  await assert.rejects(rejected, (error) => error === rejection);
+  const synchronousError = new Error("fixture-synchronous-failure");
+  const synchronous = observeAskExecution(original(undefined, synchronousError), diagnostics);
+  assert.throws(() => synchronous.call(receiver, "call-id", params, signal), (error) => error === synchronousError);
+  assert.equal(calls, 3);
+  assert.deepEqual(diagnostics, {
+    askExecutionEnteredCount: 3,
+    askExecutionRejectedCount: 2,
+    askRawArgumentsRejectedCount: 1,
+  });
+});
+
+test("bounded Ask observations retain prior tracked evidence through summary formatting", async () => {
+  const { buildHarnessFailureState } = await loadObservationHelpers();
+  const diagnostics = {
+    askActiveAtProvider: true,
+    askObjectSelectionOptions: true,
+    askScalarLabelOptions: false,
+    ...Object.fromEntries([
+      "askCallCount", "askSchemaValidCount", "askSchemaInvalidCount",
+      "askExecutionEnteredCount", "askExecutionRejectedCount", "askToolResultErrorCount",
+      "askEmitterPromiseRejectedCount", "askEarliestGateListenerCount", "askQuarantineCount",
+      "askRawArgumentsRejectedCount", "askEmitterEnteredCount", "askArgumentValidationFailureCount",
+      "askExecutionFailureCount", "askNotFoundCount",
+    ].map((key) => [key, 0])),
+  };
+  const state = buildHarnessFailureState({
+    ownedPromptStatus: "pending",
+    ownerTicketPhase: "active",
+    providerCalls: 2,
+    publicTerminalCount: 1,
+    publicRootPromptStatus: "fulfilled",
+    sdkPendingGateCount: 0,
+    adapterPendingGateCount: 0,
+    trackedSubmissions: [{
+      submissionId: "tracked-budget-proof",
+      executionDisposition: "promoted-to-run",
+      terminalStatus: "pending",
+    }],
+  }, diagnostics);
+  assert.equal(Object.keys(state).length, 24);
+  assert.equal(Object.hasOwn(state, "askNotFoundCount"), false);
+  const summary = failureSummary({
+    code: "TRACKED_ADAPTER_SETTLEMENT_MISMATCH",
+    primaryFailure: { stage: "tracked", code: "TRACKED_ADAPTER_SETTLEMENT_MISMATCH", state },
+  });
+  for (const expected of [
+    "ownedPromptStatus=pending", "ownerTicketPhase=active", "providerCalls=2",
+    "publicTerminalCount=1", "publicRootPromptStatus=fulfilled",
+    "sdkPendingGateCount=0", "adapterPendingGateCount=0",
+    "trackedSubmissions.0.submissionId=tracked-budget-proof",
+    "trackedSubmissions.0.executionDisposition=promoted-to-run",
+    "trackedSubmissions.0.terminalStatus=pending",
+  ]) assert.ok(summary.includes(expected), expected);
+});
+
 function assertSubmissionEvidence(record, delivery, disposition, removed = false) {
   assert.equal(typeof record.submissionId, "string");
   assert.ok(record.submissionId.length > 0);
@@ -399,7 +555,7 @@ function assertSubmissionEvidence(record, delivery, disposition, removed = false
 }
 
 test(
-  "SDK 0.19.0 real tracked controls qualify ownership, sequential delivery, late rearm, joined Ask, gates, failures, and disposal",
+  "SDK 0.20.0 real tracked controls qualify ownership, sequential delivery, late rearm, joined Ask, gates, failures, and disposal",
   { timeout: 55_000 },
   async () => {
     assert.ok(existsSync(fixture), "real SDK contract fixture is missing");
@@ -719,7 +875,7 @@ test(
       "public abort rejected before late-answer probe"
     );
 
-    // SDK 0.19.0 does not publicly export the decision-gate builders. This
+    // SDK 0.20.0 does not publicly export the decision-gate builders. This
     // oracle deliberately reports that boundary instead of copying a private
     // approval/execution schema and accidentally turning another fake into truth.
     assert.deepEqual(receipt.decisionGate, {

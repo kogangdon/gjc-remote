@@ -2,17 +2,39 @@
 
 Discord-controlled remote GJC sessions.
 
-> **Tracked-input source integration (#231): LOCAL Windows subset qualified; issue OPEN.**
+> **Current source: SDK 0.20.0 candidate — scoped Windows qualification passed.**
+> `feat/sdk-0.20.0-upgrade` coordinates official unpatched 0.20.0 dependencies,
+> lockfile, native SDK contract and Docker pins; official package SRI and all six
+> source-byte comparisons passed. Config schema 2 and transcript 5 markers remain
+> unchanged. Official per-workDir profile activation and structured SDK gate
+> options resolve the initial Ask/planner failures without changing scalar wire
+> choices. Windows Node 26.12.1 `npm test`: **3120 total, 3108 pass, 0 fail, 12 skip**;
+> Bun 1.4.4 daemon: **1186 pass, 0 fail, 2 skip**. Canonical imports, all SDK
+> contract cells and isolation in both creation orders passed; three independent
+> reviews APPROVE after diagnostics fixes. See the
+> [candidate ledger](docs/daemon-workspace-verification.md#sdk-0200-candidate--qualification-scope).
+> One explicitly authorized same-profile A→B→A provider smoke passed (three
+> `SMOKE_OK` prompts, exit 0); its grant is **CONSUMED**, not reusable. All future
+> provider calls require a fresh grant. This is basic same-profile proof, not
+> divergent real-profile/tenant isolation, provider-backed active controls or a
+> #247/#7412 fix; #231/#247 remain open and #7412 unresolved.
+> This is not Bun conversion: service/bot Node 26.7.0, daemon/producer Bun 1.4.2,
+> 15 held native Bun failures and two held snapshots remain separate and unchanged.
+> No deployed Bun 1.4.2 SDK 0.20, Linux/macOS/Docker, SCM, signing, production or
+> rollback compatibility qualification or release approval follows from these local receipts.
+> CI evidence must come from the corresponding PR checks.
+
+> **Historical SDK 0.19.0 tracked-input integration (#231): LOCAL Windows subset qualified; issue OPEN.**
 > On `feat/sdk-tracked-live-controls`, active `steer`/`follow_up` use public
 > `submitUserMessage` tracked handles with scoped cohort/run ownership; idle
 > controls remain serialized real prompts. Official unpatched SDK **0.19.0**
-> and its SRI stay unchanged. Post-review Windows focused **474/474** and unrestricted
+> and its SRI were unchanged within that cohort. Post-review Windows focused **474/474** and unrestricted
 > workspace **2897 tests, 2887 pass, 0 fail, 10 existing skips** passed,
 > including genuine SDK primary/joined Ask ownership and late successor consumption.
 > Ambiguous promoted-overlap gates remain bounded refusals, not universal gate support.
 > The issue231 basic-root provider smoke is CONSUMED-PASS on **PRE-REVIEW source only**;
 > later router/fatal-retirement fixes and final test corrections were not provider rerun.
-> Current focused/full checks use credentialless mock providers, not provider-backed
+> Those focused/full checks used credentialless mock providers, not provider-backed
 > active-control or profile/tenant isolation qualification. Never replay the smoke.
 > Five prior independent review lanes and the final test-correction review **APPROVE**
 > statically only; exact-head CI remains **PENDING**. See
@@ -20,6 +42,7 @@ Discord-controlled remote GJC sessions.
 > SDK adoption at `9512dd8` / [PR #274](https://github.com/kogangdon/gjc-remote/pull/274)
 > and [PR #265](https://github.com/kogangdon/gjc-remote/pull/265)'s 0.18.12 receipts
 > are historical, not tracked-input qualification or fresh provider authority.
+> None of these receipts qualifies the 0.20.0 candidate.
 > No fresh Linux/macOS/Docker, profile/tenant isolation, security, production,
 > release, support, installation or deployment qualification or issue closure is claimed.
 
@@ -79,8 +102,8 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    authority; prompt fulfillment alone is not successful completion.
    Each cohort has one deliberate gate owner; unprovable ownership fails
    explicitly within a bound rather than guessing or broadcasting answers.
-   Genuine SDK primary and joined-run Ask checks prove exact owner/presentation;
-   late `follow_up` and `steer` checks prove real successor consumption.
+   Historical 0.19.0 SDK primary and joined-run Ask checks proved exact owner/presentation;
+   late `follow_up` and `steer` checks proved real successor consumption.
    Promoted-overlap gates without a public immutable owner bridge are refused
    with bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP`, with no gate presentation,
    answer or continuation; this negative check is not universal gate support.
@@ -296,7 +319,7 @@ bun run --filter '@gjc-remote/daemon' start
 
 Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
 daemon runs on Bun (>=1.4.0) and embeds the
-[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.19.0**
+[`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.20.0** (source candidate)
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
 should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
@@ -319,18 +342,21 @@ implements no Broker/Router or product-policy migration.
 
 Use canonical `@gajae-code/coding-agent/sdk` exports, including the `host`,
 `router`, `lifecycle`, `bus`, and `mcp` namespaces. Old `sdk/broker`, `sdk/client`,
-and `sdk/models` import subpaths are blocked in 0.19.0; source-file presence
-does not make them public entrypoints.
+and `sdk/models` import subpaths are not supported integration entrypoints;
+source-file presence does not make them public. The 0.20.0 real canonical import,
+all SDK contract cells and isolation probes in both creation orders passed on
+the scoped Windows Node/Bun runners, not on deployed or other-platform runtimes.
 
-SDK 0.19.0 retains the bundled catalog change introduced in 0.16.4: the retired
-`team` command is replaced by `autoresearch`. After deploying this upgrade, run
+The bundled catalog change introduced in 0.16.4 replaced the retired
+`team` command with `autoresearch`. After deploying this upgrade, run
 `npm run register` from `bot/` to replace the guild slash-command catalog.
 Registration is an explicit operator action; upgrading dependencies alone does
 not change Discord's stored commands.
 
-> **Current tracked-input evidence: LOCAL Windows subset qualified.** Source pins remain official unpatched
+> **Historical 0.19.0 tracked-input evidence: LOCAL Windows subset qualified.** That cohort used official unpatched
 > `@gajae-code/coding-agent` **0.19.0**, requiring **Bun 1.4.0 or newer**;
-> SDK version/SRI are unchanged. Post-review focused and unrestricted workspace checks
+> its SDK version/SRI were unchanged. These receipts do not qualify 0.20.0.
+> Post-review focused and unrestricted workspace checks
 > passed with mock providers; the consumed basic-root smoke qualifies **PRE-REVIEW source only**,
 > not later router/fatal-retirement fixes or final test corrections, active controls or isolation.
 > It cannot be replayed. Ambiguous promoted-overlap gates remain bounded refusals.

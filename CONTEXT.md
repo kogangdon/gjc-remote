@@ -11,11 +11,54 @@ online, from a single Discord bot exposing GJC's bundled workflow skills
 (`deep-interview`, `ralplan`, `autoresearch`, `ultragoal`) plus direct prompts and
 runtime model switching as `/slash` commands.
 
-## Architecture (tracked-input source integration; LOCAL Windows subset qualified)
+## Architecture (SDK 0.20.0 source candidate; scoped Windows qualification passed)
+
+Current branch `feat/sdk-0.20.0-upgrade` coordinates official unpatched
+`@gajae-code/coding-agent`, `agent-core` and `ai` 0.20.0 dependencies, lockfile,
+native SDK contract and Docker pins atomically. Official package SRI and six
+source-byte comparisons were verified; config schema 2 and transcript 5 source
+markers remain unchanged. Official per-workDir profile activation preserves real
+model/planner/provider and creation-order isolation. Structured SDK gate options
+(`{selected: [label]}`, `{decision: d}`) translate to unchanged scalar wire choices;
+request-changes requires JSON comments, not one-click approval. Legacy scalar SDK
+options are rejected, not accepted through a fallback. Tracked `removed/refused`
+remains failed nonexecution, not revocation.
+
+Final Windows Node 26.12.1 root `npm test`: **3120 total, 3108 pass, 0 fail, 12 skip**
+(scripts 165; bot 377; daemon 1332 pass/2 skip; native 1031 pass/10 skip; shared 203).
+Bun 1.4.4 full daemon: **1186 pass, 0 fail, 2 skip**. Four focused SDK files:
+Node **328 pass**, Bun **213 pass**, zero failures. Real canonical imports, all SDK
+contract cells and isolation in both creation orders passed. Independent reviews
+24/profile and 25/codec APPROVE; 26/diagnostics initially found two P2s (promise
+identity and evidence truncation), fixed with regressions and re-reviewed APPROVE.
+The initial real Ask/divergent-planner failures and Node 3102 total/3088 pass/
+2 fail/12 skip, plus the corrected Bun adapter/router 147-pass cohort, remain
+historical attempts, not final results; their logs remain in
+`gjc-sdk020-qualification-XF1UEB`. See the
+[candidate ledger](docs/daemon-workspace-verification.md#sdk-0200-candidate--qualification-scope).
+
+After the earlier provider restriction, the user explicitly authorized ONE actual
+provider local-smoke: canonical script, existing configured profile, A→B→A three
+`SMOKE_OK` prompts, exit 0, all three invoke terminals, heartbeat and profile
+activation assertions passed. Owned temporary A/B configs disabled SDK request/
+stream retries, background memory and compaction; `GJC_NO_TITLE=1`, no model query
+or automatic rerun. Identity-checked temporary-root cleanup succeeded after child
+exit; no global SDK state was deleted. The grant is **CONSUMED**; all future
+provider calls require a fresh grant. This paid BASIC same-profile proof is not
+divergent real-profile/tenant isolation, provider-backed active-control qualification
+or a #247/#7412 fix. #231/#247 remain open; #7412 is unresolved.
+
+This is source-scope qualification only, not release approval or CI evidence.
+CI evidence must come from the corresponding PR checks. Bun conversion, 15 held native Bun failures and two held snapshots
+remain separate and unchanged, as do service/bot Node 26.7.0 and daemon/producer
+Bun 1.4.2 pins. No deployed Bun 1.4.2 SDK 0.20, Linux/macOS/Docker, SCM, signing,
+production or rollback compatibility qualification is claimed.
+
+**Historical SDK 0.19.0 tracked-input integration (#231).**
 
 `feat/sdk-tracked-live-controls` implements #231 atop merged SDK 0.19.0 main
 `891c7aad71307f56ce5a140fb08599b1a53551ab`. The daemon dependency, lockfile and
-SRI remain official unpatched 0.19.0. Focused and unrestricted workspace checks
+SRI remained official unpatched 0.19.0 within that cohort. Focused and unrestricted workspace checks
 passed post-review locally on Windows: **474/474** focused, **2897 tests, 2887 pass,
 0 fail, 10 existing skips** in unrestricted `npm test` (exit 0), using credentialless
 mock providers. These include genuine SDK primary/joined Ask ownership,
@@ -29,7 +72,7 @@ isolation. Five prior independent lanes plus final test-correction review
 statically **APPROVE**; this is not independent runtime evidence. Exact-head CI
 remains **PENDING**. Full counts, receipts and review provenance are in
 [current tracked-input evidence](docs/daemon-workspace-verification.md#current-tracked-input-evidence).
-No historical receipt or review qualifies this feature. #231 remains **OPEN**, not
+These receipts and reviews do not qualify the 0.20.0 candidate. #231 remains **OPEN**, not
 universally complete. No fresh Linux/macOS/Docker, security, profile/tenant
 isolation or issue closure is claimed. This source change does not authorize
 release, signing, installation, deployment, host-ACL/account/credential changes
@@ -90,8 +133,8 @@ Genuine execution/terminal/removal receipts are authoritative, not text matches
 or unrelated terminals. Idle controls remain serialized real prompts, and root
 prompt/model operations cannot overtake tracked work. Each cohort has one
 deliberate gate owner; unprovable ownership produces a bounded explicit failure,
-not guessed ownership. Local genuine SDK primary and joined-run Ask checks prove
-exact owner/presentation; late `follow_up` and `steer` checks prove real successor
+not guessed ownership. Historical 0.19.0 genuine SDK primary and joined-run Ask checks proved
+exact owner/presentation; late `follow_up` and `steer` checks proved real successor
 consumption. Promoted-overlap gates without an immutable public owner bridge fail
 with bounded `SDK_TRACKED_INPUT_GATE_OWNERSHIP`, with no gate presentation, answer
 or continuation. This negative qualification is not universal gate support.
@@ -117,8 +160,8 @@ Do not promote its pass into bounded active-interruption qualification.
 Historically, the published 0.16.7 package lacked #5371's late-follow-up
 continuation fix for upstream #5351. SDK 0.18.12 includes that fix and the
 public ownership API associated with #5429; those are no longer absent SDK
-capabilities. This branch integrates the public tracked lifecycle for active
-controls within the recorded LOCAL Windows subset, not universal gate support,
+capabilities. The prior 0.19.0 branch integrated the public tracked lifecycle for active
+controls within its recorded LOCAL Windows subset, not universal gate support,
 and does not consume internal `queuedAtDispatch` or SDK-host
 `onQueuedPromoted` hooks. Do not substitute queue-text matching, private
 capabilities, or forced lower-level continuation.
@@ -214,7 +257,7 @@ selection, workDir canonicalization, workspace admission/lifecycle policy, and
 relay limits. The SDK runtime remains authoritative for provider/model
 catalogs, provider authentication, and agent-turn semantics; the bridge
 resolves remote selectors and schedules/relays controls without reimplementing
-those semantics. Public SDK 0.19.0 `router` and `lifecycle` namespaces are reserved for a
+those semantics. Public SDK `router` and `lifecycle` namespaces are reserved for a
 separate evaluation as a possible future external-session path. No
 Broker/Router adapter, route, product-policy migration, or fallback is
 implemented.

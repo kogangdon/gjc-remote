@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### SDK 0.20.0 source candidate — scoped Windows qualification passed
+
+- On `feat/sdk-0.20.0-upgrade`, coordinate official unpatched
+  `@gajae-code/coding-agent`, `agent-core` and `ai` 0.20.0 dependencies,
+  lockfile, native SDK contract and Docker pins atomically. Official package SRI
+  and six source-byte comparisons were independently verified; config schema 2
+  and transcript 5 source markers are unchanged.
+- Resolve the divergent-planner failure through official per-workDir profile
+  activation, preserving real model/planner/provider and creation-order
+  isolation. Resolve Ask quarantine by translating structured SDK options (`{selected: [label]}`, `{decision: d}`)
+  to unchanged scalar wire choices; request-changes uses JSON comments, not a
+  one-click choice. Reject legacy scalar SDK options rather than falling back.
+- Final Windows Node 26.12.1 root `npm test`: **3120 total, 3108 pass, 0 fail,
+  12 skip** (scripts 165; bot 377; daemon 1332 pass/2 skip; native 1031 pass/10 skip;
+  shared 203). Bun 1.4.4 full daemon: **1186 pass, 0 fail, 2 skip**. Four focused
+  SDK files: Node **328 pass**, Bun **213 pass**, zero failures. Real canonical
+  imports, all SDK contract cells and isolation in both creation orders passed.
+  Reviews 24/profile and 25/codec APPROVE; 26/diagnostics' initial two P2s
+  (promise identity/evidence truncation) were fixed, regression-tested and
+  re-reviewed APPROVE. Initial failed attempts remain historical evidence.
+- Consume ONE newly user-authorized canonical provider local-smoke: existing
+  configured profile, A→B→A, three `SMOKE_OK` prompts, exit 0; all invoke terminals,
+  heartbeat and profile activation assertions passed. Owned temporary A/B configs
+  disabled SDK request/stream retries, background memory and compaction;
+  `GJC_NO_TITLE=1`, no model query or automatic rerun. Identity-checked owned-root
+  cleanup succeeded after child exit without deleting global SDK state. The grant
+  is **CONSUMED**; future calls require a fresh grant. This BASIC same-profile
+  proof does not qualify divergent real profiles/tenants or provider-backed active
+  controls, fix #247/#7412, or close #231/#247; #7412 remains unresolved.
+- Keep Bun conversion, 15 held native Bun failures, two held snapshots and runtime
+  pins (service/bot Node 26.7.0; daemon/producer Bun 1.4.2) separate and unchanged.
+  Prior 0.19/0.18 receipts below qualify only their original cohorts. No deployed
+  Bun 1.4.2 SDK 0.20, Linux/macOS/Docker, SCM, signing, production or rollback
+  compatibility qualification or release approval follows from these local receipts.
+  CI evidence must come from the corresponding PR checks.
+- Classify matching tracked `removed/refused` receipts as failed nonexecution,
+  not revocation, successful cancellation or contract corruption. Contradictory receipts
+  still fail closed; bounded regression checks preserve the owning root/session.
+
 ### Windows boundary admission and streamed-input contracts (issue #240)
 
 - Validate Windows trial boundaries against one coherent, already-admitted
@@ -66,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of an actual systemd/SCM uninstall or permission to modify installed services,
   accounts, credentials, ACLs, signed releases or deployment state.
 
-### Tracked live-input integration (issue #231)
+### Tracked live-input integration (issue #231; historical SDK 0.19.0 receipts)
 
 - Integrate active steering/follow-up through official SDK 0.19.0's public
   `submitUserMessage` admission/execution/terminal/cancel lifecycle. Retain idle

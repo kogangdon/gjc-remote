@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /*
- * Real installed SDK 0.19.0 tracked-control contract oracle.
+ * Real installed SDK 0.20.0 tracked-control contract oracle.
  * Stdout contains one bounded receipt.
  */
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const RECEIPT_SCHEMA = "sdk-contract-probe-v1";
-const EXPECTED_SDK_VERSION = "0.19.0";
+const EXPECTED_SDK_VERSION = "0.20.0";
 const HISTORICAL_SDK_VERSION = "0.16.4";
 const DECISION_GATE_CODE =
   "DECISION_GATE_BUILDERS_NOT_PUBLIC";
@@ -79,6 +79,36 @@ function boundedDiagnosticState(value, depth = 0) {
     return output;
   }
   return "UNSUPPORTED";
+}
+
+function buildHarnessFailureState(state, askDiagnostics) {
+  // Additional observations must never displace original lifecycle evidence.
+  return boundedDiagnosticState({ ...state, ...askDiagnostics });
+}
+
+function observeAskExecution(execute, diagnostics) {
+  const recordRejection = (error) => {
+    diagnostics.askExecutionRejectedCount += 1;
+    try {
+      if (error?.message === 'Validation failed for tool "ask": raw arguments rejected before coercion') {
+        diagnostics.askRawArgumentsRejectedCount += 1;
+      }
+    } catch {
+      // Diagnostic inspection must not replace the SDK's original rejection.
+    }
+  };
+  return function (...args) {
+    diagnostics.askExecutionEnteredCount += 1;
+    let result;
+    try {
+      result = execute.apply(this, args);
+    } catch (error) {
+      recordRejection(error);
+      throw error;
+    }
+    void Promise.resolve(result).then(undefined, recordRejection);
+    return result;
+  };
 }
 
 function deferred() {
@@ -199,6 +229,25 @@ async function createHarness(
     subscriptions: new Set(),
     calls: {},
     releases: [],
+    askDiagnostics: {
+      askActiveAtProvider: false,
+      askCallCount: 0,
+      askSchemaValidCount: 0,
+      askSchemaInvalidCount: 0,
+      askExecutionEnteredCount: 0,
+      askExecutionRejectedCount: 0,
+      askObjectSelectionOptions: false,
+      askScalarLabelOptions: false,
+      askEmitterPromiseRejectedCount: 0,
+      askEarliestGateListenerCount: 0,
+      askQuarantineCount: 0,
+      askRawArgumentsRejectedCount: 0,
+      askEmitterEnteredCount: 0,
+      askToolResultErrorCount: 0,
+      askArgumentValidationFailureCount: 0,
+      askExecutionFailureCount: 0,
+      askNotFoundCount: 0,
+    },
   };
   try {
     return await initializeHarness(harness, responseSets, options);
@@ -298,6 +347,9 @@ async function initializeHarness(
       streamSimple(model, context, options) {
         const mock = mockModels.get(model.id);
         if (!mock) throw new ProbeError("UNSCRIPTED_MODEL_SELECTED");
+        if (withAsk) {
+          harness.askDiagnostics.askActiveAtProvider = context.tools?.some((tool) => tool.name === "ask") === true;
+        }
         return mock.stream(mock, context, options);
       },
       models: [...mockModels.keys()].map(modelDefinition),
@@ -328,6 +380,11 @@ async function initializeHarness(
   };
   const askTool = withAsk ? AskTool.createIf(toolSession) : undefined;
   if (withAsk) requireCondition(askTool, "ASK_TOOL_NOT_AVAILABLE");
+  if (askTool) {
+    // Observe entry into the real tool, after agent-core validation/session guards.
+    // Forward the exact arguments/result; never substitute a gate or continuation.
+    askTool.execute = observeAskExecution(askTool.execute, harness.askDiagnostics);
+  }
   const tools = askTool ? [askTool] : [];
   const toolRegistry = new Map(tools.map((tool) => [tool.name, tool]));
   const agent = new Agent({
@@ -398,11 +455,62 @@ async function initializeHarness(
   if (withAsk) {
     const emitter = session.getWorkflowGateEmitter();
     requireCondition(emitter, "REAL_GATE_EMITTER_UNAVAILABLE");
+    const emitGate = emitter.emitGate;
+    emitter.emitGate = function (...args) {
+      harness.askDiagnostics.askEmitterEnteredCount += 1;
+      const result = emitGate.apply(this, args);
+      // Observe rejection without replacing the exact public promise returned to Ask.
+      void result.then(undefined, () => { harness.askDiagnostics.askEmitterPromiseRejectedCount += 1; });
+      return result;
+    };
+    const quarantineGate = emitter.quarantineGate;
+    emitter.quarantineGate = function (...args) {
+      harness.askDiagnostics.askQuarantineCount += 1;
+      return quarantineGate.apply(this, args);
+    };
     trackSubscriptions(harness, emitter, "onGateEmitted", "gate");
+    // Remote-answer support is unconditional in BrokerWorkflowGateEmitter. This
+    // listener only counts publication, before scenario listeners clone payloads.
+    const releasePublicationObserver = emitter.onGateEmitted((gate) => {
+      harness.askDiagnostics.askEarliestGateListenerCount += 1;
+      const options = gate.options;
+      if (Array.isArray(options) && options.length > 0) {
+        harness.askDiagnostics.askScalarLabelOptions = options.every((option) => option.value === option.label);
+        harness.askDiagnostics.askObjectSelectionOptions = options.every((option) => {
+          const value = option.value;
+          return value !== null && typeof value === "object" && !Array.isArray(value) &&
+            Object.keys(value).length === 1 && Array.isArray(value.selected) &&
+            value.selected.length === 1 && value.selected[0] === option.label;
+        });
+      }
+      releasePublicationObserver();
+    });
+    harness.releases.push(releasePublicationObserver);
   }
   session.setDisposeTimeoutForTests(3_000);
   const events = [];
-  const unsubscribe = session.subscribe((event) => events.push(event));
+  const unsubscribe = session.subscribe((event) => {
+    events.push(event);
+    if (!askTool || event?.type !== "message_end") return;
+    const message = event.message;
+    if (message?.role === "assistant" && Array.isArray(message.content)) {
+      for (const call of message.content) {
+        if (call?.type !== "toolCall" || call.name !== "ask") continue;
+        harness.askDiagnostics.askCallCount += 1;
+        // AskTool.parameters is the official stage-sensitive Zod schema.
+        const valid = askTool.parameters.safeParse(call.arguments).success;
+        harness.askDiagnostics[valid ? "askSchemaValidCount" : "askSchemaInvalidCount"] += 1;
+      }
+    }
+    if (message?.role !== "toolResult" || message.toolName !== "ask" || message.isError !== true) return;
+    harness.askDiagnostics.askToolResultErrorCount += 1;
+    // agent-core's ToolFailureEnvelope exposes only these two fixed failure kinds.
+    if (message.details?.failureKind === "argument_validation") harness.askDiagnostics.askArgumentValidationFailureCount += 1;
+    if (message.details?.failureKind === "execution") harness.askDiagnostics.askExecutionFailureCount += 1;
+    if (message.content?.some((item) => item?.type === "text" && item.text === "Tool ask not found")) {
+      harness.askDiagnostics.askNotFoundCount += 1;
+    }
+  });
   adapter = new SdkSession(session, {
     idleTimeoutMs: 6_000,
     hardCapMs: 10_000,
@@ -542,7 +650,7 @@ async function withHarness(stage, ownerRoot, responseSets, options, run) {
     primaryFailure = {
       stage,
       code: failureCode(error, "UNEXPECTED_SCENARIO_FAILURE"),
-      state: boundedDiagnosticState({
+      state: buildHarnessFailureState({
         ...(error instanceof ProbeError && error.state !== undefined ? error.state : {}),
         providerCalls: [...harness.mockModels.values()].reduce((count, model) => count + model.calls.length, 0),
         publicTerminalCount: terminalEvents(harness.events).length,
@@ -558,7 +666,7 @@ async function withHarness(stage, ownerRoot, responseSets, options, run) {
           terminalDisposition: record.terminal.value?.disposition ?? "pending",
           removalReason: record.terminal.value?.reason ?? "none",
         })),
-      }),
+      }, harness.askDiagnostics),
     };
   }
   const cleanup = await closeHarness(harness);

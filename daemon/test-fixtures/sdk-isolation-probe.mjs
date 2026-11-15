@@ -25,7 +25,7 @@ let registerProvider;
 
 const ISSUE = 62;
 const BASE_COMMIT = "a5bb530bd5a063b6571a7ba963e938bb6f97616f";
-const EXPECTED_SDK = "0.19.0";
+const EXPECTED_SDK = "0.20.0";
 const MIN_BUN = [1, 4, 0];
 const PROVIDER_A = "issue62-provider-a";
 const PROVIDER_B = "issue62-provider-b";
@@ -155,6 +155,7 @@ function policySnapshot(settings) {
     enabledModels: [...settings.get("enabledModels")],
     modelRolesDefault: settings.getModelRole("default"),
     planner: settings.get("task.agentModelOverrides")?.planner,
+    modelProfileDefault: settings.get("modelProfile.default"),
     modelProviderOrder: [...settings.get("modelProviderOrder")],
     globalModelProviderOrder: [...(settings.getGlobal("modelProviderOrder") ?? [])],
     networkPrewarm: settings.get("startup.networkPrewarm"),
@@ -167,6 +168,7 @@ function globalPolicySnapshot(settings) {
     enabledModels: [...(settings.getGlobal("enabledModels") ?? [])],
     modelRolesDefault: settings.getGlobal("modelRoles")?.default,
     planner: settings.getGlobal("task.agentModelOverrides")?.planner,
+    modelProfileDefault: settings.getGlobal("modelProfile.default"),
     modelProviderOrder: [...(settings.getGlobal("modelProviderOrder") ?? [])],
     networkPrewarm: settings.getGlobal("startup.networkPrewarm"),
   };
@@ -197,6 +199,7 @@ function policyFingerprint(policy) {
     enabledModels: policy.enabledModels,
     modelRolesDefault: policy.modelRolesDefault,
     planner: policy.planner,
+    modelProfileDefault: policy.modelProfileDefault,
     modelProviderOrder: policy.modelProviderOrder,
     globalModelProviderOrder: policy.globalModelProviderOrder,
   });
@@ -674,12 +677,15 @@ async function createHermeticFixture(explicitRoot) {
   };
   for (const label of ["A", "B", "C"]) {
     const policy = policies[label];
-    const config = `configSchemaVersion: 2\nstartup:\n  networkPrewarm: false\ndisabledProviders:\n${policy.disabledProviders.map(item => `  - ${item}`).join("\n")}\nenabledModels:\n  - ${label === "C" ? "issue62-no-such-provider/issue62-no-such-model" : MODEL_A}\n  - ${label === "C" ? "issue62-no-such-provider/issue62-no-such-model-2" : MODEL_B}\nmodelRoles:\n  default: ${policy.default}\ntask:\n  agentModelOverrides:\n    planner: ${policy.planner}\nmodelProviderOrder:\n${policy.modelProviderOrder.map(item => `  - ${item}`).join("\n")}\n`;
+    const config = `configSchemaVersion: 2\nstartup:\n  networkPrewarm: false\ndisabledProviders:\n${policy.disabledProviders.map(item => `  - ${item}`).join("\n")}\nenabledModels:\n  - ${label === "C" ? "issue62-no-such-provider/issue62-no-such-model" : MODEL_A}\n  - ${label === "C" ? "issue62-no-such-provider/issue62-no-such-model-2" : MODEL_B}\nmodelRoles:\n  default: ${policy.default}\n${label === "C" ? "" : `modelProfile:\n  default: issue62-profile-${label.toLowerCase()}\n`}modelProviderOrder:\n${policy.modelProviderOrder.map(item => `  - ${item}`).join("\n")}\n`;
     await writeFile(join(workDirs[label], ".gjc", "config.yml"), config);
   }
   const modelsPath = join(agentDir, "models.yml");
   const modelsConfig = `providers:\n  ${PROVIDER_A}:\n    baseUrl: http://127.0.0.1:1/issue62-a\n    api: anthropic-messages\n    auth: none\n    models:\n      - id: issue62-model-a\n        name: Issue62 fixture model A\n        contextWindow: 4096\n        maxTokens: 512\n        input: [text]\n        output: [text]\n        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}\n  ${PROVIDER_B}:\n    baseUrl: http://127.0.0.1:1/issue62-b\n    api: anthropic-messages\n    auth: none\n    models:\n      - id: issue62-model-b\n        name: Issue62 fixture model B\n        contextWindow: 4096\n        maxTokens: 512\n        input: [text]\n        output: [text]\n        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}\nequivalence:\n  overrides:\n    ${MODEL_A}: ${CANONICAL}\n    ${MODEL_B}: ${CANONICAL}\n`;
-  await writeFile(modelsPath, modelsConfig);
+  // SDK 0.20 models-config-schema.ts accepts user profiles with explicit
+  // default/planner mappings. No credentials or provider prerequisites are added.
+  const profilesConfig = `profiles:\n${["A", "B"].map(label => `  issue62-profile-${label.toLowerCase()}:\n    required_providers: []\n    model_mapping:\n      default: ${policies[label].default}\n      planner: ${policies[label].planner}\n`).join("")}`;
+  await writeFile(modelsPath, modelsConfig + profilesConfig);
   setupRoot = undefined;
   return {
     root,
@@ -1226,13 +1232,28 @@ async function createPooledSession(fixture, workDir, label, registries, cAttempt
     record.authEntryProviderCount = Object.keys(record.modelRegistry.authStorage.getAll()).length;
     record.policy = policySnapshot(record.settings);
     record.globalPolicy = globalPolicySnapshot(record.settings);
-    const policy = record.policy;
     requireCondition(record.settings.getCwd() === workDir && record.settings.getAgentDir() === fixture.agentDir, "API_CONTRACT_MISMATCH", "SDK-owned settings scope is not fixture-owned", { label, cwd: record.settings.getCwd(), agentDir: record.settings.getAgentDir() });
     requireCondition(record.authEntryProviderCount === 0, "ENVIRONMENT_BLOCKED", "SDK-owned fixture auth storage was not empty", { label, providerCount: record.authEntryProviderCount });
+    const expectedProfile = `issue62-profile-${label.toLowerCase()}`;
+    requireCondition(record.policy.modelProfileDefault === expectedProfile, "API_CONTRACT_MISMATCH", "A/B configured profiles did not remain workDir-local", { label, policy: record.policy });
+    const profile = record.modelRegistry.getModelProfile(expectedProfile);
+    const expectedModel = label === "A" ? MODEL_A : MODEL_B;
+    requireCondition(profile?.source === "user" && profile.requiredProviders.length === 0 && profile.modelMapping.default === expectedModel && profile.modelMapping.planner === expectedModel,
+      "API_CONTRACT_MISMATCH", "SDK did not parse the fixture default/planner profile", { label, profile });
+    // AgentSession's nonvisual control is session-only and performs the SDK's
+    // credential preflight and role publication; never inject settings overrides.
+    await record.rawSession.activateModelProfileForControl(record.policy.modelProfileDefault);
+    requireCondition(record.rawSession.getActiveModelProfile() === expectedProfile && record.rawSession.getActivatedModelProfile() === expectedProfile,
+      "API_CONTRACT_MISMATCH", "SDK did not activate the workDir profile", { label });
+    requireCondition(JSON.stringify(record.rawSession.getConfiguredModelChain("default")) === JSON.stringify([expectedModel]),
+      "API_CONTRACT_MISMATCH", "profile default chain did not remain workDir-local", { label });
+    record.policy = policySnapshot(record.settings);
+    const policy = record.policy;
+    requireCondition(policyFingerprint(globalPolicySnapshot(record.settings)) === policyFingerprint(record.globalPolicy),
+      "SESSION_POLICY_BLEED", "session profile activation changed durable global policy", { label });
     requireCondition(JSON.stringify(policy.modelProviderOrder) === JSON.stringify(label === "A" ? [PROVIDER_A, PROVIDER_B] : [PROVIDER_B, PROVIDER_A]), "API_CONTRACT_MISMATCH", "A/B merged provider orders did not remain divergent", { label, policy });
     requireCondition(JSON.stringify(policy.globalModelProviderOrder) === JSON.stringify([PROVIDER_A, PROVIDER_B]), "API_CONTRACT_MISMATCH", "global provider order did not remain fixture-owned", { label, policy });
-    const expectedModel = label === "A" ? MODEL_A : MODEL_B;
-    requireCondition(policy.modelRolesDefault === expectedModel && policy.planner === expectedModel, "API_CONTRACT_MISMATCH", "A/B role policy did not remain session-local", { label, policy });
+    requireCondition(record.policy.modelRolesDefault === expectedModel && record.policy.planner === expectedModel, "API_CONTRACT_MISMATCH", "A/B role policy did not remain session-local", { label, policy: record.policy });
     requireCondition(policy.networkPrewarm === false, "API_CONTRACT_MISMATCH", "SDK-owned scope startup.networkPrewarm is not false", { label, policy });
     requireCondition(JSON.stringify(policy.enabledModels) === JSON.stringify(ALLOW_LIST), "API_CONTRACT_MISMATCH", "A/B enabled-model allow-list diverged unexpectedly", { label, policy });
     requireCondition(record.modelRegistry.getCanonicalVariants(CANONICAL, { availableOnly: false }).length === 2, "API_CONTRACT_MISMATCH", "canonical equivalence did not produce two variants");
@@ -1279,11 +1300,19 @@ async function readSession(record, fixture) {
   const active = record.rawSession.model;
   const settingsAfterSibling = policySnapshot(record.settings);
   requireCondition(policyFingerprint(settingsAfterSibling) === policyFingerprint(record.policy), "SESSION_POLICY_BLEED", "session settings changed after sibling creation", { label: record.label, before: record.policy, after: settingsAfterSibling });
+  const activeProfile = record.rawSession.getActiveModelProfile();
+  const activatedProfile = record.rawSession.getActivatedModelProfile();
+  const defaultChain = record.rawSession.getConfiguredModelChain("default");
+  requireCondition(activeProfile === settingsAfterSibling.modelProfileDefault && activatedProfile === activeProfile && JSON.stringify(defaultChain) === JSON.stringify([record.active]),
+    "SESSION_POLICY_BLEED", "profile activation changed after sibling creation", { label: record.label, activeProfile, activatedProfile, defaultChain });
   const registry = registrySnapshot(record.modelRegistry, record.settings, `final-${record.label}`);
   return {
     label: record.label,
     cwd: record.settings.getCwd(),
     settings: settingsAfterSibling,
+    activeProfile,
+    activatedProfile,
+    defaultChain,
     activeModel: modelSelector(active),
     activeProvider: active?.provider,
     capability: capabilityResult,
@@ -1594,6 +1623,9 @@ async function runOrder(order, fixture, provenance, guard) {
           activeModel: item.activeModel,
           activeProvider: item.activeProvider,
           settings: item.settings,
+          activeProfile: item.activeProfile,
+          activatedProfile: item.activatedProfile,
+          defaultChain: item.defaultChain,
           authEntryProviderCount: registries[item.label].authEntryProviderCount,
         })),
         modelFallback: false,
@@ -1644,10 +1676,10 @@ async function runOrder(order, fixture, provenance, guard) {
       coverage: {
         auth: "SDK-owned empty fixture auth for A/B; fixture-owned empty auth for C",
         sessionHostAccess: "not-exercised",
-        profileActivation: "not-exercised",
+        profileActivation: "workDir modelProfile.default via AgentSession.activateModelProfileForControl; user default/planner mappings, session-only",
         liveProviderTransport: "not-exercised",
       },
-      customFactoryBoundary: "A/B use the public createAgentSession path with SDK-owned Settings.loadForScope/AuthStorage/ModelRegistry under the fixture agentDir; C is a no-session allow-list oracle. Profile activation and live provider transport are not covered.",
+      customFactoryBoundary: "A/B use the public createAgentSession path with SDK-owned Settings.loadForScope/AuthStorage/ModelRegistry under the fixture agentDir and public session-only profile activation; C is a no-session allow-list oracle. Live provider transport is not covered.",
     };
   } catch (error) {
     runError = error;

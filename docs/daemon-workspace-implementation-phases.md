@@ -1,5 +1,14 @@
 # Daemon workspace implementation phases
 
+The SDK 0.20.0 source candidate has scoped Windows verification of official
+per-workDir profiles and structured gate options: workspace 3108 pass/0 fail/12
+existing skips, full Bun daemon 1186 pass/0 fail/2 skips, canonical imports and
+one user-authorized same-profile A→B→A provider smoke passed. That grant is
+consumed; tenant isolation, #247 repair, installed-runtime, signing, service and
+deployment approval do not follow. The 0.19.0 tracked-input subset and counts
+below remain historical. See the
+[current qualification scope](daemon-workspace-verification.md#sdk-0200-candidate--qualification-scope).
+
 This document supplements ADR 0002 and issue #43. It freezes sequencing and MVP boundaries
 without weakening the final workspace-container contract. ADR 0002 and the verification matrix
 remain authoritative for safety and permissiveness; this document supplies sequencing and
@@ -211,7 +220,7 @@ no-follow containment, final lease/fence/generation recovery, cgroup headroom, a
 
 ## Current tracked-input integration — LOCAL qualified subset
 
-The issue #231 slice keeps official unpatched SDK **0.19.0** and its SRI
+The historical issue #231 slice kept official unpatched SDK **0.19.0** and its SRI
 unchanged. Active steering/follow-up uses `submitUserMessage` with distinct tracked
 admission, execution, terminal, and cancellation ownership. Admission alone is not
 execution or completion. Delivery is sequential per queue, not a global FIFO.
@@ -306,7 +315,7 @@ attestation, and supported-platform promotion remain Phase 4 obligations.
 
 Every verification-matrix evidence layer and non-negotiable gate must close before promotion:
 
-- ownership/fixture agreement and exact SDK/package/lock provenance at official unpatched 0.19.0;
+- ownership/fixture agreement and exact SDK/package/lock provenance at the candidate's official unpatched 0.20.0 pin;
 - unit/integration/Compose tests for mapping, readiness, lifecycle, resource, Git, backup/restore,
   provider recovery, remap fencing, and cleanup;
 - image/base/source/lock/SDK digests, SBOM, scan, signature/attestation, volume manifests, copied or
