@@ -1,5 +1,25 @@
 # Issue #62 SDK isolation probe
 
+## SDK 0.20.0 candidate — locally verified boundary
+
+The active source pins SDK/core/ai to 0.20.0 on
+`feat/sdk-0.20.0-upgrade`; the 0.19.0 tracked-input receipts below remain
+historical. Initial Node and Bun runs failed the real divergent-session probe:
+project `task.agentModelOverrides` is filtered by the SDK, leaving B with the
+global planner A. This is not evidence of sibling-session contamination.
+The original divergent planner assertion is retained. Valid user-profile
+default/planner mappings, per-project `modelProfile.default` and the public
+`activateModelProfileForControl` path now pass both creation orders with
+concrete model, role, provider, sibling-state and cleanup checks. No manual
+runtime-role injection or acceptance of planner A for B was added.
+Focused isolation tests pass 60/60; independent profile review APPROVE is
+static, not another runtime receipt. The final workspace has 3108 pass,
+0 fail, 12 existing skips; the full Bun daemon has 1186 pass, 0 fail, 2 skips.
+The separately authorized one-shot same-profile A→B→A provider smoke passed;
+it is not divergent-provider/profile or tenant isolation proof, and its grant
+is consumed. #7412 remains unqualified. See the
+[current SDK qualification scope](../daemon-workspace-verification.md#sdk-0200-candidate--qualification-scope).
+
 ## Current tracked-input evidence — locally qualified subset
 
 `feat/sdk-tracked-live-controls` implements #231 atop merged SDK 0.19.0 main
@@ -232,10 +252,10 @@ No bypass or admission recovery is authorized.
 ## Current implementation contract
 
 The probe requires Bun **>=1.4.0** and Node wrapper **>=26**. Exact daemon,
-installed coding-agent and lockfile pins must be 0.19.0. The coding-agent
+installed coding-agent and lockfile pins must be 0.20.0. The coding-agent
 declarations, installed versions and lockfile entries for agent-core and ai
-must independently equal 0.19.0; mismatches fail, with no fallback. These are
-current source requirements, not observed 0.19.0 execution results. Historical 0.18.12 dependency
+must independently equal 0.20.0; mismatches fail, with no fallback. These are
+candidate source requirements, not successful 0.20.0 execution results. Historical 0.18.12 dependency
 installation used official npm with `--ignore-scripts`; its Bun lock
 was regenerated separately. That historical parent isolated Linux install log records Bun
 1.4.2 installing 291 packages; the bounded receipts establish version/lock
@@ -282,7 +302,7 @@ delay, retry, chmod/cwd repair, file exclusion, fake fallback or suppressed
 close error can turn a failure into success. The first removal verdict and
 bounded diagnostics are retained. `cleanup.nativeCache` describes the separate
 process-lifetime cache; Windows additionally requires a staged `.node` under
-its exact 0.19.0 directory for a new run. Only after child close may the parent remove the
+its exact 0.20.0 directory for a new run. Only after child close may the parent remove the
 launcher root, once, as `cleanup.parentCacheRemoval`; its
 `immediateSessionCloseProof` is false. Post-exit failed-scratch salvage is
 separate (`cleanup.parentSalvage`) and never replaces the child's verdict.
@@ -453,8 +473,8 @@ checkout. The historical 0.18.12 parent receipts identify their post-admission r
 historical initial and failed attempts retain their own pins and results.
 Any new receipt must independently report `sdkVersionExpected`,
 `sdkVersionObserved`, `daemonDependencyVersion`, and `lockfileVersionEvidence`
-as `0.19.0`, and its ordered working-tree digest must match the four live files.
-The `sdkDependencyProvenance` entries must independently match 0.19.0 for
+as `0.20.0`, and its ordered working-tree digest must match the four live files.
+The `sdkDependencyProvenance` entries must independently match 0.20.0 for
 agent-core and ai (coding-agent declaration, installed version and lockfile).
 The wrapper removes each stale order-specific output before running that order.
 

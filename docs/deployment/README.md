@@ -1,5 +1,14 @@
 # Deployment guide
 
+SDK 0.20.0 is a source-only candidate on `feat/sdk-0.20.0-upgrade`, not an
+approved replacement for any installed or signed runtime. Its official profile
+and structured gate-option boundaries pass local Windows regressions, canonical
+imports and one separately authorized same-profile A→B→A provider smoke.
+That grant is consumed; #247, tenant isolation and deployed-runtime support are
+not qualified by it. The 0.19.0 evidence below is historical, not reusable current
+proof. Existing runtime pins and release identities remain unchanged. See the
+[SDK qualification scope](../daemon-workspace-verification.md#sdk-0200-candidate--qualification-scope).
+
 Deploy the bot and each daemon independently. The bot is the Discord-facing
 control plane; every daemon runs on the host that owns its work directories and
 connects **outbound** to the bot over WebSocket. A mapped channel can execute
@@ -10,7 +19,7 @@ code on that host. Read [Security](../../SECURITY.md) before provisioning.
 | Component | Native status | Container status | Supported platforms |
 | --- | --- | --- | --- |
 | Bot | Foreground command documented for Node.js >=26; no native service installer is shipped | Linux-only release candidate; no signed-image release evidence | Native-control: Linux x64/arm64, Windows x64 |
-| Daemon | Foreground command documented for Bun >=1.4.0 and SDK 0.19.0; no native service installer is shipped | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
+| Daemon | Bun >=1.4.0; SDK 0.20.0 has scoped Windows source verification, not installed-service approval; no native service installer is shipped | Not available; daemon Docker is a future phase | Native-control: Linux x64/arm64, Windows x64 |
 | Native control | Observed only on the approved tuples | Used by the bot container candidate only with an externally verified bundle | Linux x64/arm64, Windows x64 |
 
 macOS is not supported for native-control. “Foreground command documented”

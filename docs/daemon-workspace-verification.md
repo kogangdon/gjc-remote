@@ -1,5 +1,82 @@
 # Daemon workspace contract verification matrix
 
+## SDK 0.20.0 candidate — qualification scope
+
+`feat/sdk-0.20.0-upgrade` coordinates official unpatched SDK dependencies,
+lockfile, native SDK contract and Docker provenance. The published tarball SRI
+matches the pin; installed `package.json`, config-version marker and four SDK
+source roots are byte-identical to that tarball. Lock SHA-256 is
+`410ed8056e4815f572f6aeb37da8a29b59e3b2fb402457ff120604ac1b25b6f6`.
+Config schema 2 and transcript 5 are unchanged source markers, not persistence
+or rollback compatibility proof.
+
+The initial candidate had 3102 tests: 3088 pass, 2 fail, 12 skip. Those failed
+receipts are historical, not relabeled as passing. Their causes are resolved:
+
+- Project `task.agentModelOverrides` is filtered by the SDK, so B inherited
+  global planner A; this was not demonstrated sibling-state contamination.
+  Valid user profiles plus per-workDir `modelProfile.default` and public
+  `activateModelProfileForControl` now retain the original concrete
+  model/planner/default/provider/creation-order and cleanup assertions.
+- Ask schema and dispatch were valid: a real gate was published, then the old
+  adapter quarantined its structured option value. The current producers emit
+  `{selected:[label]}` or `{decision:value}`; the adapter recognizes only those
+  shapes and keeps daemon wire choices scalar. Approval exposes approve/reject;
+  request-changes requires structured comments. Legacy scalar SDK values and
+  malformed/mismatched objects refuse before presentation or resolution.
+
+Matching tracked `removed/refused` receipts prove failed nonexecution, not
+successful cancellation. Identity/reason contradictions still fail closed.
+
+Latest parent Windows verification used Node 26.12.1 and Bun 1.4.4:
+
+| Cohort | Pass | Fail | Skip |
+| --- | ---: | ---: | ---: |
+| Script contracts | 165 | 0 | 0 |
+| Bot | 377 | 0 | 0 |
+| Daemon | 1332 | 0 | 2 |
+| Native control (Node runner) | 1031 | 0 | 10 |
+| Shared | 203 | 0 | 0 |
+| Full Bun daemon (separate cohort) | 1186 | 0 | 2 |
+
+Final `npm test` exits 0: **3120 total, 3108 pass, 0 fail, 12 existing skips**.
+Focused SDK session/router/contract/isolation tests pass **328/328 on Node**
+and **213/213 on Bun**, with no skips. The full Bun daemon command is
+`bun test --timeout 60000` from `daemon/`; it is not a full Bun workspace pass.
+Canonical imports and the complete credentialless real-SDK contract/isolation
+probes pass. Actual SDK probes use Bun children even under the Node parent.
+Initial failed Docker SDK assertions were updated to the new pin; Git ownership
+failure was addressed only through an exact-repository, test-command-scoped
+`GIT_CONFIG_*` exception, never a global configuration change. SDK child
+isolation continues stripping inherited Git configuration. No timeout, skip,
+planner expectation, gate requirement, or installed SDK source was weakened.
+
+The user separately authorized **one** real-provider `scripts/local-smoke.js`
+execution. It passed A→B→A in distinct owned temporary workDirs using the
+existing configured profile: three exact `SMOKE_OK` invoke terminals, heartbeat
+and profile-activation assertions, exit 0. Project-local request/stream retries,
+memory and compaction were disabled; background titles were disabled; no model
+query or rerun occurred. Scratch identity was checked and removed after child
+exit; global SDK state was not removed. This same-profile basic smoke is not
+divergent-profile, active-control/provider, tenant isolation, or #247 repair
+proof. The grant is consumed and cannot be replayed.
+
+Independent profile and codec reviews approved their captured source slices.
+The diagnostic review found two P2s (promise substitution and displacement of
+tracked evidence); both were corrected, regression-tested, and independently
+re-reviewed APPROVE before the final suites. All review verdicts are static,
+not independent runtime receipts. Parent logs/patches are in the owned
+`gjc-sdk020-adapt-4DdOhY` temporary evidence directory, including
+`final-gates-02.json` and `authorized-live-smoke.json`.
+
+#231/#247 remain open; optional `runtime_turn_id` does not resolve #7412.
+Bun conversion, its 15 held native failures and the two held snapshot tests
+remain separate. Service/bot Node 26.7.0 and daemon/producer Bun 1.4.2 policies
+are unchanged. These Windows Node 26.12.1/Bun 1.4.4 receipts do not qualify
+SDK 0.20.0 on deployed Bun 1.4.2, Linux/macOS/Docker, real services, signing,
+installation, release or production. Historical 0.19/0.18 cohorts below retain
+their original scope and grants, including incoming-link headings.
+
 This matrix is the handoff boundary for issue #43. It identifies evidence that must exist before
 implementation is released; design documents alone are not runtime evidence.
 

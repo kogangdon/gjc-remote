@@ -82,7 +82,7 @@ function schemaHash(schema) {
   return createHash("sha256").update(canonicalJson(schema)).digest("hex");
 }
 
-// Exact output shape of SDK 0.19.0 buildAskGateAnswerSchema() and
+// Exact output shape of SDK 0.20.0 buildAskGateAnswerSchema() and
 // buildAskGateStageState() in workflow-gate-types.ts. Keeping the
 // generated schema on every fake gate makes scalar-answer regressions visible.
 function sdkAskGate({
@@ -183,7 +183,7 @@ function sdkAskGate({
     ],
   };
   const canonicalOptions = options.map((option) => ({
-    value: option.label,
+    value: { selected: [option.label] },
     label: option.label,
     ...(option.description === undefined
       ? {}
@@ -215,7 +215,7 @@ function sdkAskGate({
   return gate;
 }
 
-// Exact schemas/options from SDK 0.19.0 approval-gate.ts.
+// Exact schemas/options from SDK 0.20.0 approval-gate.ts.
 function sdkDecisionGate({ gate_id, kind, context = {} }) {
   const approval = kind === "approval";
   const decisions = approval
@@ -235,6 +235,15 @@ function sdkDecisionGate({ gate_id, kind, context = {} }) {
     },
     required: ["decision"],
     additionalProperties: false,
+    ...(approval ? {
+      anyOf: [
+        { properties: { decision: { enum: ["approve", "reject"] } } },
+        {
+          properties: { decision: { const: "request-changes" }, comments: { type: "string", pattern: "\\S" } },
+          required: ["comments"],
+        },
+      ],
+    } : {}),
   };
   return {
     type: "workflow_gate",
@@ -243,8 +252,8 @@ function sdkDecisionGate({ gate_id, kind, context = {} }) {
     kind,
     schema,
     schema_hash: schemaHash(schema),
-    options: decisions.map((decision) => ({
-      value: decision,
+    options: decisions.filter((decision) => decision !== "request-changes").map((decision) => ({
+      value: { decision },
       label: decision,
     })),
     context,
@@ -1908,6 +1917,91 @@ test("queue removal is not a final ticket result until both removed receipts mat
   agent.finishRoot();
   await root;
   await session.dispose();
+});
+
+test("refused tracked controls wait for both receipts and fail without disposing their owning run", async (t) => {
+  for (const type of ["steer", "follow_up"]) await t.test(type, async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const root = session.send({ type: "prompt", message: "root" }, () => {});
+    await waitForImmediate(() => agent.calls.length === 1);
+    let activations = 0;
+    const control = session.sendOwned("control", { type, message: "denied control" }, () => {}, undefined,
+      { onActivate: () => { activations += 1; } });
+    let settled = false;
+    const controlCheck = assert.rejects(control.result, (error) => {
+      assert.equal(error.code, "input_refused");
+      assert.equal(error.terminalDisposition, "failed");
+      assert.equal(error.message, "GJC SDK invocation failed (input_refused)");
+      assert.equal(error.revokedBeforeStart, undefined);
+      return true;
+    }).then(() => { settled = true; });
+    await waitForImmediate(() => agent.inputs.length === 1);
+    const input = agent.inputs[0];
+    const receipt = { ...input.identity, disposition: "removed", reason: "refused" };
+    input.execution.resolve(receipt);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(control.phase, "queued");
+    assert.equal(session.closed, false);
+    assert.equal(agent.disposeCalls, 0);
+    input.terminal.resolve(receipt);
+    await controlCheck;
+    assert.equal(control.phase, "terminal");
+    assert.equal(activations, 0);
+    assert.equal(session.closed, false);
+    assert.equal(agent.disposeCalls, 0);
+
+    // The same owning root can still accept and execute a healthy control.
+    const healthy = session.sendOwned("healthy", { type, message: "healthy control" }, () => {});
+    await waitForImmediate(() => agent.inputs.length === 2);
+    agent.inputs[1].execute(agent.rootScope);
+    await waitForImmediate(() => healthy.phase === "active");
+    agent.inputs[1].complete(agent.rootScope);
+    agent.finishRoot();
+    assert.deepEqual(await healthy.result, { disposition: "completed" });
+    assert.deepEqual(await root, { disposition: "completed" });
+    assert.equal(session.closed, false);
+    assert.equal(agent.disposeCalls, 0);
+    await waitForImmediate(() => !session.isBusy());
+    assert.equal(session.isBusy(), false);
+    await session.dispose();
+    assert.equal(agent.disposeCalls, 1);
+  });
+});
+
+test("contradictory refused receipt pairs still fail closed and dispose the owning run", async (t) => {
+  const cases = [
+    { name: "terminal reason", terminal: { reason: "cancelled" } },
+    { name: "terminal removed reason", terminal: { reason: "removed" } },
+    { name: "terminal unknown reason", terminal: { reason: "unknown" } },
+    { name: "terminal submission id", terminal: { submissionId: "foreign" } },
+    { name: "terminal delivery", terminal: { delivery: "followUp" } },
+    { name: "terminal executed", terminal: { disposition: "completed", attemptScope: attemptScope(1) } },
+    { name: "execution submission id", execution: { submissionId: "foreign" } },
+    { name: "execution delivery", execution: { delivery: "followUp" } },
+  ];
+  for (const fixture of cases) await t.test(fixture.name, async () => {
+    const agent = new TrackedAgentSession();
+    const session = new SdkSession(agent);
+    const root = session.send({ type: "prompt", message: "root" }, () => {});
+    const rootCheck = assert.rejects(root, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+    await waitForImmediate(() => agent.calls.length === 1);
+    const control = session.sendOwned("control", { type: "steer", message: "denied control" }, () => {});
+    const controlCheck = assert.rejects(control.result, (error) => error.code === "SDK_TRACKED_INPUT_CONTRACT");
+    await waitForImmediate(() => agent.inputs.length === 1);
+    const input = agent.inputs[0];
+    const receipt = { ...input.identity, disposition: "removed", reason: "refused" };
+    input.execution.resolve({ ...receipt, ...fixture.execution });
+    input.terminal.resolve({ ...receipt, ...fixture.terminal });
+    await Promise.all([rootCheck, controlCheck]);
+    assert.equal(session.closed, true);
+    await session.dispose();
+    assert.equal(agent.disposeCalls, 1);
+    assert.equal(agent.listeners.size, 0);
+    assert.equal(agent.rawListeners.size, 0);
+    assert.equal(session.adapterWaiterCancellations.size, 0);
+  });
 });
 
 test("a completed tracked receipt still waits for its exact scoped genuine terminal", async () => {
@@ -4480,6 +4574,42 @@ test("oversized gate content is quarantined without silent truncation", async ()
   assert.deepEqual(agent.gateEmitter.quarantineCalls, ["g-clamp"]);
   await rejected;
   await session.dispose();
+});
+
+test("malformed or obsolete SDK option values are quarantined before presentation", async (t) => {
+  const cases = [
+    { name: "legacy Ask scalar", kind: "question", value: "A" },
+    { name: "empty Ask selection", kind: "question", value: { selected: [] } },
+    { name: "multiple Ask selections", kind: "question", value: { selected: ["A", "B"] } },
+    { name: "mismatched Ask label", kind: "question", value: { selected: ["B"] } },
+    { name: "extra Ask answer fields", kind: "question", value: { selected: ["A"], other: false } },
+    { name: "null Ask value", kind: "question", value: null },
+    { name: "legacy approval scalar", kind: "approval", value: "approve" },
+    { name: "legacy execution scalar", kind: "execution", value: "approve" },
+    { name: "mismatched decision", kind: "execution", value: { decision: "decline" } },
+    { name: "extra decision fields", kind: "approval", value: { decision: "approve", comments: "extra" } },
+  ];
+  for (const fixture of cases) await t.test(fixture.name, async () => {
+    const gate = fixture.kind === "question"
+      ? sdkAskGate({ gate_id: "g-malformed-option", options: [{ label: "A" }] })
+      : sdkDecisionGate({ gate_id: "g-malformed-option", kind: fixture.kind });
+    gate.options[0].value = fixture.value;
+    const agent = new GatingAgentSession(gate);
+    const session = new SdkSession(agent);
+    const events = [];
+    try {
+      await assert.rejects(
+        session.send({ type: "prompt", message: "hi" }, (event) => events.push(event), 100),
+        /prompt_failed/
+      );
+      assert.equal(events.some((event) => event.type === "gate_request"), false);
+      assert.equal(session.pendingGates.size, 0);
+      assert.deepEqual(agent.gateEmitter.quarantineCalls, [gate.gate_id]);
+      assert.deepEqual(agent.gateEmitter.resolveCalls, []);
+    } finally {
+      await session.dispose();
+    }
+  });
 });
 
 test("unsupported gate kinds are quarantined instead of coerced", async () => {

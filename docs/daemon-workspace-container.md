@@ -105,9 +105,47 @@ volume. Credentials are never relayed through Discord, bot, or a future manageme
 Provider backups require external encrypted key ownership/recovery, independent signature and
 manifest verification, rotation, and restore rehearsal.
 
-## Current tracked-input runtime contract — LOCAL qualified subset
+## Current source candidate — SDK 0.20.0, scoped Windows qualification passed
 
-The issue #231 integration uses official unpatched SDK **0.19.0**
+`feat/sdk-0.20.0-upgrade` coordinates official unpatched 0.20.0 dependencies,
+lockfile, native SDK contract and Docker pins atomically. Official package SRI
+and six source-byte comparisons passed; config schema 2 and transcript 5 markers
+remain unchanged. Official per-workDir profile activation resolves the initial
+planner failure while preserving real model/planner/provider and both
+creation-order isolation checks. Resolving Ask quarantine, structured SDK options (`{selected: [label]}`,
+`{decision: d}`) map to unchanged scalar wire choices; request-changes uses JSON
+comments, not one-click approval. Legacy scalar SDK options are rejected, not
+fallbacks; tracked `removed/refused` is failed nonexecution, not revocation.
+
+Final Windows Node 26.12.1 root `npm test`: **3120 total, 3108 pass, 0 fail, 12 skip**
+(scripts 165; bot 377; daemon 1332 pass/2 skip; native 1031 pass/10 skip; shared 203).
+Bun 1.4.4 full daemon: **1186 pass, 0 fail, 2 skip**; four focused SDK files:
+Node **328 pass**, Bun **213 pass**, zero failures. Real canonical imports and all
+SDK contract cells passed on both runners. Independent 24/profile and 25/codec
+reviews APPROVE; 26/diagnostics' initial promise-identity/evidence-truncation P2s
+were fixed, regression-tested and re-reviewed APPROVE. Initial failed attempts
+remain historical; see the
+[candidate ledger](daemon-workspace-verification.md#sdk-0200-candidate--qualification-scope).
+
+One newly user-authorized canonical provider local-smoke passed: existing
+configured profile A→B→A, three `SMOKE_OK` prompts, exit 0, all three invoke
+terminals/heartbeat/profile activation assertions. Owned temporary A/B configs
+disabled SDK request/stream retries, background memory and compaction, with
+`GJC_NO_TITLE=1`; no model query or automatic rerun. Identity-checked owned-root
+cleanup succeeded after child exit; no global SDK state was deleted. This grant
+is **CONSUMED**; all future provider calls require a fresh grant. BASIC same-profile
+proof is not divergent real-profile/tenant isolation, provider-backed active-control
+qualification or a #247/#7412 fix. #231/#247 remain open; #7412 unresolved.
+
+This source qualification does not convert services to Bun: service/bot Node
+26.7.0, daemon/producer Bun 1.4.2, 15 held native Bun failures and two held snapshots
+remain separate and unchanged. No deployed Bun 1.4.2 SDK 0.20, Linux/macOS/Docker,
+SCM, signing, production or rollback compatibility qualification, release approval,
+or CI evidence follows from these local receipts. CI evidence belongs to the PR checks.
+
+## Tracked-input runtime contract — historical 0.19.0 LOCAL qualified subset
+
+The historical issue #231 qualification used official unpatched SDK **0.19.0**
 `submitUserMessage` for active steering/follow-up input. Track each submission's
 admission, execution receipt, terminal outcome, and cancellation ownership; an
 admission receipt is not execution or successful completion. Delivery is sequential
@@ -135,10 +173,11 @@ There is no selective abort of executing shared-run work or cancellation of sibl
 
 Idle requests still use real SDK prompts; root prompts and model changes remain
 serialized. No Broker/Router/subprocess redesign or new feature flag/opt-in is
-introduced. SDK stays 0.19.0 with unchanged SRI, and native C++ is unchanged.
+introduced. Within that historical cohort SDK 0.19.0/SRI and native C++ were unchanged.
 
 The [current tracked-input evidence](daemon-workspace-verification.md#current-tracked-input-evidence)
-records the **LOCAL Windows qualified subset**: focused-04 passed 474/474 with zero
+records the **historical 0.19.0 LOCAL Windows qualified subset**, not 0.20.0 qualification:
+focused-04 passed 474/474 with zero
 failures, skips or cancellations; unrestricted workspace-02 `npm test` exited 0 with
 2897 tests/2887 pass/zero fail/10 existing platform/privilege skips and no exclusion
 patterns. Unit-05 passed 240/240 and lifecycle-03 passed 52/52. These post-review
@@ -226,7 +265,9 @@ and restart count. Every release packet runs path/secret/control sentinel scans.
 The five documents carry an assumptions ledger: #44 route/envelope and mapping persistence,
 receiver TTL/skew/probe bounds, Git refs/allowlist/dirty policy, lease/resource budgets, provider
 key recovery, #42/#45 evidence schedules, and SDK/package/lock reconciliation at official unpatched
-0.19.0. The [SDK 0.19.0 adoption record (PR #274)](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
+0.20.0 as a scoped Windows-qualified source candidate; container/promotion gates
+above remain separate and unqualified.
+The historical [SDK 0.19.0 adoption record (PR #274)](daemon-workspace-verification.md#current-sdk-only-0190-evidence)
 preserves the source base, SRI, original Windows tests/imports/provider smoke,
 review/CI/landing history, and unchanged promotion limits. Those receipts do not
 qualify the tracked-input integration; its separate **LOCAL qualified subset** and

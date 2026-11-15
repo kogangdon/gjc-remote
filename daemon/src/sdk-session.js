@@ -105,7 +105,7 @@ function sameArray(left, right) {
   );
 }
 
-// SDK 0.19.0 has two concrete gate-answer schema families. AskTool gates use
+// SDK 0.20.0 has two concrete gate-answer schema families. AskTool gates use
 // buildAskGateAnswerSchema() and approval/execution gates use decision objects.
 // Recognize only those producer shapes: inventing a scalar fallback would turn a
 // transport limitation into a workflow decision the SDK never received.
@@ -158,7 +158,14 @@ function gateAnswerCodec(gate) {
     sameArray(state.options, labels) &&
     state.other_option === "Other (type your own)" &&
     state.clarification_action === "clarify" &&
-    options.every((option) => option.value === option.label)
+    options.every((option) =>
+      isPlainRecord(option.value) &&
+      Object.keys(option.value).length === 1 &&
+      Object.hasOwn(option.value, "selected") &&
+      Array.isArray(option.value.selected) &&
+      option.value.selected.length === 1 &&
+      option.value.selected[0] === option.label
+    )
   ) {
     return {
       type: "ask",
@@ -176,6 +183,9 @@ function gateAnswerCodec(gate) {
         ? EXECUTION_DECISIONS
         : undefined;
   const detailKey = gate.kind === "approval" ? "comments" : "reason";
+  const clickableDecisions = gate.kind === "approval"
+    ? APPROVAL_DECISIONS.filter((decision) => decision !== "request-changes")
+    : expectedDecisions;
   if (
     expectedDecisions &&
     isPlainRecord(decision) &&
@@ -185,11 +195,14 @@ function gateAnswerCodec(gate) {
     hasOnlyKeys(properties, new Set(["decision", detailKey])) &&
     isPlainRecord(properties[detailKey]) &&
     properties[detailKey].type === "string" &&
-    options.length === expectedDecisions.length &&
+    options.length === clickableDecisions.length &&
     options.every(
       (option, index) =>
-        option.value === expectedDecisions[index] &&
-        option.label === expectedDecisions[index]
+        isPlainRecord(option.value) &&
+        Object.keys(option.value).length === 1 &&
+        Object.hasOwn(option.value, "decision") &&
+        option.value.decision === clickableDecisions[index] &&
+        option.label === clickableDecisions[index]
     )
   ) {
     return { type: gate.kind, decisions: expectedDecisions, detailKey };
@@ -283,7 +296,7 @@ function matchGateChoice(options, text) {
 }
 
 // Encode the daemon's bounded text answer into the exact object unions emitted
-// by SDK 0.19.0. JSON objects are the explicit route for multi-select,
+// by SDK 0.20.0. JSON objects are the explicit route for multi-select,
 // clarification, custom-answer disambiguation, and decision comments/reasons.
 function encodeGateAnswer(gate, answer) {
   const codec = gateAnswerCodec(gate);
@@ -316,14 +329,14 @@ function encodeGateAnswer(gate, answer) {
     };
   }
 
-  if (!choice) return { ok: false, error: "unsupported gate decision" };
-  if (codec.type === "approval" && choice.value === "request-changes") {
+  if (codec.type === "approval" && parsed.text.toLowerCase() === "request-changes") {
     return {
       ok: false,
       error: "request-changes requires structured comments",
     };
   }
-  return { ok: true, answer: { decision: choice.value } };
+  if (!choice) return { ok: false, error: "unsupported gate decision" };
+  return { ok: true, answer: { decision: choice.value.decision } };
 }
 
 function sanitizedFailure(error, fallbackCode = "prompt_failed") {
@@ -499,7 +512,7 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { se
   const sessionDir = resolveSdkSessionDirectory(workDir, sessionRoot);
   const { createAgentSession, SessionManager } = await loadSdk();
   const sessionManager = SessionManager.create(workDir, sessionDir);
-  // SDK 0.19.0 creates an isolated Settings.loadForScope({ cwd, agentDir })
+  // SDK 0.20.0 creates an isolated Settings.loadForScope({ cwd, agentDir })
   // instance when `settings` is omitted and closes that owned scope from
   // AgentSession.dispose(). Supplying a clone here would transfer ownership to
   // the daemon and bypass that lifecycle.
@@ -538,7 +551,7 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { se
  * Resolution reads the profile from the SDK-owned scope-local
  * `session.settings`, so a project-level `modelProfile.default` override is
  * honoured in that directory. `AgentSession.activateModelProfileForControl()`
- * is the 0.19.0 public nonvisual, session-scoped activation surface; it never
+ * is the 0.20.0 public nonvisual, session-scoped activation surface; it never
  * persists `modelProfile.default`. A misconfigured/uncredentialed profile
  * throws here, which fails session creation loudly instead of silently serving
  * a broken session.
@@ -1016,7 +1029,7 @@ export class SdkSession {
       }
     };
     const removed = (receipt) => receipt.disposition === "removed" &&
-      (receipt.reason === "cancelled" || receipt.reason === "removed");
+      (receipt.reason === "cancelled" || receipt.reason === "removed" || receipt.reason === "refused");
     const work = this.#withStreamingTimeout(async () => {
       if (typeof this.session.submitUserMessage !== "function") {
         throw trackedInputError("submitUserMessage is unavailable");
@@ -1063,6 +1076,11 @@ export class SdkSession {
         const terminal = await this.#withAdapterClose(() => handle.terminal);
         validateIdentity(terminal);
         if (!removed(terminal) || terminal.reason !== execution.reason) throw trackedInputError("removal terminal mismatch");
+        // A positive SDK run-start refusal proves nonexecution, not successful
+        // caller revocation. Only the matching receipt pair can fail this control.
+        if (execution.reason === "refused") {
+          throw sdkTerminalError(failedTerminalOutcome(sanitizedFailure(undefined, "input_refused")));
+        }
         return { revokedBeforeStart: true };
       }
       if (!["joined-current-run", "promoted-to-run"].includes(execution.disposition) || !scopeKey(execution.attemptScope)) {
@@ -1274,7 +1292,7 @@ export class SdkSession {
     const choices =
       options.length > 0
         ? options.map((option) => ({
-            value: option.value,
+            value: codec.type === "ask" ? option.label : option.value.decision,
             label: option.label,
           }))
         : undefined;
