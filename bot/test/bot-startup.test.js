@@ -183,7 +183,7 @@ test("a service-claimed launch is refused by the bootstrap guard before dotenv o
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /ERR_NATIVE_CONTROL_REFUSED|SERVICE_BOOTSTRAP_REFUSED/);
+  assert.match(result.stderr, /SERVICE_BOOTSTRAP_REFUSED/);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /HostRegistry|Loaded channel map|Logged in/);
   assert.doesNotMatch(result.stderr, /secret-a|secret-b|definitely-invalid-token/);
 });
