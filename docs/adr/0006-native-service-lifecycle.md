@@ -719,5 +719,17 @@ with the following independently reviewed deployment and evidence gates:
 7. source-bound real evidence on separately authorized disposable Linux x64,
    Linux arm64, and Windows x64 hosts.
 
+The disposable-host gate is a production qualification requirement, not a claim
+that every native primitive check requires a VM. A separately and explicitly
+authorized general Windows host may exercise the bounded SCM primitive scenario
+(create disabled, protect, demand, disable, delete, and observe absence). Its
+receipt must identify general-host evidence and must not be promoted to
+disposable-host qualification, production provenance, or full lifecycle evidence.
+This does not add shared-workstation Windows as a supported lifecycle target.
+The scenario must refuse pre-existing services and retain the native signature,
+Launch, role, ownership, ACL, and compare-and-swap guards. It may not create
+accounts, provision paths, start a service, adopt an existing resource, or
+automatically reconcile an uncertain failure by deleting newly observed state.
+
 No service command, key generation, signing, release, deployment, or host
 mutation is authorized or evidenced by this ADR.
