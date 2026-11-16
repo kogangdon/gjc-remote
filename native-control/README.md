@@ -477,14 +477,80 @@ do not acquire service authority through this addition.
 A local native build or fixture-signed load is not production provenance.
 Deployment signing uses the separate policy in
 [`deployment-keys/README.md`](deployment-keys/README.md); a bundled native addon
-still needs its own independently trusted signature. Real service mutation and
-protected-root evidence require a separately authorized disposable host. The
-ordinary native test suite does not perform SCM mutations.
+still needs its own independently trusted signature. Production qualification
+and protected-root evidence require a separately authorized disposable host.
+An explicitly authorized general Windows host may run the narrowly scoped SCM
+primitive scenario described below; this does not qualify it as a supported
+shared-workstation lifecycle deployment. The ordinary native test suite does
+not perform SCM mutations.
 Its temporary-file source tests exercise real read/identity behavior under the
 current OS caller. Its empty temporary-directory ACL test exercises repeated
 application and a final-directory profile transition under the actual M/S caller.
 These do not prove cross-account recovery or workload access, protected-root
 bootstrap, artifact writes, sealing, GC, or service operation.
+
+### Explicitly authorized Windows SCM primitive checks
+
+The standalone verifier supports general and disposable Windows x64 hosts:
+
+```text
+node native-control/test-fixtures/service-scm.mjs --host-mode general-host --fixture <protected-fixture.json>
+node native-control/test-fixtures/service-scm.mjs --host-mode disposable-host --fixture <protected-fixture.json>
+```
+
+This replaces the obsolete disposable-only script and its spread-argument
+Launch tuple. Do not declare a workstation disposable to run a check. Neither
+administrator membership nor this documentation authorizes host mutation.
+An operator must authorize the exact service, preprovisioned role accounts,
+Launch paths, and change scope before invoking the command. The fixture is
+sensitive input: restrict access to the operator and do not commit it or its
+password. The verifier does not create accounts, payload directories, keys,
+configuration, or deployment assets and does not grant filesystem permissions.
+
+The fixture is strict JSON with exactly these fields:
+
+- `schemaVersion`: `1`; `platform`: `win32-x64`.
+- `hostMode`: the exact CLI mode; `evidenceKind`: `real-general-host` or
+  `real-disposable-host`, matching that mode.
+- `acknowledgement`: `authorize-current-host-scm-primitives` for general hosts
+  or `authorize-disposable-host-scm-primitives` for disposable hosts.
+- `serviceRole`: `bot` or `daemon`; `serviceName`: exactly `GJCRemoteBot` or
+  `GJCRemoteDaemon-<serviceKey>` under the existing topology. No alternate names.
+- `roles`: the existing five-role Windows SID tuple. The service account is
+  derived natively from the selected role; there is no account-name override.
+- `launch`: the complete current 27-field Windows Launch record, including
+  pinned runtime version/revision, bootstrap/config identities, content hashes,
+  log names, and the derived `runtimePolicyFingerprint`. Missing, extra or
+  inconsistent fields refuse before creation; the old positional tuple refuses.
+- `servicePassword`: `null` or the existing account's nonempty password.
+- `transitionProof`: a lowercase 64-hex transition identifier.
+- `changeScope`: exactly `["create-disabled","protect","demand","disable",
+  "delete","observe-absence"]` in that order.
+
+Both modes require the current addon manifest's signature to verify against the
+package's pinned native release trust store. A development-key or unsigned load
+is not an alternative. Native materialized Launch hash, ACL, account and CAS
+checks remain authoritative. Any existing target service causes refusal rather
+than adoption. Only the handle created by this execution is used for mutations;
+after any failure the verifier closes handles but never queries a fresh snapshot
+to authorize cleanup. A failure may leave a disabled or demand-start service:
+retain its receipt and reconcile ownership/state explicitly before any cleanup.
+Even a cleanup failure is reported, not hidden as success.
+
+The scenario never starts a service: it creates disabled, protects the service,
+changes demand then disabled, deletes it, closes retained handles, and observes
+actual absence under a fixed five-second/101-attempt bound. Deletion acceptance
+alone is not success. JSON receipts identify host evidence kind, exact service,
+Launch fingerprint, input/source/artifact hashes, observed cleanup and a bounded
+failure code; they omit passwords and raw native exception messages. Preserve
+stdout and the process exit code for both successful and failed executions.
+
+Receipts remain `scope=native-scm-primitives-only` and
+`productionProvenance=not-verified`, even when the native signature is valid.
+General-host success is not disposable-host qualification. Neither mode proves
+application/Shawl deployment provenance, service start/stop/recovery/uninstall,
+production readiness, or complete lifecycle behavior. These remain separate
+authorization and evidence gates in ADR 0006.
 
 ## Native addon build reproducibility
 
