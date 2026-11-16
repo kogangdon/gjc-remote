@@ -552,6 +552,26 @@ application/Shawl deployment provenance, service start/stop/recovery/uninstall,
 production readiness, or complete lifecycle behavior. These remain separate
 authorization and evidence gates in ADR 0006.
 
+### Service bootstrap refusal boundary
+
+An explicitly service-claimed launch must pass the signed bootstrap guard before
+application code runs. Native addon verification, self-configuration observation,
+process-epoch observation and bootstrap policy refusal all stop the launch with
+`SERVICE_BOOTSTRAP_REFUSED`. A valid native signature does not imply that the
+current working directory, protected configuration or process epoch is valid.
+An ordinary non-service launch performs no bootstrap native work.
+
+Native failures expose only bounded diagnostic metadata, never their original
+message, stack, cause, file paths, environment or configuration contents. Native
+error accounting is trusted only for a known code and the operation matching
+the current bootstrap stage, captured from own data properties. Known write
+counts and ambiguity are preserved; missing, mismatched or untrusted accounting
+must not be reported as proven zero writes. Existing policy refusal reasons remain
+stable. Captured configuration bytes are cleared after policy evaluation and on
+later observation failure, and configuration/context is published only after
+successful validation. These guards do not relax native trust, ACL or ownership
+checks and do not qualify service startup or full lifecycle behavior.
+
 ## Native addon build reproducibility
 
 Windows Release builds deliberately replace, rather than append to, node-gyp's

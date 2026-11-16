@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { createServiceBootstrapNative } from './service-bootstrap-native.js';
-import { ServiceBootstrapRefusal, evaluateServiceBootstrap } from './service-bootstrap-policy.js';
+import { ServiceBootstrapRefusal, runServiceBootstrap } from './service-bootstrap-policy.js';
 
 // Signed Windows service bootstrap guard. The daemon loads this exact file via
 // BUN_INSPECT_PRELOAD before its entrypoint; the bot imports it first. Module
@@ -15,12 +15,8 @@ let bootstrapContext = null;
 let consumed = false;
 
 if (process.env.GJC_REMOTE_SERVICE_COMPONENT !== undefined) {
-  const native = createServiceBootstrapNative();
-  const selfConfig = native.readSelfServiceConfig();
-  const epoch = native.observeSelfProcessEpoch();
-  let result;
-  try {
-    result = evaluateServiceBootstrap({
+  const result = runServiceBootstrap({
+      createNative: createServiceBootstrapNative,
       env: process.env,
       runtime: {
         platform: process.platform,
@@ -31,13 +27,8 @@ if (process.env.GJC_REMOTE_SERVICE_COMPONENT !== undefined) {
         bunRevision: globalThis.Bun?.revision,
       },
       bootstrapPath,
-      selfConfig,
-      epoch,
       parseDotenv: (bytes) => dotenv.parse(bytes),
     });
-  } finally {
-    if (selfConfig?.bytes instanceof Uint8Array) selfConfig.bytes.fill(0);
-  }
   // Verified bytes become the process configuration; later dotenv/config loads
   // never override existing keys, so the application sees exactly these values.
   for (const [key, value] of result.entries) {

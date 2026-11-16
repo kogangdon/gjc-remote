@@ -82,8 +82,12 @@ test('guard closure has no application, SDK, broad public, dotenv-config or dyna
     assert.equal(/\beval\s*\(|new Function\s*\(/.test(source), false, `${file} evaluates code`);
   }
   const guard = readFileSync(guardPath, 'utf8');
-  assert.equal(guard.match(/createServiceBootstrapNative\(\)/g).length, 1);
-  assert.equal(guard.match(/evaluateServiceBootstrap\(/g).length, 1);
+  assert.equal((guard.match(/runServiceBootstrap\(/g) ?? []).length, 1);
+  assert.equal((guard.match(/createNative:\s*createServiceBootstrapNative\b/g) ?? []).length, 1);
+  assert.equal(/createServiceBootstrapNative\(/.test(guard), false);
+  const policy = readFileSync(join(repoRoot, 'native-control', 'src', 'service-bootstrap-policy.js'), 'utf8');
+  assert.equal((policy.match(/const native = createNative\(\)/g) ?? []).length, 1);
+  assert.equal((policy.match(/return evaluateServiceBootstrap\(/g) ?? []).length, 1);
 });
 
 test('closure fingerprint is domain-separated and binds every path and hash in order', () => {

@@ -69,7 +69,132 @@ export class ServiceBootstrapRefusal extends Error {
   }
 }
 
-function refuse(reason) { throw new ServiceBootstrapRefusal(reason); }
+const policyRefusals = new WeakSet();
+
+function refuse(reason) {
+  const error = Object.freeze(new ServiceBootstrapRefusal(reason));
+  policyRefusals.add(error);
+  throw error;
+}
+
+const BOOTSTRAP_ERROR_CODES = new Set([
+  'ERR_NATIVE_CONTROL_REFUSED', 'SERVICE_ACCESS_DENIED', 'SERVICE_UNSUPPORTED',
+  'SERVICE_STALE', 'SERVICE_IO_FAILED', 'SERVICE_OUTPUT_LIMIT', 'SERVICE_PENDING',
+  'SERVICE_INVALID',
+]);
+const BOOTSTRAP_ERROR_OPERATIONS = new Set([
+  'create_service_bootstrap_native', 'read_self_service_config', 'observe_self_process_epoch',
+]);
+const STAGE_OPERATIONS = Object.freeze({
+  'native-load': 'create_service_bootstrap_native',
+  'self-config-observation': 'read_self_service_config',
+  'process-epoch-observation': 'observe_self_process_epoch',
+});
+
+function receiptWrites(value, configReceipt) {
+  try {
+    const record = exactData(value, configReceipt ? SELF_CONFIG_KEYS : EPOCH_KEYS);
+    if (record === null) return null;
+    if (!configReceipt) return typeof record.processEpochFingerprint === 'string' &&
+      HEX.test(record.processEpochFingerprint) ? writeCount(record) : null;
+    if (record.schemaVersion !== 1 || typeof record.sourceIdentityFingerprint !== 'string' ||
+        !HEX.test(record.sourceIdentityFingerprint) || !(record.bytes instanceof Uint8Array)) return null;
+    if (record.runtimeConfig !== null) {
+      const runtime = exactData(record.runtimeConfig, RUNTIME_CONFIG_RESULT_KEYS);
+      if (runtime === null || !['rootIdentityFingerprint', 'fileIdentityFingerprint', 'fileSha256'].every(
+        (key) => typeof runtime[key] === 'string' && HEX.test(runtime[key])) ||
+        !Number.isSafeInteger(runtime.byteLength) || runtime.byteLength < 0) return null;
+    }
+    return writeCount(record);
+  } catch {
+    return null;
+  }
+}
+
+function ownDataValue(value, key) {
+  try {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeCount(value) {
+  const writes = ownDataValue(value, 'writes');
+  return Number.isSafeInteger(writes) && writes >= 0 ? writes : null;
+}
+
+function addWrites(left, right) {
+  return left !== null && right !== null && Number.isSafeInteger(left + right) ? left + right : null;
+}
+
+function clearConfigBytes(bytes) {
+  if (!ArrayBuffer.isView(bytes)) return;
+  // Intrinsic getters also handle invalid DataView receipts without invoking
+  // user accessors or replacing the policy refusal with a fill TypeError.
+  let prototype = Object.getPrototypeOf(Uint8Array.prototype);
+  let buffer;
+  try {
+    buffer = Reflect.apply(Object.getOwnPropertyDescriptor(prototype, 'buffer').get, bytes, []);
+  } catch {
+    prototype = DataView.prototype;
+    buffer = Reflect.apply(Object.getOwnPropertyDescriptor(prototype, 'buffer').get, bytes, []);
+  }
+  // Detached ArrayBuffers contain no accessible configuration bytes. Shared
+  // buffers reject this getter but remain valid inputs to the view getters.
+  try {
+    if (Reflect.apply(Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get, buffer, []) === 0) return;
+  } catch { /* SharedArrayBuffer */ }
+  const offset = Reflect.apply(Object.getOwnPropertyDescriptor(prototype, 'byteOffset').get, bytes, []);
+  const length = Reflect.apply(Object.getOwnPropertyDescriptor(prototype, 'byteLength').get, bytes, []);
+  Uint8Array.prototype.fill.call(new Uint8Array(buffer, offset, length), 0);
+}
+
+// Internal orchestration seam: production binds the signed loader directly.
+// No environment or context is installed here; callers apply only a successful result.
+export function runServiceBootstrap({ createNative, ...input }) {
+  let stage = 'native-load';
+  let bytes;
+  let writes = 0;
+  try {
+    try {
+      const native = createNative();
+      stage = 'self-config-observation';
+      const selfConfig = native.readSelfServiceConfig();
+      bytes = ownDataValue(selfConfig, 'bytes');
+      writes = addWrites(writes, receiptWrites(selfConfig, true));
+      stage = 'process-epoch-observation';
+      const epoch = native.observeSelfProcessEpoch();
+      writes = addWrites(writes, receiptWrites(epoch, false));
+      stage = 'policy-evaluation';
+      return evaluateServiceBootstrap({ ...input, selfConfig, epoch });
+    } finally {
+      clearConfigBytes(bytes);
+    }
+  } catch (error) {
+    const policyRefusal = stage === 'policy-evaluation' && policyRefusals.has(error);
+    if (policyRefusal && writes === 0) throw error;
+    const code = ownDataValue(error, 'code');
+    const operation = ownDataValue(error, 'operation');
+    const ambiguous = ownDataValue(error, 'ambiguous');
+    const trustedError = Object.hasOwn(STAGE_OPERATIONS, stage) &&
+      operation === STAGE_OPERATIONS[stage] && BOOTSTRAP_ERROR_CODES.has(code) &&
+      (stage === 'native-load' ? code === 'ERR_NATIVE_CONTROL_REFUSED' : code !== 'ERR_NATIVE_CONTROL_REFUSED');
+    const refusal = new ServiceBootstrapRefusal(policyRefusal ? error.reason : `${stage}-failed`);
+    refusal.writes = policyRefusal ? writes : addWrites(writes, trustedError ? writeCount(error) : null);
+    refusal.ambiguous = trustedError && typeof ambiguous === 'boolean' ? ambiguous : null;
+    refusal.diagnostics = Object.freeze({
+      stage,
+      code: BOOTSTRAP_ERROR_CODES.has(code) ? code : null,
+      operation: BOOTSTRAP_ERROR_OPERATIONS.has(operation) ? operation : null,
+      writes: refusal.writes,
+      ambiguous: refusal.ambiguous,
+    });
+    throw refusal;
+  }
+}
 
 function exactData(value, keys) {
   if (value === null || typeof value !== 'object' || Array.isArray(value) ||

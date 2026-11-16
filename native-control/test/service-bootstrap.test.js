@@ -12,6 +12,7 @@ import {
   SERVICE_BOOTSTRAP_RUNTIMES,
   SERVICE_EFFECTIVE_CONFIG_DOMAIN,
   evaluateServiceBootstrap,
+  runServiceBootstrap,
   serviceEffectiveConfigFingerprint,
   validateServiceDotenvEntries,
 } from '../src/service-bootstrap-policy.js';
@@ -84,6 +85,255 @@ function fixture(component) {
 function refusal(reason) {
   return (error) => error?.code === 'SERVICE_BOOTSTRAP_REFUSED' && error.reason === reason && error.writes === 0;
 }
+
+function orchestrate(input, overrides = {}) {
+  return runServiceBootstrap({
+    ...input,
+    createNative: () => ({
+      readSelfServiceConfig: () => input.selfConfig,
+      observeSelfProcessEpoch: () => input.epoch,
+      ...overrides,
+    }),
+  });
+}
+
+function nativeFailure(operation, extra = {}) {
+  return Object.assign(new Error('secret-token-value C:\\private\\config.env'), {
+    code: 'SERVICE_ACCESS_DENIED', operation, writes: 0, ambiguous: false, ...extra,
+  });
+}
+
+test('orchestration returns valid policy results without installing configuration and clears bytes', () => {
+  for (const component of ['bot', 'daemon']) {
+    const input = fixture(component);
+    const before = { ...input.env };
+    input.selfConfig.bytes.fill = () => { throw new Error('must use intrinsic fill'); };
+    const result = orchestrate(input);
+    assert.equal(result.context.component, component);
+    assert.deepEqual(result.entries, [['A', '1'], ['B', 'two']]);
+    assert.deepEqual(input.env, before);
+    assert.equal(input.selfConfig.bytes.every((byte) => byte === 0), true);
+  }
+});
+
+test('missing or unverified production loader failures have one safe outward boundary', () => {
+  for (const error of [undefined, nativeFailure('create_service_bootstrap_native', {
+    code: 'ERR_NATIVE_CONTROL_REFUSED', reason: 'production-native-addon-unverified',
+  })]) {
+    assert.throws(() => runServiceBootstrap({
+      ...fixture('bot'),
+      createNative: () => { throw error; },
+    }), (refused) => {
+      assert.equal(refused.code, 'SERVICE_BOOTSTRAP_REFUSED');
+      assert.equal(refused.reason, 'native-load-failed');
+      assert.equal(refused.writes, error === undefined ? null : 0);
+      assert.equal(refused.diagnostics.code, error === undefined ? null : 'ERR_NATIVE_CONTROL_REFUSED');
+      assert.equal(Object.hasOwn(refused, 'cause'), false);
+      return true;
+    });
+  }
+  assert.throws(() => runServiceBootstrap({ ...fixture('bot'), createNative: undefined }), (error) =>
+    error.code === 'SERVICE_BOOTSTRAP_REFUSED' && error.reason === 'native-load-failed' && error.writes === null);
+});
+
+test('signed-load-equivalent self-config access denial is refused before epoch, policy or application work', () => {
+  const input = fixture('bot');
+  const before = { ...input.env };
+  let epochCalls = 0;
+  let parseCalls = 0;
+  let applicationRan = false;
+  input.parseDotenv = () => { parseCalls++; return {}; };
+  assert.throws(() => {
+    orchestrate(input, {
+      readSelfServiceConfig: () => { throw nativeFailure('read_self_service_config'); },
+      observeSelfProcessEpoch: () => { epochCalls++; return input.epoch; },
+    });
+    applicationRan = true;
+  }, (error) => {
+    assert.equal(error.code, 'SERVICE_BOOTSTRAP_REFUSED');
+    assert.equal(error.reason, 'self-config-observation-failed');
+    assert.deepEqual(error.diagnostics, {
+      stage: 'self-config-observation', code: 'SERVICE_ACCESS_DENIED',
+      operation: 'read_self_service_config', writes: 0, ambiguous: false,
+    });
+    assert.equal(Object.isFrozen(error.diagnostics), true);
+    assert.doesNotMatch(`${error.message}\n${error.stack}\n${JSON.stringify(error)}`, /secret-token-value|private|config.env/);
+    return true;
+  });
+  assert.equal(epochCalls, 0);
+  assert.equal(parseCalls, 0);
+  assert.equal(applicationRan, false);
+  assert.deepEqual(input.env, before);
+});
+
+test('epoch failures clear config bytes, preserve write uncertainty and do not apply configuration', () => {
+  for (const writes of [0, 2, undefined, -1, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    const input = fixture('daemon');
+    const before = { ...input.env };
+    assert.throws(() => orchestrate(input, {
+      observeSelfProcessEpoch: () => {
+        throw nativeFailure('observe_self_process_epoch', { writes, ambiguous: true });
+      },
+    }), (error) => {
+      assert.equal(error.code, 'SERVICE_BOOTSTRAP_REFUSED');
+      assert.equal(error.reason, 'process-epoch-observation-failed');
+      assert.equal(error.writes, writes === 0 || writes === 2 ? writes : null);
+      assert.equal(error.ambiguous, true);
+      return true;
+    });
+    assert.equal(input.selfConfig.bytes.every((byte) => byte === 0), true);
+    assert.deepEqual(input.env, before);
+  }
+});
+
+test('policy mismatch retains its reason and clears bytes without installing configuration', () => {
+  for (const writes of [0, 3, undefined]) {
+    const input = fixture('daemon');
+    input.env.GJC_REMOTE_RUNTIME_VERSION = 'wrong';
+    input.selfConfig.writes = writes;
+    const before = { ...input.env };
+    assert.throws(() => orchestrate(input), (error) => {
+      assert.equal(error.code, 'SERVICE_BOOTSTRAP_REFUSED');
+      assert.equal(error.reason, 'runtime-policy-mismatch');
+      assert.equal(error.writes, writes === undefined ? null : writes);
+      assert.equal(Object.hasOwn(error, 'diagnostics'), writes !== 0);
+      return true;
+    });
+    assert.equal(input.selfConfig.bytes.every((byte) => byte === 0), true);
+    assert.deepEqual(input.env, before);
+  }
+});
+
+test('opaque throws and malicious descriptors cannot leak data or execute diagnostic getters', () => {
+  let getterCalls = 0;
+  const malicious = Object.create({ code: 'SERVICE_ACCESS_DENIED', writes: 0 });
+  for (const key of ['code', 'operation', 'writes', 'ambiguous', 'message', 'stack', 'cause']) {
+    Object.defineProperty(malicious, key, { get() { getterCalls++; throw new Error('secret-token-value'); } });
+  }
+  const proxy = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error('secret-token-value'); } });
+  const huge = 'secret-token-value'.repeat(10_000);
+  for (const thrown of [null, undefined, huge, 42, Symbol('secret-token-value'), malicious, proxy,
+    Object.create({ code: 'SERVICE_ACCESS_DENIED', operation: 'observe_self_process_epoch', writes: 0, ambiguous: false }),
+    { code: huge, operation: huge, writes: huge, ambiguous: huge, cause: malicious }]) {
+    const input = fixture('bot');
+    assert.throws(() => orchestrate(input, {
+      observeSelfProcessEpoch: () => { throw thrown; },
+    }), (error) => {
+      assert.equal(error.code, 'SERVICE_BOOTSTRAP_REFUSED');
+      assert.deepEqual(error.diagnostics, {
+        stage: 'process-epoch-observation', code: null, operation: null, writes: null, ambiguous: null,
+      });
+      assert.equal(Object.hasOwn(error, 'cause'), false);
+      assert.ok(JSON.stringify(error).length < 512);
+      assert.doesNotMatch(`${error.message}\n${error.stack}\n${JSON.stringify(error)}`, /secret-token-value/);
+      return true;
+    });
+    assert.equal(input.selfConfig.bytes.every((byte) => byte === 0), true);
+  }
+  assert.equal(getterCalls, 0);
+});
+
+test('config byte capture does not execute accessors on malformed observation records', () => {
+  const input = fixture('bot');
+  let getterCalls = 0;
+  Object.defineProperty(input.selfConfig, 'bytes', {
+    get() { getterCalls++; throw new Error('secret-token-value'); },
+  });
+  assert.throws(() => orchestrate(input), (error) =>
+    error.code === 'SERVICE_BOOTSTRAP_REFUSED' && error.reason === 'config-source-drift' && error.writes === null);
+  assert.equal(getterCalls, 0);
+});
+
+test('invalid DataView receipts are cleared without masking policy or epoch refusals', () => {
+  for (const epochFails of [false, true]) {
+    const input = fixture('bot');
+    const storage = input.selfConfig.bytes;
+    input.selfConfig.bytes = new DataView(storage.buffer, storage.byteOffset, storage.byteLength);
+    const overrides = epochFails ? {
+      observeSelfProcessEpoch: () => { throw nativeFailure('observe_self_process_epoch', { code: 'SERVICE_INVALID' }); },
+    } : {};
+    assert.throws(() => orchestrate(input, overrides), (error) => {
+      assert.equal(error.code, 'SERVICE_BOOTSTRAP_REFUSED');
+      assert.equal(error.reason, epochFails ? 'process-epoch-observation-failed' : 'config-source-drift');
+      if (epochFails) assert.equal(error.diagnostics.code, 'SERVICE_INVALID');
+      return true;
+    });
+    assert.equal(storage.every((byte) => byte === 0), true);
+  }
+});
+
+test('unexpected policy evaluation exceptions are normalized after byte cleanup', () => {
+  const input = fixture('bot');
+  Object.defineProperty(input.runtime, 'platform', { get() { throw new Error('secret-token-value'); } });
+  assert.throws(() => orchestrate(input), (error) => {
+    assert.equal(error.code, 'SERVICE_BOOTSTRAP_REFUSED');
+    assert.equal(error.reason, 'policy-evaluation-failed');
+    assert.equal(error.writes, null);
+    assert.doesNotMatch(error.message, /secret-token-value/);
+    return true;
+  });
+  assert.equal(input.selfConfig.bytes.every((byte) => byte === 0), true);
+});
+
+test('error write and ambiguity claims require an own stage-matched operation and known code', () => {
+  let getterCalls = 0;
+  const accessor = nativeFailure('observe_self_process_epoch');
+  Object.defineProperty(accessor, 'operation', { get() { getterCalls++; return 'observe_self_process_epoch'; } });
+  const codeAccessor = nativeFailure('observe_self_process_epoch');
+  Object.defineProperty(codeAccessor, 'code', { get() { getterCalls++; return 'SERVICE_ACCESS_DENIED'; } });
+  const inherited = Object.assign(Object.create({ operation: 'observe_self_process_epoch' }), {
+    code: 'SERVICE_ACCESS_DENIED', writes: 0, ambiguous: false,
+  });
+  for (const error of [
+    nativeFailure('read_self_service_config'),
+    nativeFailure(undefined), nativeFailure(42),
+    nativeFailure('observe_self_process_epoch', { code: undefined }),
+    nativeFailure('observe_self_process_epoch', { code: 'secret-token-value' }),
+    nativeFailure('observe_self_process_epoch', { code: 'ERR_NATIVE_CONTROL_REFUSED' }),
+    accessor, codeAccessor, inherited,
+    Object.assign(Object.create({ code: 'SERVICE_ACCESS_DENIED' }), {
+      operation: 'observe_self_process_epoch', writes: 0, ambiguous: false,
+    }),
+  ]) {
+    const input = fixture('bot');
+    assert.throws(() => orchestrate(input, {
+      observeSelfProcessEpoch: () => { throw error; },
+    }), (refused) => {
+      assert.equal(refused.code, 'SERVICE_BOOTSTRAP_REFUSED');
+      assert.equal(refused.writes, null);
+      assert.equal(refused.ambiguous, null);
+      assert.doesNotMatch(JSON.stringify(refused), /secret-token-value/);
+      return true;
+    });
+    assert.equal(input.selfConfig.bytes.every((byte) => byte === 0), true);
+  }
+  assert.equal(getterCalls, 0);
+  assert.throws(() => runServiceBootstrap({ createNative: () => {
+    throw nativeFailure('create_service_bootstrap_native');
+  } }), (error) => error.code === 'SERVICE_BOOTSTRAP_REFUSED' && error.writes === null && error.ambiguous === null);
+});
+
+test('malformed successful receipts cannot establish zero writes before later refusals', () => {
+  for (const mutate of [
+    (i) => { i.selfConfig.schemaVersion = 2; },
+    (i) => { i.selfConfig.sourceIdentityFingerprint = 'invalid'; },
+    (i) => { i.selfConfig.extra = true; },
+    (i) => { i.selfConfig = Object.assign(Object.create({ writes: 0 }), i.selfConfig); delete i.selfConfig.writes; },
+    (i) => { Object.defineProperty(i.selfConfig, 'writes', { get() { throw new Error('secret-token-value'); } }); },
+  ]) {
+    const input = fixture('bot');
+    const bytes = input.selfConfig.bytes;
+    mutate(input);
+    assert.throws(() => orchestrate(input, {
+      observeSelfProcessEpoch: () => { throw nativeFailure('observe_self_process_epoch'); },
+    }), (error) => error.code === 'SERVICE_BOOTSTRAP_REFUSED' && error.writes === null);
+    assert.equal(bytes.every((byte) => byte === 0), true);
+  }
+  const input = fixture('bot');
+  input.epoch.processEpochFingerprint = 'invalid';
+  assert.throws(() => orchestrate(input), (error) =>
+    error.code === 'SERVICE_BOOTSTRAP_REFUSED' && error.reason === 'epoch-invalid' && error.writes === null);
+});
 
 for (const component of ['bot', 'daemon']) {
   test(`${component} guard inputs yield one frozen nonsecret context and verified entries`, () => {
@@ -240,7 +490,7 @@ test('a service launch refusal stops the entrypoint before any application code 
   assert.equal(result.signal, null);
   assert.equal(result.status, 1);
   assert.equal(result.stdout.includes('APPLICATION-RAN'), false);
-  assert.match(result.stderr, /ERR_NATIVE_CONTROL_REFUSED|SERVICE_BOOTSTRAP_REFUSED/);
+  assert.match(result.stderr, /SERVICE_BOOTSTRAP_REFUSED/);
 });
 
 test('package exports the canonical guard path and pins the dotenv parser dependency', () => {
