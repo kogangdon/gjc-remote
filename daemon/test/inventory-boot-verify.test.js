@@ -54,7 +54,11 @@ async function bootDaemon(envOverrides) {
     });
   });
 
-  const child = spawn(process.env.BUN_BIN || "bun", [daemonEntry], {
+  const child = spawn(process.env.BUN_BIN || "bun", [
+    "--preload",
+    fileURLToPath(new URL("../test-fixtures/isolated-host-state.mjs", import.meta.url)),
+    daemonEntry,
+  ], {
     env: {
       ...process.env,
       HOST_ID: "boot-test-host",

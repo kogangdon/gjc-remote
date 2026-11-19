@@ -77,6 +77,11 @@ services:
       - type: volume
         source: state
         target: /var/lib/gjc-remote/state
+      - type: bind
+        source: /var/lib/gjc-remote/host-state
+        target: /var/lib/gjc-remote/host-state
+        bind:
+          create_host_path: false
     networks:
       - control
     depends_on:

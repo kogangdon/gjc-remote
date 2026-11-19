@@ -471,6 +471,21 @@ try {
 
 const containerSessionStatePath =
   process.env.GJC_CONTAINER_RUNTIME === "1" ? ROLE_PATHS.session : undefined;
+let hostState;
+try {
+  const { openHostState } = await import("./host-state.js");
+  hostState = openHostState();
+} catch (error) {
+  // No fallback to a per-user store or to an unlocked, in-memory daemon.
+  console.error(`daemon: host state unavailable: ${sanitizeDaemonError(error)}`);
+  process.exit(1);
+}
+process.prependOnceListener("exit", () => {
+  try { hostState.close(); } catch {
+    console.error("daemon: host state close failed");
+    process.exitCode = 1;
+  }
+});
 const daemonObservability = new DaemonObservability();
 const sessionFactory = (() => {
   const fixtureFactory = globalThis[TEST_SESSION_FACTORY_SYMBOL];

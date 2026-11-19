@@ -83,6 +83,15 @@ test("daemon image fixes the non-root identity and preflight entrypoint", () => 
   assert.match(dockerfile, /COPY deploy\/docker\/daemon\/persistence-probe\.js/);
 });
 
+test("daemon image leaves host coordination inaccessible without its host bind", () => {
+  assert.match(
+    dockerfile,
+    /chown -R 1004:1004 \/workspaces \/var\/lib\/gjc-remote \/home\/gjc \\\n    && mkdir -m 000 \/var\/lib\/gjc-remote\/host-state/,
+  );
+  assert.doesNotMatch(dockerfile, /VOLUME\s/);
+  assert.doesNotMatch(dockerfile, /^\s*(?:ENV\s+)?[A-Z_]*HOST_STATE[A-Z_]*=/m);
+});
+
 test("Linux CI executes preflight rejection and cross-recreation persistence", () => {
   assert.match(workflow, /os: ubuntu-latest[\s\S]+platform: linux\/amd64/);
   assert.match(workflow, /os: ubuntu-24\.04-arm[\s\S]+platform: linux\/arm64/);
@@ -155,7 +164,7 @@ test("Compose fixture is private, bounded, non-root, and independently deployabl
   assert.doesNotMatch(daemonService, /docker\.sock|privileged:\s*true|network_mode:\s*host|pid:\s*host|^\s+ports:/m);
 });
 
-test("Compose grants exactly four persistent daemon role mounts", () => {
+test("Compose grants four service role volumes and the fixed host coordination bind", () => {
   const daemonService = compose.slice(
     compose.indexOf("\n  daemon:\n"),
     compose.indexOf("\nnetworks:\n")
@@ -170,8 +179,18 @@ test("Compose grants exactly four persistent daemon role mounts", () => {
     "/var/lib/gjc-remote/sessions",
     "/home/gjc/.gjc",
     "/var/lib/gjc-remote/state",
+    "/var/lib/gjc-remote/host-state",
   ]);
-  for (const volume of ["workspace", "sessions", "provider", "state"]) {
-    assert.match(compose, new RegExp(`^  ${volume}:$`, "m"));
-  }
+  assert.equal([...volumeBlock.matchAll(/^      - type: volume$/gm)].length, 4);
+  assert.equal([...volumeBlock.matchAll(/^      - type: bind$/gm)].length, 1);
+  assert.match(
+    volumeBlock,
+    /      - type: bind\n        source: \/var\/lib\/gjc-remote\/host-state\n        target: \/var\/lib\/gjc-remote\/host-state\n        bind:\n          create_host_path: false$/,
+  );
+  const namedVolumes = compose.slice(compose.indexOf("\nvolumes:\n"), compose.indexOf("\nsecrets:\n"));
+  assert.deepEqual(
+    [...namedVolumes.matchAll(/^  (\S+):$/gm)].map((match) => match[1]),
+    ["workspace", "sessions", "provider", "state"],
+  );
+  assert.doesNotMatch(daemonService, /^\s+[A-Z_]*HOST_STATE[A-Z_]*:/m);
 });

@@ -210,6 +210,11 @@ jobs:
           trap cleanup EXIT
           docker build --target preflight-probe --tag "$image" \
             -f deploy/docker/daemon/Dockerfile .
+          # Disposable runner only. Never adopt or alter a pre-existing host store.
+          host_state=/var/lib/gjc-remote/host-state
+          sudo mkdir -p /var/lib/gjc-remote
+          sudo mkdir -m 0700 "$host_state"
+          sudo chown 1004:1004 "$host_state"
           for volume in "${volumes[@]}"; do docker volume create "$volume"; done
           common=(
             --rm
@@ -225,6 +230,7 @@ jobs:
             --mount "type=volume,source=${volumes[0]},target=/workspaces"
             --mount "type=volume,source=${volumes[1]},target=/var/lib/gjc-remote/sessions"
             --mount "type=volume,source=${volumes[2]},target=/home/gjc/.gjc"
+            --mount "type=bind,source=$host_state,target=$host_state"
             --mount "type=volume,source=${volumes[3]},target=/var/lib/gjc-remote/state"
           )
           output="$(docker run "${common[@]}" --security-opt no-new-privileges "$image")"
