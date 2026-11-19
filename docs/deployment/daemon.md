@@ -13,10 +13,9 @@ Restrict write/delete access to the intended daemon account and trusted
 administrators (POSIX: daemon-owned, mode `0700`); do not use a workspace,
 network share or service restore directory. The daemon will not provision the
 parent or fall back to an account-specific path. It takes an exclusive OS-backed
-lock on `gjc-lifecycle.lock` before opening `gjc-lifecycle.sqlite3`. Do not
-delete the lock file to resolve contention. With no database or sidecars,
-startup creates an empty decision store; unreadable or corrupt data stops
-startup. An old valid database is accepted as current, not detected as rollback.
+lock on `gjc-lifecycle.lock` before registration. Do not delete the lock file
+to resolve contention. Startup neither creates nor opens `gjc-lifecycle.sqlite3`;
+any existing decision database and its sidecars are left untouched.
 
 ### Current tracked-input source contract — LOCAL qualified subset
 
