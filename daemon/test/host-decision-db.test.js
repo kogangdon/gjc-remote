@@ -80,6 +80,18 @@ function assertChildSucceeded(result) {
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 
+test("Bun can strictly close a fresh and a reopened decision database", (t) => {
+  const { directory } = fixture(t);
+  assertChildSucceeded(child(`
+    import { openHostDecisionDb } from ${JSON.stringify(MODULE_URL)};
+    openHostDecisionDb(process.argv[1]).close();
+    const db = openHostDecisionDb(process.argv[1]);
+    db.setDecision("host", "consent", false);
+    db.readDecision("host", "consent");
+    db.close();
+  `, [directory], [], process.env.BUN_BIN || "bun"));
+});
+
 test("committed allow and deny decisions survive real process restarts", (t) => {
   const f = fixture(t);
   assertChildSucceeded(child(`

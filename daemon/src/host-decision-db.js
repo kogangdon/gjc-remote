@@ -95,15 +95,20 @@ function openSqlite(path) {
       strict: true,
     });
     return {
-      database,
+      prepare: (sql) => database.query(sql),
       exec: (sql) => database.run(sql),
-      close: () => database.close(true),
+      close: () => {
+        // All SQL is static. Finalize every cached statement, including the
+        // schema checks on a partially initialized connection, before close.
+        database.clearQueryCache();
+        database.close(true);
+      },
     };
   }
   const { DatabaseSync } = require("node:sqlite");
   const database = new DatabaseSync(path);
   return {
-    database,
+    prepare: (sql) => database.prepare(sql),
     exec: (sql) => database.exec(sql),
     close: () => database.close(),
   };
@@ -169,7 +174,7 @@ export function openHostDecisionDb(directory) {
   }
   const { path, created } = reserveDatabase(directory);
   const driver = openSqlite(path);
-  const { database } = driver;
+  const database = driver;
   try {
     driver.exec("PRAGMA trusted_schema = OFF; PRAGMA synchronous = EXTRA; PRAGMA locking_mode = NORMAL");
     if (created) {
