@@ -17,7 +17,8 @@ import { cgroupMemoryMinimumMb } from "../src/admission-headroom.js";
 const roleMounts = Object.entries(ROLE_PATHS)
   .map(([name, point], index) => `${20 + index} 1 0:${20 + index} / ${point} rw - ext4 /dev/role-${name} rw`)
   .join("\n");
-const mountInfo = `1 0 0:1 / / ro - overlay overlay ro\n2 1 0:2 / /tmp rw - tmpfs tmpfs rw,nosuid,nodev,noexec,size=16m\n3 1 0:3 / /sys/fs/cgroup ro - cgroup2 cgroup rw\n${roleMounts}\n`;
+const hostMount = "30 1 0:20 /var/lib/gjc-remote/host-state /var/lib/gjc-remote/host-state rw - ext4 /dev/host rw";
+const mountInfo = `1 0 0:1 / / ro - overlay overlay ro\n2 1 0:2 / /tmp rw - tmpfs tmpfs rw,nosuid,nodev,noexec,size=16m\n3 1 0:3 / /sys/fs/cgroup ro - cgroup2 cgroup rw\n${roleMounts}\n${hostMount}\n`;
 const status = `Name:\ttest\nNoNewPrivs:\t1\nSeccomp:\t2\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\n`;
 
 function fixture(overrides = {}) {
@@ -60,6 +61,8 @@ test("accepts the complete constrained-container evidence", async () => {
 
 test("rejects every primary security condition", async () => {
   const cases = [
+    ["host-state-mount", fixture({ files: { "/proc/self/mountinfo": mountInfo.replace(hostMount, "") } })],
+    ["host-state-mount", fixture({ files: { "/proc/self/mountinfo": mountInfo.replace(hostMount, hostMount.replace(" rw -", " ro -")) } })],
     ["linux", fixture({ platform: () => "darwin" })],
     ["native-linux-engine", fixture({ release: () => "5.15.90.1-microsoft-standard-WSL2" })],
     ["native-linux-engine", fixture({ release: () => "6.10.14-linuxkit" })],

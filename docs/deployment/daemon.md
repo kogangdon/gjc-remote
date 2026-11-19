@@ -6,6 +6,18 @@ and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.
 
+Before first startup, provision the fixed host-state directory on local disk:
+`C:\ProgramData\gjc-remote\host-state` on Windows or
+`/var/lib/gjc-remote/host-state` on Linux. Protect its parent against replacement.
+Restrict write/delete access to the intended daemon account and trusted
+administrators (POSIX: daemon-owned, mode `0700`); do not use a workspace,
+network share or service restore directory. The daemon will not provision the
+parent or fall back to an account-specific path. It takes an exclusive OS-backed
+lock on `gjc-lifecycle.lock` before opening `gjc-lifecycle.sqlite3`. Do not
+delete the lock file to resolve contention. With no database or sidecars,
+startup creates an empty decision store; unreadable or corrupt data stops
+startup. An old valid database is accepted as current, not detected as rollback.
+
 ### Current tracked-input source contract — LOCAL qualified subset
 
 The issue #231 source integration submits active `steer` and `follow_up`

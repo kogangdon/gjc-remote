@@ -31,6 +31,8 @@ ENTRYPOINT ["bun", "/app/fixture-relay.js"]
 
 FROM ${BUN_IMAGE} AS runtime-base
 USER root
+# Host coordination must be supplied by the fixed host bind; the image-only
+# mountpoint stays root-owned and inaccessible to the daemon identity.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       ca-certificates=20250419 \
@@ -41,6 +43,7 @@ RUN apt-get update \
     && useradd --uid 1004 --gid 1004 --create-home --home-dir /home/gjc --shell /usr/sbin/nologin gjc \
     && mkdir -p /workspaces /var/lib/gjc-remote/sessions /var/lib/gjc-remote/state /home/gjc/.gjc \
     && chown -R 1004:1004 /workspaces /var/lib/gjc-remote /home/gjc \
+    && mkdir -m 000 /var/lib/gjc-remote/host-state \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

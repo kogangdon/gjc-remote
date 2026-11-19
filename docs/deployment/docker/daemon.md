@@ -19,6 +19,32 @@ or an unbounded `/tmp`. Its four persistent writable roles are:
 - provider: `/home/gjc/.gjc`;
 - state: `/var/lib/gjc-remote/state`.
 
+Host coordination is separate from those four service roles. Every daemon on
+the same native Linux host, whether native or containerized, must use the exact
+protected host directory `/var/lib/gjc-remote/host-state` for the process-lifetime
+singleton lock and decision database. The Compose daemon binds that literal
+host source to the same literal container target with `create_host_path: false`.
+A named volume, anonymous volume, per-container directory, alternate bind
+source, or environment-selected path is not a substitute: it would split the
+host-wide exclusion and decision history.
+
+Before startup, an authorized host operator must provision this directory as
+`1004:1004`, mode `0700`, under trusted, non-symlink ancestors that cannot be
+replaced by untrusted users. The native daemon must use the same UID/GID as the
+container; granting a different UID an ACL is not supported. Neither the image,
+Compose fixture, nor daemon provisions or repairs this host directory. The image
+contains only a root-owned, mode-`000` mountpoint, and container preflight must
+reject a missing or private-image-layer host-state mount before importing the
+daemon. Runtime mount inspection does not independently attest the engine's
+host source pathname; qualification must also verify the actual fixed bind
+configuration on the trusted Linux engine.
+
+The host-state directory is not service data: exclude it from service backup,
+restore, rollback, and disposable-volume cleanup. Do not restore, replace, or
+unlink its lock or decision database to recover a service; doing so can split a
+live lock or replay an already consumed decision. Service restore must leave
+this directory and its contents intact.
+
 Container sessions use an opaque hash-derived directory in the session role.
 Existing native `.gjc-remote-session` histories are not copied or migrated.
 The Compose fixture uses a read-only root, dropped capabilities, a checked-in
@@ -35,6 +61,9 @@ sole route authority.
 
 CI runs the topology with the explicitly labeled `compose-fixture-daemon`
 stage, which contains no native addon and cannot enable inventory or serving.
+Only the four service-role volumes are disposable; the host-state bind remains
+host-scoped even for this fixture. An isolated fixture using private host-state
+storage cannot qualify native/container singleton exclusion on the same host.
 The signed final `runtime` target is a separate boundary: CI supplies an
 untrusted bundle and requires that build to fail. This proves rejection, not
 that a production-signed image starts.

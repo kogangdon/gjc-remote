@@ -74,11 +74,13 @@ _Diagram: [English](docs/architecture.en.png) · [한국어](docs/architecture.k
    1h idle)
 ```
 
-1. `daemon/` runs on each machine you want to control. It connects outbound to
+1. One bot can control many hosts, with at most one running `daemon/` per
+   host. The daemon connects outbound to
    `bot/`'s WebSocket server and registers with a per-host pre-shared token. The
    bot sends an application `ping` every 30 seconds and requires `pong` within
    10 seconds; half-open sockets are removed and their pending requests fail.
-   A replacement connection for the same host owns its own heartbeat state.
+   A reconnect is not a second daemon: the replacement connection for the same
+   host owns its own heartbeat state.
 2. On each Discord command, the daemon resolves its configured `workDir` to the
    host filesystem's current canonical real path, so retargeted symlinks or
    junctions cannot reuse a stale target. Different path spellings for the same

@@ -188,6 +188,10 @@ export async function inspectContainerSecurityPreflight(injectedIo = {}) {
   const identities = roleMounts.map(([, mount]) =>
     mount && `${mount.source}\u0000${mount.root}`
   );
+  const hostDirectory = "/var/lib/gjc-remote/host-state";
+  const hostMount = mounts?.filter((mount) => mount.point === hostDirectory);
+  add("host-state-mount", hostMount?.length === 1 && isReadWrite(hostMount[0]) &&
+    !identities.includes(`${hostMount[0].source}\u0000${hostMount[0].root}`));
   add(
     "role-mount-identities",
     identities.every(Boolean) &&

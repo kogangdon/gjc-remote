@@ -233,7 +233,11 @@ async function startReadinessDaemon({
     });
   });
 
-  const child = spawn(process.env.BUN_BIN || "bun", [daemonEntryOverride], {
+  const child = spawn(process.env.BUN_BIN || "bun", [
+    "--preload",
+    fileURLToPath(new URL("../test-fixtures/isolated-host-state.mjs", import.meta.url)),
+    daemonEntryOverride,
+  ], {
     env: {
       ...process.env,
       HOST_ID: "readiness-test-host",
@@ -1447,7 +1451,11 @@ test("denied registration uses one fixed retry and accepted recovery restores no
     });
   });
 
-  const child = spawn(process.env.BUN_BIN || "bun", [daemonEntry], {
+  const child = spawn(process.env.BUN_BIN || "bun", [
+    "--preload",
+    fileURLToPath(new URL("../test-fixtures/isolated-host-state.mjs", import.meta.url)),
+    daemonEntry,
+  ], {
     env: {
       ...process.env,
       HOST_ID: "lifecycle-test-host",
@@ -1496,7 +1504,11 @@ test("denied registration uses one fixed retry and accepted recovery restores no
 async function runFixture(name, envOverrides = {}) {
   const child = spawn(
     process.env.BUN_BIN || "bun",
-    [fileURLToPath(new URL(name, fixturesDir))],
+    [
+      "--preload",
+      fileURLToPath(new URL("../test-fixtures/isolated-host-state.mjs", import.meta.url)),
+      fileURLToPath(new URL(name, fixturesDir)),
+    ],
     {
       env: {
         ...process.env,
