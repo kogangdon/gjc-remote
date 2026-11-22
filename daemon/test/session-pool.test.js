@@ -34,6 +34,65 @@ function receiptIdentity(socketGeneration, bindingId, digit) {
   };
 }
 
+test("withdrawn in-flight profile creation cannot publish an SDK session", async () => {
+  let release, started;
+  const waiting = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  let allowed = true;
+  const listeners = new Set();
+  const binding = {
+    assertCurrent() { if (!allowed) throw new Error("grant withdrawn"); },
+    subscribeWithdrawal(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+  };
+  const session = new FakeSession();
+  const pool = createPool({ sessionFactory: async (_, supplied) => {
+    assert.equal(supplied, binding);
+    started();
+    await gate;
+    return session;
+  } });
+  try {
+    const creation = pool.ensureSession(WORK_DIR, { profileBinding: binding });
+    await waiting;
+    const joined = pool.ensureSession(WORK_DIR, { profileBinding: binding });
+    const transition = pool.sessionTransitions.get(WORK_DIR).operation;
+    allowed = false;
+    for (const notify of listeners) notify();
+    await Promise.all([creation, joined].map(result =>
+      assert.rejects(result, { code: "SDK_PROFILE_WITHDRAWN" })
+    ));
+    assert.equal(listeners.size, 0);
+    assert.equal(session.disposeCalls, 0);
+    release();
+    await assert.rejects(transition, /grant withdrawn/);
+    assert.equal(session.disposeCalls, 1);
+    assert.equal(pool.sessions.size, 0);
+  } finally {
+    release();
+    await pool.shutdown();
+  }
+});
+
+test("regrant cannot dispose an active previous profile session", async () => {
+  const first = new FakeSession();
+  let busy = true;
+  first.isBusy = () => busy;
+  const next = new FakeSession();
+  const oldGrant = { assertCurrent() {}, subscribeWithdrawal() { return () => {}; } };
+  const newGrant = { ...oldGrant };
+  const pool = createPool({ sessionFactory: async (_, binding) => binding === oldGrant ? first : next });
+  try {
+    assert.equal(await pool.ensureSession(WORK_DIR, { profileBinding: oldGrant }), first);
+    await assert.rejects(pool.ensureSession(WORK_DIR, { profileBinding: newGrant }));
+    assert.equal(first.disposeCalls, 0);
+    busy = false;
+    assert.equal(await pool.ensureSession(WORK_DIR, { profileBinding: newGrant }), next);
+    assert.equal(first.disposeCalls, 1);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
 test("a closed SDK session is disposed and replaced", async () => {
   const created = [];
   const pool = createPool({

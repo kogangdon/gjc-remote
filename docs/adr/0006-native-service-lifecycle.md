@@ -66,18 +66,17 @@ retired when it has no pending or active work; retirement does not erase consent
 or revocation records.
 
 The startup requirement is an exclusive OS lock on the same protected lock
-file for all daemon launches on the host. Acquire it before opening the host
-decision DB, creating sessions or registering with the bot. Contention or an
+file for all daemon launches on the host. Acquire it before creating sessions
+or registering with the bot. Contention or an
 indeterminate acquisition fails startup without disturbing the owner. File
 existence is not ownership: never delete or replace the file to break the lock.
 Keep the lock across idle periods and reconnects; release it last on orderly
 shutdown. The OS releases it on process exit. A successor acquiring it has not
 thereby proved that a prompt was cancelled or a pending revocation completed.
 
-One host decision database serves all managed sessions. The daemon
-mediates access; holding the lock does not grant the workload or a session
-controller write privileges. Authorized management writes use short SQLite
-transactions, not a database-wide lock for the lifetime of the process.
+Daemon startup neither creates nor opens the host decision database. Existing
+database files are not migrated or removed. Holding the lock does not grant
+the workload or a session controller write privileges.
 
 **Integration boundary.** The lock proves exclusive daemon ownership, not
 freshness of the database or completion of an SDK stop. After a restart, an
@@ -85,15 +84,13 @@ empty session pool is not a revocation receipt. A completed stop requires
 durably recorded revocation and evidence that all prior holders, including
 sessions still being created, can no longer start SDK calls.
 
-**Current-store policy.** In the provisioned management directory, absence of
-both the decision DB and all SQLite sidecars initializes an empty store under
-the host lock. No decision means no shared-profile consent. Corruption, I/O
-errors, an unknown schema or orphan sidecars are not absence and must not be
-silently repaired. Once initialized, the current valid store is authoritative:
-replacing it offline with an old valid copy can restore old decisions. This
-design neither authenticates historical file identity nor detects that restore.
-Exclude the directory from service backups. Startup persistence does not by
-itself implement management commands, SDK revocation or stop completion.
+**Profile-sharing design (not a startup feature).** Keep the service account's
+decision for a specific personal profile in a protected host configuration
+file, not SQLite. The intended daemon reads it on startup and on file change,
+applies a changed decision in memory, then notifies affected active sessions.
+No valid matching allow means no sharing. This setting does not need a
+separate file lock; it neither authorizes other resources nor constitutes an
+emergency stop of work already in progress.
 
 ## Deployment trust and immutable artifacts
 

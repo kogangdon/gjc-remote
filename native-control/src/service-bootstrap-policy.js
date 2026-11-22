@@ -29,7 +29,7 @@ export const SERVICE_BOOTSTRAP_STATIC_CLOSURE = Object.freeze([
 ]);
 
 export const SERVICE_BOOTSTRAP_CONTEXT_KEYS = Object.freeze([
-  'schemaVersion', 'component', 'serviceKey', 'processEpochFingerprint',
+  'schemaVersion', 'component', 'serviceKey', 'managementOnly', 'processEpochFingerprint',
   'effectiveConfigFingerprint', 'configSourceIdentityFingerprint',
   'launchFingerprint', 'runtimePolicyFingerprint', 'bootstrapClosureFingerprint',
   'scopeFingerprint',
@@ -328,7 +328,7 @@ function validateEnvironment(component, env, bootstrapPath) {
   if (component === 'bot') {
     for (const key of RUNTIME_CONFIG_KEYS) if (envString(env, key) !== '') refuse('environment-policy');
     if (!WINDOWS_ABSOLUTE.test(envString(env, 'CHANNELS_CONFIG'))) refuse('environment-policy');
-    return;
+    return false;
   }
   for (const key of ['BUN_OPTIONS', 'BUN_INSPECT', 'BUN_INSPECT_CONNECT_TO']) {
     if (envString(env, key) !== '') refuse('inspector-policy');
@@ -343,10 +343,18 @@ function validateEnvironment(component, env, bootstrapPath) {
     refuse('runtime-config-policy');
   }
   const profile = envString(env, 'GJC_REMOTE_SDK_PROFILE_PATH');
+  if (profile === '') {
+    // Management startup must not inherit a selector that enables SDK fallback.
+    for (const key of ['GJC_CODING_AGENT_DIR', 'PI_CODING_AGENT_DIR']) {
+      if (env[key] !== undefined && env[key] !== '') refuse('sdk-profile-policy');
+    }
+    return true;
+  }
   if (!WINDOWS_ABSOLUTE.test(profile) || envString(env, 'GJC_CODING_AGENT_DIR') !== profile ||
       (env.PI_CODING_AGENT_DIR !== undefined && env.PI_CODING_AGENT_DIR !== profile)) {
     refuse('sdk-profile-policy');
   }
+  return false;
 }
 
 function validateSelfConfig(component, env, selfConfig) {
@@ -380,7 +388,7 @@ export function evaluateServiceBootstrap({ env, runtime, bootstrapPath, selfConf
   if (component !== 'bot' && component !== 'daemon') refuse('component-invalid');
   const serviceKey = envString(env, 'GJC_REMOTE_SERVICE_KEY');
   validateServiceKey(component, serviceKey);
-  validateEnvironment(component, env, bootstrapPath);
+  const managementOnly = validateEnvironment(component, env, bootstrapPath);
   validateRuntime(component, env, runtime);
   const bytes = validateSelfConfig(component, env, selfConfig);
   const observed = exactData(epoch, EPOCH_KEYS);
@@ -400,6 +408,7 @@ export function evaluateServiceBootstrap({ env, runtime, bootstrapPath, selfConf
     schemaVersion: 1,
     component,
     serviceKey,
+    managementOnly,
     processEpochFingerprint: observed.processEpochFingerprint,
     effectiveConfigFingerprint,
     configSourceIdentityFingerprint: env.GJC_REMOTE_CONFIG_SOURCE_IDENTITY_FINGERPRINT,

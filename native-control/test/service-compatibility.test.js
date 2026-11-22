@@ -16,6 +16,7 @@ import { createGenesisEmptyChannels } from '@gjc-remote/shared/mapping-envelope'
 import {
   createServiceCompatibilityObserverForTest,
   createSdkPackageRootReaderForTest,
+  readServiceAuthorityScope,
   SERVICE_COMPATIBILITY_LIMITS,
 } from '../src/service-compatibility.js';
 import { SDK_EXTERNAL_STATE_REQUIREMENTS } from '../src/service-sdk-contract.js';
@@ -141,6 +142,10 @@ function daemonBinding(candidate = candidateManifest()) {
 }
 
 function daemonSdkObserver({
+  managementOnly = false,
+  mutateCatalog = undefined,
+  installationOwner = roles.management.value,
+  installationAbsent = false,
   profileEntryCount = 0,
   installationEntryCount = 0,
   installationListing = undefined,
@@ -154,7 +159,8 @@ function daemonSdkObserver({
   const configIdentity = nativeIdentity('service-daemon-config-directory');
   const catalogIdentity = nativeIdentity('service-daemon-config-file', '00000000000000000000000000000002');
   const profileIdentity = nativeIdentity('service-sdk-install-directory', '00000000000000000000000000000003');
-  const installationIdentity = nativeIdentity('service-sdk-install-directory', '00000000000000000000000000000004');
+  const installationIdentity = nativeIdentity('service-sdk-install-directory',
+    '00000000000000000000000000000004', installationOwner);
   const sdkContractFingerprint = hex('9');
   const stateIdentityAttestationFields = {
     schemaVersion: 1,
@@ -165,13 +171,13 @@ function daemonSdkObserver({
   };
   const sdk = {
     installationRoot,
-    profileRoot,
+    profileRoot: managementOnly ? null : profileRoot,
     packageVersion: SDK_EXTERNAL_STATE_REQUIREMENTS.packageVersion,
     lockIntegrity: SDK_EXTERNAL_STATE_REQUIREMENTS.lockIntegrity,
     sdkExternalStateContractFingerprint: sdkContractFingerprint,
     provenanceManifestPath: 'application.manifest.json',
     provenanceSignaturePath: 'application.manifest.json.sig',
-    stateIdentityAttestation: {
+    stateIdentityAttestation: managementOnly ? null : {
       ...stateIdentityAttestationFields,
       attestationFingerprint: canonicalJsonHash(stateIdentityAttestationFields),
     },
@@ -185,9 +191,11 @@ function daemonSdkObserver({
     nativeWorkspaceRoots: [],
     sdk,
   };
+  mutateCatalog?.(catalogFields);
+  const scopeFingerprint = canonicalJsonHash(catalogFields);
   const catalog = Buffer.from(JSON.stringify({
     ...catalogFields,
-    scopeFingerprint: canonicalJsonHash(catalogFields),
+    scopeFingerprint,
   }));
   const directoryEntries = (count, identityOffset) => Array.from({ length: count }, (_, index) => ({
     name: `entry-${String(index).padStart(5, '0')}.js`,
@@ -220,6 +228,8 @@ function daemonSdkObserver({
     .map((entry) => [entry.name, entry]));
   let installationChildReads = 0;
   const sidecarByteReads = [];
+  const openedRoots = [];
+  const closedRoots = [];
   const fileObservation = (identity, bytes) => ({
     kind: 'file', identity, absence: null, bytes, entries: null, writes: 0,
   });
@@ -228,6 +238,17 @@ function daemonSdkObserver({
   });
   const native = {
     open_service_external_root(absolutePath, profile) {
+      openedRoots.push(absolutePath);
+      if (installationAbsent && absolutePath === installationRoot) {
+        return {
+          handle: { absolutePath }, profile, absolutePath, rootIdentity: null,
+          absence: {
+            parentIdentity: nativeIdentity('service-external-anchor-directory'),
+            missingSegments: ['sdk-install'],
+          },
+          writes: 0,
+        };
+      }
       const rootIdentity = absolutePath === 'C:\\service' && profile === 'config' ? configIdentity :
         absolutePath === profileRoot && profile === 'sdk-install' ? profileIdentity :
           absolutePath === installationRoot && profile === 'sdk-install' ? installationIdentity : null;
@@ -276,13 +297,21 @@ function daemonSdkObserver({
         securitySha256: sidecar.identity.securitySha256,
       };
     },
-    close_service_handle() {
+    close_service_handle(handle) {
+      closedRoots.push(handle.absolutePath);
       return { writes: 0 };
     },
   };
   return {
     observer: createServiceCompatibilityObserverForTest({ binding, native }),
+    readScope: () => readServiceAuthorityScope(native, {
+      component: binding.component, serviceKey: binding.serviceKey,
+      roles: binding.roles, workingDirectory: binding.workingDirectory,
+    }),
     get installationChildReads() { return installationChildReads; },
+    scopeFingerprint,
+    openedRoots,
+    closedRoots,
     sidecarByteReads,
   };
 }
@@ -375,6 +404,70 @@ test('large SDK profile and installation listings pass the compatibility invento
     }, label);
     assert.equal(fixture.installationChildReads, expectedChildReads, label);
   }
+});
+
+test('management-only authority projects an explicit null profile without opening an SDK root', () => {
+  const fixture = daemonSdkObserver({ managementOnly: true });
+  assert.deepEqual(fixture.readScope(), {
+    scopeFingerprint: fixture.scopeFingerprint,
+    sdkProfileRoot: null,
+  });
+  assert.deepEqual(fixture.openedRoots, ['C:\\service']);
+  assert.deepEqual(fixture.closedRoots, ['C:\\service']);
+});
+
+test('management-only scopes still require a complete, owned SDK installation and signed package', async () => {
+  for (const [options, code, sidecarReads] of [
+    [{}, 'SERVICE_COMPATIBILITY_SDK_FILE_NOT_IN_INSTALLATION', []],
+    [{ installationAbsent: true }, 'SERVICE_COMPATIBILITY_ROOT_ABSENT', []],
+    [{ installationOwner: roles.daemon.value }, 'SERVICE_COMPATIBILITY_NATIVE_OWNER', []],
+    [{ includeSidecars: true }, 'DEPLOYMENT_MANIFEST_INVALID', [
+      'application.manifest.json', 'application.manifest.json.sig',
+    ]],
+    [{ includeSidecars: true, omitSignature: true }, 'SERVICE_COMPATIBILITY_SDK_FILE_NOT_IN_INSTALLATION', [
+      'application.manifest.json',
+    ]],
+    [{ includeSidecars: true, foreignManifest: true }, 'SERVICE_COMPATIBILITY_SDK_FILE_PROFILE_DRIFT', [
+      'application.manifest.json',
+    ]],
+  ]) {
+    const fixture = daemonSdkObserver({ managementOnly: true, ...options });
+    await assert.rejects(() => fixture.observer.assertFirstInstall(), { code, writes: 0 });
+    assert.deepEqual(fixture.openedRoots, ['C:\\service', 'C:\\sdk-install']);
+    assert.deepEqual(fixture.closedRoots, fixture.openedRoots);
+    assert.deepEqual(fixture.sidecarByteReads, sidecarReads);
+  }
+});
+
+test('management-only scopes reject incomplete profile declarations and preserve catalog binding', () => {
+  for (const [mutateCatalog, code] of [
+    [(catalog) => { delete catalog.sdk.profileRoot; }, 'SERVICE_COMPATIBILITY_SDK_SCOPE'],
+    [(catalog) => { delete catalog.sdk.stateIdentityAttestation; }, 'SERVICE_COMPATIBILITY_SDK_SCOPE'],
+    [(catalog) => { catalog.sdk.profileRoot = 'C:\\sdk-profile'; }, 'SERVICE_COMPATIBILITY_SDK_ATTESTATION'],
+    [(catalog) => { catalog.sdk.stateIdentityAttestation = {}; }, 'SERVICE_COMPATIBILITY_SDK_ATTESTATION'],
+    [(catalog) => { catalog.sdk = null; }, 'SERVICE_COMPATIBILITY_SDK_SCOPE_MISSING'],
+    [(catalog) => { catalog.sdk.installationRoot = null; }, 'SERVICE_COMPATIBILITY_SDK_INSTALLATION_ROOT'],
+    [(catalog) => { catalog.sdk.packageVersion = '0.0.0'; }, 'SERVICE_COMPATIBILITY_SDK_SCOPE'],
+    [(catalog) => { catalog.sdk.lockIntegrity = 'sha512-untrusted'; }, 'SERVICE_COMPATIBILITY_SDK_SCOPE'],
+    [(catalog) => { catalog.rolesFingerprint = hex('0'); }, 'SERVICE_COMPATIBILITY_SCOPE_CATALOG'],
+    [(catalog) => { catalog.serviceKey = 'other'; }, 'SERVICE_COMPATIBILITY_SCOPE_CATALOG'],
+    [(catalog) => { catalog.workDirs = [{ path: 'C:\\sdk-install', identityFingerprint: hex('b') }]; },
+      'SERVICE_COMPATIBILITY_SCOPE_ROOT_OVERLAP'],
+    [(catalog) => { catalog.scopeFingerprint = hex('0'); }, 'SERVICE_COMPATIBILITY_SCOPE_FINGERPRINT'],
+  ]) {
+    const fixture = daemonSdkObserver({ managementOnly: true, mutateCatalog });
+    assert.throws(() => fixture.readScope(), { code, writes: 0 });
+    assert.deepEqual(fixture.openedRoots, ['C:\\service']);
+    assert.deepEqual(fixture.closedRoots, ['C:\\service']);
+  }
+});
+
+test('profile-bound scopes cannot drop the profile identity attestation', () => {
+  const fixture = daemonSdkObserver({
+    mutateCatalog: (catalog) => { catalog.sdk.stateIdentityAttestation = null; },
+  });
+  assert.throws(() => fixture.readScope(), { code: 'SERVICE_COMPATIBILITY_SDK_ATTESTATION', writes: 0 });
+  assert.deepEqual(fixture.openedRoots, ['C:\\service']);
 });
 
 test('present SDK provenance sidecars are read from the authenticated installation tree before signature validation', async () => {

@@ -22,11 +22,11 @@ or an unbounded `/tmp`. Its four persistent writable roles are:
 Host coordination is separate from those four service roles. Every daemon on
 the same native Linux host, whether native or containerized, must use the exact
 protected host directory `/var/lib/gjc-remote/host-state` for the process-lifetime
-singleton lock and decision database. The Compose daemon binds that literal
+singleton lock. The Compose daemon binds that literal
 host source to the same literal container target with `create_host_path: false`.
 A named volume, anonymous volume, per-container directory, alternate bind
 source, or environment-selected path is not a substitute: it would split the
-host-wide exclusion and decision history.
+host-wide exclusion.
 
 Before startup, an authorized host operator must provision this directory as
 `1004:1004`, mode `0700`, under trusted, non-symlink ancestors that cannot be
@@ -41,8 +41,8 @@ configuration on the trusted Linux engine.
 
 The host-state directory is not service data: exclude it from service backup,
 restore, rollback, and disposable-volume cleanup. Do not restore, replace, or
-unlink its lock or decision database to recover a service; doing so can split a
-live lock or replay an already consumed decision. Service restore must leave
+unlink its lock to recover a service; doing so can split a live lock.
+Service restore must leave
 this directory and its contents intact.
 
 Container sessions use an opaque hash-derived directory in the session role.

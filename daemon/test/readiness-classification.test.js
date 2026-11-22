@@ -40,6 +40,7 @@ test("session retirement is an admission-boundary refusal", () => {
 
 test("durable session/readiness faults do NOT take the admission-boundary branch", () => {
   for (const code of [
+    PROTOCOL_ERROR_CODES.SDK_PROFILE_UNAVAILABLE,
     PROTOCOL_ERROR_CODES.SESSION_LIMIT,
     PROTOCOL_ERROR_CODES.RESOURCE_EXHAUSTED,
     PROTOCOL_ERROR_CODES.WORKSPACE_NOT_FOUND,
@@ -57,6 +58,8 @@ test("admission-boundary codes are exactly the request-local refusals", () => {
     PROTOCOL_ERROR_CODES.LEASE_CONFLICT,
     PROTOCOL_ERROR_CODES.SESSION_RETIREMENT_FAILED,
     PROTOCOL_ERROR_CODES.SESSION_RETIREMENT_PENDING,
+    PROTOCOL_ERROR_CODES.SDK_PROFILE_WITHDRAWN,
+    PROTOCOL_ERROR_CODES.SDK_PROFILE_LIVE_UNSUPPORTED,
     PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED,
   ].sort());
   assert.equal(Object.isFrozen(ADMISSION_BOUNDARY_REJECTION_CODES), true);

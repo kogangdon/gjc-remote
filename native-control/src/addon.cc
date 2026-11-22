@@ -8682,7 +8682,7 @@ bool CaptureWin32ServiceLaunch(napi_env env, napi_value value,
   const std::string expected_runtime_config_path =
       expected_runtime_config_root + "\\.bunfig.toml";
   if (launch->has_runtime_config != daemon ||
-      launch->has_sdk_profile != daemon ||
+      (launch->has_sdk_profile && !daemon) ||
       launch->has_channels_config != !daemon ||
       launch->runtime_version != expected_version ||
       launch->runtime_source_revision != expected_revision ||
@@ -8720,7 +8720,8 @@ bool CaptureWin32ServiceLaunch(napi_env env, napi_value value,
         launch->runtime_config_sha256 !=
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ||
         !ValidWin32LaunchHash(launch->runtime_config_identity_fingerprint) ||
-        !ValidCanonicalWin32LaunchPath(launch->sdk_profile_path) ||
+        (launch->has_sdk_profile &&
+         !ValidCanonicalWin32LaunchPath(launch->sdk_profile_path)) ||
         launch->runtime_config_root != expected_runtime_config_root ||
         launch->runtime_config_path != expected_runtime_config_path)) ||
       (!daemon && (!launch->runtime_config_root.empty() ||
@@ -8767,7 +8768,7 @@ bool CaptureWin32ServiceLaunch(napi_env env, napi_value value,
       (!daemon && !VerifyWindowsPathServiceAcl(launch->channels_config, roles,
           ServiceAclProfile::BotConfigFile)) ||
       (daemon && !VerifyWin32RuntimeConfigLaunch(*launch, roles)) ||
-      (daemon && (!VerifyWindowsPathServiceAcl(launch->sdk_profile_path,
+      (launch->has_sdk_profile && (!VerifyWindowsPathServiceAcl(launch->sdk_profile_path,
           roles, ServiceAclProfile::SdkInstallDirectory)))) return false;
 
   launch->launch_fingerprint = Win32LaunchFingerprint(

@@ -96,6 +96,8 @@ import { RequestIdFence } from "./request-id-fence.js";
 import { resolveDaemonConnectionConfig } from "./daemon-config.js";
 import { ROLE_PATHS } from "./container-security-preflight.js";
 import { createSdkSession } from "./sdk-session.js";
+import { createSdkProfileStore } from "./sdk-profile-store.js";
+import { createSdkProfileAdmission } from "./sdk-profile-admission.js";
 import {
   DaemonObservability,
   isDestructiveLifecycleAction,
@@ -176,9 +178,9 @@ const serviceStartupReporter = serviceBootstrapContext === null
     });
 const readinessV2Advertised = process.env.GJC_READINESS_V2 === "1";
 const READINESS_TEST_INJECTION_ENABLED =
-  process.env.GJC_READINESS_TEST_INJECTION === "1";
+  serviceBootstrapContext === null && process.env.GJC_READINESS_TEST_INJECTION === "1";
 const OBSERVABILITY_TEST_IPC_ENABLED =
-  process.env.GJC_DAEMON_TEST_MODE === "1" &&
+  serviceBootstrapContext === null && process.env.GJC_DAEMON_TEST_MODE === "1" &&
   process.env.GJC_OBSERVABILITY_TEST_IPC === "1";
 const TEST_SESSION_FACTORY_SYMBOL = Symbol.for(
   "@gjc-remote/daemon/test-session-factory"
@@ -293,6 +295,9 @@ function makeReadinessError(code, at = Date.now()) {
 
 function classifyReadinessError(error, fallback = PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME) {
   const explicitCode = error && typeof error === "object" ? error.code : undefined;
+  if (explicitCode === "ERR_SDK_PROFILE_TARGET_REFUSED") {
+    return PROTOCOL_ERROR_CODES.SDK_PROFILE_UNAVAILABLE;
+  }
   if (typeof explicitCode === "string" && READINESS_ERROR_CODES.has(explicitCode)) {
     return explicitCode;
   }
@@ -400,8 +405,8 @@ function runStaticSecurityPreflight() {
   const result = {
     connection: "offline",
     runtime: "ready",
-    providerAuth: "missing",
-    modelProfile: "missing",
+    providerAuth: serviceBootstrapContext?.managementOnly ? "unknown" : "missing",
+    modelProfile: serviceBootstrapContext?.managementOnly ? "unknown" : "missing",
     workspace: "unknown",
     errors: [],
   };
@@ -487,13 +492,22 @@ process.prependOnceListener("exit", () => {
   }
 });
 const daemonObservability = new DaemonObservability();
+const profileStore = serviceBootstrapContext?.managementOnly ? createSdkProfileStore() : null;
+const profileAdmission = profileStore && createSdkProfileAdmission({
+  store: profileStore,
+  sessionRoot: containerSessionStatePath,
+});
+await profileStore?.start();
 const sessionFactory = (() => {
-  const fixtureFactory = globalThis[TEST_SESSION_FACTORY_SYMBOL];
-  if (!SESSION_FACTORY_TEST_INJECTION_ENABLED || fixtureFactory === undefined) {
-    return (workDir) =>
-      createSdkSession(workDir, undefined, {
+  const fixtureFactory = SESSION_FACTORY_TEST_INJECTION_ENABLED ? globalThis[TEST_SESSION_FACTORY_SYMBOL] : undefined;
+  if (fixtureFactory === undefined) {
+    return (workDir, profileBinding) => {
+      if (profileAdmission) return profileAdmission.create(workDir, profileBinding);
+      return createSdkSession(workDir, undefined, {
         sessionRoot: containerSessionStatePath,
+        profileBinding,
       });
+    };
   }
   if (typeof fixtureFactory !== "function") {
     throw new TypeError("daemon: invalid test session factory");
@@ -1176,6 +1190,8 @@ function createReadinessState(connection) {
       ? PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME
       : staticReadiness.runtime !== "ready"
         ? PROTOCOL_ERROR_CODES.RUNTIME_INCOMPATIBLE
+        : profileAdmission
+          ? PROTOCOL_ERROR_CODES.SDK_PROFILE_UNAVAILABLE
         : staticReadiness.providerAuth === "invalid"
           ? PROTOCOL_ERROR_CODES.PROVIDER_INVALID
           : staticReadiness.providerAuth === "unknown"
@@ -1765,6 +1781,8 @@ function readinessRejection(state, bindingState = undefined) {
   if (dimensions.runtime !== "ready") {
     return makeReadinessError(PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
   }
+  if (state.lastError?.code === PROTOCOL_ERROR_CODES.SDK_PROFILE_UNAVAILABLE ||
+      state.lastError?.code === PROTOCOL_ERROR_CODES.SDK_PROFILE_WITHDRAWN) return state.lastError;
   if (dimensions.providerAuth !== "configured") {
     const code =
       dimensions.providerAuth === "invalid"
@@ -1842,9 +1860,13 @@ async function runCurrentRunProbe() {
 
 async function probeReadiness(state) {
   if (!state?.committed || state.probeStarted || state.probePassed) return;
+  const probeRevision = state.profileRevision;
   state.probeStarted = true;
   try {
+    const binding = profileAdmission?.capture();
     const evidence = await runCurrentRunProbe();
+    if (!state.committed || state.profileRevision !== probeRevision) return;
+    binding?.assertCurrent();
     state.status.runtime = evidence.runtime;
     state.status.providerAuth = evidence.providerAuth;
     state.status.modelProfile = evidence.modelProfile;
@@ -1858,6 +1880,7 @@ async function probeReadiness(state) {
       state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.MAPPING_ID_REQUIRED);
     }
   } catch (error) {
+    if (!state.committed || state.profileRevision !== probeRevision) return;
     setReadinessError(state, error, PROTOCOL_ERROR_CODES.UNKNOWN_RUNTIME);
     for (const bindingState of state.bindings.values()) {
       if (!bindingState.ready) bindingState.lastError = state.lastError;
@@ -1866,6 +1889,25 @@ async function probeReadiness(state) {
   }
   publishReadiness(state);
 }
+
+profileStore?.subscribe(() => {
+  for (const connection of connections) {
+    const state = readinessByConnection.get(connection);
+    if (!state?.committed) continue;
+    state.profileRevision = Symbol("profile revision");
+    state.probeStarted = false;
+    state.probePassed = false;
+    state.status.modelProfile = "unknown";
+    state.status.providerAuth = "unknown";
+    state.lastError = makeReadinessError(PROTOCOL_ERROR_CODES.SDK_PROFILE_UNAVAILABLE);
+    for (const binding of state.bindings.values()) {
+      binding.ready = false;
+      binding.lastError = state.lastError;
+    }
+    publishReadiness(state);
+    void probeReadiness(state);
+  }
+});
 
 function invokeMappingRejection(state, message) {
   const bindingState = message.bindingId !== undefined
@@ -1907,7 +1949,7 @@ function invokeMappingRejection(state, message) {
   return undefined;
 }
 
-async function admitReadyWorkload(state, workDir, message) {
+async function admitReadyWorkload(state, workDir, message, profileBinding) {
   const bindingState = message.bindingId !== undefined
     ? state.bindings.get(message.bindingId)
     : undefined;
@@ -1982,6 +2024,7 @@ async function admitReadyWorkload(state, workDir, message) {
       });
     }
     const session = await pool.ensureSession(effectiveWorkDir, {
+      profileBinding,
       ...(receiptIdentity ? { receiptIdentity } : {
         managedIdentity: bindingFingerprintValue,
       }),
@@ -2022,6 +2065,9 @@ async function admitReadyWorkload(state, workDir, message) {
         error: makeReadinessError(PROTOCOL_ERROR_CODES.WORKSPACE_MAPPING_CHANGED),
       };
     }
+    // Inventory validation above may have awaited after session creation.
+    // Do not grant this request admission under a superseded profile.
+    profileBinding?.assertCurrent();
     return {
       session,
       effectiveWorkDir,
@@ -3246,8 +3292,9 @@ async function handleMessage(
       }
       return;
     }
+    const profileBinding = profileAdmission?.capture();
     if (readinessState?.committed) {
-      const admission = await admitReadyWorkload(readinessState, workDir, msg);
+      const admission = await admitReadyWorkload(readinessState, workDir, msg, profileBinding);
       if (cancellationRecord.revoked) {
         activityLease = admission.activityLease;
         cancellationRecord.activityLease = activityLease;
@@ -3296,7 +3343,7 @@ async function handleMessage(
         fenceSequence: admission.activityLease?.fence,
       });
     } else {
-      session = await pool.ensureSession(workDir);
+      session = await pool.ensureSession(workDir, { profileBinding });
       cancellationRecord.session = session;
       if (cancellationRecord.revoked) {
         invokeOutcome = "failed";
@@ -3486,6 +3533,7 @@ function toRpcCommand(command) {
 }
 
 function closeConnections() {
+  const storeClosed = profileStore?.close();
   stopInventoryPoll();
   for (const connection of connections) {
     const readinessState = readinessByConnection.get(connection);
@@ -3501,6 +3549,7 @@ function closeConnections() {
       );
     }
   }
+  return storeClosed;
 }
 function formatPendingShutdownOperations() {
   let pending;
@@ -3539,8 +3588,17 @@ async function shutdownAndExit(exitCode) {
       }, DAEMON_SHUTDOWN_TIMEOUT_MS);
     });
     try {
-      closeConnections();
-      await Promise.race([Promise.resolve().then(() => pool.shutdown()), timeout]);
+      const storeClosed = closeConnections();
+      const drainPool = async () => {
+        try {
+          await pool.shutdown();
+        } finally {
+          // This retry set contains only leases already proven safe to close;
+          // pool failure/timeout never turns live SDK ownership into that proof.
+          await profileAdmission?.retryTargetCleanup();
+        }
+      };
+      await Promise.race([Promise.all([storeClosed, drainPool()]), timeout]);
     } catch (error) {
       // Signal shutdown remains successful even if disposal fails. Fatal
       // shutdown keeps the first caller's non-zero exit code.

@@ -27,7 +27,7 @@ const BOOTSTRAP = 'C:\\GJC\\release\\native-control\\src\\service-bootstrap.js';
 const DAEMON_KEY = `default-${h('daemon-key')}`;
 const CONFIG_BYTES = 'A=1\nB=two\n';
 
-function fixture(component) {
+function fixture(component, { managementOnly = false } = {}) {
   const entries = [['A', '1'], ['B', 'two']];
   const serviceKey = component === 'bot' ? 'bot' : DAEMON_KEY;
   const runtime = SERVICE_BOOTSTRAP_RUNTIMES[component];
@@ -49,14 +49,15 @@ function fixture(component) {
   if (component === 'bot') {
     env.CHANNELS_CONFIG = 'C:\\GJC\\config\\channels.json';
   } else {
+    const profile = managementOnly ? '' : 'C:\\GJC\\home\\.gjc\\agent';
     Object.assign(env, {
       BUN_OPTIONS: '', BUN_INSPECT_PRELOAD: BOOTSTRAP, XDG_CONFIG_HOME: 'C:\\GJC\\work\\runtime-config',
-      BUN_INSPECT: '', BUN_INSPECT_CONNECT_TO: '', GJC_CODING_AGENT_DIR: 'C:\\GJC\\home\\.gjc\\agent',
+      BUN_INSPECT: '', BUN_INSPECT_CONNECT_TO: '', GJC_CODING_AGENT_DIR: profile,
       GJC_REMOTE_RUNTIME_CONFIG_ROOT_IDENTITY_FINGERPRINT: h('root'),
       GJC_REMOTE_RUNTIME_CONFIG_PATH: 'C:\\GJC\\work\\runtime-config\\.bunfig.toml',
       GJC_REMOTE_RUNTIME_CONFIG_SHA256: SERVICE_BOOTSTRAP_EMPTY_FILE_SHA256,
       GJC_REMOTE_RUNTIME_CONFIG_IDENTITY_FINGERPRINT: h('file'),
-      GJC_REMOTE_SDK_PROFILE_PATH: 'C:\\GJC\\home\\.gjc\\agent',
+      GJC_REMOTE_SDK_PROFILE_PATH: profile,
     });
     runtimeConfig = {
       rootIdentityFingerprint: h('root'), fileIdentityFingerprint: h('file'),
@@ -343,6 +344,7 @@ for (const component of ['bot', 'daemon']) {
     assert.equal(Object.isFrozen(context), true);
     assert.equal(context.component, component);
     assert.equal(context.serviceKey, input.env.GJC_REMOTE_SERVICE_KEY);
+    assert.equal(context.managementOnly, false);
     assert.equal(context.processEpochFingerprint, h('epoch'));
     assert.equal(context.effectiveConfigFingerprint, input.env.GJC_REMOTE_EFFECTIVE_CONFIG_FINGERPRINT);
     assert.equal(context.configSourceIdentityFingerprint, h('source'));
@@ -351,6 +353,65 @@ for (const component of ['bot', 'daemon']) {
     assert.equal(JSON.stringify(context).includes('two'), false);
   });
 }
+
+test('management-only daemon bootstrap captures profile-free mode without installing a profile selector', () => {
+  for (const selectors of [
+    {},
+    { GJC_CODING_AGENT_DIR: '' },
+    { PI_CODING_AGENT_DIR: '' },
+    { GJC_CODING_AGENT_DIR: '', PI_CODING_AGENT_DIR: '' },
+  ]) {
+    const input = fixture('daemon', { managementOnly: true });
+    delete input.env.GJC_CODING_AGENT_DIR;
+    Object.assign(input.env, selectors);
+    const before = { ...input.env };
+    const { context, entries } = orchestrate(input);
+    assert.equal(context.managementOnly, true);
+    assert.equal(context.component, 'daemon');
+    assert.equal(context.launchFingerprint, h('launch'));
+    assert.equal(context.processEpochFingerprint, h('epoch'));
+    assert.deepEqual(Reflect.ownKeys(context), [...SERVICE_BOOTSTRAP_CONTEXT_KEYS]);
+    assert.equal(Object.isFrozen(context), true);
+    assert.deepEqual(entries, [['A', '1'], ['B', 'two']]);
+    assert.deepEqual(input.env, before);
+    assert.equal(input.selfConfig.bytes.every((byte) => byte === 0), true);
+    input.env.GJC_REMOTE_SDK_PROFILE_PATH = 'C:\\GJC\\changed-after-bootstrap';
+    assert.equal(context.managementOnly, true);
+  }
+});
+
+test('management-only bootstrap refuses inherited SDK selectors and an unspecified launch mode', () => {
+  for (const key of ['GJC_CODING_AGENT_DIR', 'PI_CODING_AGENT_DIR']) {
+    for (const value of ['C:\\Other\\profile', 'relative-profile', ' ', null, 1]) {
+      const input = fixture('daemon', { managementOnly: true });
+      input.env[key] = value;
+      assert.throws(() => evaluateServiceBootstrap(input), refusal('sdk-profile-policy'), key);
+    }
+  }
+  const input = fixture('daemon', { managementOnly: true });
+  delete input.env.GJC_REMOTE_SDK_PROFILE_PATH;
+  assert.throws(() => evaluateServiceBootstrap(input), refusal('environment-missing'));
+});
+
+test('management-only mode retains bootstrap, runtime, protected config and epoch proofs', () => {
+  for (const [mutate, reason] of [
+    [(i) => { i.env.GJC_REMOTE_LAUNCH_FINGERPRINT = 'invalid'; }, 'environment-policy'],
+    [(i) => { i.env.GJC_REMOTE_SCOPE_FINGERPRINT = ''; }, 'environment-policy'],
+    [(i) => { i.env.GJC_REMOTE_BOOTSTRAP_CLOSURE_FINGERPRINT = ''; }, 'environment-policy'],
+    [(i) => { i.env.GJC_REMOTE_BOOTSTRAP_PATH = 'C:\\Other\\service-bootstrap.js'; }, 'bootstrap-path-mismatch'],
+    [(i) => { i.env.GJC_REMOTE_RUNTIME_CONFIG_SHA256 = h('nonempty'); }, 'runtime-config-policy'],
+    [(i) => { i.runtime.versions.bun = '1.4.1'; }, 'runtime-mismatch'],
+    [(i) => { i.selfConfig.sourceIdentityFingerprint = h('foreign'); }, 'config-source-drift'],
+    [(i) => { i.selfConfig.runtimeConfig = null; }, 'runtime-config-drift'],
+    [(i) => { i.epoch.processEpochFingerprint = ''; }, 'epoch-invalid'],
+    [(i) => { i.selfConfig.bytes = Buffer.from('A=changed\n'); }, 'effective-config-drift'],
+    [(i) => { i.selfConfig.bytes = Buffer.from('GJC_CODING_AGENT_DIR=C:\\Other\\profile\n'); }, 'config-reserved-key'],
+  ]) {
+    const input = fixture('daemon', { managementOnly: true });
+    mutate(input);
+    assert.throws(() => evaluateServiceBootstrap(input), refusal(reason), reason);
+  }
+});
 
 test('guard service-key policy agrees with the Windows service naming validator', () => {
   for (const key of [DAEMON_KEY, 'a-' + h('x'), 'Default-' + h('x'), 'default-' + h('x').slice(1), '-x-' + h('x')]) {

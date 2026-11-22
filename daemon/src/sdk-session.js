@@ -508,34 +508,159 @@ export function resolveSdkSessionDirectory(workDir, sessionRoot) {
   return join(sessionRoot, workDirHash);
 }
 
-export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { sessionRoot } = {}) {
-  const sessionDir = resolveSdkSessionDirectory(workDir, sessionRoot);
-  const { createAgentSession, SessionManager } = await loadSdk();
-  const sessionManager = SessionManager.create(workDir, sessionDir);
-  // SDK 0.20.0 creates an isolated Settings.loadForScope({ cwd, agentDir })
-  // instance when `settings` is omitted and closes that owned scope from
-  // AgentSession.dispose(). Supplying a clone here would transfer ownership to
-  // the daemon and bypass that lifecycle.
-  const { session } = await createAgentSession({
-    cwd: workDir,
-    sessionManager,
-  });
+function validateProfileBinding(profileBinding) {
+  if (profileBinding === undefined) return;
+  if (
+    !isPlainRecord(profileBinding) ||
+    !Object.isFrozen(profileBinding) ||
+    typeof profileBinding.agentDir !== "string" ||
+    !isAbsolute(profileBinding.agentDir) ||
+    typeof profileBinding.assertCurrent !== "function" ||
+    typeof profileBinding.subscribeWithdrawal !== "function"
+  ) {
+    throw new TypeError("profileBinding must be a frozen profile binding with an absolute agentDir");
+  }
+}
+
+function profileWithdrawnError() {
+  const error = new Error("SDK profile sharing was withdrawn");
+  error.code = "SDK_PROFILE_WITHDRAWN";
+  return error;
+}
+
+function profileLiveUnsupportedError() {
+  const error = new Error("Live SDK input is unsupported for a guarded profile");
+  error.code = "SDK_PROFILE_LIVE_UNSUPPORTED";
+  return error;
+}
+
+function assertProfileCurrent(profileBinding) {
+  if (profileBinding === undefined) return;
   try {
-    await applyConfiguredModelProfile(session);
+    profileBinding.assertCurrent();
+  } catch (error) {
+    if (error?.code === "ERR_SDK_PROFILE_TARGET_REFUSED") throw error;
+    throw profileWithdrawnError();
+  }
+}
+
+function validateSdkDisposedHook(onSdkDisposed) {
+  if (onSdkDisposed !== undefined && typeof onSdkDisposed !== "function") {
+    throw new TypeError("onSdkDisposed must be a function");
+  }
+}
+
+function withSdkDisposalState(error, sdkDisposalState) {
+  try {
+    Object.defineProperty(error, "sdkDisposalState", {
+      value: sdkDisposalState,
+      configurable: true,
+      enumerable: true,
+    });
+    return error;
+  } catch {
+    // A primitive or frozen rejection cannot carry lifetime evidence. Preserve
+    // it as the cause, including its error code when readable.
+    const failure = new Error("GJC SDK session operation failed", { cause: error });
+    try {
+      if (typeof error?.code === "string") failure.code = error.code;
+    } catch {
+      // The original rejection remains available as cause.
+    }
+    failure.sdkDisposalState = sdkDisposalState;
+    return failure;
+  }
+}
+
+async function disposeSdkSession(session, onSdkDisposed, profileBinding) {
+  try {
+    try {
+      await session.dispose();
+    } catch (error) {
+      if (
+        profileBinding === undefined ||
+        error?.name !== "SessionDisposalIncompleteError" ||
+        typeof session.awaitDisposeCompletion !== "function"
+      ) {
+        throw error;
+      }
+    }
+    if (profileBinding !== undefined) {
+      // SDK 0.20.0 bounds dispose() for its caller, not for the retained
+      // teardown owner. Pins must outlive that deadline and every owned store.
+      await session.awaitDisposeCompletion();
+    }
+  } catch (error) {
+    throw withSdkDisposalState(error, "unconfirmed");
+  }
+  try {
+    await onSdkDisposed?.();
+  } catch (error) {
+    throw withSdkDisposalState(error, "disposed");
+  }
+}
+
+// Creation failures expose sdkDisposalState: not_created lets the caller release
+// its pins; disposed means onSdkDisposed was invoked after confirmed teardown;
+// unconfirmed requires retaining pins, including a rejecting SDK factory whose
+// internals never returned a session. No rejection alone proves SDK disposal.
+export async function createSdkSession(
+  workDir,
+  loadSdk = loadCanonicalSdk,
+  { sessionRoot, profileBinding, onSdkDisposed } = {}
+) {
+  let session;
+  let sdkDisposalState = "not_created";
+  try {
+    const sessionDir = resolveSdkSessionDirectory(workDir, sessionRoot);
+    validateProfileBinding(profileBinding);
+    validateSdkDisposedHook(onSdkDisposed);
+    assertProfileCurrent(profileBinding);
+    const { createAgentSession, SessionManager } = await loadSdk();
+    assertProfileCurrent(profileBinding);
+    const sessionManager = SessionManager.create(workDir, sessionDir);
+    // SDK 0.20.0 creates an isolated Settings.loadForScope({ cwd, agentDir })
+    // instance when `settings` is omitted and closes that owned scope from
+    // AgentSession.dispose(). Supplying a clone here would transfer ownership to
+    // the daemon and bypass that lifecycle.
+    assertProfileCurrent(profileBinding);
+    sdkDisposalState = "unconfirmed";
+    ({ session } = await createAgentSession({
+      cwd: workDir,
+      sessionManager,
+      ...(profileBinding === undefined
+        ? {}
+        : {
+            agentDir: profileBinding.agentDir,
+            profileAuthority: "custom",
+            // A verified target lease may pin local-only auth discovery. Keep
+            // its snapshot intact rather than re-resolving ambient broker config.
+            ...(Object.hasOwn(profileBinding, "startupAuthConfig")
+              ? { startupAuthConfig: profileBinding.startupAuthConfig }
+              : {}),
+          }),
+    }));
+    assertProfileCurrent(profileBinding);
+    await applyConfiguredModelProfile(session, { profileBinding });
+    assertProfileCurrent(profileBinding);
+    return new SdkSession(session, { profileBinding, onSdkDisposed });
   } catch (error) {
     // The raw AgentSession is not yet owned by an SdkSession/SessionPool, so
     // dispose it here to avoid leaking the underlying runtime on a failed
-    // activation before propagating the failure.
-    await Promise.resolve()
-      .then(() => session.dispose())
-      .catch(() => {
+    // activation or a withdrawn binding before publication.
+    if (session !== undefined) {
+      try {
+        await disposeSdkSession(session, onSdkDisposed, profileBinding);
+        sdkDisposalState = "disposed";
+      } catch (disposalError) {
+        sdkDisposalState = disposalError.sdkDisposalState;
         console.error(
-          "gjc-remote daemon: failed to dispose session after activation failure."
+          "gjc-remote daemon: failed to finish unpublished session disposal."
         );
-      });
-    throw error;
+      }
+    }
+    throw withSdkDisposalState(error, sdkDisposalState);
   }
-  return new SdkSession(session);
 }
 
 /**
@@ -558,7 +683,8 @@ export async function createSdkSession(workDir, loadSdk = loadCanonicalSdk, { se
  *
  * `GJC_MODEL_PROFILE` overrides the configured profile name when set.
  */
-export async function applyConfiguredModelProfile(session) {
+export async function applyConfiguredModelProfile(session, { profileBinding } = {}) {
+  assertProfileCurrent(profileBinding);
   const settings = session.settings;
   const configured = settings.get("modelProfile.default");
   const envOverride = (process.env.GJC_MODEL_PROFILE ?? "").trim();
@@ -584,6 +710,7 @@ export async function applyConfiguredModelProfile(session) {
     return;
   }
 
+  assertProfileCurrent(profileBinding);
   try {
     await session.activateModelProfileForControl(profileName);
   } catch (error) {
@@ -601,7 +728,16 @@ export async function applyConfiguredModelProfile(session) {
  * provided by the RPC transport.
  */
 export class SdkSession {
+  #profileBinding;
+  #profileWithdrawalError;
+  #profileUnsubscribe;
+  #onSdkDisposed;
+
   constructor(session, options = {}) {
+    validateProfileBinding(options.profileBinding);
+    validateSdkDisposedHook(options.onSdkDisposed);
+    this.#profileBinding = options.profileBinding;
+    this.#onSdkDisposed = options.onSdkDisposed;
     this.session = session;
     this.closed = false;
     this.queue = Promise.resolve();
@@ -673,6 +809,52 @@ export class SdkSession {
     this.gateSubscribed = false;
     this.gateEmitter = undefined;
     this.gateUnsubscribe = undefined;
+    if (this.#profileBinding !== undefined) {
+      try {
+        this.#assertProfileCurrent();
+        this.#profileUnsubscribe = this.#profileBinding.subscribeWithdrawal(
+          () => this.#withdrawProfile()
+        );
+        if (typeof this.#profileUnsubscribe !== "function") {
+          throw new TypeError("profileBinding subscription must return an unsubscribe function");
+        }
+        this.#assertProfileCurrent();
+      } catch (error) {
+        this.#unsubscribeProfile();
+        throw error;
+      }
+    }
+  }
+
+  #assertProfileCurrent() {
+    if (this.#profileWithdrawalError) throw this.#profileWithdrawalError;
+    try {
+      assertProfileCurrent(this.#profileBinding);
+    } catch (error) {
+      this.#withdrawProfile(error);
+    }
+    if (this.#profileWithdrawalError) throw this.#profileWithdrawalError;
+  }
+
+  #withdrawProfile(error) {
+    this.#profileWithdrawalError ??= error ?? profileWithdrawnError();
+    // Withdrawal forbids new work, not the continuation of an already-started
+    // SDK operation. Do not close the router, quarantine gates, or cancel runs.
+    for (const ticket of [...this.ownedQueueTickets]) {
+      if (ticket.phase === "queued") {
+        this.#rejectOwnedQueueTicket(ticket, this.#profileWithdrawalError);
+      }
+    }
+  }
+
+  #unsubscribeProfile() {
+    const unsubscribe = this.#profileUnsubscribe;
+    this.#profileUnsubscribe = undefined;
+    try {
+      unsubscribe?.();
+    } catch {
+      // The latched withdrawal/closed state still fences this adapter.
+    }
   }
 
   isBusy() {
@@ -713,6 +895,12 @@ export class SdkSession {
       );
       return ticket.publicTicket;
     }
+    try {
+      this.#assertProfileCurrent();
+    } catch (error) {
+      this.#rejectOwnedQueueTicket(ticket, error);
+      return ticket.publicTicket;
+    }
     const isLiveControl =
       command?.type === "steer" || command?.type === "follow_up";
     if (isLiveControl) {
@@ -726,7 +914,14 @@ export class SdkSession {
           );
           return;
         }
+        this.#assertProfileCurrent();
         if (this.activePromptRuns > 0 || this.trackedWork.size > 0) {
+          if (this.#profileBinding !== undefined) {
+            // The public tracked API has no profile fence at SDK dequeue.
+            // Refuse before submission rather than claim a cancel race is safe.
+            this.#rejectOwnedQueueTicket(ticket, profileLiveUnsupportedError());
+            return;
+          }
           this.#submitTrackedControl(command, onEvent, timeoutMs, ticket, onActivate);
           return;
         }
@@ -807,6 +1002,7 @@ export class SdkSession {
           if (this.closed) throw new Error("GJC SDK session is not running");
           if (ticket.phase !== "queued") return;
         }
+        this.#assertProfileCurrent();
         ticket.phase = "active";
         onActivate?.();
         return this.#dispatch(command, onEvent, timeoutMs, ticket.ownerId);
@@ -823,6 +1019,7 @@ export class SdkSession {
   }
 
   async #dispatch(command, onEvent, timeoutMs, ownerId) {
+    this.#assertProfileCurrent();
     if (!command || typeof command !== "object") {
       throw new Error("Invalid SDK session command");
     }
@@ -830,6 +1027,7 @@ export class SdkSession {
     switch (command.type) {
       case "get_available_models":
       case "list_models": {
+        this.#assertProfileCurrent();
         const models = this.session.getAvailableModels().map(({ id, name, provider }) => ({
           id,
           name,
@@ -845,6 +1043,7 @@ export class SdkSession {
         return;
       }
       case "set_model": {
+        this.#assertProfileCurrent();
         const model = this.session
           .getAvailableModels()
           .find(
@@ -854,7 +1053,10 @@ export class SdkSession {
         if (!model) {
           throw new Error(`Model is not available: ${command.provider}/${command.modelId}`);
         }
-        await this.#withTimeout(() => this.session.setModel(model), timeoutMs);
+        await this.#withTimeout(() => {
+          this.#assertProfileCurrent();
+          return this.session.setModel(model);
+        }, timeoutMs);
         onEvent({
           type: "response",
           command: command.type,
@@ -867,6 +1069,7 @@ export class SdkSession {
         return this.#runPromptCommand(command, onEvent, timeoutMs, ownerId);
       case "steer":
       case "follow_up":
+        if (this.#profileBinding !== undefined) throw profileLiveUnsupportedError();
         return this.#runPromptCommand(
           { type: "prompt", message: command.message },
           onEvent,
@@ -900,9 +1103,11 @@ export class SdkSession {
       this.#ensureGateSubscription();
       await this.#withStreamingTimeout(
         async () => {
+          const message = command.message;
+          this.#assertProfileCurrent();
           let promptSubmission;
           try {
-            promptSubmission = this.session.prompt(command.message);
+            promptSubmission = this.session.prompt(message);
           } catch (error) {
             promptSubmission = Promise.reject(error);
           }
@@ -1483,6 +1688,7 @@ export class SdkSession {
       }
       return { ok: false, error: "workflow gate is no longer answerable" };
     }
+    this.#assertProfileCurrent();
     const encoded = encodeGateAnswer(entry.gate, answer);
     if (!encoded.ok) return encoded;
     entry.resolving = true;
@@ -1495,17 +1701,23 @@ export class SdkSession {
       idempotency_key: `gjc-remote:${gateId}`,
     };
     entry.response = response;
+    let submitted = false;
     try {
       // This adapter does not publish through the SDK presentation arbiter, so
       // the direct-control proof is `not_published`, matching the SDK 0.19.0
       // workflow.gate_answer path. Without this proof resolveGate accepts the
       // answer durably and then rejects because no terminal controller exists.
+      this.#assertProfileCurrent();
       if (entry.emitter.prepareTerminalization?.(gateId, "not_published") !== true) {
         entry.response = undefined;
         return { ok: false, error: "workflow gate is no longer answerable" };
       }
       const resolution = await this.#awaitGateOperation(
-        () => entry.emitter.resolveGate(response)
+        () => {
+          this.#assertProfileCurrent();
+          submitted = true;
+          return entry.emitter.resolveGate(response);
+        }
       );
       if (resolution?.status === "rejected") {
         entry.response = undefined;
@@ -1545,6 +1757,11 @@ export class SdkSession {
       this.#flushDeferredGateCandidate(entry);
       return { ok: true, resolution: completed.resolution };
     } catch (error) {
+      if (!submitted && error?.code === "SDK_PROFILE_WITHDRAWN") {
+        entry.emitter.clearPreparedTerminalization?.(gateId);
+        entry.response = undefined;
+        throw error;
+      }
       if (this.closed) {
         return { ok: false, error: "session is closed" };
       }
@@ -1652,6 +1869,7 @@ export class SdkSession {
   #closeAdapter(error) {
     this.closed = true;
     this.closeError ??= error;
+    this.#unsubscribeProfile();
     for (const gate of this.inputRouter.pendingGateValues()) {
       this.#quarantineGate(this.gateEmitter, gate?.gate_id);
     }
@@ -1772,7 +1990,9 @@ export class SdkSession {
 
   #disposeUnderlying() {
     if (!this.disposePromise) {
-      this.disposePromise = Promise.resolve().then(() => this.session.dispose());
+      this.disposePromise = Promise.resolve().then(() =>
+        disposeSdkSession(this.session, this.#onSdkDisposed, this.#profileBinding)
+      );
     }
     return this.disposePromise;
   }

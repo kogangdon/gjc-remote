@@ -216,7 +216,8 @@ function launchFields(value, component, serviceKey, requirePolicy) {
       (component === 'daemon' && (!validCanonicalWindowsPath(fields.runtimeConfigRoot) ||
         !validHash(fields.runtimeConfigRootIdentityFingerprint) ||
         !validCanonicalWindowsPath(fields.runtimeConfigPath) || fields.runtimeConfigSha256 !== EMPTY_FILE_SHA256 ||
-        !validHash(fields.runtimeConfigIdentityFingerprint) || !validCanonicalWindowsPath(fields.sdkProfilePath) ||
+        !validHash(fields.runtimeConfigIdentityFingerprint) ||
+        (fields.sdkProfilePath !== null && !validCanonicalWindowsPath(fields.sdkProfilePath)) ||
         fields.channelsConfig !== null ||
         fields.runtimeConfigRoot !== `${fields.workingDirectory}\\runtime-config` ||
         fields.runtimeConfigPath !== `${fields.runtimeConfigRoot}\\.bunfig.toml`)) ||
@@ -248,7 +249,7 @@ function serviceEnvironment(launch, component, serviceKey, launchFingerprint, po
     environment.push(
       ['BUN_OPTIONS', ''], ['BUN_INSPECT_PRELOAD', launch.bootstrapPath],
       ['XDG_CONFIG_HOME', launch.runtimeConfigRoot], ['BUN_INSPECT', ''],
-      ['BUN_INSPECT_CONNECT_TO', ''], ['GJC_CODING_AGENT_DIR', launch.sdkProfilePath],
+      ['BUN_INSPECT_CONNECT_TO', ''], ['GJC_CODING_AGENT_DIR', launch.sdkProfilePath ?? ''],
     );
   } else {
     environment.push(['CHANNELS_CONFIG', launch.channelsConfig]);

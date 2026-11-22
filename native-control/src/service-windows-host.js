@@ -200,7 +200,7 @@ function captureAuthority(dependencies, native, { component, serviceKey, roles, 
     refuse('SERVICE_PENDING', operation, 'scope-catalog');
   }
   if (!exact(scope, ['scopeFingerprint', 'sdkProfileRoot']) || !validHash(scope.scopeFingerprint) ||
-      (component === 'daemon' ? !canonicalWindowsPath(scope.sdkProfileRoot) : scope.sdkProfileRoot !== null)) {
+      (scope.sdkProfileRoot !== null && (component !== 'daemon' || !canonicalWindowsPath(scope.sdkProfileRoot)))) {
     refuse('SERVICE_PENDING', operation, 'scope-catalog');
   }
   let runtimeFacts;

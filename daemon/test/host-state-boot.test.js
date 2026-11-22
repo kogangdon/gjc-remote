@@ -2,14 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
 const local = (path) => fileURLToPath(new URL(path, import.meta.url));
-test('daemon registration requires the shared lock and a usable decision DB', { timeout: 25000 }, async (t) => {
+test('registration requires the shared lock but does not create or open a decision DB', { timeout: 25000 }, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'gjc-host-boot-'));
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   const processes = [];
@@ -45,16 +45,16 @@ test('daemon registration requires the shared lock and a usable decision DB', { 
   }
   const first = start('owner-a');
   assert.equal(await registered(first), 'owner-a');
+  const legacyDb = join(dir, 'gjc-lifecycle.sqlite3');
+  assert.equal(existsSync(legacyDb), false);
   const other = start('owner-b');
   assert.equal((await other.exited)[0], 1, other.diagnostic());
   assert.match(other.diagnostic(), /host state unavailable/);
   first.child.kill('SIGKILL'); await first.exited;
+  writeFileSync(legacyDb, 'corrupt-fixture');
   const successor = start('owner-c');
   assert.equal(await registered(successor), 'owner-c');
   successor.child.kill('SIGKILL'); await successor.exited;
-  writeFileSync(join(dir, 'gjc-lifecycle.sqlite3'), 'corrupt-fixture');
-  const broken = start('owner-d');
-  assert.equal((await broken.exited)[0], 1);
-  assert.match(broken.diagnostic(), /host state unavailable/);
+  assert.equal(readFileSync(legacyDb, 'utf8'), 'corrupt-fixture');
   assert.deepEqual(registrations, ['owner-a', 'owner-c']);
 });
