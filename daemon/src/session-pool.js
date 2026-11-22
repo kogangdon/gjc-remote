@@ -19,6 +19,27 @@ function leaseConflict() {
   return error;
 }
 
+// Only detach the caller. The pool continues owning the creation and its
+// transition fence until the result is published or safely retired.
+async function awaitProfileAdmission(operation, binding) {
+  if (!binding) return operation;
+  let unsubscribe;
+  try {
+    const withdrawn = new Promise((_, reject) => {
+      unsubscribe = binding.subscribeWithdrawal(() => {
+        const error = new Error("SDK profile withdrawn before session admission");
+        error.code = "SDK_PROFILE_WITHDRAWN";
+        reject(error);
+      });
+    });
+    const session = await Promise.race([operation, withdrawn]);
+    binding.assertCurrent();
+    return session;
+  } finally {
+    unsubscribe?.();
+  }
+}
+
 function normalizeReceiptIdentity(receiptIdentity) {
   if (
     !receiptIdentity ||
@@ -402,16 +423,30 @@ export class SessionPool {
     throw error;
   }
 
-  async #createSessionBounded(workDir, managedIdentity) {
+  #fenceUnconfirmedCreation(workDir, managedIdentity, reason) {
+    const failure = Promise.resolve({ status: "rejected", reason });
+    this.retirements.set(workDir, {
+      state: "failed", managedIdentity, holds: new Set(), releasedHolds: new Set(),
+      bounded: failure, settlement: failure,
+    });
+  }
+
+  async #createSessionBounded(workDir, managedIdentity, profileBinding) {
     const hold = Symbol("session creation");
     this.creationHolds.set(workDir, hold);
-    const pending = Promise.resolve().then(() => this.sessionFactory(workDir));
+    const pending = Promise.resolve().then(() => {
+      profileBinding?.assertCurrent();
+      return this.sessionFactory(workDir, profileBinding);
+    });
     const result = await this.#settleBounded(pending, this.sessionCreateTimeoutMs);
     if (result.status === "fulfilled") {
       if (this.creationHolds.get(workDir) === hold) this.creationHolds.delete(workDir);
       return result.value;
     }
     if (result.status === "rejected") {
+      if (profileBinding && result.reason?.sdkDisposalState === "unconfirmed") {
+        this.#fenceUnconfirmedCreation(workDir, managedIdentity, result.reason);
+      }
       if (this.creationHolds.get(workDir) === hold) this.creationHolds.delete(workDir);
       throw result.reason;
     }
@@ -446,7 +481,12 @@ export class SessionPool {
           }
         }
       },
-      () => {}
+      (reason) => {
+        if (profileBinding && reason?.sdkDisposalState === "unconfirmed") {
+          this.#fenceUnconfirmedCreation(workDir, managedIdentity, reason);
+          throw reason;
+        }
+      }
     );
     void error.pendingCleanup.then(
       () => {
@@ -459,9 +499,14 @@ export class SessionPool {
     throw error;
   }
 
-  async #ensureCanonicalSession(canonicalWorkDir, managedIdentity) {
+  async #ensureCanonicalSession(canonicalWorkDir, managedIdentity, profileBinding) {
     let existing = this.sessions.get(canonicalWorkDir);
-    const identityMatches = existing?.managedIdentity === managedIdentity;
+    const identityMatches = existing?.managedIdentity === managedIdentity &&
+      existing?.profileBinding === profileBinding;
+    if (existing && existing.profileBinding !== profileBinding &&
+        existing.session && !existing.session.closed && existing.session.isBusy?.() !== false) {
+      throw leaseConflict();
+    }
     if (identityMatches && existing?.session && !existing.session.closed) {
       existing.lastUsed = this.nowFn();
       return existing.session;
@@ -492,6 +537,7 @@ export class SessionPool {
       session: undefined,
       creation: undefined,
       managedIdentity,
+      profileBinding,
     };
     const creationStartedAt = this.monotonicNowFn();
     this.#emit({
@@ -521,8 +567,15 @@ export class SessionPool {
 
       const session = await this.#createSessionBounded(
         canonicalWorkDir,
-        managedIdentity
+        managedIdentity,
+        profileBinding
       );
+      try {
+        profileBinding?.assertCurrent();
+      } catch (error) {
+        await this.#retireIgnoringFailure(session, canonicalWorkDir, "withdrawn", managedIdentity);
+        throw error;
+      }
       if (this.closed) {
         await this.#retireIgnoringFailure(
           session,
@@ -567,8 +620,9 @@ export class SessionPool {
     }
   }
 
-  async ensureSession(workDir, { managedIdentity, receiptIdentity } = {}) {
+  async ensureSession(workDir, { managedIdentity, receiptIdentity, profileBinding } = {}) {
     if (this.closed) throw new Error("SessionPool is shut down");
+    profileBinding?.assertCurrent();
     if (managedIdentity !== undefined && receiptIdentity !== undefined) {
       throw new TypeError("managedIdentity and receiptIdentity are mutually exclusive");
     }
@@ -625,18 +679,20 @@ export class SessionPool {
       if (active.cleanupPending) {
         throw leaseConflict();
       }
-      if (active.managedIdentity === effectiveManagedIdentity) {
-        return await active.operation;
+      if (active.managedIdentity === effectiveManagedIdentity && active.profileBinding === profileBinding) {
+        return awaitProfileAdmission(active.operation, profileBinding);
       }
       throw leaseConflict();
     }
 
     const rawOperation = this.#ensureCanonicalSession(
       canonicalWorkDir,
-      effectiveManagedIdentity
+      effectiveManagedIdentity,
+      profileBinding
     );
     const transition = {
       managedIdentity: effectiveManagedIdentity,
+      profileBinding,
       operation: undefined,
       cleanupPending: false,
     };
@@ -662,7 +718,7 @@ export class SessionPool {
     );
     transition.operation = operation;
     this.sessionTransitions.set(canonicalWorkDir, transition);
-    return await operation;
+    return awaitProfileAdmission(operation, profileBinding);
   }
 
   async retireSession(session, { holds } = {}) {

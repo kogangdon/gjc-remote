@@ -372,6 +372,10 @@ class FakeAgentSession {
   async dispose() {
     this.disposeCalls += 1;
   }
+
+  async awaitDisposeCompletion() {
+    assert.ok(this.disposeCalls > 0, "retained teardown may only be joined after disposal starts");
+  }
 }
 
 // #35: a fake public WorkflowGateEmitter. emitGate() fires the registered
@@ -552,6 +556,34 @@ async function waitForImmediate(predicate, maxTurns = 1_000) {
   throw new Error("condition was not met within the immediate-turn bound");
 }
 
+// No profile files or credentials are opened: this is only an in-memory grant
+// fence and a synthetic absolute path passed to the injected fake SDK.
+function profileBindingHarness({ onSubscribe } = {}) {
+  let current = true;
+  const listeners = new Set();
+  const binding = Object.freeze({
+    agentDir: resolve("test-only-sdk-profile"),
+    assertCurrent() {
+      if (!current) throw new Error("fake profile grant is stale");
+    },
+    subscribeWithdrawal(listener) {
+      listeners.add(listener);
+      onSubscribe?.();
+      return () => listeners.delete(listener);
+    },
+  });
+  return {
+    binding,
+    listeners,
+    invalidate() { current = false; },
+    withdraw() {
+      current = false;
+      for (const listener of [...listeners]) listener();
+    },
+    restoreForTest() { current = true; },
+  };
+}
+
 test("createSdkSession uses the canonical workDir and dedicated session directory", async () => {
   const calls = [];
   const agent = new FakeAgentSession();
@@ -581,6 +613,9 @@ test("createSdkSession uses the canonical workDir and dedicated session director
   assert.equal(calls[1][0], "session");
   assert.equal(calls[1][1].cwd, "/workspace");
   assert.strictEqual(calls[1][1].sessionManager, manager);
+  assert.equal(Object.hasOwn(calls[1][1], "agentDir"), false);
+  assert.equal(Object.hasOwn(calls[1][1], "profileAuthority"), false);
+  assert.equal(Object.hasOwn(calls[1][1], "startupAuthConfig"), false);
   assert.equal(
     Object.hasOwn(calls[1][1], "settings"),
     false,
@@ -658,6 +693,271 @@ test("createSdkSession rejects invalid container session roots without loading t
     /sessionRoot must be an absolute path/
   );
   assert.equal(loadCalls, 0);
+});
+
+test("createSdkSession binds the exact selected profile with custom authority", async () => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  const manager = {};
+  let sdkOptions;
+  const session = await createSdkSession("/workspace", async () => ({
+    SessionManager: { create: () => manager },
+    async createAgentSession(options) {
+      sdkOptions = options;
+      return { session: agent };
+    },
+  }), { profileBinding: fence.binding });
+
+  assert.deepEqual(sdkOptions, {
+    cwd: "/workspace",
+    sessionManager: manager,
+    agentDir: fence.binding.agentDir,
+    profileAuthority: "custom",
+  });
+  assert.equal(fence.listeners.size, 1);
+  await session.send({ type: "list_models" }, () => {});
+  await session.dispose();
+  assert.equal(fence.listeners.size, 0);
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("createSdkSession forwards an explicit guarded startup auth snapshot by identity only", async (t) => {
+  const fence = profileBindingHarness();
+  const startupAuthConfig = Object.freeze({
+    broker: null,
+    credentialStoreIdentity: `local:${join(fence.binding.agentDir, "agent.db")}`,
+    credentialRankingMode: "balanced",
+    credentialPins: Object.freeze({}),
+    credentialPreferences: Object.freeze({}),
+  });
+  for (const mode of ["guarded-snapshot", "guarded-default", "ordinary"]) await t.test(mode, async () => {
+    const agent = new FakeAgentSession();
+    let sdkOptions;
+    const options = mode === "ordinary"
+      ? { startupAuthConfig }
+      : {
+          profileBinding: mode === "guarded-snapshot"
+            ? Object.freeze({ ...fence.binding, startupAuthConfig })
+            : fence.binding,
+        };
+    const session = await createSdkSession("/workspace", async () => ({
+      SessionManager: { create: () => ({}) },
+      async createAgentSession(value) {
+        sdkOptions = value;
+        return { session: agent };
+      },
+    }), options);
+    try {
+      if (mode === "guarded-snapshot") {
+        assert.strictEqual(sdkOptions.startupAuthConfig, startupAuthConfig);
+        assert.equal(sdkOptions.startupAuthConfig.broker, null);
+      } else {
+        assert.equal(Object.hasOwn(sdkOptions, "startupAuthConfig"), false);
+      }
+      assert.equal(Object.hasOwn(sdkOptions, "authStorage"), false);
+      assert.equal(Object.hasOwn(sdkOptions, "modelRegistry"), false);
+    } finally {
+      await session.dispose();
+    }
+  });
+});
+
+test("invalid profile bindings fail before loading the SDK or constructing an adapter", async () => {
+  const valid = profileBindingHarness().binding;
+  for (const profileBinding of [
+    null,
+    { ...valid },
+    Object.freeze({ ...valid, agentDir: "relative-profile" }),
+    Object.freeze({ ...valid, agentDir: "" }),
+    Object.freeze({ ...valid, assertCurrent: undefined }),
+    Object.freeze({ ...valid, subscribeWithdrawal: undefined }),
+  ]) {
+    let loads = 0;
+    await assert.rejects(createSdkSession("/workspace", async () => {
+      loads += 1;
+    }, { profileBinding }), /profileBinding must be a frozen profile binding/);
+    assert.equal(loads, 0);
+    assert.throws(
+      () => new SdkSession(new FakeAgentSession(), { profileBinding }),
+      /profileBinding must be a frozen profile binding/
+    );
+  }
+});
+
+test("profile fences precede SDK loading, manager creation, session creation, and activation", async (t) => {
+  for (const [withdrawAt, expectedSteps] of [
+    ["initial", []],
+    ["load", ["load"]],
+    ["manager", ["load", "manager"]],
+    ["session", ["load", "manager", "session"]],
+  ]) await t.test(withdrawAt, async () => {
+    const fence = profileBindingHarness();
+    const agent = new FakeAgentSession();
+    const steps = [];
+    const step = (name) => {
+      steps.push(name);
+      if (withdrawAt === name) fence.invalidate();
+    };
+    if (withdrawAt === "initial") fence.invalidate();
+    await assert.rejects(createSdkSession("/workspace", async () => {
+      step("load");
+      return {
+        SessionManager: { create() { step("manager"); return {}; } },
+        async createAgentSession() {
+          step("session");
+          return { session: agent };
+        },
+      };
+    }, { profileBinding: fence.binding }), { code: "SDK_PROFILE_WITHDRAWN" });
+    assert.deepEqual(steps, expectedSteps);
+    assert.deepEqual(agent.profileCalls, []);
+    assert.equal(agent.disposeCalls, withdrawAt === "session" ? 1 : 0);
+    assert.equal(fence.listeners.size, 0);
+  });
+});
+
+test("withdrawal during asynchronous SDK creation or activation disposes the unpublished session", async (t) => {
+  for (const phase of ["creation", "activation"]) await t.test(phase, async () => {
+    const fence = profileBindingHarness();
+    const agent = new FakeAgentSession();
+    const paused = trackedDeferred();
+    const entered = trackedDeferred();
+    const disposing = trackedDeferred();
+    const disposalEntered = trackedDeferred();
+    const lifetime = [];
+    agent.dispose = async () => {
+      agent.disposeCalls += 1;
+      lifetime.push("sdk-dispose-start");
+      disposalEntered.resolve();
+      await disposing.promise;
+      lifetime.push("sdk-disposed");
+    };
+    if (phase === "activation") {
+      agent.activateModelProfileForControl = async (profileName) => {
+        agent.profileCalls.push(profileName);
+        entered.resolve();
+        await paused.promise;
+        return true;
+      };
+    }
+    const creating = createSdkSession("/workspace", async () => ({
+      SessionManager: { create: () => ({}) },
+      async createAgentSession() {
+        if (phase === "creation") {
+          entered.resolve();
+          await paused.promise;
+        }
+        return { session: agent };
+      },
+    }), {
+      profileBinding: fence.binding,
+      onSdkDisposed: () => { lifetime.push("pins-released"); },
+    });
+    const rejected = assert.rejects(creating,
+      { code: "SDK_PROFILE_WITHDRAWN", sdkDisposalState: "disposed" });
+    await entered.promise;
+    fence.withdraw();
+    paused.resolve();
+    await disposalEntered.promise;
+    assert.deepEqual(lifetime, ["sdk-dispose-start"]);
+    disposing.resolve();
+    await rejected;
+    assert.deepEqual(lifetime, ["sdk-dispose-start", "sdk-disposed", "pins-released"]);
+    assert.equal(agent.disposeCalls, 1);
+    assert.equal(agent.profileCalls.length, phase === "activation" ? 1 : 0);
+    assert.equal(fence.listeners.size, 0);
+  });
+});
+
+test("profile activation is fenced after reading scoped settings", async () => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  agent.settings.get = () => {
+    fence.invalidate();
+    return "copilot-claude";
+  };
+  await assert.rejects(createSdkSession("/workspace", async () => ({
+    SessionManager: { create: () => ({}) },
+    createAgentSession: async () => ({ session: agent }),
+  }), { profileBinding: fence.binding }), { code: "SDK_PROFILE_WITHDRAWN" });
+  assert.deepEqual(agent.profileCalls, []);
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("withdrawal during adapter subscription cannot publish or leak a stale session", async () => {
+  const fence = profileBindingHarness({ onSubscribe: () => fence.withdraw() });
+  const agent = new FakeAgentSession();
+  await assert.rejects(createSdkSession("/workspace", async () => ({
+    SessionManager: { create: () => ({}) },
+    createAgentSession: async () => ({ session: agent }),
+  }), { profileBinding: fence.binding }), { code: "SDK_PROFILE_WITHDRAWN" });
+  assert.equal(agent.disposeCalls, 1);
+  assert.equal(fence.listeners.size, 0);
+});
+
+test("SDK creation failures report pin ownership without treating a factory rejection as disposal", async (t) => {
+  for (const phase of ["load", "manager", "factory-throw", "factory-reject"]) await t.test(phase, async () => {
+    const original = new Error(`fake ${phase} failure`);
+    original.code = "fake_sdk_failure";
+    let releases = 0;
+    await assert.rejects(createSdkSession("/workspace", async () => {
+      if (phase === "load") throw original;
+      return {
+        SessionManager: {
+          create() {
+            if (phase === "manager") throw original;
+            return {};
+          },
+        },
+        createAgentSession() {
+          if (phase === "factory-throw") throw original;
+          return Promise.reject(original);
+        },
+      };
+    }, { onSdkDisposed: () => { releases += 1; } }), (error) => {
+      assert.strictEqual(error, original);
+      assert.equal(error.code, "fake_sdk_failure");
+      assert.equal(error.sdkDisposalState,
+        phase.startsWith("factory") ? "unconfirmed" : "not_created");
+      return true;
+    });
+    assert.equal(releases, 0);
+  });
+});
+
+test("stale raw creation retains pins when underlying disposal is unconfirmed", async () => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  let releases = 0;
+  agent.dispose = async () => {
+    agent.disposeCalls += 1;
+    throw new Error("fake raw disposal failure");
+  };
+  await assert.rejects(createSdkSession("/workspace", async () => ({
+    SessionManager: { create: () => ({}) },
+    async createAgentSession() {
+      fence.invalidate();
+      return { session: agent };
+    },
+  }), {
+    profileBinding: fence.binding,
+    onSdkDisposed: () => { releases += 1; },
+  }), { code: "SDK_PROFILE_WITHDRAWN", sdkDisposalState: "unconfirmed" });
+  assert.equal(releases, 0);
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("profile refusal before SDK loading leaves pin release to the caller", async () => {
+  const fence = profileBindingHarness();
+  fence.invalidate();
+  let releases = 0;
+  await assert.rejects(createSdkSession("/workspace", async () => {
+    assert.fail("a withdrawn binding must not load the SDK");
+  }, {
+    profileBinding: fence.binding,
+    onSdkDisposed: () => { releases += 1; },
+  }), { code: "SDK_PROFILE_WITHDRAWN", sdkDisposalState: "not_created" });
+  assert.equal(releases, 0);
 });
 
 test("SDK adapter forwards prompt events and preserves model command receipts", async () => {
@@ -1217,6 +1517,260 @@ test("dispose rejects owned queued tickets without dispatching them", async () =
   assert.equal(queued.phase, "terminal");
   assert.equal(queued.revokeBeforeStart(), false);
   assert.deepEqual(agent.calls, [["prompt", "active"]]);
+});
+
+const guardedCommands = [
+  { type: "get_available_models" },
+  { type: "list_models" },
+  { type: "set_model", provider: "provider-a", modelId: "model-a" },
+  { type: "prompt", message: "guarded" },
+  { type: "steer", message: "guarded" },
+  { type: "follow_up", message: "guarded" },
+];
+
+test("guarded commands revalidate before work even without a withdrawal notification", async (t) => {
+  for (const command of guardedCommands) await t.test(command.type, async () => {
+    const fence = profileBindingHarness();
+    const agent = new FakeAgentSession();
+    agent.getAvailableModels = () => {
+      assert.fail("a stale profile must not be consulted for model lookup");
+    };
+    const session = new SdkSession(agent, { profileBinding: fence.binding });
+    fence.invalidate();
+    await assert.rejects(session.send(command, () => {
+      assert.fail("a stale command must not emit a receipt");
+    }), { code: "SDK_PROFILE_WITHDRAWN" });
+    assert.deepEqual(agent.calls, []);
+    assert.equal(session.closed, false);
+    assert.equal(session.isBusy(), false);
+    await session.dispose();
+  });
+});
+
+test("guarded queued commands revalidate after adapter-owned waits before activation", async (t) => {
+  for (const command of guardedCommands) await t.test(command.type, async () => {
+    const fence = profileBindingHarness();
+    const agent = new FakeAgentSession();
+    const session = new SdkSession(agent, { profileBinding: fence.binding });
+    const receipt = trackedDeferred();
+    // Stand in for an in-flight gate receipt without starting an SDK operation.
+    session.inFlightGateAnswers.add(receipt.promise);
+    let activations = 0;
+    const ticket = session.sendOwned("guarded-owner", command, () => {}, undefined, {
+      onActivate: () => { activations += 1; },
+    });
+    const rejected = assert.rejects(ticket.result, { code: "SDK_PROFILE_WITHDRAWN" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(ticket.phase, "queued");
+    fence.invalidate();
+    session.inFlightGateAnswers.delete(receipt.promise);
+    receipt.resolve();
+    await rejected;
+    assert.equal(activations, 0);
+    assert.deepEqual(agent.calls, []);
+    assert.equal(session.closed, false);
+    await session.dispose();
+  });
+});
+
+test("withdrawal settles unstarted tickets once without stopping the active prompt or permitting stale reuse", async (t) => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  const release = trackedDeferred();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    await release.promise;
+    agent.emit(terminalEvent({ text: message }));
+  };
+  const session = new SdkSession(agent, { profileBinding: fence.binding });
+  t.after(() => session.dispose());
+  const active = session.sendOwned("active-owner", { type: "prompt", message: "active" }, () => {});
+  let activeSettled = false;
+  const activeResult = active.result.finally(() => { activeSettled = true; });
+  await waitForImmediate(() => agent.calls.length === 1);
+  const tickets = guardedCommands.map((command, index) =>
+    session.sendOwned(`queued-${index}`, command, () => {
+      assert.fail("withdrawn queued work must not emit events");
+    })
+  );
+  const settlements = tickets.map(() => 0);
+  const failures = tickets.map((ticket, index) => ticket.result.then(
+    () => assert.fail("withdrawn queued work must fail"),
+    (error) => { settlements[index] += 1; return error; }
+  ));
+  fence.withdraw();
+  fence.withdraw();
+  const errors = await Promise.all(failures);
+  for (const [index, ticket] of tickets.entries()) {
+    assert.equal(errors[index].code, "SDK_PROFILE_WITHDRAWN");
+    assert.strictEqual(errors[index], errors[0]);
+    assert.equal(ticket.phase, "terminal");
+    assert.equal(ticket.revokeBeforeStart(), false);
+    assert.equal(settlements[index], 1);
+  }
+  assert.equal(active.phase, "active");
+  assert.equal(activeSettled, false);
+  assert.equal(session.closed, false);
+  assert.equal(agent.disposeCalls, 0);
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+
+  fence.restoreForTest();
+  await assert.rejects(session.send({ type: "prompt", message: "stale reuse" }, () => {}),
+    { code: "SDK_PROFILE_WITHDRAWN" });
+  release.resolve();
+  assert.deepEqual(await activeResult, { disposition: "completed" });
+  await session.queue;
+  assert.equal(session.isBusy(), false);
+  assert.deepEqual(settlements, tickets.map(() => 1));
+  assert.deepEqual(agent.calls, [["prompt", "active"]]);
+  await session.dispose();
+  assert.equal(fence.listeners.size, 0);
+});
+
+test("guarded SDK dispatch rechecks withdrawal caused by the activation callback", async (t) => {
+  for (const command of guardedCommands) await t.test(command.type, async () => {
+    const fence = profileBindingHarness();
+    const agent = new FakeAgentSession();
+    agent.getAvailableModels = () => assert.fail("withdrawal must precede SDK lookup");
+    const session = new SdkSession(agent, { profileBinding: fence.binding });
+    const ticket = session.sendOwned("guarded-owner", command, () => {}, undefined, {
+      onActivate: () => fence.withdraw(),
+    });
+    await assert.rejects(ticket.result, { code: "SDK_PROFILE_WITHDRAWN" });
+    assert.deepEqual(agent.calls, []);
+    assert.equal(session.closed, false);
+    await session.dispose();
+  });
+});
+
+test("model changes are fenced again after model lookup", async () => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  agent.getAvailableModels = () => {
+    fence.invalidate();
+    return agent.models;
+  };
+  const session = new SdkSession(agent, { profileBinding: fence.binding });
+  await assert.rejects(session.send(
+    { type: "set_model", provider: "provider-a", modelId: "model-a" }, () => {}
+  ), { code: "SDK_PROFILE_WITHDRAWN" });
+  assert.deepEqual(agent.calls, []);
+  assert.equal(session.closed, false);
+  await session.dispose();
+});
+
+test("prompt entry is fenced after SDK subscriptions replay", async () => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  const subscribe = agent.subscribe.bind(agent);
+  agent.subscribe = (listener) => {
+    const unsubscribe = subscribe(listener);
+    fence.invalidate();
+    return unsubscribe;
+  };
+  const session = new SdkSession(agent, { profileBinding: fence.binding });
+  await assert.rejects(session.send({ type: "prompt", message: "not submitted" }, () => {}),
+    { code: "SDK_PROFILE_WITHDRAWN" });
+  assert.deepEqual(agent.calls, []);
+  assert.equal(agent.listeners.size, 0);
+  assert.equal(agent.rawListeners.size, 0);
+  assert.equal(session.isBusy(), false);
+  assert.equal(session.closed, false);
+  await session.dispose();
+});
+
+test("actual SDK model and prompt entry is fenced after timeout setup", async (t) => {
+  for (const command of guardedCommands.filter((value) =>
+    value.type === "set_model" || value.type === "prompt"
+  )) await t.test(command.type, async () => {
+    const fence = profileBindingHarness();
+    const agent = new FakeAgentSession();
+    const timers = createManualTimeouts();
+    const session = new SdkSession(agent, {
+      profileBinding: fence.binding,
+      setTimeoutFn(callback, duration) {
+        fence.invalidate();
+        return timers.setTimeout(callback, duration);
+      },
+      clearTimeoutFn: timers.clearTimeout,
+    });
+    await assert.rejects(session.send(command, () => {}), { code: "SDK_PROFILE_WITHDRAWN" });
+    assert.deepEqual(agent.calls, []);
+    assert.equal(timers.size, 0);
+    assert.equal(session.closed, false);
+    await session.dispose();
+  });
+});
+
+test("withdrawal does not cancel an already-started model change", async (t) => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  const release = trackedDeferred();
+  agent.setModel = async (model) => {
+    agent.calls.push(["set_model", model]);
+    await release.promise;
+  };
+  const session = new SdkSession(agent, { profileBinding: fence.binding });
+  t.after(() => session.dispose());
+  const events = [];
+  const changing = session.send(
+    { type: "set_model", provider: "provider-a", modelId: "model-a" },
+    (event) => events.push(event)
+  );
+  await waitForImmediate(() => agent.calls.length === 1);
+  fence.withdraw();
+  assert.equal(session.closed, false);
+  assert.equal(agent.disposeCalls, 0);
+  release.resolve();
+  await changing;
+  assert.equal(events[0].success, true);
+  await session.dispose();
+});
+
+test("guarded live controls decline before tracked SDK submission without poisoning the active run", async (t) => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  const release = trackedDeferred();
+  agent.prompt = async (message) => {
+    agent.calls.push(["prompt", message]);
+    await release.promise;
+    agent.emit(terminalEvent());
+  };
+  agent.submitUserMessage = () => assert.fail("guarded live inputs must not reach the SDK");
+  const session = new SdkSession(agent, { profileBinding: fence.binding });
+  t.after(() => session.dispose());
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => agent.calls.length === 1);
+  for (const type of ["steer", "follow_up"]) {
+    let activated = false;
+    const ticket = session.sendOwned(type, { type, message: type }, () => {}, undefined, {
+      onActivate: () => { activated = true; },
+    });
+    await assert.rejects(ticket.result, { code: "SDK_PROFILE_LIVE_UNSUPPORTED" });
+    assert.equal(activated, false);
+    assert.equal(ticket.phase, "terminal");
+    assert.equal(ticket.revokeBeforeStart(), false);
+  }
+  assert.equal(session.closed, false);
+  assert.equal(agent.disposeCalls, 0);
+  assert.equal(session.trackedWork.size, 0);
+  assert.deepEqual(agent.calls, [["prompt", "root"]]);
+  release.resolve();
+  assert.deepEqual(await root, { disposition: "completed" });
+  await session.dispose();
+});
+
+test("guarded idle live input is refused without conversion to a root prompt", async () => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  agent.submitUserMessage = () => assert.fail("an idle command must not use live submission");
+  const session = new SdkSession(agent, { profileBinding: fence.binding });
+  for (const type of ["steer", "follow_up"]) {
+    await assert.rejects(session.send({ type, message: type }, () => {}),
+      { code: "SDK_PROFILE_LIVE_UNSUPPORTED" });
+  }
+  assert.deepEqual(agent.calls, []);
+  await session.dispose();
 });
 
 function trackedDeferred() {
@@ -2776,6 +3330,136 @@ test("adversarial: non-positive/NaN/undefined idle and hard-cap config fall back
 });
 
 
+test("onSdkDisposed releases pins once, only after actual disposal of a returned SDK session", async () => {
+  const fence = profileBindingHarness();
+  const agent = new FakeAgentSession();
+  const entered = trackedDeferred();
+  const released = trackedDeferred();
+  const lifetime = [];
+  agent.dispose = async () => {
+    agent.disposeCalls += 1;
+    lifetime.push("sdk-dispose-start");
+    entered.resolve();
+    await released.promise;
+    lifetime.push("sdk-disposed");
+  };
+  const session = await createSdkSession("/workspace", async () => ({
+    SessionManager: { create: () => ({}) },
+    createAgentSession: async () => ({ session: agent }),
+  }), {
+    profileBinding: fence.binding,
+    onSdkDisposed: async () => { lifetime.push("pins-released"); },
+  });
+  fence.withdraw();
+  assert.deepEqual(lifetime, []);
+  const first = session.dispose();
+  const second = session.dispose();
+  await entered.promise;
+  assert.deepEqual(lifetime, ["sdk-dispose-start"]);
+  released.resolve();
+  await Promise.all([first, second]);
+  await session.dispose();
+  assert.deepEqual(lifetime, ["sdk-dispose-start", "sdk-disposed", "pins-released"]);
+  assert.equal(agent.disposeCalls, 1);
+});
+
+test("timeout and fatal-close paths hold pins until SDK disposal is confirmed", async (t) => {
+  for (const phase of ["prompt-timeout", "model-timeout", "subscription-failure"]) await t.test(phase, async () => {
+    const agent = new FakeAgentSession();
+    const timers = createManualTimeouts();
+    const disposing = trackedDeferred();
+    const entered = trackedDeferred();
+    let disposed = false;
+    let releases = 0;
+    agent.prompt = (message) => {
+      agent.calls.push(["prompt", message]);
+      return new Promise(() => {});
+    };
+    agent.setModel = (model) => {
+      agent.calls.push(["set_model", model]);
+      return new Promise(() => {});
+    };
+    if (phase === "subscription-failure") {
+      agent.subscribe = () => { throw new Error("fake subscription failure"); };
+    }
+    agent.dispose = async () => {
+      agent.disposeCalls += 1;
+      entered.resolve();
+      await disposing.promise;
+      disposed = true;
+    };
+    const session = new SdkSession(agent, {
+      idleTimeoutMs: 100,
+      hardCapMs: 1_000,
+      setTimeoutFn: timers.setTimeout,
+      clearTimeoutFn: timers.clearTimeout,
+      onSdkDisposed() {
+        assert.equal(disposed, true);
+        releases += 1;
+      },
+    });
+    const command = phase === "model-timeout"
+      ? { type: "set_model", provider: "provider-a", modelId: "model-a" }
+      : { type: "prompt", message: "root" };
+    const rejected = assert.rejects(session.send(command, () => {}),
+      phase === "subscription-failure" ? /fake subscription failure/ : /SDK command timed out/);
+    if (phase !== "subscription-failure") {
+      await waitForImmediate(() => agent.calls.length === 1);
+      timers.advance(100);
+    }
+    await rejected;
+    await entered.promise;
+    assert.equal(session.closed, true);
+    assert.equal(releases, 0);
+    disposing.resolve();
+    await session.dispose();
+    await session.dispose();
+    assert.equal(releases, 1);
+    assert.equal(agent.disposeCalls, 1);
+  });
+});
+
+test("failed underlying SDK disposal never releases pins or retries the disposal hook", async () => {
+  const agent = new FakeAgentSession();
+  const failure = new Error("fake disposal failure");
+  agent.dispose = async () => {
+    agent.disposeCalls += 1;
+    throw failure;
+  };
+  let releases = 0;
+  const session = new SdkSession(agent, { onSdkDisposed: () => { releases += 1; } });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(session.dispose(), (error) => {
+      assert.strictEqual(error, failure);
+      assert.equal(error.sdkDisposalState, "unconfirmed");
+      return true;
+    });
+  }
+  assert.equal(agent.disposeCalls, 1);
+  assert.equal(releases, 0);
+});
+
+test("a failing disposal hook still reports confirmed SDK disposal and is invoked only once", async () => {
+  const agent = new FakeAgentSession();
+  const failure = new Error("fake pin-release failure");
+  let releases = 0;
+  const session = new SdkSession(agent, {
+    async onSdkDisposed() {
+      releases += 1;
+      throw failure;
+    },
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(session.dispose(), (error) => {
+      assert.strictEqual(error, failure);
+      assert.equal(error.sdkDisposalState, "disposed");
+      return true;
+    });
+  }
+  assert.equal(agent.disposeCalls, 1);
+  assert.equal(releases, 1);
+});
+
 test("dispose cancels adapter waiters without relying on an SDK terminal", async () => {
   const agent = new FakeAgentSession();
   const timers = createManualTimeouts();
@@ -2961,6 +3645,81 @@ test("createSdkSession disposes the raw session when profile activation fails", 
 // ---------------------------------------------------------------------------
 // #35: workflow gate answer channel
 // ---------------------------------------------------------------------------
+
+test("withdrawal fences new gate answers, including a last-moment preparation race, without cancelling the run", async (t) => {
+  for (const phase of ["before-answer", "after-preparation"]) await t.test(phase, async (t) => {
+    const fence = profileBindingHarness();
+    const gateId = `guarded-${phase}`;
+    const agent = new GatingAgentSession({ gate_id: gateId, options: [{ label: "A" }] });
+    const session = new SdkSession(agent, { profileBinding: fence.binding });
+    t.after(() => session.dispose());
+    let rootSettled = false;
+    const root = session.send({ type: "prompt", message: "root" }, () => {}).then(
+      () => { rootSettled = true; },
+      (error) => { rootSettled = true; return error; }
+    );
+    await waitForImmediate(() => session.pendingGates.has(gateId));
+    if (phase === "before-answer") {
+      fence.withdraw();
+    } else {
+      const prepare = agent.gateEmitter.prepareTerminalization.bind(agent.gateEmitter);
+      agent.gateEmitter.prepareTerminalization = (...args) => {
+        const prepared = prepare(...args);
+        fence.withdraw();
+        return prepared;
+      };
+    }
+    await assert.rejects(answerGate(session, gateId, "A"), { code: "SDK_PROFILE_WITHDRAWN" });
+    assert.deepEqual(agent.gateEmitter.resolveCalls, []);
+    assert.deepEqual(agent.gateEmitter.quarantineCalls, []);
+    assert.deepEqual(agent.gateEmitter.prepareCalls,
+      phase === "before-answer" ? [] : [[gateId, "not_published"]]);
+    assert.deepEqual(agent.gateEmitter.clearPreparedCalls,
+      phase === "before-answer" ? [] : [gateId]);
+    const entry = session.pendingGates.get(gateId);
+    assert.equal(entry.response, undefined);
+    assert.notEqual(entry.resolving, true);
+    assert.equal(session.closed, false);
+    assert.equal(agent.disposeCalls, 0);
+    assert.equal(rootSettled, false);
+    await session.dispose();
+    assert.match((await root).message, /disposed/);
+  });
+});
+
+test("withdrawal preserves an already-submitted gate answer and its accepted-answer recovery", async (t) => {
+  const fence = profileBindingHarness();
+  const gateId = "guarded-accepted-answer";
+  const agent = new GatingAgentSession({ gate_id: gateId, options: [{ label: "A" }] });
+  const receipt = trackedDeferred();
+  const entered = trackedDeferred();
+  agent.gateEmitter.beforeReceipt = async (response) => {
+    agent.gateEmitter.acceptedIncompleteKeys.add(response.idempotency_key);
+    entered.resolve();
+    await receipt.promise;
+  };
+  agent.gateEmitter.recoverAccepted = () => {
+    agent.gateEmitter.acceptedIncompleteKeys.clear();
+    return [];
+  };
+  const session = new SdkSession(agent, { profileBinding: fence.binding });
+  t.after(() => session.dispose());
+  const root = session.send({ type: "prompt", message: "root" }, () => {});
+  await waitForImmediate(() => session.pendingGates.has(gateId));
+  const answering = answerGate(session, gateId, "A");
+  await entered.promise;
+  fence.withdraw();
+  assert.equal(session.closed, false);
+  assert.equal(agent.disposeCalls, 0);
+  receipt.resolve();
+  assert.equal((await answering).ok, true);
+  assert.deepEqual(await root, { disposition: "completed" });
+  assert.equal(agent.gateEmitter.recoveryCalls, 1);
+  assert.deepEqual(agent.gateEmitter.resolveCalls,
+    [gateResponse(gateId, { selected: ["A"] })]);
+  assert.deepEqual(agent.gateEmitter.quarantineCalls, []);
+  await session.dispose();
+});
 
 test("gate emission produces a gate_request event and resolves on a label answer", async () => {
   const timers = createManualTimeouts();

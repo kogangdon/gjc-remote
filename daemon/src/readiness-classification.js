@@ -20,6 +20,10 @@ export const ADMISSION_BOUNDARY_REJECTION_CODES = Object.freeze([
   PROTOCOL_ERROR_CODES.WORKSPACE_ADMISSION_EXCEEDED,
   PROTOCOL_ERROR_CODES.SESSION_RETIREMENT_PENDING,
   PROTOCOL_ERROR_CODES.SESSION_RETIREMENT_FAILED,
+  // A request captured the previous grant. Its late refusal must not change
+  // a newer grant's readiness or replace a successful reprobe.
+  PROTOCOL_ERROR_CODES.SDK_PROFILE_WITHDRAWN,
+  PROTOCOL_ERROR_CODES.SDK_PROFILE_LIVE_UNSUPPORTED,
 ]);
 
 export function isAdmissionBoundaryRejection(errorCode) {
