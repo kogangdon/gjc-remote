@@ -516,15 +516,17 @@ function validateSdkScope(value) {
   if (!record || record.packageVersion !== SDK_EXTERNAL_STATE_REQUIREMENTS.packageVersion ||
       record.lockIntegrity !== SDK_EXTERNAL_STATE_REQUIREMENTS.lockIntegrity ||
       !isHex64(record.sdkExternalStateContractFingerprint)) refuse('sdk-scope');
+  if ((record.profileRoot === null) !== (record.stateIdentityAttestation === null)) refuse('sdk-attestation');
   const result = Object.freeze({
     installationRoot: windowsPath(record.installationRoot, 'sdk-installation-root'),
-    profileRoot: windowsPath(record.profileRoot, 'sdk-profile-root'),
+    profileRoot: record.profileRoot === null ? null : windowsPath(record.profileRoot, 'sdk-profile-root'),
     packageVersion: record.packageVersion,
     lockIntegrity: record.lockIntegrity,
     sdkExternalStateContractFingerprint: record.sdkExternalStateContractFingerprint,
     provenanceManifestPath: relativePath(record.provenanceManifestPath, 'sdk-provenance-path'),
     provenanceSignaturePath: relativePath(record.provenanceSignaturePath, 'sdk-signature-path'),
-    stateIdentityAttestation: validateAttestation(record.stateIdentityAttestation),
+    stateIdentityAttestation: record.stateIdentityAttestation === null
+      ? null : validateAttestation(record.stateIdentityAttestation),
   });
   if (result.provenanceManifestPath === result.provenanceSignaturePath) refuse('sdk-provenance-path');
   return result;
@@ -541,12 +543,14 @@ function validateCatalog(bytes, binding) {
   const nativeWorkspaceRoots = validateRootRefs(record.nativeWorkspaceRoots, 'workspace-roots');
   const sdk = validateSdkScope(record.sdk);
   assertDisjointRoots(workDirs, nativeWorkspaceRoots, sdk === null ? [] : [
-    { path: sdk.installationRoot }, { path: sdk.profileRoot },
+    { path: sdk.installationRoot },
+    ...(sdk.profileRoot === null ? [] : [{ path: sdk.profileRoot }]),
   ]);
   if (binding.component === 'bot' &&
       (workDirs.length !== 0 || nativeWorkspaceRoots.length !== 0 || sdk !== null)) refuse('scope-component');
   if (binding.component === 'daemon' && sdk === null) refuse('sdk-scope-missing');
-  if (sdk !== null && (sdk.installationRoot.toLowerCase().toUpperCase() === sdk.profileRoot.toLowerCase().toUpperCase() ||
+  if (sdk !== null && sdk.profileRoot !== null &&
+      (sdk.installationRoot.toLowerCase().toUpperCase() === sdk.profileRoot.toLowerCase().toUpperCase() ||
       sdk.installationRoot.toLowerCase().toUpperCase().startsWith(`${sdk.profileRoot.toLowerCase().toUpperCase()}\\`) ||
       sdk.profileRoot.toLowerCase().toUpperCase().startsWith(`${sdk.installationRoot.toLowerCase().toUpperCase()}\\`))) {
     refuse('sdk-scope-overlap');
@@ -1162,7 +1166,8 @@ export function createSdkPackageRootReaderForTest(input) {
 }
 
 async function inspectSdkInstallation(native, binding, sdk, budget, observations) {
-  observeSdkProfileRoot(native, binding, sdk, budget, observations);
+  // A management-only scope still proves the SDK package, never a personal profile.
+  if (sdk.profileRoot !== null) observeSdkProfileRoot(native, binding, sdk, budget, observations);
   const installation = openRoot(native, sdk.installationRoot, 'sdk-install', 'daemon', binding.roles, true);
   installation.roles = binding.roles;
   try {

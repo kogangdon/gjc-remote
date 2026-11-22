@@ -307,8 +307,21 @@ test('reserved, conflicting or invalid effective config refuses write-free at pr
     await assert.rejects(failing.create().effectiveConfigPreflight(context(failing)),
       (thrown) => thrown.code === error.code && thrown.reason === error.reason);
   }
-  const scope = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', scope: { scopeFingerprint: hex('4'), sdkProfileRoot: null } });
+  const scope = harness({ component: 'daemon', env: 'HOST_ID=a\nBOT_WS_URL=ws://b/\n', scope: { scopeFingerprint: hex('4'), sdkProfileRoot: '' } });
   await refusal(scope.create().effectiveConfigPreflight(context(scope)), 'SERVICE_PENDING', 'scope-catalog');
+});
+
+test('management-only Windows daemon launch requires no SDK profile', async () => {
+  const h = harness({ component: 'daemon', env: 'HOST_ID=host-a\nBOT_WS_URL=wss://bot.example/ws\nHOST_TOKEN=t\n',
+    scope: { scopeFingerprint: hex('4'), sdkProfileRoot: null } });
+  const operation = h.create();
+  await operation.effectiveConfigPreflight(context(h));
+  operation.lifecycleOptions(context(h)).createWindowsDriver({
+    session: session(daemonKey), request: h.request, release: releaseFor('daemon'),
+  });
+  const { launch } = h.drivers[0];
+  assert.equal(launch.sdkProfilePath, null);
+  assert.match(launch.runtimeConfigRootIdentityFingerprint, /^[0-9a-f]{64}$/);
 });
 
 test('operation binding refuses drift, missing preflight and foreign platforms', async () => {
