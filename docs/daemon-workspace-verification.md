@@ -1,5 +1,12 @@
 # Daemon workspace contract verification matrix
 
+## Host SDK profile reuse on Windows
+
+Management-only daemons register without an SDK profile. Cross-profile sharing
+is unsupported: requests must not open a target, start an SDK session, or
+fall back to another profile. The management, admission and management-only
+boot tests cover that refusal; they do not qualify cross-account Windows access.
+
 ## SDK 0.20.0 candidate — qualification scope
 
 `feat/sdk-0.20.0-upgrade` coordinates official unpatched SDK dependencies,
@@ -501,7 +508,7 @@ release/platform gate. GitHub-hosted CI (including the required `ubuntu-24.04-ar
 only one effective runner principal and cannot itself prove multi-principal deployment behavior.
 
 **Native workspace serving is env-gated and OFF by default.** Native workspace serving is now a
-fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:315, an
+fail-closed runtime decision (`NATIVE_WORKSPACE_SERVING_ENABLED` at daemon/src/daemon.js:320, an
 `= resolveNativeServingEnabled({env, inventoryReceiptAdvertised})` call): it is enabled only when the operator opt-in `GJC_NATIVE_WORKSPACE_SERVING`
 is exactly `"1"` AND `inventoryReceiptAdvertised` is boolean `true`. With the env var unset (the
 default) the gate reads `false` and its read site inside `admitReadyWorkload` returns
