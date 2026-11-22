@@ -57,6 +57,15 @@ import {
   validateWorkspaceAuthorityDescriptor,
   workspaceBindingFingerprint,
 } from "@gjc-remote/shared/workspace-binding";
+import {
+  SDK_PROFILE_MANAGEMENT_CAPABILITY,
+  SDK_PROFILE_MANAGEMENT_TYPES,
+  SDK_PROFILE_MANAGEMENT_ERROR_CODES,
+  buildSdkProfileManagementRequest,
+  buildSdkProfileManagementResult,
+  parseSdkProfileManagementResult,
+  validateSdkProfileManagementResult,
+} from "@gjc-remote/shared/sdk-profile-management.js";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -70,6 +79,8 @@ const MAX_GATE_PRESENTATION_ATTEMPTS = 64;
 const OUTPUT_TRUNCATED_NOTICE = "[output truncated: too large]";
 export const MAX_BINDING_READINESS_STATES = 64;
 const BINDING_DEADLINE_MS = 10_000;
+const SDK_PROFILE_MANAGEMENT_TIMEOUT_MS = 10_000;
+const MAX_SDK_PROFILE_MANAGEMENT_REQUESTS = 64;
 // Local-only observability. The schema deliberately has no extensibility
 // fields: this callback must never become a path, prompt, token, error, or
 // fingerprint transport.
@@ -98,7 +109,10 @@ const OBSERVABILITY_CODES = Object.freeze(new Set([
 ]));
 const MAX_UINT53 = Number.MAX_SAFE_INTEGER;
 const PING_PAYLOAD = JSON.stringify(PING);
-const BOT_CAPABILITIES = CAPABILITIES;
+const BOT_CAPABILITIES = Object.freeze([
+  ...CAPABILITIES,
+  SDK_PROFILE_MANAGEMENT_CAPABILITY,
+]);
 const V2_CAPABILITIES = Object.freeze([...BOT_CAPABILITIES, WORKSPACE_READINESS_CAPABILITY]);
 const V3_CAPABILITIES = Object.freeze([
   ...V2_CAPABILITIES,
@@ -333,6 +347,8 @@ export class HostRegistry {
     this.heartbeatStates = new Map();
     /** @type {Map<string, { socket: import("ws").WebSocket, resolve: (v: any) => void, onEvent: (e: object) => void, text?: string, truncated?: boolean }>} */
     this.pendingRequests = new Map();
+    /** @type {Map<string, { socket: import("ws").WebSocket, hostId: string, connectionIdentity: number, request: object, timer?: object, settle: (v: object) => void, fail: (code: string) => void }>} */
+    this.pendingSdkProfileManagement = new Map();
     /** @type {Map<string, { socket: import("ws").WebSocket, cancelId: string, timer?: object }>} */
     this.cancelTombstones = new Map();
     /** @type {Map<string, { answerId: string, requestId: string, gateId: string, socket: import("ws").WebSocket, pending: object, timer?: object, resolve: (v: any) => void }>} */
@@ -598,6 +614,10 @@ export class HostRegistry {
 
     if (isPongMessage(msg)) {
       this.#acceptPong(socket);
+      return;
+    }
+    if (msg?.type === SDK_PROFILE_MANAGEMENT_TYPES.RESULT) {
+      this.#acceptSdkProfileManagementResult(socket, raw);
       return;
     }
     if (msg?.type === MSG_TYPES.BIND_OK || msg?.type === MSG_TYPES.UNBIND_OK) {
@@ -2358,6 +2378,11 @@ export class HostRegistry {
     this.#clearHeartbeat(socket);
     this.connectionIdentities.delete(socket);
     this.#failPendingForSocket(socket, error);
+    for (const pending of this.pendingSdkProfileManagement.values()) {
+      if (pending.socket === socket) {
+        pending.fail(SDK_PROFILE_MANAGEMENT_ERROR_CODES.CONNECTION_LOST);
+      }
+    }
     if (wasCurrent) this.#notifyConnectionStateChange();
     return wasCurrent;
   }
@@ -2542,6 +2567,9 @@ export class HostRegistry {
         code: GATE_ANSWER_ERROR_CODES.FAILED,
       });
     }
+    for (const pending of this.pendingSdkProfileManagement.values()) {
+      pending.fail(SDK_PROFILE_MANAGEMENT_ERROR_CODES.CONNECTION_LOST);
+    }
     this.connections.clear();
     this.hostInfo.clear();
     for (const state of this.readinessStates.values()) {
@@ -2661,6 +2689,110 @@ export class HostRegistry {
       protocolVersion: info.protocolVersion,
       capabilities: [...info.capabilities],
     };
+  }
+
+  /**
+   * Transport only: the protected management controller must admit this operation
+   * before calling it. Host registration and SDK invocation are not admission.
+   * No caller paths, principal claims, or credentials are accepted here.
+   * A timeout/disconnect leaves mutation outcome unknown; read status before retry.
+   */
+  async manageSdkProfile(hostId, operation) {
+    if (!operation || Object.getPrototypeOf(operation) !== Object.prototype ||
+        ["type", "version", "requestId"].some((key) => Object.hasOwn(operation, key))) {
+      throw new TypeError("SDK_PROFILE_MANAGEMENT_INVALID");
+    }
+    const request = buildSdkProfileManagementRequest({
+      ...operation,
+      requestId: randomUUID(),
+    });
+    const failure = (code) => buildSdkProfileManagementResult({
+      requestId: request.requestId,
+      operation: request.operation,
+      ok: false,
+      code,
+    }, request);
+    const socket = this.connections.get(hostId);
+    if (this.closed || !socket || socket.readyState !== WebSocket.OPEN) {
+      return failure(SDK_PROFILE_MANAGEMENT_ERROR_CODES.HOST_OFFLINE);
+    }
+    const info = this.hostInfo.get(hostId);
+    if (!(info?.protocolVersion >= PROTOCOL_VERSION) ||
+        !info.capabilities.includes(SDK_PROFILE_MANAGEMENT_CAPABILITY)) {
+      return failure(SDK_PROFILE_MANAGEMENT_ERROR_CODES.UNSUPPORTED);
+    }
+    if (this.pendingSdkProfileManagement.size >= MAX_SDK_PROFILE_MANAGEMENT_REQUESTS) {
+      return failure(SDK_PROFILE_MANAGEMENT_ERROR_CODES.BUSY);
+    }
+    for (const pending of this.pendingSdkProfileManagement.values()) {
+      if (pending.socket === socket) return failure(SDK_PROFILE_MANAGEMENT_ERROR_CODES.BUSY);
+    }
+    return new Promise((resolve) => {
+      const pending = {
+        socket,
+        hostId,
+        connectionIdentity: this.connectionIdentities.get(socket),
+        request,
+        timer: undefined,
+        settle: (result) => {
+          if (this.pendingSdkProfileManagement.get(request.requestId) !== pending) return;
+          this.pendingSdkProfileManagement.delete(request.requestId);
+          this.timers.clearTimeout(pending.timer);
+          resolve(result);
+        },
+        fail: (code) => pending.settle(failure(code)),
+      };
+      this.pendingSdkProfileManagement.set(request.requestId, pending);
+      pending.timer = this.timers.setTimeout(() => {
+        pending.fail(SDK_PROFILE_MANAGEMENT_ERROR_CODES.REQUEST_TIMEOUT);
+      }, SDK_PROFILE_MANAGEMENT_TIMEOUT_MS);
+      pending.timer.unref?.();
+      try {
+        socket.send(JSON.stringify(request), (error) => {
+          if (error) pending.fail(SDK_PROFILE_MANAGEMENT_ERROR_CODES.SEND_FAILED);
+        });
+      } catch {
+        pending.fail(SDK_PROFILE_MANAGEMENT_ERROR_CODES.SEND_FAILED);
+      }
+    });
+  }
+
+  #acceptSdkProfileManagementResult(socket, raw) {
+    const hostId = this.heartbeatStates.get(socket)?.hostId;
+    if (this.connections.get(hostId) !== socket ||
+        !this.hostInfo.get(hostId)?.capabilities.includes(SDK_PROFILE_MANAGEMENT_CAPABILITY)) {
+      socket.close(1008, "profile management not negotiated");
+      return;
+    }
+    let result;
+    try {
+      result = parseSdkProfileManagementResult(raw);
+    } catch {
+      for (const pending of this.pendingSdkProfileManagement.values()) {
+        if (pending.socket === socket) {
+          pending.fail(SDK_PROFILE_MANAGEMENT_ERROR_CODES.INVALID_RESPONSE);
+        }
+      }
+      socket.close(1008, "invalid profile management result");
+      return;
+    }
+    const pending = this.pendingSdkProfileManagement.get(result.requestId);
+    if (!pending) return; // Late or duplicate result; never applies to a newer request.
+    if (pending.socket !== socket ||
+        pending.connectionIdentity !== this.connectionIdentities.get(socket) ||
+        this.connections.get(pending.hostId) !== socket ||
+        !this.hostInfo.get(pending.hostId)?.capabilities.includes(SDK_PROFILE_MANAGEMENT_CAPABILITY)) {
+      socket.close(1008, "profile management owner mismatch");
+      return;
+    }
+    try {
+      validateSdkProfileManagementResult(result, pending.request);
+    } catch {
+      pending.fail(SDK_PROFILE_MANAGEMENT_ERROR_CODES.INVALID_RESPONSE);
+      socket.close(1008, "conflicting profile management result");
+      return;
+    }
+    pending.settle(deepFreeze(result));
   }
 
   /** Returns a constant-shape, receiver-local schema-v1 gauge snapshot. */
