@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Windows service release candidate preparation
+
+- Prepare application `0.4.0-rc.15` (sequence 15) for SDK 0.20.0. The
+  existing rc.14 tag and artifacts remain unchanged. This metadata change
+  does not qualify an installation or publish a release.
+
 ### SDK 0.20.0 source candidate — scoped Windows qualification passed
 
 - On `feat/sdk-0.20.0-upgrade`, coordinate official unpatched

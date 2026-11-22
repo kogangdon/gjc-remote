@@ -690,6 +690,9 @@ release. Build takes exactly `--source`, `--output`, `--platform`,
 `--architecture`, `--release-sequence`, `--signing-key-id`, `--native-addon`,
 `--native-manifest`, and `--native-signature`. Verify takes only `--candidate`.
 Output must be a new directory outside the source tree.
+The rc.15 candidate uses `--release-sequence 15`, SDK 0.20.0, and the
+existing native and deployment trust roots. Build from the reviewed final
+merge tagged `v0.4.0-rc.15`, not from the preparation branch.
 For the historical rc.14 candidate, `--release-sequence 14` matched the pinned contract;
 its build and candidate verification rejected every other sequence. That historical
 recipe does not authorize building the current SDK source under the rc.14 identity.

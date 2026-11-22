@@ -485,9 +485,9 @@ function validateContractShape(contract, platform, architecture) {
   ]) || contract.schemaVersion !== 1 ||
       contract.kind !== 'gjc-remote-application-release-contract' ||
       contract.repository !== 'kogangdon/gjc-remote' ||
-      contract.releaseVersion !== '0.4.0-rc.14' ||
-      contract.releaseTag !== 'v0.4.0-rc.14' ||
-      contract.releaseSequence !== 14 ||
+      contract.releaseVersion !== '0.4.0-rc.15' ||
+      contract.releaseTag !== 'v0.4.0-rc.15' ||
+      contract.releaseSequence !== 15 ||
       contract.producer?.bunVersion !== '1.4.2' ||
       !Array.isArray(contract.sourceWorkspaces) ||
       contract.sourceWorkspaces.length !== workspaces.size ||
@@ -515,7 +515,7 @@ function validateContractShape(contract, platform, architecture) {
     const roots = workspaces.get(workspace?.path);
     if (!roots || seen.has(workspace.path) ||
         workspace.packageName !== `@gjc-remote/${workspace.path}` ||
-        workspace.packageVersion !== (workspace.path === 'native-control' ? '2.1.0' : '0.4.0-rc.14') ||
+        workspace.packageVersion !== (workspace.path === 'native-control' ? '2.1.0' : '0.4.0-rc.15') ||
         JSON.stringify(workspace.productionRoots) !== JSON.stringify(roots)) {
       fail('SERVICE_RELEASE_REAL_BUN_FIXTURE_CONTRACT_INVALID');
     }
