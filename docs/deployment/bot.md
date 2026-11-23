@@ -1,6 +1,7 @@
 # Native bot deployment
 
-Run the bot as the always-on Discord control plane with **Node.js 26 or later**.
+Run the bot as the always-on Discord control plane. The Windows x64 checkout
+foreground launcher uses **Bun 1.4.5**; the generic Node launcher requires **Node.js 26 or later**.
 The daemon hosts are separate deployments; they open outbound WebSocket
 connections to this process.
 
@@ -84,11 +85,12 @@ rebuilding, signing, or installing under an immutable old release tag.
 
 ## Register and start
 
-Run both package scripts with real Node (not `bun run --bun`):
+Register with real Node. From the repository root:
 
 ```sh
 bun run --filter '@gjc-remote/bot' register
-bun run --filter '@gjc-remote/bot' start
+npm --prefix bot run start:windows  # Windows x64 checkout; Bun 1.4.5
+# Other supported checkout hosts: npm --prefix bot start (Node)
 ```
 
 Register after changing application command definitions. Start the daemon(s)

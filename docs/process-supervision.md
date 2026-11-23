@@ -56,8 +56,9 @@ Run one bot service on the bot host and one daemon service for each exact valid 
 
 ### Foreground operational fallback
 
-These are the existing operational fallback and a useful process-level evidence
-baseline:
+For a Windows x64 source checkout use `npm --prefix bot run start:windows`
+(Bun 1.4.5). This is not the signed service launcher. The Node bot path below
+remains the fallback for the existing release:
 
 ```text
 # from the repository root

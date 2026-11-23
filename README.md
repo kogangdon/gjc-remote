@@ -239,7 +239,7 @@ disposable Linux/Windows host evidence remain release requirements.
 
 Install the repository prerequisites before running `bun install`:
 
-- **Node.js 26 or newer.** Node runs the bot, management CLI, smoke harness,
+- **Node.js 26 or newer.** Node runs the default `start` script, management CLI, smoke harness,
   and every `node --test` workspace suite.
 - **Bun 1.4.0 or newer.** Bun installs the committed `bun.lock`, runs the
   daemon, and must be on `PATH` because daemon integration tests spawn a real
@@ -324,14 +324,13 @@ daemon runs on Bun (>=1.4.0) and embeds the
 [`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.20.0** (source candidate)
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
-should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
-and the smoke harness require Node.js >=26 and always run under real Node via
-their package scripts (`node src/...`); the daemon is the only piece that runs
-on Bun. Do not run those Node scripts with `bun run --bun` — Bun does not
-report a Node 26 major to `process.versions.node`, so `bot/src/node-version-guard.js`
-(loaded first by `bot.js` and `management-entrypoint.js`) refuses to start under
-it. `bun run --filter '@gjc-remote/bot' start` (no `--bun`) is fine: Bun just
-shells out to the `node src/bot.js` package script on PATH.
+should match it. On Windows x64, start the foreground bot from the checkout with
+`npm --prefix bot run start:windows` instead of the generic `start` command
+above. This uses Bun **1.4.5** and leaves `.env` loading to the bot. Use npm
+as the launcher so a parent Bun process cannot preload other dotenv files.
+The generic `start`, `register`, management CLI (`gjc-remote-admin`) and smoke
+harness remain Node paths; do not force them to Bun with `--bun`. Docker,
+systemd and the signed Windows service keep their existing launch contracts.
 
 The integration boundary remains narrow. `gjc-remote` owns host authentication,
 Discord routing, workDir canonicalization, and workspace admission/lifecycle

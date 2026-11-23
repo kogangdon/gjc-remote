@@ -1,7 +1,7 @@
 # Native daemon foreground deployment
 
 Run one daemon on each host that owns mapped work directories. It embeds the
-pinned official unpatched `@gajae-code/coding-agent` SDK **0.19.0**
+pinned official unpatched `@gajae-code/coding-agent` SDK **0.20.0**
 and requires **Bun 1.4.0 or
 later**. The daemon is not a bot sidecar: it opens an authenticated outbound
 WebSocket connection to the independently deployed bot.

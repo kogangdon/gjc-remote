@@ -2,8 +2,11 @@ import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { copyFileSync, cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { foregroundRuntimeRefusal, nodeVersionRefusal } from "../src/runtime-policy.js";
 
 const botDir = fileURLToPath(new URL("..", import.meta.url));
 const botEntryUrl = new URL("../src/bot.js", import.meta.url).href;
@@ -186,4 +189,157 @@ test("a service-claimed launch is refused by the bootstrap guard before dotenv o
   assert.match(result.stderr, /SERVICE_BOOTSTRAP_REFUSED/);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /HostRegistry|Loaded channel map|Logged in/);
   assert.doesNotMatch(result.stderr, /secret-a|secret-b|definitely-invalid-token/);
+});
+
+test("foreground runtime permission uses Bun identity, exact version and Windows x64", () => {
+  function bunRuntime(bun, node = "24.3.0", platform = "win32", arch = "x64") {
+    return { versions: { bun, node }, version: `v${node}`, platform, arch };
+  }
+  for (const node of ["24.3.0", "26.0.0", "99.0.0"]) {
+    const runtime = bunRuntime("1.4.5", node);
+    assert.equal(foregroundRuntimeRefusal(runtime), null);
+  }
+  for (const bun of ["", "1.4.4", "1.4.6", "1.4.5-canary", "1.5.0"]) {
+    assert.equal(foregroundRuntimeRefusal(bunRuntime(bun, "99.0.0")).event, "unsupported_bot_runtime");
+  }
+  for (const [platform, arch] of [["linux", "x64"], ["darwin", "arm64"], ["win32", "arm64"], ["win32", "ia32"]]) {
+    assert.equal(foregroundRuntimeRefusal(bunRuntime("1.4.5", "99.0.0", platform, arch)).event, "unsupported_bot_runtime");
+  }
+});
+
+test("real Node entry retains its version policy on every platform", () => {
+  for (const platform of ["win32", "linux", "darwin"]) {
+    for (const node of ["26.0.0", "26.2.0", "27.0.0"]) {
+      const runtime = { versions: { node }, version: `v${node}`, platform, arch: "arm64" };
+      assert.equal(foregroundRuntimeRefusal(runtime), null);
+      assert.equal(nodeVersionRefusal(runtime), null);
+    }
+    for (const node of ["24.0.0", "25.9.0", "invalid", undefined]) {
+      const runtime = { versions: { node }, version: `v${node}`, platform, arch: "x64" };
+      assert.equal(foregroundRuntimeRefusal(runtime).event, "unsupported_node_version");
+      assert.equal(nodeVersionRefusal(runtime).event, "unsupported_node_version");
+    }
+  }
+});
+
+test("entrypoint guards reject injected unsupported identities before application evaluation", () => {
+  const cases = [
+    ["bot.js", { node: "24.0.0" }, "unsupported_node_version"],
+    ["bot.js", { node: "99.0.0", bun: "1.4.6" }, "unsupported_bot_runtime"],
+    ["management-entrypoint.js", { node: "24.0.0" }, "unsupported_node_version"],
+    ["register-commands.js", { node: "24.0.0" }, "unsupported_node_version"],
+    ["management-entrypoint.js", { node: "24.0.0", bun: "1.4.5" }, "unsupported_node_version"],
+    ["register-commands.js", { node: "24.0.0", bun: "1.4.5" }, "unsupported_node_version"],
+  ];
+  for (const [entrypoint, versions, event] of cases) {
+    const script = `
+      for (const [key, value] of Object.entries(${JSON.stringify(versions)})) {
+        Object.defineProperty(process.versions, key, { value, configurable: true });
+      }
+      await import(${JSON.stringify(new URL(`../src/${entrypoint}`, import.meta.url).href)});
+    `;
+    // Start with a Node identity for every synthetic case. A Bun parent
+    // would otherwise leave versions.bun present even in the Node-only case.
+    const result = spawnSync("node", ["--input-type=module", "-e", script], {
+      cwd: botDir,
+      env: startupEnv({ GJC_REMOTE_REQUIRE_ALLOWLIST: "1", GJC_BOT_ALLOWED_USERS: "" }),
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 1, `${entrypoint}: ${result.stderr}`);
+    assert.equal(result.stdout, "");
+    const fatal = JSON.parse(result.stderr.trim());
+    assert.equal(fatal.level, "error");
+    assert.equal(fatal.event, event);
+    assert.doesNotMatch(result.stderr, /secret-a|secret-b|definitely-invalid-token|Invalid bot environment configuration/);
+  }
+});
+
+const windowsForegroundSkip = process.env.GJC_REMOTE_BOT_WINDOWS_FOREGROUND_E2E === "1"
+  ? false
+  : "Set GJC_REMOTE_BOT_WINDOWS_FOREGROUND_E2E=1 on Windows x64 with Bun 1.4.5 for launcher coverage.";
+
+function runWindowsForegroundLauncher({ dotenv, env = {} }) {
+  assert.equal(process.platform, "win32", "Windows foreground E2E requires Windows.");
+  assert.equal(process.arch, "x64", "Windows foreground E2E requires x64.");
+  assert.equal(process.versions.bun, undefined, "Run launcher coverage with real Node, not Bun.");
+  const npmCli = process.env.npm_execpath;
+  assert.match(npmCli ?? "", /(?:^|[\\/])(?:npm-cli|npm)\.js$/i,
+    "Run launcher coverage through npm exec --workspace bot -- node --test test/bot-startup.test.js.");
+  const directory = mkdtempSync(join(botDir, ".startup-windows-"));
+  try {
+    cpSync(join(botDir, "src"), join(directory, "src"), { recursive: true });
+    copyFileSync(join(botDir, "package.json"), join(directory, "package.json"));
+    writeFileSync(join(directory, ".env"), [
+      "DISCORD_TOKEN=dotenv-launcher-secret",
+      "HOST_TOKENS=prod-1:dotenv-host-secret",
+      ...dotenv,
+      "",
+    ].join("\n"));
+    writeFileSync(join(directory, ".env.local"), [
+      "DISCORD_TOKEN=local-launcher-secret",
+      "HOST_TOKENS=prod-1:local-host-secret",
+      "GJC_REMOTE_REQUIRE_ALLOWLIST=0",
+      "GJC_BOT_ALLOWED_USERS=123456789012345678",
+      "",
+    ].join("\n"));
+    const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+      !/^(GJC_|DISCORD_|HOST_|CHANNELS_CONFIG$|DOTENV_|BUN_|NODE_ENV$|NODE_OPTIONS$|NODE_PATH$|NPM_CONFIG_)/i.test(key)
+    ));
+    const childEnv = { ...cleanEnv, NODE_OPTIONS: "", NODE_PATH: "", ...env };
+    const bunVersion = spawnSync("bun", ["--version"], {
+      cwd: directory,
+      env: childEnv,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.ifError(bunVersion.error);
+    assert.equal(bunVersion.status, 0, bunVersion.stderr);
+    assert.equal(bunVersion.stdout.trim(), "1.4.5", "Windows foreground E2E requires Bun 1.4.5 on PATH.");
+    // A real Node parent runs npm's actual CLI, never `bun run`/`bun x`, so
+    // neither parent nor child can preload .env.local before dotenv/config.
+    return spawnSync(process.execPath, [npmCli, "--prefix", directory, "run", "start:windows"], {
+      cwd: directory,
+      env: childEnv,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("Windows npm launcher uses dotenv .env and ignores conflicting .env.local allowlist settings", {
+  skip: windowsForegroundSkip,
+}, () => {
+  const cases = [
+    { dotenv: ["GJC_REMOTE_REQUIRE_ALLOWLIST=1", "GJC_BOT_ALLOWED_USERS="] },
+    {
+      dotenv: ["GJC_REMOTE_REQUIRE_ALLOWLIST=0", "GJC_BOT_ALLOWED_USERS=123456789012345678"],
+      env: { GJC_REMOTE_REQUIRE_ALLOWLIST: "1", GJC_BOT_ALLOWED_USERS: " " },
+    },
+  ];
+  for (const options of cases) {
+    const result = runWindowsForegroundLauncher(options);
+    assert.ifError(result.error);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Invalid bot environment configuration:.*GJC_BOT_ALLOWED_USERS.*GJC_REMOTE_REQUIRE_ALLOWLIST=1/);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /HostRegistry|Loaded channel map|Logged in|SECURITY WARNING/);
+    assert.doesNotMatch(result.stderr, /dotenv-launcher-secret|dotenv-host-secret|local-launcher-secret|local-host-secret/);
+  }
+});
+
+test("Windows Bun foreground permission does not authorize a claimed service launch", {
+  skip: windowsForegroundSkip,
+}, () => {
+  const result = runWindowsForegroundLauncher({
+    dotenv: ["GJC_REMOTE_REQUIRE_ALLOWLIST=1", "GJC_BOT_ALLOWED_USERS="],
+    env: { GJC_REMOTE_SERVICE_COMPONENT: "bot" },
+  });
+  assert.ifError(result.error);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /SERVICE_BOOTSTRAP_REFUSED/);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /Invalid bot environment configuration|HostRegistry|Loaded channel map|Logged in/);
+  assert.doesNotMatch(result.stderr, /dotenv-launcher-secret|dotenv-host-secret|local-launcher-secret|local-host-secret/);
 });

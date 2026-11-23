@@ -1,17 +1,31 @@
 # Windows deployment
 
-Windows x64 supports foreground execution when Node.js is at least 26 for the bot and Bun is at least 1.4.0 for the daemon. Native-control on Windows additionally requires the Visual Studio C++ build tools. Windows arm64 is not an approved native-control target.
+On Windows x64 the checkout foreground bot uses Bun 1.4.5; registration and management tools still use Node.js 26 or later. The checkout daemon requires Bun 1.4.0 or later. Native-control additionally requires the Visual Studio C++ build tools. Windows arm64 is not an approved native-control target.
 
 Run components independently from the repository root:
 
 ```text
-cd bot    && node src/bot.js
+npm --prefix bot run start:windows
 cd daemon && bun src/daemon.js
 ```
 
 Foreground operation is the operational fallback when service, provenance, or
 evidence gates are not satisfied. It is not boot-managed and does not roll
 back the application artifact, runtime, mapping authority, or durable state.
+
+This launcher is for the source checkout, not a change to signed `rc.15`.
+Shawl is not required for foreground validation. Its separate signature and
+service lifecycle checks still apply to the official SCM path.
+
+The second phase is a separate Windows packaging change: embed Bun in one
+bot executable and one daemon executable. Neither is shipped by this change.
+Before distributing them, bind each EXE and its immutable sidecars to a
+build inventory; define a protected external configuration directory, explicit
+mapping path and physical signed-addon/trust-store layout. The daemon also
+needs the locked SDK and its platform assets. Acceptance requires both roles
+to run separately without developer caches or Node/Bun on PATH, reject
+missing or modified native inputs, and open a real SDK session on the daemon.
+Registration alone does not exercise the lazy SDK load.
 
 ## Current tracked-input source contract — LOCAL qualified subset
 
