@@ -1,4 +1,4 @@
-import "./node-version-guard.js";
+import "./foreground-runtime-guard.js";
 import { consumeServiceBootstrapContext } from "@gjc-remote/native-control/service-bootstrap";
 import "dotenv/config";
 import { existsSync, lstatSync } from "node:fs";

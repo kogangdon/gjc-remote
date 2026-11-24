@@ -18,7 +18,7 @@ Discord-controlled remote GJC sessions.
 > provider calls require a fresh grant. This is basic same-profile proof, not
 > divergent real-profile/tenant isolation, provider-backed active controls or a
 > #247/#7412 fix; #231/#247 remain open and #7412 unresolved.
-> This is not Bun conversion: service/bot Node 26.7.0, daemon/producer Bun 1.4.2,
+> These SDK results do not change the signed rc.15 runtimes: service bot Node 26.7.0, daemon/producer Bun 1.4.2;
 > 15 held native Bun failures and two held snapshots remain separate and unchanged.
 > No deployed Bun 1.4.2 SDK 0.20, Linux/macOS/Docker, SCM, signing, production or
 > rollback compatibility qualification or release approval follows from these local receipts.
@@ -239,11 +239,12 @@ disposable Linux/Windows host evidence remain release requirements.
 
 Install the repository prerequisites before running `bun install`:
 
-- **Node.js 26 or newer.** Node runs the bot, management CLI, smoke harness,
+- **Node.js 26 or newer.** Node runs the default `start` script, management CLI, smoke harness,
   and every `node --test` workspace suite.
 - **Bun 1.4.0 or newer.** Bun installs the committed `bun.lock`, runs the
   daemon, and must be on `PATH` because daemon integration tests spawn a real
-  Bun child even when `npm test` is launched with Node.
+  Bun child even when `npm test` is launched with Node. For the **Windows x64
+  foreground bot**, install **Bun 1.4.5 exactly** and check `bun --version`.
 - **A native C++ build toolchain supported by `node-gyp`.** The
   `native-control` workspace has no portable fallback; installation and the
   native verification path require its N-API addon to build successfully.
@@ -312,26 +313,25 @@ cp bot/channels.example.json bot/channels.json   # map Discord channel IDs -> {h
 # Set GJC_REMOTE_REQUIRE_ALLOWLIST=0 ONLY for isolated local testing.
 bun run --filter '@gjc-remote/bot' register    # publish slash commands to Discord
 # Enable the Discord Developer Portal "Message Content Intent" for plain chat prompts.
-bun run --filter '@gjc-remote/bot' start
+# Start the bot once, using the command for your checkout host:
+npm --prefix bot run start:windows  # Windows x64: Bun 1.4.5
+# npm --prefix bot start            # Linux: Node.js 26+
 
 # On each machine you want to control (requires Bun 1.4.0 or newer):
 cp daemon/.env.example daemon/.env  # fill in HOST_ID, HOST_TOKEN (must match bot's HOST_TOKENS), BOT_WS_URL
 bun run --filter '@gjc-remote/daemon' start
 ```
 
-Every command above is driven by Bun (the repo's lockfile is `bun.lock`). The
-daemon runs on Bun (>=1.4.0) and embeds the
+The daemon runs on Bun (>=1.4.0) and embeds the
 [`@gajae-code/coding-agent` SDK](https://github.com/Yeachan-Heo/gajae-code) **0.20.0** (source candidate)
 (pinned in `daemon/package.json` and `bun.lock`); `bun install` provisions
 exactly that version, and the interactive `gjc` used for provider login (below)
-should match it. The bot, `register`, the management CLI (`gjc-remote-admin`),
-and the smoke harness require Node.js >=26 and always run under real Node via
-their package scripts (`node src/...`); the daemon is the only piece that runs
-on Bun. Do not run those Node scripts with `bun run --bun` — Bun does not
-report a Node 26 major to `process.versions.node`, so `bot/src/node-version-guard.js`
-(loaded first by `bot.js` and `management-entrypoint.js`) refuses to start under
-it. `bun run --filter '@gjc-remote/bot' start` (no `--bun`) is fine: Bun just
-shells out to the `node src/bot.js` package script on PATH.
+should match it. Use npm to launch the Windows foreground bot: `start:windows`
+passes `--no-env-file` to Bun and leaves `.env` loading to the bot. A parent
+`bun run` could preload other dotenv files before the bot starts.
+The generic `start`, `register`, management CLI (`gjc-remote-admin`) and smoke
+harness remain Node paths; do not force them to Bun with `--bun`. Docker,
+systemd and the signed Windows service keep their existing launch contracts.
 
 The integration boundary remains narrow. `gjc-remote` owns host authentication,
 Discord routing, workDir canonicalization, and workspace admission/lifecycle
@@ -622,7 +622,10 @@ cannot satisfy its evidence gates:
 
 ```text
 # from the repository root
-cd bot    && node src/bot.js
+# Windows x64 checkout:
+npm --prefix bot run start:windows
+# Node fallback (including the signed rc.15 checkout):
+npm --prefix bot start
 cd daemon && bun src/daemon.js   # Bun >= 1.4.0
 ```
 
